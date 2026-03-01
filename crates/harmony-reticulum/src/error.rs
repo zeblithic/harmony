@@ -51,6 +51,15 @@ pub enum ReticulumError {
     #[error("link already closed")]
     LinkAlreadyClosed,
 
+    #[error("interface offline")]
+    InterfaceOffline,
+
+    #[error("IFAC verification failed")]
+    IfacVerificationFailed,
+
     #[error(transparent)]
     Identity(#[from] IdentityError),
+
+    #[error(transparent)]
+    Crypto(#[from] harmony_crypto::CryptoError),
 }
