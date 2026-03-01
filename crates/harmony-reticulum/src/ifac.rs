@@ -40,6 +40,10 @@ impl IfacAuthenticator {
         ifac_netkey: Option<&str>,
         ifac_size: usize,
     ) -> Result<Self, ReticulumError> {
+        if ifac_netname.is_none() && ifac_netkey.is_none() {
+            return Err(ReticulumError::IfacMissingCredentials);
+        }
+
         // Build ifac_origin: SHA256(netname) || SHA256(netkey)
         let mut ifac_origin = Vec::new();
         if let Some(name) = ifac_netname {
@@ -126,16 +130,16 @@ impl IfacAuthenticator {
     /// Returns the original raw packet bytes (without IFAC) on success,
     /// or `IfacVerificationFailed` if the access code doesn't match.
     pub fn unmask(&self, raw: &[u8]) -> Result<Vec<u8>, ReticulumError> {
-        // Check IFAC flag
-        if raw[0] & IFAC_FLAG == 0 {
-            return Err(ReticulumError::IfacVerificationFailed);
-        }
-
         if raw.len() < MIN_PACKET_SIZE + self.ifac_size {
             return Err(ReticulumError::PacketTooShort {
                 minimum: MIN_PACKET_SIZE + self.ifac_size,
                 actual: raw.len(),
             });
+        }
+
+        // Check IFAC flag (safe: length validated above)
+        if raw[0] & IFAC_FLAG == 0 {
+            return Err(ReticulumError::IfacVerificationFailed);
         }
 
         // 1. Extract IFAC (cleartext, bytes 2..2+ifac_size)
@@ -368,5 +372,18 @@ mod tests {
 
         // Ed25519 signing is deterministic, so masking should be too
         assert_eq!(m1, m2);
+    }
+
+    #[test]
+    fn unmask_empty_input_returns_error_not_panic() {
+        let auth = make_authenticator();
+        let result = auth.unmask(&[]);
+        assert!(matches!(result, Err(ReticulumError::PacketTooShort { .. })));
+    }
+
+    #[test]
+    fn new_with_no_credentials_rejected() {
+        let result = IfacAuthenticator::new(None, None, 8);
+        assert!(matches!(result, Err(ReticulumError::IfacMissingCredentials)));
     }
 }

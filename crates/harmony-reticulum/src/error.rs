@@ -57,6 +57,9 @@ pub enum ReticulumError {
     #[error("IFAC verification failed")]
     IfacVerificationFailed,
 
+    #[error("IFAC requires at least one of netname or netkey")]
+    IfacMissingCredentials,
+
     #[error(transparent)]
     Identity(#[from] IdentityError),
 
