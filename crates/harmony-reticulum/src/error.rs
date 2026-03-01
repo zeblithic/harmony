@@ -51,6 +51,21 @@ pub enum ReticulumError {
     #[error("link already closed")]
     LinkAlreadyClosed,
 
+    #[error("interface offline")]
+    InterfaceOffline,
+
+    #[error("IFAC verification failed")]
+    IfacVerificationFailed,
+
+    #[error("IFAC requires at least one of netname or netkey")]
+    IfacMissingCredentials,
+
+    #[error("IFAC size must be between 1 and 64 bytes, got {0}")]
+    IfacInvalidSize(usize),
+
     #[error(transparent)]
     Identity(#[from] IdentityError),
+
+    #[error(transparent)]
+    Crypto(#[from] harmony_crypto::CryptoError),
 }
