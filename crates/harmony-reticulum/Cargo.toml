@@ -1,0 +1,18 @@
+[package]
+name = "harmony-reticulum"
+description = "Reticulum packet format and announce mechanism for the Harmony network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harmony-crypto = { workspace = true }
+harmony-identity = { workspace = true }
+rand_core = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+hex = { workspace = true }
