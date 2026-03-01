@@ -2,11 +2,16 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
+use crate::CryptoError;
+
 /// Default derived key length for AES-256-CBC Fernet (Reticulum default).
 pub const DERIVED_KEY_LENGTH_256: usize = 64;
 
 /// Derived key length for AES-128-CBC Fernet (Reticulum optional).
 pub const DERIVED_KEY_LENGTH_128: usize = 32;
+
+/// Maximum HKDF-SHA256 output length: 255 * 32 = 8160 bytes.
+const HKDF_SHA256_MAX_OUTPUT: usize = 255 * 32;
 
 /// Perform HKDF-SHA256 key derivation.
 ///
@@ -14,15 +19,20 @@ pub const DERIVED_KEY_LENGTH_128: usize = 32;
 /// - `ikm`: Input key material (e.g., ECDH shared secret)
 /// - `salt`: Optional salt (defaults to 32 zero bytes if `None`)
 /// - `info`: Optional context info (defaults to empty)
-/// - `length`: Output key length in bytes
-///
-/// Returns the derived key material, or panics if length exceeds HKDF limits.
-pub fn derive_key(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], length: usize) -> Vec<u8> {
+/// - `length`: Output key length in bytes (max 8160 for SHA-256)
+pub fn derive_key(
+    ikm: &[u8],
+    salt: Option<&[u8]>,
+    info: &[u8],
+    length: usize,
+) -> Result<Vec<u8>, CryptoError> {
     let hk = Hkdf::<Sha256>::new(salt, ikm);
     let mut okm = vec![0u8; length];
-    hk.expand(info, &mut okm)
-        .expect("HKDF output length should be <= 255 * HashLen");
-    okm
+    hk.expand(info, &mut okm).map_err(|_| CryptoError::HkdfLengthExceeded {
+        requested: length,
+        max: HKDF_SHA256_MAX_OUTPUT,
+    })?;
+    Ok(okm)
 }
 
 /// Convenience: derive a 64-byte key (Reticulum AES-256-CBC default).
@@ -33,6 +43,7 @@ pub fn derive_key(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], length: usize) -
 pub fn derive_key_256(ikm: &[u8], salt: Option<&[u8]>) -> [u8; DERIVED_KEY_LENGTH_256] {
     let mut key = [0u8; DERIVED_KEY_LENGTH_256];
     let hk = Hkdf::<Sha256>::new(salt, ikm);
+    // 64 bytes is a compile-time constant, well within the 8160-byte limit.
     hk.expand(&[], &mut key)
         .expect("64 bytes is within HKDF-SHA256 limits");
     key
@@ -46,10 +57,15 @@ pub struct DerivedKey {
 }
 
 impl DerivedKey {
-    pub fn new(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], length: usize) -> Self {
-        Self {
-            bytes: derive_key(ikm, salt, info, length),
-        }
+    pub fn new(
+        ikm: &[u8],
+        salt: Option<&[u8]>,
+        info: &[u8],
+        length: usize,
+    ) -> Result<Self, CryptoError> {
+        Ok(Self {
+            bytes: derive_key(ikm, salt, info, length)?,
+        })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -79,7 +95,7 @@ mod tests {
             "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
         ).unwrap();
 
-        let okm = derive_key(&ikm, Some(&salt), &info, 42);
+        let okm = derive_key(&ikm, Some(&salt), &info, 42).unwrap();
         assert_eq!(okm, expected_okm);
     }
 
@@ -107,7 +123,7 @@ mod tests {
              cc30c58179ec3e87c14c01d5c1f3434f1d87"
         ).unwrap();
 
-        let okm = derive_key(&ikm, Some(&salt), &info, 82);
+        let okm = derive_key(&ikm, Some(&salt), &info, 82).unwrap();
         assert_eq!(okm, expected_okm);
     }
 
@@ -120,9 +136,7 @@ mod tests {
              9d201395faa4b61a96c8"
         ).unwrap();
 
-        // Reticulum passes None for salt when absent, which HKDF treats as
-        // hash_len zero bytes. The `hkdf` crate does the same with `None`.
-        let okm = derive_key(&ikm, None, &[], 42);
+        let okm = derive_key(&ikm, None, &[], 42).unwrap();
         assert_eq!(okm, expected_okm);
     }
 
@@ -152,10 +166,30 @@ mod tests {
 
     #[test]
     fn derived_key_wrapper_zeroizes_on_drop() {
-        let dk = DerivedKey::new(b"ikm", None, &[], 32);
+        let dk = DerivedKey::new(b"ikm", None, &[], 32).unwrap();
         assert_eq!(dk.len(), 32);
         assert!(!dk.is_empty());
-        // Can't easily test zeroize on drop, but we verify the API works
         let _ = dk.as_bytes();
+    }
+
+    #[test]
+    fn excessive_length_returns_error() {
+        let result = derive_key(b"ikm", None, &[], 8161);
+        assert!(matches!(
+            result,
+            Err(CryptoError::HkdfLengthExceeded {
+                requested: 8161,
+                max: 8160,
+            })
+        ));
+    }
+
+    #[test]
+    fn derived_key_wrapper_excessive_length_returns_error() {
+        let result = DerivedKey::new(b"ikm", None, &[], 9000);
+        assert!(matches!(
+            result,
+            Err(CryptoError::HkdfLengthExceeded { .. })
+        ));
     }
 }

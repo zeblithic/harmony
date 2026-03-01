@@ -73,8 +73,10 @@ pub fn decrypt(key: &[u8], token: &[u8]) -> Result<Vec<u8>, CryptoError> {
     validate_key_length(key)?;
     let (signing_key, encryption_key) = split_key(key);
 
-    if token.len() < FERNET_OVERHEAD_MIN + 1 {
-        // Need at least IV + 1 block of ciphertext + HMAC
+    // AES-CBC + PKCS7 always produces ciphertext in 16-byte blocks (minimum 16).
+    // Minimum valid token: 16 (IV) + 16 (one AES block) + 32 (HMAC) = 64 bytes.
+    const MIN_TOKEN_LENGTH: usize = IV_LENGTH + 16 + HMAC_LENGTH;
+    if token.len() < MIN_TOKEN_LENGTH {
         return Err(CryptoError::CiphertextTooShort);
     }
 
@@ -234,6 +236,21 @@ mod tests {
         // Truncate to less than minimum
         let result = decrypt(key.as_bytes(), &token[..40]);
         assert!(matches!(result, Err(CryptoError::CiphertextTooShort)));
+    }
+
+    #[test]
+    fn tokens_under_64_bytes_rejected() {
+        // Minimum valid: 16 (IV) + 16 (one AES block) + 32 (HMAC) = 64.
+        // Tokens of 49-63 bytes can never be valid AES-CBC output.
+        let key = generate_key(&mut OsRng);
+        for len in [49, 55, 60, 63] {
+            let fake_token = vec![0u8; len];
+            let result = decrypt(key.as_bytes(), &fake_token);
+            assert!(
+                matches!(result, Err(CryptoError::CiphertextTooShort)),
+                "token of {len} bytes should be rejected as too short"
+            );
+        }
     }
 
     #[test]

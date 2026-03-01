@@ -161,16 +161,13 @@ impl PrivateIdentity {
         let encryption_key = X25519PublicKey::from(&encryption_secret);
         let verifying_key = signing_key.verifying_key();
 
-        let mut combined = [0u8; PUBLIC_KEY_LENGTH];
-        combined[..32].copy_from_slice(encryption_key.as_bytes());
-        combined[32..].copy_from_slice(verifying_key.as_bytes());
-        let address_hash = hash::truncated_hash(&combined);
-
-        let identity = Identity {
-            encryption_key,
-            verifying_key,
-            address_hash,
-        };
+        // Delegate address derivation to Identity::from_public_keys (single source of truth).
+        // Ed25519 keys from generate() are always valid, so unwrap is safe.
+        let identity = Identity::from_public_keys(
+            encryption_key.as_bytes(),
+            verifying_key.as_bytes(),
+        )
+        .expect("keys from generate() are always valid");
 
         Self {
             identity,
@@ -244,16 +241,11 @@ impl PrivateIdentity {
         let encryption_key = X25519PublicKey::from(&encryption_secret);
         let verifying_key = signing_key.verifying_key();
 
-        let mut combined = [0u8; PUBLIC_KEY_LENGTH];
-        combined[..32].copy_from_slice(encryption_key.as_bytes());
-        combined[32..].copy_from_slice(verifying_key.as_bytes());
-        let address_hash = hash::truncated_hash(&combined);
-
-        let identity = Identity {
-            encryption_key,
-            verifying_key,
-            address_hash,
-        };
+        // Delegate address derivation to Identity::from_public_keys (single source of truth).
+        let identity = Identity::from_public_keys(
+            encryption_key.as_bytes(),
+            verifying_key.as_bytes(),
+        )?;
 
         Ok(Self {
             identity,

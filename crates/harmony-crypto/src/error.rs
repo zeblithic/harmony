@@ -18,4 +18,7 @@ pub enum CryptoError {
 
     #[error("AEAD decryption failed (authentication tag mismatch)")]
     AeadDecryptFailed,
+
+    #[error("HKDF output length {requested} exceeds maximum ({max})")]
+    HkdfLengthExceeded { requested: usize, max: usize },
 }
