@@ -180,8 +180,8 @@ fn harmony_encrypt_decrypt_with_reticulum_keys() {
         .encrypt(&mut OsRng, plaintext)
         .unwrap();
 
-    // Verify first 32 bytes are an ephemeral key, rest is Fernet token
-    assert!(ciphertext.len() > 32 + 48);
+    // 32 ephemeral X25519 pub + at least 64-byte Fernet token (IV + 1 AES block + HMAC)
+    assert!(ciphertext.len() >= 96);
 
     let decrypted = priv_identity.decrypt(&ciphertext).unwrap();
     assert_eq!(decrypted, plaintext);

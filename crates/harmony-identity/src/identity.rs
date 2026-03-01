@@ -450,8 +450,8 @@ mod tests {
     fn ciphertext_starts_with_32_byte_ephemeral_key() {
         let id = PrivateIdentity::generate(&mut OsRng);
         let ciphertext = id.public_identity().encrypt(&mut OsRng, b"test").unwrap();
-        // First 32 bytes are the ephemeral X25519 public key
-        assert!(ciphertext.len() > 32);
+        // 32 ephemeral X25519 pub + at least 64-byte Fernet token (IV + 1 AES block + HMAC)
+        assert!(ciphertext.len() >= 96);
     }
 
     #[test]
