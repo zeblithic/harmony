@@ -308,12 +308,15 @@ dependencies = [
 name = "harmony-reticulum"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "harmony-crypto",
  "harmony-identity",
  "hex",
  "rand",
  "rand_core",
  "thiserror",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

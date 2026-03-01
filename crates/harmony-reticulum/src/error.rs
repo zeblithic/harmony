@@ -33,6 +33,24 @@ pub enum ReticulumError {
     #[error("app_data too large for MTU")]
     AppDataTooLarge,
 
+    #[error("link request too short: minimum {minimum} bytes, got {actual}")]
+    LinkRequestTooShort { minimum: usize, actual: usize },
+
+    #[error("link proof too short: minimum {minimum} bytes, got {actual}")]
+    LinkProofTooShort { minimum: usize, actual: usize },
+
+    #[error("link proof signature invalid")]
+    LinkProofSignatureInvalid,
+
+    #[error("link identification invalid")]
+    LinkIdentificationInvalid,
+
+    #[error("link not active")]
+    LinkNotActive,
+
+    #[error("link already closed")]
+    LinkAlreadyClosed,
+
     #[error(transparent)]
     Identity(#[from] IdentityError),
 }

@@ -228,6 +228,23 @@ impl Packet {
         })
     }
 
+    /// Return the hashable portion of this packet for link_id computation.
+    ///
+    /// Strips transport metadata: IFAC, header_type, context_flag, propagation
+    /// bits are cleared (keeping only dest_type + packet_type in the low 4 bits),
+    /// the hops byte is dropped, and transport_id is dropped for Type2.
+    ///
+    /// Result: `[flags & 0x0F][dest_hash:16][context:1][data:N]`
+    pub fn hashable_part(&self) -> Result<Vec<u8>, ReticulumError> {
+        let masked_flags = self.header.flags.to_byte() & 0x0F;
+        let mut buf = Vec::with_capacity(1 + 16 + 1 + self.data.len());
+        buf.push(masked_flags);
+        buf.extend_from_slice(&self.header.destination_hash);
+        buf.push(self.header.context.as_byte());
+        buf.extend_from_slice(&self.data);
+        Ok(buf)
+    }
+
     /// Serialize this packet to bytes, enforcing MTU.
     pub fn to_bytes(&self) -> Result<Vec<u8>, ReticulumError> {
         // Validate header_type ↔ transport_id consistency
@@ -580,5 +597,87 @@ mod tests {
 
         header.flags.header_type = HeaderType::Type2;
         assert_eq!(header.wire_size(), HEADER_2_SIZE);
+    }
+
+    // ── hashable_part tests ─────────────────────────────────────────
+
+    #[test]
+    fn hashable_part_type1_basic() {
+        let dest_hash = [0xAA; 16];
+        let packet = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::LinkRequest,
+                },
+                hops: 5,
+                transport_id: None,
+                destination_hash: dest_hash,
+                context: PacketContext::None,
+            },
+            data: vec![1, 2, 3],
+        };
+
+        let hp = packet.hashable_part().unwrap();
+        // flags masked to low 4 bits: dest_type=Single(0), packet_type=LinkRequest(2) => 0x02
+        assert_eq!(hp[0], 0x02);
+        assert_eq!(&hp[1..17], &dest_hash);
+        assert_eq!(hp[17], 0x00); // context None
+        assert_eq!(&hp[18..], &[1, 2, 3]);
+        // hops is NOT included
+        assert_eq!(hp.len(), 1 + 16 + 1 + 3);
+    }
+
+    #[test]
+    fn hashable_part_type2_strips_transport_id() {
+        let transport_id = [0xBB; 16];
+        let dest_hash = [0xCC; 16];
+        let packet = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type2,
+                    context_flag: false,
+                    propagation: PropagationType::Transport,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::LinkRequest,
+                },
+                hops: 3,
+                transport_id: Some(transport_id),
+                destination_hash: dest_hash,
+                context: PacketContext::None,
+            },
+            data: vec![0xDD; 10],
+        };
+
+        let hp = packet.hashable_part().unwrap();
+        // transport_id should NOT appear in hashable_part
+        assert_eq!(hp[0], 0x02); // flags masked: Single(0) + LinkRequest(2)
+        assert_eq!(&hp[1..17], &dest_hash);
+        // No transport_id bytes
+        assert_eq!(hp.len(), 1 + 16 + 1 + 10);
+    }
+
+    #[test]
+    fn hashable_part_flags_masked_to_low_4_bits() {
+        // Set all high bits: IFAC=1, Type2=1, context=1, propagation=1
+        // plus dest_type=Link(3), packet_type=Proof(3) => low 4 bits = 0x0F
+        let packet = Packet {
+            header: PacketHeader {
+                flags: PacketFlags::from_byte(0xFF),
+                hops: 0,
+                transport_id: Some([0; 16]),
+                destination_hash: [0; 16],
+                context: PacketContext::LrProof,
+            },
+            data: vec![],
+        };
+
+        let hp = packet.hashable_part().unwrap();
+        assert_eq!(hp[0], 0x0F, "only low 4 bits should survive masking");
     }
 }
