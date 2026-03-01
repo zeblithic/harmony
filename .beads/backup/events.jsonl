@@ -20,3 +20,4 @@
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-01T12:03:46Z","event_type":"created","id":20,"issue_id":"harmony-0p6","new_value":"","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-01T12:03:49Z","event_type":"created","id":21,"issue_id":"harmony-ovn","new_value":"","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-01T12:03:52Z","event_type":"created","id":22,"issue_id":"harmony-971","new_value":"","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-01T14:03:11Z","event_type":"closed","id":23,"issue_id":"harmony-ovn","new_value":"Done: harmony-reticulum crate implemented with packet format, destination naming/hashing, announce build/validate. 55 tests + 6 interop tests against Python Reticulum. Merged.","old_value":""}
