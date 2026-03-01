@@ -27,8 +27,12 @@ const IV_LENGTH: usize = 16;
 const HMAC_LENGTH: usize = 32;
 const AES256_KEY_LENGTH: usize = 32;
 
-/// Overhead added by Fernet: 16-byte IV + up to 16-byte padding + 32-byte HMAC.
-pub const FERNET_OVERHEAD_MIN: usize = IV_LENGTH + HMAC_LENGTH;
+/// Minimum Fernet token size in bytes.
+///
+/// AES-CBC with PKCS7 always produces at least one 16-byte block of ciphertext
+/// (even for empty plaintext, padding fills an entire block), so the minimum
+/// valid token is: 16 (IV) + 16 (one AES block) + 32 (HMAC) = 64 bytes.
+pub const FERNET_TOKEN_MIN: usize = IV_LENGTH + 16 + HMAC_LENGTH;
 
 /// Encrypt plaintext using Reticulum-compatible Fernet.
 ///
@@ -73,10 +77,7 @@ pub fn decrypt(key: &[u8], token: &[u8]) -> Result<Vec<u8>, CryptoError> {
     validate_key_length(key)?;
     let (signing_key, encryption_key) = split_key(key);
 
-    // AES-CBC + PKCS7 always produces ciphertext in 16-byte blocks (minimum 16).
-    // Minimum valid token: 16 (IV) + 16 (one AES block) + 32 (HMAC) = 64 bytes.
-    const MIN_TOKEN_LENGTH: usize = IV_LENGTH + 16 + HMAC_LENGTH;
-    if token.len() < MIN_TOKEN_LENGTH {
+    if token.len() < FERNET_TOKEN_MIN {
         return Err(CryptoError::CiphertextTooShort);
     }
 

@@ -185,7 +185,8 @@ impl PrivateIdentity {
     ///
     /// Expects: `[32B ephemeral X25519 pub][Fernet token]`
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, IdentityError> {
-        if ciphertext.len() < 33 {
+        // Minimum: 32 (ephemeral X25519 pub) + 64 (smallest valid Fernet token) = 96
+        if ciphertext.len() < 96 {
             return Err(IdentityError::DecryptionFailed);
         }
 

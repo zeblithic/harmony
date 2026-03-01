@@ -2,6 +2,15 @@
 //!
 //! This is the preferred cipher for Harmony traffic (vs Fernet for Reticulum compat).
 //! Single-pass authenticated encryption with associated data.
+//!
+//! # Security: Nonce Reuse
+//!
+//! **A nonce MUST NEVER be reused with the same key.** Reusing a nonce completely
+//! breaks the security of ChaCha20-Poly1305: it reveals the XOR of two plaintexts
+//! and allows forgery of authentication tags. Use [`generate_nonce`] to produce
+//! random 12-byte nonces — the collision probability is ~2^-48 after 2^32 messages,
+//! which is safe for typical usage. For high-volume streams where billions of
+//! messages share a key, use a counter-based nonce scheme instead.
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -24,11 +33,17 @@ pub const TAG_LENGTH: usize = 16;
 /// Encrypt plaintext with ChaCha20-Poly1305.
 ///
 /// - `key`: 32-byte symmetric key
-/// - `nonce`: 12-byte nonce (must never be reused with the same key)
+/// - `nonce`: 12-byte nonce (**must never be reused with the same key** — see module docs)
 /// - `plaintext`: data to encrypt
 /// - `aad`: additional authenticated data (authenticated but not encrypted)
 ///
 /// Returns ciphertext with appended 16-byte Poly1305 tag.
+///
+/// # Security
+///
+/// Reusing a nonce with the same key completely breaks confidentiality and
+/// authenticity. Use [`generate_nonce`] for random nonces or a monotonic
+/// counter for high-volume streams.
 pub fn encrypt(
     key: &[u8; KEY_LENGTH],
     nonce: &[u8; NONCE_LENGTH],
@@ -68,6 +83,9 @@ pub fn decrypt(
 }
 
 /// Generate a random 12-byte nonce.
+///
+/// Safe for up to ~2^32 messages per key (birthday bound gives ~2^-48 collision
+/// probability). For higher volumes, use a counter-based nonce instead.
 pub fn generate_nonce(rng: &mut impl CryptoRngCore) -> [u8; NONCE_LENGTH] {
     let mut nonce = [0u8; NONCE_LENGTH];
     rng.fill_bytes(&mut nonce);
