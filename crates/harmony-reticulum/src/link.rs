@@ -282,7 +282,6 @@ impl Link {
     ///
     /// Returns the new link (in Handshake state) and the proof packet.
     pub fn respond(
-        _rng: &mut impl CryptoRngCore,
         private_identity: &PrivateIdentity,
         dest_name: &DestinationName,
         request_packet: &Packet,
@@ -672,7 +671,7 @@ mod tests {
 
         // Step 2: Responder receives request and builds proof
         let (mut responder_link, proof_packet) =
-            Link::respond(&mut OsRng, &responder_priv, &dest_name, &request_packet).unwrap();
+            Link::respond(&responder_priv, &dest_name, &request_packet).unwrap();
         assert_eq!(responder_link.state(), LinkState::Handshake);
         assert!(!responder_link.is_initiator());
 
@@ -699,7 +698,7 @@ mod tests {
         let (mut initiator_link, request_packet) =
             Link::initiate(&mut OsRng, responder_pub, &dest_name).unwrap();
         let (responder_link, proof_packet) =
-            Link::respond(&mut OsRng, &responder_priv, &dest_name, &request_packet).unwrap();
+            Link::respond(&responder_priv, &dest_name, &request_packet).unwrap();
 
         initiator_link
             .complete_handshake(&mut OsRng, &proof_packet, 0.01)
@@ -721,7 +720,7 @@ mod tests {
         let (mut initiator_link, request_packet) =
             Link::initiate(&mut OsRng, responder_pub, &dest_name).unwrap();
         let (mut responder_link, proof_packet) =
-            Link::respond(&mut OsRng, &responder_priv, &dest_name, &request_packet).unwrap();
+            Link::respond(&responder_priv, &dest_name, &request_packet).unwrap();
 
         let rtt_packet = initiator_link
             .complete_handshake(&mut OsRng, &proof_packet, 0.01)
@@ -975,7 +974,7 @@ mod tests {
         };
 
         assert!(matches!(
-            Link::respond(&mut OsRng, &responder_priv, &dest_name, &short_packet),
+            Link::respond(&responder_priv, &dest_name, &short_packet),
             Err(ReticulumError::LinkRequestTooShort { minimum: 67, actual: 30 })
         ));
     }
@@ -1024,7 +1023,7 @@ mod tests {
         let (mut initiator, request) =
             Link::initiate(&mut OsRng, responder_pub, &dest_name).unwrap();
         let (_, mut proof_packet) =
-            Link::respond(&mut OsRng, &responder_priv, &dest_name, &request).unwrap();
+            Link::respond(&responder_priv, &dest_name, &request).unwrap();
 
         // Tamper with signature in proof data
         proof_packet.data[0] ^= 0x01;
