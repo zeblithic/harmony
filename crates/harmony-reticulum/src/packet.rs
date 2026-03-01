@@ -230,11 +230,11 @@ impl Packet {
 
     /// Serialize this packet to bytes, enforcing MTU.
     pub fn to_bytes(&self) -> Result<Vec<u8>, ReticulumError> {
-        // Validate Type2 has transport_id
-        if matches!(self.header.flags.header_type, HeaderType::Type2)
-            && self.header.transport_id.is_none()
-        {
-            return Err(ReticulumError::MissingTransportId);
+        // Validate header_type ↔ transport_id consistency
+        match (self.header.flags.header_type, &self.header.transport_id) {
+            (HeaderType::Type2, None) => return Err(ReticulumError::MissingTransportId),
+            (HeaderType::Type1, Some(_)) => return Err(ReticulumError::UnexpectedTransportId),
+            _ => {}
         }
 
         let header_size = self.header.wire_size();
@@ -514,6 +514,30 @@ mod tests {
 
         let result = packet.to_bytes();
         assert!(matches!(result, Err(ReticulumError::MissingTransportId)));
+    }
+
+    #[test]
+    fn type1_with_transport_id_rejected() {
+        let packet = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: Some([0xBB; 16]), // Invalid for Type1!
+                destination_hash: [0; 16],
+                context: PacketContext::None,
+            },
+            data: vec![],
+        };
+
+        let result = packet.to_bytes();
+        assert!(matches!(result, Err(ReticulumError::UnexpectedTransportId)));
     }
 
     #[test]

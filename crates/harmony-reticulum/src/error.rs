@@ -24,6 +24,9 @@ pub enum ReticulumError {
     #[error("transport header requires transport_id")]
     MissingTransportId,
 
+    #[error("Type1 header must not have transport_id")]
+    UnexpectedTransportId,
+
     #[error("invalid destination name: dots are not allowed in individual components")]
     InvalidDestinationName,
 
