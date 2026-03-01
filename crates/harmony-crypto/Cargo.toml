@@ -1,0 +1,25 @@
+[package]
+name = "harmony-crypto"
+description = "Cryptographic primitives for the Harmony decentralized network stack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true }
+chacha20poly1305 = { workspace = true }
+rand_core = { workspace = true }
+zeroize = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+hex = { workspace = true }
