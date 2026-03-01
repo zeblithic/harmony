@@ -10,7 +10,10 @@ rust-version.workspace = true
 [dependencies]
 harmony-crypto = { workspace = true }
 harmony-identity = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
 rand_core = { workspace = true }
+zeroize = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
