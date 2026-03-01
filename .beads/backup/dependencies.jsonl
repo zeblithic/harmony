@@ -2,6 +2,7 @@
 {"created_at":"2026-03-01T11:56:31Z","created_by":"Jake Englund","depends_on_id":"harmony-14z","issue_id":"harmony-8wy","type":"blocks"}
 {"created_at":"2026-03-01T14:04:46Z","created_by":"Jake Englund","depends_on_id":"harmony-3aj","issue_id":"harmony-aaf","type":"blocks"}
 {"created_at":"2026-03-01T14:04:46Z","created_by":"Jake Englund","depends_on_id":"harmony-3aj","issue_id":"harmony-b83","type":"blocks"}
+{"created_at":"2026-03-01T15:52:24Z","created_by":"Jake Englund","depends_on_id":"harmony-b83","issue_id":"harmony-b83.1","type":"parent-child"}
 {"created_at":"2026-03-01T11:56:31Z","created_by":"Jake Englund","depends_on_id":"harmony-14z","issue_id":"harmony-d00","type":"blocks"}
 {"created_at":"2026-03-01T11:56:32Z","created_by":"Jake Englund","depends_on_id":"harmony-1pm","issue_id":"harmony-gi1","type":"blocks"}
 {"created_at":"2026-03-01T11:56:32Z","created_by":"Jake Englund","depends_on_id":"harmony-iii","issue_id":"harmony-gi1","type":"blocks"}
