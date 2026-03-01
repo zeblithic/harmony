@@ -60,6 +60,9 @@ pub enum ReticulumError {
     #[error("IFAC requires at least one of netname or netkey")]
     IfacMissingCredentials,
 
+    #[error("IFAC size must be between 1 and 64 bytes, got {0}")]
+    IfacInvalidSize(usize),
+
     #[error(transparent)]
     Identity(#[from] IdentityError),
 

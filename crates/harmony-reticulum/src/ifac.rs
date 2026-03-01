@@ -18,6 +18,9 @@ const IFAC_FLAG: u8 = 0x80;
 /// Minimum packet size for IFAC operations (flags + hops).
 const MIN_PACKET_SIZE: usize = 2;
 
+/// Ed25519 signature length — the upper bound for ifac_size.
+const SIGNATURE_LENGTH: usize = 64;
+
 /// IFAC authenticator for interface access control.
 ///
 /// Sans-I/O: transforms raw packet bytes, no actual I/O. The authenticator
@@ -44,6 +47,10 @@ impl IfacAuthenticator {
             return Err(ReticulumError::IfacMissingCredentials);
         }
 
+        if ifac_size == 0 || ifac_size > SIGNATURE_LENGTH {
+            return Err(ReticulumError::IfacInvalidSize(ifac_size));
+        }
+
         // Build ifac_origin: SHA256(netname) || SHA256(netkey)
         let mut ifac_origin = Vec::new();
         if let Some(name) = ifac_netname {
@@ -55,8 +62,8 @@ impl IfacAuthenticator {
 
         let ifac_origin_hash = hash::full_hash(&ifac_origin);
 
-        // HKDF: derive 64-byte key
-        let ifac_key_vec = hkdf::derive_key(
+        // HKDF: derive 64-byte key, zeroizing the intermediate Vec
+        let mut ifac_key_vec = hkdf::derive_key(
             &ifac_origin_hash,
             Some(&IFAC_SALT),
             &[],
@@ -65,6 +72,7 @@ impl IfacAuthenticator {
 
         let mut ifac_key = [0u8; 64];
         ifac_key.copy_from_slice(&ifac_key_vec);
+        ifac_key_vec.zeroize();
 
         // Create Ed25519 identity from the derived key
         let ifac_identity = PrivateIdentity::from_private_bytes(&ifac_key)?;
@@ -385,5 +393,25 @@ mod tests {
     fn new_with_no_credentials_rejected() {
         let result = IfacAuthenticator::new(None, None, 8);
         assert!(matches!(result, Err(ReticulumError::IfacMissingCredentials)));
+    }
+
+    #[test]
+    fn new_with_zero_ifac_size_rejected() {
+        let result = IfacAuthenticator::new(Some("net"), None, 0);
+        assert!(matches!(result, Err(ReticulumError::IfacInvalidSize(0))));
+    }
+
+    #[test]
+    fn new_with_oversized_ifac_rejected() {
+        let result = IfacAuthenticator::new(Some("net"), None, 65);
+        assert!(matches!(result, Err(ReticulumError::IfacInvalidSize(65))));
+    }
+
+    #[test]
+    fn new_with_max_ifac_size_accepted() {
+        // 64 bytes = full Ed25519 signature, should be accepted
+        let auth = IfacAuthenticator::new(Some("net"), None, 64);
+        assert!(auth.is_ok());
+        assert_eq!(auth.unwrap().ifac_size(), 64);
     }
 }
