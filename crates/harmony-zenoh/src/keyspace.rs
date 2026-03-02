@@ -62,11 +62,6 @@ pub fn channel_msg_sub_all() -> Result<OwnedKeyExpr, ZenohError> {
     ke("harmony/server/*/channel/*/msg")
 }
 
-/// Subscribe to direct messages for a specific user pair.
-pub fn dm_sub(user_a: &str, user_b: &str) -> Result<OwnedKeyExpr, ZenohError> {
-    dm_key(user_a, user_b)
-}
-
 /// Subscribe to all direct messages involving a user (either side).
 /// Returns two subscription patterns since DMs are keyed by `{user_a}/{user_b}`.
 pub fn dm_sub_all_for_user(user_id: &str) -> Result<[OwnedKeyExpr; 2], ZenohError> {
