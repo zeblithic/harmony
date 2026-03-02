@@ -111,7 +111,7 @@ struct AnnounceTableEntry {
     source_interface: Arc<str>,
     hops: u8,
     destination_hash: DestinationHash,
-    packet_data: Vec<u8>,
+    packet_data: Arc<[u8]>,
 }
 
 /// A reverse table entry mapping a relayed packet hash back to the interface
@@ -1596,7 +1596,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::None,
             },
-            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
         }
         .to_bytes()
         .unwrap()
@@ -1619,7 +1619,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::None,
             },
-            data: vec![0x01, 0x02, 0x03],
+            data: vec![0x01, 0x02, 0x03].into(),
         }
         .to_bytes()
         .unwrap()
@@ -1642,7 +1642,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::None,
             },
-            data: vec![0; 200],
+            data: vec![0; 200].into(),
         }
         .to_bytes()
         .unwrap()
@@ -3102,7 +3102,7 @@ mod tests {
                 source_interface: "eth0".into(),
                 hops: 1,
                 destination_hash: dh,
-                packet_data: vec![0u8; 470], // will overflow Type2 MTU
+                packet_data: vec![0u8; 470].into(), // will overflow Type2 MTU
             },
         );
         assert_eq!(node.announce_table_len(), 1);
@@ -3151,7 +3151,7 @@ mod tests {
                 source_interface: "eth0".into(),
                 hops: 1,
                 destination_hash: dh,
-                packet_data: vec![0xAA; 466],
+                packet_data: vec![0xAA; 466].into(),
             },
         );
 
@@ -3395,7 +3395,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::None,
             },
-            data: vec![0xDE, 0xAD],
+            data: vec![0xDE, 0xAD].into(),
         }
         .to_bytes()
         .unwrap()
@@ -3419,7 +3419,7 @@ mod tests {
                 destination_hash: proof_dest,
                 context: PacketContext::None,
             },
-            data: vec![0xAA, 0x00, 0xFF],
+            data: vec![0xAA, 0x00, 0xFF].into(),
         }
         .to_bytes()
         .unwrap()
@@ -3442,7 +3442,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::None,
             },
-            data: vec![0xDE, 0xAD],
+            data: vec![0xDE, 0xAD].into(),
         };
         hash::truncated_hash(&pkt.hashable_part().unwrap())
     }
@@ -3955,7 +3955,7 @@ mod tests {
                 destination_hash: remote,
                 context: PacketContext::None,
             },
-            data: vec![0u8; 470],
+            data: vec![0u8; 470].into(),
         };
         let path_entry = node.path_table().get(&remote).unwrap().clone();
         let eth0: Arc<str> = Arc::from("eth0");
@@ -3988,7 +3988,7 @@ mod tests {
                 destination_hash: remote,
                 context: PacketContext::None,
             },
-            data: vec![0xBB; 10],
+            data: vec![0xBB; 10].into(),
         };
         // Use a path entry pointing to a non-existent interface
         let bad_entry = PathEntry {
@@ -4038,7 +4038,7 @@ mod tests {
                 destination_hash: proof_key,
                 context: PacketContext::None,
             },
-            data: vec![0xCC; 10],
+            data: vec![0xCC; 10].into(),
         };
         let eth0: Arc<str> = Arc::from("eth0");
         let actions = node.route_proof(&proof_pkt, &eth0);
@@ -4120,7 +4120,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::None,
             },
-            data,
+            data: data.into(),
         }
         .to_bytes()
         .unwrap()
@@ -4143,7 +4143,7 @@ mod tests {
                 destination_hash: link_id,
                 context: PacketContext::LrProof,
             },
-            data: vec![0xBB; 99], // Proof data (signature + x25519 + signalling)
+            data: vec![0xBB; 99].into(), // Proof data (signature + x25519 + signalling)
         }
         .to_bytes()
         .unwrap()
@@ -4170,7 +4170,7 @@ mod tests {
                 destination_hash: link_id,
                 context: PacketContext::None,
             },
-            data: vec![0xCC; 20],
+            data: vec![0xCC; 20].into(),
         }
         .to_bytes()
         .unwrap()
@@ -4201,7 +4201,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::None,
             },
-            data,
+            data: data.into(),
         };
         crate::link::link_id_from_request(&pkt).unwrap()
     }

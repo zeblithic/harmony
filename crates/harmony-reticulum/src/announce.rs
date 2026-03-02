@@ -164,7 +164,7 @@ pub fn build_announce(
             destination_hash,
             context: PacketContext::None,
         },
-        data: payload,
+        data: payload.into(),
     })
 }
 
@@ -430,7 +430,9 @@ mod tests {
 
         // Tamper with the signature (at offset 84 = 64 + 10 + 10)
         let sig_offset = PUBLIC_KEY_LENGTH + hash::NAME_HASH_LENGTH + RANDOM_HASH_LENGTH;
-        packet.data[sig_offset] ^= 0x01;
+        let mut data = packet.data.to_vec();
+        data[sig_offset] ^= 0x01;
+        packet.data = data.into();
 
         let result = validate_announce(&packet);
         assert!(matches!(
@@ -472,7 +474,9 @@ mod tests {
 
         // Tamper with app_data (last bytes of payload)
         let len = packet.data.len();
-        packet.data[len - 1] ^= 0x01;
+        let mut data = packet.data.to_vec();
+        data[len - 1] ^= 0x01;
+        packet.data = data.into();
 
         let result = validate_announce(&packet);
         assert!(matches!(
@@ -500,7 +504,7 @@ mod tests {
                 destination_hash: [0; 16],
                 context: PacketContext::None,
             },
-            data: vec![0; 200],
+            data: vec![0; 200].into(),
         };
 
         let result = validate_announce(&packet);
@@ -524,7 +528,7 @@ mod tests {
                 destination_hash: [0; 16],
                 context: PacketContext::None,
             },
-            data: vec![0; 100], // Too short for announce
+            data: vec![0; 100].into(), // Too short for announce
         };
 
         let result = validate_announce(&packet);
@@ -554,7 +558,7 @@ mod tests {
                 destination_hash: [0; 16],
                 context: PacketContext::None,
             },
-            data: vec![0; 150], // Enough without ratchet (148), not enough with (180)
+            data: vec![0; 150].into(), // Enough without ratchet (148), not enough with (180)
         };
 
         let result = validate_announce(&packet);

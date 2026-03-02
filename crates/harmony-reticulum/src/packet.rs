@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use harmony_crypto::hash;
 
 use crate::context::PacketContext;
@@ -166,7 +168,7 @@ impl PacketHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
     pub header: PacketHeader,
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
 }
 
 impl Packet {
@@ -214,7 +216,7 @@ impl Packet {
 
         let context = PacketContext::from_byte(raw[header_size - 1]);
 
-        let data = raw[header_size..].to_vec();
+        let data: Arc<[u8]> = Arc::from(&raw[header_size..]);
 
         Ok(Self {
             header: PacketHeader {
@@ -388,7 +390,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::None,
             },
-            data: vec![1, 2, 3, 4, 5],
+            data: vec![1, 2, 3, 4, 5].into(),
         };
 
         let bytes = packet.to_bytes().unwrap();
@@ -423,7 +425,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::Resource,
             },
-            data: vec![0xDD; 100],
+            data: vec![0xDD; 100].into(),
         };
 
         let bytes = packet.to_bytes().unwrap();
@@ -477,7 +479,7 @@ mod tests {
                 destination_hash: [0; 16],
                 context: PacketContext::None,
             },
-            data: vec![0u8; MTU], // header(19) + MTU(500) > 500
+            data: vec![0u8; MTU].into(), // header(19) + MTU(500) > 500
         };
 
         let result = packet.to_bytes();
@@ -502,7 +504,7 @@ mod tests {
                 destination_hash: [0; 16],
                 context: PacketContext::None,
             },
-            data: vec![0u8; MTU - HEADER_1_SIZE],
+            data: vec![0u8; MTU - HEADER_1_SIZE].into(),
         };
 
         let bytes = packet.to_bytes().unwrap();
@@ -526,7 +528,7 @@ mod tests {
                 destination_hash: [0; 16],
                 context: PacketContext::None,
             },
-            data: vec![],
+            data: vec![].into(),
         };
 
         let result = packet.to_bytes();
@@ -550,7 +552,7 @@ mod tests {
                 destination_hash: [0; 16],
                 context: PacketContext::None,
             },
-            data: vec![],
+            data: vec![].into(),
         };
 
         let result = packet.to_bytes();
@@ -574,7 +576,7 @@ mod tests {
                 destination_hash: [0; 16],
                 context: PacketContext::None,
             },
-            data: vec![],
+            data: vec![].into(),
         };
 
         let bytes = packet.to_bytes().unwrap();
@@ -619,7 +621,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::None,
             },
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
         };
 
         let hp = packet.hashable_part().unwrap();
@@ -651,7 +653,7 @@ mod tests {
                 destination_hash: dest_hash,
                 context: PacketContext::None,
             },
-            data: vec![0xDD; 10],
+            data: vec![0xDD; 10].into(),
         };
 
         let hp = packet.hashable_part().unwrap();
@@ -674,7 +676,7 @@ mod tests {
                 destination_hash: [0; 16],
                 context: PacketContext::LrProof,
             },
-            data: vec![],
+            data: vec![].into(),
         };
 
         let hp = packet.hashable_part().unwrap();

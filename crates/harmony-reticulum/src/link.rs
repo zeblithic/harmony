@@ -182,7 +182,7 @@ impl Link {
                 destination_hash,
                 context: PacketContext::None,
             },
-            data,
+            data: data.into(),
         };
 
         // Compute link_id from hashable_part of the request
@@ -281,7 +281,7 @@ impl Link {
                 destination_hash: self.link_id,
                 context: PacketContext::Lrrtt,
             },
-            data: encrypted,
+            data: encrypted.into(),
         };
 
         Ok(packet)
@@ -360,7 +360,7 @@ impl Link {
                 destination_hash: link_id,
                 context: PacketContext::LrProof,
             },
-            data: proof_data,
+            data: proof_data.into(),
         };
 
         let link = Self {
@@ -459,7 +459,7 @@ impl Link {
                 destination_hash: self.link_id,
                 context: PacketContext::LinkIdentify,
             },
-            data: encrypted,
+            data: encrypted.into(),
         })
     }
 
@@ -525,7 +525,7 @@ impl Link {
                 destination_hash: self.link_id,
                 context: PacketContext::LinkClose,
             },
-            data: encrypted,
+            data: encrypted.into(),
         })
     }
 
@@ -571,7 +571,7 @@ impl Link {
                 destination_hash: self.link_id,
                 context: PacketContext::Keepalive,
             },
-            data: vec![0xFF],
+            data: vec![0xFF].into(),
         })
     }
 
@@ -809,9 +809,11 @@ mod tests {
             .unwrap();
 
         // Tamper with encrypted data
-        if let Some(byte) = identify_packet.data.last_mut() {
+        let mut data = identify_packet.data.to_vec();
+        if let Some(byte) = data.last_mut() {
             *byte ^= 0x01;
         }
+        identify_packet.data = data.into();
 
         assert!(responder.validate_identification(&identify_packet).is_err());
     }
@@ -854,7 +856,7 @@ mod tests {
                 destination_hash: initiator.link_id,
                 context: PacketContext::LinkIdentify,
             },
-            data: encrypted,
+            data: encrypted.into(),
         };
 
         assert!(matches!(
@@ -898,7 +900,7 @@ mod tests {
                 destination_hash: initiator.link_id,
                 context: PacketContext::LinkClose,
             },
-            data: encrypted,
+            data: encrypted.into(),
         };
 
         assert!(responder.receive_close(&packet).is_err());
@@ -912,7 +914,7 @@ mod tests {
 
         let keepalive = initiator.build_keepalive().unwrap();
         assert_eq!(keepalive.header.context, PacketContext::Keepalive);
-        assert_eq!(keepalive.data, vec![0xFF]);
+        assert_eq!(&*keepalive.data, &[0xFF]);
         assert_eq!(keepalive.header.destination_hash, *initiator.link_id());
     }
 
@@ -981,7 +983,7 @@ mod tests {
                 destination_hash: [0; 16],
                 context: PacketContext::None,
             },
-            data: vec![0; 30], // Too short
+            data: vec![0; 30].into(), // Too short
         };
 
         assert!(matches!(
@@ -1015,7 +1017,7 @@ mod tests {
                 destination_hash: *initiator.link_id(),
                 context: PacketContext::LrProof,
             },
-            data: vec![0; 50], // Too short
+            data: vec![0; 50].into(), // Too short
         };
 
         assert!(matches!(
@@ -1037,7 +1039,9 @@ mod tests {
             Link::respond(&responder_priv, &dest_name, &request).unwrap();
 
         // Tamper with signature in proof data
-        proof_packet.data[0] ^= 0x01;
+        let mut data = proof_packet.data.to_vec();
+        data[0] ^= 0x01;
+        proof_packet.data = data.into();
 
         assert!(matches!(
             initiator.complete_handshake(&mut OsRng, &proof_packet, 0.01),
