@@ -284,7 +284,7 @@ impl Node {
         raw: Vec<u8>,
     ) -> Vec<NodeAction> {
         if let Some(entry) = self.path_table.get(destination_hash) {
-            self.send_on_interface(&entry.interface_name.clone(), &raw)
+            self.send_on_interface(&entry.interface_name, &raw)
         } else {
             self.broadcast_on_all_interfaces(&raw)
         }
