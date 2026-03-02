@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use zenoh_keyexpr::key_expr::{keyexpr, OwnedKeyExpr};
 
 use crate::error::ZenohError;
-use crate::session::{ExprId, Session};
+use crate::session::{ExprId, Session, SessionAction};
 use crate::subscription::{SubscriptionId, SubscriptionTable};
 
 /// Opaque publisher identifier.
@@ -42,6 +42,8 @@ pub enum PubSubAction {
         key_expr: String,
         payload: Vec<u8>,
     },
+    /// Propagate a session-level action (resource declare/undeclare).
+    Session(SessionAction),
 }
 
 /// A sans-I/O pub/sub router managing publisher/subscriber declarations
@@ -113,11 +115,12 @@ impl PubSubRouter {
         key_expr: String,
         session: &mut Session,
     ) -> Result<(PublisherId, Vec<PubSubAction>), ZenohError> {
-        let (expr_id, _session_actions) = session.declare_resource(key_expr)?;
+        let (expr_id, session_actions) = session.declare_resource(key_expr)?;
         let pub_id = self.next_publisher_id;
         self.next_publisher_id += 1;
         self.publishers.insert(pub_id, expr_id);
-        Ok((pub_id, vec![]))
+        let actions = session_actions.into_iter().map(PubSubAction::Session).collect();
+        Ok((pub_id, actions))
     }
 
     /// Undeclare a previously declared publisher.
@@ -133,8 +136,9 @@ impl PubSubRouter {
             .publishers
             .remove(&pub_id)
             .ok_or(ZenohError::UnknownPublisherId(pub_id))?;
-        session.undeclare_resource(expr_id)?;
-        Ok(vec![])
+        let session_actions = session.undeclare_resource(expr_id)?;
+        let actions = session_actions.into_iter().map(PubSubAction::Session).collect();
+        Ok(actions)
     }
 
     /// Publish a message through the given publisher.
@@ -219,6 +223,10 @@ impl PubSubRouter {
         &mut self,
         key_expr: String,
     ) -> Result<Vec<PubSubAction>, ZenohError> {
+        // Remove previous interest on the same key expression to avoid orphaned entries
+        if let Some(old_sub_id) = self.remote_interest_ids.remove(&key_expr) {
+            let _ = self.remote_interest.unsubscribe(old_sub_id);
+        }
         let owned = OwnedKeyExpr::autocanonize(key_expr.clone())
             .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
         let sub_id = self.remote_interest.subscribe(&owned);
@@ -233,7 +241,9 @@ impl PubSubRouter {
         let sub_id = self
             .remote_interest_ids
             .remove(&key_expr)
-            .ok_or(ZenohError::SubscriptionNotFound(0))?;
+            .ok_or(ZenohError::InvalidKeyExpr(format!(
+                "no remote interest for '{key_expr}'"
+            )))?;
         self.remote_interest.unsubscribe(sub_id)?;
         Ok(vec![])
     }
@@ -291,7 +301,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(pub_id, 1);
-        assert!(actions.is_empty());
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], PubSubAction::Session(SessionAction::SendResourceDeclare { .. })));
         assert!(alice.resolve_local(1).is_some());
     }
 
@@ -305,7 +316,8 @@ mod tests {
             .unwrap();
 
         let actions = router.undeclare_publisher(pub_id, &mut alice).unwrap();
-        assert!(actions.is_empty());
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], PubSubAction::Session(SessionAction::SendResourceUndeclare { .. })));
         assert!(alice.resolve_local(1).is_none());
     }
 
@@ -526,6 +538,38 @@ mod tests {
             .collect();
         assert!(sub_ids.contains(&sub1));
         assert!(sub_ids.contains(&sub2));
+    }
+
+    #[test]
+    fn duplicate_remote_interest_does_not_leak() {
+        let (mut alice, _bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        let (pub_id, _) = router
+            .declare_publisher("harmony/server/srv1/channel/general/msg".into(), &mut alice)
+            .unwrap();
+
+        let ke = "harmony/server/srv1/channel/*/msg";
+
+        // Declare interest twice on the same key expression
+        router
+            .handle_event(PubSubEvent::SubscriberDeclared { key_expr: ke.into() }, &alice)
+            .unwrap();
+        router
+            .handle_event(PubSubEvent::SubscriberDeclared { key_expr: ke.into() }, &alice)
+            .unwrap();
+
+        // Should still match (second declare replaced first)
+        let actions = router.publish(pub_id, b"msg".to_vec(), &alice).unwrap();
+        assert_eq!(actions.len(), 1);
+
+        // Single undeclare should clear interest — no orphaned entry
+        router
+            .handle_event(PubSubEvent::SubscriberUndeclared { key_expr: ke.into() }, &alice)
+            .unwrap();
+
+        let actions = router.publish(pub_id, b"msg".to_vec(), &alice).unwrap();
+        assert!(actions.is_empty());
     }
 
     #[test]
