@@ -7,7 +7,10 @@
 
 use std::collections::HashMap;
 
-use crate::session::ExprId;
+use zenoh_keyexpr::key_expr::{keyexpr, OwnedKeyExpr};
+
+use crate::error::ZenohError;
+use crate::session::{ExprId, Session};
 use crate::subscription::{SubscriptionId, SubscriptionTable};
 
 /// Opaque publisher identifier.
@@ -44,7 +47,9 @@ pub enum PubSubAction {
 /// A sans-I/O pub/sub router managing publisher/subscriber declarations
 /// and message dispatch for a single peer-to-peer connection.
 pub struct PubSubRouter {
+    #[allow(dead_code)] // Used in Task 3 (subscriber declare/unsubscribe)
     subscriptions: SubscriptionTable,
+    #[allow(dead_code)] // Used in Task 3 (subscriber declare/unsubscribe)
     sub_key_exprs: HashMap<SubscriptionId, String>,
     remote_interest: SubscriptionTable,
     remote_interest_ids: HashMap<String, SubscriptionId>,
@@ -64,10 +69,240 @@ impl PubSubRouter {
             next_publisher_id: 1,
         }
     }
+
+    /// Declare a publisher on the given key expression.
+    ///
+    /// Allocates a resource on the session and stores the publisher-to-resource
+    /// mapping. Returns the new `PublisherId` and any session-level actions
+    /// (the caller must execute them).
+    pub fn declare_publisher(
+        &mut self,
+        key_expr: String,
+        session: &mut Session,
+    ) -> Result<(PublisherId, Vec<PubSubAction>), ZenohError> {
+        let (expr_id, _session_actions) = session.declare_resource(key_expr)?;
+        let pub_id = self.next_publisher_id;
+        self.next_publisher_id += 1;
+        self.publishers.insert(pub_id, expr_id);
+        Ok((pub_id, vec![]))
+    }
+
+    /// Undeclare a previously declared publisher.
+    ///
+    /// Removes the publisher from the router and undeclares its resource
+    /// on the session.
+    pub fn undeclare_publisher(
+        &mut self,
+        pub_id: PublisherId,
+        session: &mut Session,
+    ) -> Result<Vec<PubSubAction>, ZenohError> {
+        let expr_id = self
+            .publishers
+            .remove(&pub_id)
+            .ok_or(ZenohError::UnknownPublisherId(pub_id))?;
+        session.undeclare_resource(expr_id)?;
+        Ok(vec![])
+    }
+
+    /// Publish a message through the given publisher.
+    ///
+    /// Resolves the publisher's key expression and checks the remote interest
+    /// table. If no remote subscriber is interested, returns an empty action
+    /// list (write-side filtering). Otherwise emits a `SendMessage`.
+    pub fn publish(
+        &self,
+        pub_id: PublisherId,
+        payload: Vec<u8>,
+        session: &Session,
+    ) -> Result<Vec<PubSubAction>, ZenohError> {
+        let expr_id = self
+            .publishers
+            .get(&pub_id)
+            .copied()
+            .ok_or(ZenohError::UnknownPublisherId(pub_id))?;
+
+        let key_expr_str = session
+            .resolve_local(expr_id)
+            .ok_or(ZenohError::UnknownExprId(expr_id))?;
+
+        let ke = keyexpr::new(key_expr_str)
+            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+
+        let matches = self.remote_interest.matches(ke);
+        if matches.is_empty() {
+            return Ok(vec![]);
+        }
+
+        Ok(vec![PubSubAction::SendMessage { expr_id, payload }])
+    }
+
+    /// Process an inbound pub/sub event and return actions for the caller.
+    pub fn handle_event(
+        &mut self,
+        event: PubSubEvent,
+        _session: &Session,
+    ) -> Result<Vec<PubSubAction>, ZenohError> {
+        match event {
+            PubSubEvent::SubscriberDeclared { key_expr } => {
+                self.handle_subscriber_declared(key_expr)
+            }
+            PubSubEvent::SubscriberUndeclared { key_expr } => {
+                self.handle_subscriber_undeclared(key_expr)
+            }
+            PubSubEvent::MessageReceived { .. } => Ok(vec![]),
+        }
+    }
+
+    fn handle_subscriber_declared(
+        &mut self,
+        key_expr: String,
+    ) -> Result<Vec<PubSubAction>, ZenohError> {
+        let owned = OwnedKeyExpr::autocanonize(key_expr.clone())
+            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let sub_id = self.remote_interest.subscribe(&owned);
+        self.remote_interest_ids.insert(key_expr, sub_id);
+        Ok(vec![])
+    }
+
+    fn handle_subscriber_undeclared(
+        &mut self,
+        key_expr: String,
+    ) -> Result<Vec<PubSubAction>, ZenohError> {
+        let sub_id = self
+            .remote_interest_ids
+            .remove(&key_expr)
+            .ok_or(ZenohError::SubscriptionNotFound(0))?;
+        self.remote_interest.unsubscribe(sub_id)?;
+        Ok(vec![])
+    }
 }
 
 impl Default for PubSubRouter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{Session, SessionAction, SessionConfig, SessionEvent, SessionState};
+    use harmony_identity::PrivateIdentity;
+    use rand::rngs::OsRng;
+
+    fn active_session_pair() -> (Session, Session) {
+        let mut rng = OsRng;
+        let alice_id = PrivateIdentity::generate(&mut rng);
+        let bob_id = PrivateIdentity::generate(&mut rng);
+        let alice_pub = alice_id.public_identity().clone();
+        let bob_pub = bob_id.public_identity().clone();
+        let (mut alice, alice_actions) =
+            Session::new(alice_id, bob_pub, SessionConfig::default(), 0);
+        let (mut bob, bob_actions) = Session::new(bob_id, alice_pub, SessionConfig::default(), 0);
+        let alice_proof = match &alice_actions[0] {
+            SessionAction::SendHandshake { proof } => proof.clone(),
+            _ => panic!("expected SendHandshake"),
+        };
+        let bob_proof = match &bob_actions[0] {
+            SessionAction::SendHandshake { proof } => proof.clone(),
+            _ => panic!("expected SendHandshake"),
+        };
+        bob.handle_event(SessionEvent::HandshakeReceived {
+            proof: alice_proof,
+        })
+        .unwrap();
+        alice
+            .handle_event(SessionEvent::HandshakeReceived { proof: bob_proof })
+            .unwrap();
+        assert_eq!(alice.state(), SessionState::Active);
+        assert_eq!(bob.state(), SessionState::Active);
+        (alice, bob)
+    }
+
+    #[test]
+    fn declare_publisher_returns_id_and_declares_resource() {
+        let (mut alice, _bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        let (pub_id, actions) = router
+            .declare_publisher("harmony/server/srv1/channel/general/msg".into(), &mut alice)
+            .unwrap();
+
+        assert_eq!(pub_id, 1);
+        assert!(actions.is_empty());
+        assert!(alice.resolve_local(1).is_some());
+    }
+
+    #[test]
+    fn undeclare_publisher_removes_resource() {
+        let (mut alice, _bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        let (pub_id, _) = router
+            .declare_publisher("harmony/server/srv1/channel/general/msg".into(), &mut alice)
+            .unwrap();
+
+        let actions = router.undeclare_publisher(pub_id, &mut alice).unwrap();
+        assert!(actions.is_empty());
+        assert!(alice.resolve_local(1).is_none());
+    }
+
+    #[test]
+    fn publish_with_remote_interest_emits_send_message() {
+        let (mut alice, _bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        let (pub_id, _) = router
+            .declare_publisher("harmony/server/srv1/channel/general/msg".into(), &mut alice)
+            .unwrap();
+
+        // Simulate remote subscriber declaring interest with wildcard
+        router
+            .handle_event(
+                PubSubEvent::SubscriberDeclared {
+                    key_expr: "harmony/server/srv1/channel/*/msg".into(),
+                },
+                &alice,
+            )
+            .unwrap();
+
+        let actions = router
+            .publish(pub_id, b"hello".to_vec(), &alice)
+            .unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0],
+            PubSubAction::SendMessage {
+                expr_id: 1,
+                payload: b"hello".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn publish_without_remote_interest_emits_nothing() {
+        let (mut alice, _bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        let (pub_id, _) = router
+            .declare_publisher("harmony/server/srv1/channel/general/msg".into(), &mut alice)
+            .unwrap();
+
+        // No subscriber declared — should emit nothing
+        let actions = router
+            .publish(pub_id, b"hello".to_vec(), &alice)
+            .unwrap();
+
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn publish_unknown_publisher_fails() {
+        let (alice, _bob) = active_session_pair();
+        let router = PubSubRouter::new();
+
+        let result = router.publish(999, b"hello".to_vec(), &alice);
+        assert!(matches!(result, Err(ZenohError::UnknownPublisherId(999))));
     }
 }
