@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use harmony_crypto::hash;
 use harmony_identity::identity::PrivateIdentity;
@@ -15,7 +16,7 @@ use crate::packet::{
     DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
 };
 use crate::packet_hashlist::PacketHashlist;
-use crate::path_table::{DestinationHash, PathEntry, PathTable, PathUpdateResult};
+use crate::path_table::{DestinationHash, PathTable, PathUpdateResult};
 
 // ── Constants (transport-mode announce propagation) ──────────────────────
 
@@ -107,7 +108,7 @@ struct AnnounceTableEntry {
     retransmit_at: u64,
     retries: u8,
     local_rebroadcasts: u8,
-    source_interface: String,
+    source_interface: Arc<str>,
     hops: u8,
     destination_hash: DestinationHash,
     packet_data: Vec<u8>,
@@ -117,10 +118,10 @@ struct AnnounceTableEntry {
 /// it arrived on. Used for routing proofs back along the original data path.
 struct ReverseTableEntry {
     /// Interface the data packet was received on (proof goes back here).
-    received_interface: String,
+    received_interface: Arc<str>,
     /// Interface the data packet was forwarded to.
     #[allow(dead_code)] // Retained for diagnostics; used by link table routing (b83.6)
-    outbound_interface: String,
+    outbound_interface: Arc<str>,
     /// Monotonic timestamp when this entry was created.
     timestamp: u64,
 }
@@ -133,11 +134,11 @@ struct LinkTableEntry {
     /// Next transport toward the destination (from path table).
     next_hop: DestinationHash,
     /// Interface to forward toward the destination.
-    outbound_interface: String,
+    outbound_interface: Arc<str>,
     /// Hops from us to destination (from path table).
     remaining_hops: u8,
     /// Interface the link request arrived on.
-    received_interface: String,
+    received_interface: Arc<str>,
     /// Packet hops at time of receipt (post-increment).
     taken_hops: u8,
     /// Original destination of the link request.
@@ -218,21 +219,21 @@ pub enum NodeAction {
         destination_hash: DestinationHash,
         validated_announce: Box<ValidatedAnnounce>,
         path_update: PathUpdateResult,
-        interface_name: String,
+        interface_name: Arc<str>,
         hops: u8,
     },
     /// A packet should be delivered to a locally registered destination.
     DeliverLocally {
         destination_hash: DestinationHash,
         packet: Packet,
-        interface_name: String,
+        interface_name: Arc<str>,
     },
     /// Expired paths were removed from the path table.
     PathsExpired { count: usize },
     /// A packet was dropped for the given reason.
     PacketDropped {
         reason: DropReason,
-        interface_name: String,
+        interface_name: Arc<str>,
     },
     /// A destination's scheduled announce is due. Caller should call node.announce().
     AnnounceNeeded {
@@ -240,7 +241,7 @@ pub enum NodeAction {
     },
     /// Send raw bytes on the named interface (outbound).
     SendOnInterface {
-        interface_name: String,
+        interface_name: Arc<str>,
         raw: Vec<u8>,
     },
     /// Transport node rebroadcast an announce on interfaces (excluding source).
@@ -252,12 +253,12 @@ pub enum NodeAction {
     PacketRelayed {
         destination_hash: DestinationHash,
         next_hop: DestinationHash,
-        interface_name: String,
+        interface_name: Arc<str>,
     },
     /// Transport node routed a proof back toward the packet originator.
     ProofRelayed {
         proof_destination: DestinationHash,
-        interface_name: String,
+        interface_name: Arc<str>,
     },
     /// Reverse table entries expired during timer tick.
     ReverseTableExpired { count: usize },
@@ -266,17 +267,17 @@ pub enum NodeAction {
         link_id: DestinationHash,
         destination_hash: DestinationHash,
         next_hop: DestinationHash,
-        interface_name: String,
+        interface_name: Arc<str>,
     },
     /// Transport node routed a link proof back toward the initiator.
     LinkProofRouted {
         link_id: DestinationHash,
-        interface_name: String,
+        interface_name: Arc<str>,
     },
     /// Transport node routed a link data packet.
     LinkDataRouted {
         link_id: DestinationHash,
-        interface_name: String,
+        interface_name: Arc<str>,
     },
     /// Link table entries expired during timer tick.
     LinkTableExpired { count: usize },
@@ -294,7 +295,7 @@ pub enum NodeAction {
 pub struct Node {
     path_table: PathTable,
     packet_hashlist: PacketHashlist,
-    interfaces: HashMap<String, InterfaceConfig>,
+    interfaces: HashMap<Arc<str>, InterfaceConfig>,
     local_destinations: HashSet<DestinationHash>,
     announcing_destinations: HashMap<DestinationHash, AnnouncingDestination>,
     transport_identity: Option<PrivateIdentity>,
@@ -385,7 +386,7 @@ impl Node {
         ifac: Option<IfacAuthenticator>,
     ) {
         self.interfaces.insert(
-            name,
+            Arc::from(name),
             InterfaceConfig {
                 mode,
                 ifac,
@@ -465,7 +466,7 @@ impl Node {
                 None => {
                     return vec![NodeAction::PacketDropped {
                         reason: DropReason::UnknownDestination,
-                        interface_name: String::new(),
+                        interface_name: Arc::from(""),
                     }];
                 }
             };
@@ -481,7 +482,7 @@ impl Node {
                 Err(_) => {
                     return vec![NodeAction::PacketDropped {
                         reason: DropReason::AnnounceBuildFailed,
-                        interface_name: String::new(),
+                        interface_name: Arc::from(""),
                     }];
                 }
             };
@@ -490,7 +491,7 @@ impl Node {
                 Err(_) => {
                     return vec![NodeAction::PacketDropped {
                         reason: DropReason::OutboundSerializeFailed,
-                        interface_name: String::new(),
+                        interface_name: Arc::from(""),
                     }];
                 }
             }
@@ -607,13 +608,13 @@ impl Node {
     // ── Private helpers (outbound) ─────────────────────────────────────
 
     /// IFAC-mask (if configured) and emit `SendOnInterface` for one interface.
-    fn send_on_interface(&self, interface_name: &str, raw: &[u8]) -> Vec<NodeAction> {
-        let iface = match self.interfaces.get(interface_name) {
+    fn send_on_interface(&self, interface_name: &Arc<str>, raw: &[u8]) -> Vec<NodeAction> {
+        let iface = match self.interfaces.get(&**interface_name) {
             Some(c) => c,
             None => {
                 return vec![NodeAction::PacketDropped {
                     reason: DropReason::UnknownInterface,
-                    interface_name: interface_name.to_owned(),
+                    interface_name: Arc::clone(interface_name),
                 }];
             }
         };
@@ -623,7 +624,7 @@ impl Node {
                 Err(_) => {
                     return vec![NodeAction::PacketDropped {
                         reason: DropReason::OutboundIfacFailed,
-                        interface_name: interface_name.to_owned(),
+                        interface_name: Arc::clone(interface_name),
                     }];
                 }
             }
@@ -631,7 +632,7 @@ impl Node {
             raw.to_vec()
         };
         vec![NodeAction::SendOnInterface {
-            interface_name: interface_name.to_owned(),
+            interface_name: Arc::clone(interface_name),
             raw: outbound,
         }]
     }
@@ -649,7 +650,7 @@ impl Node {
     fn broadcast_except(&self, exclude: &str, raw: &[u8]) -> Vec<NodeAction> {
         let mut actions = Vec::with_capacity(self.interfaces.len());
         for name in self.interfaces.keys() {
-            if name != exclude {
+            if &**name != exclude {
                 actions.extend(self.send_on_interface(name, raw));
             }
         }
@@ -747,7 +748,8 @@ impl Node {
 
         // First pass: collect completed and due entries
         let mut completed = Vec::new();
-        let mut due: Vec<(DestinationHash, Option<Vec<u8>>, String, u8)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut due: Vec<(DestinationHash, Option<Vec<u8>>, Arc<str>, u8)> = Vec::new();
 
         for (dest, entry) in &self.announce_table {
             // Completed: exceeded max retries, or retries>0 with enough rebroadcasts
@@ -831,16 +833,18 @@ impl Node {
         // 1. Interface lookup + 2. IFAC handling
         // Confined to a block so the immutable borrow of self.interfaces
         // is dropped before we mutate self.packet_hashlist / self.path_table.
-        let (processed_raw, interface_mode) = {
-            let iface_config = match self.interfaces.get(&interface_name) {
-                Some(config) => config,
-                None => {
-                    return vec![NodeAction::PacketDropped {
-                        reason: DropReason::UnknownInterface,
-                        interface_name,
-                    }];
-                }
-            };
+        // Also recovers the interned Arc<str> from the HashMap key.
+        let (interface_name, processed_raw, interface_mode) = {
+            let (arc_name, iface_config) =
+                match self.interfaces.get_key_value(interface_name.as_str()) {
+                    Some((k, v)) => (Arc::clone(k), v),
+                    None => {
+                        return vec![NodeAction::PacketDropped {
+                            reason: DropReason::UnknownInterface,
+                            interface_name: Arc::from(interface_name),
+                        }];
+                    }
+                };
 
             let has_ifac_flag = raw.first().is_some_and(|&b| b & 0x80 != 0);
 
@@ -851,7 +855,7 @@ impl Node {
                         Err(_) => {
                             return vec![NodeAction::PacketDropped {
                                 reason: DropReason::IfacFailed,
-                                interface_name,
+                                interface_name: arc_name,
                             }];
                         }
                     }
@@ -859,14 +863,15 @@ impl Node {
                 (true, false) | (false, true) => {
                     return vec![NodeAction::PacketDropped {
                         reason: DropReason::IfacMismatch,
-                        interface_name,
+                        interface_name: arc_name,
                     }];
                 }
                 (false, false) => raw,
             };
 
-            (processed, iface_config.mode)
+            (arc_name, processed, iface_config.mode)
         };
+        // From here, interface_name is Arc<str> (shadows the original String).
 
         // 3. Parse
         let mut packet = match Packet::from_bytes(&processed_raw) {
@@ -938,7 +943,7 @@ impl Node {
         &mut self,
         packet: Packet,
         full_packet_hash: &[u8; 32],
-        interface_name: String,
+        interface_name: Arc<str>,
         interface_mode: InterfaceMode,
         now: u64,
     ) -> Vec<NodeAction> {
@@ -1046,7 +1051,7 @@ impl Node {
     fn process_data_packet(
         &mut self,
         packet: Packet,
-        interface_name: String,
+        interface_name: Arc<str>,
         now: u64,
     ) -> Vec<NodeAction> {
         let destination_hash = packet.header.destination_hash;
@@ -1102,9 +1107,9 @@ impl Node {
             return self.route_link_data(packet, interface_name, now);
         }
 
-        // 8. Look up destination in path table
-        let path_entry = match self.path_table.get(&destination_hash) {
-            Some(entry) => entry.clone(),
+        // 8. Look up destination in path table — extract only what relay needs
+        let (next_hop, path_iface) = match self.path_table.get(&destination_hash) {
+            Some(entry) => (entry.next_hop, Arc::clone(&entry.interface_name)),
             None => {
                 return vec![NodeAction::PacketDropped {
                     reason: DropReason::NoRouteForTransport,
@@ -1121,15 +1126,15 @@ impl Node {
         );
 
         // 10. Relay the packet
-        let actions = self.relay_packet(packet, &path_entry, &interface_name);
+        let actions = self.relay_packet(packet, next_hop, &path_iface);
 
         // 11. Only store reverse table entry if relay succeeded
         if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
             self.reverse_table.insert(
                 reverse_key,
                 ReverseTableEntry {
-                    received_interface: interface_name.clone(),
-                    outbound_interface: path_entry.interface_name.clone(),
+                    received_interface: interface_name,
+                    outbound_interface: Arc::clone(&path_iface),
                     timestamp: now,
                 },
             );
@@ -1138,18 +1143,18 @@ impl Node {
         actions
     }
 
-    /// Relay a data packet to the next hop based on path table entry.
+    /// Relay a data packet to the next hop.
     ///
     /// Final hop (next_hop == destination): convert Type2→Type1, Broadcast propagation.
     /// Intermediate hop: keep Type2, replace transport_id with next transport.
     fn relay_packet(
         &self,
         packet: Packet,
-        path_entry: &PathEntry,
-        _source_interface: &str,
+        next_hop: DestinationHash,
+        out_iface: &Arc<str>,
     ) -> Vec<NodeAction> {
         let destination_hash = packet.header.destination_hash;
-        let is_final_hop = path_entry.next_hop == destination_hash;
+        let is_final_hop = next_hop == destination_hash;
 
         // Hops were already incremented in the inbound pipeline (process_incoming),
         // so we forward with the current value — matching Python Reticulum behavior.
@@ -1175,7 +1180,7 @@ impl Node {
                 header: PacketHeader {
                     flags: packet.header.flags,
                     hops: packet.header.hops,
-                    transport_id: Some(path_entry.next_hop),
+                    transport_id: Some(next_hop),
                     destination_hash,
                     context: packet.header.context,
                 },
@@ -1185,12 +1190,12 @@ impl Node {
 
         match forwarded.to_bytes() {
             Ok(raw) => {
-                let mut actions = self.send_on_interface(&path_entry.interface_name, &raw);
+                let mut actions = self.send_on_interface(out_iface, &raw);
                 if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
                     actions.push(NodeAction::PacketRelayed {
                         destination_hash,
-                        next_hop: path_entry.next_hop,
-                        interface_name: path_entry.interface_name.clone(),
+                        next_hop,
+                        interface_name: Arc::clone(out_iface),
                     });
                 }
                 actions
@@ -1198,7 +1203,7 @@ impl Node {
             Err(_) => {
                 vec![NodeAction::PacketDropped {
                     reason: DropReason::RelaySerializeFailed,
-                    interface_name: path_entry.interface_name.clone(),
+                    interface_name: Arc::clone(out_iface),
                 }]
             }
         }
@@ -1208,14 +1213,18 @@ impl Node {
     fn forward_link_request(
         &mut self,
         packet: Packet,
-        interface_name: String,
+        interface_name: Arc<str>,
         now: u64,
     ) -> Vec<NodeAction> {
         let destination_hash = packet.header.destination_hash;
 
-        // Look up destination in path table
-        let path_entry = match self.path_table.get(&destination_hash) {
-            Some(entry) => entry.clone(),
+        // Look up destination in path table — extract only needed fields
+        let (next_hop, path_iface, path_hops) = match self.path_table.get(&destination_hash) {
+            Some(entry) => (
+                entry.next_hop,
+                Arc::clone(&entry.interface_name),
+                entry.hops,
+            ),
             None => {
                 return vec![NodeAction::PacketDropped {
                     reason: DropReason::NoRouteForLinkRequest,
@@ -1236,11 +1245,10 @@ impl Node {
         };
 
         let taken_hops = packet.header.hops;
-        let proof_timeout =
-            now + ESTABLISHMENT_TIMEOUT_PER_HOP * (path_entry.hops as u64).max(1);
+        let proof_timeout = now + ESTABLISHMENT_TIMEOUT_PER_HOP * (path_hops as u64).max(1);
 
         // Forward via relay_packet (same Type2→Type1/Type2 conversion as data relay)
-        let actions = self.relay_packet(packet, &path_entry, &interface_name);
+        let actions = self.relay_packet(packet, next_hop, &path_iface);
 
         // Only create link table entry if relay succeeded
         if !actions
@@ -1251,10 +1259,10 @@ impl Node {
                 link_id,
                 LinkTableEntry {
                     timestamp: now,
-                    next_hop: path_entry.next_hop,
-                    outbound_interface: path_entry.interface_name.clone(),
-                    remaining_hops: path_entry.hops,
-                    received_interface: interface_name.clone(),
+                    next_hop,
+                    outbound_interface: Arc::clone(&path_iface),
+                    remaining_hops: path_hops,
+                    received_interface: interface_name,
                     taken_hops,
                     destination_hash,
                     validated: false,
@@ -1266,8 +1274,8 @@ impl Node {
             result.push(NodeAction::LinkRequestForwarded {
                 link_id,
                 destination_hash,
-                next_hop: path_entry.next_hop,
-                interface_name: path_entry.interface_name.clone(),
+                next_hop,
+                interface_name: path_iface,
             });
             result
         } else {
@@ -1279,7 +1287,7 @@ impl Node {
     fn route_link_proof(
         &mut self,
         packet: &Packet,
-        interface_name: &str,
+        interface_name: &Arc<str>,
         now: u64,
     ) -> Vec<NodeAction> {
         let link_id = packet.header.destination_hash;
@@ -1289,7 +1297,7 @@ impl Node {
             None => {
                 return vec![NodeAction::PacketDropped {
                     reason: DropReason::LinkProofNoEntry,
-                    interface_name: interface_name.to_owned(),
+                    interface_name: Arc::clone(interface_name),
                 }];
             }
         };
@@ -1298,22 +1306,22 @@ impl Node {
         if packet.header.hops != entry.remaining_hops {
             return vec![NodeAction::PacketDropped {
                 reason: DropReason::LinkProofHopsMismatch,
-                interface_name: interface_name.to_owned(),
+                interface_name: Arc::clone(interface_name),
             }];
         }
 
         // Validate proof arrived on the outbound interface (from destination side)
-        if interface_name != entry.outbound_interface {
+        if **interface_name != *entry.outbound_interface {
             return vec![NodeAction::PacketDropped {
                 reason: DropReason::LinkProofWrongInterface,
-                interface_name: interface_name.to_owned(),
+                interface_name: Arc::clone(interface_name),
             }];
         }
 
         // Mark entry as validated and update timestamp
         entry.validated = true;
         entry.timestamp = now;
-        let target_interface = entry.received_interface.clone();
+        let target_interface = Arc::clone(&entry.received_interface);
 
         // Construct Type1/Broadcast proof packet for the initiator side
         let forwarded = Packet {
@@ -1364,7 +1372,7 @@ impl Node {
     fn route_link_data(
         &mut self,
         packet: Packet,
-        interface_name: String,
+        interface_name: Arc<str>,
         now: u64,
     ) -> Vec<NodeAction> {
         let link_id = packet.header.destination_hash;
@@ -1378,22 +1386,22 @@ impl Node {
             if entry.outbound_interface == entry.received_interface {
                 // Same-interface case: use hops to distinguish direction
                 if packet.header.hops == entry.taken_hops {
-                    (Some(entry.outbound_interface.clone()), true)
+                    (Some(Arc::clone(&entry.outbound_interface)), true)
                 } else if packet.header.hops == entry.remaining_hops {
-                    (Some(entry.outbound_interface.clone()), false)
+                    (Some(Arc::clone(&entry.outbound_interface)), false)
                 } else {
                     (None, false)
                 }
-            } else if interface_name == entry.outbound_interface
+            } else if *interface_name == *entry.outbound_interface
                 && packet.header.hops == entry.remaining_hops
             {
                 // From destination side → forward to initiator
-                (Some(entry.received_interface.clone()), false)
-            } else if interface_name == entry.received_interface
+                (Some(Arc::clone(&entry.received_interface)), false)
+            } else if *interface_name == *entry.received_interface
                 && packet.header.hops == entry.taken_hops
             {
                 // From initiator side → forward to destination
-                (Some(entry.outbound_interface.clone()), true)
+                (Some(Arc::clone(&entry.outbound_interface)), true)
             } else {
                 (None, false)
             }
@@ -1492,7 +1500,7 @@ impl Node {
     }
 
     /// Route a proof packet back toward the originator via the reverse table.
-    fn route_proof(&self, packet: &Packet, _interface_name: &str) -> Vec<NodeAction> {
+    fn route_proof(&self, packet: &Packet, interface_name: &Arc<str>) -> Vec<NodeAction> {
         let proof_dest = packet.header.destination_hash;
 
         let entry = match self.reverse_table.get(&proof_dest) {
@@ -1500,7 +1508,7 @@ impl Node {
             None => {
                 return vec![NodeAction::PacketDropped {
                     reason: DropReason::ProofNoReverseEntry,
-                    interface_name: _interface_name.to_owned(),
+                    interface_name: Arc::clone(interface_name),
                 }];
             }
         };
@@ -1555,6 +1563,7 @@ mod tests {
     use crate::context::PacketContext;
     use crate::destination::DestinationName;
     use crate::packet::{HeaderType, PacketFlags, PacketHeader, PropagationType};
+    use crate::path_table::PathEntry;
     use harmony_identity::identity::PrivateIdentity;
     use rand::rngs::OsRng;
 
@@ -1701,7 +1710,7 @@ mod tests {
                 interface_name,
             } => {
                 assert_eq!(*reason, DropReason::UnknownInterface);
-                assert_eq!(interface_name, "eth99");
+                assert_eq!(&**interface_name, "eth99");
             }
             _ => panic!("expected PacketDropped"),
         }
@@ -1994,7 +2003,7 @@ mod tests {
             } => {
                 assert_eq!(*dh, dest_hash);
                 assert_eq!(*path_update, PathUpdateResult::Inserted);
-                assert_eq!(interface_name, "eth0");
+                assert_eq!(&**interface_name, "eth0");
                 assert_eq!(*hops, 1); // incremented from 0
             }
             _ => panic!("expected AnnounceReceived"),
@@ -2003,7 +2012,7 @@ mod tests {
         // Verify path table
         let entry = node.path_table().get(&dest_hash).unwrap();
         assert_eq!(entry.hops, 1);
-        assert_eq!(entry.interface_name, "eth0");
+        assert_eq!(&*entry.interface_name, "eth0");
         assert_eq!(entry.next_hop, dest_hash); // leaf mode: next_hop = dest
     }
 
@@ -2074,7 +2083,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*destination_hash, dh);
-                assert_eq!(interface_name, "eth0");
+                assert_eq!(&**interface_name, "eth0");
             }
             _ => panic!("expected DeliverLocally"),
         }
@@ -2258,7 +2267,7 @@ mod tests {
         let mut iface_names: Vec<&str> = actions
             .iter()
             .map(|a| match a {
-                NodeAction::SendOnInterface { interface_name, .. } => interface_name.as_str(),
+                NodeAction::SendOnInterface { interface_name, .. } => &**interface_name,
                 _ => panic!("expected SendOnInterface"),
             })
             .collect();
@@ -2315,7 +2324,7 @@ mod tests {
                     interface_name,
                     raw,
                 } => {
-                    if interface_name == "eth0" {
+                    if &**interface_name == "eth0" {
                         // IFAC interface → flag set
                         assert_ne!(raw[0] & 0x80, 0);
                     } else {
@@ -2407,7 +2416,7 @@ mod tests {
                 interface_name,
                 raw,
             } => {
-                assert_eq!(interface_name, "eth0");
+                assert_eq!(&**interface_name, "eth0");
                 assert_eq!(*raw, data);
             }
             _ => panic!("expected SendOnInterface"),
@@ -2427,7 +2436,7 @@ mod tests {
         let mut iface_names: Vec<&str> = actions
             .iter()
             .map(|a| match a {
-                NodeAction::SendOnInterface { interface_name, .. } => interface_name.as_str(),
+                NodeAction::SendOnInterface { interface_name, .. } => &**interface_name,
                 _ => panic!("expected SendOnInterface"),
             })
             .collect();
@@ -2471,7 +2480,7 @@ mod tests {
                     interface_name,
                     raw,
                 } => {
-                    if interface_name == "eth0" {
+                    if &**interface_name == "eth0" {
                         assert_ne!(raw[0] & 0x80, 0, "eth0 should have IFAC");
                     } else {
                         assert_eq!(raw[0] & 0x80, 0, "wlan0 should not have IFAC");
@@ -2503,7 +2512,7 @@ mod tests {
         match &actions[0] {
             NodeAction::PacketDropped { reason, interface_name } => {
                 assert_eq!(*reason, DropReason::UnknownInterface);
-                assert_eq!(interface_name, "eth0");
+                assert_eq!(&**interface_name, "eth0");
             }
             _ => panic!("expected PacketDropped for stale interface"),
         }
@@ -2673,7 +2682,7 @@ mod tests {
             .iter()
             .filter_map(|a| match a {
                 NodeAction::SendOnInterface { interface_name, raw } => {
-                    Some((interface_name.as_str(), raw.clone()))
+                    Some((&**interface_name, raw.clone()))
                 }
                 _ => None,
             })
@@ -2717,7 +2726,7 @@ mod tests {
             .iter()
             .filter_map(|a| match a {
                 NodeAction::SendOnInterface { interface_name, .. } => {
-                    Some(interface_name.as_str())
+                    Some(&**interface_name)
                 }
                 _ => None,
             })
@@ -3749,8 +3758,8 @@ mod tests {
 
         let key = reverse_key_for(th, remote);
         let entry = node.reverse_table.get(&key).expect("reverse entry should exist");
-        assert_eq!(entry.received_interface, "eth0");
-        assert_eq!(entry.outbound_interface, "wlan0"); // path entry points to wlan0
+        assert_eq!(&*entry.received_interface, "eth0");
+        assert_eq!(&*entry.outbound_interface, "wlan0"); // path entry points to wlan0
     }
 
     #[test]
@@ -3847,7 +3856,7 @@ mod tests {
 
         // Should be sent on "eth0" (the received_interface of the reverse entry)
         let send = actions.iter().find_map(|a| match a {
-            NodeAction::SendOnInterface { interface_name, .. } => Some(interface_name.as_str()),
+            NodeAction::SendOnInterface { interface_name, .. } => Some(&**interface_name),
             _ => None,
         });
         assert_eq!(send, Some("eth0"), "proof should go back on received interface");
@@ -3949,7 +3958,8 @@ mod tests {
             data: vec![0u8; 470],
         };
         let path_entry = node.path_table().get(&remote).unwrap().clone();
-        let actions = node.relay_packet(oversized_pkt, &path_entry, "eth0");
+        let eth0: Arc<str> = Arc::from("eth0");
+        let actions = node.relay_packet(oversized_pkt, path_entry.next_hop, &eth0);
 
         let dropped = actions.iter().find_map(|a| match a {
             NodeAction::PacketDropped { reason, .. } => Some(reason),
@@ -3991,7 +4001,7 @@ mod tests {
             announce_timestamp: 1000,
             random_blobs: vec![],
         };
-        let actions = node.relay_packet(pkt, &bad_entry, "eth0");
+        let actions = node.relay_packet(pkt, bad_entry.next_hop, &bad_entry.interface_name);
 
         // Should get PacketDropped but NOT PacketRelayed
         assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
@@ -4030,7 +4040,8 @@ mod tests {
             },
             data: vec![0xCC; 10],
         };
-        let actions = node.route_proof(&proof_pkt, "eth0");
+        let eth0: Arc<str> = Arc::from("eth0");
+        let actions = node.route_proof(&proof_pkt, &eth0);
 
         // Should get PacketDropped but NOT ProofRelayed
         assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
@@ -4247,8 +4258,8 @@ mod tests {
 
         let link_id = link_id_for_request(th, remote, 0);
         let entry = node.link_table.get(&link_id).expect("entry should exist");
-        assert_eq!(entry.outbound_interface, "wlan0");
-        assert_eq!(entry.received_interface, "eth0");
+        assert_eq!(&*entry.outbound_interface, "wlan0");
+        assert_eq!(&*entry.received_interface, "eth0");
         assert_eq!(entry.remaining_hops, 3);
         assert_eq!(entry.taken_hops, 1); // hops 0 on wire, pipeline increments to 1
         assert!(!entry.validated);
@@ -4328,7 +4339,7 @@ mod tests {
 
         // Should be sent on "eth0" (the received_interface)
         let send = actions.iter().find_map(|a| match a {
-            NodeAction::SendOnInterface { interface_name, .. } => Some(interface_name.as_str()),
+            NodeAction::SendOnInterface { interface_name, .. } => Some(&**interface_name),
             _ => None,
         });
         assert_eq!(send, Some("eth0"), "proof should route back on received interface");
@@ -4484,7 +4495,7 @@ mod tests {
             NodeAction::SendOnInterface {
                 interface_name,
                 raw,
-            } => Some((interface_name.as_str(), raw.clone())),
+            } => Some((&**interface_name, raw.clone())),
             _ => None,
         });
         let (iface, raw) = send_action.unwrap();
@@ -4534,7 +4545,7 @@ mod tests {
             NodeAction::SendOnInterface {
                 interface_name,
                 raw,
-            } => Some((interface_name.as_str(), raw.clone())),
+            } => Some((&**interface_name, raw.clone())),
             _ => None,
         });
         let (iface, raw) = send_action.unwrap();
