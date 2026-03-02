@@ -2,8 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use harmony_crypto::hash;
+use harmony_identity::identity::PrivateIdentity;
+use rand_core::CryptoRngCore;
 
-use crate::announce::{validate_announce, ValidatedAnnounce};
+use crate::announce::{build_announce, validate_announce, ValidatedAnnounce};
+use crate::destination::DestinationName;
 use crate::ifac::IfacAuthenticator;
 use crate::interface::InterfaceMode;
 use crate::packet::{DestinationType, Packet, PacketType};
@@ -23,6 +26,26 @@ impl fmt::Debug for InterfaceConfig {
         f.debug_struct("InterfaceConfig")
             .field("mode", &self.mode)
             .field("ifac", &self.ifac.is_some())
+            .finish()
+    }
+}
+
+/// A locally owned destination that can generate announces.
+struct AnnouncingDestination {
+    identity: PrivateIdentity,
+    name: DestinationName,
+    app_data: Vec<u8>,
+    announce_interval: Option<u64>,
+    next_announce_at: u64,
+}
+
+impl fmt::Debug for AnnouncingDestination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnnouncingDestination")
+            .field("name", &self.name)
+            .field("app_data_len", &self.app_data.len())
+            .field("announce_interval", &self.announce_interval)
+            .field("next_announce_at", &self.next_announce_at)
             .finish()
     }
 }
@@ -61,6 +84,14 @@ pub enum DropReason {
     InvalidAnnounceDestType,
     /// No local destination registered for this packet.
     NoLocalDestination,
+    /// announce() called for an unregistered destination.
+    UnknownDestination,
+    /// build_announce() returned an error.
+    AnnounceBuildFailed,
+    /// packet.to_bytes() failed on outbound.
+    OutboundSerializeFailed,
+    /// IFAC mask() failed on outbound.
+    OutboundIfacFailed,
 }
 
 /// Output actions for the caller.
@@ -87,6 +118,15 @@ pub enum NodeAction {
         reason: DropReason,
         interface_name: String,
     },
+    /// A destination's scheduled announce is due. Caller should call node.announce().
+    AnnounceNeeded {
+        dest_hash: DestinationHash,
+    },
+    /// Send raw bytes on the named interface (outbound).
+    SendOnInterface {
+        interface_name: String,
+        raw: Vec<u8>,
+    },
 }
 
 // ── Node ────────────────────────────────────────────────────────────────
@@ -102,6 +142,7 @@ pub struct Node {
     packet_hashlist: PacketHashlist,
     interfaces: HashMap<String, InterfaceConfig>,
     local_destinations: HashSet<DestinationHash>,
+    announcing_destinations: HashMap<DestinationHash, AnnouncingDestination>,
 }
 
 impl Node {
@@ -112,6 +153,7 @@ impl Node {
             packet_hashlist: PacketHashlist::new(),
             interfaces: HashMap::new(),
             local_destinations: HashSet::new(),
+            announcing_destinations: HashMap::new(),
         }
     }
 
@@ -138,8 +180,119 @@ impl Node {
     }
 
     /// Unregister a local destination. Returns `true` if it was registered.
+    ///
+    /// Also removes the destination from announcing destinations if present.
     pub fn unregister_destination(&mut self, dest_hash: &DestinationHash) -> bool {
+        self.announcing_destinations.remove(dest_hash);
         self.local_destinations.remove(dest_hash)
+    }
+
+    /// Register a destination that can generate announces and receive packets.
+    ///
+    /// Takes ownership of the `PrivateIdentity`. Also registers for local delivery.
+    /// Returns the computed `DestinationHash`.
+    pub fn register_announcing_destination(
+        &mut self,
+        identity: PrivateIdentity,
+        name: DestinationName,
+        app_data: Vec<u8>,
+        announce_interval: Option<u64>,
+        now: u64,
+    ) -> DestinationHash {
+        let dest_hash = name.destination_hash(&identity.public_identity().address_hash);
+        self.local_destinations.insert(dest_hash);
+        self.announcing_destinations.insert(
+            dest_hash,
+            AnnouncingDestination {
+                identity,
+                name,
+                app_data,
+                announce_interval,
+                next_announce_at: now,
+            },
+        );
+        dest_hash
+    }
+
+    /// Unregister an announcing destination. Returns `true` if it existed.
+    ///
+    /// Also removes from local_destinations.
+    pub fn unregister_announcing_destination(&mut self, dest_hash: &DestinationHash) -> bool {
+        self.local_destinations.remove(dest_hash);
+        self.announcing_destinations.remove(dest_hash).is_some()
+    }
+
+    /// Build and route an announce for a registered announcing destination.
+    ///
+    /// Two-phase design: `handle_event(TimerTick)` emits `AnnounceNeeded`, then
+    /// the caller invokes this with their own RNG. This keeps the scheduler
+    /// deterministic and the node fully sans-I/O.
+    pub fn announce(
+        &self,
+        dest_hash: &DestinationHash,
+        rng: &mut impl CryptoRngCore,
+        now: u64,
+    ) -> Vec<NodeAction> {
+        // Build announce packet — scoped borrow of announcing_destinations.
+        let raw = {
+            let ad = match self.announcing_destinations.get(dest_hash) {
+                Some(ad) => ad,
+                None => {
+                    return vec![NodeAction::PacketDropped {
+                        reason: DropReason::UnknownDestination,
+                        interface_name: String::new(),
+                    }];
+                }
+            };
+            let packet = match build_announce(
+                &ad.identity,
+                &ad.name,
+                rng,
+                now,
+                &ad.app_data,
+                None,
+            ) {
+                Ok(p) => p,
+                Err(_) => {
+                    return vec![NodeAction::PacketDropped {
+                        reason: DropReason::AnnounceBuildFailed,
+                        interface_name: String::new(),
+                    }];
+                }
+            };
+            match packet.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return vec![NodeAction::PacketDropped {
+                        reason: DropReason::OutboundSerializeFailed,
+                        interface_name: String::new(),
+                    }];
+                }
+            }
+        };
+
+        // Broadcast on all interfaces — separate borrow of self.interfaces.
+        self.broadcast_on_all_interfaces(&raw)
+    }
+
+    /// Route a pre-built raw packet to the appropriate interface(s).
+    ///
+    /// Known path → send on the path's interface. No path → broadcast all.
+    pub fn route_packet(
+        &self,
+        destination_hash: &DestinationHash,
+        raw: Vec<u8>,
+    ) -> Vec<NodeAction> {
+        if let Some(entry) = self.path_table.get(destination_hash) {
+            self.send_on_interface(&entry.interface_name, &raw)
+        } else {
+            self.broadcast_on_all_interfaces(&raw)
+        }
+    }
+
+    /// Number of announcing destinations.
+    pub fn announcing_destination_count(&self) -> usize {
+        self.announcing_destinations.len()
     }
 
     /// Process an event and return any resulting actions.
@@ -154,12 +307,26 @@ impl Node {
                 now,
             } => self.process_inbound(interface_name, raw, now),
             NodeEvent::TimerTick { now } => {
+                let mut actions = Vec::new();
+
                 let count = self.path_table.expire(now);
                 if count > 0 {
-                    vec![NodeAction::PathsExpired { count }]
-                } else {
-                    vec![]
+                    actions.push(NodeAction::PathsExpired { count });
                 }
+
+                for (dest_hash, ad) in &mut self.announcing_destinations {
+                    if let Some(interval) = ad.announce_interval {
+                        if now >= ad.next_announce_at {
+                            actions.push(NodeAction::AnnounceNeeded {
+                                dest_hash: *dest_hash,
+                            });
+                            let jitter = (dest_hash[0] as u64) % 60;
+                            ad.next_announce_at = now + interval + jitter;
+                        }
+                    }
+                }
+
+                actions
             }
         }
     }
@@ -179,7 +346,48 @@ impl Node {
         self.local_destinations.len()
     }
 
-    // ── Private pipeline ────────────────────────────────────────────────
+    // ── Private helpers (outbound) ─────────────────────────────────────
+
+    /// IFAC-mask (if configured) and emit `SendOnInterface` for one interface.
+    fn send_on_interface(&self, interface_name: &str, raw: &[u8]) -> Vec<NodeAction> {
+        let iface = match self.interfaces.get(interface_name) {
+            Some(c) => c,
+            None => {
+                return vec![NodeAction::PacketDropped {
+                    reason: DropReason::UnknownInterface,
+                    interface_name: interface_name.to_owned(),
+                }];
+            }
+        };
+        let outbound = if let Some(ref auth) = iface.ifac {
+            match auth.mask(raw) {
+                Ok(masked) => masked,
+                Err(_) => {
+                    return vec![NodeAction::PacketDropped {
+                        reason: DropReason::OutboundIfacFailed,
+                        interface_name: interface_name.to_owned(),
+                    }];
+                }
+            }
+        } else {
+            raw.to_vec()
+        };
+        vec![NodeAction::SendOnInterface {
+            interface_name: interface_name.to_owned(),
+            raw: outbound,
+        }]
+    }
+
+    /// Broadcast raw bytes on all registered interfaces, IFAC-masking each.
+    fn broadcast_on_all_interfaces(&self, raw: &[u8]) -> Vec<NodeAction> {
+        let mut actions = Vec::with_capacity(self.interfaces.len());
+        for name in self.interfaces.keys() {
+            actions.extend(self.send_on_interface(name, raw));
+        }
+        actions
+    }
+
+    // ── Private pipeline (inbound) ──────────────────────────────────────
 
     fn process_inbound(
         &mut self,
@@ -986,5 +1194,391 @@ mod tests {
             }
             _ => panic!("expected DeliverLocally"),
         }
+    }
+
+    // ── Announcing destination helpers ───────────────────────────────
+
+    fn make_announcing_node() -> (Node, DestinationHash) {
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
+        let dh = node.register_announcing_destination(identity, name, vec![], Some(300), 1000);
+        (node, dh)
+    }
+
+    fn make_announcing_node_with_ifac() -> (Node, DestinationHash) {
+        let mut node = Node::new();
+        let auth = IfacAuthenticator::new(Some("testnet"), None, 8).unwrap();
+        node.register_interface("eth0".into(), InterfaceMode::Full, Some(auth));
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
+        let dh = node.register_announcing_destination(identity, name, vec![], Some(300), 1000);
+        (node, dh)
+    }
+
+    // ── 10. Announcing destination registration ─────────────────────
+
+    #[test]
+    fn register_announcing_dest_returns_correct_hash() {
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("myapp", &["svc"]).unwrap();
+        let expected = name.destination_hash(&identity.public_identity().address_hash);
+
+        let dh = node.register_announcing_destination(identity, name, vec![], None, 0);
+        assert_eq!(dh, expected);
+        assert_eq!(node.announcing_destination_count(), 1);
+        assert_eq!(node.destination_count(), 1); // also registered for local delivery
+    }
+
+    #[test]
+    fn unregister_announcing_dest_removes_from_both() {
+        let (mut node, dh) = make_announcing_node();
+        assert_eq!(node.announcing_destination_count(), 1);
+        assert_eq!(node.destination_count(), 1);
+
+        assert!(node.unregister_announcing_destination(&dh));
+        assert_eq!(node.announcing_destination_count(), 0);
+        assert_eq!(node.destination_count(), 0);
+
+        // Second call returns false
+        assert!(!node.unregister_announcing_destination(&dh));
+    }
+
+    #[test]
+    fn announcing_dest_receives_local_delivery() {
+        let (mut node, dh) = make_announcing_node();
+        let raw = make_data_packet_raw(dh, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], NodeAction::DeliverLocally { .. }));
+    }
+
+    // ── 11. Announce generation ─────────────────────────────────────
+
+    #[test]
+    fn announce_emits_send_for_each_interface() {
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
+        let dh = node.register_announcing_destination(identity, name, vec![], None, 0);
+
+        let actions = node.announce(&dh, &mut OsRng, 1_700_000_000);
+        assert_eq!(actions.len(), 2);
+
+        let mut iface_names: Vec<&str> = actions
+            .iter()
+            .map(|a| match a {
+                NodeAction::SendOnInterface { interface_name, .. } => interface_name.as_str(),
+                _ => panic!("expected SendOnInterface"),
+            })
+            .collect();
+        iface_names.sort();
+        assert_eq!(iface_names, &["eth0", "wlan0"]);
+    }
+
+    #[test]
+    fn announce_unknown_dest_returns_drop() {
+        let node = Node::new();
+        let actions = node.announce(&dest(99), &mut OsRng, 1_700_000_000);
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            NodeAction::PacketDropped { reason, .. } => {
+                assert_eq!(*reason, DropReason::UnknownDestination);
+            }
+            _ => panic!("expected PacketDropped"),
+        }
+    }
+
+    #[test]
+    fn announce_with_ifac_produces_masked_output() {
+        let (node, dh) = make_announcing_node_with_ifac();
+
+        let actions = node.announce(&dh, &mut OsRng, 1_700_000_000);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            NodeAction::SendOnInterface { raw, .. } => {
+                // Masked packets have the IFAC flag set (bit 7 of first byte)
+                assert_ne!(raw[0] & 0x80, 0, "IFAC flag should be set on masked output");
+            }
+            _ => panic!("expected SendOnInterface"),
+        }
+    }
+
+    #[test]
+    fn announce_mixed_ifac_interfaces() {
+        let mut node = Node::new();
+        let auth = IfacAuthenticator::new(Some("testnet"), None, 8).unwrap();
+        node.register_interface("eth0".into(), InterfaceMode::Full, Some(auth));
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
+        let dh = node.register_announcing_destination(identity, name, vec![], None, 0);
+
+        let actions = node.announce(&dh, &mut OsRng, 1_700_000_000);
+        assert_eq!(actions.len(), 2);
+
+        for action in &actions {
+            match action {
+                NodeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                } => {
+                    if interface_name == "eth0" {
+                        // IFAC interface → flag set
+                        assert_ne!(raw[0] & 0x80, 0);
+                    } else {
+                        // No IFAC → flag clear
+                        assert_eq!(raw[0] & 0x80, 0);
+                    }
+                }
+                _ => panic!("expected SendOnInterface"),
+            }
+        }
+    }
+
+    // ── 12. Auto-announce scheduling ────────────────────────────────
+
+    #[test]
+    fn timer_emits_announce_needed_when_due() {
+        let (mut node, dh) = make_announcing_node();
+        // next_announce_at = 1000 (the `now` passed to register)
+
+        let actions = node.handle_event(NodeEvent::TimerTick { now: 1000 });
+        let announce_needed: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, NodeAction::AnnounceNeeded { .. }))
+            .collect();
+        assert_eq!(announce_needed.len(), 1);
+        match announce_needed[0] {
+            NodeAction::AnnounceNeeded { dest_hash } => assert_eq!(*dest_hash, dh),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn timer_no_announce_before_interval() {
+        let (mut node, _dh) = make_announcing_node();
+        // After first tick at now=1000, next_announce_at = 1000 + 300 + jitter
+
+        // Fire first tick to advance the schedule
+        node.handle_event(NodeEvent::TimerTick { now: 1000 });
+
+        // Fire again at now=1100 — well before the 300s interval
+        let actions = node.handle_event(NodeEvent::TimerTick { now: 1100 });
+        let announce_needed: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, NodeAction::AnnounceNeeded { .. }))
+            .collect();
+        assert!(announce_needed.is_empty());
+    }
+
+    #[test]
+    fn manual_only_dest_never_auto_announces() {
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
+        // announce_interval = None → manual only
+        node.register_announcing_destination(identity, name, vec![], None, 0);
+
+        // Even at far future, no auto-announce
+        let actions = node.handle_event(NodeEvent::TimerTick { now: 999_999 });
+        let announce_needed: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, NodeAction::AnnounceNeeded { .. }))
+            .collect();
+        assert!(announce_needed.is_empty());
+    }
+
+    // ── 13. Outbound routing ────────────────────────────────────────
+
+    #[test]
+    fn route_packet_known_path_sends_on_correct_interface() {
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+
+        // Inject a path via inbound announce on eth0
+        let (raw, dh) = make_valid_announce();
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        let data = vec![0xDE, 0xAD];
+        let actions = node.route_packet(&dh, data.clone());
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            NodeAction::SendOnInterface {
+                interface_name,
+                raw,
+            } => {
+                assert_eq!(interface_name, "eth0");
+                assert_eq!(*raw, data);
+            }
+            _ => panic!("expected SendOnInterface"),
+        }
+    }
+
+    #[test]
+    fn route_packet_no_path_broadcasts_all() {
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+
+        let data = vec![0xBE, 0xEF];
+        let actions = node.route_packet(&dest(99), data);
+        assert_eq!(actions.len(), 2);
+
+        let mut iface_names: Vec<&str> = actions
+            .iter()
+            .map(|a| match a {
+                NodeAction::SendOnInterface { interface_name, .. } => interface_name.as_str(),
+                _ => panic!("expected SendOnInterface"),
+            })
+            .collect();
+        iface_names.sort();
+        assert_eq!(iface_names, &["eth0", "wlan0"]);
+    }
+
+    #[test]
+    fn route_packet_with_ifac_masks_outbound() {
+        let mut node = Node::new();
+        let auth = IfacAuthenticator::new(Some("testnet"), None, 8).unwrap();
+        node.register_interface("eth0".into(), InterfaceMode::Full, Some(auth));
+
+        // Route some raw data — needs to be long enough for IFAC mask (min packet size)
+        let raw = make_data_packet_raw(dest(1), 0);
+        let actions = node.route_packet(&dest(99), raw.clone());
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            NodeAction::SendOnInterface { raw: masked, .. } => {
+                assert_ne!(*masked, raw, "output should be masked");
+                assert_ne!(masked[0] & 0x80, 0, "IFAC flag should be set");
+            }
+            _ => panic!("expected SendOnInterface"),
+        }
+    }
+
+    #[test]
+    fn route_packet_broadcast_mixed_ifac() {
+        let mut node = Node::new();
+        let auth = IfacAuthenticator::new(Some("testnet"), None, 8).unwrap();
+        node.register_interface("eth0".into(), InterfaceMode::Full, Some(auth));
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+
+        let raw = make_data_packet_raw(dest(1), 0);
+        let actions = node.route_packet(&dest(99), raw);
+        assert_eq!(actions.len(), 2);
+
+        for action in &actions {
+            match action {
+                NodeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                } => {
+                    if interface_name == "eth0" {
+                        assert_ne!(raw[0] & 0x80, 0, "eth0 should have IFAC");
+                    } else {
+                        assert_eq!(raw[0] & 0x80, 0, "wlan0 should not have IFAC");
+                    }
+                }
+                _ => panic!("expected SendOnInterface"),
+            }
+        }
+    }
+
+    #[test]
+    fn route_packet_stale_path_reports_unknown_interface() {
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+
+        // Learn a path on eth0
+        let (raw, dh) = make_valid_announce();
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        // Unregister eth0 — path entry now references a stale interface
+        node.unregister_interface("eth0");
+
+        let actions = node.route_packet(&dh, vec![0xDE, 0xAD]);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            NodeAction::PacketDropped { reason, interface_name } => {
+                assert_eq!(*reason, DropReason::UnknownInterface);
+                assert_eq!(interface_name, "eth0");
+            }
+            _ => panic!("expected PacketDropped for stale interface"),
+        }
+    }
+
+    // ── 14. Edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn unregister_then_announce_fails() {
+        let (mut node, dh) = make_announcing_node();
+        node.unregister_announcing_destination(&dh);
+
+        let actions = node.announce(&dh, &mut OsRng, 1_700_000_000);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            NodeAction::PacketDropped { reason, .. } => {
+                assert_eq!(*reason, DropReason::UnknownDestination);
+            }
+            _ => panic!("expected PacketDropped"),
+        }
+    }
+
+    #[test]
+    fn unregister_destination_also_removes_announcing() {
+        let (mut node, dh) = make_announcing_node();
+        assert_eq!(node.announcing_destination_count(), 1);
+
+        // Use the generic unregister_destination (not unregister_announcing_destination)
+        node.unregister_destination(&dh);
+
+        assert_eq!(node.announcing_destination_count(), 0);
+        assert_eq!(node.destination_count(), 0);
+    }
+
+    #[test]
+    fn jitter_derived_from_dest_hash() {
+        // Verify jitter = dest_hash[0] % 60 and next_announce_at = now + interval + jitter
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("app1", &["svc"]).unwrap();
+        let dh = node.register_announcing_destination(identity, name, vec![], Some(300), 0);
+
+        // Fire timer to trigger announce and advance the schedule
+        node.handle_event(NodeEvent::TimerTick { now: 0 });
+
+        let expected_jitter = (dh[0] as u64) % 60;
+        let ad = &node.announcing_destinations[&dh];
+        assert_eq!(ad.next_announce_at, 300 + expected_jitter);
+        assert!(expected_jitter < 60);
     }
 }
