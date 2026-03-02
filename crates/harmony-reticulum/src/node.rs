@@ -352,7 +352,12 @@ impl Node {
     fn send_on_interface(&self, interface_name: &str, raw: &[u8]) -> Vec<NodeAction> {
         let iface = match self.interfaces.get(interface_name) {
             Some(c) => c,
-            None => return vec![],
+            None => {
+                return vec![NodeAction::PacketDropped {
+                    reason: DropReason::UnknownInterface,
+                    interface_name: interface_name.to_owned(),
+                }];
+            }
         };
         let outbound = if let Some(ref auth) = iface.ifac {
             match auth.mask(raw) {
@@ -1502,6 +1507,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn route_packet_stale_path_reports_unknown_interface() {
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+
+        // Learn a path on eth0
+        let (raw, dh) = make_valid_announce();
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        // Unregister eth0 — path entry now references a stale interface
+        node.unregister_interface("eth0");
+
+        let actions = node.route_packet(&dh, vec![0xDE, 0xAD]);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            NodeAction::PacketDropped { reason, interface_name } => {
+                assert_eq!(*reason, DropReason::UnknownInterface);
+                assert_eq!(interface_name, "eth0");
+            }
+            _ => panic!("expected PacketDropped for stale interface"),
+        }
+    }
+
     // ── 14. Edge cases ──────────────────────────────────────────────
 
     #[test]
@@ -1532,36 +1564,21 @@ mod tests {
     }
 
     #[test]
-    fn jitter_varies_by_dest_hash() {
-        // Two destinations with different first bytes → different jitter
+    fn jitter_derived_from_dest_hash() {
+        // Verify jitter = dest_hash[0] % 60 and next_announce_at = now + interval + jitter
         let mut node = Node::new();
         node.register_interface("eth0".into(), InterfaceMode::Full, None);
 
-        let id1 = PrivateIdentity::generate(&mut OsRng);
-        let id2 = PrivateIdentity::generate(&mut OsRng);
-        let name1 = DestinationName::from_name("app1", &["svc"]).unwrap();
-        let name2 = DestinationName::from_name("app2", &["svc"]).unwrap();
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("app1", &["svc"]).unwrap();
+        let dh = node.register_announcing_destination(identity, name, vec![], Some(300), 0);
 
-        let dh1 = node.register_announcing_destination(id1, name1, vec![], Some(300), 0);
-        let dh2 = node.register_announcing_destination(id2, name2, vec![], Some(300), 0);
-
-        // Fire timer to trigger both announces and update next_announce_at
+        // Fire timer to trigger announce and advance the schedule
         node.handle_event(NodeEvent::TimerTick { now: 0 });
 
-        // If dest_hash[0] differs, jitter differs, so next_announce_at differs.
-        // (Cryptographic hashes make same first byte extremely unlikely for random identities.)
-        let ad1 = &node.announcing_destinations[&dh1];
-        let ad2 = &node.announcing_destinations[&dh2];
-
-        if dh1[0] != dh2[0] {
-            // Jitter is dest_hash[0] % 60, so different first bytes → different jitter
-            let jitter1 = (dh1[0] as u64) % 60;
-            let jitter2 = (dh2[0] as u64) % 60;
-            assert_ne!(jitter1, jitter2);
-            assert_eq!(ad1.next_announce_at, 0 + 300 + jitter1);
-            assert_eq!(ad2.next_announce_at, 0 + 300 + jitter2);
-        }
-        // If by astronomical chance they have the same first byte, the test is still valid
-        // (it just can't assert the jitter differs).
+        let expected_jitter = (dh[0] as u64) % 60;
+        let ad = &node.announcing_destinations[&dh];
+        assert_eq!(ad.next_announce_at, 300 + expected_jitter);
+        assert!(expected_jitter < 60);
     }
 }
