@@ -99,7 +99,6 @@ pub struct Session {
     state: SessionState,
     local_identity: PrivateIdentity,
     remote_identity: Identity,
-    handshake_sent: bool,
     handshake_verified: bool,
     local_resources: HashMap<ExprId, String>,
     remote_resources: HashMap<ExprId, String>,
@@ -135,7 +134,6 @@ impl Session {
             state: SessionState::Init,
             local_identity,
             remote_identity,
-            handshake_sent: true,
             handshake_verified: false,
             local_resources: HashMap::new(),
             remote_resources: HashMap::new(),
@@ -217,13 +215,8 @@ impl Session {
 
         self.handshake_verified = true;
         self.last_received_ms = self.last_tick_ms;
-
-        if self.handshake_sent && self.handshake_verified {
-            self.state = SessionState::Active;
-            Ok(vec![SessionAction::SessionOpened])
-        } else {
-            Ok(vec![])
-        }
+        self.state = SessionState::Active;
+        Ok(vec![SessionAction::SessionOpened])
     }
 
     /// Declare a local resource, allocating the next ExprId.
@@ -369,6 +362,9 @@ impl Session {
     }
 
     fn handle_close_ack_received(&mut self) -> Result<Vec<SessionAction>, ZenohError> {
+        if self.state != SessionState::Closing {
+            return Err(ZenohError::SessionNotActive);
+        }
         self.last_received_ms = self.last_tick_ms;
         Ok(self.force_close())
     }
@@ -742,5 +738,17 @@ mod tests {
         assert!(actions.contains(&SessionAction::SendCloseAck));
         assert!(actions.contains(&SessionAction::SessionClosed));
         assert_eq!(bob.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn unsolicited_close_ack_in_active_rejected() {
+        let (mut alice, alice_actions, mut bob, bob_actions) = create_session_pair();
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+
+        // CloseAck without a preceding Close should be rejected
+        let result = alice.handle_event(SessionEvent::CloseAckReceived);
+        assert!(matches!(result, Err(ZenohError::SessionNotActive)));
+        // Session stays Active — not torn down
+        assert_eq!(alice.state(), SessionState::Active);
     }
 }
