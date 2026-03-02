@@ -54,8 +54,13 @@ pub enum PubSubAction {
 /// and message dispatch for a single peer-to-peer connection.
 pub struct PubSubRouter {
     subscriptions: SubscriptionTable,
+    /// Maps each local subscription ID to its canonical key expression.
     sub_key_exprs: HashMap<SubscriptionId, String>,
+    /// Tracks how many local subscriptions exist per canonical key expression.
+    /// `SendSubscriberDeclare` is emitted only on 0→1, `SendSubscriberUndeclare` only on 1→0.
+    local_interest_count: HashMap<String, usize>,
     remote_interest: SubscriptionTable,
+    /// Maps canonical key expression → SubscriptionId in the remote interest table.
     remote_interest_ids: HashMap<String, SubscriptionId>,
     publishers: HashMap<PublisherId, ExprId>,
     next_publisher_id: PublisherId,
@@ -67,6 +72,7 @@ impl PubSubRouter {
         Self {
             subscriptions: SubscriptionTable::new(),
             sub_key_exprs: HashMap::new(),
+            local_interest_count: HashMap::new(),
             remote_interest: SubscriptionTable::new(),
             remote_interest_ids: HashMap::new(),
             publishers: HashMap::new(),
@@ -77,26 +83,31 @@ impl PubSubRouter {
     /// Subscribe to a key expression.
     ///
     /// Registers in local SubscriptionTable and emits `SendSubscriberDeclare`
-    /// to propagate interest to the peer.
+    /// to propagate interest to the peer. If another local subscription already
+    /// covers this key expression, the declare is suppressed (refcounted).
     pub fn subscribe(
         &mut self,
         key_expr: &str,
     ) -> Result<(SubscriptionId, Vec<PubSubAction>), ZenohError> {
         let owned = OwnedKeyExpr::autocanonize(key_expr.to_string())
             .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let canonical = owned.to_string();
         let sub_id = self.subscriptions.subscribe(&owned);
-        self.sub_key_exprs.insert(sub_id, key_expr.to_string());
-        Ok((
-            sub_id,
-            vec![PubSubAction::SendSubscriberDeclare {
-                key_expr: key_expr.to_string(),
-            }],
-        ))
+        self.sub_key_exprs.insert(sub_id, canonical.clone());
+        let count = self.local_interest_count.entry(canonical.clone()).or_insert(0);
+        *count += 1;
+        let actions = if *count == 1 {
+            vec![PubSubAction::SendSubscriberDeclare { key_expr: canonical }]
+        } else {
+            vec![]
+        };
+        Ok((sub_id, actions))
     }
 
     /// Unsubscribe by subscription ID.
     ///
-    /// Removes from local SubscriptionTable and emits `SendSubscriberUndeclare`.
+    /// Removes from local SubscriptionTable and emits `SendSubscriberUndeclare`
+    /// only when the last local subscription for this key expression is removed.
     pub fn unsubscribe(
         &mut self,
         sub_id: SubscriptionId,
@@ -106,7 +117,15 @@ impl PubSubRouter {
             .remove(&sub_id)
             .ok_or(ZenohError::UnknownSubscriptionId(sub_id.as_u64()))?;
         self.subscriptions.unsubscribe(sub_id)?;
-        Ok(vec![PubSubAction::SendSubscriberUndeclare { key_expr }])
+        let mut actions = vec![];
+        if let Some(count) = self.local_interest_count.get_mut(&key_expr) {
+            *count -= 1;
+            if *count == 0 {
+                self.local_interest_count.remove(&key_expr);
+                actions.push(PubSubAction::SendSubscriberUndeclare { key_expr });
+            }
+        }
+        Ok(actions)
     }
 
     /// Declare a publisher on the given key expression.
@@ -228,14 +247,15 @@ impl PubSubRouter {
         &mut self,
         key_expr: String,
     ) -> Result<Vec<PubSubAction>, ZenohError> {
-        // Remove previous interest on the same key expression to avoid orphaned entries
-        if let Some(old_sub_id) = self.remote_interest_ids.remove(&key_expr) {
+        let owned = OwnedKeyExpr::autocanonize(key_expr)
+            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let canonical = owned.to_string();
+        // Remove previous interest on the same canonical key to avoid orphaned entries.
+        if let Some(old_sub_id) = self.remote_interest_ids.remove(&canonical) {
             let _ = self.remote_interest.unsubscribe(old_sub_id);
         }
-        let owned = OwnedKeyExpr::autocanonize(key_expr.clone())
-            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
         let sub_id = self.remote_interest.subscribe(&owned);
-        self.remote_interest_ids.insert(key_expr, sub_id);
+        self.remote_interest_ids.insert(canonical, sub_id);
         Ok(vec![])
     }
 
@@ -243,7 +263,10 @@ impl PubSubRouter {
         &mut self,
         key_expr: String,
     ) -> Result<Vec<PubSubAction>, ZenohError> {
-        if let Some(sub_id) = self.remote_interest_ids.remove(&key_expr) {
+        let owned = OwnedKeyExpr::autocanonize(key_expr)
+            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let canonical = owned.to_string();
+        if let Some(sub_id) = self.remote_interest_ids.remove(&canonical) {
             self.remote_interest.unsubscribe(sub_id)?;
         }
         Ok(vec![])
@@ -611,6 +634,74 @@ mod tests {
 
         // Publish should emit nothing again
         let actions = router.publish(pub_id, b"msg3".to_vec(), &alice).unwrap();
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn duplicate_subscribe_refcounts_interest_declaration() {
+        let mut router = PubSubRouter::new();
+        let ke = "harmony/server/srv1/channel/*/msg";
+
+        // First subscribe emits declare
+        let (sub1, actions1) = router.subscribe(ke).unwrap();
+        assert_eq!(actions1.len(), 1);
+        assert!(matches!(
+            &actions1[0],
+            PubSubAction::SendSubscriberDeclare { .. }
+        ));
+
+        // Second subscribe on same key: no declare (refcount 1→2)
+        let (sub2, actions2) = router.subscribe(ke).unwrap();
+        assert!(actions2.is_empty());
+
+        // Unsubscribe first: no undeclare (refcount 2→1)
+        let actions3 = router.unsubscribe(sub1).unwrap();
+        assert!(actions3.is_empty());
+
+        // Unsubscribe last: undeclare emitted (refcount 1→0)
+        let actions4 = router.unsubscribe(sub2).unwrap();
+        assert_eq!(actions4.len(), 1);
+        assert!(matches!(
+            &actions4[0],
+            PubSubAction::SendSubscriberUndeclare { .. }
+        ));
+    }
+
+    #[test]
+    fn remote_interest_canonical_key_roundtrip() {
+        let (mut alice, _bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        let (pub_id, _) = router
+            .declare_publisher("harmony/server/srv1/channel/general/msg".into(), &mut alice)
+            .unwrap();
+
+        // Declare with non-canonical form (Zenoh canonicalizes $* → *)
+        router
+            .handle_event(
+                PubSubEvent::SubscriberDeclared {
+                    key_expr: "harmony/server/srv1/channel/$*/msg".into(),
+                },
+                &alice,
+            )
+            .unwrap();
+
+        // Should match via the canonical form
+        let actions = router.publish(pub_id, b"msg".to_vec(), &alice).unwrap();
+        assert_eq!(actions.len(), 1);
+
+        // Undeclare with canonical form — should still find the entry
+        router
+            .handle_event(
+                PubSubEvent::SubscriberUndeclared {
+                    key_expr: "harmony/server/srv1/channel/*/msg".into(),
+                },
+                &alice,
+            )
+            .unwrap();
+
+        // Interest gone
+        let actions = router.publish(pub_id, b"msg".to_vec(), &alice).unwrap();
         assert!(actions.is_empty());
     }
 }
