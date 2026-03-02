@@ -6,6 +6,7 @@ pub mod ifac;
 pub mod interface;
 pub mod link;
 pub mod loopback;
+pub mod node;
 pub mod packet;
 pub mod packet_hashlist;
 pub mod path_table;
@@ -22,5 +23,6 @@ pub use packet::{
     DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
     HEADER_1_SIZE, HEADER_2_SIZE, MTU,
 };
+pub use node::{DropReason, InterfaceConfig, Node, NodeAction, NodeEvent};
 pub use packet_hashlist::PacketHashlist;
 pub use path_table::{PathEntry, PathTable, PathUpdateResult};
