@@ -27,6 +27,10 @@ const PATHFINDER_G: u64 = 5;
 /// Maximum local rebroadcast echoes before considering propagation done.
 const LOCAL_REBROADCASTS_MAX: u8 = 2;
 
+/// Announce rate table entries unseen for this many seconds are evicted.
+/// Matches the shortest path expiry (Roaming = 6 hours).
+const RATE_TABLE_EXPIRY: u64 = 21_600;
+
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -442,6 +446,7 @@ impl Node {
 
                 if self.is_transport() {
                     actions.extend(self.process_announce_table(now));
+                    self.expire_rate_table(now);
                 }
 
                 actions
@@ -553,6 +558,18 @@ impl Node {
 
         entry.last_checked = now;
         false
+    }
+
+    /// Evict stale entries from the announce rate table.
+    ///
+    /// An entry is stale when it hasn't been checked recently and isn't
+    /// actively blocking a destination. Called from TimerTick.
+    fn expire_rate_table(&mut self, now: u64) {
+        self.announce_rate_table.retain(|_, entry| {
+            let age = now.saturating_sub(entry.last_checked);
+            // Keep if: still within expiry window, OR actively blocking
+            age < RATE_TABLE_EXPIRY || now < entry.blocked_until
+        });
     }
 
     /// Detect local rebroadcast echo or downstream forward.
@@ -795,9 +812,17 @@ impl Node {
         let hops = packet.header.hops;
         let context_flag = packet.header.flags.context_flag;
 
-        // Rate limiting (transport mode only)
+        // Rebroadcast detection runs BEFORE rate limiting so echoes of our
+        // own rebroadcasts don't consume grace points. Echoes are expected
+        // traffic, not abuse — they shouldn't count toward rate violations.
         if self.is_transport() {
-            // Clone the rate config (if any) to avoid holding a borrow on self.interfaces
+            self.check_rebroadcast_echo(destination_hash, hops);
+        }
+
+        // Rate limiting (transport mode only).
+        // Skip for destinations we're actively tracking in the announce table —
+        // those are echoes/forwards of our own rebroadcasts.
+        if self.is_transport() && !self.announce_table.contains_key(&destination_hash) {
             let rate_config = self
                 .interfaces
                 .get(&interface_name)
@@ -810,11 +835,6 @@ impl Node {
                     }];
                 }
             }
-        }
-
-        // Rebroadcast detection (transport mode only)
-        if self.is_transport() {
-            self.check_rebroadcast_echo(destination_hash, hops);
         }
 
         // Announce packet hash: truncated (first 16 bytes) of the full hash
@@ -2517,5 +2537,113 @@ mod tests {
             .iter()
             .any(|a| matches!(a, NodeAction::AnnounceRebroadcast { .. }));
         assert!(!has_rebroadcast, "should not rebroadcast on serialize failure");
+    }
+
+    #[test]
+    fn rate_table_entries_evicted_when_stale() {
+        let (mut node, _th) = make_transport_node();
+        let dh = dest(11);
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 2,
+            penalty: 120,
+        };
+
+        // Seed a rate entry at t=1000
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+        assert_eq!(node.announce_rate_table.len(), 1);
+
+        // Tick well before expiry — entry retained
+        node.handle_event(NodeEvent::TimerTick { now: 1000 + RATE_TABLE_EXPIRY - 1 });
+        assert_eq!(node.announce_rate_table.len(), 1);
+
+        // Tick at expiry boundary — entry evicted (age == RATE_TABLE_EXPIRY, not <)
+        node.handle_event(NodeEvent::TimerTick { now: 1000 + RATE_TABLE_EXPIRY });
+        assert_eq!(node.announce_rate_table.len(), 0);
+    }
+
+    #[test]
+    fn rate_table_blocked_entry_retained_until_penalty_expires() {
+        let (mut node, _th) = make_transport_node();
+        let dh = dest(12);
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 0,
+            penalty: RATE_TABLE_EXPIRY + 1000, // penalty outlasts expiry window
+        };
+
+        // Trigger a block: first pass, then immediate violation
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+        assert!(node.is_rate_limited(dh, &config, 1010));
+        // blocked_until = 1010 + 60 + (RATE_TABLE_EXPIRY + 1000)
+
+        let blocked_until = 1010 + 60 + RATE_TABLE_EXPIRY + 1000;
+
+        // Tick past RATE_TABLE_EXPIRY but before blocked_until — entry retained
+        node.handle_event(NodeEvent::TimerTick { now: 1000 + RATE_TABLE_EXPIRY + 500 });
+        assert_eq!(
+            node.announce_rate_table.len(),
+            1,
+            "blocked entry must survive past age expiry"
+        );
+
+        // Tick after blocked_until AND past expiry — now evictable
+        node.handle_event(NodeEvent::TimerTick { now: blocked_until + RATE_TABLE_EXPIRY });
+        assert_eq!(node.announce_rate_table.len(), 0);
+    }
+
+    #[test]
+    fn echo_not_blocked_by_rate_limiter() {
+        // Regression: rate limiting ran before echo detection, so echoes of our
+        // own rebroadcasts consumed grace points. With grace=0, echoes were
+        // blocked entirely, preventing echo-based completion.
+        let (mut node, _th) = make_transport_node_with_rate(60, 0, 120);
+        let (raw, dh) = make_valid_announce();
+
+        // Receive announce on rate-limited interface at t=1000
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: raw.clone(),
+            now: 1000,
+        });
+        assert!(actions.iter().any(|a| matches!(a, NodeAction::AnnounceReceived { .. })));
+        assert_eq!(node.announce_table_len(), 1);
+        assert_eq!(node.announce_table[&dh].local_rebroadcasts, 0);
+        // Stored hops = 1 (wire hops 0, pipeline incremented)
+
+        // Retransmit so retries > 0
+        node.handle_event(NodeEvent::TimerTick { now: 1010 });
+        assert!(node.announce_table[&dh].retries > 0);
+
+        // Build an echo: our rebroadcast (hops=1 on wire) heard back by a
+        // neighbor who sends it back to us. Set wire hops=1 so our pipeline
+        // increments to 2, giving incoming_hops-1 = 1 == stored_hops(1).
+        let mut echo = raw.clone();
+        echo[1] = 1; // hops byte on wire
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: echo,
+            now: 1012,
+        });
+
+        // Should NOT be rate-limited (no AnnounceRateLimited drop)
+        let was_rate_limited = actions.iter().any(|a| matches!(
+            a,
+            NodeAction::PacketDropped {
+                reason: DropReason::AnnounceRateLimited,
+                ..
+            }
+        ));
+        assert!(
+            !was_rate_limited,
+            "echoes of tracked announces must bypass rate limiting"
+        );
+
+        // Echo detection should have incremented local_rebroadcasts
+        assert_eq!(
+            node.announce_table[&dh].local_rebroadcasts, 1,
+            "echo should have been detected and counted"
+        );
     }
 }
