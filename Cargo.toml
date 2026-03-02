@@ -4,6 +4,7 @@ members = [
     "crates/harmony-crypto",
     "crates/harmony-identity",
     "crates/harmony-reticulum",
+    "crates/harmony-zenoh",
 ]
 
 [workspace.package]
@@ -38,3 +39,4 @@ hex = "0.4"
 # Internal crates
 harmony-crypto = { path = "crates/harmony-crypto" }
 harmony-identity = { path = "crates/harmony-identity" }
+harmony-zenoh = { path = "crates/harmony-zenoh" }

@@ -1,0 +1,14 @@
+[package]
+name = "harmony-zenoh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Zenoh key expression integration for the Harmony decentralized stack"
+
+[dependencies]
+zenoh-keyexpr = { version = "1.7", default-features = false, features = ["std"] }
+thiserror.workspace = true
+
+[dev-dependencies]
