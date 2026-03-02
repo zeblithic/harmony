@@ -55,11 +55,15 @@ pub struct LivelinessRouter {
     remote_tokens: SubscriptionTable,
     /// Reverse map: SubscriptionId in remote_tokens → canonical key expression.
     remote_token_keys: HashMap<SubscriptionId, String>,
+    /// Reverse map: canonical key expression → SubscriptionId in remote_tokens.
+    remote_token_ids: HashMap<String, SubscriptionId>,
 
     /// Local subscribers for token appear/disappear event fan-out.
     subscribers: SubscriptionTable,
     /// Map: LivelinessSubscriberId → SubscriptionId in subscribers table.
     subscriber_keys: HashMap<LivelinessSubscriberId, SubscriptionId>,
+    /// Reverse map: SubscriptionId → LivelinessSubscriberId.
+    subscriber_ids: HashMap<SubscriptionId, LivelinessSubscriberId>,
 
     /// Local tokens declared by this peer.
     local_tokens: HashMap<TokenId, String>,
@@ -73,15 +77,17 @@ impl LivelinessRouter {
         Self {
             remote_tokens: SubscriptionTable::new(),
             remote_token_keys: HashMap::new(),
+            remote_token_ids: HashMap::new(),
             subscribers: SubscriptionTable::new(),
             subscriber_keys: HashMap::new(),
+            subscriber_ids: HashMap::new(),
             local_tokens: HashMap::new(),
             next_token_id: 1,
             next_subscriber_id: 1,
         }
     }
 
-    // ── Task 3: Token declaration ────────────────────────────────────
+    // ── Token declaration ──────────────────────────────────────────
 
     /// Declare a local liveliness token on the given key expression.
     ///
@@ -119,7 +125,7 @@ impl LivelinessRouter {
         Ok(vec![LivelinessAction::SendTokenUndeclare { key_expr }])
     }
 
-    // ── Task 4: Subscriber management ────────────────────────────────
+    // ── Subscriber management ──────────────────────────────────────
 
     /// Subscribe to liveliness token changes matching the given key expression.
     ///
@@ -136,6 +142,7 @@ impl LivelinessRouter {
         let sub_id = self.next_subscriber_id;
         self.next_subscriber_id += 1;
         self.subscriber_keys.insert(sub_id, sub_table_id);
+        self.subscriber_ids.insert(sub_table_id, sub_id);
 
         // History: emit TokenAppeared for each existing remote token that matches.
         let mut actions = Vec::new();
@@ -162,11 +169,12 @@ impl LivelinessRouter {
             .subscriber_keys
             .remove(&subscriber_id)
             .ok_or(ZenohError::UnknownSubscriptionId(subscriber_id))?;
+        self.subscriber_ids.remove(&sub_table_id);
         self.subscribers.unsubscribe(sub_table_id)?;
         Ok(())
     }
 
-    // ── Task 5: Event handling ───────────────────────────────────────
+    // ── Event handling ─────────────────────────────────────────────
 
     /// Process an inbound liveliness event and return actions for the caller.
     pub fn handle_event(
@@ -193,12 +201,13 @@ impl LivelinessRouter {
         let canonical = owned.to_string();
 
         // Idempotent: if this exact key is already tracked, skip.
-        if self.remote_token_keys.values().any(|k| k == &canonical) {
+        if self.remote_token_ids.contains_key(&canonical) {
             return Ok(vec![]);
         }
 
         let sub_id = self.remote_tokens.subscribe(&owned);
         self.remote_token_keys.insert(sub_id, canonical.clone());
+        self.remote_token_ids.insert(canonical.clone(), sub_id);
 
         // Notify matching local subscribers.
         self.notify_subscribers_appeared(&canonical)
@@ -213,13 +222,7 @@ impl LivelinessRouter {
         let canonical = owned.to_string();
 
         // Find and remove the token.
-        let table_id = self
-            .remote_token_keys
-            .iter()
-            .find(|(_, k)| *k == &canonical)
-            .map(|(id, _)| *id);
-
-        let Some(table_id) = table_id else {
+        let Some(table_id) = self.remote_token_ids.remove(&canonical) else {
             return Ok(vec![]); // Unknown token — no-op.
         };
 
@@ -232,6 +235,7 @@ impl LivelinessRouter {
     fn handle_peer_lost(&mut self) -> Vec<LivelinessAction> {
         let token_keys: Vec<(SubscriptionId, String)> =
             self.remote_token_keys.drain().collect();
+        self.remote_token_ids.clear();
         let mut actions = Vec::new();
 
         for (table_id, key_expr) in token_keys {
@@ -254,11 +258,7 @@ impl LivelinessRouter {
         let matches = self.subscribers.matches(ke);
         let mut actions = Vec::new();
         for sub_table_id in matches {
-            if let Some((&sub_id, _)) = self
-                .subscriber_keys
-                .iter()
-                .find(|(_, &table_id)| table_id == sub_table_id)
-            {
+            if let Some(&sub_id) = self.subscriber_ids.get(&sub_table_id) {
                 actions.push(LivelinessAction::TokenAppeared {
                     subscriber_id: sub_id,
                     key_expr: key_expr.to_string(),
@@ -278,11 +278,7 @@ impl LivelinessRouter {
         let matches = self.subscribers.matches(ke);
         let mut actions = Vec::new();
         for sub_table_id in matches {
-            if let Some((&sub_id, _)) = self
-                .subscriber_keys
-                .iter()
-                .find(|(_, &table_id)| table_id == sub_table_id)
-            {
+            if let Some(&sub_id) = self.subscriber_ids.get(&sub_table_id) {
                 actions.push(LivelinessAction::TokenDisappeared {
                     subscriber_id: sub_id,
                     key_expr: key_expr.to_string(),
@@ -292,7 +288,7 @@ impl LivelinessRouter {
         Ok(actions)
     }
 
-    // ── Task 6: Query ────────────────────────────────────────────────
+    // ── Query ─────────────────────────────────────────────────────
 
     /// Query currently alive remote tokens matching the given key expression.
     ///
@@ -330,7 +326,7 @@ mod tests {
         assert!(router.subscriber_keys.is_empty());
     }
 
-    // ── Task 3: declare_token / undeclare_token ──────────────────────
+    // ── declare_token / undeclare_token ──────────────────────────────
 
     #[test]
     fn declare_token_returns_id_and_send_action() {
@@ -385,7 +381,7 @@ mod tests {
         assert!(matches!(result, Err(ZenohError::UnknownTokenId(999))));
     }
 
-    // ── Task 4: subscribe / unsubscribe ──────────────────────────────
+    // ── subscribe / unsubscribe ──────────────────────────────────────
 
     #[test]
     fn subscribe_returns_id() {
@@ -414,7 +410,7 @@ mod tests {
         ));
     }
 
-    // ── Task 5: handle_event ─────────────────────────────────────────
+    // ── handle_event ─────────────────────────────────────────────────
 
     #[test]
     fn subscribe_delivers_existing_remote_tokens() {
@@ -598,7 +594,7 @@ mod tests {
         assert!(actions.is_empty());
     }
 
-    // ── Task 6: query ────────────────────────────────────────────────
+    // ── query ────────────────────────────────────────────────────────
 
     #[test]
     fn query_returns_matching_remote_tokens() {
