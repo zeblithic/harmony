@@ -10,6 +10,7 @@ use crate::context::PacketContext;
 use crate::destination::DestinationName;
 use crate::ifac::IfacAuthenticator;
 use crate::interface::InterfaceMode;
+use crate::link;
 use crate::packet::{
     DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
 };
@@ -35,6 +36,12 @@ const RATE_TABLE_EXPIRY: u64 = 21_600;
 /// Matches Python `Transport.REVERSE_TIMEOUT`.
 const REVERSE_TIMEOUT: u64 = 480;
 
+/// Validated link table entries expire after 10 minutes of inactivity.
+/// Matches Python `Transport.STALE_TIME * 1.25`.
+const LINK_TIMEOUT: u64 = 600;
+
+/// Seconds per hop to allow for link proof arrival (unvalidated entries).
+const ESTABLISHMENT_TIMEOUT_PER_HOP: u64 = 6;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -118,6 +125,29 @@ struct ReverseTableEntry {
     timestamp: u64,
 }
 
+/// A link table entry tracking a link request passing through this transport node.
+/// Used for routing link proofs back and link data bidirectionally.
+struct LinkTableEntry {
+    /// Monotonic timestamp when created or last data activity.
+    timestamp: u64,
+    /// Next transport toward the destination (from path table).
+    next_hop: DestinationHash,
+    /// Interface to forward toward the destination.
+    outbound_interface: String,
+    /// Hops from us to destination (from path table).
+    remaining_hops: u8,
+    /// Interface the link request arrived on.
+    received_interface: String,
+    /// Packet hops at time of receipt (post-increment).
+    taken_hops: u8,
+    /// Original destination of the link request.
+    destination_hash: DestinationHash,
+    /// False until link proof received; controls expiry mode.
+    validated: bool,
+    /// Absolute deadline for proof arrival (unvalidated entries).
+    proof_timeout: u64,
+}
+
 /// Input events from the caller.
 #[derive(Debug)]
 pub enum NodeEvent {
@@ -170,6 +200,14 @@ pub enum DropReason {
     RelaySerializeFailed,
     /// Proof arrived but no reverse table entry found for routing.
     ProofNoReverseEntry,
+    /// LinkRequest for destination not in path table.
+    NoRouteForLinkRequest,
+    /// LRPROOF arrived but no link table entry found.
+    LinkProofNoEntry,
+    /// LRPROOF hops don't match expected remaining_hops.
+    LinkProofHopsMismatch,
+    /// LRPROOF arrived on wrong interface.
+    LinkProofWrongInterface,
 }
 
 /// Output actions for the caller.
@@ -223,6 +261,25 @@ pub enum NodeAction {
     },
     /// Reverse table entries expired during timer tick.
     ReverseTableExpired { count: usize },
+    /// Transport node forwarded a link request toward its destination.
+    LinkRequestForwarded {
+        link_id: DestinationHash,
+        destination_hash: DestinationHash,
+        next_hop: DestinationHash,
+        interface_name: String,
+    },
+    /// Transport node routed a link proof back toward the initiator.
+    LinkProofRouted {
+        link_id: DestinationHash,
+        interface_name: String,
+    },
+    /// Transport node routed a link data packet.
+    LinkDataRouted {
+        link_id: DestinationHash,
+        interface_name: String,
+    },
+    /// Link table entries expired during timer tick.
+    LinkTableExpired { count: usize },
 }
 
 // ── Node ────────────────────────────────────────────────────────────────
@@ -244,6 +301,7 @@ pub struct Node {
     announce_table: HashMap<DestinationHash, AnnounceTableEntry>,
     announce_rate_table: HashMap<DestinationHash, AnnounceRateEntry>,
     reverse_table: HashMap<DestinationHash, ReverseTableEntry>,
+    link_table: HashMap<DestinationHash, LinkTableEntry>,
 }
 
 impl Node {
@@ -259,6 +317,7 @@ impl Node {
             announce_table: HashMap::new(),
             announce_rate_table: HashMap::new(),
             reverse_table: HashMap::new(),
+            link_table: HashMap::new(),
         }
     }
 
@@ -274,6 +333,7 @@ impl Node {
             announce_table: HashMap::new(),
             announce_rate_table: HashMap::new(),
             reverse_table: HashMap::new(),
+            link_table: HashMap::new(),
         }
     }
 
@@ -308,6 +368,11 @@ impl Node {
     /// Number of entries in the reverse table.
     pub fn reverse_table_len(&self) -> usize {
         self.reverse_table.len()
+    }
+
+    /// Number of entries in the link table.
+    pub fn link_table_len(&self) -> usize {
+        self.link_table.len()
     }
 
     /// Register an interface by name and configuration.
@@ -498,6 +563,24 @@ impl Node {
                     let expired = before - self.reverse_table.len();
                     if expired > 0 {
                         actions.push(NodeAction::ReverseTableExpired { count: expired });
+                    }
+
+                    // Expire stale link table entries
+                    let link_before = self.link_table.len();
+                    self.link_table.retain(|_, entry| {
+                        if entry.validated {
+                            // Validated links: expire after LINK_TIMEOUT of inactivity
+                            now.saturating_sub(entry.timestamp) < LINK_TIMEOUT
+                        } else {
+                            // Unvalidated links: expire after proof_timeout
+                            now < entry.proof_timeout
+                        }
+                    });
+                    let link_expired = link_before - self.link_table.len();
+                    if link_expired > 0 {
+                        actions.push(NodeAction::LinkTableExpired {
+                            count: link_expired,
+                        });
                     }
                 }
 
@@ -826,11 +909,16 @@ impl Node {
             .expect("hashable_part is infallible for parsed packets");
         let full_packet_hash = hash::full_hash(&hashable);
         let is_announce = pkt_type == PacketType::Announce;
+        let is_lrproof = pkt_type == PacketType::Proof
+            && packet.header.context == PacketContext::LrProof;
 
         // Duplicate non-announces are dropped; duplicate announces still pass
         // through for path evaluation (multiple paths to same destination).
+        // LRPROOF packets are also exempt: link proofs must pass through
+        // transport nodes for link establishment.
         if !self.packet_hashlist.insert(full_packet_hash.to_vec())
             && !is_announce
+            && !is_lrproof
         {
             return vec![NodeAction::PacketDropped {
                 reason: DropReason::DuplicatePacket,
@@ -983,12 +1071,20 @@ impl Node {
             }
         };
 
-        // 3. Proof routing via reverse table
+        // 3. LRPROOF routing via link table (before transport_id check —
+        //    link proofs travel as Type1/Broadcast with no transport_id)
+        if packet.header.flags.packet_type == PacketType::Proof
+            && packet.header.context == PacketContext::LrProof
+        {
+            return self.route_link_proof(&packet, &interface_name, now);
+        }
+
+        // 4. Regular proof routing via reverse table
         if packet.header.flags.packet_type == PacketType::Proof {
             return self.route_proof(&packet, &interface_name);
         }
 
-        // 4. Only relay Type2 packets addressed to our transport_id
+        // 5. Only relay Type2 packets addressed to our transport_id
         if packet.header.transport_id != Some(our_transport_hash) {
             return vec![NodeAction::PacketDropped {
                 reason: DropReason::NoLocalDestination,
@@ -996,7 +1092,17 @@ impl Node {
             }];
         }
 
-        // 5. Look up destination in path table
+        // 6. LinkRequest → create link table entry + forward
+        if packet.header.flags.packet_type == PacketType::LinkRequest {
+            return self.forward_link_request(packet, interface_name, now);
+        }
+
+        // 7. Link data routing via link table
+        if self.link_table.contains_key(&destination_hash) {
+            return self.route_link_data(packet, interface_name, now);
+        }
+
+        // 8. Look up destination in path table
         let path_entry = match self.path_table.get(&destination_hash) {
             Some(entry) => entry.clone(),
             None => {
@@ -1007,17 +1113,17 @@ impl Node {
             }
         };
 
-        // 6. Compute reverse key before relay (needs packet data pre-move)
+        // 9. Compute reverse key before relay (needs packet data pre-move)
         let reverse_key = hash::truncated_hash(
             &packet
                 .hashable_part()
                 .expect("hashable_part is infallible for parsed packets"),
         );
 
-        // 7. Relay the packet
+        // 10. Relay the packet
         let actions = self.relay_packet(packet, &path_entry, &interface_name);
 
-        // 8. Only store reverse table entry if relay succeeded
+        // 11. Only store reverse table entry if relay succeeded
         if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
             self.reverse_table.insert(
                 reverse_key,
@@ -1093,6 +1199,293 @@ impl Node {
                 vec![NodeAction::PacketDropped {
                     reason: DropReason::RelaySerializeFailed,
                     interface_name: path_entry.interface_name.clone(),
+                }]
+            }
+        }
+    }
+
+    /// Forward a LinkRequest packet toward its destination and create a link table entry.
+    fn forward_link_request(
+        &mut self,
+        packet: Packet,
+        interface_name: String,
+        now: u64,
+    ) -> Vec<NodeAction> {
+        let destination_hash = packet.header.destination_hash;
+
+        // Look up destination in path table
+        let path_entry = match self.path_table.get(&destination_hash) {
+            Some(entry) => entry.clone(),
+            None => {
+                return vec![NodeAction::PacketDropped {
+                    reason: DropReason::NoRouteForLinkRequest,
+                    interface_name,
+                }];
+            }
+        };
+
+        // Compute link_id from the request packet
+        let link_id = match link::link_id_from_request(&packet) {
+            Ok(id) => id,
+            Err(_) => {
+                return vec![NodeAction::PacketDropped {
+                    reason: DropReason::NoRouteForLinkRequest,
+                    interface_name,
+                }];
+            }
+        };
+
+        let taken_hops = packet.header.hops;
+        let proof_timeout =
+            now + ESTABLISHMENT_TIMEOUT_PER_HOP * (path_entry.hops as u64).max(1);
+
+        // Forward via relay_packet (same Type2→Type1/Type2 conversion as data relay)
+        let actions = self.relay_packet(packet, &path_entry, &interface_name);
+
+        // Only create link table entry if relay succeeded
+        if !actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::PacketDropped { .. }))
+        {
+            self.link_table.insert(
+                link_id,
+                LinkTableEntry {
+                    timestamp: now,
+                    next_hop: path_entry.next_hop,
+                    outbound_interface: path_entry.interface_name.clone(),
+                    remaining_hops: path_entry.hops,
+                    received_interface: interface_name.clone(),
+                    taken_hops,
+                    destination_hash,
+                    validated: false,
+                    proof_timeout,
+                },
+            );
+
+            let mut result = actions;
+            result.push(NodeAction::LinkRequestForwarded {
+                link_id,
+                destination_hash,
+                next_hop: path_entry.next_hop,
+                interface_name: path_entry.interface_name.clone(),
+            });
+            result
+        } else {
+            actions
+        }
+    }
+
+    /// Route an LRPROOF (link proof) back toward the link initiator via the link table.
+    fn route_link_proof(
+        &mut self,
+        packet: &Packet,
+        interface_name: &str,
+        now: u64,
+    ) -> Vec<NodeAction> {
+        let link_id = packet.header.destination_hash;
+
+        let entry = match self.link_table.get_mut(&link_id) {
+            Some(e) => e,
+            None => {
+                return vec![NodeAction::PacketDropped {
+                    reason: DropReason::LinkProofNoEntry,
+                    interface_name: interface_name.to_owned(),
+                }];
+            }
+        };
+
+        // Validate hop count matches expected remaining_hops
+        if packet.header.hops != entry.remaining_hops {
+            return vec![NodeAction::PacketDropped {
+                reason: DropReason::LinkProofHopsMismatch,
+                interface_name: interface_name.to_owned(),
+            }];
+        }
+
+        // Validate proof arrived on the outbound interface (from destination side)
+        if interface_name != entry.outbound_interface {
+            return vec![NodeAction::PacketDropped {
+                reason: DropReason::LinkProofWrongInterface,
+                interface_name: interface_name.to_owned(),
+            }];
+        }
+
+        // Mark entry as validated and update timestamp
+        entry.validated = true;
+        entry.timestamp = now;
+        let target_interface = entry.received_interface.clone();
+
+        // Construct Type1/Broadcast proof packet for the initiator side
+        let forwarded = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    header_type: HeaderType::Type1,
+                    propagation: PropagationType::Broadcast,
+                    ..packet.header.flags
+                },
+                hops: packet.header.hops,
+                transport_id: None,
+                destination_hash: link_id,
+                context: packet.header.context,
+            },
+            data: packet.data.clone(),
+        };
+
+        match forwarded.to_bytes() {
+            Ok(raw) => {
+                let mut actions = self.send_on_interface(&target_interface, &raw);
+                if !actions
+                    .iter()
+                    .any(|a| matches!(a, NodeAction::PacketDropped { .. }))
+                {
+                    actions.push(NodeAction::LinkProofRouted {
+                        link_id,
+                        interface_name: target_interface,
+                    });
+                }
+                actions
+            }
+            Err(_) => {
+                vec![NodeAction::PacketDropped {
+                    reason: DropReason::RelaySerializeFailed,
+                    interface_name: target_interface,
+                }]
+            }
+        }
+    }
+
+    /// Route link data bidirectionally through the link table.
+    ///
+    /// Unlike raw relay, this rewrites transport headers for the next hop:
+    /// - Final hop (directly reachable recipient): Type2 → Type1/Broadcast
+    /// - Intermediate hop toward destination: transport_id = next transport node
+    /// - Intermediate hop toward initiator: best-effort (multi-hop reverse path
+    ///   is a known limitation — deferred to a future bead)
+    fn route_link_data(
+        &mut self,
+        packet: Packet,
+        interface_name: String,
+        now: u64,
+    ) -> Vec<NodeAction> {
+        let link_id = packet.header.destination_hash;
+
+        // Determine the target interface and direction based on which side
+        // the packet arrived from. `toward_destination` is true when forwarding
+        // from the initiator side toward the link destination.
+        let (target_interface, toward_destination) = {
+            let entry = self.link_table.get(&link_id).unwrap();
+
+            if entry.outbound_interface == entry.received_interface {
+                // Same-interface case: use hops to distinguish direction
+                if packet.header.hops == entry.taken_hops {
+                    (Some(entry.outbound_interface.clone()), true)
+                } else if packet.header.hops == entry.remaining_hops {
+                    (Some(entry.outbound_interface.clone()), false)
+                } else {
+                    (None, false)
+                }
+            } else if interface_name == entry.outbound_interface
+                && packet.header.hops == entry.remaining_hops
+            {
+                // From destination side → forward to initiator
+                (Some(entry.received_interface.clone()), false)
+            } else if interface_name == entry.received_interface
+                && packet.header.hops == entry.taken_hops
+            {
+                // From initiator side → forward to destination
+                (Some(entry.outbound_interface.clone()), true)
+            } else {
+                (None, false)
+            }
+        };
+
+        let target = match target_interface {
+            Some(t) => t,
+            None => {
+                // No matching direction — silently drop
+                return vec![NodeAction::PacketDropped {
+                    reason: DropReason::NoLocalDestination,
+                    interface_name,
+                }];
+            }
+        };
+
+        // Rewrite transport headers for the next hop.
+        let entry = self.link_table.get(&link_id).unwrap();
+        let same_interface_equidistant = entry.outbound_interface == entry.received_interface
+            && entry.taken_hops == entry.remaining_hops;
+        let is_final_hop = if same_interface_equidistant {
+            // Both endpoints on the same broadcast medium at equal distance:
+            // direction is ambiguous but both are directly reachable, so
+            // always convert to Type1/Broadcast.
+            true
+        } else if toward_destination {
+            // Final hop: next_hop IS the actual destination
+            entry.next_hop == entry.destination_hash
+        } else {
+            // Final hop toward initiator: request came directly (single hop)
+            entry.taken_hops <= 1
+        };
+        let next_hop = entry.next_hop;
+
+        let forwarded = if is_final_hop {
+            // Final hop: convert Type2 → Type1 (direct delivery)
+            Packet {
+                header: PacketHeader {
+                    flags: PacketFlags {
+                        header_type: HeaderType::Type1,
+                        propagation: PropagationType::Broadcast,
+                        ..packet.header.flags
+                    },
+                    hops: packet.header.hops,
+                    transport_id: None,
+                    destination_hash: link_id,
+                    context: packet.header.context,
+                },
+                data: packet.data,
+            }
+        } else if toward_destination {
+            // Intermediate hop toward destination: address to next transport
+            Packet {
+                header: PacketHeader {
+                    flags: packet.header.flags,
+                    hops: packet.header.hops,
+                    transport_id: Some(next_hop),
+                    destination_hash: link_id,
+                    context: packet.header.context,
+                },
+                data: packet.data,
+            }
+        } else {
+            // Intermediate hop toward initiator: multi-hop reverse path is
+            // unknown (we don't store the previous transport identity).
+            // Preserve existing headers as best-effort. Full multi-transport-hop
+            // reverse routing is deferred to a future bead.
+            packet
+        };
+
+        match forwarded.to_bytes() {
+            Ok(raw) => {
+                let mut actions = self.send_on_interface(&target, &raw);
+                if !actions
+                    .iter()
+                    .any(|a| matches!(a, NodeAction::PacketDropped { .. }))
+                {
+                    // Update timestamp to keep validated links alive
+                    if let Some(entry) = self.link_table.get_mut(&link_id) {
+                        entry.timestamp = now;
+                    }
+                    actions.push(NodeAction::LinkDataRouted {
+                        link_id,
+                        interface_name: target,
+                    });
+                }
+                actions
+            }
+            Err(_) => {
+                vec![NodeAction::PacketDropped {
+                    reason: DropReason::RelaySerializeFailed,
+                    interface_name: target,
                 }]
             }
         }
@@ -3658,5 +4051,811 @@ mod tests {
             },
         );
         assert_eq!(node.reverse_table_len(), 1);
+    }
+
+    // ── Link table test helpers ──────────────────────────────────────
+
+    /// Create a transport node with "eth0" and "wlan0", with a path table
+    /// entry for `remote_dest` reachable via next_hop on "wlan0" at given hops.
+    /// Returns (node, transport_hash, dest_hash).
+    fn make_link_relay_node(
+        remote_dest: DestinationHash,
+        next_hop: DestinationHash,
+        hops: u8,
+    ) -> (Node, [u8; 16]) {
+        let (mut node, th) = make_transport_node();
+        let mut random_blob = [0u8; crate::path_table::RANDOM_BLOB_LENGTH];
+        random_blob[0] = 1;
+        let ts: u64 = 1000;
+        let ts_bytes = ts.to_be_bytes();
+        random_blob[5..10].copy_from_slice(&ts_bytes[3..8]);
+        node.path_table.update(
+            remote_dest,
+            next_hop,
+            hops,
+            "wlan0".into(),
+            dest(99),
+            random_blob,
+            InterfaceMode::Full,
+            1000,
+        );
+        (node, th)
+    }
+
+    /// Build a Type2 LinkRequest packet (raw bytes) addressed to a transport.
+    fn make_link_request_raw(
+        transport_id: [u8; 16],
+        dest_hash: DestinationHash,
+        hops: u8,
+    ) -> Vec<u8> {
+        // LinkRequest data: [x25519_pub:32][ed25519_pub:32][signalling:3] = 67 bytes
+        let mut data = vec![0u8; 67];
+        // Fill with deterministic but non-zero data so hashable_part is meaningful
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_add(dest_hash[0]);
+        }
+        Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type2,
+                    context_flag: false,
+                    propagation: PropagationType::Transport,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::LinkRequest,
+                },
+                hops,
+                transport_id: Some(transport_id),
+                destination_hash: dest_hash,
+                context: PacketContext::None,
+            },
+            data,
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    /// Build a Type1 LRPROOF packet (raw bytes).
+    fn make_lrproof_raw(link_id: DestinationHash, hops: u8) -> Vec<u8> {
+        Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: true,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Link,
+                    packet_type: PacketType::Proof,
+                },
+                hops,
+                transport_id: None,
+                destination_hash: link_id,
+                context: PacketContext::LrProof,
+            },
+            data: vec![0xBB; 99], // Proof data (signature + x25519 + signalling)
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    /// Build a Type2 link data packet (raw bytes) with given dest_hash (link_id).
+    fn make_link_data_raw(
+        transport_id: [u8; 16],
+        link_id: DestinationHash,
+        hops: u8,
+    ) -> Vec<u8> {
+        Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type2,
+                    context_flag: false,
+                    propagation: PropagationType::Transport,
+                    destination_type: DestinationType::Link,
+                    packet_type: PacketType::Data,
+                },
+                hops,
+                transport_id: Some(transport_id),
+                destination_hash: link_id,
+                context: PacketContext::None,
+            },
+            data: vec![0xCC; 20],
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    /// Compute the link_id for a LinkRequest going through a transport node.
+    fn link_id_for_request(
+        transport_id: [u8; 16],
+        dest_hash: DestinationHash,
+        hops: u8,
+    ) -> DestinationHash {
+        let mut data = vec![0u8; 67];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_add(dest_hash[0]);
+        }
+        let pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type2,
+                    context_flag: false,
+                    propagation: PropagationType::Transport,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::LinkRequest,
+                },
+                hops,
+                transport_id: Some(transport_id),
+                destination_hash: dest_hash,
+                context: PacketContext::None,
+            },
+            data,
+        };
+        crate::link::link_id_from_request(&pkt).unwrap()
+    }
+
+    // ── Link ID helper ───────────────────────────────────────────────
+
+    #[test]
+    fn link_id_from_request_matches_initiate() {
+        let responder_priv = PrivateIdentity::generate(&mut OsRng);
+        let responder_pub = responder_priv.public_identity();
+        let dest_name = DestinationName::from_name("testapp", &["link"]).unwrap();
+
+        let (_link, request_packet) =
+            crate::link::Link::initiate(&mut OsRng, responder_pub, &dest_name).unwrap();
+
+        let helper_id = crate::link::link_id_from_request(&request_packet).unwrap();
+        assert_eq!(helper_id, *_link.link_id());
+    }
+
+    // ── LinkRequest forwarding ───────────────────────────────────────
+
+    #[test]
+    fn transport_forwards_link_request() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+        let raw = make_link_request_raw(th, remote, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let has_send = actions.iter().any(|a| matches!(a, NodeAction::SendOnInterface { .. }));
+        let has_forwarded = actions.iter().any(|a| matches!(a, NodeAction::LinkRequestForwarded { .. }));
+        assert!(has_send, "expected SendOnInterface");
+        assert!(has_forwarded, "expected LinkRequestForwarded");
+    }
+
+    #[test]
+    fn link_request_creates_link_table_entry() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+        assert_eq!(node.link_table_len(), 0);
+
+        let raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        assert_eq!(node.link_table_len(), 1);
+
+        let link_id = link_id_for_request(th, remote, 0);
+        let entry = node.link_table.get(&link_id).expect("entry should exist");
+        assert_eq!(entry.outbound_interface, "wlan0");
+        assert_eq!(entry.received_interface, "eth0");
+        assert_eq!(entry.remaining_hops, 3);
+        assert_eq!(entry.taken_hops, 1); // hops 0 on wire, pipeline increments to 1
+        assert!(!entry.validated);
+    }
+
+    #[test]
+    fn link_request_no_route_drops() {
+        let (mut node, th) = make_transport_node();
+        // No path table entry for dest(50)
+        let raw = make_link_request_raw(th, dest(50), 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let dropped = actions.iter().find_map(|a| match a {
+            NodeAction::PacketDropped { reason, .. } => Some(reason),
+            _ => None,
+        });
+        assert_eq!(dropped, Some(&DropReason::NoRouteForLinkRequest));
+        assert_eq!(node.link_table_len(), 0);
+    }
+
+    #[test]
+    fn link_request_failed_relay_no_entry() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        // Remove the outbound interface so relay will fail
+        node.interfaces.remove("wlan0");
+
+        let raw = make_link_request_raw(th, remote, 0);
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        assert_eq!(node.link_table_len(), 0, "failed relay should not create link table entry");
+    }
+
+    // ── Link proof routing ───────────────────────────────────────────
+
+    #[test]
+    fn link_proof_routes_via_link_table() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        // Forward a link request to create the entry
+        let req_raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+        assert_eq!(node.link_table_len(), 1);
+
+        // Send LRPROOF with matching link_id and correct hops
+        let link_id = link_id_for_request(th, remote, 0);
+        let entry = node.link_table.get(&link_id).unwrap();
+        let remaining_hops = entry.remaining_hops;
+
+        // LRPROOF arrives on outbound_interface with remaining_hops
+        // Wire hops = remaining_hops - 1 (pipeline will increment)
+        let proof_raw = make_lrproof_raw(link_id, remaining_hops.saturating_sub(1));
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        let routed = actions.iter().any(|a| matches!(a, NodeAction::LinkProofRouted { .. }));
+        assert!(routed, "expected LinkProofRouted");
+
+        // Should be sent on "eth0" (the received_interface)
+        let send = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { interface_name, .. } => Some(interface_name.as_str()),
+            _ => None,
+        });
+        assert_eq!(send, Some("eth0"), "proof should route back on received interface");
+    }
+
+    #[test]
+    fn link_proof_marks_validated() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        let req_raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, remote, 0);
+        let remaining_hops = node.link_table.get(&link_id).unwrap().remaining_hops;
+        assert!(!node.link_table.get(&link_id).unwrap().validated);
+
+        let proof_raw = make_lrproof_raw(link_id, remaining_hops.saturating_sub(1));
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        assert!(node.link_table.get(&link_id).unwrap().validated);
+    }
+
+    #[test]
+    fn link_proof_no_entry_dropped() {
+        let (mut node, _th) = make_transport_node();
+        let unknown_link_id = dest(88);
+        let proof_raw = make_lrproof_raw(unknown_link_id, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2000,
+        });
+
+        let dropped = actions.iter().find_map(|a| match a {
+            NodeAction::PacketDropped { reason, .. } => Some(reason),
+            _ => None,
+        });
+        assert_eq!(dropped, Some(&DropReason::LinkProofNoEntry));
+    }
+
+    #[test]
+    fn link_proof_hops_mismatch_dropped() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        let req_raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, remote, 0);
+
+        // Send proof with wrong hops (0 on wire → 1 after increment, but remaining=3)
+        let proof_raw = make_lrproof_raw(link_id, 0);
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        let dropped = actions.iter().find_map(|a| match a {
+            NodeAction::PacketDropped { reason, .. } => Some(reason),
+            _ => None,
+        });
+        assert_eq!(dropped, Some(&DropReason::LinkProofHopsMismatch));
+    }
+
+    #[test]
+    fn link_proof_wrong_interface_dropped() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        let req_raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, remote, 0);
+        let remaining_hops = node.link_table.get(&link_id).unwrap().remaining_hops;
+
+        // Send proof on "eth0" instead of "wlan0" (the outbound_interface)
+        let proof_raw = make_lrproof_raw(link_id, remaining_hops.saturating_sub(1));
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        let dropped = actions.iter().find_map(|a| match a {
+            NodeAction::PacketDropped { reason, .. } => Some(reason),
+            _ => None,
+        });
+        assert_eq!(dropped, Some(&DropReason::LinkProofWrongInterface));
+    }
+
+    // ── Link data routing ────────────────────────────────────────────
+
+    #[test]
+    fn link_data_routes_initiator_to_destination() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        // Forward LinkRequest to create link table entry
+        let req_raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, remote, 0);
+        let entry = node.link_table.get(&link_id).unwrap();
+        // Mark validated so we know it's a live link
+        let taken_hops = entry.taken_hops;
+
+        // Validate the link (route a proof through)
+        let remaining_hops = entry.remaining_hops;
+        let proof_raw = make_lrproof_raw(link_id, remaining_hops.saturating_sub(1));
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        // Send link data from initiator side (received_interface="eth0", taken_hops)
+        // Wire hops = taken_hops - 1 (pipeline will increment)
+        let data_raw = make_link_data_raw(th, link_id, taken_hops.saturating_sub(1));
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: data_raw,
+            now: 2002,
+        });
+
+        let routed = actions.iter().any(|a| matches!(a, NodeAction::LinkDataRouted { .. }));
+        assert!(routed, "expected LinkDataRouted");
+
+        // Should be sent on "wlan0" (toward destination)
+        let send_action = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface {
+                interface_name,
+                raw,
+            } => Some((interface_name.as_str(), raw.clone())),
+            _ => None,
+        });
+        let (iface, raw) = send_action.unwrap();
+        assert_eq!(iface, "wlan0");
+
+        // Final hop (next_hop == destination): should be converted to Type1
+        assert_eq!(raw[0] & 0x40, 0, "expected Type1 header (final hop toward destination)");
+    }
+
+    #[test]
+    fn link_data_routes_destination_to_initiator() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        let req_raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, remote, 0);
+        let remaining_hops = node.link_table.get(&link_id).unwrap().remaining_hops;
+
+        // Validate the link
+        let proof_raw = make_lrproof_raw(link_id, remaining_hops.saturating_sub(1));
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        // Send link data from destination side (outbound_interface="wlan0", remaining_hops)
+        // Wire hops = remaining_hops - 1 (pipeline will increment)
+        let data_raw = make_link_data_raw(th, link_id, remaining_hops.saturating_sub(1));
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: data_raw,
+            now: 2002,
+        });
+
+        let routed = actions.iter().any(|a| matches!(a, NodeAction::LinkDataRouted { .. }));
+        assert!(routed, "expected LinkDataRouted");
+
+        // Should be sent on "eth0" (toward initiator)
+        let send_action = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface {
+                interface_name,
+                raw,
+            } => Some((interface_name.as_str(), raw.clone())),
+            _ => None,
+        });
+        let (iface, raw) = send_action.unwrap();
+        assert_eq!(iface, "eth0");
+
+        // Single-hop initiator (taken_hops==1): should be converted to Type1
+        assert_eq!(raw[0] & 0x40, 0, "expected Type1 header (final hop toward initiator)");
+    }
+
+    #[test]
+    fn link_data_updates_timestamp() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        let req_raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, remote, 0);
+        let entry = node.link_table.get(&link_id).unwrap();
+        let remaining_hops = entry.remaining_hops;
+        assert_eq!(entry.timestamp, 2000);
+
+        // Validate the link
+        let proof_raw = make_lrproof_raw(link_id, remaining_hops.saturating_sub(1));
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        // Send link data
+        let data_raw = make_link_data_raw(th, link_id, remaining_hops.saturating_sub(1));
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: data_raw,
+            now: 3000,
+        });
+
+        assert_eq!(node.link_table.get(&link_id).unwrap().timestamp, 3000);
+    }
+
+    #[test]
+    fn link_data_unknown_link_falls_through() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+        // No link table entry — this is a normal data packet
+        let raw = make_type2_data_raw(th, remote, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        // Should fall through to normal path relay
+        let relayed = actions.iter().any(|a| matches!(a, NodeAction::PacketRelayed { .. }));
+        assert!(relayed, "should fall through to normal path relay");
+    }
+
+    #[test]
+    fn link_data_equidistant_same_interface_routes_correctly() {
+        // When taken_hops == remaining_hops on the same interface, direction
+        // is ambiguous. Both endpoints are on the same broadcast medium, so
+        // the transport should produce Type1/Broadcast regardless of direction.
+        let remote = dest(42);
+        let (mut node, th) = make_transport_node();
+
+        // Path entry on "eth0" with hops=2 (same interface + same hops as request)
+        let mut random_blob = [0u8; crate::path_table::RANDOM_BLOB_LENGTH];
+        random_blob[0] = 1;
+        let ts: u64 = 1000;
+        let ts_bytes = ts.to_be_bytes();
+        random_blob[5..10].copy_from_slice(&ts_bytes[3..8]);
+        node.path_table.update(
+            remote,
+            remote, // next_hop == destination (final hop toward dest)
+            2,      // remaining_hops = 2
+            "eth0".into(),
+            dest(99),
+            random_blob,
+            InterfaceMode::Full,
+            1000,
+        );
+
+        // LinkRequest arrives on "eth0" with wire hops=1 (→ taken_hops=2 after increment)
+        // This gives: outbound_interface="eth0", received_interface="eth0", taken_hops=2, remaining_hops=2
+        let req_raw = make_link_request_raw(th, remote, 1);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, remote, 1);
+        let entry = node.link_table.get(&link_id).unwrap();
+        assert_eq!(entry.taken_hops, entry.remaining_hops, "precondition: equidistant");
+        assert_eq!(entry.outbound_interface, entry.received_interface, "precondition: same interface");
+        let equidistant_hops = entry.taken_hops;
+
+        // Validate the link (proof arrives on "eth0" = outbound_interface)
+        let proof_raw = make_lrproof_raw(link_id, equidistant_hops.saturating_sub(1));
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        // Send link data with matching hops (wire = equidistant_hops - 1, becomes equidistant_hops)
+        let data_raw = make_link_data_raw(th, link_id, equidistant_hops.saturating_sub(1));
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: data_raw,
+            now: 2002,
+        });
+
+        let routed = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::LinkDataRouted { .. }));
+        assert!(routed, "equidistant link data should be routed");
+
+        // Must produce Type1 header (final hop on shared medium)
+        let send_action = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { raw, .. } => Some(raw.clone()),
+            _ => None,
+        });
+        let raw = send_action.unwrap();
+        assert_eq!(
+            raw[0] & 0x40,
+            0,
+            "equidistant same-interface must produce Type1 (not Type2)"
+        );
+    }
+
+    // ── Dedup exemption ──────────────────────────────────────────────
+
+    #[test]
+    fn lrproof_not_deduplicated() {
+        let (mut node, th) = make_link_relay_node(dest(42), dest(42), 3);
+
+        // Forward a link request first to create the entry
+        let req_raw = make_link_request_raw(th, dest(42), 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, dest(42), 0);
+        let remaining_hops = node.link_table.get(&link_id).unwrap().remaining_hops;
+
+        // Send same LRPROOF twice
+        let proof_raw = make_lrproof_raw(link_id, remaining_hops.saturating_sub(1));
+
+        let actions1 = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw.clone(),
+            now: 2001,
+        });
+        let routed1 = actions1.iter().any(|a| matches!(a, NodeAction::LinkProofRouted { .. }));
+        assert!(routed1, "first LRPROOF should route");
+
+        // Second identical LRPROOF — should NOT be deduplicated
+        let actions2 = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2002,
+        });
+        let was_deduplicated = actions2.iter().any(|a| matches!(
+            a,
+            NodeAction::PacketDropped { reason: DropReason::DuplicatePacket, .. }
+        ));
+        assert!(!was_deduplicated, "LRPROOF should not be deduplicated");
+    }
+
+    // ── Link table expiry ────────────────────────────────────────────
+
+    #[test]
+    fn validated_link_expires_after_timeout() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        let req_raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, remote, 0);
+        let remaining_hops = node.link_table.get(&link_id).unwrap().remaining_hops;
+
+        // Validate the link
+        let proof_raw = make_lrproof_raw(link_id, remaining_hops.saturating_sub(1));
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+        assert!(node.link_table.get(&link_id).unwrap().validated);
+
+        // Timer tick past LINK_TIMEOUT
+        let actions = node.handle_event(NodeEvent::TimerTick {
+            now: 2001 + LINK_TIMEOUT + 1,
+        });
+
+        assert_eq!(node.link_table_len(), 0);
+        let expired = actions.iter().any(|a| matches!(a, NodeAction::LinkTableExpired { count: 1 }));
+        assert!(expired, "expected LinkTableExpired action");
+    }
+
+    #[test]
+    fn unvalidated_link_expires_after_proof_timeout() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        let req_raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+        assert_eq!(node.link_table_len(), 1);
+
+        let link_id = link_id_for_request(th, remote, 0);
+        let entry = node.link_table.get(&link_id).unwrap();
+        assert!(!entry.validated);
+        let proof_timeout = entry.proof_timeout;
+
+        // Timer tick past proof_timeout
+        let actions = node.handle_event(NodeEvent::TimerTick {
+            now: proof_timeout,
+        });
+
+        assert_eq!(node.link_table_len(), 0);
+        let expired = actions.iter().any(|a| matches!(a, NodeAction::LinkTableExpired { count: 1 }));
+        assert!(expired, "expected LinkTableExpired action");
+    }
+
+    #[test]
+    fn active_link_kept_by_data_traffic() {
+        let remote = dest(42);
+        let (mut node, th) = make_link_relay_node(remote, remote, 3);
+
+        let req_raw = make_link_request_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, remote, 0);
+        let remaining_hops = node.link_table.get(&link_id).unwrap().remaining_hops;
+
+        // Validate
+        let proof_raw = make_lrproof_raw(link_id, remaining_hops.saturating_sub(1));
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        // Send data traffic just before timeout would expire
+        let refresh_time = 2001 + LINK_TIMEOUT - 10;
+        let data_raw = make_link_data_raw(th, link_id, remaining_hops.saturating_sub(1));
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: data_raw,
+            now: refresh_time,
+        });
+
+        // Timer tick past original timeout but within refreshed window
+        node.handle_event(NodeEvent::TimerTick {
+            now: 2001 + LINK_TIMEOUT + 1,
+        });
+        assert_eq!(node.link_table_len(), 1, "data traffic should keep link alive");
+
+        // Timer tick past refreshed timeout
+        let actions = node.handle_event(NodeEvent::TimerTick {
+            now: refresh_time + LINK_TIMEOUT + 1,
+        });
+        assert_eq!(node.link_table_len(), 0, "link should expire after inactivity");
+        let expired = actions.iter().any(|a| matches!(a, NodeAction::LinkTableExpired { .. }));
+        assert!(expired);
+    }
+
+    // ── Edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn leaf_node_drops_link_request() {
+        let mut node = make_node_with_interface();
+        // Build a Type2 LinkRequest addressed to some transport — but node is leaf
+        let raw = make_link_request_raw(dest(99), dest(42), 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let dropped = actions.iter().find_map(|a| match a {
+            NodeAction::PacketDropped { reason, .. } => Some(reason),
+            _ => None,
+        });
+        assert_eq!(dropped, Some(&DropReason::NoLocalDestination));
+    }
+
+    #[test]
+    fn link_table_len_accessor() {
+        let (mut node, th) = make_link_relay_node(dest(42), dest(42), 3);
+        assert_eq!(node.link_table_len(), 0);
+
+        let req_raw = make_link_request_raw(th, dest(42), 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+        assert_eq!(node.link_table_len(), 1);
     }
 }
