@@ -173,7 +173,7 @@ impl PubSubRouter {
     pub fn handle_event(
         &mut self,
         event: PubSubEvent,
-        _session: &Session,
+        session: &Session,
     ) -> Result<Vec<PubSubAction>, ZenohError> {
         match event {
             PubSubEvent::SubscriberDeclared { key_expr } => {
@@ -182,8 +182,37 @@ impl PubSubRouter {
             PubSubEvent::SubscriberUndeclared { key_expr } => {
                 self.handle_subscriber_undeclared(key_expr)
             }
-            PubSubEvent::MessageReceived { .. } => Ok(vec![]),
+            PubSubEvent::MessageReceived { expr_id, payload } => {
+                self.handle_message_received(expr_id, payload, session)
+            }
         }
+    }
+
+    fn handle_message_received(
+        &self,
+        expr_id: ExprId,
+        payload: Vec<u8>,
+        session: &Session,
+    ) -> Result<Vec<PubSubAction>, ZenohError> {
+        let key_expr_str = session
+            .resolve_remote(expr_id)
+            .ok_or(ZenohError::UnknownExprId(expr_id))?;
+        let key = keyexpr::new(key_expr_str)
+            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let matches = self.subscriptions.matches(key);
+
+        if matches.is_empty() {
+            return Ok(vec![]);
+        }
+
+        Ok(matches
+            .into_iter()
+            .map(|sub_id| PubSubAction::Deliver {
+                subscription_id: sub_id,
+                key_expr: key_expr_str.to_string(),
+                payload: payload.clone(),
+            })
+            .collect())
     }
 
     fn handle_subscriber_declared(
@@ -377,5 +406,125 @@ mod tests {
             result,
             Err(ZenohError::UnknownSubscriptionId(999))
         ));
+    }
+
+    #[test]
+    fn inbound_message_with_matching_subscriber_delivers() {
+        let (mut alice, mut bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        // Alice subscribes to channel messages
+        let (sub_id, _) = router
+            .subscribe("harmony/server/srv1/channel/*/msg")
+            .unwrap();
+
+        // Bob declares a resource (simulated: alice receives ResourceDeclared event)
+        let (expr_id, _) = bob
+            .declare_resource("harmony/server/srv1/channel/general/msg".into())
+            .unwrap();
+        alice
+            .handle_event(SessionEvent::ResourceDeclared {
+                expr_id,
+                key_expr: "harmony/server/srv1/channel/general/msg".into(),
+            })
+            .unwrap();
+
+        // Inbound message from bob
+        let actions = router
+            .handle_event(
+                PubSubEvent::MessageReceived {
+                    expr_id,
+                    payload: b"hello".to_vec(),
+                },
+                &alice,
+            )
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            PubSubAction::Deliver {
+                subscription_id,
+                key_expr,
+                payload,
+            } if *subscription_id == sub_id
+                && key_expr == "harmony/server/srv1/channel/general/msg"
+                && payload == b"hello"
+        ));
+    }
+
+    #[test]
+    fn inbound_message_with_no_matching_subscriber_drops() {
+        let (mut alice, mut bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        // No local subscriptions
+
+        // Bob declares a resource
+        let (expr_id, _) = bob
+            .declare_resource("harmony/server/srv1/channel/general/msg".into())
+            .unwrap();
+        alice
+            .handle_event(SessionEvent::ResourceDeclared {
+                expr_id,
+                key_expr: "harmony/server/srv1/channel/general/msg".into(),
+            })
+            .unwrap();
+
+        let actions = router
+            .handle_event(
+                PubSubEvent::MessageReceived {
+                    expr_id,
+                    payload: b"hello".to_vec(),
+                },
+                &alice,
+            )
+            .unwrap();
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn inbound_message_with_multiple_subscribers_delivers_to_all() {
+        let (mut alice, mut bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        // Two overlapping subscriptions
+        let (sub1, _) = router
+            .subscribe("harmony/server/srv1/channel/*/msg")
+            .unwrap();
+        let (sub2, _) = router.subscribe("harmony/**").unwrap();
+
+        // Bob declares a resource
+        let (expr_id, _) = bob
+            .declare_resource("harmony/server/srv1/channel/general/msg".into())
+            .unwrap();
+        alice
+            .handle_event(SessionEvent::ResourceDeclared {
+                expr_id,
+                key_expr: "harmony/server/srv1/channel/general/msg".into(),
+            })
+            .unwrap();
+
+        let actions = router
+            .handle_event(
+                PubSubEvent::MessageReceived {
+                    expr_id,
+                    payload: b"hello".to_vec(),
+                },
+                &alice,
+            )
+            .unwrap();
+        assert_eq!(actions.len(), 2);
+
+        let sub_ids: Vec<SubscriptionId> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PubSubAction::Deliver {
+                    subscription_id, ..
+                } => Some(*subscription_id),
+                _ => None,
+            })
+            .collect();
+        assert!(sub_ids.contains(&sub1));
+        assert!(sub_ids.contains(&sub2));
     }
 }
