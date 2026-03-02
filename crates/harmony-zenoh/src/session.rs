@@ -226,6 +226,36 @@ impl Session {
         }
     }
 
+    /// Declare a local resource, allocating the next ExprId.
+    pub fn declare_resource(&mut self, key_expr: String) -> (ExprId, Vec<SessionAction>) {
+        let expr_id = self.next_expr_id;
+        self.next_expr_id += 1;
+        self.local_resources.insert(expr_id, key_expr.clone());
+        let actions = vec![SessionAction::SendResourceDeclare { expr_id, key_expr }];
+        (expr_id, actions)
+    }
+
+    /// Undeclare a local resource.
+    pub fn undeclare_resource(
+        &mut self,
+        expr_id: ExprId,
+    ) -> Result<Vec<SessionAction>, ZenohError> {
+        if self.local_resources.remove(&expr_id).is_none() {
+            return Err(ZenohError::UnknownExprId(expr_id));
+        }
+        Ok(vec![SessionAction::SendResourceUndeclare { expr_id }])
+    }
+
+    /// Look up a remote resource's key expression by ExprId.
+    pub fn resolve_remote(&self, expr_id: ExprId) -> Option<&str> {
+        self.remote_resources.get(&expr_id).map(|s| s.as_str())
+    }
+
+    /// Look up a local resource's key expression by ExprId.
+    pub fn resolve_local(&self, expr_id: ExprId) -> Option<&str> {
+        self.local_resources.get(&expr_id).map(|s| s.as_str())
+    }
+
     // Stub methods — implemented in later tasks
     fn handle_timer_tick(&mut self, _now_ms: u64) -> Result<Vec<SessionAction>, ZenohError> {
         Ok(vec![])
@@ -233,17 +263,26 @@ impl Session {
 
     fn handle_resource_declared(
         &mut self,
-        _expr_id: ExprId,
-        _key_expr: String,
+        expr_id: ExprId,
+        key_expr: String,
     ) -> Result<Vec<SessionAction>, ZenohError> {
-        Ok(vec![])
+        self.last_received_ms = self.last_tick_ms;
+        if self.remote_resources.contains_key(&expr_id) {
+            return Err(ZenohError::DuplicateExprId(expr_id));
+        }
+        self.remote_resources.insert(expr_id, key_expr.clone());
+        Ok(vec![SessionAction::ResourceAdded { expr_id, key_expr }])
     }
 
     fn handle_resource_undeclared(
         &mut self,
-        _expr_id: ExprId,
+        expr_id: ExprId,
     ) -> Result<Vec<SessionAction>, ZenohError> {
-        Ok(vec![])
+        self.last_received_ms = self.last_tick_ms;
+        if self.remote_resources.remove(&expr_id).is_none() {
+            return Err(ZenohError::UnknownExprId(expr_id));
+        }
+        Ok(vec![SessionAction::ResourceRemoved { expr_id }])
     }
 
     fn handle_keepalive_received(&mut self) -> Result<Vec<SessionAction>, ZenohError> {
@@ -404,5 +443,88 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(alice.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn resource_declare_undeclare_lifecycle() {
+        let (mut alice, alice_actions, mut bob, bob_actions) = create_session_pair();
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+
+        // Alice declares a local resource
+        let (expr_id, actions) = alice.declare_resource("harmony/server/srv1/channel/general/msg".into());
+        assert_eq!(expr_id, 1);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            SessionAction::SendResourceDeclare { expr_id: 1, key_expr } if key_expr == "harmony/server/srv1/channel/general/msg"
+        ));
+
+        // Bob receives the declaration
+        let actions = bob
+            .handle_event(SessionEvent::ResourceDeclared {
+                expr_id: 1,
+                key_expr: "harmony/server/srv1/channel/general/msg".into(),
+            })
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            SessionAction::ResourceAdded { expr_id: 1, key_expr } if key_expr == "harmony/server/srv1/channel/general/msg"
+        ));
+
+        // Bob can resolve the remote resource
+        assert_eq!(
+            bob.resolve_remote(1),
+            Some("harmony/server/srv1/channel/general/msg")
+        );
+
+        // Bob receives undeclare
+        let actions = bob
+            .handle_event(SessionEvent::ResourceUndeclared { expr_id: 1 })
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], SessionAction::ResourceRemoved { expr_id: 1 }));
+        assert_eq!(bob.resolve_remote(1), None);
+    }
+
+    #[test]
+    fn duplicate_expr_id_rejected() {
+        let (mut alice, alice_actions, mut bob, bob_actions) = create_session_pair();
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+
+        bob.handle_event(SessionEvent::ResourceDeclared {
+            expr_id: 5,
+            key_expr: "harmony/dm/abc/msg".into(),
+        })
+        .unwrap();
+
+        let result = bob.handle_event(SessionEvent::ResourceDeclared {
+            expr_id: 5,
+            key_expr: "harmony/dm/xyz/msg".into(),
+        });
+        assert!(matches!(result, Err(ZenohError::DuplicateExprId(5))));
+    }
+
+    #[test]
+    fn unknown_expr_id_undeclare_rejected() {
+        let (mut alice, alice_actions, mut bob, bob_actions) = create_session_pair();
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+
+        let result = bob.handle_event(SessionEvent::ResourceUndeclared { expr_id: 99 });
+        assert!(matches!(result, Err(ZenohError::UnknownExprId(99))));
+    }
+
+    #[test]
+    fn local_expr_id_monotonic() {
+        let (mut alice, alice_actions, mut bob, bob_actions) = create_session_pair();
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+
+        let (id1, _) = alice.declare_resource("harmony/server/a/msg".into());
+        let (id2, _) = alice.declare_resource("harmony/server/b/msg".into());
+        let (id3, _) = alice.declare_resource("harmony/server/c/msg".into());
+
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
     }
 }
