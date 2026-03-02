@@ -67,6 +67,17 @@ fn decode_signalling(bytes: &[u8; SIGNALLING_SIZE]) -> (u32, u8) {
     (mtu, mode)
 }
 
+// ── Public helpers ──────────────────────────────────────────────────
+
+/// Compute the link_id for a LinkRequest packet.
+///
+/// This is the same computation that [`Link::initiate`] and [`Link::respond`]
+/// use internally: `truncated_hash(hashable_part())`.
+pub fn link_id_from_request(packet: &Packet) -> Result<[u8; 16], ReticulumError> {
+    let hp = packet.hashable_part()?;
+    Ok(hash::truncated_hash(&hp))
+}
+
 // ── Link state machine ──────────────────────────────────────────────
 
 /// Link state in the handshake protocol.
