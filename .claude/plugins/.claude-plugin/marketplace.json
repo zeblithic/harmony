@@ -1,0 +1,16 @@
+{
+  "name": "harmony-plugins",
+  "description": "Project-local plugins for zeblithic/harmony",
+  "owner": {
+    "name": "zeblithic",
+    "homepage": "https://github.com/zeblithic/harmony"
+  },
+  "plugins": [
+    {
+      "name": "harmony-deliver",
+      "description": "Delivery workflow — commit, push, PR, trigger agent reviews",
+      "source": "./harmony-deliver",
+      "category": "productivity"
+    }
+  ]
+}

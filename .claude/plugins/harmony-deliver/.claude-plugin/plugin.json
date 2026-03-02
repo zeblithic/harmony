@@ -1,0 +1,8 @@
+{
+  "name": "harmony-deliver",
+  "description": "Delivery workflow for zeblithic/harmony — commit, push, PR, and trigger agent reviews",
+  "version": "1.0.0",
+  "author": {
+    "name": "zeblithic"
+  }
+}

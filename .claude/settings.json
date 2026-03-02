@@ -1,0 +1,13 @@
+{
+  "enabledPlugins": {
+    "harmony-deliver@harmony-plugins": true
+  },
+  "extraKnownMarketplaces": {
+    "harmony-plugins": {
+      "source": {
+        "source": "directory",
+        "path": "./.claude/plugins"
+      }
+    }
+  }
+}

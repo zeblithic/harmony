@@ -14,7 +14,7 @@ use crate::packet::{
     DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
 };
 use crate::packet_hashlist::PacketHashlist;
-use crate::path_table::{DestinationHash, PathTable, PathUpdateResult};
+use crate::path_table::{DestinationHash, PathEntry, PathTable, PathUpdateResult};
 
 // ── Constants (transport-mode announce propagation) ──────────────────────
 
@@ -30,6 +30,10 @@ const LOCAL_REBROADCASTS_MAX: u8 = 2;
 /// Announce rate table entries unseen for this many seconds are evicted.
 /// Matches the shortest path expiry (Roaming = 6 hours).
 const RATE_TABLE_EXPIRY: u64 = 21_600;
+
+/// Reverse table entries older than this are expired (8 minutes).
+/// Matches Python `Transport.REVERSE_TIMEOUT`.
+const REVERSE_TIMEOUT: u64 = 480;
 
 
 // ── Types ───────────────────────────────────────────────────────────────
@@ -102,6 +106,18 @@ struct AnnounceTableEntry {
     packet_data: Vec<u8>,
 }
 
+/// A reverse table entry mapping a relayed packet hash back to the interface
+/// it arrived on. Used for routing proofs back along the original data path.
+struct ReverseTableEntry {
+    /// Interface the data packet was received on (proof goes back here).
+    received_interface: String,
+    /// Interface the data packet was forwarded to.
+    #[allow(dead_code)] // Retained for diagnostics; used by link table routing (b83.6)
+    outbound_interface: String,
+    /// Monotonic timestamp when this entry was created.
+    timestamp: u64,
+}
+
 /// Input events from the caller.
 #[derive(Debug)]
 pub enum NodeEvent {
@@ -148,6 +164,12 @@ pub enum DropReason {
     AnnounceRateLimited,
     /// Announce could not be re-serialized as HEADER_2 (likely MTU overflow).
     AnnounceRebroadcastSerializeFailed,
+    /// Type2 data packet addressed to us but no path to the destination.
+    NoRouteForTransport,
+    /// Forwarded packet failed to_bytes() (e.g., MTU exceeded).
+    RelaySerializeFailed,
+    /// Proof arrived but no reverse table entry found for routing.
+    ProofNoReverseEntry,
 }
 
 /// Output actions for the caller.
@@ -188,6 +210,19 @@ pub enum NodeAction {
         destination_hash: DestinationHash,
         hops: u8,
     },
+    /// Transport node relayed a data packet toward its destination.
+    PacketRelayed {
+        destination_hash: DestinationHash,
+        next_hop: DestinationHash,
+        interface_name: String,
+    },
+    /// Transport node routed a proof back toward the packet originator.
+    ProofRelayed {
+        proof_destination: DestinationHash,
+        interface_name: String,
+    },
+    /// Reverse table entries expired during timer tick.
+    ReverseTableExpired { count: usize },
 }
 
 // ── Node ────────────────────────────────────────────────────────────────
@@ -208,6 +243,7 @@ pub struct Node {
     transport_identity: Option<PrivateIdentity>,
     announce_table: HashMap<DestinationHash, AnnounceTableEntry>,
     announce_rate_table: HashMap<DestinationHash, AnnounceRateEntry>,
+    reverse_table: HashMap<DestinationHash, ReverseTableEntry>,
 }
 
 impl Node {
@@ -222,6 +258,7 @@ impl Node {
             transport_identity: None,
             announce_table: HashMap::new(),
             announce_rate_table: HashMap::new(),
+            reverse_table: HashMap::new(),
         }
     }
 
@@ -236,6 +273,7 @@ impl Node {
             transport_identity: Some(identity),
             announce_table: HashMap::new(),
             announce_rate_table: HashMap::new(),
+            reverse_table: HashMap::new(),
         }
     }
 
@@ -265,6 +303,11 @@ impl Node {
     /// Number of entries in the announce propagation table.
     pub fn announce_table_len(&self) -> usize {
         self.announce_table.len()
+    }
+
+    /// Number of entries in the reverse table.
+    pub fn reverse_table_len(&self) -> usize {
+        self.reverse_table.len()
     }
 
     /// Register an interface by name and configuration.
@@ -446,6 +489,16 @@ impl Node {
                 if self.is_transport() {
                     actions.extend(self.process_announce_table(now));
                     self.expire_rate_table(now);
+
+                    // Expire stale reverse table entries
+                    let before = self.reverse_table.len();
+                    self.reverse_table.retain(|_, entry| {
+                        now.saturating_sub(entry.timestamp) < REVERSE_TIMEOUT
+                    });
+                    let expired = before - self.reverse_table.len();
+                    if expired > 0 {
+                        actions.push(NodeAction::ReverseTableExpired { count: expired });
+                    }
                 }
 
                 actions
@@ -789,7 +842,7 @@ impl Node {
         if is_announce {
             self.process_announce(packet, &full_packet_hash, interface_name, interface_mode, now)
         } else {
-            self.process_data_packet(packet, interface_name)
+            self.process_data_packet(packet, interface_name, now)
         }
     }
 
@@ -847,8 +900,13 @@ impl Node {
         let mut announce_packet_hash: DestinationHash = [0u8; 16];
         announce_packet_hash.copy_from_slice(&full_packet_hash[..16]);
 
-        // In leaf mode, next_hop is the destination itself
-        let next_hop = destination_hash;
+        // If the announce arrived via a transport node (Type2 header),
+        // next_hop is the transport_id so relay knows to chain through it.
+        // For direct (Type1) announces, next_hop is the destination itself.
+        let next_hop = packet
+            .header
+            .transport_id
+            .unwrap_or(destination_hash);
 
         let path_update = self.path_table.update(
             destination_hash,
@@ -898,23 +956,195 @@ impl Node {
     }
 
     fn process_data_packet(
-        &self,
+        &mut self,
         packet: Packet,
         interface_name: String,
+        now: u64,
     ) -> Vec<NodeAction> {
         let destination_hash = packet.header.destination_hash;
 
+        // 1. Local delivery takes priority
         if self.local_destinations.contains(&destination_hash) {
-            vec![NodeAction::DeliverLocally {
+            return vec![NodeAction::DeliverLocally {
                 destination_hash,
                 packet,
                 interface_name,
-            }]
-        } else {
-            vec![NodeAction::PacketDropped {
+            }];
+        }
+
+        // 2. Non-transport nodes cannot relay
+        let our_transport_hash = match self.transport_identity_hash() {
+            Some(h) => h,
+            None => {
+                return vec![NodeAction::PacketDropped {
+                    reason: DropReason::NoLocalDestination,
+                    interface_name,
+                }];
+            }
+        };
+
+        // 3. Proof routing via reverse table
+        if packet.header.flags.packet_type == PacketType::Proof {
+            return self.route_proof(&packet, &interface_name);
+        }
+
+        // 4. Only relay Type2 packets addressed to our transport_id
+        if packet.header.transport_id != Some(our_transport_hash) {
+            return vec![NodeAction::PacketDropped {
                 reason: DropReason::NoLocalDestination,
                 interface_name,
-            }]
+            }];
+        }
+
+        // 5. Look up destination in path table
+        let path_entry = match self.path_table.get(&destination_hash) {
+            Some(entry) => entry.clone(),
+            None => {
+                return vec![NodeAction::PacketDropped {
+                    reason: DropReason::NoRouteForTransport,
+                    interface_name,
+                }];
+            }
+        };
+
+        // 6. Compute reverse key before relay (needs packet data pre-move)
+        let reverse_key = hash::truncated_hash(
+            &packet
+                .hashable_part()
+                .expect("hashable_part is infallible for parsed packets"),
+        );
+
+        // 7. Relay the packet
+        let actions = self.relay_packet(packet, &path_entry, &interface_name);
+
+        // 8. Only store reverse table entry if relay succeeded
+        if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
+            self.reverse_table.insert(
+                reverse_key,
+                ReverseTableEntry {
+                    received_interface: interface_name.clone(),
+                    outbound_interface: path_entry.interface_name.clone(),
+                    timestamp: now,
+                },
+            );
+        }
+
+        actions
+    }
+
+    /// Relay a data packet to the next hop based on path table entry.
+    ///
+    /// Final hop (next_hop == destination): convert Type2→Type1, Broadcast propagation.
+    /// Intermediate hop: keep Type2, replace transport_id with next transport.
+    fn relay_packet(
+        &self,
+        packet: Packet,
+        path_entry: &PathEntry,
+        _source_interface: &str,
+    ) -> Vec<NodeAction> {
+        let destination_hash = packet.header.destination_hash;
+        let is_final_hop = path_entry.next_hop == destination_hash;
+
+        // Hops were already incremented in the inbound pipeline (process_incoming),
+        // so we forward with the current value — matching Python Reticulum behavior.
+        let forwarded = if is_final_hop {
+            // Final hop: convert Type2 → Type1 (direct delivery)
+            Packet {
+                header: PacketHeader {
+                    flags: PacketFlags {
+                        header_type: HeaderType::Type1,
+                        propagation: PropagationType::Broadcast,
+                        ..packet.header.flags
+                    },
+                    hops: packet.header.hops,
+                    transport_id: None,
+                    destination_hash,
+                    context: packet.header.context,
+                },
+                data: packet.data,
+            }
+        } else {
+            // Intermediate hop: keep Type2, replace transport_id
+            Packet {
+                header: PacketHeader {
+                    flags: packet.header.flags,
+                    hops: packet.header.hops,
+                    transport_id: Some(path_entry.next_hop),
+                    destination_hash,
+                    context: packet.header.context,
+                },
+                data: packet.data,
+            }
+        };
+
+        match forwarded.to_bytes() {
+            Ok(raw) => {
+                let mut actions = self.send_on_interface(&path_entry.interface_name, &raw);
+                if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
+                    actions.push(NodeAction::PacketRelayed {
+                        destination_hash,
+                        next_hop: path_entry.next_hop,
+                        interface_name: path_entry.interface_name.clone(),
+                    });
+                }
+                actions
+            }
+            Err(_) => {
+                vec![NodeAction::PacketDropped {
+                    reason: DropReason::RelaySerializeFailed,
+                    interface_name: path_entry.interface_name.clone(),
+                }]
+            }
+        }
+    }
+
+    /// Route a proof packet back toward the originator via the reverse table.
+    fn route_proof(&self, packet: &Packet, _interface_name: &str) -> Vec<NodeAction> {
+        let proof_dest = packet.header.destination_hash;
+
+        let entry = match self.reverse_table.get(&proof_dest) {
+            Some(e) => e,
+            None => {
+                return vec![NodeAction::PacketDropped {
+                    reason: DropReason::ProofNoReverseEntry,
+                    interface_name: _interface_name.to_owned(),
+                }];
+            }
+        };
+
+        // Forward proof with current hops (already incremented in inbound pipeline)
+        let forwarded = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    header_type: HeaderType::Type1,
+                    propagation: PropagationType::Broadcast,
+                    ..packet.header.flags
+                },
+                hops: packet.header.hops,
+                transport_id: None,
+                destination_hash: proof_dest,
+                context: packet.header.context,
+            },
+            data: packet.data.clone(),
+        };
+
+        match forwarded.to_bytes() {
+            Ok(raw) => {
+                let mut actions = self.send_on_interface(&entry.received_interface, &raw);
+                if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
+                    actions.push(NodeAction::ProofRelayed {
+                        proof_destination: proof_dest,
+                        interface_name: entry.received_interface.clone(),
+                    });
+                }
+                actions
+            }
+            Err(_) => {
+                vec![NodeAction::PacketDropped {
+                    reason: DropReason::RelaySerializeFailed,
+                    interface_name: entry.received_interface.clone(),
+                }]
+            }
         }
     }
 }
@@ -2710,5 +2940,723 @@ mod tests {
         let rate_entry = &node.announce_rate_table[&dh];
         assert_eq!(rate_entry.last_checked, 1000);
         assert_eq!(rate_entry.rate_violations, 0);
+    }
+
+    // ── Test Helpers (relay) ─────────────────────────────────────────
+
+    /// Create a transport node with a path table entry for `remote_dest`,
+    /// reachable via `next_hop` on "wlan0".
+    fn make_relay_node(
+        remote_dest: DestinationHash,
+        next_hop: DestinationHash,
+        hops: u8,
+    ) -> (Node, [u8; 16]) {
+        let (mut node, th) = make_transport_node();
+        let blob = crate::path_table::timestamp_from_random_blob;
+        let _ = blob; // just checking import; we build a blob inline
+        let mut random_blob = [0u8; crate::path_table::RANDOM_BLOB_LENGTH];
+        random_blob[0] = 1;
+        let ts: u64 = 1000;
+        let ts_bytes = ts.to_be_bytes();
+        random_blob[5..10].copy_from_slice(&ts_bytes[3..8]);
+        node.path_table.update(
+            remote_dest,
+            next_hop,
+            hops,
+            "wlan0".into(),
+            dest(99),
+            random_blob,
+            InterfaceMode::Full,
+            1000,
+        );
+        (node, th)
+    }
+
+    /// Build a Type2 data packet (raw bytes) addressed to a specific transport_id.
+    fn make_type2_data_raw(
+        transport_id: [u8; 16],
+        dest_hash: DestinationHash,
+        hops: u8,
+    ) -> Vec<u8> {
+        Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type2,
+                    context_flag: false,
+                    propagation: PropagationType::Transport,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops,
+                transport_id: Some(transport_id),
+                destination_hash: dest_hash,
+                context: PacketContext::None,
+            },
+            data: vec![0xDE, 0xAD],
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    /// Build a Type1 proof packet (raw bytes) with destination_hash set to
+    /// the truncated hash of the original packet's hashable_part.
+    fn make_proof_raw(proof_dest: DestinationHash, hops: u8) -> Vec<u8> {
+        Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Proof,
+                },
+                hops,
+                transport_id: None,
+                destination_hash: proof_dest,
+                context: PacketContext::None,
+            },
+            data: vec![0xAA, 0x00, 0xFF],
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    /// Compute the reverse table key for a Type2 data packet.
+    fn reverse_key_for(transport_id: [u8; 16], dest_hash: DestinationHash) -> DestinationHash {
+        let pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type2,
+                    context_flag: false,
+                    propagation: PropagationType::Transport,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0, // doesn't matter — hashable_part strips hops
+                transport_id: Some(transport_id),
+                destination_hash: dest_hash,
+                context: PacketContext::None,
+            },
+            data: vec![0xDE, 0xAD],
+        };
+        hash::truncated_hash(&pkt.hashable_part().unwrap())
+    }
+
+    // ── 16. Path table next_hop fix ─────────────────────────────────
+
+    #[test]
+    fn path_table_stores_transport_id_as_next_hop() {
+        // Simulate receiving a Type2 announce: transport_id present
+        let (mut node, th) = make_transport_node();
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let dest_name = DestinationName::from_name("testapp", &["svc"]).unwrap();
+        let announce_pkt = build_announce(
+            &identity,
+            &dest_name,
+            &mut OsRng,
+            1_700_000_000,
+            b"",
+            None,
+        )
+        .unwrap();
+        let dh = announce_pkt.header.destination_hash;
+
+        // Wrap as Type2 with our transport_id
+        let type2 = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    header_type: HeaderType::Type2,
+                    propagation: PropagationType::Transport,
+                    ..announce_pkt.header.flags
+                },
+                hops: 1,
+                transport_id: Some(th),
+                destination_hash: dh,
+                context: announce_pkt.header.context,
+            },
+            data: announce_pkt.data,
+        };
+        let raw = type2.to_bytes().unwrap();
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        // Should produce AnnounceReceived
+        let received = actions
+            .iter()
+            .find(|a| matches!(a, NodeAction::AnnounceReceived { .. }));
+        assert!(received.is_some(), "expected AnnounceReceived");
+
+        // Check path entry: next_hop should be transport_hash, not dest_hash
+        let entry = node.path_table().get(&dh).unwrap();
+        assert_eq!(entry.next_hop, th, "next_hop should be transport_id for Type2 announce");
+    }
+
+    #[test]
+    fn path_table_stores_dest_as_next_hop_for_type1() {
+        let mut node = make_node_with_interface();
+        let (raw, dh) = make_valid_announce();
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        let entry = node.path_table().get(&dh).unwrap();
+        assert_eq!(entry.next_hop, dh, "next_hop should be dest_hash for Type1 announce");
+    }
+
+    // ── 17. Relay basics ────────────────────────────────────────────
+
+    #[test]
+    fn transport_relays_type2_packet_addressed_to_it() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+        let raw = make_type2_data_raw(th, remote, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let has_send = actions.iter().any(|a| matches!(a, NodeAction::SendOnInterface { .. }));
+        let has_relay = actions.iter().any(|a| matches!(a, NodeAction::PacketRelayed { .. }));
+        assert!(has_send, "expected SendOnInterface");
+        assert!(has_relay, "expected PacketRelayed");
+    }
+
+    #[test]
+    fn transport_ignores_type2_not_addressed_to_it() {
+        let remote = dest(42);
+        let (mut node, _th) = make_relay_node(remote, remote, 3);
+        let other_transport = dest(99);
+        let raw = make_type2_data_raw(other_transport, remote, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let dropped = actions.iter().find(|a| matches!(a, NodeAction::PacketDropped { .. }));
+        assert!(dropped.is_some(), "expected PacketDropped for wrong transport_id");
+    }
+
+    #[test]
+    fn leaf_does_not_relay() {
+        let mut node = make_node_with_interface();
+        let remote = dest(42);
+        // Type1 data packet for unregistered dest
+        let raw = make_data_packet_raw(remote, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        match &actions[0] {
+            NodeAction::PacketDropped { reason, .. } => {
+                assert_eq!(*reason, DropReason::NoLocalDestination);
+            }
+            _ => panic!("expected PacketDropped"),
+        }
+    }
+
+    #[test]
+    fn relay_local_delivery_takes_priority() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+        node.register_destination(remote);
+
+        let raw = make_type2_data_raw(th, remote, 0);
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let delivered = actions.iter().any(|a| matches!(a, NodeAction::DeliverLocally { .. }));
+        assert!(delivered, "local delivery should take priority over relay");
+    }
+
+    // ── 18. Type2→Type1 conversion at final hop ─────────────────────
+
+    #[test]
+    fn final_hop_converts_to_type1() {
+        let remote = dest(42);
+        // next_hop == remote → final hop
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+        let raw = make_type2_data_raw(th, remote, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let send = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { raw, .. } => Some(raw),
+            _ => None,
+        });
+        assert!(send.is_some());
+        let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
+        assert_eq!(forwarded.header.flags.header_type, HeaderType::Type1);
+        assert_eq!(forwarded.header.flags.propagation, PropagationType::Broadcast);
+    }
+
+    #[test]
+    fn final_hop_increments_hops() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+        let raw = make_type2_data_raw(th, remote, 5);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let send = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { raw, .. } => Some(raw),
+            _ => None,
+        });
+        let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
+        // Inbound pipeline increments by 1; relay preserves (matching Python)
+        assert_eq!(forwarded.header.hops, 5 + 1);
+    }
+
+    #[test]
+    fn final_hop_strips_transport_id() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+        let raw = make_type2_data_raw(th, remote, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let send = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { raw, .. } => Some(raw),
+            _ => None,
+        });
+        let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
+        assert!(forwarded.header.transport_id.is_none());
+    }
+
+    // ── 19. Type2→Type2 intermediate relay ──────────────────────────
+
+    #[test]
+    fn intermediate_hop_keeps_type2() {
+        let remote = dest(42);
+        let next_transport = dest(77);
+        // next_hop != remote → intermediate hop
+        let (mut node, th) = make_relay_node(remote, next_transport, 3);
+        let raw = make_type2_data_raw(th, remote, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let send = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { raw, .. } => Some(raw),
+            _ => None,
+        });
+        let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
+        assert_eq!(forwarded.header.flags.header_type, HeaderType::Type2);
+    }
+
+    #[test]
+    fn intermediate_hop_replaces_transport_id() {
+        let remote = dest(42);
+        let next_transport = dest(77);
+        let (mut node, th) = make_relay_node(remote, next_transport, 3);
+        let raw = make_type2_data_raw(th, remote, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let send = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { raw, .. } => Some(raw),
+            _ => None,
+        });
+        let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
+        assert_eq!(
+            forwarded.header.transport_id,
+            Some(next_transport),
+            "transport_id should be replaced with next transport"
+        );
+    }
+
+    #[test]
+    fn intermediate_hop_increments_hops() {
+        let remote = dest(42);
+        let next_transport = dest(77);
+        let (mut node, th) = make_relay_node(remote, next_transport, 3);
+        let raw = make_type2_data_raw(th, remote, 3);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let send = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { raw, .. } => Some(raw),
+            _ => None,
+        });
+        let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
+        assert_eq!(forwarded.header.hops, 3 + 1); // inbound +1, relay preserves
+    }
+
+    // ── 20. Reverse table ───────────────────────────────────────────
+
+    #[test]
+    fn relay_creates_reverse_table_entry() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+        assert_eq!(node.reverse_table_len(), 0);
+
+        let raw = make_type2_data_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        assert_eq!(node.reverse_table_len(), 1);
+    }
+
+    #[test]
+    fn reverse_table_entry_records_interfaces() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+        let raw = make_type2_data_raw(th, remote, 0);
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let key = reverse_key_for(th, remote);
+        let entry = node.reverse_table.get(&key).expect("reverse entry should exist");
+        assert_eq!(entry.received_interface, "eth0");
+        assert_eq!(entry.outbound_interface, "wlan0"); // path entry points to wlan0
+    }
+
+    #[test]
+    fn reverse_table_expired_by_timer() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+        let raw = make_type2_data_raw(th, remote, 0);
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+        assert_eq!(node.reverse_table_len(), 1);
+
+        // Advance past REVERSE_TIMEOUT
+        let actions = node.handle_event(NodeEvent::TimerTick {
+            now: 1000 + REVERSE_TIMEOUT + 1,
+        });
+
+        assert_eq!(node.reverse_table_len(), 0);
+        let expired = actions.iter().any(|a| matches!(a, NodeAction::ReverseTableExpired { count: 1 }));
+        assert!(expired, "expected ReverseTableExpired action");
+    }
+
+    #[test]
+    fn reverse_table_fresh_entry_retained() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+        let raw = make_type2_data_raw(th, remote, 0);
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        // Advance to just before expiry
+        node.handle_event(NodeEvent::TimerTick {
+            now: 1000 + REVERSE_TIMEOUT - 1,
+        });
+
+        assert_eq!(node.reverse_table_len(), 1, "fresh entry should be retained");
+    }
+
+    #[test]
+    fn failed_relay_does_not_create_reverse_entry() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+
+        // Remove the outbound interface so relay will fail
+        node.interfaces.remove("wlan0");
+        assert_eq!(node.reverse_table_len(), 0);
+
+        let raw = make_type2_data_raw(th, remote, 0);
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        // Relay should fail (unknown outbound interface)
+        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        // Reverse table should remain empty
+        assert_eq!(node.reverse_table_len(), 0);
+    }
+
+    // ── 21. Proof routing ───────────────────────────────────────────
+
+    #[test]
+    fn proof_routed_via_reverse_table() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+
+        // First relay a data packet to create reverse entry
+        let data_raw = make_type2_data_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: data_raw,
+            now: 2000,
+        });
+
+        // Now send a proof with dest = reverse_key
+        let key = reverse_key_for(th, remote);
+        let proof_raw = make_proof_raw(key, 0);
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        let relayed = actions.iter().any(|a| matches!(a, NodeAction::ProofRelayed { .. }));
+        assert!(relayed, "expected ProofRelayed");
+
+        // Should be sent on "eth0" (the received_interface of the reverse entry)
+        let send = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { interface_name, .. } => Some(interface_name.as_str()),
+            _ => None,
+        });
+        assert_eq!(send, Some("eth0"), "proof should go back on received interface");
+    }
+
+    #[test]
+    fn proof_no_reverse_entry_dropped() {
+        let (mut node, _th) = make_transport_node();
+        let unknown_key = dest(88);
+        let proof_raw = make_proof_raw(unknown_key, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: proof_raw,
+            now: 2000,
+        });
+
+        let dropped = actions.iter().find_map(|a| match a {
+            NodeAction::PacketDropped { reason, .. } => Some(reason),
+            _ => None,
+        });
+        assert_eq!(dropped, Some(&DropReason::ProofNoReverseEntry));
+    }
+
+    #[test]
+    fn proof_increments_hops() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+
+        let data_raw = make_type2_data_raw(th, remote, 0);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: data_raw,
+            now: 2000,
+        });
+
+        let key = reverse_key_for(th, remote);
+        let proof_raw = make_proof_raw(key, 2);
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        let send = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { raw, .. } => Some(raw),
+            _ => None,
+        });
+        let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
+        // Inbound pipeline +1, route_proof preserves = original(2) + 1 = 3
+        assert_eq!(forwarded.header.hops, 2 + 1);
+    }
+
+    // ── 22. Error cases ─────────────────────────────────────────────
+
+    #[test]
+    fn relay_no_path_drops_packet() {
+        let (mut node, th) = make_transport_node();
+        let unknown_dest = dest(50);
+        // No path table entry for dest(50)
+        let raw = make_type2_data_raw(th, unknown_dest, 0);
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        let dropped = actions.iter().find_map(|a| match a {
+            NodeAction::PacketDropped { reason, .. } => Some(reason),
+            _ => None,
+        });
+        assert_eq!(dropped, Some(&DropReason::NoRouteForTransport));
+    }
+
+    #[test]
+    fn relay_serialize_failure_drops() {
+        let remote = dest(42);
+        let next_transport = dest(77);
+        // Intermediate relay: Type2→Type2 (keeps 35-byte header)
+        let (node, _th) = make_relay_node(remote, next_transport, 3);
+
+        // 35 + 470 = 505 > MTU(500) — will fail to_bytes()
+        let oversized_pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type2,
+                    context_flag: false,
+                    propagation: PropagationType::Transport,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: Some(next_transport),
+                destination_hash: remote,
+                context: PacketContext::None,
+            },
+            data: vec![0u8; 470],
+        };
+        let path_entry = node.path_table().get(&remote).unwrap().clone();
+        let actions = node.relay_packet(oversized_pkt, &path_entry, "eth0");
+
+        let dropped = actions.iter().find_map(|a| match a {
+            NodeAction::PacketDropped { reason, .. } => Some(reason),
+            _ => None,
+        });
+        assert_eq!(dropped, Some(&DropReason::RelaySerializeFailed));
+    }
+
+    #[test]
+    fn relay_send_failure_suppresses_relayed_action() {
+        let remote = dest(42);
+        let (node, _th) = make_relay_node(remote, remote, 3); // final hop
+
+        let pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type2,
+                    context_flag: false,
+                    propagation: PropagationType::Transport,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: Some(dest(99)),
+                destination_hash: remote,
+                context: PacketContext::None,
+            },
+            data: vec![0xBB; 10],
+        };
+        // Use a path entry pointing to a non-existent interface
+        let bad_entry = PathEntry {
+            next_hop: remote,
+            hops: 3,
+            interface_name: "no_such_iface".into(),
+            learned_at: 1000,
+            expires_at: 2000,
+            announce_packet_hash: dest(0),
+            announce_timestamp: 1000,
+            random_blobs: vec![],
+        };
+        let actions = node.relay_packet(pkt, &bad_entry, "eth0");
+
+        // Should get PacketDropped but NOT PacketRelayed
+        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        assert!(!actions.iter().any(|a| matches!(a, NodeAction::PacketRelayed { .. })));
+    }
+
+    #[test]
+    fn proof_send_failure_suppresses_relayed_action() {
+        let (mut node, _th) = make_transport_node();
+        let proof_key = dest(55);
+
+        // Insert reverse table entry pointing to a non-existent interface
+        node.reverse_table.insert(
+            proof_key,
+            ReverseTableEntry {
+                received_interface: "no_such_iface".into(),
+                outbound_interface: "wlan0".into(),
+                timestamp: 1000,
+            },
+        );
+
+        let proof_pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Proof,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: proof_key,
+                context: PacketContext::None,
+            },
+            data: vec![0xCC; 10],
+        };
+        let actions = node.route_proof(&proof_pkt, "eth0");
+
+        // Should get PacketDropped but NOT ProofRelayed
+        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        assert!(!actions.iter().any(|a| matches!(a, NodeAction::ProofRelayed { .. })));
+    }
+
+    #[test]
+    fn relay_reverse_table_len_accessor() {
+        let mut node = Node::new();
+        assert_eq!(node.reverse_table_len(), 0);
+
+        node.reverse_table.insert(
+            dest(1),
+            ReverseTableEntry {
+                received_interface: "eth0".into(),
+                outbound_interface: "wlan0".into(),
+                timestamp: 1000,
+            },
+        );
+        assert_eq!(node.reverse_table_len(), 1);
     }
 }
