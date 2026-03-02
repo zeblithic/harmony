@@ -39,4 +39,7 @@ pub enum ZenohError {
 
     #[error("unknown subscription ID: {0}")]
     UnknownSubscriptionId(u64),
+
+    #[error("unknown token ID: {0}")]
+    UnknownTokenId(u64),
 }
