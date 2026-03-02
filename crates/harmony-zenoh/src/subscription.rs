@@ -105,27 +105,15 @@ impl SubscriptionTable {
     pub fn matches(&self, message_key: &keyexpr) -> Vec<SubscriptionId> {
         let mut result = Vec::new();
 
-        // nodes_including: returns nodes whose KE includes (is a superset of)
-        // the query. This finds subscriptions that would match the message.
-        for node in self.tree.nodes_including(message_key) {
-            if let Some(entries) = node.weight() {
-                for entry in entries {
-                    result.push(entry.id);
-                }
-            }
-        }
-
-        // Also check intersecting nodes for wildcard-to-wildcard matches.
-        // nodes_including handles the case where a subscription pattern
-        // includes the exact message key, but intersecting_nodes catches
-        // the reverse (message key includes subscription pattern) which
-        // applies when the subscription is more specific.
+        // intersecting_nodes returns all nodes whose KE has any overlap with
+        // the query. This is a superset of nodes_including (inclusion implies
+        // intersection), so a single traversal catches both exact matches and
+        // wildcard-to-wildcard matches. Each tree node is visited at most once,
+        // and subscription IDs are unique per node, so no dedup is needed.
         for node in self.tree.intersecting_nodes(message_key) {
             if let Some(entries) = node.weight() {
                 for entry in entries {
-                    if !result.contains(&entry.id) {
-                        result.push(entry.id);
-                    }
+                    result.push(entry.id);
                 }
             }
         }
