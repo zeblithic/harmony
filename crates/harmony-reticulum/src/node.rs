@@ -46,7 +46,7 @@ const ESTABLISHMENT_TIMEOUT_PER_HOP: u64 = 6;
 // ── Types ───────────────────────────────────────────────────────────────
 
 /// Per-interface announce rate limiting configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct AnnounceRateConfig {
     /// Minimum seconds between announces for the same destination.
     pub target: u64,
@@ -916,7 +916,7 @@ impl Node {
         // through for path evaluation (multiple paths to same destination).
         // LRPROOF packets are also exempt: link proofs must pass through
         // transport nodes for link establishment.
-        if !self.packet_hashlist.insert(full_packet_hash.to_vec())
+        if !self.packet_hashlist.insert(full_packet_hash)
             && !is_announce
             && !is_lrproof
         {
@@ -973,7 +973,7 @@ impl Node {
             let rate_config = self
                 .interfaces
                 .get(&interface_name)
-                .and_then(|c| c.announce_rate.clone());
+                .and_then(|c| c.announce_rate);
             if let Some(config) = rate_config {
                 if self.is_rate_limited(destination_hash, &config, now) {
                     return vec![NodeAction::PacketDropped {
