@@ -241,7 +241,7 @@ fn interop_hashable_part_matches_python() {
             destination_hash: dest_hash_arr,
             context: PacketContext::None,
         },
-        data,
+        data: data.into(),
     };
 
     let hp = packet.hashable_part().unwrap();
