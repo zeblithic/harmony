@@ -110,3 +110,299 @@ pub struct Session {
     close_initiated_ms: Option<u64>,
     config: SessionConfig,
 }
+
+/// Handshake info string prefix.
+const HANDSHAKE_INFO: &[u8] = b"harmony-session-v1";
+
+impl Session {
+    /// Create a new session and produce the initial handshake action.
+    ///
+    /// Returns the session and the initial actions (always a single
+    /// `SendHandshake` containing the Ed25519 proof).
+    pub fn new(
+        local_identity: PrivateIdentity,
+        remote_identity: Identity,
+        config: SessionConfig,
+        now_ms: u64,
+    ) -> (Self, Vec<SessionAction>) {
+        // Sign: "harmony-session-v1" || remote_address_hash
+        let mut msg = Vec::with_capacity(HANDSHAKE_INFO.len() + 16);
+        msg.extend_from_slice(HANDSHAKE_INFO);
+        msg.extend_from_slice(&remote_identity.address_hash);
+        let proof = local_identity.sign(&msg);
+
+        let session = Self {
+            state: SessionState::Init,
+            local_identity,
+            remote_identity,
+            handshake_sent: true,
+            handshake_verified: false,
+            local_resources: HashMap::new(),
+            remote_resources: HashMap::new(),
+            next_expr_id: 1,
+            last_received_ms: now_ms,
+            last_sent_ms: now_ms,
+            last_tick_ms: now_ms,
+            close_initiated_ms: None,
+            config,
+        };
+
+        let actions = vec![SessionAction::SendHandshake {
+            proof: proof.to_vec(),
+        }];
+
+        (session, actions)
+    }
+
+    /// Current lifecycle state.
+    pub fn state(&self) -> SessionState {
+        self.state
+    }
+
+    /// Process an inbound event and return actions for the caller to execute.
+    pub fn handle_event(
+        &mut self,
+        event: SessionEvent,
+    ) -> Result<Vec<SessionAction>, ZenohError> {
+        match event {
+            SessionEvent::HandshakeReceived { proof } => self.handle_handshake(proof),
+            SessionEvent::TimerTick { now_ms } => self.handle_timer_tick(now_ms),
+            _ => {
+                if self.state == SessionState::Closed || self.state == SessionState::Init {
+                    return Err(ZenohError::SessionNotActive);
+                }
+                match event {
+                    SessionEvent::ResourceDeclared { expr_id, key_expr } => {
+                        self.handle_resource_declared(expr_id, key_expr)
+                    }
+                    SessionEvent::ResourceUndeclared { expr_id } => {
+                        self.handle_resource_undeclared(expr_id)
+                    }
+                    SessionEvent::KeepaliveReceived => self.handle_keepalive_received(),
+                    SessionEvent::CloseReceived => self.handle_close_received(),
+                    SessionEvent::CloseAckReceived => self.handle_close_ack_received(),
+                    SessionEvent::HandshakeReceived { .. } | SessionEvent::TimerTick { .. } => {
+                        unreachable!()
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_handshake(&mut self, proof: Vec<u8>) -> Result<Vec<SessionAction>, ZenohError> {
+        if self.state != SessionState::Init {
+            return Err(ZenohError::SessionNotActive);
+        }
+
+        // Proof must be exactly 64 bytes (Ed25519 signature)
+        let signature: [u8; 64] = match proof.try_into() {
+            Ok(sig) => sig,
+            Err(_) => {
+                self.state = SessionState::Closed;
+                return Err(ZenohError::HandshakeFailed("invalid proof length".into()));
+            }
+        };
+
+        // Verify: remote signed "harmony-session-v1" || our_address_hash
+        let mut msg = Vec::with_capacity(HANDSHAKE_INFO.len() + 16);
+        msg.extend_from_slice(HANDSHAKE_INFO);
+        msg.extend_from_slice(&self.local_identity.public_identity().address_hash);
+
+        if self.remote_identity.verify(&msg, &signature).is_err() {
+            self.state = SessionState::Closed;
+            return Err(ZenohError::HandshakeFailed(
+                "signature verification failed".into(),
+            ));
+        }
+
+        self.handshake_verified = true;
+        self.last_received_ms = self.last_tick_ms;
+
+        if self.handshake_sent && self.handshake_verified {
+            self.state = SessionState::Active;
+            Ok(vec![SessionAction::SessionOpened])
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    // Stub methods — implemented in later tasks
+    fn handle_timer_tick(&mut self, _now_ms: u64) -> Result<Vec<SessionAction>, ZenohError> {
+        Ok(vec![])
+    }
+
+    fn handle_resource_declared(
+        &mut self,
+        _expr_id: ExprId,
+        _key_expr: String,
+    ) -> Result<Vec<SessionAction>, ZenohError> {
+        Ok(vec![])
+    }
+
+    fn handle_resource_undeclared(
+        &mut self,
+        _expr_id: ExprId,
+    ) -> Result<Vec<SessionAction>, ZenohError> {
+        Ok(vec![])
+    }
+
+    fn handle_keepalive_received(&mut self) -> Result<Vec<SessionAction>, ZenohError> {
+        Ok(vec![])
+    }
+
+    fn handle_close_received(&mut self) -> Result<Vec<SessionAction>, ZenohError> {
+        Ok(vec![])
+    }
+
+    fn handle_close_ack_received(&mut self) -> Result<Vec<SessionAction>, ZenohError> {
+        Ok(vec![])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::OsRng;
+
+    /// Helper: create a session pair (alice's session, bob's session) and
+    /// the initial SendHandshake actions from each.
+    fn create_session_pair() -> (Session, Vec<SessionAction>, Session, Vec<SessionAction>) {
+        let mut rng = OsRng;
+        let alice_id = PrivateIdentity::generate(&mut rng);
+        let bob_id = PrivateIdentity::generate(&mut rng);
+
+        let alice_pub = alice_id.public_identity().clone();
+        let bob_pub = bob_id.public_identity().clone();
+
+        let (alice_session, alice_actions) = Session::new(
+            alice_id,
+            bob_pub,
+            SessionConfig::default(),
+            0,
+        );
+        let (bob_session, bob_actions) = Session::new(
+            bob_id,
+            alice_pub,
+            SessionConfig::default(),
+            0,
+        );
+
+        (alice_session, alice_actions, bob_session, bob_actions)
+    }
+
+    /// Helper: extract the handshake proof from SendHandshake action.
+    fn extract_handshake_proof(actions: &[SessionAction]) -> Vec<u8> {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                SessionAction::SendHandshake { proof } => Some(proof.clone()),
+                _ => None,
+            })
+            .expect("expected SendHandshake action")
+    }
+
+    /// Helper: complete the handshake for both sides, returning both to Active.
+    fn complete_handshake(
+        alice: &mut Session,
+        alice_actions: &[SessionAction],
+        bob: &mut Session,
+        bob_actions: &[SessionAction],
+    ) {
+        let alice_proof = extract_handshake_proof(alice_actions);
+        let bob_proof = extract_handshake_proof(bob_actions);
+
+        let bob_result = bob
+            .handle_event(SessionEvent::HandshakeReceived { proof: alice_proof })
+            .unwrap();
+        assert!(bob_result.contains(&SessionAction::SessionOpened));
+        assert_eq!(bob.state(), SessionState::Active);
+
+        let alice_result = alice
+            .handle_event(SessionEvent::HandshakeReceived { proof: bob_proof })
+            .unwrap();
+        assert!(alice_result.contains(&SessionAction::SessionOpened));
+        assert_eq!(alice.state(), SessionState::Active);
+    }
+
+    #[test]
+    fn handshake_roundtrip() {
+        let (mut alice, alice_actions, mut bob, bob_actions) = create_session_pair();
+
+        assert_eq!(alice.state(), SessionState::Init);
+        assert_eq!(bob.state(), SessionState::Init);
+        assert_eq!(alice_actions.len(), 1);
+        assert!(matches!(&alice_actions[0], SessionAction::SendHandshake { .. }));
+
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+    }
+
+    #[test]
+    fn handshake_wrong_identity_fails() {
+        let mut rng = OsRng;
+        let alice_id = PrivateIdentity::generate(&mut rng);
+        let bob_id = PrivateIdentity::generate(&mut rng);
+        let eve_id = PrivateIdentity::generate(&mut rng);
+
+        let bob_pub = bob_id.public_identity().clone();
+        let alice_pub = alice_id.public_identity().clone();
+
+        let (mut bob_session, _) = Session::new(
+            bob_id,
+            alice_pub,
+            SessionConfig::default(),
+            0,
+        );
+
+        // Eve signs a proof, but Bob expects Alice
+        let eve_proof = eve_id.sign(
+            &[b"harmony-session-v1" as &[u8], &bob_pub.address_hash].concat(),
+        );
+
+        let result = bob_session.handle_event(SessionEvent::HandshakeReceived {
+            proof: eve_proof.to_vec(),
+        });
+        assert!(result.is_err());
+        assert_eq!(bob_session.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn handshake_replay_rejected() {
+        let mut rng = OsRng;
+        let alice_id = PrivateIdentity::generate(&mut rng);
+        let bob_id = PrivateIdentity::generate(&mut rng);
+        let charlie_id = PrivateIdentity::generate(&mut rng);
+
+        let alice_pub = alice_id.public_identity().clone();
+        let bob_pub = bob_id.public_identity().clone();
+
+        // Alice signs proof for Bob
+        let proof_for_bob = alice_id.sign(
+            &[b"harmony-session-v1" as &[u8], &bob_pub.address_hash].concat(),
+        );
+
+        // Try to replay that proof to Charlie (who expects Alice)
+        let (mut charlie_session, _) = Session::new(
+            charlie_id,
+            alice_pub,
+            SessionConfig::default(),
+            0,
+        );
+
+        // Charlie's address_hash != Bob's, so verification should fail
+        let result = charlie_session.handle_event(SessionEvent::HandshakeReceived {
+            proof: proof_for_bob.to_vec(),
+        });
+        assert!(result.is_err());
+        assert_eq!(charlie_session.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn handshake_invalid_proof_length_fails() {
+        let (mut alice, _, _, _) = create_session_pair();
+        let result = alice.handle_event(SessionEvent::HandshakeReceived {
+            proof: vec![0u8; 32], // Wrong length
+        });
+        assert!(result.is_err());
+        assert_eq!(alice.state(), SessionState::Closed);
+    }
+}
