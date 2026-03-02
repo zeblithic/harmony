@@ -227,19 +227,32 @@ impl Session {
     }
 
     /// Declare a local resource, allocating the next ExprId.
-    pub fn declare_resource(&mut self, key_expr: String) -> (ExprId, Vec<SessionAction>) {
+    ///
+    /// Only valid in the `Active` state.
+    pub fn declare_resource(
+        &mut self,
+        key_expr: String,
+    ) -> Result<(ExprId, Vec<SessionAction>), ZenohError> {
+        if self.state != SessionState::Active {
+            return Err(ZenohError::SessionNotActive);
+        }
         let expr_id = self.next_expr_id;
         self.next_expr_id += 1;
         self.local_resources.insert(expr_id, key_expr.clone());
         let actions = vec![SessionAction::SendResourceDeclare { expr_id, key_expr }];
-        (expr_id, actions)
+        Ok((expr_id, actions))
     }
 
     /// Undeclare a local resource.
+    ///
+    /// Only valid in the `Active` state.
     pub fn undeclare_resource(
         &mut self,
         expr_id: ExprId,
     ) -> Result<Vec<SessionAction>, ZenohError> {
+        if self.state != SessionState::Active {
+            return Err(ZenohError::SessionNotActive);
+        }
         if self.local_resources.remove(&expr_id).is_none() {
             return Err(ZenohError::UnknownExprId(expr_id));
         }
@@ -293,8 +306,8 @@ impl Session {
 
         // Check stale timeout (applies in Init, Active, and Closing)
         if now_ms.saturating_sub(self.last_received_ms) >= self.config.stale_timeout_ms {
-            actions.extend(self.force_close());
             actions.push(SessionAction::PeerStale);
+            actions.extend(self.force_close());
             return Ok(actions);
         }
 
@@ -514,7 +527,7 @@ mod tests {
         complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
 
         // Alice declares a local resource
-        let (expr_id, actions) = alice.declare_resource("harmony/server/srv1/channel/general/msg".into());
+        let (expr_id, actions) = alice.declare_resource("harmony/server/srv1/channel/general/msg".into()).unwrap();
         assert_eq!(expr_id, 1);
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -582,9 +595,9 @@ mod tests {
         let (mut alice, alice_actions, mut bob, bob_actions) = create_session_pair();
         complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
 
-        let (id1, _) = alice.declare_resource("harmony/server/a/msg".into());
-        let (id2, _) = alice.declare_resource("harmony/server/b/msg".into());
-        let (id3, _) = alice.declare_resource("harmony/server/c/msg".into());
+        let (id1, _) = alice.declare_resource("harmony/server/a/msg".into()).unwrap();
+        let (id2, _) = alice.declare_resource("harmony/server/b/msg".into()).unwrap();
+        let (id3, _) = alice.declare_resource("harmony/server/c/msg".into()).unwrap();
 
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
