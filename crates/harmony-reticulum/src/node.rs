@@ -100,7 +100,6 @@ struct AnnounceTableEntry {
     hops: u8,
     destination_hash: DestinationHash,
     packet_data: Vec<u8>,
-    context_flag: bool,
 }
 
 /// Input events from the caller.
@@ -573,29 +572,34 @@ impl Node {
     }
 
     /// Detect local rebroadcast echo or downstream forward.
-    fn check_rebroadcast_echo(&mut self, dest: DestinationHash, incoming_hops: u8) {
-        let should_remove = if let Some(entry) = self.announce_table.get_mut(&dest) {
+    /// Returns `true` if the packet matched an announce table entry (echo or forward).
+    fn check_rebroadcast_echo(&mut self, dest: DestinationHash, incoming_hops: u8) -> bool {
+        let (matched, should_remove) = if let Some(entry) = self.announce_table.get_mut(&dest) {
             // incoming_hops is post-increment (our pipeline already did +1)
             // entry.hops is stored post-increment too
             // Echo: we hear our own rebroadcast back (same hop count)
             if incoming_hops.saturating_sub(1) == entry.hops {
                 entry.local_rebroadcasts += 1;
-                entry.retries > 0
-                    && entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX
+                let remove = entry.retries > 0
+                    && entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX;
+                (true, remove)
             }
             // Downstream forward: another transport picked it up (hops+1)
             else if incoming_hops.saturating_sub(1) == entry.hops.saturating_add(1) {
-                entry.retries > 0
+                (true, entry.retries > 0)
             } else {
-                false
+                // Entry exists but hops don't match echo/forward pattern
+                (true, false)
             }
         } else {
-            false
+            (false, false)
         };
 
         if should_remove {
             self.announce_table.remove(&dest);
         }
+
+        matched
     }
 
     /// Process announce table: remove completed entries, retransmit due entries.
@@ -627,7 +631,7 @@ impl Node {
                         flags: PacketFlags {
                             ifac: false,
                             header_type: HeaderType::Type2,
-                            context_flag: entry.context_flag,
+                            context_flag: false,
                             propagation: PropagationType::Transport,
                             destination_type: DestinationType::Single,
                             packet_type: PacketType::Announce,
@@ -810,19 +814,21 @@ impl Node {
         let destination_hash = validated.destination_hash;
         let random_hash = validated.random_hash;
         let hops = packet.header.hops;
-        let context_flag = packet.header.flags.context_flag;
 
         // Rebroadcast detection runs BEFORE rate limiting so echoes of our
         // own rebroadcasts don't consume grace points. Echoes are expected
         // traffic, not abuse — they shouldn't count toward rate violations.
-        if self.is_transport() {
-            self.check_rebroadcast_echo(destination_hash, hops);
-        }
+        let was_echo = if self.is_transport() {
+            self.check_rebroadcast_echo(destination_hash, hops)
+        } else {
+            false
+        };
 
         // Rate limiting (transport mode only).
-        // Skip for destinations we're actively tracking in the announce table —
-        // those are echoes/forwards of our own rebroadcasts.
-        if self.is_transport() && !self.announce_table.contains_key(&destination_hash) {
+        // Skip if this packet matched an announce table entry (echo/forward of
+        // our own rebroadcast) — even if the entry was just removed by echo
+        // detection, the packet is expected traffic, not abuse.
+        if self.is_transport() && !was_echo {
             let rate_config = self
                 .interfaces
                 .get(&interface_name)
@@ -878,7 +884,6 @@ impl Node {
                     hops,
                     destination_hash,
                     packet_data: packet.data,
-                    context_flag,
                 },
             );
         }
@@ -2466,7 +2471,6 @@ mod tests {
                 hops: 1,
                 destination_hash: dh,
                 packet_data: vec![0u8; 470], // will overflow Type2 MTU
-                context_flag: false,
             },
         );
         assert_eq!(node.announce_table_len(), 1);
@@ -2516,7 +2520,6 @@ mod tests {
                 hops: 1,
                 destination_hash: dh,
                 packet_data: vec![0xAA; 466],
-                context_flag: false,
             },
         );
 
@@ -2645,5 +2648,67 @@ mod tests {
             node.announce_table[&dh].local_rebroadcasts, 1,
             "echo should have been detected and counted"
         );
+    }
+
+    #[test]
+    fn echo_removal_does_not_trigger_rate_limiting() {
+        // Regression: check_rebroadcast_echo could remove the announce table
+        // entry, then the rate limiter guard (checking announce_table.contains_key)
+        // would see the entry gone and rate-limit the very packet that was an echo.
+        let (mut node, _th) = make_transport_node_with_rate(60, 0, 120);
+        let (raw, dh) = make_valid_announce();
+
+        // Receive original announce
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: raw.clone(),
+            now: 1000,
+        });
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Retransmit so retries > 0
+        node.handle_event(NodeEvent::TimerTick { now: 1010 });
+        assert!(node.announce_table[&dh].retries > 0);
+
+        // Send LOCAL_REBROADCASTS_MAX echoes through the full pipeline.
+        // The final echo removes the entry. With grace=0, if rate limiting
+        // ran after removal, that echo would get blocked.
+        for i in 0..LOCAL_REBROADCASTS_MAX {
+            let mut echo = raw.clone();
+            echo[1] = 1; // wire hops=1 → pipeline to 2 → echo match
+            let actions = node.handle_event(NodeEvent::InboundPacket {
+                interface_name: "eth0".into(),
+                raw: echo,
+                now: 1012 + i as u64,
+            });
+
+            // No echo should ever be rate-limited
+            let was_rate_limited = actions.iter().any(|a| matches!(
+                a,
+                NodeAction::PacketDropped {
+                    reason: DropReason::AnnounceRateLimited,
+                    ..
+                }
+            ));
+            assert!(
+                !was_rate_limited,
+                "echo #{} should not be rate-limited (even if entry was just removed)",
+                i + 1
+            );
+        }
+
+        // Entry should be removed after max echoes
+        assert_eq!(node.announce_table_len(), 0);
+        // Rate table has exactly 1 entry — from the original announce at t=1000.
+        // The echoes must not have added or modified any additional entries.
+        assert_eq!(
+            node.announce_rate_table.len(),
+            1,
+            "only the original announce should touch the rate table, not echoes"
+        );
+        // The entry should still show last_checked=1000 (untouched by echoes)
+        let rate_entry = &node.announce_rate_table[&dh];
+        assert_eq!(rate_entry.last_checked, 1000);
+        assert_eq!(rate_entry.rate_violations, 0);
     }
 }
