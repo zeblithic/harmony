@@ -1357,6 +1357,12 @@ impl Node {
     }
 
     /// Route link data bidirectionally through the link table.
+    ///
+    /// Unlike raw relay, this rewrites transport headers for the next hop:
+    /// - Final hop (directly reachable recipient): Type2 → Type1/Broadcast
+    /// - Intermediate hop toward destination: transport_id = next transport node
+    /// - Intermediate hop toward initiator: best-effort (multi-hop reverse path
+    ///   is a known limitation — deferred to a future bead)
     fn route_link_data(
         &mut self,
         packet: Packet,
@@ -1365,31 +1371,33 @@ impl Node {
     ) -> Vec<NodeAction> {
         let link_id = packet.header.destination_hash;
 
-        // Determine the target interface based on which side the packet arrived from.
-        let target_interface = {
+        // Determine the target interface and direction based on which side
+        // the packet arrived from. `toward_destination` is true when forwarding
+        // from the initiator side toward the link destination.
+        let (target_interface, toward_destination) = {
             let entry = self.link_table.get(&link_id).unwrap();
 
             if entry.outbound_interface == entry.received_interface {
-                // Same-interface case: accept if hops match either direction
-                if packet.header.hops == entry.remaining_hops
-                    || packet.header.hops == entry.taken_hops
-                {
-                    Some(entry.outbound_interface.clone())
+                // Same-interface case: use hops to distinguish direction
+                if packet.header.hops == entry.taken_hops {
+                    (Some(entry.outbound_interface.clone()), true)
+                } else if packet.header.hops == entry.remaining_hops {
+                    (Some(entry.outbound_interface.clone()), false)
                 } else {
-                    None
+                    (None, false)
                 }
             } else if interface_name == entry.outbound_interface
                 && packet.header.hops == entry.remaining_hops
             {
                 // From destination side → forward to initiator
-                Some(entry.received_interface.clone())
+                (Some(entry.received_interface.clone()), false)
             } else if interface_name == entry.received_interface
                 && packet.header.hops == entry.taken_hops
             {
                 // From initiator side → forward to destination
-                Some(entry.outbound_interface.clone())
+                (Some(entry.outbound_interface.clone()), true)
             } else {
-                None
+                (None, false)
             }
         };
 
@@ -1404,9 +1412,54 @@ impl Node {
             }
         };
 
-        // Forward packet preserving its structure (Type2 header, transport_id, etc.)
-        // Only hops are updated (already incremented in inbound pipeline).
-        match packet.to_bytes() {
+        // Rewrite transport headers for the next hop.
+        let entry = self.link_table.get(&link_id).unwrap();
+        let is_final_hop = if toward_destination {
+            // Final hop: next_hop IS the actual destination
+            entry.next_hop == entry.destination_hash
+        } else {
+            // Final hop toward initiator: request came directly (single hop)
+            entry.taken_hops <= 1
+        };
+        let next_hop = entry.next_hop;
+
+        let forwarded = if is_final_hop {
+            // Final hop: convert Type2 → Type1 (direct delivery)
+            Packet {
+                header: PacketHeader {
+                    flags: PacketFlags {
+                        header_type: HeaderType::Type1,
+                        propagation: PropagationType::Broadcast,
+                        ..packet.header.flags
+                    },
+                    hops: packet.header.hops,
+                    transport_id: None,
+                    destination_hash: link_id,
+                    context: packet.header.context,
+                },
+                data: packet.data,
+            }
+        } else if toward_destination {
+            // Intermediate hop toward destination: address to next transport
+            Packet {
+                header: PacketHeader {
+                    flags: packet.header.flags,
+                    hops: packet.header.hops,
+                    transport_id: Some(next_hop),
+                    destination_hash: link_id,
+                    context: packet.header.context,
+                },
+                data: packet.data,
+            }
+        } else {
+            // Intermediate hop toward initiator: multi-hop reverse path is
+            // unknown (we don't store the previous transport identity).
+            // Preserve existing headers as best-effort. Full multi-transport-hop
+            // reverse routing is deferred to a future bead.
+            packet
+        };
+
+        match forwarded.to_bytes() {
             Ok(raw) => {
                 let mut actions = self.send_on_interface(&target, &raw);
                 if !actions
@@ -4422,11 +4475,18 @@ mod tests {
         assert!(routed, "expected LinkDataRouted");
 
         // Should be sent on "wlan0" (toward destination)
-        let send = actions.iter().find_map(|a| match a {
-            NodeAction::SendOnInterface { interface_name, .. } => Some(interface_name.as_str()),
+        let send_action = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface {
+                interface_name,
+                raw,
+            } => Some((interface_name.as_str(), raw.clone())),
             _ => None,
         });
-        assert_eq!(send, Some("wlan0"));
+        let (iface, raw) = send_action.unwrap();
+        assert_eq!(iface, "wlan0");
+
+        // Final hop (next_hop == destination): should be converted to Type1
+        assert_eq!(raw[0] & 0x40, 0, "expected Type1 header (final hop toward destination)");
     }
 
     #[test]
@@ -4465,11 +4525,18 @@ mod tests {
         assert!(routed, "expected LinkDataRouted");
 
         // Should be sent on "eth0" (toward initiator)
-        let send = actions.iter().find_map(|a| match a {
-            NodeAction::SendOnInterface { interface_name, .. } => Some(interface_name.as_str()),
+        let send_action = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface {
+                interface_name,
+                raw,
+            } => Some((interface_name.as_str(), raw.clone())),
             _ => None,
         });
-        assert_eq!(send, Some("eth0"));
+        let (iface, raw) = send_action.unwrap();
+        assert_eq!(iface, "eth0");
+
+        // Single-hop initiator (taken_hops==1): should be converted to Type1
+        assert_eq!(raw[0] & 0x40, 0, "expected Type1 header (final hop toward initiator)");
     }
 
     #[test]
