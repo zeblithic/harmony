@@ -377,6 +377,7 @@ dependencies = [
  "rand_core",
  "thiserror",
  "zenoh-keyexpr",
+ "zeroize",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@
 use harmony_crypto::{aead, hkdf};
 use harmony_identity::{Identity, PrivateIdentity};
 use rand_core::CryptoRngCore;
+use zeroize::Zeroize;
 
 use crate::ZenohError;
 
@@ -54,28 +55,30 @@ fn derive_shared_key(
     remote: &Identity,
     sender_address: &[u8; 16],
     recipient_address: &[u8; 16],
-) -> Result<[u8; aead::KEY_LENGTH], ZenohError> {
+) -> Result<[u8; aead::KEY_LENGTH], String> {
     let shared_secret = local.ecdh(&remote.encryption_key);
 
     let mut salt = [0u8; 32];
     salt[..16].copy_from_slice(sender_address);
     salt[16..].copy_from_slice(recipient_address);
 
-    let key_bytes = hkdf::derive_key(
+    let mut key_bytes = hkdf::derive_key(
         shared_secret.as_bytes(),
         Some(&salt),
         HKDF_INFO,
         aead::KEY_LENGTH,
     )
-    .map_err(|e| ZenohError::SealFailed(e.to_string()))?;
+    .map_err(|e| e.to_string())?;
 
     let mut key = [0u8; aead::KEY_LENGTH];
     key.copy_from_slice(&key_bytes);
+    key_bytes.zeroize();
     Ok(key)
 }
 
 /// A decoded Harmony message envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
 pub struct HarmonyEnvelope {
     pub version: u8,
     pub msg_type: MessageType,
@@ -100,7 +103,8 @@ impl HarmonyEnvelope {
     ) -> Result<Vec<u8>, ZenohError> {
         let nonce = aead::generate_nonce(rng);
         let sender_addr = sender.public_identity().address_hash;
-        let key = derive_shared_key(sender, recipient, &sender_addr, &recipient.address_hash)?;
+        let mut key = derive_shared_key(sender, recipient, &sender_addr, &recipient.address_hash)
+            .map_err(ZenohError::SealFailed)?;
 
         // Build header
         let mut header = [0u8; HEADER_SIZE];
@@ -110,13 +114,15 @@ impl HarmonyEnvelope {
         header[29..33].copy_from_slice(&sequence.to_be_bytes());
 
         // Encrypt with header as AAD
-        let ciphertext = aead::encrypt(&key, &nonce, plaintext, &header)
-            .map_err(|e| ZenohError::SealFailed(e.to_string()))?;
+        let result = aead::encrypt(&key, &nonce, plaintext, &header)
+            .map_err(|e| ZenohError::SealFailed(e.to_string()));
+        key.zeroize();
+        let ciphertext = result?;
 
-        let mut result = Vec::with_capacity(HEADER_SIZE + ciphertext.len());
-        result.extend_from_slice(&header);
-        result.extend_from_slice(&ciphertext);
-        Ok(result)
+        let mut out = Vec::with_capacity(HEADER_SIZE + ciphertext.len());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
     }
 
     /// Open an encrypted envelope and recover the plaintext.
@@ -150,17 +156,24 @@ impl HarmonyEnvelope {
 
         let sequence = u32::from_be_bytes(header[29..33].try_into().unwrap());
 
+        // Validate sender_address matches the provided sender identity
+        if sender_address != sender.address_hash {
+            return Err(ZenohError::OpenFailed("sender address mismatch".into()));
+        }
+
         // Derive shared key (salt: sender || recipient, same order as seal)
-        let key = derive_shared_key(
+        let mut key = derive_shared_key(
             recipient,
             sender,
             &sender_address,
             &recipient.public_identity().address_hash,
         )
-        .map_err(|_| ZenohError::OpenFailed("key derivation failed".into()))?;
+        .map_err(ZenohError::OpenFailed)?;
 
-        let plaintext = aead::decrypt(&key, &nonce, ciphertext, header)
-            .map_err(|e| ZenohError::OpenFailed(e.to_string()))?;
+        let result = aead::decrypt(&key, &nonce, ciphertext, header)
+            .map_err(|e| ZenohError::OpenFailed(e.to_string()));
+        key.zeroize();
+        let plaintext = result?;
 
         Ok(HarmonyEnvelope {
             version,
@@ -391,7 +404,10 @@ mod tests {
         let sender = PrivateIdentity::generate(&mut rng);
 
         let result = HarmonyEnvelope::open(&recipient, sender.public_identity(), &[0u8; 32]);
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(ZenohError::EnvelopeTooShort(32, MIN_ENVELOPE_SIZE))
+        ));
     }
 
     #[test]

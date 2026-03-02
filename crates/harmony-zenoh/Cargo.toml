@@ -13,6 +13,7 @@ thiserror.workspace = true
 harmony-crypto.workspace = true
 harmony-identity.workspace = true
 rand_core.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
