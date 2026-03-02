@@ -67,6 +67,9 @@ pub struct LivelinessRouter {
 
     /// Local tokens declared by this peer.
     local_tokens: HashMap<TokenId, String>,
+    /// Refcount per canonical key expression for local tokens.
+    /// Wire declare emitted on 0→1, wire undeclare on 1→0.
+    local_token_count: HashMap<String, usize>,
     next_token_id: TokenId,
     next_subscriber_id: LivelinessSubscriberId,
 }
@@ -82,6 +85,7 @@ impl LivelinessRouter {
             subscriber_keys: HashMap::new(),
             subscriber_ids: HashMap::new(),
             local_tokens: HashMap::new(),
+            local_token_count: HashMap::new(),
             next_token_id: 1,
             next_subscriber_id: 1,
         }
@@ -103,12 +107,16 @@ impl LivelinessRouter {
         let token_id = self.next_token_id;
         self.next_token_id += 1;
         self.local_tokens.insert(token_id, canonical.clone());
-        Ok((
-            token_id,
+        let count = self.local_token_count.entry(canonical.clone()).or_insert(0);
+        *count += 1;
+        let actions = if *count == 1 {
             vec![LivelinessAction::SendTokenDeclare {
                 key_expr: canonical,
-            }],
-        ))
+            }]
+        } else {
+            vec![]
+        };
+        Ok((token_id, actions))
     }
 
     /// Undeclare a local liveliness token.
@@ -122,7 +130,15 @@ impl LivelinessRouter {
             .local_tokens
             .remove(&token_id)
             .ok_or(ZenohError::UnknownTokenId(token_id))?;
-        Ok(vec![LivelinessAction::SendTokenUndeclare { key_expr }])
+        let mut actions = vec![];
+        if let Some(count) = self.local_token_count.get_mut(&key_expr) {
+            *count -= 1;
+            if *count == 0 {
+                self.local_token_count.remove(&key_expr);
+                actions.push(LivelinessAction::SendTokenUndeclare { key_expr });
+            }
+        }
+        Ok(actions)
     }
 
     // ── Subscriber management ──────────────────────────────────────
@@ -145,11 +161,12 @@ impl LivelinessRouter {
         self.subscriber_ids.insert(sub_table_id, sub_id);
 
         // History: emit TokenAppeared for each existing remote token that matches.
+        let ke = keyexpr::new(owned.as_str())
+            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let token_matches = self.remote_tokens.matches(ke);
         let mut actions = Vec::new();
-        for token_key in self.remote_token_keys.values() {
-            let token_ke = keyexpr::new(token_key)
-                .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
-            if owned.intersects(token_ke) {
+        for token_table_id in token_matches {
+            if let Some(token_key) = self.remote_token_keys.get(&token_table_id) {
                 actions.push(LivelinessAction::TokenAppeared {
                     subscriber_id: sub_id,
                     key_expr: token_key.clone(),
@@ -296,11 +313,12 @@ impl LivelinessRouter {
     pub fn query(&self, key_expr: &str) -> Result<Vec<String>, ZenohError> {
         let owned = OwnedKeyExpr::autocanonize(key_expr.to_string())
             .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let ke = keyexpr::new(owned.as_str())
+            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let token_matches = self.remote_tokens.matches(ke);
         let mut results = Vec::new();
-        for token_key in self.remote_token_keys.values() {
-            let token_ke = keyexpr::new(token_key)
-                .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
-            if owned.intersects(token_ke) {
+        for token_table_id in token_matches {
+            if let Some(token_key) = self.remote_token_keys.get(&token_table_id) {
                 results.push(token_key.clone());
             }
         }
@@ -379,6 +397,30 @@ mod tests {
         let mut router = LivelinessRouter::new();
         let result = router.undeclare_token(999);
         assert!(matches!(result, Err(ZenohError::UnknownTokenId(999))));
+    }
+
+    #[test]
+    fn duplicate_local_token_suppresses_wire_declare() {
+        let mut router = LivelinessRouter::new();
+        let (id1, actions1) = router.declare_token("harmony/presence/srv1/alice").unwrap();
+        assert_eq!(actions1.len(), 1); // First: wire declare
+        let (id2, actions2) = router.declare_token("harmony/presence/srv1/alice").unwrap();
+        assert!(actions2.is_empty()); // Second: suppressed
+        assert_ne!(id1, id2); // Distinct token IDs
+
+        // Undeclare first: no wire undeclare (refcount 2→1)
+        let actions3 = router.undeclare_token(id1).unwrap();
+        assert!(actions3.is_empty());
+
+        // Undeclare last: wire undeclare emitted (refcount 1→0)
+        let actions4 = router.undeclare_token(id2).unwrap();
+        assert_eq!(actions4.len(), 1);
+        assert_eq!(
+            actions4[0],
+            LivelinessAction::SendTokenUndeclare {
+                key_expr: "harmony/presence/srv1/alice".into(),
+            }
+        );
     }
 
     // ── subscribe / unsubscribe ──────────────────────────────────────
