@@ -1007,23 +1007,29 @@ impl Node {
             }
         };
 
-        // 6. Store reverse table entry for proof routing
+        // 6. Compute reverse key before relay (needs packet data pre-move)
         let reverse_key = hash::truncated_hash(
             &packet
                 .hashable_part()
                 .expect("hashable_part is infallible for parsed packets"),
         );
-        self.reverse_table.insert(
-            reverse_key,
-            ReverseTableEntry {
-                received_interface: interface_name.clone(),
-                outbound_interface: path_entry.interface_name.clone(),
-                timestamp: now,
-            },
-        );
 
         // 7. Relay the packet
-        self.relay_packet(packet, &path_entry, &interface_name)
+        let actions = self.relay_packet(packet, &path_entry, &interface_name);
+
+        // 8. Only store reverse table entry if relay succeeded
+        if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
+            self.reverse_table.insert(
+                reverse_key,
+                ReverseTableEntry {
+                    received_interface: interface_name.clone(),
+                    outbound_interface: path_entry.interface_name.clone(),
+                    timestamp: now,
+                },
+            );
+        }
+
+        actions
     }
 
     /// Relay a data packet to the next hop based on path table entry.
@@ -1039,6 +1045,8 @@ impl Node {
         let destination_hash = packet.header.destination_hash;
         let is_final_hop = path_entry.next_hop == destination_hash;
 
+        // Hops were already incremented in the inbound pipeline (process_incoming),
+        // so we forward with the current value — matching Python Reticulum behavior.
         let forwarded = if is_final_hop {
             // Final hop: convert Type2 → Type1 (direct delivery)
             Packet {
@@ -1048,7 +1056,7 @@ impl Node {
                         propagation: PropagationType::Broadcast,
                         ..packet.header.flags
                     },
-                    hops: packet.header.hops.saturating_add(1),
+                    hops: packet.header.hops,
                     transport_id: None,
                     destination_hash,
                     context: packet.header.context,
@@ -1060,7 +1068,7 @@ impl Node {
             Packet {
                 header: PacketHeader {
                     flags: packet.header.flags,
-                    hops: packet.header.hops.saturating_add(1),
+                    hops: packet.header.hops,
                     transport_id: Some(path_entry.next_hop),
                     destination_hash,
                     context: packet.header.context,
@@ -1104,7 +1112,7 @@ impl Node {
             }
         };
 
-        // Forward proof as-is with hops incremented
+        // Forward proof with current hops (already incremented in inbound pipeline)
         let forwarded = Packet {
             header: PacketHeader {
                 flags: PacketFlags {
@@ -1112,7 +1120,7 @@ impl Node {
                     propagation: PropagationType::Broadcast,
                     ..packet.header.flags
                 },
-                hops: packet.header.hops.saturating_add(1),
+                hops: packet.header.hops,
                 transport_id: None,
                 destination_hash: proof_dest,
                 context: packet.header.context,
@@ -3222,8 +3230,8 @@ mod tests {
             _ => None,
         });
         let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
-        // Inbound pipeline increments by 1, relay increments by 1 = original + 2
-        assert_eq!(forwarded.header.hops, 5 + 2);
+        // Inbound pipeline increments by 1; relay preserves (matching Python)
+        assert_eq!(forwarded.header.hops, 5 + 1);
     }
 
     #[test]
@@ -3313,7 +3321,7 @@ mod tests {
             _ => None,
         });
         let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
-        assert_eq!(forwarded.header.hops, 3 + 2); // inbound +1, relay +1
+        assert_eq!(forwarded.header.hops, 3 + 1); // inbound +1, relay preserves
     }
 
     // ── 20. Reverse table ───────────────────────────────────────────
@@ -3395,6 +3403,28 @@ mod tests {
         assert_eq!(node.reverse_table_len(), 1, "fresh entry should be retained");
     }
 
+    #[test]
+    fn failed_relay_does_not_create_reverse_entry() {
+        let remote = dest(42);
+        let (mut node, th) = make_relay_node(remote, remote, 3);
+
+        // Remove the outbound interface so relay will fail
+        node.interfaces.remove("wlan0");
+        assert_eq!(node.reverse_table_len(), 0);
+
+        let raw = make_type2_data_raw(th, remote, 0);
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 2000,
+        });
+
+        // Relay should fail (unknown outbound interface)
+        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        // Reverse table should remain empty
+        assert_eq!(node.reverse_table_len(), 0);
+    }
+
     // ── 21. Proof routing ───────────────────────────────────────────
 
     #[test]
@@ -3474,8 +3504,8 @@ mod tests {
             _ => None,
         });
         let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
-        // Inbound pipeline +1, route_proof +1 = original(2) + 2 = 4
-        assert_eq!(forwarded.header.hops, 2 + 2);
+        // Inbound pipeline +1, route_proof preserves = original(2) + 1 = 3
+        assert_eq!(forwarded.header.hops, 2 + 1);
     }
 
     // ── 22. Error cases ─────────────────────────────────────────────
