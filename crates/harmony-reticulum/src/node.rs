@@ -27,8 +27,6 @@ const PATHFINDER_G: u64 = 5;
 /// Maximum local rebroadcast echoes before considering propagation done.
 const LOCAL_REBROADCASTS_MAX: u8 = 2;
 
-/// Maximum timestamps tracked per destination for rate limiting.
-const MAX_RATE_TIMESTAMPS: usize = 16;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -85,7 +83,6 @@ struct AnnounceRateEntry {
     last_checked: u64,
     rate_violations: u32,
     blocked_until: u64,
-    timestamps: Vec<u64>,
 }
 
 /// An announce queued for transport retransmission.
@@ -146,6 +143,8 @@ pub enum DropReason {
     OutboundIfacFailed,
     /// Announce dropped by per-destination rate limiter.
     AnnounceRateLimited,
+    /// Announce could not be re-serialized as HEADER_2 (likely MTU overflow).
+    AnnounceRebroadcastSerializeFailed,
 }
 
 /// Output actions for the caller.
@@ -529,7 +528,6 @@ impl Node {
                 last_checked: 0,
                 rate_violations: 0,
                 blocked_until: 0,
-                timestamps: Vec::new(),
             }
         });
 
@@ -544,17 +542,16 @@ impl Node {
             entry.rate_violations += 1;
             if entry.rate_violations > config.grace {
                 entry.blocked_until = now + config.target + config.penalty;
+                // Reset violations so grace is renewable after penalty expires
+                entry.rate_violations = 0;
                 return true;
             }
+        } else {
+            // Properly spaced — reset violations
+            entry.rate_violations = 0;
         }
 
-        // Record this timestamp
         entry.last_checked = now;
-        if entry.timestamps.len() >= MAX_RATE_TIMESTAMPS {
-            entry.timestamps.remove(0);
-        }
-        entry.timestamps.push(now);
-
         false
     }
 
@@ -593,7 +590,7 @@ impl Node {
 
         // First pass: collect completed and due entries
         let mut completed = Vec::new();
-        let mut due: Vec<(DestinationHash, Vec<u8>, String, u8)> = Vec::new();
+        let mut due: Vec<(DestinationHash, Option<Vec<u8>>, String, u8)> = Vec::new();
 
         for (dest, entry) in &self.announce_table {
             // Completed: exceeded max retries, or retries>0 with enough rebroadcasts
@@ -626,9 +623,10 @@ impl Node {
                     data: entry.packet_data.clone(),
                 };
 
-                if let Ok(raw) = packet.to_bytes() {
-                    due.push((*dest, raw, entry.source_interface.clone(), entry.hops));
-                }
+                // Always mark as due (even on serialization failure) so
+                // retries increments and the entry can eventually be cleaned up.
+                let raw = packet.to_bytes().ok();
+                due.push((*dest, raw, entry.source_interface.clone(), entry.hops));
             }
         }
 
@@ -645,11 +643,21 @@ impl Node {
                 entry.retransmit_at =
                     now + PATHFINDER_G + (dest[2] as u64 % 3);
             }
-            actions.extend(self.broadcast_except(&source_iface, &raw));
-            actions.push(NodeAction::AnnounceRebroadcast {
-                destination_hash: dest,
-                hops,
-            });
+            match raw {
+                Some(bytes) => {
+                    actions.extend(self.broadcast_except(&source_iface, &bytes));
+                    actions.push(NodeAction::AnnounceRebroadcast {
+                        destination_hash: dest,
+                        hops,
+                    });
+                }
+                None => {
+                    actions.push(NodeAction::PacketDropped {
+                        reason: DropReason::AnnounceRebroadcastSerializeFailed,
+                        interface_name: source_iface,
+                    });
+                }
+            }
         }
 
         actions
@@ -838,7 +846,7 @@ impl Node {
                     | PathUpdateResult::Kept
             )
         {
-            let initial_delay = (destination_hash[1] as u64) % 2;
+            let initial_delay = (destination_hash[1] as u64) % 5;
             self.announce_table.insert(
                 destination_hash,
                 AnnounceTableEntry {
@@ -2108,8 +2116,8 @@ mod tests {
             now: 1000,
         });
 
-        // Initial retransmit_at = 1000 + (dh[1] % 2)
-        let expected_initial = 1000 + (dh[1] as u64) % 2;
+        // Initial retransmit_at = 1000 + (dh[1] % 5)
+        let expected_initial = 1000 + (dh[1] as u64) % 5;
         let entry = &node.announce_table[&dh];
         assert_eq!(entry.retransmit_at, expected_initial);
 
@@ -2359,5 +2367,155 @@ mod tests {
                 penalty: 120,
             },
         ));
+    }
+
+    // ── 21. Regression tests (PR #8 review feedback) ────────────────
+
+    #[test]
+    fn rate_violations_reset_when_properly_spaced() {
+        // Regression: violations previously never reset, causing permanent blocking.
+        let (mut node, _th) = make_transport_node();
+        let dh = dest(7);
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 2,
+            penalty: 120,
+        };
+
+        // First announce — always passes, sets last_checked
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+
+        // Two rapid announces — accumulate 2 violations (at grace limit)
+        assert!(!node.is_rate_limited(dh, &config, 1010)); // violation 1
+        assert!(!node.is_rate_limited(dh, &config, 1020)); // violation 2
+
+        // Now wait properly (>= target) — violations should reset to 0
+        assert!(!node.is_rate_limited(dh, &config, 1100)); // elapsed=80 >= 60
+
+        // Two more rapid announces should be tolerated (fresh grace budget)
+        assert!(!node.is_rate_limited(dh, &config, 1110)); // violation 1 (fresh)
+        assert!(!node.is_rate_limited(dh, &config, 1120)); // violation 2 (fresh)
+
+        // Third rapid announce exceeds grace → blocked
+        assert!(node.is_rate_limited(dh, &config, 1130));
+    }
+
+    #[test]
+    fn rate_violations_reset_after_penalty_expiry() {
+        // Regression: after penalty expired, a single violation would re-trigger
+        // blocking because accumulated violations were never cleared.
+        let (mut node, _th) = make_transport_node();
+        let dh = dest(8);
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 1,
+            penalty: 120,
+        };
+
+        // Build up to block: announce, rapid, rapid → blocked
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+        assert!(!node.is_rate_limited(dh, &config, 1010)); // violation 1 (at grace)
+        assert!(node.is_rate_limited(dh, &config, 1020));  // violation 2 > grace → blocked
+        // blocked_until = 1020 + 60 + 120 = 1200
+
+        // After penalty expires, should get a fresh grace budget
+        assert!(!node.is_rate_limited(dh, &config, 1200)); // unblocked, resets
+        assert!(!node.is_rate_limited(dh, &config, 1210)); // violation 1 (fresh grace)
+        // Should NOT be immediately blocked — grace is renewed
+        assert!(node.is_rate_limited(dh, &config, 1220));  // violation 2 > grace → blocked again
+    }
+
+    #[test]
+    fn serialization_failure_does_not_trap_entry() {
+        // Regression: if to_bytes() failed, the entry stayed forever because
+        // retries was never incremented.
+        let (mut node, _transport_hash) = make_transport_node();
+
+        // Craft an announce table entry with data that will exceed MTU as Type2.
+        // Type1 max data = 500 - 19 = 481, Type2 max data = 500 - 35 = 465.
+        // 470 bytes of data is valid as Type1 but overflows as Type2.
+        let dh = dest(9);
+        node.announce_table.insert(
+            dh,
+            AnnounceTableEntry {
+                received_at: 1000,
+                retransmit_at: 1000,
+                retries: 0,
+                local_rebroadcasts: 0,
+                source_interface: "eth0".into(),
+                hops: 1,
+                destination_hash: dh,
+                packet_data: vec![0u8; 470], // will overflow Type2 MTU
+                context_flag: false,
+            },
+        );
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Tick 1: retransmit_at <= now, serialization fails → retries becomes 1
+        let actions = node.handle_event(NodeEvent::TimerTick { now: 1000 });
+        // Should emit a serialize-failed drop
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            NodeAction::PacketDropped {
+                reason: DropReason::AnnounceRebroadcastSerializeFailed,
+                ..
+            }
+        )));
+        // Entry still present (retries=1, not > PATHFINDER_R=1 yet)
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Tick 2: retries becomes 2 > PATHFINDER_R=1 → entry removed on next tick
+        let _actions = node.handle_event(NodeEvent::TimerTick { now: 1010 });
+
+        // Tick 3: completion check fires (retries=2 > 1) → entry removed
+        let _ = node.handle_event(NodeEvent::TimerTick { now: 1020 });
+        assert_eq!(
+            node.announce_table_len(),
+            0,
+            "entry should be cleaned up after retries exceed PATHFINDER_R"
+        );
+    }
+
+    #[test]
+    fn near_mtu_announce_emits_diagnostic_on_type2_overflow() {
+        // Regression: near-MTU announces silently vanished during Type1→Type2
+        // conversion. Now they emit AnnounceRebroadcastSerializeFailed.
+        let (mut node, _th) = make_transport_node();
+        let dh = dest(10);
+
+        // 466 bytes of data: valid as Type1 (19+466=485 < 500) but
+        // overflows Type2 (35+466=501 > 500).
+        node.announce_table.insert(
+            dh,
+            AnnounceTableEntry {
+                received_at: 1000,
+                retransmit_at: 1000,
+                retries: 0,
+                local_rebroadcasts: 0,
+                source_interface: "eth0".into(),
+                hops: 1,
+                destination_hash: dh,
+                packet_data: vec![0xAA; 466],
+                context_flag: false,
+            },
+        );
+
+        let actions = node.handle_event(NodeEvent::TimerTick { now: 1000 });
+
+        // Must have a diagnostic drop, not silence
+        let has_drop = actions.iter().any(|a| matches!(
+            a,
+            NodeAction::PacketDropped {
+                reason: DropReason::AnnounceRebroadcastSerializeFailed,
+                ..
+            }
+        ));
+        assert!(has_drop, "expected AnnounceRebroadcastSerializeFailed action");
+
+        // Must NOT have a rebroadcast action (serialization failed)
+        let has_rebroadcast = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::AnnounceRebroadcast { .. }));
+        assert!(!has_rebroadcast, "should not rebroadcast on serialize failure");
     }
 }
