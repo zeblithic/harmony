@@ -21,4 +21,16 @@ pub enum ZenohError {
 
     #[error("envelope open failed: {0}")]
     OpenFailed(String),
+
+    #[error("session not active")]
+    SessionNotActive,
+
+    #[error("handshake failed: {0}")]
+    HandshakeFailed(String),
+
+    #[error("duplicate expression ID: {0}")]
+    DuplicateExprId(u64),
+
+    #[error("unknown expression ID: {0}")]
+    UnknownExprId(u64),
 }
