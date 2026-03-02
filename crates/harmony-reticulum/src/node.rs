@@ -131,7 +131,6 @@ struct LinkTableEntry {
     /// Monotonic timestamp when created or last data activity.
     timestamp: u64,
     /// Next transport toward the destination (from path table).
-    #[allow(dead_code)] // Retained for diagnostics; used in LinkRequestForwarded action
     next_hop: DestinationHash,
     /// Interface to forward toward the destination.
     outbound_interface: String,
@@ -142,7 +141,6 @@ struct LinkTableEntry {
     /// Packet hops at time of receipt (post-increment).
     taken_hops: u8,
     /// Original destination of the link request.
-    #[allow(dead_code)] // Retained for diagnostics
     destination_hash: DestinationHash,
     /// False until link proof received; controls expiry mode.
     validated: bool,
@@ -1414,7 +1412,14 @@ impl Node {
 
         // Rewrite transport headers for the next hop.
         let entry = self.link_table.get(&link_id).unwrap();
-        let is_final_hop = if toward_destination {
+        let same_interface_equidistant = entry.outbound_interface == entry.received_interface
+            && entry.taken_hops == entry.remaining_hops;
+        let is_final_hop = if same_interface_equidistant {
+            // Both endpoints on the same broadcast medium at equal distance:
+            // direction is ambiguous but both are directly reachable, so
+            // always convert to Type1/Broadcast.
+            true
+        } else if toward_destination {
             // Final hop: next_hop IS the actual destination
             entry.next_hop == entry.destination_hash
         } else {
@@ -4591,6 +4596,80 @@ mod tests {
         // Should fall through to normal path relay
         let relayed = actions.iter().any(|a| matches!(a, NodeAction::PacketRelayed { .. }));
         assert!(relayed, "should fall through to normal path relay");
+    }
+
+    #[test]
+    fn link_data_equidistant_same_interface_routes_correctly() {
+        // When taken_hops == remaining_hops on the same interface, direction
+        // is ambiguous. Both endpoints are on the same broadcast medium, so
+        // the transport should produce Type1/Broadcast regardless of direction.
+        let remote = dest(42);
+        let (mut node, th) = make_transport_node();
+
+        // Path entry on "eth0" with hops=2 (same interface + same hops as request)
+        let mut random_blob = [0u8; crate::path_table::RANDOM_BLOB_LENGTH];
+        random_blob[0] = 1;
+        let ts: u64 = 1000;
+        let ts_bytes = ts.to_be_bytes();
+        random_blob[5..10].copy_from_slice(&ts_bytes[3..8]);
+        node.path_table.update(
+            remote,
+            remote, // next_hop == destination (final hop toward dest)
+            2,      // remaining_hops = 2
+            "eth0".into(),
+            dest(99),
+            random_blob,
+            InterfaceMode::Full,
+            1000,
+        );
+
+        // LinkRequest arrives on "eth0" with wire hops=1 (→ taken_hops=2 after increment)
+        // This gives: outbound_interface="eth0", received_interface="eth0", taken_hops=2, remaining_hops=2
+        let req_raw = make_link_request_raw(th, remote, 1);
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: req_raw,
+            now: 2000,
+        });
+
+        let link_id = link_id_for_request(th, remote, 1);
+        let entry = node.link_table.get(&link_id).unwrap();
+        assert_eq!(entry.taken_hops, entry.remaining_hops, "precondition: equidistant");
+        assert_eq!(entry.outbound_interface, entry.received_interface, "precondition: same interface");
+        let equidistant_hops = entry.taken_hops;
+
+        // Validate the link (proof arrives on "eth0" = outbound_interface)
+        let proof_raw = make_lrproof_raw(link_id, equidistant_hops.saturating_sub(1));
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: proof_raw,
+            now: 2001,
+        });
+
+        // Send link data with matching hops (wire = equidistant_hops - 1, becomes equidistant_hops)
+        let data_raw = make_link_data_raw(th, link_id, equidistant_hops.saturating_sub(1));
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: data_raw,
+            now: 2002,
+        });
+
+        let routed = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::LinkDataRouted { .. }));
+        assert!(routed, "equidistant link data should be routed");
+
+        // Must produce Type1 header (final hop on shared medium)
+        let send_action = actions.iter().find_map(|a| match a {
+            NodeAction::SendOnInterface { raw, .. } => Some(raw.clone()),
+            _ => None,
+        });
+        let raw = send_action.unwrap();
+        assert_eq!(
+            raw[0] & 0x40,
+            0,
+            "equidistant same-interface must produce Type1 (not Type2)"
+        );
     }
 
     // ── Dedup exemption ──────────────────────────────────────────────
