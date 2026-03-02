@@ -33,4 +33,10 @@ pub enum ZenohError {
 
     #[error("unknown expression ID: {0}")]
     UnknownExprId(u64),
+
+    #[error("unknown publisher ID: {0}")]
+    UnknownPublisherId(u64),
+
+    #[error("unknown subscription ID: {0}")]
+    UnknownSubscriptionId(u64),
 }
