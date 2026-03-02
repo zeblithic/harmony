@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use harmony_crypto::hash::TRUNCATED_HASH_LENGTH;
 
@@ -41,7 +42,7 @@ pub struct PathEntry {
     /// Absolute expiry time in monotonic seconds.
     pub expires_at: u64,
     /// Name of the interface this path was learned on.
-    pub interface_name: String,
+    pub interface_name: Arc<str>,
     /// Hash of the announce packet that created this entry.
     pub announce_packet_hash: DestinationHash,
     /// Announce timestamp of the current winning route (extracted from its random blob).
@@ -152,7 +153,7 @@ impl PathTable {
         dest: DestinationHash,
         next_hop: DestinationHash,
         hops: u8,
-        interface_name: String,
+        interface_name: Arc<str>,
         announce_packet_hash: DestinationHash,
         random_blob: [u8; RANDOM_BLOB_LENGTH],
         interface_mode: InterfaceMode,
@@ -268,7 +269,7 @@ mod tests {
         let entry = table.get(&dest(1)).unwrap();
         assert_eq!(entry.next_hop, dest(2));
         assert_eq!(entry.hops, 3);
-        assert_eq!(entry.interface_name, "eth0");
+        assert_eq!(&*entry.interface_name, "eth0");
         assert_eq!(entry.learned_at, 1000);
         assert_eq!(entry.expires_at, 1000 + PATH_EXPIRY_DEFAULT);
         assert_eq!(entry.random_blobs.len(), 1);
@@ -305,7 +306,7 @@ mod tests {
         let entry = table.get(&dest(1)).unwrap();
         assert_eq!(entry.next_hop, dest(3));
         assert_eq!(entry.hops, 2);
-        assert_eq!(entry.interface_name, "eth1");
+        assert_eq!(&*entry.interface_name, "eth1");
     }
 
     // ── Update (same hops, newer timestamp) ─────────────────────────────
