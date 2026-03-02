@@ -10,5 +10,10 @@ description = "Zenoh key expression integration for the Harmony decentralized st
 [dependencies]
 zenoh-keyexpr = { version = "1.7", default-features = false, features = ["std"] }
 thiserror.workspace = true
+harmony-crypto.workspace = true
+harmony-identity.workspace = true
+rand_core.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
+rand.workspace = true

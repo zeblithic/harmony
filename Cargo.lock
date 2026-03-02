@@ -371,8 +371,13 @@ dependencies = [
 name = "harmony-zenoh"
 version = "0.1.0"
 dependencies = [
+ "harmony-crypto",
+ "harmony-identity",
+ "rand",
+ "rand_core",
  "thiserror",
  "zenoh-keyexpr",
+ "zeroize",
 ]
 
 [[package]]
