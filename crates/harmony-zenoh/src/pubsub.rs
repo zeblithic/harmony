@@ -6,6 +6,7 @@
 //! (key expression matching) without owning either.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use zenoh_keyexpr::key_expr::{keyexpr, OwnedKeyExpr};
 
@@ -37,10 +38,13 @@ pub enum PubSubAction {
     /// Send a message to the peer (caller encrypts via HarmonyEnvelope).
     SendMessage { expr_id: ExprId, payload: Vec<u8> },
     /// Deliver a received message to a local subscriber.
+    ///
+    /// Payload is reference-counted to avoid cloning when fanning out
+    /// to multiple matching subscribers.
     Deliver {
         subscription_id: SubscriptionId,
         key_expr: String,
-        payload: Vec<u8>,
+        payload: Arc<[u8]>,
     },
     /// Propagate a session-level action (resource declare/undeclare).
     Session(SessionAction),
@@ -209,12 +213,13 @@ impl PubSubRouter {
             return Ok(vec![]);
         }
 
+        let payload: Arc<[u8]> = Arc::from(payload);
         Ok(matches
             .into_iter()
             .map(|sub_id| PubSubAction::Deliver {
                 subscription_id: sub_id,
                 key_expr: key_expr_str.to_string(),
-                payload: payload.clone(),
+                payload: Arc::clone(&payload),
             })
             .collect())
     }
@@ -238,13 +243,9 @@ impl PubSubRouter {
         &mut self,
         key_expr: String,
     ) -> Result<Vec<PubSubAction>, ZenohError> {
-        let sub_id = self
-            .remote_interest_ids
-            .remove(&key_expr)
-            .ok_or(ZenohError::InvalidKeyExpr(format!(
-                "no remote interest for '{key_expr}'"
-            )))?;
-        self.remote_interest.unsubscribe(sub_id)?;
+        if let Some(sub_id) = self.remote_interest_ids.remove(&key_expr) {
+            self.remote_interest.unsubscribe(sub_id)?;
+        }
         Ok(vec![])
     }
 }
@@ -452,16 +453,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
+        assert_eq!(
+            actions[0],
             PubSubAction::Deliver {
-                subscription_id,
-                key_expr,
-                payload,
-            } if *subscription_id == sub_id
-                && key_expr == "harmony/server/srv1/channel/general/msg"
-                && payload == b"hello"
-        ));
+                subscription_id: sub_id,
+                key_expr: "harmony/server/srv1/channel/general/msg".into(),
+                payload: Arc::from(b"hello".as_slice()),
+            }
+        );
     }
 
     #[test]
