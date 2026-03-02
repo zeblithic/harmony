@@ -256,6 +256,16 @@ impl Session {
         self.local_resources.get(&expr_id).map(|s| s.as_str())
     }
 
+    /// Initiate a graceful close. Transitions to Closing and emits `SendClose`.
+    pub fn initiate_close(&mut self, now_ms: u64) -> Result<Vec<SessionAction>, ZenohError> {
+        if self.state != SessionState::Active {
+            return Err(ZenohError::SessionNotActive);
+        }
+        self.state = SessionState::Closing;
+        self.close_initiated_ms = Some(now_ms);
+        Ok(vec![SessionAction::SendClose])
+    }
+
     /// Force-close the session, bulk-undeclaring all resources.
     fn force_close(&mut self) -> Vec<SessionAction> {
         self.state = SessionState::Closed;
@@ -339,11 +349,15 @@ impl Session {
     }
 
     fn handle_close_received(&mut self) -> Result<Vec<SessionAction>, ZenohError> {
-        Ok(vec![])
+        self.last_received_ms = self.last_tick_ms;
+        let mut actions = vec![SessionAction::SendCloseAck];
+        actions.extend(self.force_close());
+        Ok(actions)
     }
 
     fn handle_close_ack_received(&mut self) -> Result<Vec<SessionAction>, ZenohError> {
-        Ok(vec![])
+        self.last_received_ms = self.last_tick_ms;
+        Ok(self.force_close())
     }
 }
 
@@ -630,5 +644,90 @@ mod tests {
         assert!(actions.contains(&SessionAction::PeerStale));
         assert!(actions.contains(&SessionAction::SessionClosed));
         assert_eq!(alice.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn graceful_close_handshake() {
+        let config = SessionConfig {
+            keepalive_interval_ms: 100,
+            stale_timeout_ms: 300,
+            close_timeout_ms: 50,
+        };
+        let mut rng = OsRng;
+        let alice_id = PrivateIdentity::generate(&mut rng);
+        let bob_id = PrivateIdentity::generate(&mut rng);
+        let alice_pub = alice_id.public_identity().clone();
+        let bob_pub = bob_id.public_identity().clone();
+
+        let (mut alice, alice_actions) = Session::new(alice_id, bob_pub, config.clone(), 0);
+        let (mut bob, bob_actions) = Session::new(bob_id, alice_pub, config, 0);
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+
+        // Alice initiates close
+        let actions = alice.initiate_close(10).unwrap();
+        assert!(actions.contains(&SessionAction::SendClose));
+        assert_eq!(alice.state(), SessionState::Closing);
+
+        // Alice receives close ack
+        let actions = alice
+            .handle_event(SessionEvent::CloseAckReceived)
+            .unwrap();
+        assert!(actions.contains(&SessionAction::SessionClosed));
+        assert_eq!(alice.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn close_timeout_forces_closed() {
+        let config = SessionConfig {
+            keepalive_interval_ms: 100,
+            stale_timeout_ms: 300,
+            close_timeout_ms: 50,
+        };
+        let mut rng = OsRng;
+        let alice_id = PrivateIdentity::generate(&mut rng);
+        let bob_id = PrivateIdentity::generate(&mut rng);
+        let alice_pub = alice_id.public_identity().clone();
+        let bob_pub = bob_id.public_identity().clone();
+
+        let (mut alice, alice_actions) = Session::new(alice_id, bob_pub, config.clone(), 0);
+        let (mut bob, bob_actions) = Session::new(bob_id, alice_pub, config, 0);
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+
+        alice.initiate_close(10).unwrap();
+
+        // Not yet timed out
+        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 30 }).unwrap();
+        assert!(!actions.contains(&SessionAction::SessionClosed));
+
+        // Timed out — force close
+        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 60 }).unwrap();
+        assert!(actions.contains(&SessionAction::SessionClosed));
+        assert_eq!(alice.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn remote_initiated_close() {
+        let config = SessionConfig {
+            keepalive_interval_ms: 100,
+            stale_timeout_ms: 300,
+            close_timeout_ms: 50,
+        };
+        let mut rng = OsRng;
+        let alice_id = PrivateIdentity::generate(&mut rng);
+        let bob_id = PrivateIdentity::generate(&mut rng);
+        let alice_pub = alice_id.public_identity().clone();
+        let bob_pub = bob_id.public_identity().clone();
+
+        let (mut alice, alice_actions) = Session::new(alice_id, bob_pub, config.clone(), 0);
+        let (mut bob, bob_actions) = Session::new(bob_id, alice_pub, config, 0);
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+
+        // Bob receives close from Alice
+        let actions = bob
+            .handle_event(SessionEvent::CloseReceived)
+            .unwrap();
+        assert!(actions.contains(&SessionAction::SendCloseAck));
+        assert!(actions.contains(&SessionAction::SessionClosed));
+        assert_eq!(bob.state(), SessionState::Closed);
     }
 }
