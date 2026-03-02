@@ -527,4 +527,47 @@ mod tests {
         assert!(sub_ids.contains(&sub1));
         assert!(sub_ids.contains(&sub2));
     }
+
+    #[test]
+    fn remote_interest_declare_undeclare_lifecycle() {
+        let (mut alice, _bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        let (pub_id, _) = router
+            .declare_publisher("harmony/server/srv1/channel/general/msg".into(), &mut alice)
+            .unwrap();
+
+        // No remote interest yet — publish should emit nothing
+        let actions = router.publish(pub_id, b"msg1".to_vec(), &alice).unwrap();
+        assert!(actions.is_empty());
+
+        // Peer declares interest
+        router
+            .handle_event(
+                PubSubEvent::SubscriberDeclared {
+                    key_expr: "harmony/server/srv1/channel/*/msg".into(),
+                },
+                &alice,
+            )
+            .unwrap();
+
+        // Now publish should emit SendMessage
+        let actions = router.publish(pub_id, b"msg2".to_vec(), &alice).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], PubSubAction::SendMessage { .. }));
+
+        // Peer undeclares interest
+        router
+            .handle_event(
+                PubSubEvent::SubscriberUndeclared {
+                    key_expr: "harmony/server/srv1/channel/*/msg".into(),
+                },
+                &alice,
+            )
+            .unwrap();
+
+        // Publish should emit nothing again
+        let actions = router.publish(pub_id, b"msg3".to_vec(), &alice).unwrap();
+        assert!(actions.is_empty());
+    }
 }
