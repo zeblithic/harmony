@@ -256,9 +256,57 @@ impl Session {
         self.local_resources.get(&expr_id).map(|s| s.as_str())
     }
 
-    // Stub methods — implemented in later tasks
-    fn handle_timer_tick(&mut self, _now_ms: u64) -> Result<Vec<SessionAction>, ZenohError> {
-        Ok(vec![])
+    /// Force-close the session, bulk-undeclaring all resources.
+    fn force_close(&mut self) -> Vec<SessionAction> {
+        self.state = SessionState::Closed;
+        let mut actions: Vec<SessionAction> = self
+            .remote_resources
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|expr_id| SessionAction::ResourceRemoved { expr_id })
+            .collect();
+        self.remote_resources.clear();
+        self.local_resources.clear();
+        actions.push(SessionAction::SessionClosed);
+        actions
+    }
+
+    fn handle_timer_tick(&mut self, now_ms: u64) -> Result<Vec<SessionAction>, ZenohError> {
+        let mut actions = Vec::new();
+        self.last_tick_ms = now_ms;
+
+        if self.state == SessionState::Closed {
+            return Ok(actions);
+        }
+
+        // Check stale timeout (applies in Init, Active, and Closing)
+        if now_ms.saturating_sub(self.last_received_ms) >= self.config.stale_timeout_ms {
+            actions.extend(self.force_close());
+            actions.push(SessionAction::PeerStale);
+            return Ok(actions);
+        }
+
+        // Check close timeout
+        if self.state == SessionState::Closing {
+            if let Some(close_ms) = self.close_initiated_ms {
+                if now_ms.saturating_sub(close_ms) >= self.config.close_timeout_ms {
+                    actions.extend(self.force_close());
+                    return Ok(actions);
+                }
+            }
+        }
+
+        // Emit keepalive if interval elapsed (only in Active state)
+        if self.state == SessionState::Active
+            && now_ms.saturating_sub(self.last_sent_ms) >= self.config.keepalive_interval_ms
+        {
+            self.last_sent_ms = now_ms;
+            actions.push(SessionAction::SendKeepalive);
+        }
+
+        Ok(actions)
     }
 
     fn handle_resource_declared(
@@ -286,6 +334,7 @@ impl Session {
     }
 
     fn handle_keepalive_received(&mut self) -> Result<Vec<SessionAction>, ZenohError> {
+        self.last_received_ms = self.last_tick_ms;
         Ok(vec![])
     }
 
@@ -526,5 +575,60 @@ mod tests {
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
         assert_eq!(id3, 3);
+    }
+
+    #[test]
+    fn keepalive_emitted_after_interval() {
+        let config = SessionConfig {
+            keepalive_interval_ms: 100,
+            stale_timeout_ms: 300,
+            close_timeout_ms: 50,
+        };
+        let mut rng = OsRng;
+        let alice_id = PrivateIdentity::generate(&mut rng);
+        let bob_id = PrivateIdentity::generate(&mut rng);
+        let alice_pub = alice_id.public_identity().clone();
+        let bob_pub = bob_id.public_identity().clone();
+
+        let (mut alice, alice_actions) = Session::new(alice_id, bob_pub, config.clone(), 0);
+        let (mut bob, bob_actions) = Session::new(bob_id, alice_pub, config, 0);
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+
+        // Before interval: no keepalive
+        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 50 }).unwrap();
+        assert!(!actions.contains(&SessionAction::SendKeepalive));
+
+        // At interval: keepalive emitted
+        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 100 }).unwrap();
+        assert!(actions.contains(&SessionAction::SendKeepalive));
+    }
+
+    #[test]
+    fn stale_peer_detected_after_timeout() {
+        let config = SessionConfig {
+            keepalive_interval_ms: 100,
+            stale_timeout_ms: 300,
+            close_timeout_ms: 50,
+        };
+        let mut rng = OsRng;
+        let alice_id = PrivateIdentity::generate(&mut rng);
+        let bob_id = PrivateIdentity::generate(&mut rng);
+        let alice_pub = alice_id.public_identity().clone();
+        let bob_pub = bob_id.public_identity().clone();
+
+        let (mut alice, alice_actions) = Session::new(alice_id, bob_pub, config.clone(), 0);
+        let (mut bob, bob_actions) = Session::new(bob_id, alice_pub, config, 0);
+        complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
+
+        // Not yet stale
+        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 200 }).unwrap();
+        assert!(!actions.contains(&SessionAction::PeerStale));
+        assert_eq!(alice.state(), SessionState::Active);
+
+        // Stale
+        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 300 }).unwrap();
+        assert!(actions.contains(&SessionAction::PeerStale));
+        assert!(actions.contains(&SessionAction::SessionClosed));
+        assert_eq!(alice.state(), SessionState::Closed);
     }
 }
