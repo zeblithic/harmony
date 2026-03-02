@@ -44,6 +44,9 @@ pub struct PathEntry {
     pub interface_name: String,
     /// Hash of the announce packet that created this entry.
     pub announce_packet_hash: DestinationHash,
+    /// Announce timestamp of the current winning route (extracted from its random blob).
+    /// Used for "same hops, newer timestamp" comparisons independently of the blob FIFO.
+    pub announce_timestamp: u64,
     /// FIFO list of random blobs from announces, for replay detection.
     pub random_blobs: Vec<[u8; RANDOM_BLOB_LENGTH]>,
 }
@@ -168,13 +171,11 @@ impl PathTable {
                     return PathUpdateResult::DuplicateBlob;
                 }
 
+                let new_timestamp = timestamp_from_random_blob(&random_blob);
                 let should_replace = existing.expires_at <= now
                     || hops < existing.hops
                     || (hops == existing.hops
-                        && timestamp_from_random_blob(&random_blob)
-                            > timestamp_from_random_blob(
-                                existing.random_blobs.last().unwrap_or(&[0; RANDOM_BLOB_LENGTH]),
-                            ));
+                        && new_timestamp > existing.announce_timestamp);
 
                 // Always record the blob, even if we don't replace the route
                 push_blob(&mut existing.random_blobs, random_blob);
@@ -186,12 +187,14 @@ impl PathTable {
                     existing.expires_at = expiry;
                     existing.interface_name = interface_name;
                     existing.announce_packet_hash = announce_packet_hash;
+                    existing.announce_timestamp = new_timestamp;
                     PathUpdateResult::Updated
                 } else {
                     PathUpdateResult::Kept
                 }
             }
             None => {
+                let announce_timestamp = timestamp_from_random_blob(&random_blob);
                 self.entries.insert(
                     dest,
                     PathEntry {
@@ -201,6 +204,7 @@ impl PathTable {
                         expires_at: expiry,
                         interface_name,
                         announce_packet_hash,
+                        announce_timestamp,
                         random_blobs: vec![random_blob],
                     },
                 );
@@ -649,6 +653,64 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&dest(1)));
         assert!(keys.contains(&dest(2)));
+    }
+
+    // ── Kept blob doesn't corrupt timestamp comparison ────────────────
+
+    #[test]
+    fn kept_blob_does_not_corrupt_winning_timestamp() {
+        let mut table = PathTable::new();
+
+        // Establish 3-hop route at ts=1000
+        table.update(
+            dest(1), dest(2), 3, "eth0".into(), dest(10), blob(1, 1000),
+            InterfaceMode::Full, 1000,
+        );
+
+        // Worse 5-hop route at ts=500 → Kept, but blob is recorded
+        let result = table.update(
+            dest(1), dest(3), 5, "eth1".into(), dest(11), blob(2, 500),
+            InterfaceMode::Full, 1001,
+        );
+        assert_eq!(result, PathUpdateResult::Kept);
+
+        // Same 3-hop route at ts=800 — should NOT replace ts=1000 route
+        let result = table.update(
+            dest(1), dest(4), 3, "eth2".into(), dest(12), blob(3, 800),
+            InterfaceMode::Full, 1002,
+        );
+        assert_eq!(result, PathUpdateResult::Kept);
+        let entry = table.get(&dest(1)).unwrap();
+        assert_eq!(entry.next_hop, dest(2)); // original route preserved
+        assert_eq!(entry.announce_timestamp, 1000);
+    }
+
+    #[test]
+    fn kept_blob_with_higher_timestamp_does_not_cause_false_upgrade() {
+        let mut table = PathTable::new();
+
+        // Establish 2-hop route at ts=1000
+        table.update(
+            dest(1), dest(2), 2, "eth0".into(), dest(10), blob(1, 1000),
+            InterfaceMode::Full, 1000,
+        );
+
+        // Worse 5-hop route at ts=5000 → Kept (more hops)
+        let result = table.update(
+            dest(1), dest(3), 5, "eth1".into(), dest(11), blob(2, 5000),
+            InterfaceMode::Full, 1001,
+        );
+        assert_eq!(result, PathUpdateResult::Kept);
+
+        // Same 2-hop route at ts=1500 — should replace ts=1000 (genuinely newer)
+        let result = table.update(
+            dest(1), dest(4), 2, "eth2".into(), dest(12), blob(3, 1500),
+            InterfaceMode::Full, 1002,
+        );
+        assert_eq!(result, PathUpdateResult::Updated);
+        let entry = table.get(&dest(1)).unwrap();
+        assert_eq!(entry.next_hop, dest(4));
+        assert_eq!(entry.announce_timestamp, 1500);
     }
 
     // ── Blob recorded even on Kept ──────────────────────────────────────
