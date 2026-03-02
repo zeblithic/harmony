@@ -130,14 +130,17 @@ impl PubSubRouter {
 
     /// Declare a publisher on the given key expression.
     ///
-    /// Allocates a resource on the session and stores the publisher-to-resource
-    /// mapping. Returns the new `PublisherId` and any session-level actions
-    /// (the caller must execute them).
+    /// Validates the key expression, allocates a resource on the session, and
+    /// stores the publisher-to-resource mapping. Returns the new `PublisherId`
+    /// and any session-level actions (the caller must execute them).
     pub fn declare_publisher(
         &mut self,
         key_expr: String,
         session: &mut Session,
     ) -> Result<(PublisherId, Vec<PubSubAction>), ZenohError> {
+        // Validate early so we never allocate a session resource for an invalid key.
+        let _owned = OwnedKeyExpr::autocanonize(key_expr.clone())
+            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
         let (expr_id, session_actions) = session.declare_resource(key_expr)?;
         let pub_id = self.next_publisher_id;
         self.next_publisher_id += 1;
@@ -703,5 +706,18 @@ mod tests {
         // Interest gone
         let actions = router.publish(pub_id, b"msg".to_vec(), &alice).unwrap();
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn declare_publisher_rejects_invalid_key_expression() {
+        let (mut alice, _bob) = active_session_pair();
+        let mut router = PubSubRouter::new();
+
+        // Empty string is not a valid Zenoh key expression
+        let result = router.declare_publisher("".into(), &mut alice);
+        assert!(matches!(result, Err(ZenohError::InvalidKeyExpr(_))));
+
+        // No session resource should have been allocated
+        assert!(alice.resolve_local(1).is_none());
     }
 }
