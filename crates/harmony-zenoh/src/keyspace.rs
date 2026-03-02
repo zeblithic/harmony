@@ -39,6 +39,7 @@ const NODE_LOOKUP_FMT: &str = "lookup/rns/${node_hash:*}";
 
 /// Subscribe to all messages on a specific server's channel.
 pub fn channel_msg_sub(server_id: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(server_id)?;
     ke(&format!(
         "harmony/server/{server_id}/channel/*/msg"
     ))
@@ -49,6 +50,8 @@ pub fn channel_msg_sub_exact(
     server_id: &str,
     channel_id: &str,
 ) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(server_id)?;
+    reject_slashes(channel_id)?;
     ke(&format!(
         "harmony/server/{server_id}/channel/{channel_id}/msg"
     ))
@@ -67,6 +70,7 @@ pub fn dm_sub(user_a: &str, user_b: &str) -> Result<OwnedKeyExpr, ZenohError> {
 /// Subscribe to all direct messages involving a user (either side).
 /// Returns two subscription patterns since DMs are keyed by `{user_a}/{user_b}`.
 pub fn dm_sub_all_for_user(user_id: &str) -> Result<[OwnedKeyExpr; 2], ZenohError> {
+    reject_slashes(user_id)?;
     Ok([
         ke(&format!("harmony/dm/{user_id}/*/msg"))?,
         ke(&format!("harmony/dm/*/{user_id}/msg"))?,
@@ -75,6 +79,7 @@ pub fn dm_sub_all_for_user(user_id: &str) -> Result<[OwnedKeyExpr; 2], ZenohErro
 
 /// Subscribe to presence on a specific server.
 pub fn presence_sub(server_id: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(server_id)?;
     ke(&format!("harmony/presence/{server_id}/*"))
 }
 
@@ -85,11 +90,14 @@ pub fn presence_sub_all() -> Result<OwnedKeyExpr, ZenohError> {
 
 /// Subscribe to geospatial announcements within an S2 level-4 cell.
 pub fn geo_s2_sub_l4(l4: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(l4)?;
     ke(&format!("geo/s2/{l4}/**"))
 }
 
 /// Subscribe to geospatial announcements within an S2 level-8 cell.
 pub fn geo_s2_sub_l8(l4: &str, l8: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(l4)?;
+    reject_slashes(l8)?;
     ke(&format!("geo/s2/{l4}/{l8}/**"))
 }
 
@@ -226,6 +234,17 @@ fn ze(msg: String) -> ZenohError {
     ZenohError::InvalidKeyExpr(msg)
 }
 
+/// Reject field values containing `/` which would silently create extra path
+/// segments in format!-based subscription patterns.
+fn reject_slashes(field: &str) -> Result<(), ZenohError> {
+    if field.contains('/') {
+        return Err(ZenohError::InvalidKeyExpr(format!(
+            "field value must not contain '/': {field:?}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,9 +310,14 @@ mod tests {
 
     #[test]
     fn dm_sub_all_for_user_matches_both_sides() {
+        // subs[0] = harmony/dm/alice/*/msg  (alice as user_a)
+        // subs[1] = harmony/dm/*/alice/msg  (alice as user_b)
         let subs = dm_sub_all_for_user("alice").unwrap();
+
+        // alice < bob, so dm_key sorts to ("alice", "bob") → alice is user_a
         let msg_as_a = dm_key("alice", "bob").unwrap();
-        let msg_as_b = dm_key("charlie", "alice").unwrap();
+        // "aaa" < "alice", so dm_key sorts to ("aaa", "alice") → alice is user_b
+        let msg_as_b = dm_key("aaa", "alice").unwrap();
 
         // At least one subscription should match each message
         assert!(
@@ -406,6 +430,18 @@ mod tests {
     fn slash_in_field_rejected() {
         // Slashes in single-chunk fields are invalid
         assert!(channel_msg_key("srv/1", "general").is_err());
+    }
+
+    #[test]
+    fn slash_in_subscription_field_rejected() {
+        // Subscription builders must also reject slashes to stay consistent
+        // with key builders — otherwise a silent pub/sub mismatch occurs.
+        assert!(channel_msg_sub("srv/1").is_err());
+        assert!(channel_msg_sub_exact("srv1", "chan/1").is_err());
+        assert!(dm_sub_all_for_user("user/1").is_err());
+        assert!(presence_sub("srv/1").is_err());
+        assert!(geo_s2_sub_l4("3/4").is_err());
+        assert!(geo_s2_sub_l8("3", "9/4").is_err());
     }
 
     #[test]
