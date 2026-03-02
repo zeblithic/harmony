@@ -23,6 +23,6 @@ pub use packet::{
     DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
     HEADER_1_SIZE, HEADER_2_SIZE, MTU,
 };
-pub use node::{DropReason, InterfaceConfig, Node, NodeAction, NodeEvent};
+pub use node::{AnnounceRateConfig, DropReason, InterfaceConfig, Node, NodeAction, NodeEvent};
 pub use packet_hashlist::PacketHashlist;
 pub use path_table::{PathEntry, PathTable, PathUpdateResult};

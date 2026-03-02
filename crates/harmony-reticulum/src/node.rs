@@ -6,19 +6,50 @@ use harmony_identity::identity::PrivateIdentity;
 use rand_core::CryptoRngCore;
 
 use crate::announce::{build_announce, validate_announce, ValidatedAnnounce};
+use crate::context::PacketContext;
 use crate::destination::DestinationName;
 use crate::ifac::IfacAuthenticator;
 use crate::interface::InterfaceMode;
-use crate::packet::{DestinationType, Packet, PacketType};
+use crate::packet::{
+    DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
+};
 use crate::packet_hashlist::PacketHashlist;
 use crate::path_table::{DestinationHash, PathTable, PathUpdateResult};
 
+// ── Constants (transport-mode announce propagation) ──────────────────────
+
+/// Maximum retransmit retries for announce propagation (Python: `PATHFINDER_R`).
+const PATHFINDER_R: u8 = 1;
+
+/// Base retry delay in seconds for announce retransmits (Python: `PATHFINDER_G`).
+const PATHFINDER_G: u64 = 5;
+
+/// Maximum local rebroadcast echoes before considering propagation done.
+const LOCAL_REBROADCASTS_MAX: u8 = 2;
+
+/// Announce rate table entries unseen for this many seconds are evicted.
+/// Matches the shortest path expiry (Roaming = 6 hours).
+const RATE_TABLE_EXPIRY: u64 = 21_600;
+
+
 // ── Types ───────────────────────────────────────────────────────────────
+
+/// Per-interface announce rate limiting configuration.
+#[derive(Debug, Clone)]
+pub struct AnnounceRateConfig {
+    /// Minimum seconds between announces for the same destination.
+    pub target: u64,
+    /// Number of violations allowed before blocking.
+    pub grace: u32,
+    /// Additional seconds added to target when blocked.
+    pub penalty: u64,
+}
 
 /// Configuration for a registered interface.
 pub struct InterfaceConfig {
     pub mode: InterfaceMode,
     pub ifac: Option<IfacAuthenticator>,
+    pub announce_rate: Option<AnnounceRateConfig>,
 }
 
 impl fmt::Debug for InterfaceConfig {
@@ -26,6 +57,7 @@ impl fmt::Debug for InterfaceConfig {
         f.debug_struct("InterfaceConfig")
             .field("mode", &self.mode)
             .field("ifac", &self.ifac.is_some())
+            .field("announce_rate", &self.announce_rate.is_some())
             .finish()
     }
 }
@@ -48,6 +80,26 @@ impl fmt::Debug for AnnouncingDestination {
             .field("next_announce_at", &self.next_announce_at)
             .finish()
     }
+}
+
+/// Per-destination rate limiting state for announce propagation.
+struct AnnounceRateEntry {
+    last_checked: u64,
+    rate_violations: u32,
+    blocked_until: u64,
+}
+
+/// An announce queued for transport retransmission.
+struct AnnounceTableEntry {
+    #[allow(dead_code)] // Retained for diagnostics
+    received_at: u64,
+    retransmit_at: u64,
+    retries: u8,
+    local_rebroadcasts: u8,
+    source_interface: String,
+    hops: u8,
+    destination_hash: DestinationHash,
+    packet_data: Vec<u8>,
 }
 
 /// Input events from the caller.
@@ -92,6 +144,10 @@ pub enum DropReason {
     OutboundSerializeFailed,
     /// IFAC mask() failed on outbound.
     OutboundIfacFailed,
+    /// Announce dropped by per-destination rate limiter.
+    AnnounceRateLimited,
+    /// Announce could not be re-serialized as HEADER_2 (likely MTU overflow).
+    AnnounceRebroadcastSerializeFailed,
 }
 
 /// Output actions for the caller.
@@ -127,26 +183,35 @@ pub enum NodeAction {
         interface_name: String,
         raw: Vec<u8>,
     },
+    /// Transport node rebroadcast an announce on interfaces (excluding source).
+    AnnounceRebroadcast {
+        destination_hash: DestinationHash,
+        hops: u8,
+    },
 }
 
 // ── Node ────────────────────────────────────────────────────────────────
 
-/// The node coordinator state machine (leaf mode).
+/// The node coordinator state machine.
 ///
-/// Ties interfaces, path table, packet hashlist, and IFAC together. A leaf
-/// node receives packets, processes announces to learn paths, deduplicates,
-/// and delivers packets to locally registered destinations — but does NOT
-/// relay or forward for others.
+/// Ties interfaces, path table, packet hashlist, and IFAC together. In leaf
+/// mode, the node receives packets, processes announces to learn paths,
+/// deduplicates, and delivers packets to locally registered destinations.
+/// In transport mode (created via `new_transport`), it also re-broadcasts
+/// received announces as HEADER_2 packets with rate limiting.
 pub struct Node {
     path_table: PathTable,
     packet_hashlist: PacketHashlist,
     interfaces: HashMap<String, InterfaceConfig>,
     local_destinations: HashSet<DestinationHash>,
     announcing_destinations: HashMap<DestinationHash, AnnouncingDestination>,
+    transport_identity: Option<PrivateIdentity>,
+    announce_table: HashMap<DestinationHash, AnnounceTableEntry>,
+    announce_rate_table: HashMap<DestinationHash, AnnounceRateEntry>,
 }
 
 impl Node {
-    /// Create an empty node with no interfaces or destinations.
+    /// Create a leaf-mode node with no interfaces or destinations.
     pub fn new() -> Self {
         Self {
             path_table: PathTable::new(),
@@ -154,7 +219,52 @@ impl Node {
             interfaces: HashMap::new(),
             local_destinations: HashSet::new(),
             announcing_destinations: HashMap::new(),
+            transport_identity: None,
+            announce_table: HashMap::new(),
+            announce_rate_table: HashMap::new(),
         }
+    }
+
+    /// Create a transport-mode node. Stores identity for HEADER_2 construction.
+    pub fn new_transport(identity: PrivateIdentity) -> Self {
+        Self {
+            path_table: PathTable::new(),
+            packet_hashlist: PacketHashlist::new(),
+            interfaces: HashMap::new(),
+            local_destinations: HashSet::new(),
+            announcing_destinations: HashMap::new(),
+            transport_identity: Some(identity),
+            announce_table: HashMap::new(),
+            announce_rate_table: HashMap::new(),
+        }
+    }
+
+    /// Whether the node is in transport mode (has a transport identity).
+    pub fn is_transport(&self) -> bool {
+        self.transport_identity.is_some()
+    }
+
+    /// The 16-byte transport identity hash, if in transport mode.
+    pub fn transport_identity_hash(&self) -> Option<[u8; 16]> {
+        self.transport_identity
+            .as_ref()
+            .map(|id| id.public_identity().address_hash)
+    }
+
+    /// Set rate limiting config on an existing interface. Returns false if not found.
+    pub fn set_announce_rate(&mut self, name: &str, config: AnnounceRateConfig) -> bool {
+        match self.interfaces.get_mut(name) {
+            Some(iface) => {
+                iface.announce_rate = Some(config);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Number of entries in the announce propagation table.
+    pub fn announce_table_len(&self) -> usize {
+        self.announce_table.len()
     }
 
     /// Register an interface by name and configuration.
@@ -166,7 +276,14 @@ impl Node {
         mode: InterfaceMode,
         ifac: Option<IfacAuthenticator>,
     ) {
-        self.interfaces.insert(name, InterfaceConfig { mode, ifac });
+        self.interfaces.insert(
+            name,
+            InterfaceConfig {
+                mode,
+                ifac,
+                announce_rate: None,
+            },
+        );
     }
 
     /// Unregister an interface. Returns `true` if it was registered.
@@ -326,6 +443,11 @@ impl Node {
                     }
                 }
 
+                if self.is_transport() {
+                    actions.extend(self.process_announce_table(now));
+                    self.expire_rate_table(now);
+                }
+
                 actions
             }
         }
@@ -384,6 +506,181 @@ impl Node {
         for name in self.interfaces.keys() {
             actions.extend(self.send_on_interface(name, raw));
         }
+        actions
+    }
+
+    /// Broadcast on all interfaces except the named one (source exclusion).
+    fn broadcast_except(&self, exclude: &str, raw: &[u8]) -> Vec<NodeAction> {
+        let mut actions = Vec::with_capacity(self.interfaces.len());
+        for name in self.interfaces.keys() {
+            if name != exclude {
+                actions.extend(self.send_on_interface(name, raw));
+            }
+        }
+        actions
+    }
+
+    /// Check if an announce for dest_hash is rate-limited. Mutates rate table.
+    fn is_rate_limited(
+        &mut self,
+        dest: DestinationHash,
+        config: &AnnounceRateConfig,
+        now: u64,
+    ) -> bool {
+        let entry = self.announce_rate_table.entry(dest).or_insert_with(|| {
+            AnnounceRateEntry {
+                last_checked: 0,
+                rate_violations: 0,
+                blocked_until: 0,
+            }
+        });
+
+        // If currently blocked, check if penalty has expired
+        if now < entry.blocked_until {
+            return true;
+        }
+
+        // Check interval since last announce
+        let elapsed = now.saturating_sub(entry.last_checked);
+        if entry.last_checked > 0 && elapsed < config.target {
+            entry.rate_violations += 1;
+            if entry.rate_violations > config.grace {
+                entry.blocked_until = now + config.target + config.penalty;
+                // Reset violations so grace is renewable after penalty expires
+                entry.rate_violations = 0;
+                return true;
+            }
+        } else {
+            // Properly spaced — reset violations
+            entry.rate_violations = 0;
+        }
+
+        entry.last_checked = now;
+        false
+    }
+
+    /// Evict stale entries from the announce rate table.
+    ///
+    /// An entry is stale when it hasn't been checked recently and isn't
+    /// actively blocking a destination. Called from TimerTick.
+    fn expire_rate_table(&mut self, now: u64) {
+        self.announce_rate_table.retain(|_, entry| {
+            let age = now.saturating_sub(entry.last_checked);
+            // Keep if: still within expiry window, OR actively blocking
+            age < RATE_TABLE_EXPIRY || now < entry.blocked_until
+        });
+    }
+
+    /// Detect local rebroadcast echo or downstream forward.
+    /// Returns `true` if the packet matched an announce table entry (echo or forward).
+    fn check_rebroadcast_echo(&mut self, dest: DestinationHash, incoming_hops: u8) -> bool {
+        let (matched, should_remove) = if let Some(entry) = self.announce_table.get_mut(&dest) {
+            // incoming_hops is post-increment (our pipeline already did +1)
+            // entry.hops is stored post-increment too
+            // Echo: we hear our own rebroadcast back (same hop count)
+            if incoming_hops.saturating_sub(1) == entry.hops {
+                entry.local_rebroadcasts += 1;
+                let remove = entry.retries > 0
+                    && entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX;
+                (true, remove)
+            }
+            // Downstream forward: another transport picked it up (hops+1)
+            else if incoming_hops.saturating_sub(1) == entry.hops.saturating_add(1) {
+                (true, entry.retries > 0)
+            } else {
+                // Entry exists but hops don't match echo/forward pattern
+                (true, false)
+            }
+        } else {
+            (false, false)
+        };
+
+        if should_remove {
+            self.announce_table.remove(&dest);
+        }
+
+        matched
+    }
+
+    /// Process announce table: remove completed entries, retransmit due entries.
+    fn process_announce_table(&mut self, now: u64) -> Vec<NodeAction> {
+        let transport_hash = match self.transport_identity_hash() {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+
+        // First pass: collect completed and due entries
+        let mut completed = Vec::new();
+        let mut due: Vec<(DestinationHash, Option<Vec<u8>>, String, u8)> = Vec::new();
+
+        for (dest, entry) in &self.announce_table {
+            // Completed: exceeded max retries, or retries>0 with enough rebroadcasts
+            if entry.retries > PATHFINDER_R
+                || (entry.retries > 0
+                    && entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX)
+            {
+                completed.push(*dest);
+                continue;
+            }
+
+            // Due for retransmit
+            if now >= entry.retransmit_at {
+                // Build HEADER_2 packet
+                let packet = Packet {
+                    header: PacketHeader {
+                        flags: PacketFlags {
+                            ifac: false,
+                            header_type: HeaderType::Type2,
+                            context_flag: false,
+                            propagation: PropagationType::Transport,
+                            destination_type: DestinationType::Single,
+                            packet_type: PacketType::Announce,
+                        },
+                        hops: entry.hops,
+                        transport_id: Some(transport_hash),
+                        destination_hash: entry.destination_hash,
+                        context: PacketContext::None,
+                    },
+                    data: entry.packet_data.clone(),
+                };
+
+                // Always mark as due (even on serialization failure) so
+                // retries increments and the entry can eventually be cleaned up.
+                let raw = packet.to_bytes().ok();
+                due.push((*dest, raw, entry.source_interface.clone(), entry.hops));
+            }
+        }
+
+        // Remove completed entries
+        for dest in &completed {
+            self.announce_table.remove(dest);
+        }
+
+        // Process due retransmits
+        let mut actions = Vec::new();
+        for (dest, raw, source_iface, hops) in due {
+            if let Some(entry) = self.announce_table.get_mut(&dest) {
+                entry.retries += 1;
+                entry.retransmit_at =
+                    now + PATHFINDER_G + (dest[2] as u64 % 3);
+            }
+            match raw {
+                Some(bytes) => {
+                    actions.extend(self.broadcast_except(&source_iface, &bytes));
+                    actions.push(NodeAction::AnnounceRebroadcast {
+                        destination_hash: dest,
+                        hops,
+                    });
+                }
+                None => {
+                    actions.push(NodeAction::PacketDropped {
+                        reason: DropReason::AnnounceRebroadcastSerializeFailed,
+                        interface_name: source_iface,
+                    });
+                }
+            }
+        }
+
         actions
     }
 
@@ -518,6 +815,34 @@ impl Node {
         let random_hash = validated.random_hash;
         let hops = packet.header.hops;
 
+        // Rebroadcast detection runs BEFORE rate limiting so echoes of our
+        // own rebroadcasts don't consume grace points. Echoes are expected
+        // traffic, not abuse — they shouldn't count toward rate violations.
+        let was_echo = if self.is_transport() {
+            self.check_rebroadcast_echo(destination_hash, hops)
+        } else {
+            false
+        };
+
+        // Rate limiting (transport mode only).
+        // Skip if this packet matched an announce table entry (echo/forward of
+        // our own rebroadcast) — even if the entry was just removed by echo
+        // detection, the packet is expected traffic, not abuse.
+        if self.is_transport() && !was_echo {
+            let rate_config = self
+                .interfaces
+                .get(&interface_name)
+                .and_then(|c| c.announce_rate.clone());
+            if let Some(config) = rate_config {
+                if self.is_rate_limited(destination_hash, &config, now) {
+                    return vec![NodeAction::PacketDropped {
+                        reason: DropReason::AnnounceRateLimited,
+                        interface_name,
+                    }];
+                }
+            }
+        }
+
         // Announce packet hash: truncated (first 16 bytes) of the full hash
         let mut announce_packet_hash: DestinationHash = [0u8; 16];
         announce_packet_hash.copy_from_slice(&full_packet_hash[..16]);
@@ -535,6 +860,33 @@ impl Node {
             interface_mode,
             now,
         );
+
+        // Announce table insertion (transport mode only)
+        if self.is_transport()
+            && !self.local_destinations.contains(&destination_hash)
+            && !self.announce_table.contains_key(&destination_hash)
+            && matches!(
+                path_update,
+                PathUpdateResult::Inserted
+                    | PathUpdateResult::Updated
+                    | PathUpdateResult::Kept
+            )
+        {
+            let initial_delay = (destination_hash[1] as u64) % 5;
+            self.announce_table.insert(
+                destination_hash,
+                AnnounceTableEntry {
+                    received_at: now,
+                    retransmit_at: now + initial_delay,
+                    retries: 0,
+                    local_rebroadcasts: 0,
+                    source_interface: interface_name.clone(),
+                    hops,
+                    destination_hash,
+                    packet_data: packet.data,
+                },
+            );
+        }
 
         vec![NodeAction::AnnounceReceived {
             destination_hash,
@@ -1580,5 +1932,783 @@ mod tests {
         let ad = &node.announcing_destinations[&dh];
         assert_eq!(ad.next_announce_at, 300 + expected_jitter);
         assert!(expected_jitter < 60);
+    }
+
+    // ── Transport-mode test helpers ──────────────────────────────────
+
+    /// Create a transport node with "eth0" and "wlan0". Returns (node, transport_hash).
+    fn make_transport_node() -> (Node, [u8; 16]) {
+        let transport_id = PrivateIdentity::generate(&mut OsRng);
+        let transport_hash = transport_id.public_identity().address_hash;
+        let mut node = Node::new_transport(transport_id);
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+        (node, transport_hash)
+    }
+
+    /// Create a transport node with rate limiting on "eth0".
+    fn make_transport_node_with_rate(
+        target: u64,
+        grace: u32,
+        penalty: u64,
+    ) -> (Node, [u8; 16]) {
+        let (mut node, th) = make_transport_node();
+        node.set_announce_rate(
+            "eth0",
+            AnnounceRateConfig {
+                target,
+                grace,
+                penalty,
+            },
+        );
+        (node, th)
+    }
+
+    // ── 15. Transport mode ───────────────────────────────────────────
+
+    #[test]
+    fn transport_node_created_with_identity() {
+        let (node, th) = make_transport_node();
+        assert!(node.is_transport());
+        assert_eq!(node.transport_identity_hash(), Some(th));
+    }
+
+    #[test]
+    fn leaf_node_is_not_transport() {
+        let node = Node::new();
+        assert!(!node.is_transport());
+        assert_eq!(node.transport_identity_hash(), None);
+    }
+
+    // ── 16. Announce table insertion ─────────────────────────────────
+
+    #[test]
+    fn transport_queues_announce_for_forwarding() {
+        let (mut node, _th) = make_transport_node();
+        let (raw, _dh) = make_valid_announce();
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        assert_eq!(node.announce_table_len(), 1);
+    }
+
+    #[test]
+    fn leaf_does_not_populate_announce_table() {
+        let mut node = make_node_with_interface();
+        let (raw, _dh) = make_valid_announce();
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        assert_eq!(node.announce_table_len(), 0);
+    }
+
+    #[test]
+    fn local_dest_announce_not_forwarded() {
+        let (mut node, _th) = make_transport_node();
+        let (raw, dh) = make_valid_announce();
+
+        // Register the destination locally — transport should not queue it
+        node.register_destination(dh);
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        assert_eq!(node.announce_table_len(), 0);
+    }
+
+    // ── 17. Retransmit scheduling ────────────────────────────────────
+
+    #[test]
+    fn timer_retransmits_due_announce_as_header2() {
+        let (mut node, th) = make_transport_node();
+        let (raw, dh) = make_valid_announce();
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Tick far enough ahead for the initial delay to pass
+        let actions = node.handle_event(NodeEvent::TimerTick { now: 1010 });
+
+        // Should have SendOnInterface actions (on wlan0 only, excluding source eth0)
+        // plus an AnnounceRebroadcast action
+        let sends: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                NodeAction::SendOnInterface { interface_name, raw } => {
+                    Some((interface_name.as_str(), raw.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sends.len(), 1, "should broadcast on 1 interface (excluding source)");
+        assert_eq!(sends[0].0, "wlan0");
+
+        // Verify the rebroadcast bytes are a valid HEADER_2 packet
+        let pkt = Packet::from_bytes(&sends[0].1).unwrap();
+        assert_eq!(pkt.header.flags.header_type, HeaderType::Type2);
+        assert_eq!(pkt.header.flags.propagation, PropagationType::Transport);
+        assert_eq!(pkt.header.flags.packet_type, PacketType::Announce);
+        assert_eq!(pkt.header.transport_id, Some(th));
+        assert_eq!(pkt.header.destination_hash, dh);
+
+        // AnnounceRebroadcast action present
+        let rebroadcasts: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, NodeAction::AnnounceRebroadcast { .. }))
+            .collect();
+        assert_eq!(rebroadcasts.len(), 1);
+    }
+
+    #[test]
+    fn timer_retransmit_excludes_source_interface() {
+        let transport_id = PrivateIdentity::generate(&mut OsRng);
+        let mut node = Node::new_transport(transport_id);
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+        node.register_interface("lora0".into(), InterfaceMode::Full, None);
+
+        let (raw, _dh) = make_valid_announce();
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        let actions = node.handle_event(NodeEvent::TimerTick { now: 1010 });
+        let sends: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                NodeAction::SendOnInterface { interface_name, .. } => {
+                    Some(interface_name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        // Should send on wlan0 and lora0, but NOT eth0
+        assert_eq!(sends.len(), 2);
+        assert!(!sends.contains(&"eth0"));
+    }
+
+    #[test]
+    fn timer_removes_after_max_retries() {
+        let (mut node, _th) = make_transport_node();
+        let (raw, _dh) = make_valid_announce();
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Tick 1: retries 0→1 (first transmit, retries == PATHFINDER_R)
+        node.handle_event(NodeEvent::TimerTick { now: 1010 });
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Tick 2: retries 1→2 (completion check is retries > PATHFINDER_R=1,
+        //         which is false at start of tick; retransmit bumps to 2)
+        node.handle_event(NodeEvent::TimerTick { now: 1020 });
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Tick 3: completion check sees retries=2 > PATHFINDER_R=1 → removed
+        node.handle_event(NodeEvent::TimerTick { now: 1030 });
+        assert_eq!(node.announce_table_len(), 0);
+    }
+
+    #[test]
+    fn timer_retransmit_deterministic_jitter() {
+        let (mut node, _th) = make_transport_node();
+        let (raw, dh) = make_valid_announce();
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        // Initial retransmit_at = 1000 + (dh[1] % 5)
+        let expected_initial = 1000 + (dh[1] as u64) % 5;
+        let entry = &node.announce_table[&dh];
+        assert_eq!(entry.retransmit_at, expected_initial);
+
+        // After first retransmit, next retransmit_at = tick_time + PATHFINDER_G + (dh[2] % 3)
+        let tick_time = expected_initial;
+        node.handle_event(NodeEvent::TimerTick { now: tick_time });
+
+        let expected_next = tick_time + PATHFINDER_G + (dh[2] as u64 % 3);
+        let entry = &node.announce_table[&dh];
+        assert_eq!(entry.retransmit_at, expected_next);
+    }
+
+    // ── 18. Rebroadcast detection ────────────────────────────────────
+
+    #[test]
+    fn echo_increments_local_rebroadcasts() {
+        let (mut node, _th) = make_transport_node();
+        let (raw, dh) = make_valid_announce();
+
+        // Receive on eth0, queued with hops=1 (incremented from 0)
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: raw.clone(),
+            now: 1000,
+        });
+        assert_eq!(node.announce_table_len(), 1);
+        assert_eq!(node.announce_table[&dh].local_rebroadcasts, 0);
+
+        // Retransmit so retries > 0
+        node.handle_event(NodeEvent::TimerTick { now: 1010 });
+        assert!(node.announce_table[&dh].retries > 0);
+
+        // Echo: our rebroadcast (hops=1) arrives back on wire with hops=1,
+        // our pipeline increments to 2. So incoming_hops=2, and
+        // incoming_hops-1 = 1 == stored_hops(1) → echo detected.
+        node.check_rebroadcast_echo(dh, 2);
+        assert_eq!(node.announce_table[&dh].local_rebroadcasts, 1);
+    }
+
+    #[test]
+    fn echo_at_max_removes_entry() {
+        let (mut node, _th) = make_transport_node();
+        let (raw, dh) = make_valid_announce();
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        // Trigger a retransmit so retries > 0
+        node.handle_event(NodeEvent::TimerTick { now: 1010 });
+
+        // Simulate LOCAL_REBROADCASTS_MAX echoes (incoming_hops=2 for echo)
+        for _ in 0..LOCAL_REBROADCASTS_MAX {
+            node.check_rebroadcast_echo(dh, 2);
+        }
+
+        // Entry should be removed after reaching max
+        assert_eq!(node.announce_table_len(), 0);
+    }
+
+    #[test]
+    fn downstream_forward_removes_entry() {
+        let (mut node, _th) = make_transport_node();
+        let (raw, dh) = make_valid_announce();
+
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        // Retransmit so retries > 0
+        node.handle_event(NodeEvent::TimerTick { now: 1010 });
+
+        // Downstream forward: another transport picked it up (hops = stored+1)
+        // stored hops = 1, so downstream forward has incoming_hops such that
+        // incoming_hops - 1 == stored_hops + 1 → incoming_hops = stored_hops + 2 = 3
+        let stored_hops = node.announce_table[&dh].hops;
+        node.check_rebroadcast_echo(dh, stored_hops + 2);
+
+        assert_eq!(node.announce_table_len(), 0);
+    }
+
+    // ── 19. Rate limiting ────────────────────────────────────────────
+
+    #[test]
+    fn rate_first_announce_passes() {
+        let (mut node, _th) = make_transport_node_with_rate(60, 2, 120);
+        let (raw, _dh) = make_valid_announce();
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        // Should not be rate limited
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::AnnounceReceived { .. })));
+    }
+
+    #[test]
+    fn rate_under_target_triggers_violation() {
+        let (mut node, _th) = make_transport_node_with_rate(60, 2, 120);
+
+        // First announce
+        let (raw1, dh1) = make_valid_announce();
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: raw1,
+            now: 1000,
+        });
+
+        // Second announce for same dest within target — need fresh announce
+        // but same destination. Since make_valid_announce generates new identities,
+        // we test rate limiting at the is_rate_limited level.
+        assert!(!node.is_rate_limited(
+            dh1,
+            &AnnounceRateConfig {
+                target: 60,
+                grace: 2,
+                penalty: 120,
+            },
+            1010,
+        ));
+        // This one is under target (10s < 60s)
+        let rate_entry = node.announce_rate_table.get(&dh1).unwrap();
+        assert_eq!(rate_entry.rate_violations, 1);
+    }
+
+    #[test]
+    fn rate_grace_exhausted_blocks() {
+        let (mut node, _th) = make_transport_node_with_rate(60, 1, 120);
+        let dh = dest(1);
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 1,
+            penalty: 120,
+        };
+
+        // First — allowed, records last_checked
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+        // Second — violation 1 (under grace of 1)
+        assert!(!node.is_rate_limited(dh, &config, 1010));
+        // Third — violation 2 > grace 1 → blocked
+        assert!(node.is_rate_limited(dh, &config, 1020));
+    }
+
+    #[test]
+    fn rate_block_expires_after_penalty() {
+        let (mut node, _th) = make_transport_node_with_rate(60, 0, 120);
+        let dh = dest(2);
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 0,
+            penalty: 120,
+        };
+
+        // First — allowed
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+        // Second — violation 1 > grace 0 → blocked, blocked_until = 1010 + 60 + 120 = 1190
+        assert!(node.is_rate_limited(dh, &config, 1010));
+        // Still blocked at 1100
+        assert!(node.is_rate_limited(dh, &config, 1100));
+        // Unblocked at 1190 (blocked_until = 1010 + 60 + 120)
+        assert!(!node.is_rate_limited(dh, &config, 1190));
+    }
+
+    #[test]
+    fn rate_no_config_no_limiting() {
+        let (mut node, _th) = make_transport_node();
+        // No rate config on any interface
+
+        let (raw, dh) = make_valid_announce();
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+
+        // Should pass through without rate limiting
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::AnnounceReceived { .. })));
+        assert!(node.announce_rate_table.is_empty());
+        // But announce table should still be populated (transport mode)
+        assert_eq!(node.announce_table_len(), 1);
+        assert!(node.announce_table.contains_key(&dh));
+    }
+
+    // ── 20. Edge cases ───────────────────────────────────────────────
+
+    #[test]
+    fn duplicate_blob_not_forwarded() {
+        let (mut node, _th) = make_transport_node();
+        let (raw, _dh) = make_valid_announce();
+
+        // First — inserted, queued for forwarding
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: raw.clone(),
+            now: 1000,
+        });
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Same announce again — DuplicateBlob path_update, should not re-queue
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1001,
+        });
+        match &actions[0] {
+            NodeAction::AnnounceReceived { path_update, .. } => {
+                assert_eq!(*path_update, PathUpdateResult::DuplicateBlob);
+            }
+            _ => panic!("expected AnnounceReceived"),
+        }
+        // Still only 1 entry (not re-queued, and already existed so not inserted again)
+        assert_eq!(node.announce_table_len(), 1);
+    }
+
+    #[test]
+    fn announce_table_count_accessor() {
+        let (mut node, _th) = make_transport_node();
+        assert_eq!(node.announce_table_len(), 0);
+
+        let (raw, _dh) = make_valid_announce();
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1000,
+        });
+        assert_eq!(node.announce_table_len(), 1);
+    }
+
+    #[test]
+    fn set_announce_rate_returns_false_for_unknown() {
+        let (mut node, _th) = make_transport_node();
+        assert!(!node.set_announce_rate(
+            "nonexistent",
+            AnnounceRateConfig {
+                target: 60,
+                grace: 2,
+                penalty: 120,
+            },
+        ));
+    }
+
+    // ── 21. Regression tests (PR #8 review feedback) ────────────────
+
+    #[test]
+    fn rate_violations_reset_when_properly_spaced() {
+        // Regression: violations previously never reset, causing permanent blocking.
+        let (mut node, _th) = make_transport_node();
+        let dh = dest(7);
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 2,
+            penalty: 120,
+        };
+
+        // First announce — always passes, sets last_checked
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+
+        // Two rapid announces — accumulate 2 violations (at grace limit)
+        assert!(!node.is_rate_limited(dh, &config, 1010)); // violation 1
+        assert!(!node.is_rate_limited(dh, &config, 1020)); // violation 2
+
+        // Now wait properly (>= target) — violations should reset to 0
+        assert!(!node.is_rate_limited(dh, &config, 1100)); // elapsed=80 >= 60
+
+        // Two more rapid announces should be tolerated (fresh grace budget)
+        assert!(!node.is_rate_limited(dh, &config, 1110)); // violation 1 (fresh)
+        assert!(!node.is_rate_limited(dh, &config, 1120)); // violation 2 (fresh)
+
+        // Third rapid announce exceeds grace → blocked
+        assert!(node.is_rate_limited(dh, &config, 1130));
+    }
+
+    #[test]
+    fn rate_violations_reset_after_penalty_expiry() {
+        // Regression: after penalty expired, a single violation would re-trigger
+        // blocking because accumulated violations were never cleared.
+        let (mut node, _th) = make_transport_node();
+        let dh = dest(8);
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 1,
+            penalty: 120,
+        };
+
+        // Build up to block: announce, rapid, rapid → blocked
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+        assert!(!node.is_rate_limited(dh, &config, 1010)); // violation 1 (at grace)
+        assert!(node.is_rate_limited(dh, &config, 1020));  // violation 2 > grace → blocked
+        // blocked_until = 1020 + 60 + 120 = 1200
+
+        // After penalty expires, should get a fresh grace budget
+        assert!(!node.is_rate_limited(dh, &config, 1200)); // unblocked, resets
+        assert!(!node.is_rate_limited(dh, &config, 1210)); // violation 1 (fresh grace)
+        // Should NOT be immediately blocked — grace is renewed
+        assert!(node.is_rate_limited(dh, &config, 1220));  // violation 2 > grace → blocked again
+    }
+
+    #[test]
+    fn serialization_failure_does_not_trap_entry() {
+        // Regression: if to_bytes() failed, the entry stayed forever because
+        // retries was never incremented.
+        let (mut node, _transport_hash) = make_transport_node();
+
+        // Craft an announce table entry with data that will exceed MTU as Type2.
+        // Type1 max data = 500 - 19 = 481, Type2 max data = 500 - 35 = 465.
+        // 470 bytes of data is valid as Type1 but overflows as Type2.
+        let dh = dest(9);
+        node.announce_table.insert(
+            dh,
+            AnnounceTableEntry {
+                received_at: 1000,
+                retransmit_at: 1000,
+                retries: 0,
+                local_rebroadcasts: 0,
+                source_interface: "eth0".into(),
+                hops: 1,
+                destination_hash: dh,
+                packet_data: vec![0u8; 470], // will overflow Type2 MTU
+            },
+        );
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Tick 1: retransmit_at <= now, serialization fails → retries becomes 1
+        let actions = node.handle_event(NodeEvent::TimerTick { now: 1000 });
+        // Should emit a serialize-failed drop
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            NodeAction::PacketDropped {
+                reason: DropReason::AnnounceRebroadcastSerializeFailed,
+                ..
+            }
+        )));
+        // Entry still present (retries=1, not > PATHFINDER_R=1 yet)
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Tick 2: retries becomes 2 > PATHFINDER_R=1 → entry removed on next tick
+        let _actions = node.handle_event(NodeEvent::TimerTick { now: 1010 });
+
+        // Tick 3: completion check fires (retries=2 > 1) → entry removed
+        let _ = node.handle_event(NodeEvent::TimerTick { now: 1020 });
+        assert_eq!(
+            node.announce_table_len(),
+            0,
+            "entry should be cleaned up after retries exceed PATHFINDER_R"
+        );
+    }
+
+    #[test]
+    fn near_mtu_announce_emits_diagnostic_on_type2_overflow() {
+        // Regression: near-MTU announces silently vanished during Type1→Type2
+        // conversion. Now they emit AnnounceRebroadcastSerializeFailed.
+        let (mut node, _th) = make_transport_node();
+        let dh = dest(10);
+
+        // 466 bytes of data: valid as Type1 (19+466=485 < 500) but
+        // overflows Type2 (35+466=501 > 500).
+        node.announce_table.insert(
+            dh,
+            AnnounceTableEntry {
+                received_at: 1000,
+                retransmit_at: 1000,
+                retries: 0,
+                local_rebroadcasts: 0,
+                source_interface: "eth0".into(),
+                hops: 1,
+                destination_hash: dh,
+                packet_data: vec![0xAA; 466],
+            },
+        );
+
+        let actions = node.handle_event(NodeEvent::TimerTick { now: 1000 });
+
+        // Must have a diagnostic drop, not silence
+        let has_drop = actions.iter().any(|a| matches!(
+            a,
+            NodeAction::PacketDropped {
+                reason: DropReason::AnnounceRebroadcastSerializeFailed,
+                ..
+            }
+        ));
+        assert!(has_drop, "expected AnnounceRebroadcastSerializeFailed action");
+
+        // Must NOT have a rebroadcast action (serialization failed)
+        let has_rebroadcast = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::AnnounceRebroadcast { .. }));
+        assert!(!has_rebroadcast, "should not rebroadcast on serialize failure");
+    }
+
+    #[test]
+    fn rate_table_entries_evicted_when_stale() {
+        let (mut node, _th) = make_transport_node();
+        let dh = dest(11);
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 2,
+            penalty: 120,
+        };
+
+        // Seed a rate entry at t=1000
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+        assert_eq!(node.announce_rate_table.len(), 1);
+
+        // Tick well before expiry — entry retained
+        node.handle_event(NodeEvent::TimerTick { now: 1000 + RATE_TABLE_EXPIRY - 1 });
+        assert_eq!(node.announce_rate_table.len(), 1);
+
+        // Tick at expiry boundary — entry evicted (age == RATE_TABLE_EXPIRY, not <)
+        node.handle_event(NodeEvent::TimerTick { now: 1000 + RATE_TABLE_EXPIRY });
+        assert_eq!(node.announce_rate_table.len(), 0);
+    }
+
+    #[test]
+    fn rate_table_blocked_entry_retained_until_penalty_expires() {
+        let (mut node, _th) = make_transport_node();
+        let dh = dest(12);
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 0,
+            penalty: RATE_TABLE_EXPIRY + 1000, // penalty outlasts expiry window
+        };
+
+        // Trigger a block: first pass, then immediate violation
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+        assert!(node.is_rate_limited(dh, &config, 1010));
+        // blocked_until = 1010 + 60 + (RATE_TABLE_EXPIRY + 1000)
+
+        let blocked_until = 1010 + 60 + RATE_TABLE_EXPIRY + 1000;
+
+        // Tick past RATE_TABLE_EXPIRY but before blocked_until — entry retained
+        node.handle_event(NodeEvent::TimerTick { now: 1000 + RATE_TABLE_EXPIRY + 500 });
+        assert_eq!(
+            node.announce_rate_table.len(),
+            1,
+            "blocked entry must survive past age expiry"
+        );
+
+        // Tick after blocked_until AND past expiry — now evictable
+        node.handle_event(NodeEvent::TimerTick { now: blocked_until + RATE_TABLE_EXPIRY });
+        assert_eq!(node.announce_rate_table.len(), 0);
+    }
+
+    #[test]
+    fn echo_not_blocked_by_rate_limiter() {
+        // Regression: rate limiting ran before echo detection, so echoes of our
+        // own rebroadcasts consumed grace points. With grace=0, echoes were
+        // blocked entirely, preventing echo-based completion.
+        let (mut node, _th) = make_transport_node_with_rate(60, 0, 120);
+        let (raw, dh) = make_valid_announce();
+
+        // Receive announce on rate-limited interface at t=1000
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: raw.clone(),
+            now: 1000,
+        });
+        assert!(actions.iter().any(|a| matches!(a, NodeAction::AnnounceReceived { .. })));
+        assert_eq!(node.announce_table_len(), 1);
+        assert_eq!(node.announce_table[&dh].local_rebroadcasts, 0);
+        // Stored hops = 1 (wire hops 0, pipeline incremented)
+
+        // Retransmit so retries > 0
+        node.handle_event(NodeEvent::TimerTick { now: 1010 });
+        assert!(node.announce_table[&dh].retries > 0);
+
+        // Build an echo: our rebroadcast (hops=1 on wire) heard back by a
+        // neighbor who sends it back to us. Set wire hops=1 so our pipeline
+        // increments to 2, giving incoming_hops-1 = 1 == stored_hops(1).
+        let mut echo = raw.clone();
+        echo[1] = 1; // hops byte on wire
+
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: echo,
+            now: 1012,
+        });
+
+        // Should NOT be rate-limited (no AnnounceRateLimited drop)
+        let was_rate_limited = actions.iter().any(|a| matches!(
+            a,
+            NodeAction::PacketDropped {
+                reason: DropReason::AnnounceRateLimited,
+                ..
+            }
+        ));
+        assert!(
+            !was_rate_limited,
+            "echoes of tracked announces must bypass rate limiting"
+        );
+
+        // Echo detection should have incremented local_rebroadcasts
+        assert_eq!(
+            node.announce_table[&dh].local_rebroadcasts, 1,
+            "echo should have been detected and counted"
+        );
+    }
+
+    #[test]
+    fn echo_removal_does_not_trigger_rate_limiting() {
+        // Regression: check_rebroadcast_echo could remove the announce table
+        // entry, then the rate limiter guard (checking announce_table.contains_key)
+        // would see the entry gone and rate-limit the very packet that was an echo.
+        let (mut node, _th) = make_transport_node_with_rate(60, 0, 120);
+        let (raw, dh) = make_valid_announce();
+
+        // Receive original announce
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw: raw.clone(),
+            now: 1000,
+        });
+        assert_eq!(node.announce_table_len(), 1);
+
+        // Retransmit so retries > 0
+        node.handle_event(NodeEvent::TimerTick { now: 1010 });
+        assert!(node.announce_table[&dh].retries > 0);
+
+        // Send LOCAL_REBROADCASTS_MAX echoes through the full pipeline.
+        // The final echo removes the entry. With grace=0, if rate limiting
+        // ran after removal, that echo would get blocked.
+        for i in 0..LOCAL_REBROADCASTS_MAX {
+            let mut echo = raw.clone();
+            echo[1] = 1; // wire hops=1 → pipeline to 2 → echo match
+            let actions = node.handle_event(NodeEvent::InboundPacket {
+                interface_name: "eth0".into(),
+                raw: echo,
+                now: 1012 + i as u64,
+            });
+
+            // No echo should ever be rate-limited
+            let was_rate_limited = actions.iter().any(|a| matches!(
+                a,
+                NodeAction::PacketDropped {
+                    reason: DropReason::AnnounceRateLimited,
+                    ..
+                }
+            ));
+            assert!(
+                !was_rate_limited,
+                "echo #{} should not be rate-limited (even if entry was just removed)",
+                i + 1
+            );
+        }
+
+        // Entry should be removed after max echoes
+        assert_eq!(node.announce_table_len(), 0);
+        // Rate table has exactly 1 entry — from the original announce at t=1000.
+        // The echoes must not have added or modified any additional entries.
+        assert_eq!(
+            node.announce_rate_table.len(),
+            1,
+            "only the original announce should touch the rate table, not echoes"
+        );
+        // The entry should still show last_checked=1000 (untouched by echoes)
+        let rate_entry = &node.announce_rate_table[&dh];
+        assert_eq!(rate_entry.last_checked, 1000);
+        assert_eq!(rate_entry.rate_violations, 0);
     }
 }
