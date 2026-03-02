@@ -1072,11 +1072,13 @@ impl Node {
         match forwarded.to_bytes() {
             Ok(raw) => {
                 let mut actions = self.send_on_interface(&path_entry.interface_name, &raw);
-                actions.push(NodeAction::PacketRelayed {
-                    destination_hash,
-                    next_hop: path_entry.next_hop,
-                    interface_name: path_entry.interface_name.clone(),
-                });
+                if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
+                    actions.push(NodeAction::PacketRelayed {
+                        destination_hash,
+                        next_hop: path_entry.next_hop,
+                        interface_name: path_entry.interface_name.clone(),
+                    });
+                }
                 actions
             }
             Err(_) => {
@@ -1121,10 +1123,12 @@ impl Node {
         match forwarded.to_bytes() {
             Ok(raw) => {
                 let mut actions = self.send_on_interface(&entry.received_interface, &raw);
-                actions.push(NodeAction::ProofRelayed {
-                    proof_destination: proof_dest,
-                    interface_name: entry.received_interface.clone(),
-                });
+                if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
+                    actions.push(NodeAction::ProofRelayed {
+                        proof_destination: proof_dest,
+                        interface_name: entry.received_interface.clone(),
+                    });
+                }
                 actions
             }
             Err(_) => {
@@ -3529,6 +3533,85 @@ mod tests {
             _ => None,
         });
         assert_eq!(dropped, Some(&DropReason::RelaySerializeFailed));
+    }
+
+    #[test]
+    fn relay_send_failure_suppresses_relayed_action() {
+        let remote = dest(42);
+        let (node, _th) = make_relay_node(remote, remote, 3); // final hop
+
+        let pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type2,
+                    context_flag: false,
+                    propagation: PropagationType::Transport,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: Some(dest(99)),
+                destination_hash: remote,
+                context: PacketContext::None,
+            },
+            data: vec![0xBB; 10],
+        };
+        // Use a path entry pointing to a non-existent interface
+        let bad_entry = PathEntry {
+            next_hop: remote,
+            hops: 3,
+            interface_name: "no_such_iface".into(),
+            learned_at: 1000,
+            expires_at: 2000,
+            announce_packet_hash: dest(0),
+            announce_timestamp: 1000,
+            random_blobs: vec![],
+        };
+        let actions = node.relay_packet(pkt, &bad_entry, "eth0");
+
+        // Should get PacketDropped but NOT PacketRelayed
+        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        assert!(!actions.iter().any(|a| matches!(a, NodeAction::PacketRelayed { .. })));
+    }
+
+    #[test]
+    fn proof_send_failure_suppresses_relayed_action() {
+        let (mut node, _th) = make_transport_node();
+        let proof_key = dest(55);
+
+        // Insert reverse table entry pointing to a non-existent interface
+        node.reverse_table.insert(
+            proof_key,
+            ReverseTableEntry {
+                received_interface: "no_such_iface".into(),
+                outbound_interface: "wlan0".into(),
+                timestamp: 1000,
+            },
+        );
+
+        let proof_pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Proof,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: proof_key,
+                context: PacketContext::None,
+            },
+            data: vec![0xCC; 10],
+        };
+        let actions = node.route_proof(&proof_pkt, "eth0");
+
+        // Should get PacketDropped but NOT ProofRelayed
+        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        assert!(!actions.iter().any(|a| matches!(a, NodeAction::ProofRelayed { .. })));
     }
 
     #[test]
