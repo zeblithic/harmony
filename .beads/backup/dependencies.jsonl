@@ -1,3 +1,12 @@
+{"created_at":"2026-03-01T23:08:29Z","created_by":"Jake Englund","depends_on_id":"harmony-0p6","issue_id":"harmony-0p6.1","type":"parent-child"}
+{"created_at":"2026-03-01T23:08:39Z","created_by":"Jake Englund","depends_on_id":"harmony-0p6","issue_id":"harmony-0p6.2","type":"parent-child"}
+{"created_at":"2026-03-01T23:08:39Z","created_by":"Jake Englund","depends_on_id":"harmony-0p6.1","issue_id":"harmony-0p6.2","type":"blocks"}
+{"created_at":"2026-03-01T23:08:50Z","created_by":"Jake Englund","depends_on_id":"harmony-0p6","issue_id":"harmony-0p6.3","type":"parent-child"}
+{"created_at":"2026-03-01T23:08:50Z","created_by":"Jake Englund","depends_on_id":"harmony-0p6.2","issue_id":"harmony-0p6.3","type":"blocks"}
+{"created_at":"2026-03-01T23:08:59Z","created_by":"Jake Englund","depends_on_id":"harmony-0p6","issue_id":"harmony-0p6.4","type":"parent-child"}
+{"created_at":"2026-03-01T23:08:59Z","created_by":"Jake Englund","depends_on_id":"harmony-0p6.3","issue_id":"harmony-0p6.4","type":"blocks"}
+{"created_at":"2026-03-01T23:09:08Z","created_by":"Jake Englund","depends_on_id":"harmony-0p6","issue_id":"harmony-0p6.5","type":"parent-child"}
+{"created_at":"2026-03-01T23:09:08Z","created_by":"Jake Englund","depends_on_id":"harmony-0p6.3","issue_id":"harmony-0p6.5","type":"blocks"}
 {"created_at":"2026-03-01T11:56:32Z","created_by":"Jake Englund","depends_on_id":"harmony-8wy","issue_id":"harmony-1pm","type":"blocks"}
 {"created_at":"2026-03-01T11:56:31Z","created_by":"Jake Englund","depends_on_id":"harmony-14z","issue_id":"harmony-8wy","type":"blocks"}
 {"created_at":"2026-03-01T14:04:46Z","created_by":"Jake Englund","depends_on_id":"harmony-3aj","issue_id":"harmony-aaf","type":"blocks"}
