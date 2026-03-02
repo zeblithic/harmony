@@ -47,9 +47,7 @@ pub enum PubSubAction {
 /// A sans-I/O pub/sub router managing publisher/subscriber declarations
 /// and message dispatch for a single peer-to-peer connection.
 pub struct PubSubRouter {
-    #[allow(dead_code)] // Used in Task 3 (subscriber declare/unsubscribe)
     subscriptions: SubscriptionTable,
-    #[allow(dead_code)] // Used in Task 3 (subscriber declare/unsubscribe)
     sub_key_exprs: HashMap<SubscriptionId, String>,
     remote_interest: SubscriptionTable,
     remote_interest_ids: HashMap<String, SubscriptionId>,
@@ -68,6 +66,41 @@ impl PubSubRouter {
             publishers: HashMap::new(),
             next_publisher_id: 1,
         }
+    }
+
+    /// Subscribe to a key expression.
+    ///
+    /// Registers in local SubscriptionTable and emits `SendSubscriberDeclare`
+    /// to propagate interest to the peer.
+    pub fn subscribe(
+        &mut self,
+        key_expr: &str,
+    ) -> Result<(SubscriptionId, Vec<PubSubAction>), ZenohError> {
+        let owned = OwnedKeyExpr::autocanonize(key_expr.to_string())
+            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let sub_id = self.subscriptions.subscribe(&owned);
+        self.sub_key_exprs.insert(sub_id, key_expr.to_string());
+        Ok((
+            sub_id,
+            vec![PubSubAction::SendSubscriberDeclare {
+                key_expr: key_expr.to_string(),
+            }],
+        ))
+    }
+
+    /// Unsubscribe by subscription ID.
+    ///
+    /// Removes from local SubscriptionTable and emits `SendSubscriberUndeclare`.
+    pub fn unsubscribe(
+        &mut self,
+        sub_id: SubscriptionId,
+    ) -> Result<Vec<PubSubAction>, ZenohError> {
+        let key_expr = self
+            .sub_key_exprs
+            .remove(&sub_id)
+            .ok_or(ZenohError::UnknownSubscriptionId(sub_id.as_u64()))?;
+        self.subscriptions.unsubscribe(sub_id)?;
+        Ok(vec![PubSubAction::SendSubscriberUndeclare { key_expr }])
     }
 
     /// Declare a publisher on the given key expression.
@@ -304,5 +337,45 @@ mod tests {
 
         let result = router.publish(999, b"hello".to_vec(), &alice);
         assert!(matches!(result, Err(ZenohError::UnknownPublisherId(999))));
+    }
+
+    #[test]
+    fn subscribe_emits_declare_action() {
+        let mut router = PubSubRouter::new();
+        let (sub_id, actions) = router
+            .subscribe("harmony/server/srv1/channel/*/msg")
+            .unwrap();
+        assert_eq!(sub_id.as_u64(), 0); // SubscriptionTable starts at 0
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            PubSubAction::SendSubscriberDeclare { key_expr }
+                if key_expr == "harmony/server/srv1/channel/*/msg"
+        ));
+    }
+
+    #[test]
+    fn unsubscribe_emits_undeclare_action() {
+        let mut router = PubSubRouter::new();
+        let (sub_id, _) = router
+            .subscribe("harmony/server/srv1/channel/*/msg")
+            .unwrap();
+        let actions = router.unsubscribe(sub_id).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            PubSubAction::SendSubscriberUndeclare { key_expr }
+                if key_expr == "harmony/server/srv1/channel/*/msg"
+        ));
+    }
+
+    #[test]
+    fn unsubscribe_unknown_id_fails() {
+        let mut router = PubSubRouter::new();
+        let result = router.unsubscribe(SubscriptionId::from_raw(999));
+        assert!(matches!(
+            result,
+            Err(ZenohError::UnknownSubscriptionId(999))
+        ));
     }
 }

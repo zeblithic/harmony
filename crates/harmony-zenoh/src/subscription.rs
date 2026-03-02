@@ -20,6 +20,12 @@ impl SubscriptionId {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Construct from a raw numeric identifier (crate-internal, for testing).
+    #[cfg(test)]
+    pub(crate) fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
 }
 
 /// A single subscription entry stored in the tree.
