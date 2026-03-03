@@ -215,4 +215,52 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn probation_to_protected_promotion() {
+        // Capacity 20: window=1, protected=4, probation=15.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 20);
+
+        // Insert an item — it enters window, then gets pushed to probation
+        // when the next item takes its window slot.
+        let target = cs.insert(b"target").unwrap();
+        let _pusher = cs.insert(b"pusher").unwrap();
+
+        // target should now be in probation (pushed out of window by pusher).
+        // Access it to promote to protected.
+        cs.record_access(&target);
+        assert!(cs.protected.contains(&target));
+        assert!(!cs.probation.contains(&target));
+    }
+
+    #[test]
+    fn scan_resistance() {
+        // The core W-TinyLFU property: a sequential scan of cold data
+        // should NOT evict a frequently-accessed hot item.
+
+        // Capacity 20: window=1, protected=4, probation=15.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 20);
+
+        // Create a hot item and give it lots of frequency.
+        let hot = cs.insert(b"frequently-accessed").unwrap();
+        for _ in 0..10 {
+            cs.record_access(&hot);
+        }
+
+        // Sequential scan: insert 50 unique cold items (never accessed again).
+        for i in 0..50 {
+            let data = format!("scan-item-{i}");
+            cs.insert(data.as_bytes()).unwrap();
+        }
+
+        // The hot item should survive the scan.
+        assert!(
+            cs.window.contains(&hot)
+                || cs.probation.contains(&hot)
+                || cs.protected.contains(&hot),
+            "hot CID should survive sequential scan"
+        );
+    }
 }
