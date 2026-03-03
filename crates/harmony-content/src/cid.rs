@@ -1,3 +1,5 @@
+use crate::error::ContentError;
+
 /// Length of the truncated SHA-256 content hash in bytes.
 pub const CONTENT_HASH_LEN: usize = 28;
 
@@ -9,6 +11,9 @@ pub const TAG_BITS: u32 = 12;
 
 /// Bitmask for the 12-bit tag field (lower 12 bits of the last u32).
 pub const TAG_MASK: u32 = 0xFFF;
+
+/// Bitmask for the 20-bit size field (upper 20 bits of the last u32).
+pub const SIZE_MASK: u32 = 0xFFFF_F000;
 
 /// A 32-byte content identifier.
 ///
@@ -42,6 +47,109 @@ impl ContentId {
     pub fn cid_type(&self) -> CidType {
         let (cid_type, _checksum) = CidType::decode(self.tag());
         cid_type
+    }
+
+    /// Create a CID for a raw data blob.
+    pub fn for_blob(data: &[u8]) -> Result<Self, ContentError> {
+        if data.len() > MAX_PAYLOAD_SIZE {
+            return Err(ContentError::PayloadTooLarge {
+                size: data.len(),
+                max: MAX_PAYLOAD_SIZE,
+            });
+        }
+
+        let full = harmony_crypto::hash::full_hash(data);
+        let mut hash = [0u8; CONTENT_HASH_LEN];
+        hash.copy_from_slice(&full[..CONTENT_HASH_LEN]);
+
+        let size = data.len() as u32;
+        let cid_type = CidType::Blob;
+        let checksum = compute_checksum(&hash, size, &cid_type);
+        let tag = cid_type.encode(checksum);
+        let size_and_tag_u32 = (size << TAG_BITS) | tag as u32;
+
+        Ok(ContentId {
+            hash,
+            size_and_tag: size_and_tag_u32.to_be_bytes(),
+        })
+    }
+
+    /// Create a CID for a bundle (array of child CIDs).
+    ///
+    /// `bundle_bytes` is the raw byte payload (concatenated child CIDs).
+    /// `children` is the parsed slice of child CIDs (used for depth calculation).
+    /// The bundle's depth is `max(child depths) + 1`.
+    pub fn for_bundle(bundle_bytes: &[u8], children: &[ContentId]) -> Result<Self, ContentError> {
+        if bundle_bytes.len() > MAX_PAYLOAD_SIZE {
+            return Err(ContentError::PayloadTooLarge {
+                size: bundle_bytes.len(),
+                max: MAX_PAYLOAD_SIZE,
+            });
+        }
+
+        let max_child_depth = children
+            .iter()
+            .map(|c| c.cid_type().depth())
+            .max()
+            .unwrap_or(0);
+        let bundle_depth = max_child_depth + 1;
+
+        if bundle_depth > 7 {
+            return Err(ContentError::DepthViolation {
+                child: max_child_depth,
+                parent: bundle_depth,
+            });
+        }
+
+        let full = harmony_crypto::hash::full_hash(bundle_bytes);
+        let mut hash = [0u8; CONTENT_HASH_LEN];
+        hash.copy_from_slice(&full[..CONTENT_HASH_LEN]);
+
+        let size = bundle_bytes.len() as u32;
+        let cid_type = CidType::Bundle(bundle_depth);
+        let checksum = compute_checksum(&hash, size, &cid_type);
+        let tag = cid_type.encode(checksum);
+        let size_and_tag_u32 = (size << TAG_BITS) | tag as u32;
+
+        Ok(ContentId {
+            hash,
+            size_and_tag: size_and_tag_u32.to_be_bytes(),
+        })
+    }
+
+    /// Extract the checksum from the tag field.
+    pub fn checksum(&self) -> u16 {
+        let raw = u32::from_be_bytes(self.size_and_tag);
+        let tag = (raw & TAG_MASK) as u16;
+        let (_cid_type, checksum) = CidType::decode(tag);
+        checksum
+    }
+
+    /// Verify the CID's checksum against its hash, size, and type.
+    pub fn verify_checksum(&self) -> Result<(), ContentError> {
+        let cid_type = self.cid_type();
+        let expected = compute_checksum(&self.hash, self.payload_size(), &cid_type);
+        if self.checksum() != expected {
+            return Err(ContentError::ChecksumMismatch);
+        }
+        Ok(())
+    }
+
+    /// Serialize to a 32-byte array.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[..CONTENT_HASH_LEN].copy_from_slice(&self.hash);
+        bytes[CONTENT_HASH_LEN..].copy_from_slice(&self.size_and_tag);
+        bytes
+    }
+
+    /// Deserialize from a 32-byte array.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        let mut hash = [0u8; CONTENT_HASH_LEN];
+        hash.copy_from_slice(&bytes[..CONTENT_HASH_LEN]);
+        let mut size_and_tag = [0u8; 4];
+        size_and_tag.copy_from_slice(&bytes[CONTENT_HASH_LEN..]);
+        ContentId { hash, size_and_tag }
     }
 }
 
@@ -508,5 +616,101 @@ mod tests {
         // Also check InlineMetadata (3-bit checksum)
         let checksum = compute_checksum(&hash, size, &CidType::InlineMetadata);
         assert!(checksum <= 0x7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 5: ContentId constructors — for_blob and for_bundle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn for_blob_basic() {
+        let data = b"hello harmony content addressing";
+        let cid = ContentId::for_blob(data).unwrap();
+        assert_eq!(cid.payload_size(), data.len() as u32);
+        assert_eq!(cid.cid_type(), CidType::Blob);
+    }
+
+    #[test]
+    fn for_blob_hash_is_truncated_sha256() {
+        let data = b"test data";
+        let cid = ContentId::for_blob(data).unwrap();
+        let full = harmony_crypto::hash::full_hash(data);
+        assert_eq!(&cid.hash, &full[..CONTENT_HASH_LEN]);
+    }
+
+    #[test]
+    fn for_blob_rejects_oversized() {
+        let data = vec![0u8; MAX_PAYLOAD_SIZE + 1];
+        let result = ContentId::for_blob(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn for_blob_empty_data() {
+        let cid = ContentId::for_blob(b"").unwrap();
+        assert_eq!(cid.payload_size(), 0);
+        assert_eq!(cid.cid_type(), CidType::Blob);
+    }
+
+    #[test]
+    fn for_blob_max_size() {
+        let data = vec![0xFFu8; MAX_PAYLOAD_SIZE];
+        let cid = ContentId::for_blob(&data).unwrap();
+        assert_eq!(cid.payload_size(), MAX_PAYLOAD_SIZE as u32);
+    }
+
+    #[test]
+    fn for_bundle_basic() {
+        // Create two blob CIDs, then bundle them
+        let blob_a = ContentId::for_blob(b"chunk a").unwrap();
+        let blob_b = ContentId::for_blob(b"chunk b").unwrap();
+        let children = [blob_a, blob_b];
+        let bundle_bytes = children_to_bytes(&children);
+        let cid = ContentId::for_bundle(&bundle_bytes, &children).unwrap();
+        assert_eq!(cid.cid_type(), CidType::Bundle(1)); // one level above blobs
+        assert_eq!(cid.payload_size(), bundle_bytes.len() as u32);
+    }
+
+    #[test]
+    fn for_bundle_depth_is_max_child_plus_one() {
+        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let l1_children = [blob];
+        let l1_bytes = children_to_bytes(&l1_children);
+        let l1 = ContentId::for_bundle(&l1_bytes, &l1_children).unwrap();
+        assert_eq!(l1.cid_type(), CidType::Bundle(1));
+
+        let l2_children = [l1];
+        let l2_bytes = children_to_bytes(&l2_children);
+        let l2 = ContentId::for_bundle(&l2_bytes, &l2_children).unwrap();
+        assert_eq!(l2.cid_type(), CidType::Bundle(2));
+    }
+
+    #[test]
+    fn for_bundle_rejects_depth_overflow() {
+        // Can't create a Bundle(8) — max is 7
+        let blob = ContentId::for_blob(b"leaf").unwrap();
+        // Build up to depth 7
+        let mut current = blob;
+        for _ in 0..7 {
+            let children = [current];
+            let bytes = children_to_bytes(&children);
+            current = ContentId::for_bundle(&bytes, &children).unwrap();
+        }
+        assert_eq!(current.cid_type(), CidType::Bundle(7));
+
+        // Trying to wrap a depth-7 bundle should fail
+        let children = [current];
+        let bytes = children_to_bytes(&children);
+        let result = ContentId::for_bundle(&bytes, &children);
+        assert!(result.is_err());
+    }
+
+    /// Helper: serialize CID array to bytes (the bundle payload).
+    fn children_to_bytes(children: &[ContentId]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(children.len() * 32);
+        for cid in children {
+            bytes.extend_from_slice(&cid.to_bytes());
+        }
+        bytes
     }
 }
