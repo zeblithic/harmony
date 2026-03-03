@@ -86,3 +86,4 @@
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-03T01:27:05Z","event_type":"created","id":86,"issue_id":"harmony-6sg","new_value":"","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-03T01:27:13Z","event_type":"created","id":87,"issue_id":"harmony-fxx","new_value":"","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-03T01:27:21Z","event_type":"created","id":88,"issue_id":"harmony-6np","new_value":"","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-03T01:40:29Z","event_type":"closed","id":89,"issue_id":"harmony-2hp","new_value":"Delivered — PR #25 pending review","old_value":""}
