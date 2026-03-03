@@ -48,6 +48,11 @@ impl Lru {
     /// If the LRU is at capacity, the tail (least recently used) is
     /// evicted and its CID is returned.
     pub fn insert(&mut self, cid: ContentId) -> Option<ContentId> {
+        // Zero-capacity LRU rejects all inserts immediately.
+        if self.capacity == 0 {
+            return Some(cid);
+        }
+
         // If already present, just touch and return.
         if self.map.contains_key(&cid) {
             self.touch(&cid);
@@ -288,5 +293,16 @@ mod tests {
         // Empty exclude — should return tail.
         let empty = HashSet::new();
         assert_eq!(lru.peek_lru_excluding(&empty), Some(c0));
+    }
+
+    #[test]
+    fn zero_capacity_rejects_insert() {
+        let mut lru = Lru::new(0);
+        let c0 = make_cid(0);
+
+        // Insert returns the CID back immediately (rejected).
+        assert_eq!(lru.insert(c0), Some(c0));
+        assert_eq!(lru.len(), 0);
+        assert!(!lru.contains(&c0));
     }
 }

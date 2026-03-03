@@ -40,7 +40,7 @@ pub struct CountMinSketch {
 - `estimate(cid)` — Minimum of the 4 counter values. Never underestimates.
 - `halve()` — Right-shift every counter by 1. Decays stale popularity.
 
-**Hashing:** CID bytes are already SHA-256 — extract two `u64` values from the first 16 bytes, derive 4 row indices via multiply-xor with different constants. No additional hash function needed.
+**Hashing:** CID bytes are already SHA-256 — extract two `u64` values from the first 16 bytes, derive 4 row indices via `h0.wrapping_mul(seed) ^ h1.wrapping_mul(seed.rotate_left(32))`. Both halves are mixed per-row for pairwise independence. No additional hash function needed.
 
 **Sizing:** Width = `2 * max_entries` counters per row. Memory = `4 * width / 2` bytes.
 
@@ -103,11 +103,26 @@ pub struct ContentStore<S: BlobStore> {
    - `sketch.estimate(window_evictee)` vs `sketch.estimate(probation.peek_lru())`
    - Higher frequency wins admission to probation. Loser is dropped.
 
-### Pin/Unpin
+### Pin/Unpin with Quota
 
-- `pin(cid)` — Add to pinned set. Eviction logic skips pinned CIDs.
+- `pin(cid) -> bool` — Add to pinned set if quota allows. Returns false when limit reached.
 - `unpin(cid)` — Remove from pinned set. CID becomes evictable.
-- If eviction candidate is pinned, skip to next tail entry.
+- `pin_limit()` — Returns `capacity / 2`. At most half the cache can be pinned.
+- If eviction candidate is pinned, scan to next non-pinned tail entry via `peek_lru_excluding`.
+- Pinned candidates (evicted from window) are always admitted to probation — never dropped.
+
+**Storage model:** The pin quota enforces a 50/50 split between shared network
+caching (evictable) and user-owned replicated content (pinned). A node
+contributing *N* slots of storage gets *N/2* slots of guaranteed replication.
+This means: for every 1TB drive plugged into the network, the contributor gets
+~500GB of "permanent cloud storage" — data replicated across multiple nodes,
+resistant to any single-node failure. The other 500GB serves the network as
+freely evictable cache, improving performance for everyone.
+
+**Quota invariant:** Because `pin_limit = capacity / 2` and `probation_cap ≈ 79%
+of capacity`, a pinned candidate always finds at least one non-pinned victim in
+probation during the admission challenge. This eliminates the need for
+force-insert or capacity overflow logic.
 
 ### BlobStore implementation
 
@@ -115,26 +130,41 @@ pub struct ContentStore<S: BlobStore> {
 
 ## Edge Cases
 
-- **Pin overflow:** If everything is pinned, cache grows beyond capacity. No pin limit (YAGNI).
+- **Pin quota:** Max pinned items = `capacity / 2`. `pin()` returns `false` when quota reached.
+- **Zero-capacity segments:** `protected_cap = 0` for capacity ≤ 4. The LRU rejects inserts immediately (returns `Some(cid)`), so promotions bounce back to probation. Correct behavior.
+- **Zero-capacity cache:** `ContentStore::new` panics if capacity < 1. A zero-item cache is nonsensical.
+- **Capacity=1:** Only window segment active (probation=0, protected=0). Pin quota=0, so pinning is disabled. Items cycle through window only.
 - **Thread safety:** Not included. Single-threaded like the rest of harmony-content. Caller manages concurrency.
 - **Error handling:** No new error variants. Sketch and LRU are infallible. Storage errors delegate to inner BlobStore.
 
-## Testing (~12 tests)
+## Testing (24 tests)
 
-**Sketch (4):**
+**Sketch (5):**
 1. Increment and estimate returns at least true count
 2. Never underestimates (Count-Min guarantee)
 3. Halving decays counters to roughly half
 4. Auto-halving triggers at threshold
+5. Hash rows are independent (per-row h1 mixing)
 
-**LRU (3):**
-5. Eviction order — oldest entry evicted first
-6. Touch promotes to head
-7. Remove frees slot for reuse
+**LRU (5):**
+6. Eviction order — oldest entry evicted first
+7. Touch promotes to head
+8. Remove frees slot for reuse
+9. `peek_lru_excluding` skips excluded entries
+10. Zero-capacity LRU rejects inserts
 
-**ContentStore (5):**
-8. Scan resistance — sequential cold scan does not evict hot CID
-9. Frequency-based admission — low-frequency newcomer loses to high-frequency resident
-10. Probation-to-protected promotion on access
-11. Pin exempts from eviction under pressure
-12. ContentStore implements BlobStore (get/insert/contains work)
+**ContentStore (11):**
+11. Implements BlobStore (get/insert/contains)
+12. `get_and_record` updates frequency and promotes
+13. Frequency-based admission — low-frequency newcomer loses
+14. Probation-to-protected promotion on access
+15. Scan resistance — cold scan does not evict hot CID
+16. Pin exempts from eviction under pressure
+17. Capacity-1 segments don't exceed capacity
+18. Capacity-2 segments don't exceed capacity
+19. Zero capacity panics
+20. Pinned candidate survives admission challenge (regression)
+21. Pinned victim skipped in admission (regression)
+22. Pin quota rejects over limit
+23. Pin quota zero for capacity-1
+24. Zero-cap protected bounces to probation

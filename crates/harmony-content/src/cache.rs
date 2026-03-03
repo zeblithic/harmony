@@ -58,9 +58,31 @@ impl<S: BlobStore> ContentStore<S> {
         }
     }
 
+    /// Maximum number of CIDs that can be pinned.
+    ///
+    /// Equal to half the total segment capacity. This enforces the storage
+    /// model where at most 50% of cache capacity is reserved for pinned
+    /// (user-owned, replicated) content, leaving the rest for shared
+    /// network caching.
+    pub fn pin_limit(&self) -> usize {
+        let total = self.window.capacity() + self.probation.capacity() + self.protected.capacity();
+        total / 2
+    }
+
     /// Pin a CID, exempting it from eviction.
-    pub fn pin(&mut self, cid: ContentId) {
+    ///
+    /// Returns `true` if the CID was pinned (or was already pinned).
+    /// Returns `false` if the pin quota ([`pin_limit`](Self::pin_limit))
+    /// is reached.
+    pub fn pin(&mut self, cid: ContentId) -> bool {
+        if self.pinned.contains(&cid) {
+            return true;
+        }
+        if self.pinned.len() >= self.pin_limit() {
+            return false;
+        }
         self.pinned.insert(cid);
+        true
     }
 
     /// Unpin a CID, making it eligible for eviction again.
@@ -151,10 +173,17 @@ impl<S: BlobStore> ContentStore<S> {
         }
 
         // Pinned candidates are always admitted — never drop a pinned CID.
+        // The pin quota (≤ capacity/2) guarantees that at least one non-pinned
+        // victim exists in probation when a pinned candidate arrives here.
         if self.pinned.contains(&candidate) {
-            if let Some(victim) = self.probation.peek_lru_excluding(&self.pinned) {
-                self.probation.remove(&victim);
-                self.store_remove(&victim);
+            let victim = self.probation.peek_lru_excluding(&self.pinned);
+            debug_assert!(
+                victim.is_some(),
+                "pin quota invariant: probation must have a non-pinned victim when candidate is pinned"
+            );
+            if let Some(v) = victim {
+                self.probation.remove(&v);
+                self.store_remove(&v);
             }
             self.probation.insert(candidate);
             return;
@@ -333,7 +362,7 @@ mod tests {
         let mut cs = ContentStore::new(store, 5);
 
         let pinned_cid = cs.insert(b"pinned-data").unwrap();
-        cs.pin(pinned_cid);
+        assert!(cs.pin(pinned_cid));
 
         // Fill the cache well beyond capacity.
         for i in 0..20 {
@@ -410,7 +439,7 @@ mod tests {
         // Insert a pinned item with zero extra frequency (just the 1 from insert).
         // It enters window, gets pushed to admission_challenge by the next insert.
         let pinned = cs.insert(b"pinned-low-freq").unwrap();
-        cs.pin(pinned);
+        assert!(cs.pin(pinned));
 
         // Push it out of window — triggers admission challenge.
         let _pusher = cs.insert(b"pusher-after-pin").unwrap();
@@ -444,7 +473,7 @@ mod tests {
 
         // Pin the LRU tail of probation (first inserted = least recent).
         let tail_cid = items[0];
-        cs.pin(tail_cid);
+        assert!(cs.pin(tail_cid));
 
         // Give the next candidate high frequency so it would beat non-pinned victims.
         let candidate_data = b"high-freq-candidate";
@@ -467,6 +496,68 @@ mod tests {
         assert!(
             cs.probation.contains(&tail_cid),
             "pinned victim should remain in probation"
+        );
+    }
+
+    #[test]
+    fn pin_quota_rejects_over_limit() {
+        // Capacity 10: pin limit = 5.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 10);
+        assert_eq!(cs.pin_limit(), 5);
+
+        let cids: Vec<ContentId> = (0..6)
+            .map(|i| cs.insert(format!("item-{i}").as_bytes()).unwrap())
+            .collect();
+
+        // First 5 pins succeed.
+        for cid in &cids[..5] {
+            assert!(cs.pin(*cid), "pin within quota should succeed");
+        }
+
+        // 6th pin is rejected.
+        assert!(!cs.pin(cids[5]), "pin over quota should fail");
+
+        // Re-pinning an already-pinned CID still succeeds (idempotent).
+        assert!(cs.pin(cids[0]), "re-pinning should succeed");
+
+        // After unpin, a new pin succeeds.
+        cs.unpin(&cids[0]);
+        assert!(cs.pin(cids[5]), "pin after unpin should succeed");
+    }
+
+    #[test]
+    fn pin_quota_zero_for_capacity_one() {
+        // Capacity 1 → total segments = 1 → pin_limit = 0.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 1);
+        assert_eq!(cs.pin_limit(), 0);
+
+        let cid = cs.insert(b"data").unwrap();
+        assert!(!cs.pin(cid), "capacity-1 cache cannot pin anything");
+    }
+
+    #[test]
+    fn zero_cap_protected_bounces_to_probation() {
+        // Capacity 4: window=1, protected=0, probation=3.
+        // When record_access tries to promote from probation to protected,
+        // the zero-cap protected segment rejects, and the item stays in probation.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 4);
+        assert_eq!(cs.protected.capacity(), 0);
+
+        // Insert target, push to probation.
+        let target = cs.insert(b"target").unwrap();
+        let _p = cs.insert(b"pusher").unwrap();
+        assert!(cs.probation.contains(&target));
+
+        // Record access — should try to promote but bounce back.
+        cs.record_access(&target);
+
+        // With zero-cap protected, item stays in probation (not lost).
+        assert!(
+            cs.probation.contains(&target) || cs.protected.contains(&target),
+            "item should still be tracked after promotion bounce"
         );
     }
 }
