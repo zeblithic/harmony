@@ -116,6 +116,11 @@ impl CountMinSketch {
         min
     }
 
+    /// Force a halve (public, for testing).
+    pub fn halve_now(&mut self) {
+        self.halve();
+    }
+
     /// Halve all counters by right-shifting each 4-bit value by 1.
     ///
     /// This implements frequency aging: recent items retain higher counts
@@ -180,5 +185,34 @@ mod tests {
             sketch.increment(&make_cid(i));
         }
         assert!(sketch.estimate(&target) >= 7);
+    }
+
+    #[test]
+    fn halving_decays_counters() {
+        let mut sketch = CountMinSketch::new(1024, 100_000);
+        let cid = make_cid(0);
+        for _ in 0..10 {
+            sketch.increment(&cid);
+        }
+        let before = sketch.estimate(&cid);
+        assert!(before >= 10);
+        sketch.halve_now();
+        let after = sketch.estimate(&cid);
+        assert!(after >= 4 && after <= before / 2 + 1);
+    }
+
+    #[test]
+    fn auto_halving_at_threshold() {
+        let mut sketch = CountMinSketch::new(64, 20);
+        let cid = make_cid(0);
+        for _ in 0..10 {
+            sketch.increment(&cid);
+        }
+        let before = sketch.estimate(&cid);
+        for i in 100..115 {
+            sketch.increment(&make_cid(i));
+        }
+        let after = sketch.estimate(&cid);
+        assert!(after < before, "expected decay: before={before}, after={after}");
     }
 }
