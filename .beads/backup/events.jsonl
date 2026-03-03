@@ -72,3 +72,9 @@
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T15:38:55Z","event_type":"closed","id":72,"issue_id":"harmony-0p6","new_value":"All 5 sub-tasks complete: crate bootstrap, message envelope, session state machine, pub/sub routing, liveliness tracking (PRs #14-18)","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:12:11Z","event_type":"closed","id":73,"issue_id":"harmony-aaf","new_value":"Implemented in PR #19. ResourceSender/ResourceReceiver sans-I/O state machines with adaptive windowing, retransmission, cancellation, proof-of-delivery. 67 resource tests + Python interop tests. All review feedback addressed.","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:54:49Z","event_type":"created","id":74,"issue_id":"harmony-jnk","new_value":"","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:55:08Z","event_type":"created","id":75,"issue_id":"harmony-b2h","new_value":"","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:55:16Z","event_type":"created","id":76,"issue_id":"harmony-7gf","new_value":"","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:55:24Z","event_type":"created","id":77,"issue_id":"harmony-5y9","new_value":"","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:55:34Z","event_type":"created","id":78,"issue_id":"harmony-2hp","new_value":"","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:55:40Z","event_type":"created","id":79,"issue_id":"harmony-313","new_value":"","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:55:48Z","event_type":"created","id":80,"issue_id":"harmony-0p5","new_value":"","old_value":""}
