@@ -134,8 +134,13 @@ impl<B: BlobStore> StorageTier<B> {
         }
     }
 
-    fn handle_transit(&mut self, _cid: ContentId, _data: Vec<u8>) -> Vec<StorageTierAction> {
-        vec![]
+    fn handle_transit(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
+        self.cache.store(cid, data);
+        self.metrics.transit_admitted += 1;
+        let cid_hex = hex::encode(cid.to_bytes());
+        let key_expr = announce_ns::key(&cid_hex);
+        let payload = cid.payload_size().to_be_bytes().to_vec();
+        vec![StorageTierAction::AnnounceContent { key_expr, payload }]
     }
 
     fn handle_publish(&mut self, _cid: ContentId, _data: Vec<u8>) -> Vec<StorageTierAction> {
@@ -218,6 +223,32 @@ mod tests {
         assert!(actions.is_empty());
         assert_eq!(tier.metrics().queries_served, 1);
         assert_eq!(tier.metrics().cache_misses, 1);
+    }
+
+    #[test]
+    fn transit_content_admitted_produces_announcement() {
+        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 1_000_000 };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let data = b"transiting blob";
+        let cid = ContentId::for_blob(data).unwrap();
+
+        let actions = tier.handle(StorageTierEvent::TransitContent {
+            cid,
+            data: data.to_vec(),
+        });
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::AnnounceContent { key_expr, .. } => {
+                assert!(key_expr.starts_with("harmony/announce/"));
+            }
+            other => panic!("expected AnnounceContent, got {other:?}"),
+        }
+        assert_eq!(tier.metrics().transit_admitted, 1);
+
+        // Content should now be queryable
+        let query_actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });
+        assert_eq!(query_actions.len(), 1);
     }
 
     #[test]
