@@ -176,15 +176,14 @@ impl<S: BlobStore> ContentStore<S> {
         // The pin quota (≤ capacity/2) guarantees that at least one non-pinned
         // victim exists in probation when a pinned candidate arrives here.
         if self.pinned.contains(&candidate) {
-            let victim = self.probation.peek_lru_excluding(&self.pinned);
-            debug_assert!(
-                victim.is_some(),
-                "pin quota invariant: probation must have a non-pinned victim when candidate is pinned"
-            );
-            if let Some(v) = victim {
-                self.probation.remove(&v);
-                self.store_remove(&v);
-            }
+            let Some(victim) = self.probation.peek_lru_excluding(&self.pinned) else {
+                // Quota invariant broken — all probation entries are pinned.
+                // Refuse to insert rather than risk evicting a pinned tail.
+                // This path is unreachable under correct quota enforcement.
+                return;
+            };
+            self.probation.remove(&victim);
+            self.store_remove(&victim);
             self.probation.insert(candidate);
             return;
         }

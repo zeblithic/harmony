@@ -42,6 +42,7 @@ impl CountMinSketch {
     ///
     /// Allocates `NUM_ROWS * (width / 2)` bytes for counters.
     pub fn new(width: usize, halving_threshold: u64) -> Self {
+        assert!(width >= 2, "CountMinSketch width must be at least 2");
         // Round width up to the nearest even number.
         let width = (width + 1) & !1;
         let bytes_per_row = width / 2;
