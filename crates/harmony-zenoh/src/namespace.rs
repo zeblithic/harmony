@@ -129,12 +129,14 @@ pub mod content {
 
     /// Content fetch key: `harmony/content/{prefix}/{cid_hex}`
     ///
-    /// The first hex character is lowercased for the shard prefix so that
-    /// it matches the registered shard patterns (`harmony/content/a/**`).
+    /// The entire `cid_hex` is lowercased to match the convention used by
+    /// `hex::encode` (always lowercase). This ensures keys are consistent
+    /// regardless of the caller's hex casing.
     /// If `cid_hex` is empty, returns a key with no shard segment (caller error).
     pub fn fetch_key(cid_hex: &str) -> String {
-        let prefix: String = cid_hex.get(..1).unwrap_or("").to_ascii_lowercase();
-        format!("{PREFIX}/{prefix}/{cid_hex}")
+        let lower = cid_hex.to_ascii_lowercase();
+        let prefix = lower.get(..1).unwrap_or("");
+        format!("{PREFIX}/{prefix}/{lower}")
     }
 
     /// Publish request key: `harmony/content/publish/{cid_hex}`
@@ -370,10 +372,10 @@ mod tests {
     }
 
     #[test]
-    fn content_fetch_key_lowercases_shard_prefix() {
-        // Uppercase hex must map to the same lowercase shard pattern.
+    fn content_fetch_key_normalizes_to_lowercase() {
+        // Uppercase hex must be fully lowercased to match hex::encode convention.
         let key = content::fetch_key("ABC123DEF456");
-        assert_eq!(key, "harmony/content/a/ABC123DEF456");
+        assert_eq!(key, "harmony/content/a/abc123def456");
     }
 
     #[test]
