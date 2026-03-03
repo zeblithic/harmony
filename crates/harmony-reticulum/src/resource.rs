@@ -4,8 +4,6 @@
 //! arbitrary-sized data over Reticulum links using chunked, windowed
 //! transfers with acknowledgement-based flow control.
 
-use std::collections::HashMap;
-
 use rand_core::CryptoRngCore;
 
 use crate::context::PacketContext;
@@ -233,7 +231,7 @@ pub struct ResourceSender {
     pub(crate) adv_sent_at: Option<u64>,
     pub(crate) last_activity: u64,
     pub(crate) adv_retries_left: u8,
-    pub(crate) sent_parts: usize,
+    pub(crate) parts_sent: Vec<bool>,
     pub(crate) rtt_ms: Option<u64>,
 }
 
@@ -268,6 +266,7 @@ impl ResourceSender {
         // Chunk the encrypted data into parts of at most `mdu` bytes.
         let sdu = crypto.mdu();
         let parts = chunk_data(&encrypted_data, sdu);
+        let num_parts = parts.len();
 
         // Compute map hashes for each part.
         let map_hashes: Vec<MapHash> = parts
@@ -298,7 +297,7 @@ impl ResourceSender {
             adv_sent_at: None,
             last_activity: now_ms,
             adv_retries_left: MAX_ADV_RETRIES as u8,
-            sent_parts: 0,
+            parts_sent: vec![false; num_parts],
             rtt_ms: None,
         })
     }
@@ -360,12 +359,20 @@ impl ResourceSender {
     }
 
     /// Process an incoming event and return resulting actions.
-    pub fn handle_event(&mut self, event: ResourceEvent, payload: &[u8]) -> Vec<ResourceAction> {
+    ///
+    /// `now_ms` is the current monotonic time provided by the caller.
+    pub fn handle_event(
+        &mut self,
+        event: ResourceEvent,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Vec<ResourceAction> {
+        self.last_activity = now_ms;
         match event {
             ResourceEvent::RequestReceived => self.handle_request(payload),
             ResourceEvent::ProofReceived => self.handle_proof(payload),
             ResourceEvent::CancelReceived => self.handle_cancel_received(),
-            ResourceEvent::Timeout { now_ms } => self.handle_timeout(now_ms),
+            ResourceEvent::Timeout { .. } => self.handle_timeout(now_ms),
             _ => vec![],
         }
     }
@@ -393,7 +400,10 @@ impl ResourceSender {
     // -- Private handlers ---------------------------------------------------
 
     fn handle_request(&mut self, payload: &[u8]) -> Vec<ResourceAction> {
-        if self.state != SenderState::Advertised && self.state != SenderState::Transferring {
+        if self.state != SenderState::Advertised
+            && self.state != SenderState::Transferring
+            && self.state != SenderState::AwaitingProof
+        {
             return vec![];
         }
 
@@ -437,12 +447,6 @@ impl ResourceSender {
         if flag == HASHMAP_IS_EXHAUSTED {
             if let Some(ref lmh) = last_map_hash {
                 if let Some(hmu_actions) = self.build_hmu(lmh) {
-                    // Build a reverse lookup from map_hash -> part index.
-                    let mut index_map: HashMap<MapHash, usize> = HashMap::new();
-                    for (i, mh) in self.map_hashes.iter().enumerate() {
-                        index_map.insert(*mh, i);
-                    }
-
                     self.state = SenderState::Transferring;
                     let mut actions = vec![ResourceAction::SenderStateChanged];
 
@@ -456,16 +460,24 @@ impl ResourceSender {
                         let mut mh = [0u8; MAPHASH_LEN];
                         mh.copy_from_slice(&map_data[offset..offset + MAPHASH_LEN]);
 
-                        if let Some(&part_idx) = index_map.get(&mh) {
+                        let part_idx = self
+                            .map_hashes
+                            .iter()
+                            .enumerate()
+                            .position(|(i, h)| *h == mh && !self.parts_sent[i])
+                            .or_else(|| self.map_hashes.iter().position(|h| *h == mh));
+
+                        if let Some(idx) = part_idx {
                             actions.push(ResourceAction::SendPacket {
                                 context: PacketContext::Resource.as_byte(),
-                                plaintext: self.parts[part_idx].clone(),
+                                plaintext: self.parts[idx].clone(),
                             });
-                            self.sent_parts += 1;
+                            self.parts_sent[idx] = true;
                         }
                     }
 
-                    if self.sent_parts >= self.parts.len() {
+                    let unique_sent = self.parts_sent.iter().filter(|&&s| s).count();
+                    if unique_sent >= self.parts.len() {
                         self.state = SenderState::AwaitingProof;
                         actions.push(ResourceAction::SenderStateChanged);
                         let timeout = self.last_activity
@@ -476,7 +488,7 @@ impl ResourceSender {
                         });
                     }
 
-                    let progress = self.sent_parts as f32 / self.parts.len().max(1) as f32;
+                    let progress = unique_sent as f32 / self.parts.len().max(1) as f32;
                     actions.push(ResourceAction::Progress { fraction: progress });
 
                     return actions;
@@ -484,33 +496,40 @@ impl ResourceSender {
             }
         }
 
-        // Build a reverse lookup from map_hash -> part index.
-        let mut index_map: HashMap<MapHash, usize> = HashMap::new();
-        for (i, mh) in self.map_hashes.iter().enumerate() {
-            index_map.insert(*mh, i);
-        }
-
         self.state = SenderState::Transferring;
         let mut actions = vec![ResourceAction::SenderStateChanged];
 
-        // Send each requested part.
+        // Send each requested part.  For each requested map hash, find the
+        // first not-yet-sent part that matches (handles duplicate hashes
+        // correctly, though encrypted data is extremely unlikely to produce
+        // duplicates).
         let requested_count = map_data.len() / MAPHASH_LEN;
         for chunk_idx in 0..requested_count {
             let offset = chunk_idx * MAPHASH_LEN;
             let mut mh = [0u8; MAPHASH_LEN];
             mh.copy_from_slice(&map_data[offset..offset + MAPHASH_LEN]);
 
-            if let Some(&part_idx) = index_map.get(&mh) {
+            // Find first unsent part matching this hash.
+            let part_idx = self
+                .map_hashes
+                .iter()
+                .enumerate()
+                .position(|(i, h)| *h == mh && !self.parts_sent[i]);
+            // Fall back to any matching part (already sent = retransmission).
+            let part_idx = part_idx.or_else(|| self.map_hashes.iter().position(|h| *h == mh));
+
+            if let Some(idx) = part_idx {
                 actions.push(ResourceAction::SendPacket {
                     context: PacketContext::Resource.as_byte(),
-                    plaintext: self.parts[part_idx].clone(),
+                    plaintext: self.parts[idx].clone(),
                 });
-                self.sent_parts += 1;
+                self.parts_sent[idx] = true;
             }
         }
 
-        // Check if all parts have been sent.
-        if self.sent_parts >= self.parts.len() {
+        // Check if all unique parts have been sent.
+        let unique_sent = self.parts_sent.iter().filter(|&&s| s).count();
+        if unique_sent >= self.parts.len() {
             self.state = SenderState::AwaitingProof;
             actions.push(ResourceAction::SenderStateChanged);
             let timeout = self.last_activity
@@ -520,7 +539,7 @@ impl ResourceSender {
             });
         }
 
-        let progress = self.sent_parts as f32 / self.parts.len().max(1) as f32;
+        let progress = unique_sent as f32 / self.parts.len().max(1) as f32;
         actions.push(ResourceAction::Progress { fraction: progress });
 
         actions
@@ -685,6 +704,19 @@ impl ResourceReceiver {
     ) -> Result<(Self, Vec<ResourceAction>), ReticulumError> {
         let adv = ResourceAdvertisement::decode(adv_plaintext)?;
 
+        // Reject advertisements that would cause unbounded allocation.
+        // transfer_size is already capped at MAX_EFFICIENT_SIZE on the sender;
+        // enforce the same limit on the receiver to protect against malicious peers.
+        if adv.transfer_size as usize > MAX_EFFICIENT_SIZE {
+            return Err(ReticulumError::ResourceTooLarge {
+                size: adv.transfer_size as usize,
+                max: MAX_EFFICIENT_SIZE,
+            });
+        }
+        if adv.part_count == 0 || adv.data_size == 0 {
+            return Err(ReticulumError::ResourceAdvInvalid);
+        }
+
         let total_parts = adv.part_count as usize;
 
         // Parse the hashmap segment into individual map hashes.
@@ -752,12 +784,20 @@ impl ResourceReceiver {
     }
 
     /// Process an incoming event and return resulting actions.
-    pub fn handle_event(&mut self, event: ResourceEvent, payload: &[u8]) -> Vec<ResourceAction> {
+    ///
+    /// `now_ms` is the current monotonic time provided by the caller.
+    pub fn handle_event(
+        &mut self,
+        event: ResourceEvent,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Vec<ResourceAction> {
+        self.last_activity = now_ms;
         match event {
-            ResourceEvent::PartReceived => self.handle_part(payload),
-            ResourceEvent::HashmapUpdateReceived => self.handle_hmu(payload),
+            ResourceEvent::PartReceived => self.handle_part(payload, now_ms),
+            ResourceEvent::HashmapUpdateReceived => self.handle_hmu(payload, now_ms),
             ResourceEvent::CancelReceived => self.handle_cancel_received(),
-            ResourceEvent::Timeout { now_ms } => self.handle_timeout(now_ms),
+            ResourceEvent::Timeout { .. } => self.handle_timeout(now_ms),
             _ => vec![],
         }
     }
@@ -820,7 +860,7 @@ impl ResourceReceiver {
 
     // -- Private handlers ---------------------------------------------------
 
-    fn handle_part(&mut self, payload: &[u8]) -> Vec<ResourceAction> {
+    fn handle_part(&mut self, payload: &[u8], now_ms: u64) -> Vec<ResourceAction> {
         if self.state != ReceiverState::Transferring {
             return vec![];
         }
@@ -894,9 +934,7 @@ impl ResourceReceiver {
                 }
             }
 
-            // Need to request more parts.
-            // Use last_activity as a proxy for now_ms (caller should update it).
-            let req_actions = self.request_next(self.last_activity);
+            let req_actions = self.request_next(now_ms);
             actions.extend(req_actions);
         }
 
@@ -907,7 +945,7 @@ impl ResourceReceiver {
     ///
     /// Parses the HMU, installs new map hashes into the receiver's hashmap,
     /// and issues a new request for the next window of parts.
-    fn handle_hmu(&mut self, payload: &[u8]) -> Vec<ResourceAction> {
+    fn handle_hmu(&mut self, payload: &[u8], now_ms: u64) -> Vec<ResourceAction> {
         if self.state != ReceiverState::Transferring {
             return vec![];
         }
@@ -961,7 +999,7 @@ impl ResourceReceiver {
         }
 
         // Now re-request with the new hashes available.
-        self.request_next(self.last_activity)
+        self.request_next(now_ms)
     }
 
     fn handle_cancel_received(&mut self) -> Vec<ResourceAction> {
@@ -1019,8 +1057,8 @@ impl ResourceReceiver {
             // Each part is roughly `sdu` bytes; we sent `outstanding_parts` of them
             // in the previous request. Use `window` as an approximation since
             // outstanding_parts has already been decremented.
-            let bytes_transferred = (self.window as u64)
-                * (self.transfer_size as u64 / (self.total_parts as u64).max(1));
+            let bytes_transferred =
+                (self.window as u64 * self.transfer_size as u64) / (self.total_parts as u64).max(1);
             let rate_bps = if rtt > 0 {
                 (bytes_transferred * 1000) / rtt
             } else {
@@ -1816,7 +1854,7 @@ mod tests {
             req.extend_from_slice(mh);
         }
 
-        let actions = sender.handle_event(ResourceEvent::RequestReceived, &req);
+        let actions = sender.handle_event(ResourceEvent::RequestReceived, &req, 2000);
 
         // Should transition to Transferring, then AwaitingProof since all parts sent.
         assert_eq!(sender.state(), SenderState::AwaitingProof);
@@ -1847,7 +1885,7 @@ mod tests {
         for mh in &sender.map_hashes {
             req.extend_from_slice(mh);
         }
-        sender.handle_event(ResourceEvent::RequestReceived, &req);
+        sender.handle_event(ResourceEvent::RequestReceived, &req, 2000);
         assert_eq!(sender.state(), SenderState::AwaitingProof);
 
         // Build a valid proof: [resource_hash:16][proof:16]
@@ -1856,7 +1894,7 @@ mod tests {
         proof_payload.extend_from_slice(&sender.resource_hash);
         proof_payload.extend_from_slice(&proof);
 
-        let actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_payload);
+        let actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_payload, 3000);
         assert_eq!(sender.state(), SenderState::Complete);
 
         let has_validated = actions
@@ -1877,7 +1915,7 @@ mod tests {
         for mh in &sender.map_hashes {
             req.extend_from_slice(mh);
         }
-        sender.handle_event(ResourceEvent::RequestReceived, &req);
+        sender.handle_event(ResourceEvent::RequestReceived, &req, 2000);
         assert_eq!(sender.state(), SenderState::AwaitingProof);
 
         // Send a bad proof.
@@ -1885,7 +1923,7 @@ mod tests {
         bad_proof.extend_from_slice(&sender.resource_hash);
         bad_proof.extend_from_slice(&[0xFF; 16]); // Wrong proof bytes.
 
-        let actions = sender.handle_event(ResourceEvent::ProofReceived, &bad_proof);
+        let actions = sender.handle_event(ResourceEvent::ProofReceived, &bad_proof, 3000);
         assert_eq!(sender.state(), SenderState::Failed);
 
         let no_validated = !actions
@@ -1924,7 +1962,7 @@ mod tests {
         let mut sender = make_sender();
         sender.advertise(1000);
 
-        let actions = sender.handle_event(ResourceEvent::CancelReceived, &[]);
+        let actions = sender.handle_event(ResourceEvent::CancelReceived, &[], 2000);
         assert_eq!(sender.state(), SenderState::Rejected);
 
         let has_state_change = actions
@@ -1998,13 +2036,61 @@ mod tests {
     }
 
     #[test]
+    fn receiver_rejects_oversized_transfer() {
+        // A malicious advertisement claiming transfer_size > MAX_EFFICIENT_SIZE
+        // must be rejected to prevent OOM.
+        let adv = ResourceAdvertisement {
+            transfer_size: MAX_EFFICIENT_SIZE as u32 + 1,
+            data_size: MAX_EFFICIENT_SIZE as u32 + 1,
+            part_count: 100,
+            resource_hash: [0xAA; 16],
+            random_hash: [0x01; 4],
+            original_hash: [0xAA; 16],
+            hashmap: vec![0u8; 400], // 100 * 4
+            flags: 0x01,
+            segment_index: 1,
+            total_segments: 1,
+            request_id: None,
+        };
+        let encoded = adv.encode();
+        let result = ResourceReceiver::accept(&encoded, 1000);
+        assert!(
+            matches!(result, Err(ReticulumError::ResourceTooLarge { .. })),
+            "should reject oversized transfer"
+        );
+    }
+
+    #[test]
+    fn receiver_rejects_zero_parts() {
+        let adv = ResourceAdvertisement {
+            transfer_size: 100,
+            data_size: 100,
+            part_count: 0,
+            resource_hash: [0xAA; 16],
+            random_hash: [0x01; 4],
+            original_hash: [0xAA; 16],
+            hashmap: vec![],
+            flags: 0x01,
+            segment_index: 1,
+            total_segments: 1,
+            request_id: None,
+        };
+        let encoded = adv.encode();
+        let result = ResourceReceiver::accept(&encoded, 1000);
+        assert!(
+            matches!(result, Err(ReticulumError::ResourceAdvInvalid)),
+            "should reject zero-part transfer"
+        );
+    }
+
+    #[test]
     fn receiver_handles_parts_and_assembles() {
         let (sender, mut receiver) = make_sender_and_receiver();
 
         // Feed all 4 parts to the receiver. With MockLinkCrypto, the part
         // data is the same as the plaintext chunks.
         for part_data in &sender.parts {
-            let actions = receiver.handle_event(ResourceEvent::PartReceived, part_data);
+            let actions = receiver.handle_event(ResourceEvent::PartReceived, part_data, 2000);
             if receiver.state() == ReceiverState::Assembling {
                 // Last part should trigger assembly.
                 let has_assembly_ready = actions
@@ -2026,7 +2112,7 @@ mod tests {
 
         // Feed all parts.
         for part_data in &sender.parts {
-            receiver.handle_event(ResourceEvent::PartReceived, part_data);
+            receiver.handle_event(ResourceEvent::PartReceived, part_data, 2000);
         }
         assert_eq!(receiver.state(), ReceiverState::Assembling);
 
@@ -2065,7 +2151,7 @@ mod tests {
     fn receiver_cancel_received_becomes_failed() {
         let (_sender, mut receiver) = make_sender_and_receiver();
 
-        let actions = receiver.handle_event(ResourceEvent::CancelReceived, &[]);
+        let actions = receiver.handle_event(ResourceEvent::CancelReceived, &[], 2000);
         assert_eq!(receiver.state(), ReceiverState::Failed);
 
         let has_state_change = actions
@@ -2080,7 +2166,7 @@ mod tests {
 
         // Feed all parts except the last one normally.
         for part_data in &sender.parts[..sender.parts.len() - 1] {
-            receiver.handle_event(ResourceEvent::PartReceived, part_data);
+            receiver.handle_event(ResourceEvent::PartReceived, part_data, 2000);
         }
 
         // Tamper with the last part before feeding it.
@@ -2149,7 +2235,7 @@ mod tests {
         let initial_retries = sender.adv_retries_left;
 
         // First timeout: should retry the advertisement.
-        let actions = sender.handle_event(ResourceEvent::Timeout { now_ms: 20_000 }, &[]);
+        let actions = sender.handle_event(ResourceEvent::Timeout { now_ms: 20_000 }, &[], 20_000);
         assert_eq!(sender.state(), SenderState::Advertised);
         assert_eq!(sender.adv_retries_left, initial_retries - 1);
 
@@ -2165,12 +2251,74 @@ mod tests {
         sender.advertise(1000);
         sender.adv_retries_left = 0;
 
-        let actions = sender.handle_event(ResourceEvent::Timeout { now_ms: 20_000 }, &[]);
+        let actions = sender.handle_event(ResourceEvent::Timeout { now_ms: 20_000 }, &[], 20_000);
         assert_eq!(sender.state(), SenderState::Failed);
         let has_state_change = actions
             .iter()
             .any(|a| matches!(a, ResourceAction::SenderStateChanged));
         assert!(has_state_change);
+    }
+
+    #[test]
+    fn sender_retransmission_does_not_inflate_progress() {
+        // Regression: sending the same part twice (retransmission) must not
+        // cause the sender to prematurely enter AwaitingProof.
+        let mut sender = make_sender();
+        sender.advertise(1000);
+
+        // Request only the first 2 of 4 parts.
+        let mut req = Vec::new();
+        req.push(HASHMAP_IS_NOT_EXHAUSTED);
+        req.extend_from_slice(&sender.resource_hash);
+        req.extend_from_slice(&sender.map_hashes[0]);
+        req.extend_from_slice(&sender.map_hashes[1]);
+
+        sender.handle_event(ResourceEvent::RequestReceived, &req, 2000);
+        assert_eq!(
+            sender.state(),
+            SenderState::Transferring,
+            "should still be Transferring (only 2 of 4 parts sent)"
+        );
+
+        // Re-request the same 2 parts (simulating retransmission).
+        sender.handle_event(ResourceEvent::RequestReceived, &req, 3000);
+        assert_eq!(
+            sender.state(),
+            SenderState::Transferring,
+            "retransmission should NOT push to AwaitingProof"
+        );
+    }
+
+    #[test]
+    fn sender_responds_to_requests_in_awaiting_proof() {
+        // After all parts are sent and sender enters AwaitingProof,
+        // a re-request from the receiver should still be handled.
+        let mut sender = make_sender();
+        sender.advertise(1000);
+
+        // Request all 4 parts.
+        let mut req = Vec::new();
+        req.push(HASHMAP_IS_NOT_EXHAUSTED);
+        req.extend_from_slice(&sender.resource_hash);
+        for mh in &sender.map_hashes {
+            req.extend_from_slice(mh);
+        }
+
+        sender.handle_event(ResourceEvent::RequestReceived, &req, 2000);
+        assert_eq!(sender.state(), SenderState::AwaitingProof);
+
+        // Re-request part 0 (receiver didn't receive it).
+        let mut re_req = Vec::new();
+        re_req.push(HASHMAP_IS_NOT_EXHAUSTED);
+        re_req.extend_from_slice(&sender.resource_hash);
+        re_req.extend_from_slice(&sender.map_hashes[0]);
+
+        let actions = sender.handle_event(ResourceEvent::RequestReceived, &re_req, 3000);
+        // Should still send the part.
+        let sends = collect_sends(&actions, PacketContext::Resource.as_byte());
+        assert_eq!(sends.len(), 1, "sender should resend part in AwaitingProof");
+        // Should remain in AwaitingProof (all parts still covered).
+        assert_eq!(sender.state(), SenderState::AwaitingProof);
     }
 
     #[test]
@@ -2180,7 +2328,7 @@ mod tests {
 
         // Should retry while retries_left > 0.
         let initial_retries = receiver.retries_left;
-        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[]);
+        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[], 50_000);
         assert_eq!(receiver.state(), ReceiverState::Transferring);
         assert_eq!(receiver.retries_left, initial_retries - 1);
 
@@ -2191,7 +2339,8 @@ mod tests {
 
         // Exhaust retries.
         receiver.retries_left = 0;
-        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 100_000 }, &[]);
+        let actions =
+            receiver.handle_event(ResourceEvent::Timeout { now_ms: 100_000 }, &[], 100_000);
         assert_eq!(receiver.state(), ReceiverState::Failed);
         let has_state_change = actions
             .iter()
@@ -2255,7 +2404,7 @@ mod tests {
 
             // Feed request to sender -> get part packets.
             let sender_actions =
-                sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+                sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext, 2000);
             let part_packets = collect_sends(&sender_actions, resource_ctx);
             assert!(
                 !part_packets.is_empty(),
@@ -2265,7 +2414,8 @@ mod tests {
             // Feed each part to receiver.
             let mut last_receiver_actions = Vec::new();
             for part in &part_packets {
-                last_receiver_actions = receiver.handle_event(ResourceEvent::PartReceived, part);
+                last_receiver_actions =
+                    receiver.handle_event(ResourceEvent::PartReceived, part, 2000);
             }
 
             if receiver.state() == ReceiverState::Assembling {
@@ -2310,7 +2460,8 @@ mod tests {
         let req_plaintext = extract_send(&rx_actions, PacketContext::ResourceReq.as_byte());
 
         // Feed the request to sender.
-        let sender_actions = sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let sender_actions =
+            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext, 2000);
 
         // Sender responds with Resource data parts.
         let part_packets = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
@@ -2318,7 +2469,7 @@ mod tests {
 
         // Feed each part to receiver.
         for part in &part_packets {
-            receiver.handle_event(ResourceEvent::PartReceived, part);
+            receiver.handle_event(ResourceEvent::PartReceived, part, 2000);
         }
 
         // Receiver should be Assembling after all parts.
@@ -2340,7 +2491,8 @@ mod tests {
 
         // Extract proof and feed to sender.
         let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext, 3000);
 
         // Sender should validate the proof and reach Complete.
         assert_eq!(sender.state(), SenderState::Complete);
@@ -2380,7 +2532,8 @@ mod tests {
 
         // Verify the sender accepted the proof.
         let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext, 3000);
         assert_eq!(sender.state(), SenderState::Complete);
         assert!(proof_actions
             .iter()
@@ -2403,12 +2556,13 @@ mod tests {
         let req_plaintext = extract_send(&rx_actions, PacketContext::ResourceReq.as_byte());
 
         // Sender sends the single part.
-        let sender_actions = sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let sender_actions =
+            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext, 2000);
         let parts = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
         assert_eq!(parts.len(), 1);
 
         // Feed the part to receiver.
-        receiver.handle_event(ResourceEvent::PartReceived, &parts[0]);
+        receiver.handle_event(ResourceEvent::PartReceived, &parts[0], 2000);
         assert_eq!(receiver.state(), ReceiverState::Assembling);
 
         // Finalize.
@@ -2426,7 +2580,8 @@ mod tests {
 
         // Verify proof.
         let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext, 3000);
         assert_eq!(sender.state(), SenderState::Complete);
         assert!(proof_actions
             .iter()
@@ -2439,7 +2594,7 @@ mod tests {
 
         // MDU 50, data 100 bytes -> exactly 2 parts.
         let mock = MockLinkCrypto::new(50);
-        let data = vec![0xDD; 100];
+        let data: Vec<u8> = (0..100u8).collect();
         let mut sender = ResourceSender::new(&mut OsRng, &mock, &data, 1000).unwrap();
         assert_eq!(sender.part_count(), 2);
 
@@ -2450,13 +2605,14 @@ mod tests {
         let req_plaintext = extract_send(&rx_actions, PacketContext::ResourceReq.as_byte());
 
         // Both parts fit in one window (window=4 > 2 parts).
-        let sender_actions = sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let sender_actions =
+            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext, 2000);
         let parts = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
         assert_eq!(parts.len(), 2);
 
         // Feed parts to receiver.
         for part in &parts {
-            receiver.handle_event(ResourceEvent::PartReceived, part);
+            receiver.handle_event(ResourceEvent::PartReceived, part, 2000);
         }
         assert_eq!(receiver.state(), ReceiverState::Assembling);
 
@@ -2475,7 +2631,8 @@ mod tests {
 
         // Verify proof.
         let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext, 3000);
         assert_eq!(sender.state(), SenderState::Complete);
         assert!(proof_actions
             .iter()
@@ -2514,7 +2671,8 @@ mod tests {
 
         // Feed the proof to sender.
         let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext, 3000);
 
         // Sender should validate the proof and reach Complete.
         assert_eq!(sender.state(), SenderState::Complete);
@@ -2558,13 +2716,14 @@ mod tests {
 
         // Feed the first request to the sender and get parts back.
         let req_plaintext = extract_send(&initial_actions, PacketContext::ResourceReq.as_byte());
-        let sender_actions = sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let sender_actions =
+            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext, 2000);
         let part_packets = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
         assert_eq!(part_packets.len(), initial_window);
 
         // Feed all parts from the first window to the receiver.
         for part in &part_packets {
-            receiver.handle_event(ResourceEvent::PartReceived, part);
+            receiver.handle_event(ResourceEvent::PartReceived, part, 2000);
         }
 
         // After receiving a full window, the window should have grown by 1.
@@ -2601,7 +2760,7 @@ mod tests {
         receiver.consecutive_completed = 0;
         receiver.outstanding_parts = 1; // will decrement to 0
 
-        receiver.handle_event(ResourceEvent::PartReceived, &part_data);
+        receiver.handle_event(ResourceEvent::PartReceived, &part_data, 2000);
 
         // Window should NOT have grown past window_max.
         assert!(
@@ -2633,7 +2792,7 @@ mod tests {
         receiver.consecutive_completed = 0;
         receiver.outstanding_parts = 1;
 
-        receiver.handle_event(ResourceEvent::PartReceived, &part_data);
+        receiver.handle_event(ResourceEvent::PartReceived, &part_data, 2000);
 
         // Window grew from (min + FLEX-1) to (min + FLEX), so window_min should increase.
         assert_eq!(
@@ -2653,7 +2812,7 @@ mod tests {
         let initial_retries = receiver.retries_left;
 
         // Fire a timeout — should shrink window, shrink window_max, and retry.
-        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[]);
+        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[], 50_000);
 
         assert_eq!(receiver.state(), ReceiverState::Transferring);
         assert_eq!(receiver.retries_left, initial_retries - 1);
@@ -2684,7 +2843,7 @@ mod tests {
         receiver.window = receiver.window_min;
         receiver.window_max = receiver.window_min;
 
-        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[]);
+        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[], 50_000);
 
         // Window should stay at window_min.
         assert_eq!(
@@ -2717,12 +2876,8 @@ mod tests {
                 "should still be Transferring at retry {}",
                 i
             );
-            receiver.handle_event(
-                ResourceEvent::Timeout {
-                    now_ms: 50_000 + i as u64 * 1_000,
-                },
-                &[],
-            );
+            let t = 50_000 + i as u64 * 1_000;
+            receiver.handle_event(ResourceEvent::Timeout { now_ms: t }, &[], t);
         }
         assert_eq!(receiver.retries_left, 0);
         assert_eq!(
@@ -2732,7 +2887,8 @@ mod tests {
         );
 
         // One more timeout should fail the transfer.
-        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 200_000 }, &[]);
+        let actions =
+            receiver.handle_event(ResourceEvent::Timeout { now_ms: 200_000 }, &[], 200_000);
         assert_eq!(receiver.state(), ReceiverState::Failed);
         let has_state_change = actions
             .iter()
@@ -2755,19 +2911,18 @@ mod tests {
 
         // Feed the request to sender.
         let req_plaintext = extract_send(&initial_actions, PacketContext::ResourceReq.as_byte());
-        let sender_actions = sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let sender_actions =
+            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext, 2000);
         let part_packets = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
 
-        // Simulate time passing: update last_activity before feeding parts.
-        receiver.last_activity = req_sent_time + 500; // 500ms later
-
-        // Feed all parts.
+        // Feed all parts 500ms after the request was sent.
+        let part_time = req_sent_time + 500;
         for part in &part_packets {
-            receiver.handle_event(ResourceEvent::PartReceived, part);
+            receiver.handle_event(ResourceEvent::PartReceived, part, part_time);
         }
 
-        // After a full window completes, request_next is called with last_activity,
-        // and RTT should be measured.
+        // After a full window completes, request_next is called with the actual
+        // part arrival time, so RTT = part_time - req_sent_time = 500ms.
         assert!(
             receiver.rtt_ms.is_some(),
             "RTT should be measured after first complete window"
@@ -2788,7 +2943,7 @@ mod tests {
         receiver.fast_rate_rounds = 3;
         receiver.very_slow_rate_rounds = 1;
 
-        receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[]);
+        receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[], 50_000);
 
         assert_eq!(
             receiver.fast_rate_rounds, 0,
@@ -2826,7 +2981,8 @@ mod tests {
 
         // Verify proof.
         let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext, 3000);
         assert_eq!(sender.state(), SenderState::Complete);
         assert!(proof_actions
             .iter()
@@ -2882,7 +3038,7 @@ mod tests {
         assert_eq!(receiver.hashmap_height, 4);
 
         // Feed the HMU to the receiver.
-        let actions = receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &hmu_pkt);
+        let actions = receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &hmu_pkt, 2000);
 
         // After HMU, hashmap_height should be 10 (all hashes installed).
         assert_eq!(receiver.hashmap_height, 10);
@@ -2934,7 +3090,7 @@ mod tests {
             req.extend_from_slice(mh);
         }
 
-        let actions = sender.handle_event(ResourceEvent::RequestReceived, &req);
+        let actions = sender.handle_event(ResourceEvent::RequestReceived, &req, 2000);
 
         // Should emit an HMU packet.
         let hmu_packets = collect_sends(&actions, PacketContext::ResourceHmu.as_byte());
@@ -3021,7 +3177,7 @@ mod tests {
         let req1 = extract_send(&round1_actions, req_ctx);
 
         // Feed request to sender.
-        let sender_actions1 = sender.handle_event(ResourceEvent::RequestReceived, &req1);
+        let sender_actions1 = sender.handle_event(ResourceEvent::RequestReceived, &req1, 2000);
         let parts1 = collect_sends(&sender_actions1, resource_ctx);
         assert_eq!(parts1.len(), 4, "round 1 should yield 4 parts");
 
@@ -3029,7 +3185,7 @@ mod tests {
         // internally call request_next, which hits hashmap exhaustion.
         let mut last_part_actions = Vec::new();
         for part in &parts1 {
-            last_part_actions = receiver.handle_event(ResourceEvent::PartReceived, part);
+            last_part_actions = receiver.handle_event(ResourceEvent::PartReceived, part, 2000);
         }
         assert_eq!(receiver.received_count, 4);
         assert_eq!(receiver.state(), ReceiverState::Transferring);
@@ -3043,7 +3199,7 @@ mod tests {
         );
 
         // Feed the exhausted request to sender -- it should respond with HMU + parts.
-        let sender_actions2 = sender.handle_event(ResourceEvent::RequestReceived, &req2);
+        let sender_actions2 = sender.handle_event(ResourceEvent::RequestReceived, &req2, 2000);
         let hmu_packets = collect_sends(&sender_actions2, hmu_ctx);
         assert_eq!(
             hmu_packets.len(),
@@ -3054,7 +3210,7 @@ mod tests {
         // Feed the HMU to the receiver. This installs the remaining hashes and
         // emits a new request for the next window of parts.
         let hmu_actions =
-            receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &hmu_packets[0]);
+            receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &hmu_packets[0], 2000);
         assert_eq!(
             receiver.hashmap_height, 10,
             "all hashes should be installed after HMU"
@@ -3066,7 +3222,7 @@ mod tests {
         // might be 0 parts. Check anyway.
         let parts2 = collect_sends(&sender_actions2, resource_ctx);
         for part in &parts2 {
-            receiver.handle_event(ResourceEvent::PartReceived, part);
+            receiver.handle_event(ResourceEvent::PartReceived, part, 2000);
         }
 
         // Now drive remaining rounds using the request from the HMU handler
@@ -3088,12 +3244,12 @@ mod tests {
                 }
             };
 
-            let sender_resp = sender.handle_event(ResourceEvent::RequestReceived, &next_req);
+            let sender_resp = sender.handle_event(ResourceEvent::RequestReceived, &next_req, 2000);
             let parts = collect_sends(&sender_resp, resource_ctx);
 
             let mut last_actions = Vec::new();
             for part in &parts {
-                last_actions = receiver.handle_event(ResourceEvent::PartReceived, part);
+                last_actions = receiver.handle_event(ResourceEvent::PartReceived, part, 2000);
             }
 
             // If the last part's actions contain a new request, capture it.
@@ -3122,7 +3278,8 @@ mod tests {
 
         // Verify proof on sender side.
         let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext, 3000);
         assert_eq!(sender.state(), SenderState::Complete);
         assert!(proof_actions
             .iter()
@@ -3143,7 +3300,7 @@ mod tests {
             write_bin(&mut hmu_pkt, &[0xAA; 8]).unwrap();
         }
 
-        let actions = receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &hmu_pkt);
+        let actions = receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &hmu_pkt, 2000);
         assert!(actions.is_empty(), "HMU with wrong hash should be ignored");
     }
 
@@ -3152,7 +3309,8 @@ mod tests {
         let (_sender, mut receiver) = make_sender_and_receiver();
 
         // Payload too short (less than 16 bytes).
-        let actions = receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &[0x01; 10]);
+        let actions =
+            receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &[0x01; 10], 2000);
         assert!(actions.is_empty(), "truncated HMU should be ignored");
     }
 
