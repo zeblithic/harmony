@@ -56,8 +56,7 @@ fn decode_hex_key(
     expected_len: usize,
     label: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let bytes =
-        hex::decode(hex_str).map_err(|e| format!("invalid {label} hex: {e}"))?;
+    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid {label} hex: {e}"))?;
     if bytes.len() != expected_len {
         return Err(format!(
             "{label}: expected {expected_len} bytes, got {}",
@@ -72,8 +71,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Identity { action } => match action {
             IdentityAction::New => {
-                let id =
-                    harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let id = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
                 let pub_id = id.public_identity();
                 println!("Address:     {}", hex::encode(pub_id.address_hash));
                 println!("Public key:  {}", hex::encode(pub_id.to_public_bytes()));
@@ -82,17 +80,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             IdentityAction::Show { private_key } => {
                 let bytes = decode_hex_key(&private_key, 64, "private key")?;
-                let id =
-                    harmony_identity::PrivateIdentity::from_private_bytes(&bytes)?;
+                let id = harmony_identity::PrivateIdentity::from_private_bytes(&bytes)?;
                 let pub_id = id.public_identity();
                 println!("Address:    {}", hex::encode(pub_id.address_hash));
                 println!("Public key: {}", hex::encode(pub_id.to_public_bytes()));
                 Ok(())
             }
-            IdentityAction::Sign { private_key, message } => {
+            IdentityAction::Sign {
+                private_key,
+                message,
+            } => {
                 let bytes = decode_hex_key(&private_key, 64, "private key")?;
-                let id =
-                    harmony_identity::PrivateIdentity::from_private_bytes(&bytes)?;
+                let id = harmony_identity::PrivateIdentity::from_private_bytes(&bytes)?;
                 let signature = id.sign(message.as_bytes());
                 println!("Signature: {}", hex::encode(signature));
                 Ok(())
@@ -102,12 +101,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 message,
                 signature,
             } => {
-                let pub_bytes =
-                    decode_hex_key(&public_key, 64, "public key")?;
-                let sig_bytes =
-                    decode_hex_key(&signature, 64, "signature")?;
-                let identity =
-                    harmony_identity::Identity::from_public_bytes(&pub_bytes)?;
+                let pub_bytes = decode_hex_key(&public_key, 64, "public key")?;
+                let sig_bytes = decode_hex_key(&signature, 64, "signature")?;
+                let identity = harmony_identity::Identity::from_public_bytes(&pub_bytes)?;
                 let sig_array: [u8; 64] = sig_bytes.try_into().unwrap();
                 match identity.verify(message.as_bytes(), &sig_array) {
                     Ok(()) => {

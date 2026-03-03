@@ -74,10 +74,7 @@ fn identity_show_rejects_invalid_hex() {
 
 #[test]
 fn identity_sign_produces_valid_signature() {
-    let new_output = harmony_cmd()
-        .args(["identity", "new"])
-        .output()
-        .unwrap();
+    let new_output = harmony_cmd().args(["identity", "new"]).output().unwrap();
     let new_stdout = String::from_utf8_lossy(&new_output.stdout);
     let new_lines: Vec<&str> = new_stdout.lines().collect();
     let priv_hex = new_lines[2].trim_start_matches("Private key:").trim();
@@ -102,10 +99,7 @@ fn identity_sign_produces_valid_signature() {
 
 #[test]
 fn sign_then_verify_round_trip() {
-    let new_output = harmony_cmd()
-        .args(["identity", "new"])
-        .output()
-        .unwrap();
+    let new_output = harmony_cmd().args(["identity", "new"]).output().unwrap();
     let new_stdout = String::from_utf8_lossy(&new_output.stdout);
     let new_lines: Vec<&str> = new_stdout.lines().collect();
     let pub_hex = new_lines[1].trim_start_matches("Public key:").trim();
@@ -139,10 +133,7 @@ fn sign_then_verify_round_trip() {
 
 #[test]
 fn verify_rejects_corrupted_signature() {
-    let new_output = harmony_cmd()
-        .args(["identity", "new"])
-        .output()
-        .unwrap();
+    let new_output = harmony_cmd().args(["identity", "new"]).output().unwrap();
     let new_stdout = String::from_utf8_lossy(&new_output.stdout);
     let new_lines: Vec<&str> = new_stdout.lines().collect();
     let pub_hex = new_lines[1].trim_start_matches("Public key:").trim();
