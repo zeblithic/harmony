@@ -139,6 +139,7 @@ impl Default for BundleBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::{BlobStore, MemoryBlobStore};
     use crate::cid::CidType;
 
     #[test]
@@ -297,5 +298,115 @@ mod tests {
         let mut b = BundleBuilder::new();
         b.add(current);
         assert!(b.build().is_err());
+    }
+
+    #[test]
+    fn full_pipeline_store_blobs_build_bundle_retrieve() {
+        let mut store = MemoryBlobStore::new();
+
+        // Insert blobs
+        let cid_a = store.insert(b"chunk alpha").unwrap();
+        let cid_b = store.insert(b"chunk beta").unwrap();
+        let cid_c = store.insert(b"chunk gamma").unwrap();
+
+        // Build bundle
+        let mut builder = BundleBuilder::new();
+        builder.add(cid_a).add(cid_b).add(cid_c);
+        let (bundle_bytes, bundle_cid) = builder.build().unwrap();
+
+        // Store bundle
+        store.store(bundle_cid, bundle_bytes);
+
+        // Retrieve and parse
+        let retrieved = store.get(&bundle_cid).unwrap();
+        let children = parse_bundle(retrieved).unwrap();
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0], cid_a);
+        assert_eq!(children[1], cid_b);
+        assert_eq!(children[2], cid_c);
+
+        // Verify each child blob is still retrievable
+        assert_eq!(store.get(&cid_a).unwrap(), b"chunk alpha");
+        assert_eq!(store.get(&cid_b).unwrap(), b"chunk beta");
+        assert_eq!(store.get(&cid_c).unwrap(), b"chunk gamma");
+    }
+
+    #[test]
+    fn full_pipeline_with_metadata_root_bundle() {
+        let mut store = MemoryBlobStore::new();
+
+        let cid_a = store.insert(b"part 1").unwrap();
+        let cid_b = store.insert(b"part 2").unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder
+            .add(cid_a)
+            .add(cid_b)
+            .with_metadata(12, 2, 1709337600000, *b"text/pln");
+
+        let (bundle_bytes, bundle_cid) = builder.build().unwrap();
+        store.store(bundle_cid, bundle_bytes);
+
+        let retrieved = store.get(&bundle_cid).unwrap();
+        let entries = parse_bundle(retrieved).unwrap();
+
+        // First entry is inline metadata
+        assert_eq!(entries[0].cid_type(), CidType::InlineMetadata);
+        let (total_size, chunk_count, ts, mime) = entries[0].parse_inline_metadata().unwrap();
+        assert_eq!(total_size, 12);
+        assert_eq!(chunk_count, 2);
+        assert_eq!(ts, 1709337600000);
+        assert_eq!(&mime, b"text/pln");
+
+        // Remaining entries are the blobs
+        assert_eq!(entries[1], cid_a);
+        assert_eq!(entries[2], cid_b);
+    }
+
+    #[test]
+    fn two_level_bundle_tree() {
+        let mut store = MemoryBlobStore::new();
+
+        // Create 4 blobs
+        let cids: Vec<ContentId> = (0..4)
+            .map(|i| store.insert(format!("chunk {i}").as_bytes()).unwrap())
+            .collect();
+
+        // L1 bundle: first 2 blobs
+        let mut b1 = BundleBuilder::new();
+        b1.add(cids[0]).add(cids[1]);
+        let (b1_bytes, b1_cid) = b1.build().unwrap();
+        assert_eq!(b1_cid.cid_type(), CidType::Bundle(1));
+        store.store(b1_cid, b1_bytes);
+
+        // L1 bundle: last 2 blobs
+        let mut b2 = BundleBuilder::new();
+        b2.add(cids[2]).add(cids[3]);
+        let (b2_bytes, b2_cid) = b2.build().unwrap();
+        store.store(b2_cid, b2_bytes);
+
+        // L2 root bundle: two L1 bundles
+        let mut root_builder = BundleBuilder::new();
+        root_builder.add(b1_cid).add(b2_cid);
+        let (root_bytes, root_cid) = root_builder.build().unwrap();
+        assert_eq!(root_cid.cid_type(), CidType::Bundle(2));
+        store.store(root_cid, root_bytes);
+
+        // Walk the tree: root → L1s → blobs
+        let root_children = parse_bundle(store.get(&root_cid).unwrap()).unwrap();
+        assert_eq!(root_children.len(), 2);
+
+        let l1a_children = parse_bundle(store.get(&root_children[0]).unwrap()).unwrap();
+        assert_eq!(l1a_children.len(), 2);
+        assert_eq!(l1a_children[0], cids[0]);
+        assert_eq!(l1a_children[1], cids[1]);
+
+        let l1b_children = parse_bundle(store.get(&root_children[1]).unwrap()).unwrap();
+        assert_eq!(l1b_children[0], cids[2]);
+        assert_eq!(l1b_children[1], cids[3]);
+
+        // All leaf data is correct
+        assert_eq!(store.get(&cids[0]).unwrap(), b"chunk 0");
+        assert_eq!(store.get(&cids[3]).unwrap(), b"chunk 3");
     }
 }
