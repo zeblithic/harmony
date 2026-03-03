@@ -5,11 +5,14 @@ allowed-tools: Bash(bd list:*), Bash(bd show:*), Bash(bd ready:*), Bash(git log:
 
 ## Context
 
-- Available beads: !`bd ready 2>/dev/null || echo "(bd not available)"`
-- All beads: !`bd list 2>/dev/null || echo "(bd not available)"`
-- Recent merges: !`git log --oneline --merges -5 2>/dev/null || echo "(no merges)"`
-- Current branch: !`git branch --show-current`
-- Open PRs: !`gh pr list --state open --limit 5 2>/dev/null || echo "(no open PRs)"`
+- Harmony repo: `/Users/zeblith/work/zeblithic/harmony`
+- Available beads: !`cd /Users/zeblith/work/zeblithic/harmony && bd ready 2>/dev/null || echo "(bd not available)"`
+- All beads: !`cd /Users/zeblith/work/zeblithic/harmony && bd list 2>/dev/null || echo "(bd not available)"`
+- Recent merges: !`cd /Users/zeblith/work/zeblithic/harmony && git log --oneline --merges -5 2>/dev/null || echo "(no merges)"`
+- Current branch: !`cd /Users/zeblith/work/zeblithic/harmony && git branch --show-current 2>/dev/null || echo "(not in repo)"`
+- Open PRs: !`cd /Users/zeblith/work/zeblithic/harmony && gh pr list --state open --limit 5 2>/dev/null || echo "(no open PRs)"`
+
+**All workflow commands must run from the harmony repo.** Start with: `cd /Users/zeblith/work/zeblithic/harmony`
 
 ## Find Task Workflow
 

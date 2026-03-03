@@ -6,10 +6,13 @@ allowed-tools: Bash(git checkout:*), Bash(git branch:*), Bash(git pull:*), Bash(
 
 ## Context
 
-- Current branch: !`git branch --show-current`
-- Git status: !`git status --short`
-- Uncommitted changes: !`git diff --stat`
-- Open PRs: !`gh pr list --state open --limit 5 2>/dev/null || echo "(gh not available)"`
+- Harmony repo: `/Users/zeblith/work/zeblithic/harmony`
+- Current branch: !`cd /Users/zeblith/work/zeblithic/harmony && git branch --show-current 2>/dev/null || echo "(not in repo)"`
+- Git status: !`cd /Users/zeblith/work/zeblithic/harmony && git status --short 2>/dev/null`
+- Uncommitted changes: !`cd /Users/zeblith/work/zeblithic/harmony && git diff --stat 2>/dev/null`
+- Open PRs: !`cd /Users/zeblith/work/zeblithic/harmony && gh pr list --state open --limit 5 2>/dev/null || echo "(gh not available)"`
+
+**All workflow commands must run from the harmony repo.** Start with: `cd /Users/zeblith/work/zeblithic/harmony`
 
 ## Arguments
 

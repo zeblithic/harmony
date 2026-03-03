@@ -6,11 +6,14 @@ allowed-tools: Bash(git add:*), Bash(git status:*), Bash(git commit:*), Bash(git
 
 ## Context
 
-- Git status: !`git status --short`
-- Current branch: !`git branch --show-current`
-- Changes summary: !`git diff HEAD --stat`
-- Recent commits: !`git log --oneline -5`
-- Active beads: !`bd list --status=active 2>/dev/null || echo "(no active beads)"`
+- Harmony repo: `/Users/zeblith/work/zeblithic/harmony`
+- Git status: !`cd /Users/zeblith/work/zeblithic/harmony && git status --short 2>/dev/null`
+- Current branch: !`cd /Users/zeblith/work/zeblithic/harmony && git branch --show-current 2>/dev/null || echo "(not in repo)"`
+- Changes summary: !`cd /Users/zeblith/work/zeblithic/harmony && git diff HEAD --stat 2>/dev/null`
+- Recent commits: !`cd /Users/zeblith/work/zeblithic/harmony && git log --oneline -5 2>/dev/null`
+- Active beads: !`cd /Users/zeblith/work/zeblithic/harmony && bd list --status=active 2>/dev/null || echo "(no active beads)"`
+
+**All workflow commands must run from the harmony repo.** Start with: `cd /Users/zeblith/work/zeblithic/harmony`
 
 ## Arguments
 

@@ -6,8 +6,11 @@ allowed-tools: Bash(gh pr view:*), Bash(gh pr comments:*), Bash(gh api:*), Bash(
 
 ## Context
 
-- Current branch: !`git branch --show-current`
-- Open PRs: !`gh pr list --state open --limit 5 2>/dev/null || echo "(gh not available)"`
+- Harmony repo: `/Users/zeblith/work/zeblithic/harmony`
+- Current branch: !`cd /Users/zeblith/work/zeblithic/harmony && git branch --show-current 2>/dev/null || echo "(not in repo)"`
+- Open PRs: !`cd /Users/zeblith/work/zeblithic/harmony && gh pr list --state open --limit 5 2>/dev/null || echo "(gh not available)"`
+
+**All workflow commands must run from the harmony repo.** Start with: `cd /Users/zeblith/work/zeblithic/harmony`
 
 ## Arguments
 

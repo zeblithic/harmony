@@ -6,9 +6,12 @@ allowed-tools: Bash(bd show:*), Bash(bd update:*), Bash(git checkout:*), Bash(gi
 
 ## Context
 
-- Current branch: !`git branch --show-current`
-- Git status: !`git status --short`
+- Harmony repo: `/Users/zeblith/work/zeblithic/harmony`
+- Current branch: !`cd /Users/zeblith/work/zeblithic/harmony && git branch --show-current 2>/dev/null || echo "(not in repo)"`
+- Git status: !`cd /Users/zeblith/work/zeblithic/harmony && git status --short 2>/dev/null`
 - Bead argument: $ARGUMENTS
+
+**All workflow commands must run from the harmony repo.** Start with: `cd /Users/zeblith/work/zeblithic/harmony`
 
 ## Arguments
 
