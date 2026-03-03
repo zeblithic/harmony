@@ -1,3 +1,5 @@
+use crate::cid::ContentId;
+
 /// Errors produced by content-addressing operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ContentError {
@@ -21,4 +23,10 @@ pub enum ContentError {
 
     #[error("invalid chunker config: {reason}")]
     InvalidChunkerConfig { reason: &'static str },
+
+    #[error("cannot ingest empty data")]
+    EmptyData,
+
+    #[error("content not found in store: {cid}")]
+    MissingContent { cid: ContentId },
 }
