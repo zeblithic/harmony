@@ -71,6 +71,21 @@ impl<S: BlobStore> ContentStore<S> {
         self.pinned.contains(cid)
     }
 
+    /// Retrieve data and record the access for frequency tracking.
+    ///
+    /// Unlike [`BlobStore::get`] (which takes `&self` and cannot update cache
+    /// metadata), this method updates the sketch frequency counter and adjusts
+    /// segment placement on hits. Returns a cloned copy of the data.
+    ///
+    /// Callers that need W-TinyLFU benefits (frequency-based admission,
+    /// promotion from probation to protected) should prefer this over the
+    /// trait `get()`.
+    pub fn get_and_record(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
+        let data = self.store.get(cid).map(|b| b.to_vec())?;
+        self.record_access(cid);
+        Some(data)
+    }
+
     /// Record an access for a CID already in the cache.
     ///
     /// Called by callers on cache hits to maintain frequency data and adjust
@@ -132,9 +147,9 @@ impl<S: BlobStore> ContentStore<S> {
                 self.probation.insert(candidate);
                 return;
             }
-            // Victim is pinned — admit candidate without evicting victim.
+            // Victim is pinned — drop candidate, pinned items win unconditionally.
             if self.pinned.contains(&victim) {
-                self.probation.insert(candidate);
+                self.store_remove(&candidate);
                 return;
             }
 
@@ -200,6 +215,28 @@ mod tests {
         let cid = cs.insert(data).unwrap();
         assert!(cs.contains(&cid));
         assert_eq!(cs.get(&cid).unwrap(), data);
+    }
+
+    #[test]
+    fn get_and_record_updates_frequency_and_promotes() {
+        // Capacity 20: window=1, protected=4, probation=15.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 20);
+
+        // Insert target, then push it to probation.
+        let target = cs.insert(b"target").unwrap();
+        let _pusher = cs.insert(b"pusher").unwrap();
+        assert!(cs.probation.contains(&target));
+
+        // get_and_record should return data AND promote to protected.
+        let data = cs.get_and_record(&target);
+        assert_eq!(data.as_deref(), Some(b"target".as_slice()));
+        assert!(cs.protected.contains(&target));
+        assert!(!cs.probation.contains(&target));
+
+        // Miss returns None.
+        let bogus = ContentId::for_blob(b"nonexistent").unwrap();
+        assert_eq!(cs.get_and_record(&bogus), None);
     }
 
     #[test]
@@ -295,8 +332,14 @@ mod tests {
             cs.insert(data.as_bytes()).unwrap();
         }
 
-        // Pinned item should still be retrievable.
+        // Pinned item should still be tracked in cache segments (not just backing store).
         assert!(cs.is_pinned(&pinned_cid));
+        assert!(
+            cs.window.contains(&pinned_cid)
+                || cs.probation.contains(&pinned_cid)
+                || cs.protected.contains(&pinned_cid),
+            "pinned CID should remain in cache segments"
+        );
         assert!(cs.contains(&pinned_cid));
 
         // Unpin and verify it becomes evictable.
