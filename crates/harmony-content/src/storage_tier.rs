@@ -1,5 +1,7 @@
 //! StorageTier: sans-I/O wrapper integrating ContentStore with Zenoh patterns.
 
+use crate::cid::ContentId;
+
 /// Configuration for storage capacity limits.
 #[derive(Debug, Clone)]
 pub struct StorageBudget {
@@ -18,6 +20,34 @@ pub struct StorageMetrics {
     pub transit_admitted: u64,
     pub transit_rejected: u64,
     pub publishes_stored: u64,
+}
+
+/// Inbound events for the storage tier to process.
+#[derive(Debug, Clone)]
+pub enum StorageTierEvent {
+    /// Content query on harmony/content/{prefix}/**
+    ContentQuery { query_id: u64, cid: ContentId },
+    /// Content transiting through router (harmony/content/transit/**)
+    TransitContent { cid: ContentId, data: Vec<u8> },
+    /// Explicit publish request (harmony/content/publish/*)
+    PublishContent { cid: ContentId, data: Vec<u8> },
+    /// Stats query on harmony/content/stats/{node_addr}
+    StatsQuery { query_id: u64 },
+}
+
+/// Outbound actions returned by the storage tier for the caller to execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageTierAction {
+    /// Reply to a content query with data.
+    SendReply { query_id: u64, payload: Vec<u8> },
+    /// Announce content availability on harmony/announce/{cid_hex}.
+    AnnounceContent { key_expr: String, payload: Vec<u8> },
+    /// Reply with cache metrics.
+    SendStatsReply { query_id: u64, payload: Vec<u8> },
+    /// Register shard queryables (returned at startup).
+    DeclareQueryables { key_exprs: Vec<String> },
+    /// Register subscriptions (returned at startup).
+    DeclareSubscribers { key_exprs: Vec<String> },
 }
 
 #[cfg(test)]
@@ -43,5 +73,17 @@ mod tests {
         assert_eq!(m.transit_admitted, 0);
         assert_eq!(m.transit_rejected, 0);
         assert_eq!(m.publishes_stored, 0);
+    }
+
+    #[test]
+    fn event_and_action_types_exist() {
+        let _event = StorageTierEvent::ContentQuery {
+            query_id: 1,
+            cid: ContentId::for_blob(b"test").unwrap(),
+        };
+        let _action = StorageTierAction::SendReply {
+            query_id: 1,
+            payload: vec![1, 2, 3],
+        };
     }
 }
