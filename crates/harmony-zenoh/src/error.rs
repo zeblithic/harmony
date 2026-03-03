@@ -45,7 +45,4 @@ pub enum ZenohError {
 
     #[error("unknown queryable ID: {0}")]
     UnknownQueryableId(u64),
-
-    #[error("unknown query ID: {0}")]
-    UnknownQueryId(u64),
 }

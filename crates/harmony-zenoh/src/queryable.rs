@@ -132,7 +132,10 @@ impl QueryableRouter {
     }
 
     /// Process an inbound queryable event and return actions for the caller.
-    pub fn on_event(&self, event: QueryableEvent) -> Vec<QueryableAction> {
+    pub fn handle_event(
+        &mut self,
+        event: QueryableEvent,
+    ) -> Result<Vec<QueryableAction>, ZenohError> {
         match event {
             QueryableEvent::QueryReceived {
                 query_id,
@@ -141,7 +144,7 @@ impl QueryableRouter {
             } => self.handle_query_received(query_id, &key_expr, payload),
             // Informational events — no local actions needed for now.
             QueryableEvent::QueryableDeclared { .. }
-            | QueryableEvent::QueryableUndeclared { .. } => vec![],
+            | QueryableEvent::QueryableUndeclared { .. } => Ok(vec![]),
         }
     }
 
@@ -152,14 +155,12 @@ impl QueryableRouter {
         query_id: QueryId,
         key_expr: &str,
         payload: Vec<u8>,
-    ) -> Vec<QueryableAction> {
-        let ke = match keyexpr::new(key_expr) {
-            Ok(ke) => ke,
-            Err(_) => return vec![],
-        };
+    ) -> Result<Vec<QueryableAction>, ZenohError> {
+        let ke = keyexpr::new(key_expr)
+            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
 
         let matches = self.local_table.matches(ke);
-        matches
+        Ok(matches
             .into_iter()
             .filter_map(|sub_id| {
                 self.sub_to_queryable
@@ -171,7 +172,7 @@ impl QueryableRouter {
                         payload: payload.clone(),
                     })
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -200,11 +201,12 @@ mod tests {
         );
 
         // Feed a query that matches
-        let actions = router.on_event(QueryableEvent::QueryReceived {
+        let actions = router.handle_event(QueryableEvent::QueryReceived {
             query_id: 1,
             key_expr: "harmony/content/a/abcd1234".into(),
             payload: b"fetch".to_vec(),
-        });
+        })
+        .unwrap();
 
         assert_eq!(actions.len(), 1);
         assert_eq!(
@@ -241,11 +243,12 @@ mod tests {
         let (qid_b, _) = router.declare("harmony/content/b/**").unwrap();
 
         // Query matching only the "a" prefix
-        let actions = router.on_event(QueryableEvent::QueryReceived {
+        let actions = router.handle_event(QueryableEvent::QueryReceived {
             query_id: 10,
             key_expr: "harmony/content/a/abcd".into(),
             payload: b"get-a".to_vec(),
-        });
+        })
+        .unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(
             actions[0],
@@ -258,11 +261,12 @@ mod tests {
         );
 
         // Query matching only the "b" prefix
-        let actions = router.on_event(QueryableEvent::QueryReceived {
+        let actions = router.handle_event(QueryableEvent::QueryReceived {
             query_id: 11,
             key_expr: "harmony/content/b/bcde".into(),
             payload: b"get-b".to_vec(),
-        });
+        })
+        .unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(
             actions[0],
@@ -292,15 +296,39 @@ mod tests {
         );
 
         // Subsequent query produces no actions
-        let actions = router.on_event(QueryableEvent::QueryReceived {
+        let actions = router.handle_event(QueryableEvent::QueryReceived {
             query_id: 99,
             key_expr: "harmony/content/a/abcd".into(),
             payload: b"fetch".to_vec(),
-        });
+        })
+        .unwrap();
         assert!(actions.is_empty());
 
         // Undeclaring again fails with UnknownQueryableId
         let result = router.undeclare(qid);
         assert!(matches!(result, Err(ZenohError::UnknownQueryableId(_))));
+    }
+
+    #[test]
+    fn declare_rejects_invalid_key_expr() {
+        let mut router = QueryableRouter::new();
+        let result = router.declare("");
+        assert!(matches!(result, Err(ZenohError::InvalidKeyExpr(_))));
+    }
+
+    #[test]
+    fn query_no_match_returns_empty() {
+        let mut router = QueryableRouter::new();
+        router.declare("harmony/content/a/**").unwrap();
+
+        // Query on a completely disjoint key expression.
+        let actions = router
+            .handle_event(QueryableEvent::QueryReceived {
+                query_id: 1,
+                key_expr: "harmony/other/xyz".to_string(),
+                payload: vec![],
+            })
+            .unwrap();
+        assert!(actions.is_empty());
     }
 }
