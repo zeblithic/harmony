@@ -18,4 +18,7 @@ pub enum ContentError {
 
     #[error("cannot build an empty bundle")]
     EmptyBundle,
+
+    #[error("invalid chunker config: {reason}")]
+    InvalidChunkerConfig { reason: &'static str },
 }

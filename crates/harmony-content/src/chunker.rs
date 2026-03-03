@@ -1,3 +1,6 @@
+use crate::cid::MAX_PAYLOAD_SIZE;
+use crate::error::ContentError;
+
 /// Generate a 256-entry Gear hash lookup table at compile time using SplitMix64.
 const fn generate_gear_table(seed: u64) -> [u64; 256] {
     let mut table = [0u64; 256];
@@ -22,6 +25,63 @@ const fn generate_gear_table(seed: u64) -> [u64; 256] {
 /// is mapped through this table to produce a rolling hash with good statistical
 /// properties.
 const GEAR_TABLE: [u64; 256] = generate_gear_table(0);
+
+/// Configuration for the FastCDC content-defined chunker.
+///
+/// Controls the minimum, average, and maximum chunk sizes produced by the
+/// chunking algorithm. The average size must be a power of two (used as the
+/// gear-hash mask), and all sizes must satisfy `min < avg < max <= MAX_PAYLOAD_SIZE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkerConfig {
+    /// Minimum chunk size in bytes. The chunker will never split below this.
+    pub min_chunk: usize,
+    /// Target average chunk size in bytes. Must be a power of two.
+    pub avg_chunk: usize,
+    /// Maximum chunk size in bytes. The chunker will force a split at this point.
+    pub max_chunk: usize,
+}
+
+impl ChunkerConfig {
+    /// Default configuration: 256 KiB min, 512 KiB avg, ~1 MiB max.
+    pub const DEFAULT: Self = Self {
+        min_chunk: 256 * 1024,
+        avg_chunk: 512 * 1024,
+        max_chunk: MAX_PAYLOAD_SIZE,
+    };
+
+    /// Validate that this configuration is well-formed.
+    ///
+    /// Returns `Ok(())` if all invariants hold, or an `InvalidChunkerConfig`
+    /// error describing the first violation found.
+    pub fn validate(&self) -> Result<(), ContentError> {
+        if self.min_chunk == 0 {
+            return Err(ContentError::InvalidChunkerConfig {
+                reason: "min_chunk must be greater than zero",
+            });
+        }
+        if !self.avg_chunk.is_power_of_two() {
+            return Err(ContentError::InvalidChunkerConfig {
+                reason: "avg_chunk must be a power of two",
+            });
+        }
+        if self.min_chunk >= self.avg_chunk {
+            return Err(ContentError::InvalidChunkerConfig {
+                reason: "min_chunk must be less than avg_chunk",
+            });
+        }
+        if self.avg_chunk >= self.max_chunk {
+            return Err(ContentError::InvalidChunkerConfig {
+                reason: "avg_chunk must be less than max_chunk",
+            });
+        }
+        if self.max_chunk > MAX_PAYLOAD_SIZE {
+            return Err(ContentError::InvalidChunkerConfig {
+                reason: "max_chunk must not exceed MAX_PAYLOAD_SIZE",
+            });
+        }
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -58,5 +118,87 @@ mod tests {
             GEAR_TABLE[0], 0xe220a8397b1dcdaf,
             "first entry changed — seed or SplitMix64 algorithm was modified"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ChunkerConfig validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_default_is_valid() {
+        ChunkerConfig::DEFAULT.validate().unwrap();
+    }
+
+    #[test]
+    fn config_rejects_zero_min() {
+        let cfg = ChunkerConfig {
+            min_chunk: 0,
+            avg_chunk: 128,
+            max_chunk: 256,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("min_chunk must be greater than zero"));
+    }
+
+    #[test]
+    fn config_rejects_non_power_of_two_avg() {
+        let cfg = ChunkerConfig {
+            min_chunk: 64,
+            avg_chunk: 100,
+            max_chunk: 256,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("avg_chunk must be a power of two"));
+    }
+
+    #[test]
+    fn config_rejects_min_ge_avg() {
+        let cfg = ChunkerConfig {
+            min_chunk: 128,
+            avg_chunk: 128,
+            max_chunk: 256,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("min_chunk must be less than avg_chunk"));
+    }
+
+    #[test]
+    fn config_rejects_avg_ge_max() {
+        let cfg = ChunkerConfig {
+            min_chunk: 64,
+            avg_chunk: 256,
+            max_chunk: 256,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("avg_chunk must be less than max_chunk"));
+    }
+
+    #[test]
+    fn config_rejects_max_exceeding_payload() {
+        let cfg = ChunkerConfig {
+            min_chunk: 64,
+            avg_chunk: 128,
+            max_chunk: MAX_PAYLOAD_SIZE + 1,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("max_chunk must not exceed MAX_PAYLOAD_SIZE"));
+    }
+
+    #[test]
+    fn config_small_valid() {
+        let cfg = ChunkerConfig {
+            min_chunk: 64,
+            avg_chunk: 128,
+            max_chunk: 256,
+        };
+        cfg.validate().unwrap();
     }
 }
