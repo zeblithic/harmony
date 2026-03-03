@@ -60,8 +60,7 @@ pub fn encrypt(
     token.extend_from_slice(&ciphertext);
 
     // HMAC-SHA256 over IV + ciphertext
-    let mut mac =
-        HmacSha256::new_from_slice(signing_key).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(signing_key).expect("HMAC accepts any key length");
     mac.update(&token);
     let tag = mac.finalize().into_bytes();
     token.extend_from_slice(&tag);
@@ -86,8 +85,7 @@ pub fn decrypt(key: &[u8], token: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let expected_tag = &token[tag_offset..];
 
     // Verify HMAC in constant time
-    let mut mac =
-        HmacSha256::new_from_slice(signing_key).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(signing_key).expect("HMAC accepts any key length");
     mac.update(data);
     let computed_tag = mac.finalize().into_bytes();
 

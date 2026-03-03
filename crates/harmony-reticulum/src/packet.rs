@@ -212,7 +212,8 @@ impl Packet {
             HeaderType::Type2 => 18,
         };
         let mut destination_hash = [0u8; hash::TRUNCATED_HASH_LENGTH];
-        destination_hash.copy_from_slice(&raw[dest_offset..dest_offset + hash::TRUNCATED_HASH_LENGTH]);
+        destination_hash
+            .copy_from_slice(&raw[dest_offset..dest_offset + hash::TRUNCATED_HASH_LENGTH]);
 
         let context = PacketContext::from_byte(raw[header_size - 1]);
 
@@ -450,7 +451,10 @@ mod tests {
     fn type1_too_short_rejected() {
         // Type1 needs 19 bytes minimum
         let result = Packet::from_bytes(&[0x00; 18]);
-        assert!(matches!(result, Err(ReticulumError::PacketTooShort { minimum: 19, .. })));
+        assert!(matches!(
+            result,
+            Err(ReticulumError::PacketTooShort { minimum: 19, .. })
+        ));
     }
 
     #[test]
@@ -459,7 +463,10 @@ mod tests {
         let mut raw = [0u8; 20];
         raw[0] = 0x40; // Type2
         let result = Packet::from_bytes(&raw);
-        assert!(matches!(result, Err(ReticulumError::PacketTooShort { minimum: 35, .. })));
+        assert!(matches!(
+            result,
+            Err(ReticulumError::PacketTooShort { minimum: 35, .. })
+        ));
     }
 
     #[test]
@@ -483,7 +490,10 @@ mod tests {
         };
 
         let result = packet.to_bytes();
-        assert!(matches!(result, Err(ReticulumError::PacketExceedsMtu { .. })));
+        assert!(matches!(
+            result,
+            Err(ReticulumError::PacketExceedsMtu { .. })
+        ));
     }
 
     #[test]

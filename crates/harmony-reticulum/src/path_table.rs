@@ -175,8 +175,7 @@ impl PathTable {
                 let new_timestamp = timestamp_from_random_blob(&random_blob);
                 let should_replace = existing.expires_at <= now
                     || hops < existing.hops
-                    || (hops == existing.hops
-                        && new_timestamp > existing.announce_timestamp);
+                    || (hops == existing.hops && new_timestamp > existing.announce_timestamp);
 
                 // Always record the blob, even if we don't replace the route
                 push_blob(&mut existing.random_blobs, random_blob);
@@ -426,7 +425,7 @@ mod tests {
         let result = table.update(
             dest(1),
             dest(3),
-            10,             // worse hops, but entry is expired
+            10, // worse hops, but entry is expired
             "eth1".into(),
             dest(11),
             blob(2, far_future),
@@ -459,10 +458,10 @@ mod tests {
         let result = table.update(
             dest(1),
             dest(3),
-            1,              // better hops, but same blob
+            1, // better hops, but same blob
             "eth1".into(),
             dest(11),
-            b,              // same blob
+            b, // same blob
             InterfaceMode::Full,
             1001,
         );
@@ -572,12 +571,30 @@ mod tests {
 
     #[test]
     fn mode_dependent_expiry() {
-        assert_eq!(path_expiry_for_mode(InterfaceMode::Full), PATH_EXPIRY_DEFAULT);
-        assert_eq!(path_expiry_for_mode(InterfaceMode::PointToPoint), PATH_EXPIRY_DEFAULT);
-        assert_eq!(path_expiry_for_mode(InterfaceMode::AccessPoint), PATH_EXPIRY_ACCESS_POINT);
-        assert_eq!(path_expiry_for_mode(InterfaceMode::Roaming), PATH_EXPIRY_ROAMING);
-        assert_eq!(path_expiry_for_mode(InterfaceMode::Boundary), PATH_EXPIRY_DEFAULT);
-        assert_eq!(path_expiry_for_mode(InterfaceMode::Gateway), PATH_EXPIRY_DEFAULT);
+        assert_eq!(
+            path_expiry_for_mode(InterfaceMode::Full),
+            PATH_EXPIRY_DEFAULT
+        );
+        assert_eq!(
+            path_expiry_for_mode(InterfaceMode::PointToPoint),
+            PATH_EXPIRY_DEFAULT
+        );
+        assert_eq!(
+            path_expiry_for_mode(InterfaceMode::AccessPoint),
+            PATH_EXPIRY_ACCESS_POINT
+        );
+        assert_eq!(
+            path_expiry_for_mode(InterfaceMode::Roaming),
+            PATH_EXPIRY_ROAMING
+        );
+        assert_eq!(
+            path_expiry_for_mode(InterfaceMode::Boundary),
+            PATH_EXPIRY_DEFAULT
+        );
+        assert_eq!(
+            path_expiry_for_mode(InterfaceMode::Gateway),
+            PATH_EXPIRY_DEFAULT
+        );
     }
 
     // ── Timestamp extraction ────────────────────────────────────────────
@@ -633,7 +650,10 @@ mod tests {
         // First blob (id=0) should have been evicted
         assert!(!entry.random_blobs.iter().any(|b| b[0] == 0));
         // Last blob should be present
-        assert!(entry.random_blobs.iter().any(|b| b[0] == MAX_RANDOM_BLOBS as u8));
+        assert!(entry
+            .random_blobs
+            .iter()
+            .any(|b| b[0] == MAX_RANDOM_BLOBS as u8));
     }
 
     // ── Iter ────────────────────────────────────────────────────────────
@@ -642,12 +662,24 @@ mod tests {
     fn iter_yields_all_entries() {
         let mut table = PathTable::new();
         table.update(
-            dest(1), dest(2), 3, "eth0".into(), dest(10), blob(1, 1000),
-            InterfaceMode::Full, 1000,
+            dest(1),
+            dest(2),
+            3,
+            "eth0".into(),
+            dest(10),
+            blob(1, 1000),
+            InterfaceMode::Full,
+            1000,
         );
         table.update(
-            dest(2), dest(3), 2, "eth0".into(), dest(11), blob(2, 1000),
-            InterfaceMode::Full, 1000,
+            dest(2),
+            dest(3),
+            2,
+            "eth0".into(),
+            dest(11),
+            blob(2, 1000),
+            InterfaceMode::Full,
+            1000,
         );
 
         let keys: Vec<_> = table.iter().map(|(k, _)| *k).collect();
@@ -664,21 +696,39 @@ mod tests {
 
         // Establish 3-hop route at ts=1000
         table.update(
-            dest(1), dest(2), 3, "eth0".into(), dest(10), blob(1, 1000),
-            InterfaceMode::Full, 1000,
+            dest(1),
+            dest(2),
+            3,
+            "eth0".into(),
+            dest(10),
+            blob(1, 1000),
+            InterfaceMode::Full,
+            1000,
         );
 
         // Worse 5-hop route at ts=500 → Kept, but blob is recorded
         let result = table.update(
-            dest(1), dest(3), 5, "eth1".into(), dest(11), blob(2, 500),
-            InterfaceMode::Full, 1001,
+            dest(1),
+            dest(3),
+            5,
+            "eth1".into(),
+            dest(11),
+            blob(2, 500),
+            InterfaceMode::Full,
+            1001,
         );
         assert_eq!(result, PathUpdateResult::Kept);
 
         // Same 3-hop route at ts=800 — should NOT replace ts=1000 route
         let result = table.update(
-            dest(1), dest(4), 3, "eth2".into(), dest(12), blob(3, 800),
-            InterfaceMode::Full, 1002,
+            dest(1),
+            dest(4),
+            3,
+            "eth2".into(),
+            dest(12),
+            blob(3, 800),
+            InterfaceMode::Full,
+            1002,
         );
         assert_eq!(result, PathUpdateResult::Kept);
         let entry = table.get(&dest(1)).unwrap();
@@ -692,21 +742,39 @@ mod tests {
 
         // Establish 2-hop route at ts=1000
         table.update(
-            dest(1), dest(2), 2, "eth0".into(), dest(10), blob(1, 1000),
-            InterfaceMode::Full, 1000,
+            dest(1),
+            dest(2),
+            2,
+            "eth0".into(),
+            dest(10),
+            blob(1, 1000),
+            InterfaceMode::Full,
+            1000,
         );
 
         // Worse 5-hop route at ts=5000 → Kept (more hops)
         let result = table.update(
-            dest(1), dest(3), 5, "eth1".into(), dest(11), blob(2, 5000),
-            InterfaceMode::Full, 1001,
+            dest(1),
+            dest(3),
+            5,
+            "eth1".into(),
+            dest(11),
+            blob(2, 5000),
+            InterfaceMode::Full,
+            1001,
         );
         assert_eq!(result, PathUpdateResult::Kept);
 
         // Same 2-hop route at ts=1500 — should replace ts=1000 (genuinely newer)
         let result = table.update(
-            dest(1), dest(4), 2, "eth2".into(), dest(12), blob(3, 1500),
-            InterfaceMode::Full, 1002,
+            dest(1),
+            dest(4),
+            2,
+            "eth2".into(),
+            dest(12),
+            blob(3, 1500),
+            InterfaceMode::Full,
+            1002,
         );
         assert_eq!(result, PathUpdateResult::Updated);
         let entry = table.get(&dest(1)).unwrap();

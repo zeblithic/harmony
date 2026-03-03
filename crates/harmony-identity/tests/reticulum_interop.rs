@@ -23,12 +23,10 @@ mod vectors {
          685cf6f3f7887d5b10b6efcbdcecaf5efe908e7b002c57c53547d6df1f1a962c";
 
     pub const SIGN_MESSAGE: &str = "6861726d6f6e7920696e7465726f702074657374206d657373616765";
-    pub const SIGNATURE: &str =
-        "f4074a5045d06b779004c08f4dfd0daf6923c8746e2493ddc70bf882e98abcea\
+    pub const SIGNATURE: &str = "f4074a5045d06b779004c08f4dfd0daf6923c8746e2493ddc70bf882e98abcea\
          3a3fe75da5e4990c53dd0c293f501447312dba6f900710d9435e34a66294aa09";
 
-    pub const ENCRYPT_PLAINTEXT: &str =
-        "68656c6c6f2066726f6d207265746963756c756d20707974686f6e";
+    pub const ENCRYPT_PLAINTEXT: &str = "68656c6c6f2066726f6d207265746963756c756d20707974686f6e";
     pub const ENCRYPT_CIPHERTEXT: &str =
         "2fbe26fc3ce9f604e09d26881e1a805c21ea379cfd40b8741254bc92e270a20a\
          ed8fb66b9d56b90d2483989aba56b5b27007c59738505076bf4169abe0492260\
@@ -84,8 +82,14 @@ fn reticulum_identity_from_private_bytes() {
     let identity = PrivateIdentity::from_private_bytes(&priv_bytes).unwrap();
 
     let pub_bytes = identity.public_identity().to_public_bytes();
-    assert_eq!(&pub_bytes[..32], decode_hex(vectors::X25519_PUBLIC).as_slice());
-    assert_eq!(&pub_bytes[32..], decode_hex(vectors::ED25519_PUBLIC).as_slice());
+    assert_eq!(
+        &pub_bytes[..32],
+        decode_hex(vectors::X25519_PUBLIC).as_slice()
+    );
+    assert_eq!(
+        &pub_bytes[32..],
+        decode_hex(vectors::ED25519_PUBLIC).as_slice()
+    );
     assert_eq!(
         identity.public_identity().address_hash.as_slice(),
         decode_hex(vectors::ADDRESS_HASH).as_slice()
@@ -136,9 +140,9 @@ fn decrypt_reticulum_python_ciphertext() {
     let identity = PrivateIdentity::from_private_bytes(&priv_bytes).unwrap();
 
     let ciphertext = decode_hex(vectors::ENCRYPT_CIPHERTEXT);
-    let plaintext = identity.decrypt(&ciphertext).expect(
-        "Failed to decrypt Reticulum Python ciphertext",
-    );
+    let plaintext = identity
+        .decrypt(&ciphertext)
+        .expect("Failed to decrypt Reticulum Python ciphertext");
 
     assert_eq!(plaintext, decode_hex(vectors::ENCRYPT_PLAINTEXT));
 }
@@ -156,9 +160,9 @@ fn decrypt_reticulum_cross_identity_ciphertext() {
     );
 
     let ciphertext = decode_hex(vectors::CROSS_ENCRYPT_CIPHERTEXT);
-    let plaintext = identity2.decrypt(&ciphertext).expect(
-        "Failed to decrypt identity2 ciphertext",
-    );
+    let plaintext = identity2
+        .decrypt(&ciphertext)
+        .expect("Failed to decrypt identity2 ciphertext");
 
     assert_eq!(plaintext, decode_hex(vectors::CROSS_ENCRYPT_PLAINTEXT));
 }

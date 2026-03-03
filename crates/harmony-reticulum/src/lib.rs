@@ -20,11 +20,11 @@ pub use ifac::IfacAuthenticator;
 pub use interface::{Interface, InterfaceDirection, InterfaceMode, InterfaceStats};
 pub use link::{Link, LinkMode, LinkState};
 pub use loopback::LoopbackInterface;
+pub use node::{AnnounceRateConfig, DropReason, InterfaceConfig, Node, NodeAction, NodeEvent};
 pub use packet::{
     DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
     HEADER_1_SIZE, HEADER_2_SIZE, MTU,
 };
-pub use node::{AnnounceRateConfig, DropReason, InterfaceConfig, Node, NodeAction, NodeEvent};
 pub use packet_hashlist::PacketHashlist;
 pub use path_table::{PathEntry, PathTable, PathUpdateResult};
 pub use resource::{

@@ -18,10 +18,10 @@ use zeroize::Zeroize;
 use crate::context::PacketContext;
 use crate::destination::DestinationName;
 use crate::error::ReticulumError;
-use crate::resource::LinkCrypto;
 use crate::packet::{
     DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
 };
+use crate::resource::LinkCrypto;
 
 // ── Wire format constants ────────────────────────────────────────────
 
@@ -387,7 +387,10 @@ impl Link {
             return Err(ReticulumError::LinkAlreadyClosed);
         }
 
-        let key = self.derived_key.as_ref().ok_or(ReticulumError::LinkNotActive)?;
+        let key = self
+            .derived_key
+            .as_ref()
+            .ok_or(ReticulumError::LinkNotActive)?;
         let plaintext = fernet::decrypt(key, &rtt_packet.data)
             .map_err(|e| ReticulumError::Identity(e.into()))?;
 
@@ -465,10 +468,7 @@ impl Link {
     }
 
     /// Validate an identification packet and store the remote identity.
-    pub fn validate_identification(
-        &mut self,
-        packet: &Packet,
-    ) -> Result<Identity, ReticulumError> {
+    pub fn validate_identification(&mut self, packet: &Packet) -> Result<Identity, ReticulumError> {
         self.require_active()?;
         let key = self.derived_key.as_ref().unwrap();
 
@@ -501,10 +501,7 @@ impl Link {
     // ── Close ───────────────────────────────────────────────────────
 
     /// Build a link close packet.
-    pub fn build_close(
-        &self,
-        rng: &mut impl CryptoRngCore,
-    ) -> Result<Packet, ReticulumError> {
+    pub fn build_close(&self, rng: &mut impl CryptoRngCore) -> Result<Packet, ReticulumError> {
         self.require_active()?;
         let key = self.derived_key.as_ref().unwrap();
 
@@ -535,8 +532,8 @@ impl Link {
         self.require_active()?;
         let key = self.derived_key.as_ref().unwrap();
 
-        let plaintext = fernet::decrypt(key, &packet.data)
-            .map_err(|e| ReticulumError::Identity(e.into()))?;
+        let plaintext =
+            fernet::decrypt(key, &packet.data).map_err(|e| ReticulumError::Identity(e.into()))?;
 
         if plaintext.len() < LINK_CLOSE_SIZE {
             return Err(ReticulumError::LinkNotActive);
@@ -971,8 +968,7 @@ mod tests {
         let (responder_priv, dest_name) = setup_handshake();
         let responder_pub = responder_priv.public_identity();
 
-        let (initiator, _request) =
-            Link::initiate(&mut OsRng, responder_pub, &dest_name).unwrap();
+        let (initiator, _request) = Link::initiate(&mut OsRng, responder_pub, &dest_name).unwrap();
 
         // Link is Pending, not Active
         assert!(matches!(
@@ -1034,7 +1030,10 @@ mod tests {
 
         assert!(matches!(
             Link::respond(&responder_priv, &dest_name, &short_packet),
-            Err(ReticulumError::LinkRequestTooShort { minimum: 67, actual: 30 })
+            Err(ReticulumError::LinkRequestTooShort {
+                minimum: 67,
+                actual: 30
+            })
         ));
     }
 
@@ -1068,7 +1067,10 @@ mod tests {
 
         assert!(matches!(
             initiator.complete_handshake(&mut OsRng, &short_proof, 0.01),
-            Err(ReticulumError::LinkProofTooShort { minimum: 99, actual: 50 })
+            Err(ReticulumError::LinkProofTooShort {
+                minimum: 99,
+                actual: 50
+            })
         ));
     }
 
@@ -1081,8 +1083,7 @@ mod tests {
 
         let (mut initiator, request) =
             Link::initiate(&mut OsRng, responder_pub, &dest_name).unwrap();
-        let (_, mut proof_packet) =
-            Link::respond(&responder_priv, &dest_name, &request).unwrap();
+        let (_, mut proof_packet) = Link::respond(&responder_priv, &dest_name, &request).unwrap();
 
         // Tamper with signature in proof data
         let mut data = proof_packet.data.to_vec();

@@ -461,10 +461,8 @@ mod tests {
         assert_ne!(a_to_b[HEADER_SIZE..], b_to_a[HEADER_SIZE..]);
 
         // Both decrypt correctly
-        let env1 =
-            HarmonyEnvelope::open(&bob, alice.public_identity(), &a_to_b).unwrap();
-        let env2 =
-            HarmonyEnvelope::open(&alice, bob.public_identity(), &b_to_a).unwrap();
+        let env1 = HarmonyEnvelope::open(&bob, alice.public_identity(), &a_to_b).unwrap();
+        let env2 = HarmonyEnvelope::open(&alice, bob.public_identity(), &b_to_a).unwrap();
         assert_eq!(env1.plaintext, b"same");
         assert_eq!(env2.plaintext, b"same");
     }

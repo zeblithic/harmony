@@ -6,7 +6,9 @@
 
 use zenoh_keyexpr::key_expr::{keyexpr, OwnedKeyExpr};
 use zenoh_keyexpr::keyexpr_tree::box_tree::KeBoxTree;
-use zenoh_keyexpr::keyexpr_tree::{IKeyExprTree, IKeyExprTreeMut, IKeyExprTreeNode, IKeyExprTreeNodeMut};
+use zenoh_keyexpr::keyexpr_tree::{
+    IKeyExprTree, IKeyExprTreeMut, IKeyExprTreeNode, IKeyExprTreeNodeMut,
+};
 
 use crate::error::ZenohError;
 

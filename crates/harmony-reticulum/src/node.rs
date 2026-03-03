@@ -236,9 +236,7 @@ pub enum NodeAction {
         interface_name: Arc<str>,
     },
     /// A destination's scheduled announce is due. Caller should call node.announce().
-    AnnounceNeeded {
-        dest_hash: DestinationHash,
-    },
+    AnnounceNeeded { dest_hash: DestinationHash },
     /// Send raw bytes on the named interface (outbound).
     SendOnInterface {
         interface_name: Arc<str>,
@@ -470,14 +468,8 @@ impl Node {
                     }];
                 }
             };
-            let packet = match build_announce(
-                &ad.identity,
-                &ad.name,
-                rng,
-                now,
-                &ad.app_data,
-                None,
-            ) {
+            let packet = match build_announce(&ad.identity, &ad.name, rng, now, &ad.app_data, None)
+            {
                 Ok(p) => p,
                 Err(_) => {
                     return vec![NodeAction::PacketDropped {
@@ -558,9 +550,8 @@ impl Node {
 
                     // Expire stale reverse table entries
                     let before = self.reverse_table.len();
-                    self.reverse_table.retain(|_, entry| {
-                        now.saturating_sub(entry.timestamp) < REVERSE_TIMEOUT
-                    });
+                    self.reverse_table
+                        .retain(|_, entry| now.saturating_sub(entry.timestamp) < REVERSE_TIMEOUT);
                     let expired = before - self.reverse_table.len();
                     if expired > 0 {
                         actions.push(NodeAction::ReverseTableExpired { count: expired });
@@ -664,13 +655,14 @@ impl Node {
         config: &AnnounceRateConfig,
         now: u64,
     ) -> bool {
-        let entry = self.announce_rate_table.entry(dest).or_insert_with(|| {
-            AnnounceRateEntry {
+        let entry = self
+            .announce_rate_table
+            .entry(dest)
+            .or_insert_with(|| AnnounceRateEntry {
                 last_checked: 0,
                 rate_violations: 0,
                 blocked_until: 0,
-            }
-        });
+            });
 
         // If currently blocked, check if penalty has expired
         if now < entry.blocked_until {
@@ -717,8 +709,8 @@ impl Node {
             // Echo: we hear our own rebroadcast back (same hop count)
             if incoming_hops.saturating_sub(1) == entry.hops {
                 entry.local_rebroadcasts += 1;
-                let remove = entry.retries > 0
-                    && entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX;
+                let remove =
+                    entry.retries > 0 && entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX;
                 (true, remove)
             }
             // Downstream forward: another transport picked it up (hops+1)
@@ -754,8 +746,7 @@ impl Node {
         for (dest, entry) in &self.announce_table {
             // Completed: exceeded max retries, or retries>0 with enough rebroadcasts
             if entry.retries > PATHFINDER_R
-                || (entry.retries > 0
-                    && entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX)
+                || (entry.retries > 0 && entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX)
             {
                 completed.push(*dest);
                 continue;
@@ -799,8 +790,7 @@ impl Node {
         for (dest, raw, source_iface, hops) in due {
             if let Some(entry) = self.announce_table.get_mut(&dest) {
                 entry.retries += 1;
-                entry.retransmit_at =
-                    now + PATHFINDER_G + (dest[2] as u64 % 3);
+                entry.retransmit_at = now + PATHFINDER_G + (dest[2] as u64 % 3);
             }
             match raw {
                 Some(bytes) => {
@@ -849,17 +839,15 @@ impl Node {
             let has_ifac_flag = raw.first().is_some_and(|&b| b & 0x80 != 0);
 
             let processed = match (iface_config.ifac.is_some(), has_ifac_flag) {
-                (true, true) => {
-                    match iface_config.ifac.as_ref().unwrap().unmask(&raw) {
-                        Ok(unmasked) => unmasked,
-                        Err(_) => {
-                            return vec![NodeAction::PacketDropped {
-                                reason: DropReason::IfacFailed,
-                                interface_name: arc_name,
-                            }];
-                        }
+                (true, true) => match iface_config.ifac.as_ref().unwrap().unmask(&raw) {
+                    Ok(unmasked) => unmasked,
+                    Err(_) => {
+                        return vec![NodeAction::PacketDropped {
+                            reason: DropReason::IfacFailed,
+                            interface_name: arc_name,
+                        }];
                     }
-                }
+                },
                 (true, false) | (false, true) => {
                     return vec![NodeAction::PacketDropped {
                         reason: DropReason::IfacMismatch,
@@ -914,17 +902,14 @@ impl Node {
             .expect("hashable_part is infallible for parsed packets");
         let full_packet_hash = hash::full_hash(&hashable);
         let is_announce = pkt_type == PacketType::Announce;
-        let is_lrproof = pkt_type == PacketType::Proof
-            && packet.header.context == PacketContext::LrProof;
+        let is_lrproof =
+            pkt_type == PacketType::Proof && packet.header.context == PacketContext::LrProof;
 
         // Duplicate non-announces are dropped; duplicate announces still pass
         // through for path evaluation (multiple paths to same destination).
         // LRPROOF packets are also exempt: link proofs must pass through
         // transport nodes for link establishment.
-        if !self.packet_hashlist.insert(full_packet_hash)
-            && !is_announce
-            && !is_lrproof
-        {
+        if !self.packet_hashlist.insert(full_packet_hash) && !is_announce && !is_lrproof {
             return vec![NodeAction::PacketDropped {
                 reason: DropReason::DuplicatePacket,
                 interface_name,
@@ -933,7 +918,13 @@ impl Node {
 
         // 7. Dispatch by packet type
         if is_announce {
-            self.process_announce(packet, &full_packet_hash, interface_name, interface_mode, now)
+            self.process_announce(
+                packet,
+                &full_packet_hash,
+                interface_name,
+                interface_mode,
+                now,
+            )
         } else {
             self.process_data_packet(packet, interface_name, now)
         }
@@ -996,10 +987,7 @@ impl Node {
         // If the announce arrived via a transport node (Type2 header),
         // next_hop is the transport_id so relay knows to chain through it.
         // For direct (Type1) announces, next_hop is the destination itself.
-        let next_hop = packet
-            .header
-            .transport_id
-            .unwrap_or(destination_hash);
+        let next_hop = packet.header.transport_id.unwrap_or(destination_hash);
 
         let path_update = self.path_table.update(
             destination_hash,
@@ -1018,9 +1006,7 @@ impl Node {
             && !self.announce_table.contains_key(&destination_hash)
             && matches!(
                 path_update,
-                PathUpdateResult::Inserted
-                    | PathUpdateResult::Updated
-                    | PathUpdateResult::Kept
+                PathUpdateResult::Inserted | PathUpdateResult::Updated | PathUpdateResult::Kept
             )
         {
             let initial_delay = (destination_hash[1] as u64) % 5;
@@ -1129,7 +1115,10 @@ impl Node {
         let actions = self.relay_packet(packet, next_hop, &path_iface);
 
         // 11. Only store reverse table entry if relay succeeded
-        if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
+        if !actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::PacketDropped { .. }))
+        {
             self.reverse_table.insert(
                 reverse_key,
                 ReverseTableEntry {
@@ -1191,7 +1180,10 @@ impl Node {
         match forwarded.to_bytes() {
             Ok(raw) => {
                 let mut actions = self.send_on_interface(out_iface, &raw);
-                if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
+                if !actions
+                    .iter()
+                    .any(|a| matches!(a, NodeAction::PacketDropped { .. }))
+                {
                     actions.push(NodeAction::PacketRelayed {
                         destination_hash,
                         next_hop,
@@ -1532,7 +1524,10 @@ impl Node {
         match forwarded.to_bytes() {
             Ok(raw) => {
                 let mut actions = self.send_on_interface(&entry.received_interface, &raw);
-                if !actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })) {
+                if !actions
+                    .iter()
+                    .any(|a| matches!(a, NodeAction::PacketDropped { .. }))
+                {
                     actions.push(NodeAction::ProofRelayed {
                         proof_destination: proof_dest,
                         interface_name: entry.received_interface.clone(),
@@ -1652,15 +1647,8 @@ mod tests {
     fn make_valid_announce() -> (Vec<u8>, DestinationHash) {
         let identity = PrivateIdentity::generate(&mut OsRng);
         let dest_name = DestinationName::from_name("testapp", &["svc"]).unwrap();
-        let packet = build_announce(
-            &identity,
-            &dest_name,
-            &mut OsRng,
-            1_700_000_000,
-            b"",
-            None,
-        )
-        .unwrap();
+        let packet =
+            build_announce(&identity, &dest_name, &mut OsRng, 1_700_000_000, b"", None).unwrap();
         let dest_hash = packet.header.destination_hash;
         (packet.to_bytes().unwrap(), dest_hash)
     }
@@ -2510,7 +2498,10 @@ mod tests {
         let actions = node.route_packet(&dh, vec![0xDE, 0xAD]);
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            NodeAction::PacketDropped { reason, interface_name } => {
+            NodeAction::PacketDropped {
+                reason,
+                interface_name,
+            } => {
                 assert_eq!(*reason, DropReason::UnknownInterface);
                 assert_eq!(&**interface_name, "eth0");
             }
@@ -2579,11 +2570,7 @@ mod tests {
     }
 
     /// Create a transport node with rate limiting on "eth0".
-    fn make_transport_node_with_rate(
-        target: u64,
-        grace: u32,
-        penalty: u64,
-    ) -> (Node, [u8; 16]) {
+    fn make_transport_node_with_rate(target: u64, grace: u32, penalty: u64) -> (Node, [u8; 16]) {
         let (mut node, th) = make_transport_node();
         node.set_announce_rate(
             "eth0",
@@ -2681,13 +2668,18 @@ mod tests {
         let sends: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                NodeAction::SendOnInterface { interface_name, raw } => {
-                    Some((&**interface_name, raw.clone()))
-                }
+                NodeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                } => Some((&**interface_name, raw.clone())),
                 _ => None,
             })
             .collect();
-        assert_eq!(sends.len(), 1, "should broadcast on 1 interface (excluding source)");
+        assert_eq!(
+            sends.len(),
+            1,
+            "should broadcast on 1 interface (excluding source)"
+        );
         assert_eq!(sends[0].0, "wlan0");
 
         // Verify the rebroadcast bytes are a valid HEADER_2 packet
@@ -2725,9 +2717,7 @@ mod tests {
         let sends: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                NodeAction::SendOnInterface { interface_name, .. } => {
-                    Some(&**interface_name)
-                }
+                NodeAction::SendOnInterface { interface_name, .. } => Some(&**interface_name),
                 _ => None,
             })
             .collect();
@@ -3072,14 +3062,14 @@ mod tests {
         // Build up to block: announce, rapid, rapid → blocked
         assert!(!node.is_rate_limited(dh, &config, 1000));
         assert!(!node.is_rate_limited(dh, &config, 1010)); // violation 1 (at grace)
-        assert!(node.is_rate_limited(dh, &config, 1020));  // violation 2 > grace → blocked
-        // blocked_until = 1020 + 60 + 120 = 1200
+        assert!(node.is_rate_limited(dh, &config, 1020)); // violation 2 > grace → blocked
+                                                          // blocked_until = 1020 + 60 + 120 = 1200
 
         // After penalty expires, should get a fresh grace budget
         assert!(!node.is_rate_limited(dh, &config, 1200)); // unblocked, resets
         assert!(!node.is_rate_limited(dh, &config, 1210)); // violation 1 (fresh grace)
-        // Should NOT be immediately blocked — grace is renewed
-        assert!(node.is_rate_limited(dh, &config, 1220));  // violation 2 > grace → blocked again
+                                                           // Should NOT be immediately blocked — grace is renewed
+        assert!(node.is_rate_limited(dh, &config, 1220)); // violation 2 > grace → blocked again
     }
 
     #[test]
@@ -3158,20 +3148,28 @@ mod tests {
         let actions = node.handle_event(NodeEvent::TimerTick { now: 1000 });
 
         // Must have a diagnostic drop, not silence
-        let has_drop = actions.iter().any(|a| matches!(
-            a,
-            NodeAction::PacketDropped {
-                reason: DropReason::AnnounceRebroadcastSerializeFailed,
-                ..
-            }
-        ));
-        assert!(has_drop, "expected AnnounceRebroadcastSerializeFailed action");
+        let has_drop = actions.iter().any(|a| {
+            matches!(
+                a,
+                NodeAction::PacketDropped {
+                    reason: DropReason::AnnounceRebroadcastSerializeFailed,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_drop,
+            "expected AnnounceRebroadcastSerializeFailed action"
+        );
 
         // Must NOT have a rebroadcast action (serialization failed)
         let has_rebroadcast = actions
             .iter()
             .any(|a| matches!(a, NodeAction::AnnounceRebroadcast { .. }));
-        assert!(!has_rebroadcast, "should not rebroadcast on serialize failure");
+        assert!(
+            !has_rebroadcast,
+            "should not rebroadcast on serialize failure"
+        );
     }
 
     #[test]
@@ -3189,11 +3187,15 @@ mod tests {
         assert_eq!(node.announce_rate_table.len(), 1);
 
         // Tick well before expiry — entry retained
-        node.handle_event(NodeEvent::TimerTick { now: 1000 + RATE_TABLE_EXPIRY - 1 });
+        node.handle_event(NodeEvent::TimerTick {
+            now: 1000 + RATE_TABLE_EXPIRY - 1,
+        });
         assert_eq!(node.announce_rate_table.len(), 1);
 
         // Tick at expiry boundary — entry evicted (age == RATE_TABLE_EXPIRY, not <)
-        node.handle_event(NodeEvent::TimerTick { now: 1000 + RATE_TABLE_EXPIRY });
+        node.handle_event(NodeEvent::TimerTick {
+            now: 1000 + RATE_TABLE_EXPIRY,
+        });
         assert_eq!(node.announce_rate_table.len(), 0);
     }
 
@@ -3215,7 +3217,9 @@ mod tests {
         let blocked_until = 1010 + 60 + RATE_TABLE_EXPIRY + 1000;
 
         // Tick past RATE_TABLE_EXPIRY but before blocked_until — entry retained
-        node.handle_event(NodeEvent::TimerTick { now: 1000 + RATE_TABLE_EXPIRY + 500 });
+        node.handle_event(NodeEvent::TimerTick {
+            now: 1000 + RATE_TABLE_EXPIRY + 500,
+        });
         assert_eq!(
             node.announce_rate_table.len(),
             1,
@@ -3223,7 +3227,9 @@ mod tests {
         );
 
         // Tick after blocked_until AND past expiry — now evictable
-        node.handle_event(NodeEvent::TimerTick { now: blocked_until + RATE_TABLE_EXPIRY });
+        node.handle_event(NodeEvent::TimerTick {
+            now: blocked_until + RATE_TABLE_EXPIRY,
+        });
         assert_eq!(node.announce_rate_table.len(), 0);
     }
 
@@ -3241,7 +3247,9 @@ mod tests {
             raw: raw.clone(),
             now: 1000,
         });
-        assert!(actions.iter().any(|a| matches!(a, NodeAction::AnnounceReceived { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::AnnounceReceived { .. })));
         assert_eq!(node.announce_table_len(), 1);
         assert_eq!(node.announce_table[&dh].local_rebroadcasts, 0);
         // Stored hops = 1 (wire hops 0, pipeline incremented)
@@ -3263,13 +3271,15 @@ mod tests {
         });
 
         // Should NOT be rate-limited (no AnnounceRateLimited drop)
-        let was_rate_limited = actions.iter().any(|a| matches!(
-            a,
-            NodeAction::PacketDropped {
-                reason: DropReason::AnnounceRateLimited,
-                ..
-            }
-        ));
+        let was_rate_limited = actions.iter().any(|a| {
+            matches!(
+                a,
+                NodeAction::PacketDropped {
+                    reason: DropReason::AnnounceRateLimited,
+                    ..
+                }
+            )
+        });
         assert!(
             !was_rate_limited,
             "echoes of tracked announces must bypass rate limiting"
@@ -3315,13 +3325,15 @@ mod tests {
             });
 
             // No echo should ever be rate-limited
-            let was_rate_limited = actions.iter().any(|a| matches!(
-                a,
-                NodeAction::PacketDropped {
-                    reason: DropReason::AnnounceRateLimited,
-                    ..
-                }
-            ));
+            let was_rate_limited = actions.iter().any(|a| {
+                matches!(
+                    a,
+                    NodeAction::PacketDropped {
+                        reason: DropReason::AnnounceRateLimited,
+                        ..
+                    }
+                )
+            });
             assert!(
                 !was_rate_limited,
                 "echo #{} should not be rate-limited (even if entry was just removed)",
@@ -3455,15 +3467,8 @@ mod tests {
         let (mut node, th) = make_transport_node();
         let identity = PrivateIdentity::generate(&mut OsRng);
         let dest_name = DestinationName::from_name("testapp", &["svc"]).unwrap();
-        let announce_pkt = build_announce(
-            &identity,
-            &dest_name,
-            &mut OsRng,
-            1_700_000_000,
-            b"",
-            None,
-        )
-        .unwrap();
+        let announce_pkt =
+            build_announce(&identity, &dest_name, &mut OsRng, 1_700_000_000, b"", None).unwrap();
         let dh = announce_pkt.header.destination_hash;
 
         // Wrap as Type2 with our transport_id
@@ -3497,7 +3502,10 @@ mod tests {
 
         // Check path entry: next_hop should be transport_hash, not dest_hash
         let entry = node.path_table().get(&dh).unwrap();
-        assert_eq!(entry.next_hop, th, "next_hop should be transport_id for Type2 announce");
+        assert_eq!(
+            entry.next_hop, th,
+            "next_hop should be transport_id for Type2 announce"
+        );
     }
 
     #[test]
@@ -3512,7 +3520,10 @@ mod tests {
         });
 
         let entry = node.path_table().get(&dh).unwrap();
-        assert_eq!(entry.next_hop, dh, "next_hop should be dest_hash for Type1 announce");
+        assert_eq!(
+            entry.next_hop, dh,
+            "next_hop should be dest_hash for Type1 announce"
+        );
     }
 
     // ── 17. Relay basics ────────────────────────────────────────────
@@ -3529,8 +3540,12 @@ mod tests {
             now: 2000,
         });
 
-        let has_send = actions.iter().any(|a| matches!(a, NodeAction::SendOnInterface { .. }));
-        let has_relay = actions.iter().any(|a| matches!(a, NodeAction::PacketRelayed { .. }));
+        let has_send = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::SendOnInterface { .. }));
+        let has_relay = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::PacketRelayed { .. }));
         assert!(has_send, "expected SendOnInterface");
         assert!(has_relay, "expected PacketRelayed");
     }
@@ -3548,8 +3563,13 @@ mod tests {
             now: 2000,
         });
 
-        let dropped = actions.iter().find(|a| matches!(a, NodeAction::PacketDropped { .. }));
-        assert!(dropped.is_some(), "expected PacketDropped for wrong transport_id");
+        let dropped = actions
+            .iter()
+            .find(|a| matches!(a, NodeAction::PacketDropped { .. }));
+        assert!(
+            dropped.is_some(),
+            "expected PacketDropped for wrong transport_id"
+        );
     }
 
     #[test]
@@ -3586,7 +3606,9 @@ mod tests {
             now: 2000,
         });
 
-        let delivered = actions.iter().any(|a| matches!(a, NodeAction::DeliverLocally { .. }));
+        let delivered = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::DeliverLocally { .. }));
         assert!(delivered, "local delivery should take priority over relay");
     }
 
@@ -3612,7 +3634,10 @@ mod tests {
         assert!(send.is_some());
         let forwarded = Packet::from_bytes(send.unwrap()).unwrap();
         assert_eq!(forwarded.header.flags.header_type, HeaderType::Type1);
-        assert_eq!(forwarded.header.flags.propagation, PropagationType::Broadcast);
+        assert_eq!(
+            forwarded.header.flags.propagation,
+            PropagationType::Broadcast
+        );
     }
 
     #[test]
@@ -3757,7 +3782,10 @@ mod tests {
         });
 
         let key = reverse_key_for(th, remote);
-        let entry = node.reverse_table.get(&key).expect("reverse entry should exist");
+        let entry = node
+            .reverse_table
+            .get(&key)
+            .expect("reverse entry should exist");
         assert_eq!(&*entry.received_interface, "eth0");
         assert_eq!(&*entry.outbound_interface, "wlan0"); // path entry points to wlan0
     }
@@ -3781,7 +3809,9 @@ mod tests {
         });
 
         assert_eq!(node.reverse_table_len(), 0);
-        let expired = actions.iter().any(|a| matches!(a, NodeAction::ReverseTableExpired { count: 1 }));
+        let expired = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::ReverseTableExpired { count: 1 }));
         assert!(expired, "expected ReverseTableExpired action");
     }
 
@@ -3802,7 +3832,11 @@ mod tests {
             now: 1000 + REVERSE_TIMEOUT - 1,
         });
 
-        assert_eq!(node.reverse_table_len(), 1, "fresh entry should be retained");
+        assert_eq!(
+            node.reverse_table_len(),
+            1,
+            "fresh entry should be retained"
+        );
     }
 
     #[test]
@@ -3822,7 +3856,9 @@ mod tests {
         });
 
         // Relay should fail (unknown outbound interface)
-        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::PacketDropped { .. })));
         // Reverse table should remain empty
         assert_eq!(node.reverse_table_len(), 0);
     }
@@ -3851,7 +3887,9 @@ mod tests {
             now: 2001,
         });
 
-        let relayed = actions.iter().any(|a| matches!(a, NodeAction::ProofRelayed { .. }));
+        let relayed = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::ProofRelayed { .. }));
         assert!(relayed, "expected ProofRelayed");
 
         // Should be sent on "eth0" (the received_interface of the reverse entry)
@@ -3859,7 +3897,11 @@ mod tests {
             NodeAction::SendOnInterface { interface_name, .. } => Some(&**interface_name),
             _ => None,
         });
-        assert_eq!(send, Some("eth0"), "proof should go back on received interface");
+        assert_eq!(
+            send,
+            Some("eth0"),
+            "proof should go back on received interface"
+        );
     }
 
     #[test]
@@ -4004,8 +4046,12 @@ mod tests {
         let actions = node.relay_packet(pkt, bad_entry.next_hop, &bad_entry.interface_name);
 
         // Should get PacketDropped but NOT PacketRelayed
-        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
-        assert!(!actions.iter().any(|a| matches!(a, NodeAction::PacketRelayed { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::PacketRelayed { .. })));
     }
 
     #[test]
@@ -4044,8 +4090,12 @@ mod tests {
         let actions = node.route_proof(&proof_pkt, &eth0);
 
         // Should get PacketDropped but NOT ProofRelayed
-        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
-        assert!(!actions.iter().any(|a| matches!(a, NodeAction::ProofRelayed { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::ProofRelayed { .. })));
     }
 
     #[test]
@@ -4150,11 +4200,7 @@ mod tests {
     }
 
     /// Build a Type2 link data packet (raw bytes) with given dest_hash (link_id).
-    fn make_link_data_raw(
-        transport_id: [u8; 16],
-        link_id: DestinationHash,
-        hops: u8,
-    ) -> Vec<u8> {
+    fn make_link_data_raw(transport_id: [u8; 16], link_id: DestinationHash, hops: u8) -> Vec<u8> {
         Packet {
             header: PacketHeader {
                 flags: PacketFlags {
@@ -4235,8 +4281,12 @@ mod tests {
             now: 2000,
         });
 
-        let has_send = actions.iter().any(|a| matches!(a, NodeAction::SendOnInterface { .. }));
-        let has_forwarded = actions.iter().any(|a| matches!(a, NodeAction::LinkRequestForwarded { .. }));
+        let has_send = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::SendOnInterface { .. }));
+        let has_forwarded = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::LinkRequestForwarded { .. }));
         assert!(has_send, "expected SendOnInterface");
         assert!(has_forwarded, "expected LinkRequestForwarded");
     }
@@ -4300,8 +4350,14 @@ mod tests {
             now: 2000,
         });
 
-        assert!(actions.iter().any(|a| matches!(a, NodeAction::PacketDropped { .. })));
-        assert_eq!(node.link_table_len(), 0, "failed relay should not create link table entry");
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::PacketDropped { .. })));
+        assert_eq!(
+            node.link_table_len(),
+            0,
+            "failed relay should not create link table entry"
+        );
     }
 
     // ── Link proof routing ───────────────────────────────────────────
@@ -4334,7 +4390,9 @@ mod tests {
             now: 2001,
         });
 
-        let routed = actions.iter().any(|a| matches!(a, NodeAction::LinkProofRouted { .. }));
+        let routed = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::LinkProofRouted { .. }));
         assert!(routed, "expected LinkProofRouted");
 
         // Should be sent on "eth0" (the received_interface)
@@ -4342,7 +4400,11 @@ mod tests {
             NodeAction::SendOnInterface { interface_name, .. } => Some(&**interface_name),
             _ => None,
         });
-        assert_eq!(send, Some("eth0"), "proof should route back on received interface");
+        assert_eq!(
+            send,
+            Some("eth0"),
+            "proof should route back on received interface"
+        );
     }
 
     #[test]
@@ -4487,7 +4549,9 @@ mod tests {
             now: 2002,
         });
 
-        let routed = actions.iter().any(|a| matches!(a, NodeAction::LinkDataRouted { .. }));
+        let routed = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::LinkDataRouted { .. }));
         assert!(routed, "expected LinkDataRouted");
 
         // Should be sent on "wlan0" (toward destination)
@@ -4502,7 +4566,11 @@ mod tests {
         assert_eq!(iface, "wlan0");
 
         // Final hop (next_hop == destination): should be converted to Type1
-        assert_eq!(raw[0] & 0x40, 0, "expected Type1 header (final hop toward destination)");
+        assert_eq!(
+            raw[0] & 0x40,
+            0,
+            "expected Type1 header (final hop toward destination)"
+        );
     }
 
     #[test]
@@ -4537,7 +4605,9 @@ mod tests {
             now: 2002,
         });
 
-        let routed = actions.iter().any(|a| matches!(a, NodeAction::LinkDataRouted { .. }));
+        let routed = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::LinkDataRouted { .. }));
         assert!(routed, "expected LinkDataRouted");
 
         // Should be sent on "eth0" (toward initiator)
@@ -4552,7 +4622,11 @@ mod tests {
         assert_eq!(iface, "eth0");
 
         // Single-hop initiator (taken_hops==1): should be converted to Type1
-        assert_eq!(raw[0] & 0x40, 0, "expected Type1 header (final hop toward initiator)");
+        assert_eq!(
+            raw[0] & 0x40,
+            0,
+            "expected Type1 header (final hop toward initiator)"
+        );
     }
 
     #[test]
@@ -4605,7 +4679,9 @@ mod tests {
         });
 
         // Should fall through to normal path relay
-        let relayed = actions.iter().any(|a| matches!(a, NodeAction::PacketRelayed { .. }));
+        let relayed = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::PacketRelayed { .. }));
         assert!(relayed, "should fall through to normal path relay");
     }
 
@@ -4645,8 +4721,14 @@ mod tests {
 
         let link_id = link_id_for_request(th, remote, 1);
         let entry = node.link_table.get(&link_id).unwrap();
-        assert_eq!(entry.taken_hops, entry.remaining_hops, "precondition: equidistant");
-        assert_eq!(entry.outbound_interface, entry.received_interface, "precondition: same interface");
+        assert_eq!(
+            entry.taken_hops, entry.remaining_hops,
+            "precondition: equidistant"
+        );
+        assert_eq!(
+            entry.outbound_interface, entry.received_interface,
+            "precondition: same interface"
+        );
         let equidistant_hops = entry.taken_hops;
 
         // Validate the link (proof arrives on "eth0" = outbound_interface)
@@ -4708,7 +4790,9 @@ mod tests {
             raw: proof_raw.clone(),
             now: 2001,
         });
-        let routed1 = actions1.iter().any(|a| matches!(a, NodeAction::LinkProofRouted { .. }));
+        let routed1 = actions1
+            .iter()
+            .any(|a| matches!(a, NodeAction::LinkProofRouted { .. }));
         assert!(routed1, "first LRPROOF should route");
 
         // Second identical LRPROOF — should NOT be deduplicated
@@ -4717,10 +4801,15 @@ mod tests {
             raw: proof_raw,
             now: 2002,
         });
-        let was_deduplicated = actions2.iter().any(|a| matches!(
-            a,
-            NodeAction::PacketDropped { reason: DropReason::DuplicatePacket, .. }
-        ));
+        let was_deduplicated = actions2.iter().any(|a| {
+            matches!(
+                a,
+                NodeAction::PacketDropped {
+                    reason: DropReason::DuplicatePacket,
+                    ..
+                }
+            )
+        });
         assert!(!was_deduplicated, "LRPROOF should not be deduplicated");
     }
 
@@ -4756,7 +4845,9 @@ mod tests {
         });
 
         assert_eq!(node.link_table_len(), 0);
-        let expired = actions.iter().any(|a| matches!(a, NodeAction::LinkTableExpired { count: 1 }));
+        let expired = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::LinkTableExpired { count: 1 }));
         assert!(expired, "expected LinkTableExpired action");
     }
 
@@ -4779,12 +4870,12 @@ mod tests {
         let proof_timeout = entry.proof_timeout;
 
         // Timer tick past proof_timeout
-        let actions = node.handle_event(NodeEvent::TimerTick {
-            now: proof_timeout,
-        });
+        let actions = node.handle_event(NodeEvent::TimerTick { now: proof_timeout });
 
         assert_eq!(node.link_table_len(), 0);
-        let expired = actions.iter().any(|a| matches!(a, NodeAction::LinkTableExpired { count: 1 }));
+        let expired = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::LinkTableExpired { count: 1 }));
         assert!(expired, "expected LinkTableExpired action");
     }
 
@@ -4824,14 +4915,24 @@ mod tests {
         node.handle_event(NodeEvent::TimerTick {
             now: 2001 + LINK_TIMEOUT + 1,
         });
-        assert_eq!(node.link_table_len(), 1, "data traffic should keep link alive");
+        assert_eq!(
+            node.link_table_len(),
+            1,
+            "data traffic should keep link alive"
+        );
 
         // Timer tick past refreshed timeout
         let actions = node.handle_event(NodeEvent::TimerTick {
             now: refresh_time + LINK_TIMEOUT + 1,
         });
-        assert_eq!(node.link_table_len(), 0, "link should expire after inactivity");
-        let expired = actions.iter().any(|a| matches!(a, NodeAction::LinkTableExpired { .. }));
+        assert_eq!(
+            node.link_table_len(),
+            0,
+            "link should expire after inactivity"
+        );
+        let expired = actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::LinkTableExpired { .. }));
         assert!(expired);
     }
 
