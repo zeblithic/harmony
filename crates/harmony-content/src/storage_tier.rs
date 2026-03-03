@@ -148,27 +148,47 @@ impl<B: BlobStore> StorageTier<B> {
         }
     }
 
-    // Note: `transit_admitted` is always incremented because `ContentStore::store()`
-    // handles W-TinyLFU admission internally and we can't observe whether the item
-    // was actually retained. A future refinement could check `cache.contains(&cid)`
-    // after store and use `transit_rejected` when the item was dropped. For now,
-    // the metric means "offered to cache" rather than "retained by cache".
     fn handle_transit(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
+        // Transit comes from untrusted peers — verify CID matches data hash.
+        if !Self::verify_cid(&cid, &data) {
+            self.metrics.transit_rejected += 1;
+            return vec![];
+        }
         self.cache.store(cid, data);
-        self.metrics.transit_admitted += 1;
-        let cid_hex = hex::encode(cid.to_bytes());
-        let key_expr = announce_ns::key(&cid_hex);
-        let payload = cid.payload_size().to_be_bytes().to_vec();
-        vec![StorageTierAction::AnnounceContent { key_expr, payload }]
+        // Check if W-TinyLFU actually retained the content.
+        if self.cache.contains(&cid) {
+            self.metrics.transit_admitted += 1;
+            vec![self.make_announce_action(&cid)]
+        } else {
+            self.metrics.transit_rejected += 1;
+            vec![]
+        }
     }
 
     fn handle_publish(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
+        // Publish comes from local apps — still verify as defense-in-depth.
+        if !Self::verify_cid(&cid, &data) {
+            return vec![];
+        }
         self.cache.store(cid, data);
         self.metrics.publishes_stored += 1;
+        vec![self.make_announce_action(&cid)]
+    }
+
+    /// Verify that a CID actually matches the hash of the data.
+    fn verify_cid(cid: &ContentId, data: &[u8]) -> bool {
+        match ContentId::for_blob(data) {
+            Ok(computed) => computed == *cid,
+            Err(_) => false, // e.g., data too large
+        }
+    }
+
+    /// Build an AnnounceContent action for a stored CID.
+    fn make_announce_action(&self, cid: &ContentId) -> StorageTierAction {
         let cid_hex = hex::encode(cid.to_bytes());
         let key_expr = announce_ns::key(&cid_hex);
         let payload = cid.payload_size().to_be_bytes().to_vec();
-        vec![StorageTierAction::AnnounceContent { key_expr, payload }]
+        StorageTierAction::AnnounceContent { key_expr, payload }
     }
 
     fn handle_stats_query(&mut self, query_id: u64) -> Vec<StorageTierAction> {
@@ -367,6 +387,44 @@ mod tests {
         });
 
         assert_eq!(tier.metrics().transit_admitted, 2);
+    }
+
+    #[test]
+    fn transit_rejects_cid_data_mismatch() {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+
+        // CID for "real data" but send "tampered data"
+        let cid = ContentId::for_blob(b"real data").unwrap();
+        let actions = tier.handle(StorageTierEvent::TransitContent {
+            cid,
+            data: b"tampered data".to_vec(),
+        });
+
+        assert!(actions.is_empty(), "mismatched CID should produce no actions");
+        assert_eq!(tier.metrics().transit_rejected, 1);
+        assert_eq!(tier.metrics().transit_admitted, 0);
+    }
+
+    #[test]
+    fn publish_rejects_cid_data_mismatch() {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+
+        let cid = ContentId::for_blob(b"original").unwrap();
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid,
+            data: b"different".to_vec(),
+        });
+
+        assert!(actions.is_empty(), "mismatched CID should produce no actions");
+        assert_eq!(tier.metrics().publishes_stored, 0);
     }
 
     #[test]
