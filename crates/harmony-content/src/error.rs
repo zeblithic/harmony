@@ -15,4 +15,7 @@ pub enum ContentError {
 
     #[error("invalid bundle length: {len} is not a multiple of 32")]
     InvalidBundleLength { len: usize },
+
+    #[error("cannot build an empty bundle")]
+    EmptyBundle,
 }

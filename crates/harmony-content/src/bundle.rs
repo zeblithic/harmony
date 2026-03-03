@@ -47,6 +47,95 @@ pub fn validate_bundle_depth(parent_depth: u8, children: &[ContentId]) -> Result
     Ok(())
 }
 
+/// Builder for constructing bundles from child CIDs.
+///
+/// Collects child CIDs, optionally prepends an inline metadata CID,
+/// validates depth constraints, and produces the bundle bytes + CID.
+pub struct BundleBuilder {
+    children: Vec<ContentId>,
+    metadata: Option<ContentId>,
+}
+
+impl BundleBuilder {
+    /// Create a new empty builder.
+    pub fn new() -> Self {
+        BundleBuilder {
+            children: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    /// Add a child CID to the bundle.
+    pub fn add(&mut self, cid: ContentId) -> &mut Self {
+        self.children.push(cid);
+        self
+    }
+
+    /// Set inline metadata for a root bundle.
+    ///
+    /// The metadata CID will be prepended as the first entry.
+    pub fn with_metadata(
+        &mut self,
+        total_size: u64,
+        chunk_count: u32,
+        timestamp: u64,
+        mime: [u8; 8],
+    ) -> &mut Self {
+        self.metadata = Some(ContentId::inline_metadata(
+            total_size,
+            chunk_count,
+            timestamp,
+            mime,
+        ));
+        self
+    }
+
+    /// Build the bundle, returning the raw bytes and the bundle's CID.
+    ///
+    /// The bundle's depth is `max(child_depths) + 1`. If inline metadata
+    /// was set, it is prepended as the first CID in the bundle bytes
+    /// (metadata CIDs have depth 0, so they don't affect bundle depth).
+    pub fn build(&self) -> Result<(Vec<u8>, ContentId), ContentError> {
+        if self.children.is_empty() {
+            return Err(ContentError::EmptyBundle);
+        }
+
+        // Collect all entries: optional metadata + children
+        let mut entries: Vec<ContentId> = Vec::new();
+        if let Some(meta) = &self.metadata {
+            entries.push(*meta);
+        }
+        entries.extend_from_slice(&self.children);
+
+        // Serialize to bytes
+        let mut bundle_bytes = Vec::with_capacity(entries.len() * CID_SIZE);
+        for cid in &entries {
+            bundle_bytes.extend_from_slice(&cid.to_bytes());
+        }
+
+        // Compute bundle CID (depth based on all entries including metadata)
+        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &entries)?;
+
+        Ok((bundle_bytes, bundle_cid))
+    }
+
+    /// Return the number of child CIDs (not counting metadata).
+    pub fn len(&self) -> usize {
+        self.children.len()
+    }
+
+    /// Check if the builder has no children.
+    pub fn is_empty(&self) -> bool {
+        self.children.is_empty()
+    }
+}
+
+impl Default for BundleBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +219,83 @@ mod tests {
         let l2 = ContentId::for_bundle(&l2_bytes, &[l1]).unwrap();
 
         assert!(validate_bundle_depth(3, &[blob, l1, l2]).is_ok());
+    }
+
+    #[test]
+    fn builder_basic_two_blobs() {
+        let blob_a = ContentId::for_blob(b"chunk a").unwrap();
+        let blob_b = ContentId::for_blob(b"chunk b").unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(blob_a).add(blob_b);
+
+        let (bytes, cid) = builder.build().unwrap();
+        assert_eq!(cid.cid_type(), CidType::Bundle(1));
+        assert_eq!(cid.payload_size(), 64); // 2 * 32
+        assert_eq!(bytes.len(), 64);
+
+        // Parse back and verify
+        let parsed = parse_bundle(&bytes).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], blob_a);
+        assert_eq!(parsed[1], blob_b);
+    }
+
+    #[test]
+    fn builder_with_metadata() {
+        let blob = ContentId::for_blob(b"data").unwrap();
+        let mut builder = BundleBuilder::new();
+        builder.add(blob).with_metadata(1000, 1, 0, *b"text/pln");
+
+        let (bytes, cid) = builder.build().unwrap();
+        assert_eq!(cid.cid_type(), CidType::Bundle(1));
+        // 2 entries: metadata + blob
+        assert_eq!(bytes.len(), 64);
+
+        let parsed = parse_bundle(&bytes).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].cid_type(), CidType::InlineMetadata);
+        assert_eq!(parsed[1], blob);
+    }
+
+    #[test]
+    fn builder_depth_cascade() {
+        let blob = ContentId::for_blob(b"leaf").unwrap();
+
+        // L1 bundle
+        let mut b1 = BundleBuilder::new();
+        b1.add(blob);
+        let (_, l1_cid) = b1.build().unwrap();
+        assert_eq!(l1_cid.cid_type(), CidType::Bundle(1));
+
+        // L2 bundle wrapping the L1
+        let mut b2 = BundleBuilder::new();
+        b2.add(l1_cid);
+        let (_, l2_cid) = b2.build().unwrap();
+        assert_eq!(l2_cid.cid_type(), CidType::Bundle(2));
+    }
+
+    #[test]
+    fn builder_rejects_empty() {
+        let builder = BundleBuilder::new();
+        assert!(matches!(builder.build(), Err(ContentError::EmptyBundle)));
+    }
+
+    #[test]
+    fn builder_rejects_depth_overflow() {
+        // Build up to depth 7 then try to wrap
+        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let mut current = blob;
+        for _ in 0..7 {
+            let mut b = BundleBuilder::new();
+            b.add(current);
+            let (_, cid) = b.build().unwrap();
+            current = cid;
+        }
+        assert_eq!(current.cid_type(), CidType::Bundle(7));
+
+        let mut b = BundleBuilder::new();
+        b.add(current);
+        assert!(b.build().is_err());
     }
 }
