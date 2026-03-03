@@ -115,8 +115,7 @@ mod tests {
         let mut bundle_bytes = Vec::new();
         bundle_bytes.extend_from_slice(&blob_a.to_bytes());
         bundle_bytes.extend_from_slice(&blob_b.to_bytes());
-        let bundle_cid =
-            ContentId::for_bundle(&bundle_bytes, &[blob_a, blob_b]).unwrap();
+        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &[blob_a, blob_b]).unwrap();
 
         store.store(bundle_cid, bundle_bytes.clone());
         assert_eq!(store.get(&bundle_cid).unwrap(), bundle_bytes.as_slice());
