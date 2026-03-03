@@ -326,6 +326,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-content"
+version = "0.1.0"
+dependencies = [
+ "harmony-crypto",
+ "hex",
+ "thiserror",
+]
+
+[[package]]
 name = "harmony-crypto"
 version = "0.1.0"
 dependencies = [
