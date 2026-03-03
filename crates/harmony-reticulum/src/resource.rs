@@ -4,6 +4,8 @@
 //! arbitrary-sized data over Reticulum links using chunked, windowed
 //! transfers with acknowledgement-based flow control.
 
+use rand_core::CryptoRngCore;
+
 use crate::error::ReticulumError;
 use harmony_crypto::hash;
 
@@ -104,7 +106,11 @@ pub type RandomHash = [u8; 4];
 /// decouples them so that tests can use a mock implementation.
 pub trait LinkCrypto {
     /// Encrypt `plaintext` for transmission over the link.
-    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, ReticulumError>;
+    fn encrypt(
+        &self,
+        rng: &mut dyn CryptoRngCore,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ReticulumError>;
 
     /// Decrypt `ciphertext` received from the link.
     fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, ReticulumError>;
@@ -546,7 +552,11 @@ mod tests {
     }
 
     impl LinkCrypto for MockLinkCrypto {
-        fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, ReticulumError> {
+        fn encrypt(
+            &self,
+            _rng: &mut dyn CryptoRngCore,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, ReticulumError> {
             // Identity: ciphertext == plaintext
             Ok(plaintext.to_vec())
         }
@@ -569,9 +579,10 @@ mod tests {
 
     #[test]
     fn mock_link_crypto_roundtrip() {
+        use rand::rngs::OsRng;
         let mock = MockLinkCrypto::new(400);
         let plaintext = b"hello resource transfer";
-        let encrypted = mock.encrypt(plaintext).unwrap();
+        let encrypted = mock.encrypt(&mut OsRng, plaintext).unwrap();
         let decrypted = mock.decrypt(&encrypted).unwrap();
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
         assert_eq!(mock.mdu(), 400);
