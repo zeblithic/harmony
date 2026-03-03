@@ -59,8 +59,8 @@ pub fn ingest(
                 builder.with_metadata(
                     data.len() as u64,
                     chunk_count as u32,
-                    0,          // timestamp placeholder
-                    [0u8; 8],   // MIME placeholder
+                    0,        // timestamp placeholder
+                    [0u8; 8], // MIME placeholder
                 );
             }
 
@@ -127,10 +127,7 @@ fn walk_recursive(
 /// pre-allocates the output buffer using the total file size.
 ///
 /// Guarantees: `reassemble(ingest(data)) == data` for all non-empty inputs.
-pub fn reassemble(
-    root_cid: &ContentId,
-    store: &dyn BlobStore,
-) -> Result<Vec<u8>, ContentError> {
+pub fn reassemble(root_cid: &ContentId, store: &dyn BlobStore) -> Result<Vec<u8>, ContentError> {
     // Try to pre-allocate using inline metadata if available.
     let capacity = estimate_size(root_cid, store);
     let mut output = Vec::with_capacity(capacity);
@@ -233,8 +230,7 @@ mod tests {
         let entries = bundle::parse_bundle(root_bytes).unwrap();
         assert_eq!(entries[0].cid_type(), CidType::InlineMetadata);
 
-        let (total_size, chunk_count, _ts, _mime) =
-            entries[0].parse_inline_metadata().unwrap();
+        let (total_size, chunk_count, _ts, _mime) = entries[0].parse_inline_metadata().unwrap();
         assert_eq!(total_size, data.len() as u64);
         assert!(chunk_count > 1);
     }
@@ -310,5 +306,35 @@ mod tests {
         let root = ingest(&data, &config, &mut store).unwrap();
         let recovered = reassemble(&root, &store).unwrap();
         assert_eq!(recovered, data);
+    }
+
+    #[test]
+    fn structural_sharing_across_versions() {
+        let mut store = MemoryBlobStore::new();
+        let config = test_config();
+
+        // Version 1
+        let v1: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
+        let _root_v1 = ingest(&v1, &config, &mut store).unwrap();
+        let count_after_v1 = store.len();
+
+        // Version 2: small edit in the middle
+        let mut v2 = v1.clone();
+        v2[1024..1034].copy_from_slice(&[0xFF; 10]);
+        let root_v2 = ingest(&v2, &config, &mut store).unwrap();
+        let count_after_v2 = store.len();
+
+        // V2 should add fewer new entries than V1 did (shared chunks).
+        let new_entries = count_after_v2 - count_after_v1;
+        assert!(
+            new_entries < count_after_v1,
+            "v2 added {} entries, v1 had {} — expected fewer due to dedup",
+            new_entries,
+            count_after_v1
+        );
+
+        // V2 should still round-trip correctly.
+        let recovered_v2 = reassemble(&root_v2, &store).unwrap();
+        assert_eq!(recovered_v2, v2);
     }
 }
