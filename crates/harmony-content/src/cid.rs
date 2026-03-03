@@ -12,9 +12,6 @@ pub const TAG_BITS: u32 = 12;
 /// Bitmask for the 12-bit tag field (lower 12 bits of the last u32).
 pub const TAG_MASK: u32 = 0xFFF;
 
-/// Bitmask for the 20-bit size field (upper 20 bits of the last u32).
-pub const SIZE_MASK: u32 = 0xFFFF_F000;
-
 /// A 32-byte content identifier.
 ///
 /// Layout (big-endian):
@@ -370,48 +367,24 @@ impl CidType {
                 (CidType::Bundle(d as u8), checksum)
             }
             8 => {
-                // 8 leading 1-bits, then...
-                // Check bit position 3 (from LSB) to distinguish InlineMetadata
-                // from deeper prefixes. The 9th bit (index 3) should be 0 for
-                // InlineMetadata.
-                // After 8 ones, bits [3:0] remain. Bit 3 = 0 => InlineMetadata.
-                let remaining = tag & 0xF; // bottom 4 bits
-                if remaining & 0x8 == 0 {
-                    // bit 3 = 0 => InlineMetadata, 3-bit checksum
-                    (CidType::InlineMetadata, tag & 0x7)
-                } else if remaining & 0x4 == 0 {
-                    // bit 3 = 1, bit 2 = 0 => ReservedA, 2-bit checksum
-                    (CidType::ReservedA, tag & 0x3)
-                } else if remaining & 0x2 == 0 {
-                    // bits 3,2 = 1,1; bit 1 = 0 => ReservedB, 1-bit checksum
-                    (CidType::ReservedB, tag & 0x1)
-                } else if remaining & 0x1 == 0 {
-                    // bits 3,2,1 = 1,1,1; bit 0 = 0 => ReservedC, 0-bit checksum
-                    (CidType::ReservedC, 0)
-                } else {
-                    // All bits = 1 => ReservedD, 0-bit checksum
-                    (CidType::ReservedD, 0)
-                }
+                // 1111_1111_0xxx => InlineMetadata, 3-bit checksum
+                (CidType::InlineMetadata, tag & 0x7)
+            }
+            9 => {
+                // 1111_1111_10xx => ReservedA, 2-bit checksum
+                (CidType::ReservedA, tag & 0x3)
+            }
+            10 => {
+                // 1111_1111_110x => ReservedB, 1-bit checksum
+                (CidType::ReservedB, tag & 0x1)
+            }
+            11 => {
+                // 1111_1111_1110 => ReservedC, 0-bit checksum
+                (CidType::ReservedC, 0)
             }
             _ => {
-                // 9+ leading ones means bits 8..=11 are all 1, plus more.
-                // This falls into the reserved region. We need to check
-                // the remaining bits manually.
-                // Actually, with a 12-bit field shifted to u16 top,
-                // 9+ leading ones means at least bits 11..3 are 1.
-                // We decode the remaining low bits.
-                let remaining = tag & 0xF;
-                if remaining & 0x8 == 0 {
-                    (CidType::InlineMetadata, tag & 0x7)
-                } else if remaining & 0x4 == 0 {
-                    (CidType::ReservedA, tag & 0x3)
-                } else if remaining & 0x2 == 0 {
-                    (CidType::ReservedB, tag & 0x1)
-                } else if remaining & 0x1 == 0 {
-                    (CidType::ReservedC, 0)
-                } else {
-                    (CidType::ReservedD, 0)
-                }
+                // 1111_1111_1111 => ReservedD, 0-bit checksum
+                (CidType::ReservedD, 0)
             }
         }
     }
