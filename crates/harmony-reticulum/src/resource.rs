@@ -4,8 +4,11 @@
 //! arbitrary-sized data over Reticulum links using chunked, windowed
 //! transfers with acknowledgement-based flow control.
 
+use std::collections::HashMap;
+
 use rand_core::CryptoRngCore;
 
+use crate::context::PacketContext;
 use crate::error::ReticulumError;
 use harmony_crypto::hash;
 
@@ -204,23 +207,358 @@ pub enum ResourceAction {
 }
 
 // ---------------------------------------------------------------------------
-// Struct skeletons
+// ResourceSender
 // ---------------------------------------------------------------------------
+
+/// Default timeout (ms) used before RTT is measured.
+const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 
 /// Sender-side resource transfer state machine.
 ///
 /// Drives advertisement, chunking, windowed transmission, and proof
 /// validation. Created by the link when initiating a transfer.
+#[derive(Debug)]
+#[allow(dead_code)] // Fields used in later tasks (windowing, retransmission).
 pub struct ResourceSender {
-    state: SenderState,
+    pub(crate) state: SenderState,
+    pub(crate) resource_hash: ResourceHash,
+    pub(crate) random_hash: RandomHash,
+    pub(crate) original_data: Vec<u8>,
+    pub(crate) encrypted_data: Vec<u8>,
+    pub(crate) parts: Vec<Vec<u8>>,
+    pub(crate) map_hashes: Vec<MapHash>,
+    pub(crate) hashmap: Vec<u8>,
+    pub(crate) expected_proof: ResourceHash,
+    pub(crate) sdu: usize,
+    pub(crate) adv_sent_at: Option<u64>,
+    pub(crate) last_activity: u64,
+    pub(crate) adv_retries_left: u8,
+    pub(crate) sent_parts: usize,
+    pub(crate) rtt_ms: Option<u64>,
 }
 
 impl ResourceSender {
+    /// Create a new resource sender.
+    ///
+    /// Validates the data size, encrypts, chunks, and computes all hashes.
+    /// Returns the sender in `Queued` state, ready for [`advertise`](Self::advertise).
+    pub fn new(
+        rng: &mut dyn CryptoRngCore,
+        crypto: &impl LinkCrypto,
+        data: &[u8],
+        now_ms: u64,
+    ) -> Result<Self, ReticulumError> {
+        if data.len() > MAX_EFFICIENT_SIZE {
+            return Err(ReticulumError::ResourceTooLarge {
+                size: data.len(),
+                max: MAX_EFFICIENT_SIZE,
+            });
+        }
+
+        // Generate 4-byte random nonce.
+        let mut random_hash: RandomHash = [0u8; 4];
+        rng.fill_bytes(&mut random_hash);
+
+        // Encrypt the data.
+        let encrypted_data = crypto.encrypt(rng, data)?;
+
+        // Compute the resource hash over encrypted data.
+        let resource_hash = compute_resource_hash(&encrypted_data, &random_hash);
+
+        // Chunk the encrypted data into parts of at most `mdu` bytes.
+        let sdu = crypto.mdu();
+        let parts = chunk_data(&encrypted_data, sdu);
+
+        // Compute map hashes for each part.
+        let map_hashes: Vec<MapHash> = parts
+            .iter()
+            .map(|part| compute_map_hash(part, &random_hash))
+            .collect();
+
+        // Build the concatenated hashmap (all map hashes in order).
+        let mut hashmap = Vec::with_capacity(map_hashes.len() * MAPHASH_LEN);
+        for mh in &map_hashes {
+            hashmap.extend_from_slice(mh);
+        }
+
+        // Compute the expected proof the receiver will send.
+        let expected_proof = compute_proof_hash(data, &resource_hash);
+
+        Ok(Self {
+            state: SenderState::Queued,
+            resource_hash,
+            random_hash,
+            original_data: data.to_vec(),
+            encrypted_data,
+            parts,
+            map_hashes,
+            hashmap,
+            expected_proof,
+            sdu,
+            adv_sent_at: None,
+            last_activity: now_ms,
+            adv_retries_left: MAX_ADV_RETRIES as u8,
+            sent_parts: 0,
+            rtt_ms: None,
+        })
+    }
+
     /// Current sender state.
     pub fn state(&self) -> SenderState {
         self.state
     }
+
+    /// Resource hash identifying this transfer.
+    pub fn hash(&self) -> &ResourceHash {
+        &self.resource_hash
+    }
+
+    /// Number of parts the encrypted data was split into.
+    pub fn part_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Build and emit the resource advertisement packet.
+    ///
+    /// Transitions from `Queued` to `Advertised` and schedules a timeout
+    /// for the advertisement response.
+    pub fn advertise(&mut self, now_ms: u64) -> Vec<ResourceAction> {
+        let adv = ResourceAdvertisement {
+            transfer_size: self.encrypted_data.len() as u32,
+            data_size: self.original_data.len() as u32,
+            part_count: self.parts.len() as u32,
+            resource_hash: self.resource_hash,
+            random_hash: self.random_hash,
+            original_hash: self.resource_hash, // single-segment: original == resource
+            hashmap: self.hashmap.clone(),
+            flags: 0x00,
+            segment_index: 0,
+            total_segments: 1,
+        };
+
+        self.state = SenderState::Advertised;
+        self.adv_sent_at = Some(now_ms);
+        self.last_activity = now_ms;
+
+        let timeout = now_ms + DEFAULT_TIMEOUT_MS;
+
+        vec![
+            ResourceAction::SendPacket {
+                context: PacketContext::ResourceAdv.as_byte(),
+                plaintext: adv.encode(),
+            },
+            ResourceAction::SenderStateChanged,
+            ResourceAction::ScheduleTimeout {
+                deadline_ms: timeout,
+            },
+        ]
+    }
+
+    /// Process an incoming event and return resulting actions.
+    pub fn handle_event(&mut self, event: ResourceEvent, payload: &[u8]) -> Vec<ResourceAction> {
+        match event {
+            ResourceEvent::RequestReceived => self.handle_request(payload),
+            ResourceEvent::ProofReceived => self.handle_proof(payload),
+            ResourceEvent::CancelReceived => self.handle_cancel_received(),
+            ResourceEvent::Timeout { now_ms } => self.handle_timeout(now_ms),
+            _ => vec![],
+        }
+    }
+
+    /// Cancel the transfer from the sender side.
+    ///
+    /// Emits a cancel packet (`ResourceIcl`) unless the transfer is already
+    /// complete or failed.
+    pub fn cancel(&mut self) -> Vec<ResourceAction> {
+        match self.state {
+            SenderState::Complete | SenderState::Failed | SenderState::Rejected => vec![],
+            _ => {
+                self.state = SenderState::Failed;
+                vec![
+                    ResourceAction::SendPacket {
+                        context: PacketContext::ResourceIcl.as_byte(),
+                        plaintext: self.resource_hash.to_vec(),
+                    },
+                    ResourceAction::SenderStateChanged,
+                ]
+            }
+        }
+    }
+
+    // -- Private handlers ---------------------------------------------------
+
+    fn handle_request(&mut self, payload: &[u8]) -> Vec<ResourceAction> {
+        if self.state != SenderState::Advertised && self.state != SenderState::Transferring {
+            return vec![];
+        }
+
+        // Parse RESOURCE_REQ: [flag:1][resource_hash:16][map_hashes:N*4]
+        // If flag == 0xFF, there's a 4-byte last_map_hash between flag and resource_hash:
+        //   [0xFF][last_map_hash:4][resource_hash:16][map_hashes:N*4]
+        if payload.is_empty() {
+            return vec![];
+        }
+
+        let flag = payload[0];
+        let rest = if flag == HASHMAP_IS_EXHAUSTED {
+            // Skip the 4-byte last_map_hash
+            if payload.len() < 1 + MAPHASH_LEN + 16 {
+                return vec![];
+            }
+            &payload[1 + MAPHASH_LEN..]
+        } else {
+            &payload[1..]
+        };
+
+        if rest.len() < 16 {
+            return vec![];
+        }
+
+        let mut req_hash = [0u8; 16];
+        req_hash.copy_from_slice(&rest[..16]);
+
+        if req_hash != self.resource_hash {
+            return vec![];
+        }
+
+        let map_data = &rest[16..];
+        if map_data.len() % MAPHASH_LEN != 0 {
+            return vec![];
+        }
+
+        // Build a reverse lookup from map_hash -> part index.
+        let mut index_map: HashMap<MapHash, usize> = HashMap::new();
+        for (i, mh) in self.map_hashes.iter().enumerate() {
+            index_map.insert(*mh, i);
+        }
+
+        self.state = SenderState::Transferring;
+        let mut actions = vec![ResourceAction::SenderStateChanged];
+
+        // Send each requested part.
+        let requested_count = map_data.len() / MAPHASH_LEN;
+        for chunk_idx in 0..requested_count {
+            let offset = chunk_idx * MAPHASH_LEN;
+            let mut mh = [0u8; MAPHASH_LEN];
+            mh.copy_from_slice(&map_data[offset..offset + MAPHASH_LEN]);
+
+            if let Some(&part_idx) = index_map.get(&mh) {
+                actions.push(ResourceAction::SendPacket {
+                    context: PacketContext::Resource.as_byte(),
+                    plaintext: self.parts[part_idx].clone(),
+                });
+                self.sent_parts += 1;
+            }
+        }
+
+        // Check if all parts have been sent.
+        if self.sent_parts >= self.parts.len() {
+            self.state = SenderState::AwaitingProof;
+            actions.push(ResourceAction::SenderStateChanged);
+            let timeout =
+                self.last_activity + self.rtt_ms.unwrap_or(DEFAULT_TIMEOUT_MS) * PROOF_TIMEOUT_FACTOR as u64;
+            actions.push(ResourceAction::ScheduleTimeout {
+                deadline_ms: timeout,
+            });
+        }
+
+        let progress = self.sent_parts as f32 / self.parts.len().max(1) as f32;
+        actions.push(ResourceAction::Progress { fraction: progress });
+
+        actions
+    }
+
+    fn handle_proof(&mut self, payload: &[u8]) -> Vec<ResourceAction> {
+        if self.state != SenderState::AwaitingProof {
+            return vec![];
+        }
+
+        // Parse [resource_hash:16][proof:16]
+        if payload.len() < 32 {
+            return vec![];
+        }
+
+        let mut recv_hash = [0u8; 16];
+        recv_hash.copy_from_slice(&payload[..16]);
+
+        if recv_hash != self.resource_hash {
+            return vec![];
+        }
+
+        let mut proof = [0u8; 16];
+        proof.copy_from_slice(&payload[16..32]);
+
+        if proof == self.expected_proof {
+            self.state = SenderState::Complete;
+            vec![
+                ResourceAction::ProofValidated,
+                ResourceAction::SenderStateChanged,
+            ]
+        } else {
+            self.state = SenderState::Failed;
+            vec![ResourceAction::SenderStateChanged]
+        }
+    }
+
+    fn handle_cancel_received(&mut self) -> Vec<ResourceAction> {
+        match self.state {
+            SenderState::Complete | SenderState::Failed | SenderState::Rejected => vec![],
+            _ => {
+                self.state = SenderState::Rejected;
+                vec![ResourceAction::SenderStateChanged]
+            }
+        }
+    }
+
+    fn handle_timeout(&mut self, now_ms: u64) -> Vec<ResourceAction> {
+        match self.state {
+            SenderState::Advertised => {
+                if self.adv_retries_left > 0 {
+                    self.adv_retries_left -= 1;
+                    self.adv_sent_at = Some(now_ms);
+                    self.last_activity = now_ms;
+
+                    // Re-send the advertisement.
+                    let adv = ResourceAdvertisement {
+                        transfer_size: self.encrypted_data.len() as u32,
+                        data_size: self.original_data.len() as u32,
+                        part_count: self.parts.len() as u32,
+                        resource_hash: self.resource_hash,
+                        random_hash: self.random_hash,
+                        original_hash: self.resource_hash,
+                        hashmap: self.hashmap.clone(),
+                        flags: 0x00,
+                        segment_index: 0,
+                        total_segments: 1,
+                    };
+
+                    let timeout = now_ms + DEFAULT_TIMEOUT_MS;
+                    vec![
+                        ResourceAction::SendPacket {
+                            context: PacketContext::ResourceAdv.as_byte(),
+                            plaintext: adv.encode(),
+                        },
+                        ResourceAction::ScheduleTimeout {
+                            deadline_ms: timeout,
+                        },
+                    ]
+                } else {
+                    self.state = SenderState::Failed;
+                    vec![ResourceAction::SenderStateChanged]
+                }
+            }
+            SenderState::Transferring | SenderState::AwaitingProof => {
+                self.state = SenderState::Failed;
+                vec![ResourceAction::SenderStateChanged]
+            }
+            _ => vec![],
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// ResourceReceiver
+// ---------------------------------------------------------------------------
 
 /// Receiver-side resource transfer state machine.
 ///
@@ -590,22 +928,6 @@ mod tests {
     }
 
     #[test]
-    fn sender_state_initial() {
-        let sender = ResourceSender {
-            state: SenderState::Queued,
-        };
-        assert_eq!(sender.state(), SenderState::Queued);
-    }
-
-    #[test]
-    fn receiver_state_initial() {
-        let receiver = ResourceReceiver {
-            state: ReceiverState::Transferring,
-        };
-        assert_eq!(receiver.state(), ReceiverState::Transferring);
-    }
-
-    #[test]
     fn sender_state_enum_equality() {
         assert_eq!(SenderState::Queued, SenderState::Queued);
         assert_ne!(SenderState::Queued, SenderState::Complete);
@@ -807,4 +1129,238 @@ mod tests {
         let result = ResourceAdvertisement::decode(&encoded);
         assert!(result.is_err());
     }
+
+    // -- ResourceSender tests -----------------------------------------------
+
+    /// Helper: create a sender with test data (10 bytes, mdu=3 -> 4 parts).
+    fn make_sender() -> ResourceSender {
+        use rand::rngs::OsRng;
+        let crypto = MockLinkCrypto::new(3);
+        ResourceSender::new(&mut OsRng, &crypto, b"abcdefghij", 1000).unwrap()
+    }
+
+    #[test]
+    fn sender_new_creates_parts_and_hashes() {
+        let sender = make_sender();
+        assert_eq!(sender.state(), SenderState::Queued);
+        assert_eq!(sender.part_count(), 4); // 10 bytes / 3 = ceil(3.33) = 4 parts
+        assert_eq!(sender.parts.len(), 4);
+        assert_eq!(sender.map_hashes.len(), 4);
+        assert_eq!(sender.hashmap.len(), 4 * MAPHASH_LEN);
+        // With MockLinkCrypto (identity), encrypted == original.
+        assert_eq!(sender.encrypted_data, b"abcdefghij");
+        assert_eq!(sender.original_data, b"abcdefghij");
+        // Resource hash should be 16 bytes.
+        assert_eq!(sender.hash().len(), 16);
+    }
+
+    #[test]
+    fn sender_new_rejects_oversized() {
+        use rand::rngs::OsRng;
+        let crypto = MockLinkCrypto::new(400);
+        let oversized = vec![0u8; MAX_EFFICIENT_SIZE + 1];
+        let result = ResourceSender::new(&mut OsRng, &crypto, &oversized, 0);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReticulumError::ResourceTooLarge { size, max } => {
+                assert_eq!(size, MAX_EFFICIENT_SIZE + 1);
+                assert_eq!(max, MAX_EFFICIENT_SIZE);
+            }
+            other => panic!("expected ResourceTooLarge, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sender_advertise_emits_packet_and_timeout() {
+        let mut sender = make_sender();
+        let actions = sender.advertise(2000);
+        assert_eq!(sender.state(), SenderState::Advertised);
+
+        // Should have: SendPacket{ResourceAdv}, SenderStateChanged, ScheduleTimeout.
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, ResourceAction::SendPacket { context, .. } if *context == PacketContext::ResourceAdv.as_byte()))
+            .count();
+        assert_eq!(send_count, 1);
+
+        let timeout_count = actions
+            .iter()
+            .filter(|a| matches!(a, ResourceAction::ScheduleTimeout { .. }))
+            .count();
+        assert_eq!(timeout_count, 1);
+
+        let state_changed = actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::SenderStateChanged));
+        assert!(state_changed);
+    }
+
+    #[test]
+    fn sender_handles_request_emits_parts() {
+        let mut sender = make_sender();
+        sender.advertise(1000);
+
+        // Build a RESOURCE_REQ payload requesting all 4 parts:
+        // [flag:1][resource_hash:16][map_hashes:N*4]
+        let mut req = Vec::new();
+        req.push(HASHMAP_IS_NOT_EXHAUSTED); // flag
+        req.extend_from_slice(&sender.resource_hash);
+        for mh in &sender.map_hashes {
+            req.extend_from_slice(mh);
+        }
+
+        let actions = sender.handle_event(ResourceEvent::RequestReceived, &req);
+
+        // Should transition to Transferring, then AwaitingProof since all parts sent.
+        assert_eq!(sender.state(), SenderState::AwaitingProof);
+
+        // Count Resource packets sent (one per part).
+        let resource_packets: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, ResourceAction::SendPacket { context, .. } if *context == PacketContext::Resource.as_byte()))
+            .collect();
+        assert_eq!(resource_packets.len(), 4);
+
+        // Should have a progress action.
+        let has_progress = actions.iter().any(|a| matches!(a, ResourceAction::Progress { fraction } if *fraction >= 1.0));
+        assert!(has_progress);
+    }
+
+    #[test]
+    fn sender_validates_correct_proof() {
+        let mut sender = make_sender();
+        sender.advertise(1000);
+
+        // Transition to AwaitingProof by handling a request for all parts.
+        let mut req = Vec::new();
+        req.push(HASHMAP_IS_NOT_EXHAUSTED);
+        req.extend_from_slice(&sender.resource_hash);
+        for mh in &sender.map_hashes {
+            req.extend_from_slice(mh);
+        }
+        sender.handle_event(ResourceEvent::RequestReceived, &req);
+        assert_eq!(sender.state(), SenderState::AwaitingProof);
+
+        // Build a valid proof: [resource_hash:16][proof:16]
+        let proof = compute_proof_hash(&sender.original_data, &sender.resource_hash);
+        let mut proof_payload = Vec::new();
+        proof_payload.extend_from_slice(&sender.resource_hash);
+        proof_payload.extend_from_slice(&proof);
+
+        let actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_payload);
+        assert_eq!(sender.state(), SenderState::Complete);
+
+        let has_validated = actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::ProofValidated));
+        assert!(has_validated);
+    }
+
+    #[test]
+    fn sender_rejects_wrong_proof() {
+        let mut sender = make_sender();
+        sender.advertise(1000);
+
+        // Move to AwaitingProof.
+        let mut req = Vec::new();
+        req.push(HASHMAP_IS_NOT_EXHAUSTED);
+        req.extend_from_slice(&sender.resource_hash);
+        for mh in &sender.map_hashes {
+            req.extend_from_slice(mh);
+        }
+        sender.handle_event(ResourceEvent::RequestReceived, &req);
+        assert_eq!(sender.state(), SenderState::AwaitingProof);
+
+        // Send a bad proof.
+        let mut bad_proof = Vec::new();
+        bad_proof.extend_from_slice(&sender.resource_hash);
+        bad_proof.extend_from_slice(&[0xFF; 16]); // Wrong proof bytes.
+
+        let actions = sender.handle_event(ResourceEvent::ProofReceived, &bad_proof);
+        assert_eq!(sender.state(), SenderState::Failed);
+
+        let no_validated = !actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::ProofValidated));
+        assert!(no_validated);
+    }
+
+    #[test]
+    fn sender_cancel_emits_icl() {
+        let mut sender = make_sender();
+        sender.advertise(1000);
+
+        let actions = sender.cancel();
+        assert_eq!(sender.state(), SenderState::Failed);
+
+        let has_icl = actions.iter().any(|a| {
+            matches!(a, ResourceAction::SendPacket { context, .. } if *context == PacketContext::ResourceIcl.as_byte())
+        });
+        assert!(has_icl);
+    }
+
+    #[test]
+    fn sender_cancel_on_complete_noop() {
+        let mut sender = make_sender();
+        // Force complete state.
+        sender.state = SenderState::Complete;
+
+        let actions = sender.cancel();
+        assert_eq!(sender.state(), SenderState::Complete);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn sender_receives_cancel_becomes_rejected() {
+        let mut sender = make_sender();
+        sender.advertise(1000);
+
+        let actions = sender.handle_event(ResourceEvent::CancelReceived, &[]);
+        assert_eq!(sender.state(), SenderState::Rejected);
+
+        let has_state_change = actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::SenderStateChanged));
+        assert!(has_state_change);
+    }
+
+    #[test]
+    fn sender_timeout_in_advertised_retries() {
+        let mut sender = make_sender();
+        sender.advertise(1000);
+        assert_eq!(sender.state(), SenderState::Advertised);
+
+        let initial_retries = sender.adv_retries_left;
+
+        // First timeout: should retry the advertisement.
+        let actions = sender.handle_event(
+            ResourceEvent::Timeout { now_ms: 20_000 },
+            &[],
+        );
+        assert_eq!(sender.state(), SenderState::Advertised);
+        assert_eq!(sender.adv_retries_left, initial_retries - 1);
+
+        let has_adv = actions.iter().any(|a| {
+            matches!(a, ResourceAction::SendPacket { context, .. } if *context == PacketContext::ResourceAdv.as_byte())
+        });
+        assert!(has_adv);
+    }
+
+    #[test]
+    fn sender_timeout_exhausts_retries_fails() {
+        let mut sender = make_sender();
+        sender.advertise(1000);
+        sender.adv_retries_left = 0;
+
+        let actions = sender.handle_event(
+            ResourceEvent::Timeout { now_ms: 20_000 },
+            &[],
+        );
+        assert_eq!(sender.state(), SenderState::Failed);
+        let has_state_change = actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::SenderStateChanged));
+        assert!(has_state_change);
+    }
+
 }
