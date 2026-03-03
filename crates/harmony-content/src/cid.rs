@@ -135,6 +135,53 @@ impl ContentId {
         Ok(())
     }
 
+    /// Create an inline metadata CID.
+    ///
+    /// The 28-byte hash field is repurposed to store:
+    /// - bytes 0--7: total file size (u64 big-endian)
+    /// - bytes 8--11: total chunk count (u32 big-endian)
+    /// - bytes 12--19: creation timestamp (u64 big-endian, Unix epoch ms)
+    /// - bytes 20--27: MIME type or extension (8 bytes, packed)
+    pub fn inline_metadata(
+        total_size: u64,
+        chunk_count: u32,
+        timestamp: u64,
+        mime: [u8; 8],
+    ) -> Self {
+        let mut hash = [0u8; CONTENT_HASH_LEN];
+        hash[0..8].copy_from_slice(&total_size.to_be_bytes());
+        hash[8..12].copy_from_slice(&chunk_count.to_be_bytes());
+        hash[12..20].copy_from_slice(&timestamp.to_be_bytes());
+        hash[20..28].copy_from_slice(&mime);
+
+        let cid_type = CidType::InlineMetadata;
+        // Size field is 0 for inline metadata (the data is in the hash field).
+        let size: u32 = 0;
+        let checksum = compute_checksum(&hash, size, &cid_type);
+        let tag = cid_type.encode(checksum);
+        let size_and_tag_u32 = (size << TAG_BITS) | tag as u32;
+
+        ContentId {
+            hash,
+            size_and_tag: size_and_tag_u32.to_be_bytes(),
+        }
+    }
+
+    /// Parse an inline metadata CID, returning (total_size, chunk_count, timestamp, mime).
+    pub fn parse_inline_metadata(&self) -> Result<(u64, u32, u64, [u8; 8]), ContentError> {
+        if self.cid_type() != CidType::InlineMetadata {
+            return Err(ContentError::NotInlineMetadata);
+        }
+
+        let total_size = u64::from_be_bytes(self.hash[0..8].try_into().unwrap());
+        let chunk_count = u32::from_be_bytes(self.hash[8..12].try_into().unwrap());
+        let timestamp = u64::from_be_bytes(self.hash[12..20].try_into().unwrap());
+        let mut mime = [0u8; 8];
+        mime.copy_from_slice(&self.hash[20..28]);
+
+        Ok((total_size, chunk_count, timestamp, mime))
+    }
+
     /// Serialize to a 32-byte array.
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut bytes = [0u8; 32];
@@ -712,5 +759,52 @@ mod tests {
             bytes.extend_from_slice(&cid.to_bytes());
         }
         bytes
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6: Inline Metadata CID
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn inline_metadata_round_trip() {
+        let meta = ContentId::inline_metadata(
+            100_000_000,   // 100MB total size
+            100,           // 100 chunks
+            1709337600000, // timestamp
+            *b"text/pln",  // MIME type (8 bytes)
+        );
+        assert_eq!(meta.cid_type(), CidType::InlineMetadata);
+
+        let (total_size, chunk_count, timestamp, mime) = meta.parse_inline_metadata().unwrap();
+        assert_eq!(total_size, 100_000_000);
+        assert_eq!(chunk_count, 100);
+        assert_eq!(timestamp, 1709337600000);
+        assert_eq!(&mime, b"text/pln");
+    }
+
+    #[test]
+    fn inline_metadata_zero_values() {
+        let meta = ContentId::inline_metadata(0, 0, 0, [0u8; 8]);
+        let (total_size, chunk_count, timestamp, mime) = meta.parse_inline_metadata().unwrap();
+        assert_eq!(total_size, 0);
+        assert_eq!(chunk_count, 0);
+        assert_eq!(timestamp, 0);
+        assert_eq!(mime, [0u8; 8]);
+    }
+
+    #[test]
+    fn inline_metadata_max_file_size() {
+        let meta = ContentId::inline_metadata(u64::MAX, u32::MAX, u64::MAX, [0xFF; 8]);
+        let (total_size, chunk_count, timestamp, mime) = meta.parse_inline_metadata().unwrap();
+        assert_eq!(total_size, u64::MAX);
+        assert_eq!(chunk_count, u32::MAX);
+        assert_eq!(timestamp, u64::MAX);
+        assert_eq!(mime, [0xFF; 8]);
+    }
+
+    #[test]
+    fn parse_inline_metadata_rejects_non_metadata_cid() {
+        let blob = ContentId::for_blob(b"not metadata").unwrap();
+        assert!(blob.parse_inline_metadata().is_err());
     }
 }
