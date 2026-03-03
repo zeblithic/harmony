@@ -15,6 +15,3 @@ harmony-identity = { path = "../harmony-identity" }
 clap = { version = "4", features = ["derive"] }
 hex.workspace = true
 rand.workspace = true
-
-[dev-dependencies]
-hex.workspace = true
