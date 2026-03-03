@@ -83,6 +83,115 @@ impl ChunkerConfig {
     }
 }
 
+/// FastCDC content-defined chunker using the two-mask algorithm.
+///
+/// Scans a byte stream and identifies natural split points using a rolling
+/// Gear hash. Two masks are used: a strict mask (`mask_s`) that produces fewer
+/// boundaries in the `[min, norm_point)` region, and a loose mask (`mask_l`)
+/// that produces more boundaries in the `[norm_point, max)` region. This
+/// normalizes the chunk size distribution around the target average.
+///
+/// The chunker is stateful: call [`feed`](Chunker::feed) with successive data
+/// slices, then [`finalize`](Chunker::finalize) to flush any remaining tail.
+pub struct Chunker {
+    min_chunk: usize,
+    max_chunk: usize,
+    /// Normalization point: `min_chunk + avg_chunk / 2`.
+    norm_point: usize,
+    /// Strict mask (fewer boundaries) for the `[min, norm)` region.
+    mask_s: u64,
+    /// Loose mask (more boundaries) for the `[norm, max)` region.
+    mask_l: u64,
+    /// Rolling Gear hash state.
+    hash: u64,
+    /// Bytes consumed since last cut point.
+    pos: usize,
+}
+
+impl Chunker {
+    /// Create a new chunker from the given configuration.
+    ///
+    /// The configuration is validated before use. Returns
+    /// [`ContentError::InvalidChunkerConfig`] if any invariant is violated.
+    pub fn new(config: ChunkerConfig) -> Result<Self, ContentError> {
+        config.validate()?;
+
+        let mask_l = config.avg_chunk as u64 - 1;
+        let mask_s = (mask_l << 1) | 1;
+        let norm_point = config.min_chunk + config.avg_chunk / 2;
+
+        Ok(Self {
+            min_chunk: config.min_chunk,
+            max_chunk: config.max_chunk,
+            norm_point,
+            mask_s,
+            mask_l,
+            hash: 0,
+            pos: 0,
+        })
+    }
+
+    /// Feed a slice of data into the chunker and return cut-point offsets.
+    ///
+    /// Each returned offset is relative to the start of `data` and marks the
+    /// position immediately after the last byte of a chunk (i.e., the first
+    /// byte of the *next* chunk). The caller is responsible for slicing the
+    /// original data accordingly.
+    ///
+    /// The chunker maintains internal state across calls, so a single logical
+    /// stream can be fed in arbitrarily sized pieces.
+    pub fn feed(&mut self, data: &[u8]) -> Vec<usize> {
+        let mut cuts = Vec::new();
+
+        for (i, &byte) in data.iter().enumerate() {
+            self.hash = (self.hash << 1).wrapping_add(GEAR_TABLE[byte as usize]);
+            self.pos += 1;
+
+            // Force a cut at the hard maximum.
+            if self.pos >= self.max_chunk {
+                cuts.push(i + 1);
+                self.hash = 0;
+                self.pos = 0;
+                continue;
+            }
+
+            // Below minimum — skip boundary check.
+            if self.pos < self.min_chunk {
+                continue;
+            }
+
+            // Choose mask based on normalization point.
+            let mask = if self.pos < self.norm_point {
+                self.mask_s
+            } else {
+                self.mask_l
+            };
+
+            if self.hash & mask == 0 {
+                cuts.push(i + 1);
+                self.hash = 0;
+                self.pos = 0;
+            }
+        }
+
+        cuts
+    }
+
+    /// Finalize the chunker, returning the remaining tail length if any.
+    ///
+    /// After calling this the chunker is reset and ready for reuse.
+    pub fn finalize(&mut self) -> Option<usize> {
+        let remaining = self.pos;
+        self.hash = 0;
+        self.pos = 0;
+        if remaining > 0 {
+            Some(remaining)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +309,138 @@ mod tests {
             max_chunk: 256,
         };
         cfg.validate().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunker
+    // -----------------------------------------------------------------------
+
+    /// Helper: small config suitable for unit tests (min=64, avg=128, max=256).
+    fn small_config() -> ChunkerConfig {
+        ChunkerConfig {
+            min_chunk: 64,
+            avg_chunk: 128,
+            max_chunk: 256,
+        }
+    }
+
+    #[test]
+    fn chunker_deterministic() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+
+        let cuts1 = {
+            let mut c = Chunker::new(small_config()).unwrap();
+            let mut cuts = c.feed(&data);
+            if let Some(tail) = c.finalize() {
+                let last = cuts.last().copied().unwrap_or(0);
+                cuts.push(last + tail);
+            }
+            cuts
+        };
+
+        let cuts2 = {
+            let mut c = Chunker::new(small_config()).unwrap();
+            let mut cuts = c.feed(&data);
+            if let Some(tail) = c.finalize() {
+                let last = cuts.last().copied().unwrap_or(0);
+                cuts.push(last + tail);
+            }
+            cuts
+        };
+
+        assert_eq!(cuts1, cuts2, "same data must produce identical cut points");
+        assert!(!cuts1.is_empty(), "expected at least one cut point");
+    }
+
+    #[test]
+    fn chunker_respects_min_max() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let cfg = small_config();
+        let mut chunker = Chunker::new(cfg).unwrap();
+        let cuts = chunker.feed(&data);
+        let tail = chunker.finalize();
+
+        // Build chunk sizes from cut offsets.
+        let mut sizes = Vec::new();
+        let mut prev = 0;
+        for &cut in &cuts {
+            sizes.push(cut - prev);
+            prev = cut;
+        }
+        // The tail (if any) is allowed to be smaller than min.
+        // Check non-tail chunks respect [min, max].
+        for (i, &size) in sizes.iter().enumerate() {
+            assert!(
+                size >= cfg.min_chunk,
+                "chunk {i} is {size} bytes, below min {}",
+                cfg.min_chunk
+            );
+            assert!(
+                size <= cfg.max_chunk,
+                "chunk {i} is {size} bytes, above max {}",
+                cfg.max_chunk
+            );
+        }
+
+        // Tail from finalize (last partial chunk) may be < min — that is fine.
+        if let Some(t) = tail {
+            assert!(t > 0);
+            assert!(
+                t <= cfg.max_chunk,
+                "tail is {t} bytes, above max {}",
+                cfg.max_chunk
+            );
+        }
+    }
+
+    #[test]
+    fn chunker_small_input_single_chunk() {
+        let data = vec![42u8; 32]; // well below min_chunk=64
+        let cfg = small_config();
+        let mut chunker = Chunker::new(cfg).unwrap();
+        let cuts = chunker.feed(&data);
+        assert!(
+            cuts.is_empty(),
+            "no cuts expected for input smaller than min"
+        );
+        let tail = chunker.finalize();
+        assert_eq!(tail, Some(32), "finalize should return remaining 32 bytes");
+    }
+
+    #[test]
+    fn chunker_empty_input() {
+        let mut chunker = Chunker::new(small_config()).unwrap();
+        let cuts = chunker.feed(&[]);
+        assert!(cuts.is_empty(), "no cuts on empty input");
+        assert_eq!(
+            chunker.finalize(),
+            None,
+            "finalize on empty stream should return None"
+        );
+    }
+
+    #[test]
+    fn chunker_forces_cut_at_max() {
+        let cfg = small_config();
+        // Fill with zeros — constant data is unlikely to trigger a hash boundary,
+        // so the only cuts should come from the max_chunk hard limit.
+        let data = vec![0u8; cfg.max_chunk * 3];
+        let mut chunker = Chunker::new(cfg).unwrap();
+        let cuts = chunker.feed(&data);
+        assert!(
+            !cuts.is_empty(),
+            "data larger than max_chunk must produce at least one cut"
+        );
+        // Every cut must be at most max_chunk bytes from the previous one.
+        let mut prev = 0;
+        for &cut in &cuts {
+            let size = cut - prev;
+            assert!(
+                size <= cfg.max_chunk,
+                "chunk of {size} bytes exceeds max {}",
+                cfg.max_chunk
+            );
+            prev = cut;
+        }
     }
 }
