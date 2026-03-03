@@ -263,6 +263,23 @@ impl CidType {
         }
     }
 
+    /// Return a unique ordinal for each CID type variant.
+    ///
+    /// Used in checksum computation to ensure different types with the same
+    /// depth (e.g. Blob and InlineMetadata both have depth 0) produce
+    /// different checksums.
+    pub fn type_ordinal(&self) -> u8 {
+        match self {
+            CidType::Blob => 0,
+            CidType::Bundle(d) => *d,      // 1..=7
+            CidType::InlineMetadata => 8,
+            CidType::ReservedA => 9,
+            CidType::ReservedB => 10,
+            CidType::ReservedC => 11,
+            CidType::ReservedD => 12,
+        }
+    }
+
     /// Return the number of prefix bits consumed by the unary encoding.
     fn prefix_len(&self) -> u32 {
         match self {
@@ -407,7 +424,7 @@ pub fn compute_checksum(hash: &[u8; CONTENT_HASH_LEN], size: u32, cid_type: &Cid
     let mut input = [0u8; CONTENT_HASH_LEN + 4 + 1];
     input[..CONTENT_HASH_LEN].copy_from_slice(hash);
     input[CONTENT_HASH_LEN..CONTENT_HASH_LEN + 4].copy_from_slice(&size.to_be_bytes());
-    input[CONTENT_HASH_LEN + 4] = cid_type.depth();
+    input[CONTENT_HASH_LEN + 4] = cid_type.type_ordinal();
     let digest = full_hash(&input);
 
     let raw = u16::from_be_bytes([digest[0], digest[1]]);
@@ -821,6 +838,27 @@ mod tests {
     fn checksum_verification_passes_for_inline_metadata() {
         let meta = ContentId::inline_metadata(1000, 1, 0, [0; 8]);
         assert!(meta.verify_checksum().is_ok());
+    }
+
+    #[test]
+    fn checksum_detects_type_corruption() {
+        // A Blob CID with its tag bits corrupted to InlineMetadata should
+        // fail checksum verification, even though both types have depth 0.
+        let blob = ContentId::for_blob(b"test").unwrap();
+        let mut bytes = blob.to_bytes();
+        // Corrupt the tag: overwrite bottom 12 bits with an InlineMetadata tag.
+        // InlineMetadata prefix = 0xFF0 (9 bits: 1111_1111_0), with 3-bit checksum.
+        let packed = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+        let size_bits = packed & !TAG_MASK; // preserve the 20-bit size
+        let fake_tag = CidType::InlineMetadata.encode(0); // InlineMetadata with checksum 0
+        let corrupted_packed = size_bits | fake_tag as u32;
+        bytes[28..32].copy_from_slice(&corrupted_packed.to_be_bytes());
+        let corrupted = ContentId::from_bytes(bytes);
+        assert_eq!(corrupted.cid_type(), CidType::InlineMetadata);
+        assert!(
+            corrupted.verify_checksum().is_err(),
+            "type corruption (Blob→InlineMetadata) should be detected by checksum"
+        );
     }
 
     #[test]
