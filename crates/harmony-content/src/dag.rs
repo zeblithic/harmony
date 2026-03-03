@@ -1,7 +1,7 @@
 use crate::blob::BlobStore;
-use crate::bundle::{BundleBuilder, MAX_BUNDLE_ENTRIES};
+use crate::bundle::{self, BundleBuilder, MAX_BUNDLE_ENTRIES};
 use crate::chunker::{chunk_all, ChunkerConfig};
-use crate::cid::ContentId;
+use crate::cid::{CidType, ContentId};
 use crate::error::ContentError;
 
 /// Ingest raw data into the content store, returning the root CID.
@@ -77,13 +77,54 @@ pub fn ingest(
     }
 }
 
+/// Walk a Merkle DAG from the root, returning leaf blob CIDs in order.
+///
+/// Performs a depth-first left-to-right traversal. For a bare blob root,
+/// returns a single-element vec. For a bundle root, recursively descends
+/// through child bundles, collecting blob CIDs. InlineMetadata entries
+/// are skipped (they carry metadata, not data).
+///
+/// Returns `MissingContent` if any referenced CID is not in the store.
+pub fn walk(root_cid: &ContentId, store: &dyn BlobStore) -> Result<Vec<ContentId>, ContentError> {
+    let mut result = Vec::new();
+    walk_recursive(root_cid, store, &mut result)?;
+    Ok(result)
+}
+
+fn walk_recursive(
+    cid: &ContentId,
+    store: &dyn BlobStore,
+    result: &mut Vec<ContentId>,
+) -> Result<(), ContentError> {
+    match cid.cid_type() {
+        CidType::Blob => {
+            result.push(*cid);
+        }
+        CidType::Bundle(_) => {
+            let data = store
+                .get(cid)
+                .ok_or(ContentError::MissingContent { cid: *cid })?;
+            let children = bundle::parse_bundle(data)?;
+            for child in children {
+                walk_recursive(child, store, result)?;
+            }
+        }
+        CidType::InlineMetadata => {
+            // Skip — metadata entries don't carry data.
+        }
+        _ => {
+            // Reserved types — should not appear in a well-formed DAG.
+            return Err(ContentError::MissingContent { cid: *cid });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::blob::MemoryBlobStore;
-    use crate::bundle;
     use crate::chunker::ChunkerConfig;
-    use crate::cid::CidType;
 
     /// Small chunker config for fast tests (min=64, avg=128, max=256 bytes).
     fn test_config() -> ChunkerConfig {
@@ -149,5 +190,40 @@ mod tests {
             entries[0].parse_inline_metadata().unwrap();
         assert_eq!(total_size, data.len() as u64);
         assert!(chunk_count > 1);
+    }
+
+    #[test]
+    fn walk_blob_returns_single_cid() {
+        let mut store = MemoryBlobStore::new();
+        let data = b"small blob";
+        let cid = store.insert(data).unwrap();
+        let blobs = walk(&cid, &store).unwrap();
+        assert_eq!(blobs, vec![cid]);
+    }
+
+    #[test]
+    fn walk_bundle_returns_blobs_in_order() {
+        let mut store = MemoryBlobStore::new();
+        let data: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
+        let root = ingest(&data, &test_config(), &mut store).unwrap();
+        let blobs = walk(&root, &store).unwrap();
+
+        // Should have multiple blobs, all of type Blob.
+        assert!(blobs.len() > 1);
+        for cid in &blobs {
+            assert_eq!(cid.cid_type(), CidType::Blob);
+        }
+    }
+
+    #[test]
+    fn walk_missing_cid_returns_error() {
+        let store = MemoryBlobStore::new();
+        // Ingest into a different store, then walk from empty store.
+        let mut other_store = MemoryBlobStore::new();
+        let data: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
+        let root = ingest(&data, &test_config(), &mut other_store).unwrap();
+
+        let result = walk(&root, &store);
+        assert!(matches!(result, Err(ContentError::MissingContent { .. })));
     }
 }
