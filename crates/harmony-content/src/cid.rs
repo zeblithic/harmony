@@ -271,7 +271,7 @@ impl CidType {
     pub fn type_ordinal(&self) -> u8 {
         match self {
             CidType::Blob => 0,
-            CidType::Bundle(d) => *d,      // 1..=7
+            CidType::Bundle(d) => *d, // 1..=7
             CidType::InlineMetadata => 8,
             CidType::ReservedA => 9,
             CidType::ReservedB => 10,
@@ -936,5 +936,4 @@ mod tests {
             "5c9f61c811d592b287972b0fa001f1d5d286b0f49c25e749b0eb83cd000409ca",
         );
     }
-
 }

@@ -12,4 +12,10 @@ pub enum ContentError {
 
     #[error("not an inline metadata CID")]
     NotInlineMetadata,
+
+    #[error("invalid bundle length: {len} is not a multiple of 32")]
+    InvalidBundleLength { len: usize },
+
+    #[error("cannot build an empty bundle")]
+    EmptyBundle,
 }
