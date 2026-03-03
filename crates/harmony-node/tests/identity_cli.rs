@@ -34,3 +34,40 @@ fn identity_new_prints_three_fields() {
     assert_eq!(priv_hex.len(), 128, "privkey hex length");
     hex::decode(priv_hex).expect("privkey should be valid hex");
 }
+
+#[test]
+fn identity_show_round_trips_from_new() {
+    let new_output = harmony_cmd()
+        .args(["identity", "new"])
+        .output()
+        .expect("failed to run identity new");
+    let new_stdout = String::from_utf8_lossy(&new_output.stdout);
+    let new_lines: Vec<&str> = new_stdout.lines().collect();
+    let expected_addr = new_lines[0].trim_start_matches("Address:").trim();
+    let expected_pub = new_lines[1].trim_start_matches("Public key:").trim();
+    let priv_hex = new_lines[2].trim_start_matches("Private key:").trim();
+
+    let show_output = harmony_cmd()
+        .args(["identity", "show", priv_hex])
+        .output()
+        .expect("failed to run identity show");
+    assert!(show_output.status.success());
+
+    let show_stdout = String::from_utf8_lossy(&show_output.stdout);
+    let show_lines: Vec<&str> = show_stdout.lines().collect();
+    assert_eq!(show_lines.len(), 2, "show should print 2 lines");
+
+    let show_addr = show_lines[0].trim_start_matches("Address:").trim();
+    let show_pub = show_lines[1].trim_start_matches("Public key:").trim();
+    assert_eq!(show_addr, expected_addr);
+    assert_eq!(show_pub, expected_pub);
+}
+
+#[test]
+fn identity_show_rejects_invalid_hex() {
+    let output = harmony_cmd()
+        .args(["identity", "show", "not-valid-hex"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success(), "should fail on bad hex");
+}

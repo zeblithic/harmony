@@ -51,6 +51,23 @@ fn main() {
     }
 }
 
+fn decode_hex_key(
+    hex_str: &str,
+    expected_len: usize,
+    label: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let bytes =
+        hex::decode(hex_str).map_err(|e| format!("invalid {label} hex: {e}"))?;
+    if bytes.len() != expected_len {
+        return Err(format!(
+            "{label}: expected {expected_len} bytes, got {}",
+            bytes.len()
+        )
+        .into());
+    }
+    Ok(bytes)
+}
+
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Identity { action } => match action {
@@ -63,7 +80,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Private key: {}", hex::encode(id.to_private_bytes()));
                 Ok(())
             }
-            IdentityAction::Show { .. } => todo!("identity show"),
+            IdentityAction::Show { private_key } => {
+                let bytes = decode_hex_key(&private_key, 64, "private key")?;
+                let id =
+                    harmony_identity::PrivateIdentity::from_private_bytes(&bytes)?;
+                let pub_id = id.public_identity();
+                println!("Address:    {}", hex::encode(pub_id.address_hash));
+                println!("Public key: {}", hex::encode(pub_id.to_public_bytes()));
+                Ok(())
+            }
             IdentityAction::Sign { .. } => todo!("identity sign"),
             IdentityAction::Verify { .. } => todo!("identity verify"),
         },
