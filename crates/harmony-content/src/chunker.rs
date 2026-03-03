@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::cid::MAX_PAYLOAD_SIZE;
 use crate::error::ContentError;
 
@@ -190,6 +192,27 @@ impl Chunker {
             None
         }
     }
+}
+
+/// Split data into chunks using content-defined chunking, returning byte ranges.
+///
+/// This is a convenience wrapper around [`Chunker`] for when all data is available
+/// upfront. Returns the same boundaries as `Chunker::feed()` + `finalize()`.
+pub fn chunk_all(data: &[u8], config: &ChunkerConfig) -> Result<Vec<Range<usize>>, ContentError> {
+    let mut chunker = Chunker::new(*config)?;
+    let cuts = chunker.feed(data);
+    let tail = chunker.finalize();
+
+    let mut ranges = Vec::with_capacity(cuts.len() + 1);
+    let mut start = 0;
+    for cut in cuts {
+        ranges.push(start..cut);
+        start = cut;
+    }
+    if let Some(remaining) = tail {
+        ranges.push(start..start + remaining);
+    }
+    Ok(ranges)
 }
 
 #[cfg(test)]
@@ -442,5 +465,106 @@ mod tests {
             );
             prev = cut;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // chunk_all() convenience function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chunk_all_matches_streaming() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+        let cfg = small_config();
+
+        // chunk_all path
+        let ranges = chunk_all(&data, &cfg).unwrap();
+
+        // Manual streaming path
+        let mut chunker = Chunker::new(cfg).unwrap();
+        let cuts = chunker.feed(&data);
+        let tail = chunker.finalize();
+
+        let mut expected = Vec::new();
+        let mut start = 0;
+        for cut in cuts {
+            expected.push(start..cut);
+            start = cut;
+        }
+        if let Some(remaining) = tail {
+            expected.push(start..start + remaining);
+        }
+
+        assert_eq!(
+            ranges, expected,
+            "chunk_all must produce identical ranges to feed()+finalize()"
+        );
+    }
+
+    #[test]
+    fn chunk_all_covers_entire_input() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+        let cfg = small_config();
+        let ranges = chunk_all(&data, &cfg).unwrap();
+
+        assert!(!ranges.is_empty(), "expected at least one range");
+        assert_eq!(ranges[0].start, 0, "first range must start at 0");
+        assert_eq!(
+            ranges.last().unwrap().end,
+            data.len(),
+            "last range must end at data.len()"
+        );
+
+        // Each range.end == next range.start (contiguous, no gaps or overlaps).
+        for window in ranges.windows(2) {
+            assert_eq!(
+                window[0].end, window[1].start,
+                "ranges must be contiguous: {:?} and {:?}",
+                window[0], window[1]
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_all_empty_input() {
+        let cfg = small_config();
+        let ranges = chunk_all(&[], &cfg).unwrap();
+        assert!(ranges.is_empty(), "empty input must produce empty vec");
+    }
+
+    #[test]
+    fn chunk_all_streaming_multi_feed_equivalence() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+        let cfg = small_config();
+
+        // chunk_all path (single shot)
+        let ranges = chunk_all(&data, &cfg).unwrap();
+
+        // Streaming path: feed in 100-byte increments
+        let mut chunker = Chunker::new(cfg).unwrap();
+        let mut all_cuts: Vec<usize> = Vec::new();
+        let mut offset = 0;
+        for chunk in data.chunks(100) {
+            let cuts = chunker.feed(chunk);
+            for cut in cuts {
+                all_cuts.push(offset + cut);
+            }
+            offset += chunk.len();
+        }
+        let tail = chunker.finalize();
+
+        let mut expected = Vec::new();
+        let mut start = 0;
+        for cut in all_cuts {
+            expected.push(start..cut);
+            start = cut;
+        }
+        if let Some(remaining) = tail {
+            expected.push(start..start + remaining);
+        }
+
+        assert_eq!(
+            ranges, expected,
+            "chunk_all must match multi-feed streaming results"
+        );
     }
 }
