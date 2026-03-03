@@ -129,10 +129,11 @@ pub mod content {
 
     /// Content fetch key: `harmony/content/{prefix}/{cid_hex}`
     ///
-    /// The first hex character is used as the shard prefix. If `cid_hex`
-    /// is empty, returns a key with no shard segment (caller error).
+    /// The first hex character is lowercased for the shard prefix so that
+    /// it matches the registered shard patterns (`harmony/content/a/**`).
+    /// If `cid_hex` is empty, returns a key with no shard segment (caller error).
     pub fn fetch_key(cid_hex: &str) -> String {
-        let prefix = cid_hex.get(..1).unwrap_or("");
+        let prefix: String = cid_hex.get(..1).unwrap_or("").to_ascii_lowercase();
         format!("{PREFIX}/{prefix}/{cid_hex}")
     }
 
@@ -366,6 +367,13 @@ mod tests {
     fn content_fetch_key_uses_first_char_as_shard() {
         let key = content::fetch_key("abc123def456");
         assert_eq!(key, "harmony/content/a/abc123def456");
+    }
+
+    #[test]
+    fn content_fetch_key_lowercases_shard_prefix() {
+        // Uppercase hex must map to the same lowercase shard pattern.
+        let key = content::fetch_key("ABC123DEF456");
+        assert_eq!(key, "harmony/content/a/ABC123DEF456");
     }
 
     #[test]
