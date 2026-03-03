@@ -444,65 +444,31 @@ impl ResourceSender {
 
         // If the receiver signaled hashmap exhaustion, respond with an HMU
         // before sending any requested parts.
+        // Optionally prepend HMU if the receiver signaled hashmap exhaustion.
+        let mut prefix_actions = Vec::new();
         if flag == HASHMAP_IS_EXHAUSTED {
             if let Some(ref lmh) = last_map_hash {
                 if let Some(hmu_actions) = self.build_hmu(lmh) {
-                    self.state = SenderState::Transferring;
-                    let mut actions = vec![ResourceAction::SenderStateChanged];
-
-                    // Send the HMU first so the receiver can install new hashes.
-                    actions.extend(hmu_actions);
-
-                    // Then send any requested parts.
-                    let requested_count = map_data.len() / MAPHASH_LEN;
-                    for chunk_idx in 0..requested_count {
-                        let offset = chunk_idx * MAPHASH_LEN;
-                        let mut mh = [0u8; MAPHASH_LEN];
-                        mh.copy_from_slice(&map_data[offset..offset + MAPHASH_LEN]);
-
-                        let part_idx = self
-                            .map_hashes
-                            .iter()
-                            .enumerate()
-                            .position(|(i, h)| *h == mh && !self.parts_sent[i])
-                            .or_else(|| self.map_hashes.iter().position(|h| *h == mh));
-
-                        if let Some(idx) = part_idx {
-                            actions.push(ResourceAction::SendPacket {
-                                context: PacketContext::Resource.as_byte(),
-                                plaintext: self.parts[idx].clone(),
-                            });
-                            self.parts_sent[idx] = true;
-                        }
-                    }
-
-                    let unique_sent = self.parts_sent.iter().filter(|&&s| s).count();
-                    if unique_sent >= self.parts.len() {
-                        self.state = SenderState::AwaitingProof;
-                        actions.push(ResourceAction::SenderStateChanged);
-                        let timeout = self.last_activity
-                            + self.rtt_ms.unwrap_or(DEFAULT_TIMEOUT_MS)
-                                * PROOF_TIMEOUT_FACTOR as u64;
-                        actions.push(ResourceAction::ScheduleTimeout {
-                            deadline_ms: timeout,
-                        });
-                    }
-
-                    let progress = unique_sent as f32 / self.parts.len().max(1) as f32;
-                    actions.push(ResourceAction::Progress { fraction: progress });
-
-                    return actions;
+                    prefix_actions = hmu_actions;
                 }
             }
         }
 
         self.state = SenderState::Transferring;
         let mut actions = vec![ResourceAction::SenderStateChanged];
+        actions.extend(prefix_actions);
+        actions.extend(self.send_requested_parts(map_data));
+        actions
+    }
 
-        // Send each requested part.  For each requested map hash, find the
-        // first not-yet-sent part that matches (handles duplicate hashes
-        // correctly, though encrypted data is extremely unlikely to produce
-        // duplicates).
+    /// Send the parts whose map hashes appear in `map_data`, check completion,
+    /// and emit progress.  Shared between the normal and HMU-prefixed request paths.
+    fn send_requested_parts(&mut self, map_data: &[u8]) -> Vec<ResourceAction> {
+        let mut actions = Vec::new();
+
+        // For each requested map hash, find the first not-yet-sent part that
+        // matches (handles duplicate hashes correctly, though encrypted data is
+        // extremely unlikely to produce duplicates).
         let requested_count = map_data.len() / MAPHASH_LEN;
         for chunk_idx in 0..requested_count {
             let offset = chunk_idx * MAPHASH_LEN;
