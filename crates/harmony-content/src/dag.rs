@@ -120,6 +120,53 @@ fn walk_recursive(
     Ok(())
 }
 
+/// Reassemble original data from a Merkle DAG root CID.
+///
+/// Walks the DAG to collect blob CIDs in order, fetches each blob from the
+/// store, and concatenates them. If the root is a bundle with inline metadata,
+/// pre-allocates the output buffer using the total file size.
+///
+/// Guarantees: `reassemble(ingest(data)) == data` for all non-empty inputs.
+pub fn reassemble(
+    root_cid: &ContentId,
+    store: &dyn BlobStore,
+) -> Result<Vec<u8>, ContentError> {
+    // Try to pre-allocate using inline metadata if available.
+    let capacity = estimate_size(root_cid, store);
+    let mut output = Vec::with_capacity(capacity);
+
+    let blob_cids = walk(root_cid, store)?;
+    for cid in &blob_cids {
+        let data = store
+            .get(cid)
+            .ok_or(ContentError::MissingContent { cid: *cid })?;
+        output.extend_from_slice(data);
+    }
+
+    Ok(output)
+}
+
+/// Estimate total data size from inline metadata (if present).
+/// Returns 0 if unavailable — Vec will grow dynamically.
+fn estimate_size(root_cid: &ContentId, store: &dyn BlobStore) -> usize {
+    if let CidType::Bundle(_) = root_cid.cid_type() {
+        if let Some(data) = store.get(root_cid) {
+            if let Ok(entries) = bundle::parse_bundle(data) {
+                if let Some(first) = entries.first() {
+                    if first.cid_type() == CidType::InlineMetadata {
+                        if let Ok((total_size, _, _, _)) = first.parse_inline_metadata() {
+                            return total_size as usize;
+                        }
+                    }
+                }
+            }
+        }
+    } else if let CidType::Blob = root_cid.cid_type() {
+        return root_cid.payload_size() as usize;
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +272,43 @@ mod tests {
 
         let result = walk(&root, &store);
         assert!(matches!(result, Err(ContentError::MissingContent { .. })));
+    }
+
+    #[test]
+    fn round_trip_small_data() {
+        let mut store = MemoryBlobStore::new();
+        let data = b"hello round trip";
+        let root = ingest(data.as_slice(), &test_config(), &mut store).unwrap();
+        let recovered = reassemble(&root, &store).unwrap();
+        assert_eq!(recovered, data);
+    }
+
+    #[test]
+    fn round_trip_medium_data() {
+        let mut store = MemoryBlobStore::new();
+        let data: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
+        let root = ingest(&data, &test_config(), &mut store).unwrap();
+        let recovered = reassemble(&root, &store).unwrap();
+        assert_eq!(recovered, data);
+    }
+
+    #[test]
+    fn round_trip_large_data() {
+        let mut store = MemoryBlobStore::new();
+        // 8KB+ should produce two+ bundle levels with small config.
+        let data: Vec<u8> = (0..8192).map(|i| (i * 41 % 256) as u8).collect();
+        let root = ingest(&data, &test_config(), &mut store).unwrap();
+        let recovered = reassemble(&root, &store).unwrap();
+        assert_eq!(recovered, data);
+    }
+
+    #[test]
+    fn round_trip_exact_max_chunk() {
+        let mut store = MemoryBlobStore::new();
+        let config = test_config();
+        let data = vec![0xCD; config.max_chunk];
+        let root = ingest(&data, &config, &mut store).unwrap();
+        let recovered = reassemble(&root, &store).unwrap();
+        assert_eq!(recovered, data);
     }
 }
