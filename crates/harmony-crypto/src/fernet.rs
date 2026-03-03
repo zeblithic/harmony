@@ -39,7 +39,7 @@ pub const FERNET_TOKEN_MIN: usize = IV_LENGTH + 16 + HMAC_LENGTH;
 /// `key` must be 64 bytes: `[32B signing key][32B encryption key]`.
 /// Returns `[16B IV][ciphertext with PKCS7 padding][32B HMAC]`.
 pub fn encrypt(
-    rng: &mut impl CryptoRngCore,
+    rng: &mut (impl CryptoRngCore + ?Sized),
     key: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {

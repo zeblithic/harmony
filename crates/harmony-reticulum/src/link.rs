@@ -18,6 +18,7 @@ use zeroize::Zeroize;
 use crate::context::PacketContext;
 use crate::destination::DestinationName;
 use crate::error::ReticulumError;
+use crate::resource::LinkCrypto;
 use crate::packet::{
     DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
 };
@@ -586,6 +587,35 @@ impl Link {
     }
 }
 
+impl LinkCrypto for Link {
+    fn encrypt(
+        &self,
+        rng: &mut dyn CryptoRngCore,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ReticulumError> {
+        self.require_active()?;
+        let key = self.derived_key.as_ref().unwrap();
+        fernet::encrypt(rng, key, plaintext).map_err(|e| ReticulumError::Identity(e.into()))
+    }
+
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, ReticulumError> {
+        self.require_active()?;
+        let key = self.derived_key.as_ref().unwrap();
+        fernet::decrypt(key, ciphertext).map_err(|e| ReticulumError::Identity(e.into()))
+    }
+
+    fn link_id(&self) -> &[u8; 16] {
+        &self.link_id
+    }
+
+    fn mdu(&self) -> usize {
+        // Fernet overhead: version(1) + timestamp(8) + IV(16) + padding(16 max) + HMAC(32) = ~73
+        // MTU(500) - Header Type1(19) - Fernet(73) = 408
+        // Python uses SDU=383. Match Python for interop.
+        383
+    }
+}
+
 // ── RTT data encoding ────────────────────────────────────────────────
 
 /// Encode RTT as msgpack float64: [0xcb][f64.to_be_bytes()].
@@ -778,6 +808,22 @@ mod tests {
         let encrypted = initiator.encrypt(&mut OsRng, &plaintext).unwrap();
         let decrypted = responder.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    // ── LinkCrypto trait ────────────────────────────────────────────
+
+    #[test]
+    fn link_crypto_trait_roundtrip() {
+        use crate::resource::LinkCrypto;
+        let (initiator, _responder) = setup_active_link();
+
+        // Use LinkCrypto trait methods
+        let plaintext = b"testing LinkCrypto trait impl";
+        let encrypted = LinkCrypto::encrypt(&initiator, &mut OsRng, plaintext).unwrap();
+        let decrypted = LinkCrypto::decrypt(&initiator, &encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+        assert_eq!(LinkCrypto::link_id(&initiator).len(), 16);
+        assert_eq!(LinkCrypto::mdu(&initiator), 383);
     }
 
     // ── Identification ──────────────────────────────────────────────
