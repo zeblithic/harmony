@@ -43,4 +43,5 @@ hex = "0.4"
 harmony-content = { path = "crates/harmony-content" }
 harmony-crypto = { path = "crates/harmony-crypto" }
 harmony-identity = { path = "crates/harmony-identity" }
+harmony-reticulum = { path = "crates/harmony-reticulum" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
