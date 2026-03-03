@@ -25,7 +25,6 @@ pub struct ContentStore<S: BlobStore> {
     window: Lru,
     probation: Lru,
     protected: Lru,
-    #[allow(dead_code)] // Used in Task 8: pin/unpin support
     pinned: HashSet<ContentId>,
 }
 
@@ -55,6 +54,21 @@ impl<S: BlobStore> ContentStore<S> {
             protected: Lru::new(protected_cap),
             pinned: HashSet::new(),
         }
+    }
+
+    /// Pin a CID, exempting it from eviction.
+    pub fn pin(&mut self, cid: ContentId) {
+        self.pinned.insert(cid);
+    }
+
+    /// Unpin a CID, making it eligible for eviction again.
+    pub fn unpin(&mut self, cid: &ContentId) {
+        self.pinned.remove(cid);
+    }
+
+    /// Check if a CID is pinned.
+    pub fn is_pinned(&self, cid: &ContentId) -> bool {
+        self.pinned.contains(cid)
     }
 
     /// Record an access for a CID already in the cache.
@@ -118,6 +132,12 @@ impl<S: BlobStore> ContentStore<S> {
                 self.probation.insert(candidate);
                 return;
             }
+            // Victim is pinned — admit candidate without evicting victim.
+            if self.pinned.contains(&victim) {
+                self.probation.insert(candidate);
+                return;
+            }
+
             // Probation full — compare frequencies.
             let candidate_freq = self.sketch.estimate(&candidate);
             let victim_freq = self.sketch.estimate(&victim);
@@ -262,5 +282,29 @@ mod tests {
                 || cs.protected.contains(&hot),
             "hot CID should survive sequential scan"
         );
+    }
+
+    #[test]
+    fn pin_exempts_from_eviction() {
+        // Small cache: capacity 5 → window=1, protected=1, probation=3.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 5);
+
+        let pinned_cid = cs.insert(b"pinned-data").unwrap();
+        cs.pin(pinned_cid);
+
+        // Fill the cache well beyond capacity.
+        for i in 0..20 {
+            let data = format!("filler-{i}");
+            cs.insert(data.as_bytes()).unwrap();
+        }
+
+        // Pinned item should still be retrievable.
+        assert!(cs.is_pinned(&pinned_cid));
+        assert!(cs.contains(&pinned_cid));
+
+        // Unpin and verify it becomes evictable.
+        cs.unpin(&pinned_cid);
+        assert!(!cs.is_pinned(&pinned_cid));
     }
 }
