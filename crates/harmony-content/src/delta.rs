@@ -14,6 +14,77 @@ const UPDATE_FULL: u8 = 0x00;
 /// Tag byte for encode_update: delta follows.
 const UPDATE_DELTA: u8 = 0x01;
 
+/// Compute a CID-aligned delta between an old and new bundle.
+///
+/// Returns a compact byte sequence of COPY/INSERT opcodes. Both inputs
+/// must be valid bundle byte arrays (length is a multiple of 32).
+///
+/// The algorithm finds the longest common prefix and suffix of CIDs,
+/// then emits COPY for shared regions and INSERT for changed regions.
+pub fn compute_delta(old_bundle: &[u8], new_bundle: &[u8]) -> Result<Vec<u8>, ContentError> {
+    let old_cids = bundle::parse_bundle(old_bundle)?;
+    let new_cids = bundle::parse_bundle(new_bundle)?;
+
+    let mut delta = Vec::new();
+
+    if new_cids.is_empty() {
+        return Ok(delta);
+    }
+
+    // Find longest common prefix.
+    let prefix_len = old_cids
+        .iter()
+        .zip(new_cids.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // Find longest common suffix (after the prefix).
+    let _old_remaining = old_cids.len() - prefix_len;
+    let new_remaining = new_cids.len() - prefix_len;
+    let suffix_len = old_cids[prefix_len..]
+        .iter()
+        .rev()
+        .zip(new_cids[prefix_len..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let insert_count = new_remaining - suffix_len;
+
+    // Emit COPY for prefix.
+    if prefix_len > 0 {
+        emit_copy(&mut delta, 0, prefix_len);
+    }
+
+    // Emit INSERT for middle (new CIDs not in old).
+    if insert_count > 0 {
+        emit_insert(&mut delta, &new_cids[prefix_len..prefix_len + insert_count]);
+    }
+
+    // Emit COPY for suffix.
+    if suffix_len > 0 {
+        let suffix_offset = old_cids.len() - suffix_len;
+        emit_copy(&mut delta, suffix_offset, suffix_len);
+    }
+
+    Ok(delta)
+}
+
+/// Emit a COPY opcode: copy `count` CIDs starting at `offset` in the old bundle.
+fn emit_copy(delta: &mut Vec<u8>, offset: usize, count: usize) {
+    delta.push(OP_COPY);
+    delta.extend_from_slice(&(offset as u16).to_be_bytes());
+    delta.extend_from_slice(&(count as u16).to_be_bytes());
+}
+
+/// Emit an INSERT opcode: inline `cids` as new data.
+fn emit_insert(delta: &mut Vec<u8>, cids: &[ContentId]) {
+    delta.push(OP_INSERT);
+    delta.extend_from_slice(&(cids.len() as u16).to_be_bytes());
+    for cid in cids {
+        delta.extend_from_slice(&cid.to_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,5 +114,58 @@ mod tests {
         let _ = OP_INSERT;
         let cids = make_cids(3);
         let _ = bundle_bytes(&cids);
+    }
+
+    #[test]
+    fn delta_identical_bundles() {
+        let cids = make_cids(5);
+        let old = bundle_bytes(&cids);
+        let new = bundle_bytes(&cids);
+        let delta = compute_delta(&old, &new).unwrap();
+        // Single COPY opcode = 5 bytes, much smaller than 160-byte bundle.
+        assert_eq!(delta.len(), 5);
+        assert!(delta.len() < old.len());
+    }
+
+    #[test]
+    fn delta_single_cid_change() {
+        let mut cids = make_cids(5);
+        let old = bundle_bytes(&cids);
+        // Change middle CID.
+        cids[2] = ContentId::for_blob(b"replacement").unwrap();
+        let new = bundle_bytes(&cids);
+        let delta = compute_delta(&old, &new).unwrap();
+        // COPY(0,2) + INSERT(1) + COPY(3,2) = 5 + 35 + 5 = 45 bytes.
+        assert_eq!(delta.len(), 45);
+    }
+
+    #[test]
+    fn delta_append() {
+        let cids = make_cids(5);
+        let old = bundle_bytes(&cids[..3]);
+        let new = bundle_bytes(&cids);
+        let delta = compute_delta(&old, &new).unwrap();
+        // COPY(0,3) + INSERT(2) = 5 + 67 = 72 bytes.
+        assert_eq!(delta.len(), 72);
+    }
+
+    #[test]
+    fn delta_prepend() {
+        let cids = make_cids(5);
+        let old = bundle_bytes(&cids[2..]);
+        let new = bundle_bytes(&cids);
+        let delta = compute_delta(&old, &new).unwrap();
+        // INSERT(2) + COPY(0,3) = 67 + 5 = 72 bytes.
+        assert_eq!(delta.len(), 72);
+    }
+
+    #[test]
+    fn delta_empty_old_bundle() {
+        let cids = make_cids(3);
+        let old: Vec<u8> = vec![];
+        let new = bundle_bytes(&cids);
+        let delta = compute_delta(&old, &new).unwrap();
+        // All INSERT: 3 + 96 = 99 bytes.
+        assert_eq!(delta.len(), 99);
     }
 }
