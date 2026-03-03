@@ -85,6 +85,70 @@ fn emit_insert(delta: &mut Vec<u8>, cids: &[ContentId]) {
     }
 }
 
+/// Apply a delta to an old bundle, producing the new bundle bytes.
+///
+/// The old bundle must be a valid bundle (length multiple of 32).
+/// The delta is a sequence of COPY/INSERT opcodes produced by `compute_delta`.
+pub fn apply_delta(old_bundle: &[u8], delta: &[u8]) -> Result<Vec<u8>, ContentError> {
+    let old_cids = bundle::parse_bundle(old_bundle)?;
+    let mut result = Vec::new();
+    let mut pos = 0;
+
+    while pos < delta.len() {
+        match delta[pos] {
+            OP_COPY => {
+                if pos + 5 > delta.len() {
+                    return Err(ContentError::InvalidDelta {
+                        reason: "truncated COPY opcode",
+                    });
+                }
+                let offset =
+                    u16::from_be_bytes([delta[pos + 1], delta[pos + 2]]) as usize;
+                let count =
+                    u16::from_be_bytes([delta[pos + 3], delta[pos + 4]]) as usize;
+                pos += 5;
+
+                if offset + count > old_cids.len() {
+                    return Err(ContentError::InvalidDelta {
+                        reason: "COPY range exceeds old bundle",
+                    });
+                }
+
+                for cid in &old_cids[offset..offset + count] {
+                    result.extend_from_slice(&cid.to_bytes());
+                }
+            }
+            OP_INSERT => {
+                if pos + 3 > delta.len() {
+                    return Err(ContentError::InvalidDelta {
+                        reason: "truncated INSERT opcode",
+                    });
+                }
+                let count =
+                    u16::from_be_bytes([delta[pos + 1], delta[pos + 2]]) as usize;
+                pos += 3;
+
+                let data_len = count * CID_SIZE;
+                if pos + data_len > delta.len() {
+                    return Err(ContentError::InvalidDelta {
+                        reason: "truncated INSERT data",
+                    });
+                }
+
+                result.extend_from_slice(&delta[pos..pos + data_len]);
+                pos += data_len;
+            }
+            _ => {
+                return Err(ContentError::InvalidDelta {
+                    reason: "unknown opcode",
+                });
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +231,53 @@ mod tests {
         let delta = compute_delta(&old, &new).unwrap();
         // All INSERT: 3 + 96 = 99 bytes.
         assert_eq!(delta.len(), 99);
+    }
+
+    #[test]
+    fn apply_delta_round_trip() {
+        let old_cids = make_cids(5);
+        let mut new_cids = old_cids.clone();
+        new_cids[2] = ContentId::for_blob(b"changed").unwrap();
+
+        let old = bundle_bytes(&old_cids);
+        let new = bundle_bytes(&new_cids);
+        let delta = compute_delta(&old, &new).unwrap();
+        let reconstructed = apply_delta(&old, &delta).unwrap();
+        assert_eq!(reconstructed, new);
+    }
+
+    #[test]
+    fn apply_delta_round_trip_prepend() {
+        let cids = make_cids(5);
+        let old = bundle_bytes(&cids[2..]);
+        let new = bundle_bytes(&cids);
+        let delta = compute_delta(&old, &new).unwrap();
+        let reconstructed = apply_delta(&old, &delta).unwrap();
+        assert_eq!(reconstructed, new);
+    }
+
+    #[test]
+    fn apply_delta_invalid_opcode() {
+        let old = bundle_bytes(&make_cids(1));
+        let bad_delta = vec![0xFF, 0x00, 0x00, 0x00, 0x01];
+        let result = apply_delta(&old, &bad_delta);
+        assert!(matches!(result, Err(ContentError::InvalidDelta { .. })));
+    }
+
+    #[test]
+    fn apply_delta_truncated_copy() {
+        let old = bundle_bytes(&make_cids(1));
+        let bad_delta = vec![OP_COPY, 0x00]; // Only 2 bytes, need 5.
+        let result = apply_delta(&old, &bad_delta);
+        assert!(matches!(result, Err(ContentError::InvalidDelta { .. })));
+    }
+
+    #[test]
+    fn apply_delta_copy_out_of_bounds() {
+        let old = bundle_bytes(&make_cids(2));
+        // COPY offset=0, count=5 — but old only has 2 CIDs.
+        let bad_delta = vec![OP_COPY, 0x00, 0x00, 0x00, 0x05];
+        let result = apply_delta(&old, &bad_delta);
+        assert!(matches!(result, Err(ContentError::InvalidDelta { .. })));
     }
 }
