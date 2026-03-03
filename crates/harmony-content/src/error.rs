@@ -29,4 +29,7 @@ pub enum ContentError {
 
     #[error("content not found in store: {cid}")]
     MissingContent { cid: ContentId },
+
+    #[error("invalid delta: {reason}")]
+    InvalidDelta { reason: &'static str },
 }
