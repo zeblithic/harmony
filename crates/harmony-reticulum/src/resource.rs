@@ -970,10 +970,16 @@ impl ResourceReceiver {
             return vec![];
         }
 
-        let _segment: u32 = match rmp::decode::read_int(&mut rd) {
+        let segment: u32 = match rmp::decode::read_int(&mut rd) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
+
+        // Segment 0 is the initial advertisement. HMU segments start at 1.
+        // Reject segment 0 (duplicate of advertisement data).
+        if segment == 0 {
+            return vec![];
+        }
 
         let hash_len = match rmp::decode::read_bin_len(&mut rd) {
             Ok(len) => len as usize,
@@ -1496,9 +1502,7 @@ impl ResourceAdvertisement {
             flags: flags.ok_or(ReticulumError::ResourceAdvInvalid)?,
             segment_index: segment_index.ok_or(ReticulumError::ResourceAdvInvalid)?,
             total_segments: total_segments.ok_or(ReticulumError::ResourceAdvInvalid)?,
-            request_id: request_id
-                .ok_or(ReticulumError::ResourceAdvInvalid)?
-                .clone(),
+            request_id: request_id.ok_or(ReticulumError::ResourceAdvInvalid)?,
         })
     }
 }
