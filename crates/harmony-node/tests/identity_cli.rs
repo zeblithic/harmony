@@ -99,3 +99,73 @@ fn identity_sign_produces_valid_signature() {
     );
     hex::decode(sig_hex).expect("signature should be valid hex");
 }
+
+#[test]
+fn sign_then_verify_round_trip() {
+    let new_output = harmony_cmd()
+        .args(["identity", "new"])
+        .output()
+        .unwrap();
+    let new_stdout = String::from_utf8_lossy(&new_output.stdout);
+    let new_lines: Vec<&str> = new_stdout.lines().collect();
+    let pub_hex = new_lines[1].trim_start_matches("Public key:").trim();
+    let priv_hex = new_lines[2].trim_start_matches("Private key:").trim();
+
+    let message = "test message for verification";
+
+    let sign_output = harmony_cmd()
+        .args(["identity", "sign", priv_hex, message])
+        .output()
+        .unwrap();
+    let sign_stdout = String::from_utf8_lossy(&sign_output.stdout);
+    let sig_hex = sign_stdout
+        .lines()
+        .next()
+        .unwrap()
+        .trim_start_matches("Signature:")
+        .trim();
+
+    let verify_output = harmony_cmd()
+        .args(["identity", "verify", pub_hex, message, sig_hex])
+        .output()
+        .unwrap();
+    assert!(
+        verify_output.status.success(),
+        "valid signature should verify"
+    );
+    let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
+    assert!(verify_stdout.contains("Valid"), "should print Valid");
+}
+
+#[test]
+fn verify_rejects_corrupted_signature() {
+    let new_output = harmony_cmd()
+        .args(["identity", "new"])
+        .output()
+        .unwrap();
+    let new_stdout = String::from_utf8_lossy(&new_output.stdout);
+    let new_lines: Vec<&str> = new_stdout.lines().collect();
+    let pub_hex = new_lines[1].trim_start_matches("Public key:").trim();
+    let priv_hex = new_lines[2].trim_start_matches("Private key:").trim();
+
+    let sign_output = harmony_cmd()
+        .args(["identity", "sign", priv_hex, "original"])
+        .output()
+        .unwrap();
+    let sign_stdout = String::from_utf8_lossy(&sign_output.stdout);
+    let sig_hex = sign_stdout
+        .lines()
+        .next()
+        .unwrap()
+        .trim_start_matches("Signature:")
+        .trim();
+
+    let verify_output = harmony_cmd()
+        .args(["identity", "verify", pub_hex, "tampered", sig_hex])
+        .output()
+        .unwrap();
+    assert!(
+        !verify_output.status.success(),
+        "tampered message should fail verification"
+    );
+}

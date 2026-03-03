@@ -97,7 +97,29 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Signature: {}", hex::encode(signature));
                 Ok(())
             }
-            IdentityAction::Verify { .. } => todo!("identity verify"),
+            IdentityAction::Verify {
+                public_key,
+                message,
+                signature,
+            } => {
+                let pub_bytes =
+                    decode_hex_key(&public_key, 64, "public key")?;
+                let sig_bytes =
+                    decode_hex_key(&signature, 64, "signature")?;
+                let identity =
+                    harmony_identity::Identity::from_public_bytes(&pub_bytes)?;
+                let sig_array: [u8; 64] = sig_bytes.try_into().unwrap();
+                match identity.verify(message.as_bytes(), &sig_array) {
+                    Ok(()) => {
+                        println!("Valid");
+                        Ok(())
+                    }
+                    Err(_) => {
+                        eprintln!("Invalid");
+                        std::process::exit(1);
+                    }
+                }
+            }
         },
     }
 }
