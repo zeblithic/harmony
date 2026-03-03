@@ -27,16 +27,36 @@ Complete ALL steps below. Use parallel tool calls where steps are independent.
 - Determine which bead this delivery is for (from `$ARGUMENTS`, active beads, or branch name)
 - If a bead ID is provided, run `bd show <bead-id>` to get its title
 
-### 2. Create task branch (if needed)
+### 2. Close the bead
 
-- If on `main` or `master`: create and switch to a task branch
-  - Branch naming convention: `jake-<crate-short>-<slug>` derived from the bead title
-  - Example: bead "transport relay with reverse table" on crate `harmony-reticulum` becomes `jake-harmony-ret-transport-relay-reversetbl`
-- If already on a task branch: use it as-is
+- Close the bead with `bd close <bead-id> --reason "Delivered — PR pending review"`
+- Once work goes up for review, the PR is the state tracker — the bead's job is done
 
-### 3. Stage and commit
+### 3. Ensure work is on a task branch (NOT main)
 
-- Stage relevant changed files with `git add <specific-files>` (prefer explicit paths over `git add .`)
+**CRITICAL: `bd` auto-commits and pushes to the current branch. If on main, this pushes unreviewed code. All work MUST be on a task branch.**
+
+- Branch naming convention: `jake-<crate-short>-<slug>` derived from the bead title
+- Example: bead "W-TinyLFU cache admission" on `harmony-content` becomes `jake-content-wtinylfu-cache`
+
+**If already on a task branch:** proceed to step 4.
+
+**If on main with uncommitted changes:**
+- Create task branch from main: `git checkout -b jake-<crate>-<slug>`
+- Stage and commit on the task branch
+
+**If on main with commits already pushed (retroactive PR):**
+- This is the worst case — unreviewed code landed on main via `bd` auto-push
+- Find the last clean main commit (before our work began)
+- Create task branch from that clean point: `git checkout -b jake-<crate>-<slug> <clean-sha>`
+- Cherry-pick the work commits (skip `bd: backup` commits): `git cherry-pick <sha1> <sha2> ...`
+- Push the task branch: `git push -u origin jake-<crate>-<slug>`
+- Reset main: `git checkout main && git reset --hard <clean-sha> && git push --force origin main`
+- **Warn the user this required a force-push to main**
+
+### 4. Stage and commit (if needed)
+
+- If there are unstaged changes, stage with `git add <specific-files>` (prefer explicit paths)
 - Do NOT stage secrets (.env, credentials, keys, .dolt/)
 - Create a commit with a clear message summarizing the work
 - End the commit message with:
@@ -45,11 +65,11 @@ Complete ALL steps below. Use parallel tool calls where steps are independent.
   ```
 - Use a HEREDOC for the commit message to ensure correct formatting
 
-### 4. Push to origin
+### 5. Push to origin
 
 - `git push -u origin <branch-name>`
 
-### 5. Create PR against main
+### 6. Create PR against main
 
 Use `gh pr create --base main` with this format:
 
@@ -67,7 +87,7 @@ EOF
 )"
 ```
 
-### 6. Trigger Bugbot review
+### 7. Trigger Bugbot review
 
 After the PR is created, immediately comment on it:
 
@@ -77,7 +97,7 @@ gh pr comment <pr-number> --body "bugbot run"
 
 Greptile reviews trigger automatically on PR creation — no action needed for Greptile.
 
-### 7. Report
+### 8. Report
 
 - Print the PR URL
 - Print this reminder:

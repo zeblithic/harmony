@@ -6,13 +6,27 @@ version: 1.0.0
 
 # Harmony Delivery Workflow
 
-When a unit of work from a bead is complete, the standard delivery process is:
+## CRITICAL: Branch-First Rule
 
-1. **Commit** changes on a task branch (named after the bead)
-2. **Push** to origin (once only)
-3. **Create PR** against main
-4. **Trigger reviews**: Comment "bugbot run" on the PR (Greptile triggers automatically)
-5. **Wait**: Do NOT push new changes while reviews are in progress
+**ALWAYS create a task branch BEFORE starting any work — including brainstorming, coding, or `bd` commands.**
+
+`bd sync` and `bd` backup auto-commit and auto-push to the current branch. If you're on `main`, this pushes unreviewed code directly to main. This has caused painful retroactive PR cleanups. The fix is simple: create the task branch first.
+
+**When picking up a bead:**
+1. `git checkout -b jake-<crate>-<slug>` — create task branch FIRST
+2. Then do all work (brainstorm, code, tests, `bd` interactions) on the branch
+3. When done, `/deliver` to ship
+
+## Delivery Process
+
+When a unit of work from a bead is complete:
+
+1. **Close bead** — the PR becomes the state tracker from here
+2. **Commit** changes on the task branch
+3. **Push** to origin (once only)
+4. **Create PR** against main
+5. **Trigger reviews**: Comment "bugbot run" on the PR (Greptile triggers automatically)
+6. **Wait**: Do NOT push new changes while reviews are in progress
 
 Use `/deliver` to execute this workflow automatically.
 
@@ -27,6 +41,7 @@ Proactively suggest `/deliver` when ALL of these are true:
 
 ## Critical rules
 
+- **Branch first, always** — never start work on main; `bd` auto-pushes will ruin your day
 - **Never push during active reviews** — pushing resets Bugbot and Greptile review agents
 - **Always trigger bugbot** — comment "bugbot run" on every new PR (including the first)
 - **Greptile is automatic** — it reviews on PR creation, no manual trigger needed
