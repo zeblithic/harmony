@@ -75,6 +75,7 @@ pub enum StorageTierAction {
 /// actions.
 pub struct StorageTier<B: BlobStore> {
     cache: ContentStore<B>,
+    #[allow(dead_code)]
     budget: StorageBudget,
     metrics: StorageMetrics,
 }
@@ -87,14 +88,15 @@ impl<B: BlobStore> StorageTier<B> {
         let mut queryable_keys = ns::all_shard_patterns();
         queryable_keys.push(ns::STATS.to_string());
 
-        let subscriber_keys = vec![
-            ns::TRANSIT_SUB.to_string(),
-            ns::PUBLISH_SUB.to_string(),
-        ];
+        let subscriber_keys = vec![ns::TRANSIT_SUB.to_string(), ns::PUBLISH_SUB.to_string()];
 
         let actions = vec![
-            StorageTierAction::DeclareQueryables { key_exprs: queryable_keys },
-            StorageTierAction::DeclareSubscribers { key_exprs: subscriber_keys },
+            StorageTierAction::DeclareQueryables {
+                key_exprs: queryable_keys,
+            },
+            StorageTierAction::DeclareSubscribers {
+                key_exprs: subscriber_keys,
+            },
         ];
 
         let tier = Self {
@@ -112,6 +114,7 @@ impl<B: BlobStore> StorageTier<B> {
     }
 
     /// Mutable access to the underlying content store (crate-internal).
+    #[allow(dead_code)]
     pub(crate) fn cache_mut(&mut self) -> &mut ContentStore<B> {
         &mut self.cache
     }
@@ -122,15 +125,9 @@ impl<B: BlobStore> StorageTier<B> {
             StorageTierEvent::ContentQuery { query_id, cid } => {
                 self.handle_content_query(query_id, &cid)
             }
-            StorageTierEvent::TransitContent { cid, data } => {
-                self.handle_transit(cid, data)
-            }
-            StorageTierEvent::PublishContent { cid, data } => {
-                self.handle_publish(cid, data)
-            }
-            StorageTierEvent::StatsQuery { query_id } => {
-                self.handle_stats_query(query_id)
-            }
+            StorageTierEvent::TransitContent { cid, data } => self.handle_transit(cid, data),
+            StorageTierEvent::PublishContent { cid, data } => self.handle_publish(cid, data),
+            StorageTierEvent::StatsQuery { query_id } => self.handle_stats_query(query_id),
         }
     }
 
@@ -139,7 +136,10 @@ impl<B: BlobStore> StorageTier<B> {
         match self.cache.get_and_record(cid) {
             Some(data) => {
                 self.metrics.cache_hits += 1;
-                vec![StorageTierAction::SendReply { query_id, payload: data }]
+                vec![StorageTierAction::SendReply {
+                    query_id,
+                    payload: data,
+                }]
             }
             None => {
                 self.metrics.cache_misses += 1;
@@ -215,7 +215,10 @@ mod tests {
 
     #[test]
     fn content_query_hit_returns_reply() {
-        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 1_000_000 };
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
 
         let data = b"cached blob";
@@ -237,7 +240,10 @@ mod tests {
 
     #[test]
     fn content_query_miss_returns_nothing() {
-        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 1_000_000 };
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
         let cid = ContentId::for_blob(b"not stored").unwrap();
 
@@ -249,12 +255,18 @@ mod tests {
 
     #[test]
     fn stats_query_returns_serialized_metrics() {
-        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 1_000_000 };
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
 
         let data = b"stats test blob";
         let cid = ContentId::for_blob(data).unwrap();
-        tier.handle(StorageTierEvent::PublishContent { cid, data: data.to_vec() });
+        tier.handle(StorageTierEvent::PublishContent {
+            cid,
+            data: data.to_vec(),
+        });
         tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });
 
         let actions = tier.handle(StorageTierEvent::StatsQuery { query_id: 77 });
@@ -272,7 +284,10 @@ mod tests {
 
     #[test]
     fn publish_content_always_stored_and_announced() {
-        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 1_000_000 };
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
         let data = b"explicitly published blob";
         let cid = ContentId::for_blob(data).unwrap();
@@ -300,7 +315,10 @@ mod tests {
 
     #[test]
     fn transit_content_admitted_produces_announcement() {
-        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 1_000_000 };
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
         let data = b"transiting blob";
         let cid = ContentId::for_blob(data).unwrap();
