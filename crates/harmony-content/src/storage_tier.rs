@@ -25,6 +25,20 @@ pub struct StorageMetrics {
     pub publishes_stored: u64,
 }
 
+impl StorageMetrics {
+    /// Serialize metrics as 6 big-endian u64s (48 bytes).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(48);
+        buf.extend_from_slice(&self.queries_served.to_be_bytes());
+        buf.extend_from_slice(&self.cache_hits.to_be_bytes());
+        buf.extend_from_slice(&self.cache_misses.to_be_bytes());
+        buf.extend_from_slice(&self.transit_admitted.to_be_bytes());
+        buf.extend_from_slice(&self.transit_rejected.to_be_bytes());
+        buf.extend_from_slice(&self.publishes_stored.to_be_bytes());
+        buf
+    }
+}
+
 /// Inbound events for the storage tier to process.
 #[derive(Debug, Clone)]
 pub enum StorageTierEvent {
@@ -152,8 +166,11 @@ impl<B: BlobStore> StorageTier<B> {
         vec![StorageTierAction::AnnounceContent { key_expr, payload }]
     }
 
-    fn handle_stats_query(&mut self, _query_id: u64) -> Vec<StorageTierAction> {
-        vec![]
+    fn handle_stats_query(&mut self, query_id: u64) -> Vec<StorageTierAction> {
+        vec![StorageTierAction::SendStatsReply {
+            query_id,
+            payload: self.metrics.to_bytes(),
+        }]
     }
 }
 
@@ -228,6 +245,29 @@ mod tests {
         assert!(actions.is_empty());
         assert_eq!(tier.metrics().queries_served, 1);
         assert_eq!(tier.metrics().cache_misses, 1);
+    }
+
+    #[test]
+    fn stats_query_returns_serialized_metrics() {
+        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 1_000_000 };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+
+        let data = b"stats test blob";
+        let cid = ContentId::for_blob(data).unwrap();
+        tier.handle(StorageTierEvent::PublishContent { cid, data: data.to_vec() });
+        tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });
+
+        let actions = tier.handle(StorageTierEvent::StatsQuery { query_id: 77 });
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::SendStatsReply { query_id, payload } => {
+                assert_eq!(*query_id, 77);
+                assert_eq!(payload.len(), 48);
+                let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
+                assert_eq!(queries, 1); // one ContentQuery was processed
+            }
+            other => panic!("expected SendStatsReply, got {other:?}"),
+        }
     }
 
     #[test]
