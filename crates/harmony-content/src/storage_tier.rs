@@ -143,8 +143,13 @@ impl<B: BlobStore> StorageTier<B> {
         vec![StorageTierAction::AnnounceContent { key_expr, payload }]
     }
 
-    fn handle_publish(&mut self, _cid: ContentId, _data: Vec<u8>) -> Vec<StorageTierAction> {
-        vec![]
+    fn handle_publish(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
+        self.cache.store(cid, data);
+        self.metrics.publishes_stored += 1;
+        let cid_hex = hex::encode(cid.to_bytes());
+        let key_expr = announce_ns::key(&cid_hex);
+        let payload = cid.payload_size().to_be_bytes().to_vec();
+        vec![StorageTierAction::AnnounceContent { key_expr, payload }]
     }
 
     fn handle_stats_query(&mut self, _query_id: u64) -> Vec<StorageTierAction> {
@@ -223,6 +228,34 @@ mod tests {
         assert!(actions.is_empty());
         assert_eq!(tier.metrics().queries_served, 1);
         assert_eq!(tier.metrics().cache_misses, 1);
+    }
+
+    #[test]
+    fn publish_content_always_stored_and_announced() {
+        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 1_000_000 };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let data = b"explicitly published blob";
+        let cid = ContentId::for_blob(data).unwrap();
+
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid,
+            data: data.to_vec(),
+        });
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::AnnounceContent { key_expr, payload } => {
+                assert!(key_expr.starts_with("harmony/announce/"));
+                let announced_size = u32::from_be_bytes(payload[..4].try_into().unwrap());
+                assert_eq!(announced_size, cid.payload_size());
+            }
+            other => panic!("expected AnnounceContent, got {other:?}"),
+        }
+        assert_eq!(tier.metrics().publishes_stored, 1);
+
+        // Content should be queryable
+        let query_actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });
+        assert_eq!(query_actions.len(), 1);
     }
 
     #[test]
