@@ -200,6 +200,14 @@ impl ContentId {
     }
 }
 
+impl std::fmt::Display for ContentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cid_type = self.cid_type();
+        let size = self.payload_size();
+        write!(f, "{} {:?} {}B", hex_prefix(&self.hash), cid_type, size,)
+    }
+}
+
 impl std::fmt::Debug for ContentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -806,5 +814,55 @@ mod tests {
     fn parse_inline_metadata_rejects_non_metadata_cid() {
         let blob = ContentId::for_blob(b"not metadata").unwrap();
         assert!(blob.parse_inline_metadata().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 7: Checksum verification, Display, serialization round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn checksum_verification_passes_for_valid_cid() {
+        let cid = ContentId::for_blob(b"valid data").unwrap();
+        assert!(cid.verify_checksum().is_ok());
+    }
+
+    #[test]
+    fn checksum_verification_fails_for_corrupted_cid() {
+        let cid = ContentId::for_blob(b"valid data").unwrap();
+        let mut bytes = cid.to_bytes();
+        bytes[0] ^= 0xFF; // corrupt the hash
+        let corrupted = ContentId::from_bytes(bytes);
+        assert!(corrupted.verify_checksum().is_err());
+    }
+
+    #[test]
+    fn checksum_verification_passes_for_bundle() {
+        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let children = [blob];
+        let bytes = children_to_bytes(&children);
+        let bundle = ContentId::for_bundle(&bytes, &children).unwrap();
+        assert!(bundle.verify_checksum().is_ok());
+    }
+
+    #[test]
+    fn checksum_verification_passes_for_inline_metadata() {
+        let meta = ContentId::inline_metadata(1000, 1, 0, [0; 8]);
+        assert!(meta.verify_checksum().is_ok());
+    }
+
+    #[test]
+    fn serialization_round_trip() {
+        let cid = ContentId::for_blob(b"round trip test").unwrap();
+        let bytes = cid.to_bytes();
+        let restored = ContentId::from_bytes(bytes);
+        assert_eq!(cid, restored);
+    }
+
+    #[test]
+    fn display_shows_hex_type_and_size() {
+        let cid = ContentId::for_blob(b"display test").unwrap();
+        let s = format!("{cid}");
+        assert!(s.contains("Blob"));
+        assert!(s.contains("12")); // data length
     }
 }
