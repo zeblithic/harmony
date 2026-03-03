@@ -102,10 +102,8 @@ pub fn apply_delta(old_bundle: &[u8], delta: &[u8]) -> Result<Vec<u8>, ContentEr
                         reason: "truncated COPY opcode",
                     });
                 }
-                let offset =
-                    u16::from_be_bytes([delta[pos + 1], delta[pos + 2]]) as usize;
-                let count =
-                    u16::from_be_bytes([delta[pos + 3], delta[pos + 4]]) as usize;
+                let offset = u16::from_be_bytes([delta[pos + 1], delta[pos + 2]]) as usize;
+                let count = u16::from_be_bytes([delta[pos + 3], delta[pos + 4]]) as usize;
                 pos += 5;
 
                 if offset + count > old_cids.len() {
@@ -124,8 +122,7 @@ pub fn apply_delta(old_bundle: &[u8], delta: &[u8]) -> Result<Vec<u8>, ContentEr
                         reason: "truncated INSERT opcode",
                     });
                 }
-                let count =
-                    u16::from_be_bytes([delta[pos + 1], delta[pos + 2]]) as usize;
+                let count = u16::from_be_bytes([delta[pos + 1], delta[pos + 2]]) as usize;
                 pos += 3;
 
                 let data_len = count * CID_SIZE;
@@ -147,6 +144,29 @@ pub fn apply_delta(old_bundle: &[u8], delta: &[u8]) -> Result<Vec<u8>, ContentEr
     }
 
     Ok(result)
+}
+
+/// Encode a bundle update, choosing the most compact representation.
+///
+/// Compares the delta against the full new bundle and returns whichever
+/// is smaller. The first byte of the result indicates the format:
+/// - `0x00` — full bundle bytes follow (delta wasn't worth it)
+/// - `0x01` — delta bytes follow
+pub fn encode_update(old_bundle: &[u8], new_bundle: &[u8]) -> Result<Vec<u8>, ContentError> {
+    let delta = compute_delta(old_bundle, new_bundle)?;
+
+    // +1 for the tag byte in both cases.
+    if delta.len() + 1 < new_bundle.len() + 1 {
+        let mut result = Vec::with_capacity(1 + delta.len());
+        result.push(UPDATE_DELTA);
+        result.extend_from_slice(&delta);
+        Ok(result)
+    } else {
+        let mut result = Vec::with_capacity(1 + new_bundle.len());
+        result.push(UPDATE_FULL);
+        result.extend_from_slice(new_bundle);
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -279,5 +299,32 @@ mod tests {
         let bad_delta = vec![OP_COPY, 0x00, 0x00, 0x00, 0x05];
         let result = apply_delta(&old, &bad_delta);
         assert!(matches!(result, Err(ContentError::InvalidDelta { .. })));
+    }
+
+    #[test]
+    fn encode_update_uses_delta_when_smaller() {
+        let cids = make_cids(10);
+        let mut changed = cids.clone();
+        changed[5] = ContentId::for_blob(b"one-change").unwrap();
+        let old = bundle_bytes(&cids);
+        let new = bundle_bytes(&changed);
+        let update = encode_update(&old, &new).unwrap();
+        assert_eq!(update[0], UPDATE_DELTA);
+        assert!(update.len() < new.len());
+    }
+
+    #[test]
+    fn encode_update_uses_full_when_delta_larger() {
+        let old_cids = make_cids(3);
+        let new_cids: Vec<ContentId> = (100..103)
+            .map(|i| ContentId::for_blob(format!("different-{i}").as_bytes()).unwrap())
+            .collect();
+        let old = bundle_bytes(&old_cids);
+        let new = bundle_bytes(&new_cids);
+        let update = encode_update(&old, &new).unwrap();
+        // Complete replacement: delta = INSERT(3) = 3 + 96 = 99 bytes.
+        // Full bundle = 96 bytes. Full is smaller.
+        assert_eq!(update[0], UPDATE_FULL);
+        assert_eq!(update.len(), 1 + new.len());
     }
 }
