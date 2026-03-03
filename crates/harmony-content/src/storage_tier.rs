@@ -1,6 +1,9 @@
 //! StorageTier: sans-I/O wrapper integrating ContentStore with Zenoh patterns.
 
+use crate::blob::BlobStore;
+use crate::cache::ContentStore;
 use crate::cid::ContentId;
+use harmony_zenoh::namespace::{announce as announce_ns, content as ns};
 
 /// Configuration for storage capacity limits.
 #[derive(Debug, Clone)]
@@ -50,6 +53,51 @@ pub enum StorageTierAction {
     DeclareSubscribers { key_exprs: Vec<String> },
 }
 
+/// Sans-I/O storage tier integrating [`ContentStore`] with Zenoh key patterns.
+///
+/// On construction, returns startup actions (queryable and subscriber
+/// declarations) that the caller must execute. Subsequent calls to
+/// [`handle`](Self::handle) process inbound events and return outbound
+/// actions.
+pub struct StorageTier<B: BlobStore> {
+    cache: ContentStore<B>,
+    budget: StorageBudget,
+    metrics: StorageMetrics,
+}
+
+impl<B: BlobStore> StorageTier<B> {
+    /// Create a new StorageTier with startup actions.
+    pub fn new(store: B, budget: StorageBudget) -> (Self, Vec<StorageTierAction>) {
+        let cache = ContentStore::new(store, budget.cache_capacity);
+
+        let mut queryable_keys = ns::all_shard_patterns();
+        queryable_keys.push(ns::STATS.to_string());
+
+        let subscriber_keys = vec![
+            ns::TRANSIT_SUB.to_string(),
+            ns::PUBLISH_SUB.to_string(),
+        ];
+
+        let actions = vec![
+            StorageTierAction::DeclareQueryables { key_exprs: queryable_keys },
+            StorageTierAction::DeclareSubscribers { key_exprs: subscriber_keys },
+        ];
+
+        let tier = Self {
+            cache,
+            budget,
+            metrics: StorageMetrics::default(),
+        };
+
+        (tier, actions)
+    }
+
+    /// Read-only access to metrics.
+    pub fn metrics(&self) -> &StorageMetrics {
+        &self.metrics
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +133,37 @@ mod tests {
             query_id: 1,
             payload: vec![1, 2, 3],
         };
+    }
+
+    use crate::blob::MemoryBlobStore;
+
+    #[test]
+    fn startup_declares_queryables_and_subscribers() {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (tier, actions) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let _ = tier;
+
+        assert_eq!(actions.len(), 2);
+
+        match &actions[0] {
+            StorageTierAction::DeclareQueryables { key_exprs } => {
+                assert_eq!(key_exprs.len(), 17); // 16 shards + 1 stats
+                assert!(key_exprs[0].starts_with("harmony/content/0/"));
+                assert!(key_exprs[16].starts_with("harmony/content/stats"));
+            }
+            other => panic!("expected DeclareQueryables, got {other:?}"),
+        }
+
+        match &actions[1] {
+            StorageTierAction::DeclareSubscribers { key_exprs } => {
+                assert_eq!(key_exprs.len(), 2);
+                assert!(key_exprs.contains(&"harmony/content/transit/**".to_string()));
+                assert!(key_exprs.contains(&"harmony/content/publish/*".to_string()));
+            }
+            other => panic!("expected DeclareSubscribers, got {other:?}"),
+        }
     }
 }
