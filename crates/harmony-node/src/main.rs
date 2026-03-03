@@ -54,7 +54,15 @@ fn main() {
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Identity { action } => match action {
-            IdentityAction::New => todo!("identity new"),
+            IdentityAction::New => {
+                let id =
+                    harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let pub_id = id.public_identity();
+                println!("Address:     {}", hex::encode(pub_id.address_hash));
+                println!("Public key:  {}", hex::encode(pub_id.to_public_bytes()));
+                println!("Private key: {}", hex::encode(id.to_private_bytes()));
+                Ok(())
+            }
             IdentityAction::Show { .. } => todo!("identity show"),
             IdentityAction::Sign { .. } => todo!("identity sign"),
             IdentityAction::Verify { .. } => todo!("identity verify"),
