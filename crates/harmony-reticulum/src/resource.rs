@@ -352,7 +352,7 @@ impl ResourceSender {
             random_hash: self.random_hash,
             original_hash: self.resource_hash, // single-segment: original == resource
             hashmap: self.hashmap.clone(),
-            flags: 0x01, // bit 0 = encrypted (always true for link resources)
+            flags: 0x01,      // bit 0 = encrypted (always true for link resources)
             segment_index: 1, // 1-based, matching Python
             total_segments: 1,
             request_id: None,
@@ -460,8 +460,8 @@ impl ResourceSender {
         if self.sent_parts >= self.parts.len() {
             self.state = SenderState::AwaitingProof;
             actions.push(ResourceAction::SenderStateChanged);
-            let timeout =
-                self.last_activity + self.rtt_ms.unwrap_or(DEFAULT_TIMEOUT_MS) * PROOF_TIMEOUT_FACTOR as u64;
+            let timeout = self.last_activity
+                + self.rtt_ms.unwrap_or(DEFAULT_TIMEOUT_MS) * PROOF_TIMEOUT_FACTOR as u64;
             actions.push(ResourceAction::ScheduleTimeout {
                 deadline_ms: timeout,
             });
@@ -607,7 +607,11 @@ impl ResourceReceiver {
         let hashmap_height = hashmap_data.len() / MAPHASH_LEN;
 
         let mut hashmap: Vec<Option<MapHash>> = vec![None; total_parts];
-        for (i, slot) in hashmap.iter_mut().enumerate().take(hashmap_height.min(total_parts)) {
+        for (i, slot) in hashmap
+            .iter_mut()
+            .enumerate()
+            .take(hashmap_height.min(total_parts))
+        {
             let offset = i * MAPHASH_LEN;
             let mut mh = [0u8; MAPHASH_LEN];
             mh.copy_from_slice(&hashmap_data[offset..offset + MAPHASH_LEN]);
@@ -698,7 +702,10 @@ impl ResourceReceiver {
     /// Should be called after `AssemblyReady` is emitted. Decrypts the
     /// assembled encrypted data, computes the proof, and transitions to
     /// `Complete`.
-    pub fn finalize(&mut self, crypto: &impl LinkCrypto) -> Result<Vec<ResourceAction>, ReticulumError> {
+    pub fn finalize(
+        &mut self,
+        crypto: &impl LinkCrypto,
+    ) -> Result<Vec<ResourceAction>, ReticulumError> {
         let encrypted = self
             .assembled_encrypted
             .as_ref()
@@ -794,6 +801,14 @@ impl ResourceReceiver {
                 actions.push(ResourceAction::ReceiverStateChanged);
             }
         } else if self.outstanding_parts == 0 {
+            // All parts in the current window arrived — grow the window.
+            if self.window < self.window_max {
+                self.window += 1;
+                if (self.window - self.window_min) > (WINDOW_FLEXIBILITY as usize - 1) {
+                    self.window_min += 1;
+                }
+            }
+
             // Need to request more parts.
             // Use last_activity as a proxy for now_ms (caller should update it).
             let req_actions = self.request_next(self.last_activity);
@@ -820,6 +835,21 @@ impl ResourceReceiver {
 
         if self.retries_left > 0 {
             self.retries_left -= 1;
+
+            // Window backoff: shrink both window and ceiling on timeout.
+            if self.window > self.window_min {
+                self.window -= 1;
+            }
+            if self.window_max > self.window_min {
+                self.window_max -= 1;
+            }
+
+            // Reset rate counters and discard the stale req_sent_at so that
+            // request_next does not re-measure RTT from the timed-out request.
+            self.fast_rate_rounds = 0;
+            self.very_slow_rate_rounds = 0;
+            self.req_sent_at = None;
+
             self.request_next(now_ms)
         } else {
             self.state = ReceiverState::Failed;
@@ -829,6 +859,52 @@ impl ResourceReceiver {
 
     /// Build and emit a resource request for the next window of unreceived parts.
     fn request_next(&mut self, now_ms: u64) -> Vec<ResourceAction> {
+        // RTT measurement and rate detection.
+        if let Some(sent_at) = self.req_sent_at {
+            let rtt = now_ms.saturating_sub(sent_at).max(1);
+            self.rtt_ms = Some(rtt);
+
+            // After the first RTT measurement, tighten the timeout factor.
+            if self.part_timeout_factor == PART_TIMEOUT_FACTOR as u64 {
+                self.part_timeout_factor = PART_TIMEOUT_FACTOR_AFTER_RTT as u64;
+            }
+
+            // Estimate transfer rate: bytes transferred in this window / RTT.
+            // Each part is roughly `sdu` bytes; we sent `outstanding_parts` of them
+            // in the previous request. Use `window` as an approximation since
+            // outstanding_parts has already been decremented.
+            let bytes_transferred = (self.window as u64)
+                * (self.transfer_size as u64 / (self.total_parts as u64).max(1));
+            let rate_bps = if rtt > 0 {
+                (bytes_transferred * 1000) / rtt
+            } else {
+                0
+            };
+
+            // Classify link speed and adapt window_max.
+            if rate_bps > RATE_FAST {
+                self.fast_rate_rounds += 1;
+                self.very_slow_rate_rounds = 0;
+                if self.fast_rate_rounds as u32 >= FAST_RATE_THRESHOLD {
+                    self.window_max = WINDOW_MAX_FAST as usize;
+                }
+            } else if rate_bps < RATE_VERY_SLOW {
+                self.very_slow_rate_rounds += 1;
+                self.fast_rate_rounds = 0;
+                if self.very_slow_rate_rounds as u32 >= VERY_SLOW_RATE_THRESHOLD {
+                    self.window_max = WINDOW_MAX_VERY_SLOW as usize;
+                    // Clamp window to new max.
+                    if self.window > self.window_max {
+                        self.window = self.window_max;
+                    }
+                }
+            } else {
+                // Medium speed — reset both counters.
+                self.fast_rate_rounds = 0;
+                self.very_slow_rate_rounds = 0;
+            }
+        }
+
         let mut requested_hashes = Vec::new();
         let mut exhausted = false;
         let mut scanned = 0;
@@ -880,8 +956,7 @@ impl ResourceReceiver {
         self.req_sent_at = Some(now_ms);
         self.last_activity = now_ms;
 
-        let timeout_ms = self.rtt_ms.unwrap_or(DEFAULT_TIMEOUT_MS)
-            * self.part_timeout_factor
+        let timeout_ms = self.rtt_ms.unwrap_or(DEFAULT_TIMEOUT_MS) * self.part_timeout_factor
             + PROCESSING_GRACE_MS;
 
         vec![
@@ -1073,8 +1148,8 @@ impl ResourceAdvertisement {
     pub fn decode(data: &[u8]) -> Result<Self, ReticulumError> {
         let mut rd = data;
 
-        let map_len = rmp::decode::read_map_len(&mut rd)
-            .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+        let map_len =
+            rmp::decode::read_map_len(&mut rd).map_err(|_| ReticulumError::ResourceAdvInvalid)?;
 
         if map_len != Self::MAP_LEN {
             return Err(ReticulumError::ResourceAdvInvalid);
@@ -1155,7 +1230,8 @@ impl ResourceAdvertisement {
                 }
                 b'm' => {
                     let bin_len = rmp::decode::read_bin_len(&mut rd)
-                        .map_err(|_| ReticulumError::ResourceAdvInvalid)? as usize;
+                        .map_err(|_| ReticulumError::ResourceAdvInvalid)?
+                        as usize;
                     let mut m = vec![0u8; bin_len];
                     std::io::Read::read_exact(&mut rd, &mut m)
                         .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
@@ -1220,7 +1296,9 @@ impl ResourceAdvertisement {
             flags: flags.ok_or(ReticulumError::ResourceAdvInvalid)?,
             segment_index: segment_index.ok_or(ReticulumError::ResourceAdvInvalid)?,
             total_segments: total_segments.ok_or(ReticulumError::ResourceAdvInvalid)?,
-            request_id: request_id.ok_or(ReticulumError::ResourceAdvInvalid)?.clone(),
+            request_id: request_id
+                .ok_or(ReticulumError::ResourceAdvInvalid)?
+                .clone(),
         })
     }
 }
@@ -1410,11 +1488,15 @@ mod tests {
             transfer_size: 12345,
             data_size: 10000,
             part_count: 5,
-            resource_hash: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10],
+            resource_hash: [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+                0x0F, 0x10,
+            ],
             random_hash: [0xAA, 0xBB, 0xCC, 0xDD],
-            original_hash: [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-                            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20],
+            original_hash: [
+                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+                0x1F, 0x20,
+            ],
             hashmap: vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE],
             flags: 0x01,
             segment_index: 1,
@@ -1585,7 +1667,9 @@ mod tests {
         assert_eq!(resource_packets.len(), 4);
 
         // Should have a progress action.
-        let has_progress = actions.iter().any(|a| matches!(a, ResourceAction::Progress { fraction } if *fraction >= 1.0));
+        let has_progress = actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::Progress { fraction } if *fraction >= 1.0));
         assert!(has_progress);
     }
 
@@ -1693,8 +1777,7 @@ mod tests {
     fn make_sender_and_receiver() -> (ResourceSender, ResourceReceiver) {
         use rand::rngs::OsRng;
         let crypto = MockLinkCrypto::new(3);
-        let mut sender =
-            ResourceSender::new(&mut OsRng, &crypto, b"abcdefghij", 1000).unwrap();
+        let mut sender = ResourceSender::new(&mut OsRng, &crypto, b"abcdefghij", 1000).unwrap();
         let adv_actions = sender.advertise(1000);
 
         // Extract the advertisement plaintext from the SendPacket action.
@@ -1718,8 +1801,7 @@ mod tests {
     fn receiver_accept_parses_adv_emits_request() {
         use rand::rngs::OsRng;
         let crypto = MockLinkCrypto::new(3);
-        let mut sender =
-            ResourceSender::new(&mut OsRng, &crypto, b"abcdefghij", 1000).unwrap();
+        let mut sender = ResourceSender::new(&mut OsRng, &crypto, b"abcdefghij", 1000).unwrap();
         let adv_actions = sender.advertise(1000);
 
         let adv_plaintext = adv_actions
@@ -1865,7 +1947,10 @@ mod tests {
             }
         }
         let computed_hash = compute_resource_hash(&assembled, &receiver.random_hash);
-        assert_ne!(computed_hash, receiver.resource_hash, "Tampered data should produce different hash");
+        assert_ne!(
+            computed_hash, receiver.resource_hash,
+            "Tampered data should produce different hash"
+        );
 
         // The receiver should detect this corruption.
         // Reset state to Transferring and feed the tampered last part through handle_event.
@@ -1902,10 +1987,7 @@ mod tests {
         let initial_retries = sender.adv_retries_left;
 
         // First timeout: should retry the advertisement.
-        let actions = sender.handle_event(
-            ResourceEvent::Timeout { now_ms: 20_000 },
-            &[],
-        );
+        let actions = sender.handle_event(ResourceEvent::Timeout { now_ms: 20_000 }, &[]);
         assert_eq!(sender.state(), SenderState::Advertised);
         assert_eq!(sender.adv_retries_left, initial_retries - 1);
 
@@ -1921,10 +2003,7 @@ mod tests {
         sender.advertise(1000);
         sender.adv_retries_left = 0;
 
-        let actions = sender.handle_event(
-            ResourceEvent::Timeout { now_ms: 20_000 },
-            &[],
-        );
+        let actions = sender.handle_event(ResourceEvent::Timeout { now_ms: 20_000 }, &[]);
         assert_eq!(sender.state(), SenderState::Failed);
         let has_state_change = actions
             .iter()
@@ -1939,10 +2018,7 @@ mod tests {
 
         // Should retry while retries_left > 0.
         let initial_retries = receiver.retries_left;
-        let actions = receiver.handle_event(
-            ResourceEvent::Timeout { now_ms: 50_000 },
-            &[],
-        );
+        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[]);
         assert_eq!(receiver.state(), ReceiverState::Transferring);
         assert_eq!(receiver.retries_left, initial_retries - 1);
 
@@ -1953,10 +2029,7 @@ mod tests {
 
         // Exhaust retries.
         receiver.retries_left = 0;
-        let actions = receiver.handle_event(
-            ResourceEvent::Timeout { now_ms: 100_000 },
-            &[],
-        );
+        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 100_000 }, &[]);
         assert_eq!(receiver.state(), ReceiverState::Failed);
         let has_state_change = actions
             .iter()
@@ -2022,13 +2095,15 @@ mod tests {
             let sender_actions =
                 sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
             let part_packets = collect_sends(&sender_actions, resource_ctx);
-            assert!(!part_packets.is_empty(), "sender should emit at least one part");
+            assert!(
+                !part_packets.is_empty(),
+                "sender should emit at least one part"
+            );
 
             // Feed each part to receiver.
             let mut last_receiver_actions = Vec::new();
             for part in &part_packets {
-                last_receiver_actions =
-                    receiver.handle_event(ResourceEvent::PartReceived, part);
+                last_receiver_actions = receiver.handle_event(ResourceEvent::PartReceived, part);
             }
 
             if receiver.state() == ReceiverState::Assembling {
@@ -2073,8 +2148,7 @@ mod tests {
         let req_plaintext = extract_send(&rx_actions, PacketContext::ResourceReq.as_byte());
 
         // Feed the request to sender.
-        let sender_actions =
-            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let sender_actions = sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
 
         // Sender responds with Resource data parts.
         let part_packets = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
@@ -2104,8 +2178,7 @@ mod tests {
 
         // Extract proof and feed to sender.
         let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions =
-            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
 
         // Sender should validate the proof and reach Complete.
         assert_eq!(sender.state(), SenderState::Complete);
@@ -2144,10 +2217,8 @@ mod tests {
         assert_eq!(receiver.state(), ReceiverState::Complete);
 
         // Verify the sender accepted the proof.
-        let proof_plaintext =
-            extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions =
-            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
         assert_eq!(sender.state(), SenderState::Complete);
         assert!(proof_actions
             .iter()
@@ -2170,8 +2241,7 @@ mod tests {
         let req_plaintext = extract_send(&rx_actions, PacketContext::ResourceReq.as_byte());
 
         // Sender sends the single part.
-        let sender_actions =
-            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let sender_actions = sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
         let parts = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
         assert_eq!(parts.len(), 1);
 
@@ -2193,10 +2263,8 @@ mod tests {
         assert_eq!(recovered, data);
 
         // Verify proof.
-        let proof_plaintext =
-            extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions =
-            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
         assert_eq!(sender.state(), SenderState::Complete);
         assert!(proof_actions
             .iter()
@@ -2220,8 +2288,7 @@ mod tests {
         let req_plaintext = extract_send(&rx_actions, PacketContext::ResourceReq.as_byte());
 
         // Both parts fit in one window (window=4 > 2 parts).
-        let sender_actions =
-            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let sender_actions = sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
         let parts = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
         assert_eq!(parts.len(), 2);
 
@@ -2245,10 +2312,8 @@ mod tests {
         assert_eq!(recovered, data);
 
         // Verify proof.
-        let proof_plaintext =
-            extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions =
-            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
         assert_eq!(sender.state(), SenderState::Complete);
         assert!(proof_actions
             .iter()
@@ -2286,10 +2351,8 @@ mod tests {
         );
 
         // Feed the proof to sender.
-        let proof_plaintext =
-            extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
-        let proof_actions =
-            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
 
         // Sender should validate the proof and reach Complete.
         assert_eq!(sender.state(), SenderState::Complete);
@@ -2304,5 +2367,307 @@ mod tests {
         // Verify both sides are in terminal Complete state.
         assert_eq!(sender.state(), SenderState::Complete);
         assert_eq!(receiver.state(), ReceiverState::Complete);
+    }
+
+    // -- Adaptive windowing tests -------------------------------------------
+
+    /// Helper: create a sender/receiver pair with enough parts to span
+    /// multiple windows (MDU=20, data=200 bytes -> 10 parts, window=4).
+    fn make_multipart_pair() -> (ResourceSender, ResourceReceiver, Vec<ResourceAction>) {
+        use rand::rngs::OsRng;
+        let mock = MockLinkCrypto::new(20);
+        let data: Vec<u8> = (0..200u8).collect();
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, &data, 1000).unwrap();
+        assert_eq!(sender.part_count(), 10);
+
+        let adv_actions = sender.advertise(1000);
+        let adv_plaintext = extract_send(&adv_actions, PacketContext::ResourceAdv.as_byte());
+        let (receiver, initial_actions) = ResourceReceiver::accept(&adv_plaintext, 2000).unwrap();
+        (sender, receiver, initial_actions)
+    }
+
+    #[test]
+    fn window_grows_after_full_window_received() {
+        let (mut sender, mut receiver, initial_actions) = make_multipart_pair();
+
+        // The receiver starts with window = WINDOW_INITIAL = 4.
+        assert_eq!(receiver.window, WINDOW_INITIAL as usize);
+        let initial_window = receiver.window;
+
+        // Feed the first request to the sender and get parts back.
+        let req_plaintext = extract_send(&initial_actions, PacketContext::ResourceReq.as_byte());
+        let sender_actions = sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let part_packets = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
+        assert_eq!(part_packets.len(), initial_window);
+
+        // Feed all parts from the first window to the receiver.
+        for part in &part_packets {
+            receiver.handle_event(ResourceEvent::PartReceived, part);
+        }
+
+        // After receiving a full window, the window should have grown by 1.
+        // The receiver has 10 parts, received 4, so it still needs more
+        // and should have issued a new request with grown window.
+        assert_eq!(receiver.window, initial_window + 1);
+        assert_eq!(receiver.received_count, initial_window);
+        assert_eq!(receiver.state(), ReceiverState::Transferring);
+    }
+
+    #[test]
+    fn window_does_not_exceed_window_max() {
+        let (_sender, mut receiver) = make_sender_and_receiver();
+
+        // Set window to window_max - 1 to test the cap.
+        receiver.window = receiver.window_max;
+
+        // Manually trigger the growth logic: set outstanding_parts to 0
+        // and ensure there are unreceived parts.
+        receiver.outstanding_parts = 0;
+
+        // Window growth only happens in handle_part when outstanding == 0.
+        // Since window == window_max, it should NOT grow.
+        let old_window = receiver.window;
+
+        // Feed a valid part to trigger the code path.
+        // We need a part that matches the hashmap.
+        let part_data = vec![0x42; 3]; // dummy data
+        let mh = compute_map_hash(&part_data, &receiver.random_hash);
+        // Install this map hash in slot 0.
+        receiver.hashmap[0] = Some(mh);
+        receiver.parts[0] = None;
+        receiver.received_count = receiver.total_parts - 2; // not yet complete
+        receiver.consecutive_completed = 0;
+        receiver.outstanding_parts = 1; // will decrement to 0
+
+        receiver.handle_event(ResourceEvent::PartReceived, &part_data);
+
+        // Window should NOT have grown past window_max.
+        assert!(
+            receiver.window <= old_window,
+            "window should not exceed window_max: {} > {}",
+            receiver.window,
+            old_window
+        );
+    }
+
+    #[test]
+    fn window_min_advances_with_flexibility() {
+        let (_sender, mut receiver) = make_sender_and_receiver();
+
+        // Set up conditions where window will grow repeatedly.
+        // WINDOW_FLEXIBILITY is 4, so after growing 4 times beyond window_min,
+        // window_min should also increase.
+        let original_min = receiver.window_min; // 2
+        receiver.window = original_min + (WINDOW_FLEXIBILITY as usize - 1); // 5
+        receiver.window_max = 20; // plenty of headroom
+
+        // Trigger growth by having outstanding_parts reach 0 with parts remaining.
+        // We need to simulate: receive a part that brings outstanding to 0, with more needed.
+        let part_data = vec![0xAB; 3];
+        let mh = compute_map_hash(&part_data, &receiver.random_hash);
+        receiver.hashmap[0] = Some(mh);
+        receiver.parts[0] = None;
+        receiver.received_count = receiver.total_parts - 2;
+        receiver.consecutive_completed = 0;
+        receiver.outstanding_parts = 1;
+
+        receiver.handle_event(ResourceEvent::PartReceived, &part_data);
+
+        // Window grew from (min + FLEX-1) to (min + FLEX), so window_min should increase.
+        assert_eq!(
+            receiver.window_min,
+            original_min + 1,
+            "window_min should advance when (window - window_min) > FLEXIBILITY-1"
+        );
+    }
+
+    #[test]
+    fn window_shrinks_on_timeout() {
+        let (_sender, mut receiver) = make_sender_and_receiver();
+        assert_eq!(receiver.state(), ReceiverState::Transferring);
+
+        let initial_window = receiver.window;
+        let initial_max = receiver.window_max;
+        let initial_retries = receiver.retries_left;
+
+        // Fire a timeout — should shrink window, shrink window_max, and retry.
+        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[]);
+
+        assert_eq!(receiver.state(), ReceiverState::Transferring);
+        assert_eq!(receiver.retries_left, initial_retries - 1);
+        assert_eq!(
+            receiver.window,
+            initial_window - 1,
+            "window should shrink by 1 on timeout"
+        );
+        assert_eq!(
+            receiver.window_max,
+            initial_max - 1,
+            "window_max should shrink by 1 on timeout"
+        );
+
+        // Should have emitted a new request.
+        let has_req = actions.iter().any(|a| {
+            matches!(a, ResourceAction::SendPacket { context, .. }
+                if *context == PacketContext::ResourceReq.as_byte())
+        });
+        assert!(has_req, "timeout should trigger a new request");
+    }
+
+    #[test]
+    fn window_does_not_shrink_below_min() {
+        let (_sender, mut receiver) = make_sender_and_receiver();
+
+        // Set window and window_max to their minimum values.
+        receiver.window = receiver.window_min;
+        receiver.window_max = receiver.window_min;
+
+        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[]);
+
+        // Window should stay at window_min.
+        assert_eq!(
+            receiver.window, receiver.window_min,
+            "window must not go below window_min"
+        );
+        assert_eq!(
+            receiver.window_max, receiver.window_min,
+            "window_max must not go below window_min"
+        );
+
+        // Should still have emitted a retry request.
+        let has_req = actions.iter().any(|a| {
+            matches!(a, ResourceAction::SendPacket { context, .. }
+                if *context == PacketContext::ResourceReq.as_byte())
+        });
+        assert!(has_req);
+    }
+
+    #[test]
+    fn receiver_fails_after_max_retries() {
+        let (_sender, mut receiver) = make_sender_and_receiver();
+        assert_eq!(receiver.retries_left, MAX_RETRIES as u8);
+
+        // Exhaust all retries one by one.
+        for i in 0..MAX_RETRIES {
+            assert_eq!(
+                receiver.state(),
+                ReceiverState::Transferring,
+                "should still be Transferring at retry {}",
+                i
+            );
+            receiver.handle_event(
+                ResourceEvent::Timeout {
+                    now_ms: 50_000 + i as u64 * 1_000,
+                },
+                &[],
+            );
+        }
+        assert_eq!(receiver.retries_left, 0);
+        assert_eq!(
+            receiver.state(),
+            ReceiverState::Transferring,
+            "should be Transferring with 0 retries left but not yet timed out again"
+        );
+
+        // One more timeout should fail the transfer.
+        let actions = receiver.handle_event(ResourceEvent::Timeout { now_ms: 200_000 }, &[]);
+        assert_eq!(receiver.state(), ReceiverState::Failed);
+        let has_state_change = actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::ReceiverStateChanged));
+        assert!(
+            has_state_change,
+            "should emit ReceiverStateChanged on failure"
+        );
+    }
+
+    #[test]
+    fn rtt_measured_after_first_window() {
+        let (mut sender, mut receiver, initial_actions) = make_multipart_pair();
+
+        // Before any parts, RTT should be None.
+        assert!(receiver.rtt_ms.is_none());
+
+        // Note the time the initial request was sent.
+        let req_sent_time = receiver.req_sent_at.unwrap();
+
+        // Feed the request to sender.
+        let req_plaintext = extract_send(&initial_actions, PacketContext::ResourceReq.as_byte());
+        let sender_actions = sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let part_packets = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
+
+        // Simulate time passing: update last_activity before feeding parts.
+        receiver.last_activity = req_sent_time + 500; // 500ms later
+
+        // Feed all parts.
+        for part in &part_packets {
+            receiver.handle_event(ResourceEvent::PartReceived, part);
+        }
+
+        // After a full window completes, request_next is called with last_activity,
+        // and RTT should be measured.
+        assert!(
+            receiver.rtt_ms.is_some(),
+            "RTT should be measured after first complete window"
+        );
+
+        // The part_timeout_factor should have been reduced.
+        assert_eq!(
+            receiver.part_timeout_factor, PART_TIMEOUT_FACTOR_AFTER_RTT as u64,
+            "part_timeout_factor should tighten after first RTT measurement"
+        );
+    }
+
+    #[test]
+    fn timeout_resets_rate_counters() {
+        let (_sender, mut receiver) = make_sender_and_receiver();
+
+        // Simulate that the receiver had been counting fast rounds.
+        receiver.fast_rate_rounds = 3;
+        receiver.very_slow_rate_rounds = 1;
+
+        receiver.handle_event(ResourceEvent::Timeout { now_ms: 50_000 }, &[]);
+
+        assert_eq!(
+            receiver.fast_rate_rounds, 0,
+            "fast_rate_rounds should reset on timeout"
+        );
+        assert_eq!(
+            receiver.very_slow_rate_rounds, 0,
+            "very_slow_rate_rounds should reset on timeout"
+        );
+    }
+
+    #[test]
+    fn multipart_roundtrip_with_windowing_succeeds() {
+        // End-to-end test proving that window growth doesn't break the protocol.
+        use rand::rngs::OsRng;
+        let mock = MockLinkCrypto::new(20);
+        let data: Vec<u8> = (0..200u8).collect();
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, &data, 1000).unwrap();
+        assert_eq!(sender.part_count(), 10);
+
+        let adv_actions = sender.advertise(1000);
+        let adv_plaintext = extract_send(&adv_actions, PacketContext::ResourceAdv.as_byte());
+        let (mut receiver, initial_actions) =
+            ResourceReceiver::accept(&adv_plaintext, 2000).unwrap();
+
+        let (recovered, finalize_actions) =
+            run_roundtrip(&mut sender, &mut receiver, initial_actions, &mock);
+
+        assert_eq!(recovered, data);
+        assert_eq!(receiver.state(), ReceiverState::Complete);
+
+        // Window should have grown from initial during the transfer.
+        // (We can't assert the exact final value since it depends on
+        // how many rounds were needed, but the transfer succeeded.)
+
+        // Verify proof.
+        let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        assert_eq!(sender.state(), SenderState::Complete);
+        assert!(proof_actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::ProofValidated)));
     }
 }
