@@ -323,18 +323,7 @@ impl ResourceSender {
     /// Transitions from `Queued` to `Advertised` and schedules a timeout
     /// for the advertisement response.
     pub fn advertise(&mut self, now_ms: u64) -> Vec<ResourceAction> {
-        let adv = ResourceAdvertisement {
-            transfer_size: self.encrypted_data.len() as u32,
-            data_size: self.original_data.len() as u32,
-            part_count: self.parts.len() as u32,
-            resource_hash: self.resource_hash,
-            random_hash: self.random_hash,
-            original_hash: self.resource_hash, // single-segment: original == resource
-            hashmap: self.hashmap.clone(),
-            flags: 0x00,
-            segment_index: 0,
-            total_segments: 1,
-        };
+        let adv = self.build_advertisement();
 
         self.state = SenderState::Advertised;
         self.adv_sent_at = Some(now_ms);
@@ -352,6 +341,22 @@ impl ResourceSender {
                 deadline_ms: timeout,
             },
         ]
+    }
+
+    fn build_advertisement(&self) -> ResourceAdvertisement {
+        ResourceAdvertisement {
+            transfer_size: self.encrypted_data.len() as u32,
+            data_size: self.original_data.len() as u32,
+            part_count: self.parts.len() as u32,
+            resource_hash: self.resource_hash,
+            random_hash: self.random_hash,
+            original_hash: self.resource_hash, // single-segment: original == resource
+            hashmap: self.hashmap.clone(),
+            flags: 0x01, // bit 0 = encrypted (always true for link resources)
+            segment_index: 1, // 1-based, matching Python
+            total_segments: 1,
+            request_id: None,
+        }
     }
 
     /// Process an incoming event and return resulting actions.
@@ -518,20 +523,7 @@ impl ResourceSender {
                     self.adv_sent_at = Some(now_ms);
                     self.last_activity = now_ms;
 
-                    // Re-send the advertisement.
-                    let adv = ResourceAdvertisement {
-                        transfer_size: self.encrypted_data.len() as u32,
-                        data_size: self.original_data.len() as u32,
-                        part_count: self.parts.len() as u32,
-                        resource_hash: self.resource_hash,
-                        random_hash: self.random_hash,
-                        original_hash: self.resource_hash,
-                        hashmap: self.hashmap.clone(),
-                        flags: 0x00,
-                        segment_index: 0,
-                        total_segments: 1,
-                    };
-
+                    let adv = self.build_advertisement();
                     let timeout = now_ms + DEFAULT_TIMEOUT_MS;
                     vec![
                         ResourceAction::SendPacket {
@@ -999,17 +991,20 @@ pub struct ResourceAdvertisement {
     pub original_hash: ResourceHash,
     /// Hashmap segment — concatenated map-hashes for this segment.
     pub hashmap: Vec<u8>,
-    /// Flags byte (reserved for future use).
+    /// Flags byte (bit 0 = encrypted, bit 1 = compressed, bit 2 = split).
     pub flags: u8,
-    /// Index of this hashmap segment (0-based).
+    /// Index of this hashmap segment (1-based, matching Python).
     pub segment_index: u32,
     /// Total number of hashmap segments.
     pub total_segments: u32,
+    /// Request ID (None when not part of a request/response exchange).
+    /// Always included in wire format for Python compatibility.
+    pub request_id: Option<Vec<u8>>,
 }
 
 impl ResourceAdvertisement {
-    /// Number of fields in the encoded msgpack map.
-    const MAP_LEN: u32 = 10;
+    /// Number of fields in the encoded msgpack map (matches Python's 11-field format).
+    const MAP_LEN: u32 = 11;
 
     /// Encode this advertisement as a MessagePack byte vector.
     ///
@@ -1061,6 +1056,13 @@ impl ResourceAdvertisement {
         write_str(&mut buf, "l").expect("write key l");
         write_u32(&mut buf, self.total_segments).expect("write total_segments");
 
+        // "q" -> request_id (None = msgpack nil for compatibility with Python)
+        write_str(&mut buf, "q").expect("write key q");
+        match &self.request_id {
+            Some(id) => write_bin(&mut buf, id).expect("write request_id"),
+            None => write_nil(&mut buf).expect("write nil request_id"),
+        }
+
         buf
     }
 
@@ -1088,6 +1090,7 @@ impl ResourceAdvertisement {
         let mut flags: Option<u8> = None;
         let mut segment_index: Option<u32> = None;
         let mut total_segments: Option<u32> = None;
+        let mut request_id: Option<Option<Vec<u8>>> = None;
 
         for _ in 0..map_len {
             // Read key as string
@@ -1173,6 +1176,35 @@ impl ResourceAdvertisement {
                         .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
                     total_segments = Some(v);
                 }
+                b'q' => {
+                    // request_id: can be nil (None) or binary data
+                    let marker = rmp::decode::read_marker(&mut rd)
+                        .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                    if marker == rmp::Marker::Null {
+                        request_id = Some(None);
+                    } else {
+                        // Marker is a bin type — extract length from the marker
+                        let bin_len = match marker {
+                            rmp::Marker::Bin8 => {
+                                let mut b = [0u8; 1];
+                                std::io::Read::read_exact(&mut rd, &mut b)
+                                    .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                                b[0] as usize
+                            }
+                            rmp::Marker::Bin16 => {
+                                let mut b = [0u8; 2];
+                                std::io::Read::read_exact(&mut rd, &mut b)
+                                    .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                                u16::from_be_bytes(b) as usize
+                            }
+                            _ => return Err(ReticulumError::ResourceAdvInvalid),
+                        };
+                        let mut id = vec![0u8; bin_len];
+                        std::io::Read::read_exact(&mut rd, &mut id)
+                            .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                        request_id = Some(Some(id));
+                    }
+                }
                 _ => return Err(ReticulumError::ResourceAdvInvalid),
             }
         }
@@ -1188,6 +1220,7 @@ impl ResourceAdvertisement {
             flags: flags.ok_or(ReticulumError::ResourceAdvInvalid)?,
             segment_index: segment_index.ok_or(ReticulumError::ResourceAdvInvalid)?,
             total_segments: total_segments.ok_or(ReticulumError::ResourceAdvInvalid)?,
+            request_id: request_id.ok_or(ReticulumError::ResourceAdvInvalid)?.clone(),
         })
     }
 }
@@ -1383,9 +1416,10 @@ mod tests {
             original_hash: [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
                             0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20],
             hashmap: vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE],
-            flags: 0x00,
-            segment_index: 0,
+            flags: 0x01,
+            segment_index: 1,
             total_segments: 1,
+            request_id: None,
         }
     }
 
@@ -1410,6 +1444,7 @@ mod tests {
             flags: 0xFF,
             segment_index: 99,
             total_segments: 100,
+            request_id: None,
         };
         let encoded = adv.encode();
         let decoded = ResourceAdvertisement::decode(&encoded).unwrap();
