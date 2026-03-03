@@ -34,10 +34,7 @@ pub fn parse_bundle(data: &[u8]) -> Result<&[ContentId], ContentError> {
 /// Validate that all children in a bundle have depth strictly less than the parent.
 ///
 /// Returns `Ok(())` if valid, `Err(DepthViolation)` if any child has depth >= parent_depth.
-pub fn validate_bundle_depth(
-    parent_depth: u8,
-    children: &[ContentId],
-) -> Result<(), ContentError> {
+pub fn validate_bundle_depth(parent_depth: u8, children: &[ContentId]) -> Result<(), ContentError> {
     for child in children {
         let child_depth = child.cid_type().depth();
         if child_depth >= parent_depth {
