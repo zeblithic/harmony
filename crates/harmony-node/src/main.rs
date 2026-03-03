@@ -82,8 +82,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let bytes = decode_hex_key(&private_key, 64, "private key")?;
                 let id = harmony_identity::PrivateIdentity::from_private_bytes(&bytes)?;
                 let pub_id = id.public_identity();
-                println!("Address:    {}", hex::encode(pub_id.address_hash));
-                println!("Public key: {}", hex::encode(pub_id.to_public_bytes()));
+                println!("Address:     {}", hex::encode(pub_id.address_hash));
+                println!("Public key:  {}", hex::encode(pub_id.to_public_bytes()));
                 Ok(())
             }
             IdentityAction::Sign {
@@ -104,7 +104,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let pub_bytes = decode_hex_key(&public_key, 64, "public key")?;
                 let sig_bytes = decode_hex_key(&signature, 64, "signature")?;
                 let identity = harmony_identity::Identity::from_public_bytes(&pub_bytes)?;
-                let sig_array: [u8; 64] = sig_bytes.try_into().unwrap();
+                let sig_array: [u8; 64] = sig_bytes
+                    .try_into()
+                    .map_err(|_| "signature: expected exactly 64 bytes")?;
                 match identity.verify(message.as_bytes(), &sig_array) {
                     Ok(()) => {
                         println!("Valid");

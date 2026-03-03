@@ -13,8 +13,8 @@ path = "src/main.rs"
 [dependencies]
 harmony-identity = { path = "../harmony-identity" }
 clap = { version = "4", features = ["derive"] }
-hex = "0.4"
-rand = "0.8"
+hex.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
-hex = "0.4"
+hex.workspace = true
