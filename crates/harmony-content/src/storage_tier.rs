@@ -96,6 +96,55 @@ impl<B: BlobStore> StorageTier<B> {
     pub fn metrics(&self) -> &StorageMetrics {
         &self.metrics
     }
+
+    /// Mutable access to the underlying content store (crate-internal).
+    pub(crate) fn cache_mut(&mut self) -> &mut ContentStore<B> {
+        &mut self.cache
+    }
+
+    /// Process an event and return actions for the caller to execute.
+    pub fn handle(&mut self, event: StorageTierEvent) -> Vec<StorageTierAction> {
+        match event {
+            StorageTierEvent::ContentQuery { query_id, cid } => {
+                self.handle_content_query(query_id, &cid)
+            }
+            StorageTierEvent::TransitContent { cid, data } => {
+                self.handle_transit(cid, data)
+            }
+            StorageTierEvent::PublishContent { cid, data } => {
+                self.handle_publish(cid, data)
+            }
+            StorageTierEvent::StatsQuery { query_id } => {
+                self.handle_stats_query(query_id)
+            }
+        }
+    }
+
+    fn handle_content_query(&mut self, query_id: u64, cid: &ContentId) -> Vec<StorageTierAction> {
+        self.metrics.queries_served += 1;
+        match self.cache.get_and_record(cid) {
+            Some(data) => {
+                self.metrics.cache_hits += 1;
+                vec![StorageTierAction::SendReply { query_id, payload: data }]
+            }
+            None => {
+                self.metrics.cache_misses += 1;
+                vec![]
+            }
+        }
+    }
+
+    fn handle_transit(&mut self, _cid: ContentId, _data: Vec<u8>) -> Vec<StorageTierAction> {
+        vec![]
+    }
+
+    fn handle_publish(&mut self, _cid: ContentId, _data: Vec<u8>) -> Vec<StorageTierAction> {
+        vec![]
+    }
+
+    fn handle_stats_query(&mut self, _query_id: u64) -> Vec<StorageTierAction> {
+        vec![]
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +185,40 @@ mod tests {
     }
 
     use crate::blob::MemoryBlobStore;
+
+    #[test]
+    fn content_query_hit_returns_reply() {
+        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 1_000_000 };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+
+        let data = b"cached blob";
+        let cid = tier.cache_mut().insert(data).unwrap();
+
+        let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 42, cid });
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::SendReply { query_id, payload } => {
+                assert_eq!(*query_id, 42);
+                assert_eq!(payload.as_slice(), data.as_slice());
+            }
+            other => panic!("expected SendReply, got {other:?}"),
+        }
+        assert_eq!(tier.metrics().queries_served, 1);
+        assert_eq!(tier.metrics().cache_hits, 1);
+    }
+
+    #[test]
+    fn content_query_miss_returns_nothing() {
+        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 1_000_000 };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let cid = ContentId::for_blob(b"not stored").unwrap();
+
+        let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 99, cid });
+        assert!(actions.is_empty());
+        assert_eq!(tier.metrics().queries_served, 1);
+        assert_eq!(tier.metrics().cache_misses, 1);
+    }
 
     #[test]
     fn startup_declares_queryables_and_subscribers() {
