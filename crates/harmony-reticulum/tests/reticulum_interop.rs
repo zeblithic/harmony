@@ -37,21 +37,18 @@ const NAME_HASH_NOMADNETWORK_NODE: &str = "213e6311bcec54ab4fde";
 const DESTINATION_HASH: &str = "b87c6512a0dc32fafbba3a9c9fb81b69";
 
 /// Signed data: dest_hash || public_keys || name_hash || random_hash
-const SIGNED_DATA: &str =
-    "b87c6512a0dc32fafbba3a9c9fb81b69\
+const SIGNED_DATA: &str = "b87c6512a0dc32fafbba3a9c9fb81b69\
      bcd84621fe67b3147a1a30da98f8c6eb58da6f920eedf33114fb6ed5a4dd1545\
      26ed8ace099345ac61ec64e70b69bb3f368d653ccebbfa00ce3d77f5acd0bab7\
      6ec60bc318e2c0f0d908\
      fd1679fab7006553f100";
 
 /// Ed25519 signature of signed_data
-const SIGNATURE: &str =
-    "ac071a11d3b85c6e47ffab405eef6aeb322b5e2b3ad0d3c817dec5af37c84ace\
+const SIGNATURE: &str = "ac071a11d3b85c6e47ffab405eef6aeb322b5e2b3ad0d3c817dec5af37c84ace\
      67303a8bc0dab7c73fe5ef9a55b45ac948066f009466c3a7d65d6eeabd05e301";
 
 /// Full announce packet (header + payload)
-const FULL_PACKET: &str =
-    "0100b87c6512a0dc32fafbba3a9c9fb81b6900\
+const FULL_PACKET: &str = "0100b87c6512a0dc32fafbba3a9c9fb81b6900\
      bcd84621fe67b3147a1a30da98f8c6eb58da6f920eedf33114fb6ed5a4dd1545\
      26ed8ace099345ac61ec64e70b69bb3f368d653ccebbfa00ce3d77f5acd0bab7\
      6ec60bc318e2c0f0d908\
@@ -114,7 +111,10 @@ fn interop_parse_python_announce_packet() {
     assert_eq!(packet.header.flags.packet_type, PacketType::Announce);
     assert!(!packet.header.flags.context_flag); // no ratchet
     assert_eq!(packet.header.hops, 0);
-    assert_eq!(hex::encode(packet.header.destination_hash), DESTINATION_HASH);
+    assert_eq!(
+        hex::encode(packet.header.destination_hash),
+        DESTINATION_HASH
+    );
 
     // Verify payload size: 64(pubkeys) + 10(name_hash) + 10(random_hash) + 64(sig) = 148
     assert_eq!(packet.data.len(), 148);
@@ -128,16 +128,10 @@ fn interop_validate_python_announce() {
     let validated = validate_announce(&packet).unwrap();
 
     // Identity should match
-    assert_eq!(
-        hex::encode(validated.identity.address_hash),
-        IDENTITY_HASH,
-    );
+    assert_eq!(hex::encode(validated.identity.address_hash), IDENTITY_HASH,);
 
     // Destination hash should match
-    assert_eq!(
-        hex::encode(validated.destination_hash),
-        DESTINATION_HASH,
-    );
+    assert_eq!(hex::encode(validated.destination_hash), DESTINATION_HASH,);
 
     // No ratchet, no app_data
     assert!(validated.ratchet.is_none());
@@ -176,8 +170,7 @@ const SIGNALLING_MAX_MTU_AES256CBC: &str = "3fffff";
 /// hashable_part of a link request with known data:
 /// flags=0x02 (Single+LinkRequest), dest_hash=b87c65..., context=0x00,
 /// ephemeral x25519 pub = 0x00..0x1f, ed25519 pub = 0x20..0x3f, signalling=2001f4
-const LINK_HASHABLE_PART: &str =
-    "02b87c6512a0dc32fafbba3a9c9fb81b6900\
+const LINK_HASHABLE_PART: &str = "02b87c6512a0dc32fafbba3a9c9fb81b6900\
      000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
      202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f\
      2001f4";
@@ -186,8 +179,7 @@ const LINK_HASHABLE_PART: &str =
 const LINK_ID: &str = "0b9d2ac7c6767a081d7f36e38865f12b";
 
 /// HKDF-SHA256(ikm=0x00..0x1f, salt=link_id, info=[], length=64)
-const LINK_DERIVED_KEY: &str =
-    "81963961529f000a63383284611c5e6fb967b765694a44567d0d1dcfc8a839a8\
+const LINK_DERIVED_KEY: &str = "81963961529f000a63383284611c5e6fb967b765694a44567d0d1dcfc8a839a8\
      4cfb871df77108bcae02a7e19433c8f2e76530098ef962ae387d1e98f804a65c";
 
 #[test]
@@ -284,20 +276,17 @@ fn interop_key_derivation_matches_python() {
 
 /// IFAC key derived from netname="testnet" (no netkey).
 /// HKDF-SHA256(ikm=SHA256(SHA256("testnet")), salt=IFAC_SALT, info=[], length=64)
-const IFAC_KEY_TESTNET: &str =
-    "bedfc668194da1f48eeff6901693069d77357193277c8a8335a0caae715c879c\
+const IFAC_KEY_TESTNET: &str = "bedfc668194da1f48eeff6901693069d77357193277c8a8335a0caae715c879c\
      4966121fdfb14a3096c3eab295c0014501b37f9dd8c680ee328247451120cd17";
 
 /// IFAC key derived from netname="mynetwork" + netkey="secretkey123".
 /// origin = SHA256("mynetwork") || SHA256("secretkey123")
 /// HKDF-SHA256(ikm=SHA256(origin), salt=IFAC_SALT, info=[], length=64)
-const IFAC_KEY_BOTH: &str =
-    "83e59f477fc9749db17bca7e860fd122249de5514d467baf5d98eeae7607360e\
+const IFAC_KEY_BOTH: &str = "83e59f477fc9749db17bca7e860fd122249de5514d467baf5d98eeae7607360e\
      00e5537822910d1218d76ccde6eb23580f0dc88a8393654297daa2b099fc5b1f";
 
 /// Test packet: flags=0x01 (announce), hops=0, dest=0xAA*16, context=0x00, data=DEADBEEF
-const IFAC_TEST_PACKET: &str =
-    "0100aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00deadbeef";
+const IFAC_TEST_PACKET: &str = "0100aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00deadbeef";
 
 /// Ed25519 signature of the test packet, using the IFAC identity derived from "testnet"
 const IFAC_FULL_SIGNATURE: &str =
@@ -308,16 +297,13 @@ const IFAC_FULL_SIGNATURE: &str =
 const IFAC_TRUNCATED: &str = "a31e01b5156d3a05";
 
 /// Masked packet output from Python's Transport.transmit logic
-const IFAC_MASKED_PACKET: &str =
-    "dae2a31e01b5156d3a053590a57c87b7b5168de351c79507ba7def01442cc8";
+const IFAC_MASKED_PACKET: &str = "dae2a31e01b5156d3a053590a57c87b7b5168de351c79507ba7def01442cc8";
 
 #[test]
 fn interop_ifac_key_derivation_netname_only() {
     // Manually replicate the key derivation to verify against Python
-    let ifac_salt = hex::decode(
-        "adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8",
-    )
-    .unwrap();
+    let ifac_salt =
+        hex::decode("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8").unwrap();
 
     let ifac_origin = hash::full_hash(b"testnet");
     let ifac_origin_hash = hash::full_hash(&ifac_origin);
@@ -333,10 +319,8 @@ fn interop_ifac_key_derivation_netname_only() {
 
 #[test]
 fn interop_ifac_key_derivation_netname_and_netkey() {
-    let ifac_salt = hex::decode(
-        "adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8",
-    )
-    .unwrap();
+    let ifac_salt =
+        hex::decode("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8").unwrap();
 
     let mut ifac_origin = Vec::new();
     ifac_origin.extend_from_slice(&hash::full_hash(b"mynetwork"));

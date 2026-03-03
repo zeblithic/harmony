@@ -40,9 +40,7 @@ const NODE_LOOKUP_FMT: &str = "lookup/rns/${node_hash:*}";
 /// Subscribe to all messages on a specific server's channel.
 pub fn channel_msg_sub(server_id: &str) -> Result<OwnedKeyExpr, ZenohError> {
     reject_slashes(server_id)?;
-    ke(&format!(
-        "harmony/server/{server_id}/channel/*/msg"
-    ))
+    ke(&format!("harmony/server/{server_id}/channel/*/msg"))
 }
 
 /// Subscribe to all messages on a specific channel.
@@ -99,10 +97,7 @@ pub fn geo_s2_sub_l8(l4: &str, l8: &str) -> Result<OwnedKeyExpr, ZenohError> {
 // ── Builder functions ────────────────────────────────────────────────
 
 /// Build a channel message key expression.
-pub fn channel_msg_key(
-    server_id: &str,
-    channel_id: &str,
-) -> Result<OwnedKeyExpr, ZenohError> {
+pub fn channel_msg_key(server_id: &str, channel_id: &str) -> Result<OwnedKeyExpr, ZenohError> {
     let fmt = KeFormat::new(CHANNEL_MSG_FMT).map_err(|e| ze(e.to_string()))?;
     let mut f = fmt.formatter();
     f.set("server_id", server_id)
@@ -130,16 +125,12 @@ pub fn dm_key(user_a: &str, user_b: &str) -> Result<OwnedKeyExpr, ZenohError> {
 }
 
 /// Build a presence key expression.
-pub fn presence_key(
-    server_id: &str,
-    user_id: &str,
-) -> Result<OwnedKeyExpr, ZenohError> {
+pub fn presence_key(server_id: &str, user_id: &str) -> Result<OwnedKeyExpr, ZenohError> {
     let fmt = KeFormat::new(PRESENCE_FMT).map_err(|e| ze(e.to_string()))?;
     let mut f = fmt.formatter();
     f.set("server_id", server_id)
         .map_err(|e| ze(e.to_string()))?;
-    f.set("user_id", user_id)
-        .map_err(|e| ze(e.to_string()))?;
+    f.set("user_id", user_id).map_err(|e| ze(e.to_string()))?;
     f.build().map_err(|e| ze(e.to_string()))
 }
 
@@ -157,8 +148,7 @@ pub fn geo_s2_key(
     f.set("l8", l8).map_err(|e| ze(e.to_string()))?;
     f.set("l12", l12).map_err(|e| ze(e.to_string()))?;
     f.set("l16", l16).map_err(|e| ze(e.to_string()))?;
-    f.set("rns_hash", rns_hash)
-        .map_err(|e| ze(e.to_string()))?;
+    f.set("rns_hash", rns_hash).map_err(|e| ze(e.to_string()))?;
     f.build().map_err(|e| ze(e.to_string()))
 }
 

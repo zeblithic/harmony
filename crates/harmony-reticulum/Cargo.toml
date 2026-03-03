@@ -15,6 +15,7 @@ x25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
+rmp = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

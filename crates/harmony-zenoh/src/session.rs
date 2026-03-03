@@ -158,10 +158,7 @@ impl Session {
     }
 
     /// Process an inbound event and return actions for the caller to execute.
-    pub fn handle_event(
-        &mut self,
-        event: SessionEvent,
-    ) -> Result<Vec<SessionAction>, ZenohError> {
+    pub fn handle_event(&mut self, event: SessionEvent) -> Result<Vec<SessionAction>, ZenohError> {
         match event {
             SessionEvent::HandshakeReceived { proof } => self.handle_handshake(proof),
             SessionEvent::TimerTick { now_ms } => self.handle_timer_tick(now_ms),
@@ -385,18 +382,10 @@ mod tests {
         let alice_pub = alice_id.public_identity().clone();
         let bob_pub = bob_id.public_identity().clone();
 
-        let (alice_session, alice_actions) = Session::new(
-            alice_id,
-            bob_pub,
-            SessionConfig::default(),
-            0,
-        );
-        let (bob_session, bob_actions) = Session::new(
-            bob_id,
-            alice_pub,
-            SessionConfig::default(),
-            0,
-        );
+        let (alice_session, alice_actions) =
+            Session::new(alice_id, bob_pub, SessionConfig::default(), 0);
+        let (bob_session, bob_actions) =
+            Session::new(bob_id, alice_pub, SessionConfig::default(), 0);
 
         (alice_session, alice_actions, bob_session, bob_actions)
     }
@@ -442,7 +431,10 @@ mod tests {
         assert_eq!(alice.state(), SessionState::Init);
         assert_eq!(bob.state(), SessionState::Init);
         assert_eq!(alice_actions.len(), 1);
-        assert!(matches!(&alice_actions[0], SessionAction::SendHandshake { .. }));
+        assert!(matches!(
+            &alice_actions[0],
+            SessionAction::SendHandshake { .. }
+        ));
 
         complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
     }
@@ -457,17 +449,11 @@ mod tests {
         let bob_pub = bob_id.public_identity().clone();
         let alice_pub = alice_id.public_identity().clone();
 
-        let (mut bob_session, _) = Session::new(
-            bob_id,
-            alice_pub,
-            SessionConfig::default(),
-            0,
-        );
+        let (mut bob_session, _) = Session::new(bob_id, alice_pub, SessionConfig::default(), 0);
 
         // Eve signs a proof, but Bob expects Alice
-        let eve_proof = eve_id.sign(
-            &[b"harmony-session-v1" as &[u8], &bob_pub.address_hash].concat(),
-        );
+        let eve_proof =
+            eve_id.sign(&[b"harmony-session-v1" as &[u8], &bob_pub.address_hash].concat());
 
         let result = bob_session.handle_event(SessionEvent::HandshakeReceived {
             proof: eve_proof.to_vec(),
@@ -487,17 +473,12 @@ mod tests {
         let bob_pub = bob_id.public_identity().clone();
 
         // Alice signs proof for Bob
-        let proof_for_bob = alice_id.sign(
-            &[b"harmony-session-v1" as &[u8], &bob_pub.address_hash].concat(),
-        );
+        let proof_for_bob =
+            alice_id.sign(&[b"harmony-session-v1" as &[u8], &bob_pub.address_hash].concat());
 
         // Try to replay that proof to Charlie (who expects Alice)
-        let (mut charlie_session, _) = Session::new(
-            charlie_id,
-            alice_pub,
-            SessionConfig::default(),
-            0,
-        );
+        let (mut charlie_session, _) =
+            Session::new(charlie_id, alice_pub, SessionConfig::default(), 0);
 
         // Charlie's address_hash != Bob's, so verification should fail
         let result = charlie_session.handle_event(SessionEvent::HandshakeReceived {
@@ -523,7 +504,9 @@ mod tests {
         complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
 
         // Alice declares a local resource
-        let (expr_id, actions) = alice.declare_resource("harmony/server/srv1/channel/general/msg".into()).unwrap();
+        let (expr_id, actions) = alice
+            .declare_resource("harmony/server/srv1/channel/general/msg".into())
+            .unwrap();
         assert_eq!(expr_id, 1);
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -555,7 +538,10 @@ mod tests {
             .handle_event(SessionEvent::ResourceUndeclared { expr_id: 1 })
             .unwrap();
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], SessionAction::ResourceRemoved { expr_id: 1 }));
+        assert!(matches!(
+            &actions[0],
+            SessionAction::ResourceRemoved { expr_id: 1 }
+        ));
         assert_eq!(bob.resolve_remote(1), None);
     }
 
@@ -591,9 +577,15 @@ mod tests {
         let (mut alice, alice_actions, mut bob, bob_actions) = create_session_pair();
         complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
 
-        let (id1, _) = alice.declare_resource("harmony/server/a/msg".into()).unwrap();
-        let (id2, _) = alice.declare_resource("harmony/server/b/msg".into()).unwrap();
-        let (id3, _) = alice.declare_resource("harmony/server/c/msg".into()).unwrap();
+        let (id1, _) = alice
+            .declare_resource("harmony/server/a/msg".into())
+            .unwrap();
+        let (id2, _) = alice
+            .declare_resource("harmony/server/b/msg".into())
+            .unwrap();
+        let (id3, _) = alice
+            .declare_resource("harmony/server/c/msg".into())
+            .unwrap();
 
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
@@ -618,11 +610,15 @@ mod tests {
         complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
 
         // Before interval: no keepalive
-        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 50 }).unwrap();
+        let actions = alice
+            .handle_event(SessionEvent::TimerTick { now_ms: 50 })
+            .unwrap();
         assert!(!actions.contains(&SessionAction::SendKeepalive));
 
         // At interval: keepalive emitted
-        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 100 }).unwrap();
+        let actions = alice
+            .handle_event(SessionEvent::TimerTick { now_ms: 100 })
+            .unwrap();
         assert!(actions.contains(&SessionAction::SendKeepalive));
     }
 
@@ -644,12 +640,16 @@ mod tests {
         complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
 
         // Not yet stale
-        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 200 }).unwrap();
+        let actions = alice
+            .handle_event(SessionEvent::TimerTick { now_ms: 200 })
+            .unwrap();
         assert!(!actions.contains(&SessionAction::PeerStale));
         assert_eq!(alice.state(), SessionState::Active);
 
         // Stale
-        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 300 }).unwrap();
+        let actions = alice
+            .handle_event(SessionEvent::TimerTick { now_ms: 300 })
+            .unwrap();
         assert!(actions.contains(&SessionAction::PeerStale));
         assert!(actions.contains(&SessionAction::SessionClosed));
         assert_eq!(alice.state(), SessionState::Closed);
@@ -678,9 +678,7 @@ mod tests {
         assert_eq!(alice.state(), SessionState::Closing);
 
         // Alice receives close ack
-        let actions = alice
-            .handle_event(SessionEvent::CloseAckReceived)
-            .unwrap();
+        let actions = alice.handle_event(SessionEvent::CloseAckReceived).unwrap();
         assert!(actions.contains(&SessionAction::SessionClosed));
         assert_eq!(alice.state(), SessionState::Closed);
     }
@@ -705,11 +703,15 @@ mod tests {
         alice.initiate_close(10).unwrap();
 
         // Not yet timed out
-        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 30 }).unwrap();
+        let actions = alice
+            .handle_event(SessionEvent::TimerTick { now_ms: 30 })
+            .unwrap();
         assert!(!actions.contains(&SessionAction::SessionClosed));
 
         // Timed out — force close
-        let actions = alice.handle_event(SessionEvent::TimerTick { now_ms: 60 }).unwrap();
+        let actions = alice
+            .handle_event(SessionEvent::TimerTick { now_ms: 60 })
+            .unwrap();
         assert!(actions.contains(&SessionAction::SessionClosed));
         assert_eq!(alice.state(), SessionState::Closed);
     }
@@ -732,9 +734,7 @@ mod tests {
         complete_handshake(&mut alice, &alice_actions, &mut bob, &bob_actions);
 
         // Bob receives close from Alice
-        let actions = bob
-            .handle_event(SessionEvent::CloseReceived)
-            .unwrap();
+        let actions = bob.handle_event(SessionEvent::CloseReceived).unwrap();
         assert!(actions.contains(&SessionAction::SendCloseAck));
         assert!(actions.contains(&SessionAction::SessionClosed));
         assert_eq!(bob.state(), SessionState::Closed);

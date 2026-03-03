@@ -63,6 +63,27 @@ pub enum ReticulumError {
     #[error("IFAC size must be between 1 and 64 bytes, got {0}")]
     IfacInvalidSize(usize),
 
+    #[error("resource too large: {size} bytes exceeds {max} byte limit")]
+    ResourceTooLarge { size: usize, max: usize },
+
+    #[error("resource advertisement invalid")]
+    ResourceAdvInvalid,
+
+    #[error("resource hash mismatch")]
+    ResourceHashMismatch,
+
+    #[error("resource proof invalid")]
+    ResourceProofInvalid,
+
+    #[error("unknown resource part: map_hash {map_hash:02x?}")]
+    ResourceUnknownPart { map_hash: [u8; 4] },
+
+    #[error("resource transfer failed")]
+    ResourceFailed,
+
+    #[error("resource already complete")]
+    ResourceAlreadyComplete,
+
     #[error(transparent)]
     Identity(#[from] IdentityError),
 

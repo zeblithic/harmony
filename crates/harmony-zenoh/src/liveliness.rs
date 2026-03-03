@@ -161,8 +161,8 @@ impl LivelinessRouter {
         self.subscriber_ids.insert(sub_table_id, sub_id);
 
         // History: emit TokenAppeared for each existing remote token that matches.
-        let ke = keyexpr::new(owned.as_str())
-            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let ke =
+            keyexpr::new(owned.as_str()).map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
         let token_matches = self.remote_tokens.matches(ke);
         let mut actions = Vec::new();
         for token_table_id in token_matches {
@@ -178,10 +178,7 @@ impl LivelinessRouter {
     }
 
     /// Unsubscribe a liveliness subscriber.
-    pub fn unsubscribe(
-        &mut self,
-        subscriber_id: LivelinessSubscriberId,
-    ) -> Result<(), ZenohError> {
+    pub fn unsubscribe(&mut self, subscriber_id: LivelinessSubscriberId) -> Result<(), ZenohError> {
         let sub_table_id = self
             .subscriber_keys
             .remove(&subscriber_id)
@@ -199,12 +196,8 @@ impl LivelinessRouter {
         event: LivelinessEvent,
     ) -> Result<Vec<LivelinessAction>, ZenohError> {
         match event {
-            LivelinessEvent::TokenDeclared { key_expr } => {
-                self.handle_token_declared(key_expr)
-            }
-            LivelinessEvent::TokenUndeclared { key_expr } => {
-                self.handle_token_undeclared(key_expr)
-            }
+            LivelinessEvent::TokenDeclared { key_expr } => self.handle_token_declared(key_expr),
+            LivelinessEvent::TokenUndeclared { key_expr } => self.handle_token_undeclared(key_expr),
             LivelinessEvent::PeerLost => Ok(self.handle_peer_lost()),
         }
     }
@@ -250,8 +243,7 @@ impl LivelinessRouter {
     }
 
     fn handle_peer_lost(&mut self) -> Vec<LivelinessAction> {
-        let token_keys: Vec<(SubscriptionId, String)> =
-            self.remote_token_keys.drain().collect();
+        let token_keys: Vec<(SubscriptionId, String)> = self.remote_token_keys.drain().collect();
         self.remote_token_ids.clear();
         let mut actions = Vec::new();
 
@@ -270,8 +262,7 @@ impl LivelinessRouter {
         &self,
         key_expr: &str,
     ) -> Result<Vec<LivelinessAction>, ZenohError> {
-        let ke = keyexpr::new(key_expr)
-            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let ke = keyexpr::new(key_expr).map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
         let matches = self.subscribers.matches(ke);
         let mut actions = Vec::new();
         for sub_table_id in matches {
@@ -290,8 +281,7 @@ impl LivelinessRouter {
         &self,
         key_expr: &str,
     ) -> Result<Vec<LivelinessAction>, ZenohError> {
-        let ke = keyexpr::new(key_expr)
-            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let ke = keyexpr::new(key_expr).map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
         let matches = self.subscribers.matches(ke);
         let mut actions = Vec::new();
         for sub_table_id in matches {
@@ -313,8 +303,8 @@ impl LivelinessRouter {
     pub fn query(&self, key_expr: &str) -> Result<Vec<String>, ZenohError> {
         let owned = OwnedKeyExpr::autocanonize(key_expr.to_string())
             .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
-        let ke = keyexpr::new(owned.as_str())
-            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let ke =
+            keyexpr::new(owned.as_str()).map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
         let token_matches = self.remote_tokens.matches(ke);
         let mut results = Vec::new();
         for token_table_id in token_matches {
@@ -349,9 +339,7 @@ mod tests {
     #[test]
     fn declare_token_returns_id_and_send_action() {
         let mut router = LivelinessRouter::new();
-        let (token_id, actions) = router
-            .declare_token("harmony/presence/srv1/alice")
-            .unwrap();
+        let (token_id, actions) = router.declare_token("harmony/presence/srv1/alice").unwrap();
         assert_eq!(token_id, 1);
         assert_eq!(actions.len(), 1);
         assert_eq!(
@@ -428,9 +416,7 @@ mod tests {
     #[test]
     fn subscribe_returns_id() {
         let mut router = LivelinessRouter::new();
-        let (sub_id, actions) = router
-            .subscribe("harmony/presence/srv1/*")
-            .unwrap();
+        let (sub_id, actions) = router.subscribe("harmony/presence/srv1/*").unwrap();
         assert_eq!(sub_id, 1);
         assert!(actions.is_empty());
     }
@@ -612,9 +598,7 @@ mod tests {
             })
             .unwrap();
 
-        let actions = router
-            .handle_event(LivelinessEvent::PeerLost)
-            .unwrap();
+        let actions = router.handle_event(LivelinessEvent::PeerLost).unwrap();
 
         let disappeared: Vec<String> = actions
             .iter()

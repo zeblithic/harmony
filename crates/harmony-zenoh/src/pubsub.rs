@@ -94,10 +94,15 @@ impl PubSubRouter {
         let canonical = owned.to_string();
         let sub_id = self.subscriptions.subscribe(&owned);
         self.sub_key_exprs.insert(sub_id, canonical.clone());
-        let count = self.local_interest_count.entry(canonical.clone()).or_insert(0);
+        let count = self
+            .local_interest_count
+            .entry(canonical.clone())
+            .or_insert(0);
         *count += 1;
         let actions = if *count == 1 {
-            vec![PubSubAction::SendSubscriberDeclare { key_expr: canonical }]
+            vec![PubSubAction::SendSubscriberDeclare {
+                key_expr: canonical,
+            }]
         } else {
             vec![]
         };
@@ -108,10 +113,7 @@ impl PubSubRouter {
     ///
     /// Removes from local SubscriptionTable and emits `SendSubscriberUndeclare`
     /// only when the last local subscription for this key expression is removed.
-    pub fn unsubscribe(
-        &mut self,
-        sub_id: SubscriptionId,
-    ) -> Result<Vec<PubSubAction>, ZenohError> {
+    pub fn unsubscribe(&mut self, sub_id: SubscriptionId) -> Result<Vec<PubSubAction>, ZenohError> {
         let key_expr = self
             .sub_key_exprs
             .remove(&sub_id)
@@ -145,7 +147,10 @@ impl PubSubRouter {
         let pub_id = self.next_publisher_id;
         self.next_publisher_id += 1;
         self.publishers.insert(pub_id, expr_id);
-        let actions = session_actions.into_iter().map(PubSubAction::Session).collect();
+        let actions = session_actions
+            .into_iter()
+            .map(PubSubAction::Session)
+            .collect();
         Ok((pub_id, actions))
     }
 
@@ -163,7 +168,10 @@ impl PubSubRouter {
             .remove(&pub_id)
             .ok_or(ZenohError::UnknownPublisherId(pub_id))?;
         let session_actions = session.undeclare_resource(expr_id)?;
-        let actions = session_actions.into_iter().map(PubSubAction::Session).collect();
+        let actions = session_actions
+            .into_iter()
+            .map(PubSubAction::Session)
+            .collect();
         Ok(actions)
     }
 
@@ -188,8 +196,8 @@ impl PubSubRouter {
             .resolve_local(expr_id)
             .ok_or(ZenohError::UnknownExprId(expr_id))?;
 
-        let ke = keyexpr::new(key_expr_str)
-            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let ke =
+            keyexpr::new(key_expr_str).map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
 
         let matches = self.remote_interest.matches(ke);
         if matches.is_empty() {
@@ -227,8 +235,8 @@ impl PubSubRouter {
         let key_expr_str = session
             .resolve_remote(expr_id)
             .ok_or(ZenohError::UnknownExprId(expr_id))?;
-        let key = keyexpr::new(key_expr_str)
-            .map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
+        let key =
+            keyexpr::new(key_expr_str).map_err(|e| ZenohError::InvalidKeyExpr(e.to_string()))?;
         let matches = self.subscriptions.matches(key);
 
         if matches.is_empty() {
@@ -306,10 +314,8 @@ mod tests {
             SessionAction::SendHandshake { proof } => proof.clone(),
             _ => panic!("expected SendHandshake"),
         };
-        bob.handle_event(SessionEvent::HandshakeReceived {
-            proof: alice_proof,
-        })
-        .unwrap();
+        bob.handle_event(SessionEvent::HandshakeReceived { proof: alice_proof })
+            .unwrap();
         alice
             .handle_event(SessionEvent::HandshakeReceived { proof: bob_proof })
             .unwrap();
@@ -329,7 +335,10 @@ mod tests {
 
         assert_eq!(pub_id, 1);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], PubSubAction::Session(SessionAction::SendResourceDeclare { .. })));
+        assert!(matches!(
+            &actions[0],
+            PubSubAction::Session(SessionAction::SendResourceDeclare { .. })
+        ));
         assert!(alice.resolve_local(1).is_some());
     }
 
@@ -344,7 +353,10 @@ mod tests {
 
         let actions = router.undeclare_publisher(pub_id, &mut alice).unwrap();
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], PubSubAction::Session(SessionAction::SendResourceUndeclare { .. })));
+        assert!(matches!(
+            &actions[0],
+            PubSubAction::Session(SessionAction::SendResourceUndeclare { .. })
+        ));
         assert!(alice.resolve_local(1).is_none());
     }
 
@@ -367,9 +379,7 @@ mod tests {
             )
             .unwrap();
 
-        let actions = router
-            .publish(pub_id, b"hello".to_vec(), &alice)
-            .unwrap();
+        let actions = router.publish(pub_id, b"hello".to_vec(), &alice).unwrap();
 
         assert_eq!(actions.len(), 1);
         assert_eq!(
@@ -391,9 +401,7 @@ mod tests {
             .unwrap();
 
         // No subscriber declared — should emit nothing
-        let actions = router
-            .publish(pub_id, b"hello".to_vec(), &alice)
-            .unwrap();
+        let actions = router.publish(pub_id, b"hello".to_vec(), &alice).unwrap();
 
         assert!(actions.is_empty());
     }
@@ -578,10 +586,20 @@ mod tests {
 
         // Declare interest twice on the same key expression
         router
-            .handle_event(PubSubEvent::SubscriberDeclared { key_expr: ke.into() }, &alice)
+            .handle_event(
+                PubSubEvent::SubscriberDeclared {
+                    key_expr: ke.into(),
+                },
+                &alice,
+            )
             .unwrap();
         router
-            .handle_event(PubSubEvent::SubscriberDeclared { key_expr: ke.into() }, &alice)
+            .handle_event(
+                PubSubEvent::SubscriberDeclared {
+                    key_expr: ke.into(),
+                },
+                &alice,
+            )
             .unwrap();
 
         // Should still match (second declare replaced first)
@@ -590,7 +608,12 @@ mod tests {
 
         // Single undeclare should clear interest — no orphaned entry
         router
-            .handle_event(PubSubEvent::SubscriberUndeclared { key_expr: ke.into() }, &alice)
+            .handle_event(
+                PubSubEvent::SubscriberUndeclared {
+                    key_expr: ke.into(),
+                },
+                &alice,
+            )
             .unwrap();
 
         let actions = router.publish(pub_id, b"msg".to_vec(), &alice).unwrap();

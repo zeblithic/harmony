@@ -9,7 +9,7 @@ use crate::destination::DestinationName;
 use crate::error::ReticulumError;
 use crate::packet::{
     DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
-    MTU, HEADER_1_SIZE,
+    HEADER_1_SIZE, MTU,
 };
 
 /// Hex-encode bytes without pulling in the `hex` crate at runtime.
@@ -53,7 +53,10 @@ pub struct ValidatedAnnounce {
 /// Format: `SHA256(16 random bytes)[:5] || timestamp.to_be_bytes()[3..8]`
 ///
 /// Sans-I/O: caller provides the RNG and timestamp.
-pub fn build_random_hash(rng: &mut impl CryptoRngCore, timestamp_secs: u64) -> [u8; RANDOM_HASH_LENGTH] {
+pub fn build_random_hash(
+    rng: &mut impl CryptoRngCore,
+    timestamp_secs: u64,
+) -> [u8; RANDOM_HASH_LENGTH] {
     let mut random_bytes = [0u8; hash::TRUNCATED_HASH_LENGTH];
     rng.fill_bytes(&mut random_bytes);
     let hash = hash::truncated_hash(&random_bytes);
@@ -202,9 +205,8 @@ pub fn validate_announce(packet: &Packet) -> Result<ValidatedAnnounce, Reticulum
     let data = &packet.data;
     let mut offset = 0;
 
-    let public_keys: [u8; PUBLIC_KEY_LENGTH] = data[offset..offset + PUBLIC_KEY_LENGTH]
-        .try_into()
-        .unwrap();
+    let public_keys: [u8; PUBLIC_KEY_LENGTH] =
+        data[offset..offset + PUBLIC_KEY_LENGTH].try_into().unwrap();
     offset += PUBLIC_KEY_LENGTH;
 
     let mut name_hash = [0u8; hash::NAME_HASH_LENGTH];
@@ -223,9 +225,8 @@ pub fn validate_announce(packet: &Packet) -> Result<ValidatedAnnounce, Reticulum
         None
     };
 
-    let signature: [u8; SIGNATURE_LENGTH] = data[offset..offset + SIGNATURE_LENGTH]
-        .try_into()
-        .unwrap();
+    let signature: [u8; SIGNATURE_LENGTH] =
+        data[offset..offset + SIGNATURE_LENGTH].try_into().unwrap();
     offset += SIGNATURE_LENGTH;
 
     let app_data = data[offset..].to_vec();
@@ -308,7 +309,8 @@ mod tests {
         let identity = PrivateIdentity::generate(&mut OsRng);
         let dest = DestinationName::from_name("lxmf", &["delivery"]).unwrap();
 
-        let packet = build_announce(&identity, &dest, &mut OsRng, 1_700_000_000, &[], None).unwrap();
+        let packet =
+            build_announce(&identity, &dest, &mut OsRng, 1_700_000_000, &[], None).unwrap();
 
         assert_eq!(packet.header.flags.packet_type, PacketType::Announce);
         assert!(!packet.header.flags.context_flag);
@@ -353,15 +355,8 @@ mod tests {
         let dest = DestinationName::from_name("myapp", &["service"]).unwrap();
         let app_data = b"Hello, I am a node!";
 
-        let packet = build_announce(
-            &identity,
-            &dest,
-            &mut OsRng,
-            1_700_000_000,
-            app_data,
-            None,
-        )
-        .unwrap();
+        let packet =
+            build_announce(&identity, &dest, &mut OsRng, 1_700_000_000, app_data, None).unwrap();
 
         let validated = validate_announce(&packet).unwrap();
         assert_eq!(validated.app_data, app_data);
@@ -399,15 +394,8 @@ mod tests {
         let identity = PrivateIdentity::generate(&mut OsRng);
         let dest = DestinationName::from_name("nomad", &["page"]).unwrap();
 
-        let packet = build_announce(
-            &identity,
-            &dest,
-            &mut OsRng,
-            1_700_000_000,
-            b"test",
-            None,
-        )
-        .unwrap();
+        let packet =
+            build_announce(&identity, &dest, &mut OsRng, 1_700_000_000, b"test", None).unwrap();
 
         // Serialize and deserialize
         let bytes = packet.to_bytes().unwrap();

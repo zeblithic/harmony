@@ -6,10 +6,8 @@ use crate::error::ReticulumError;
 
 /// Reticulum IFAC salt (from Reticulum.py line 152).
 const IFAC_SALT: [u8; 32] = [
-    0xad, 0xf5, 0x4d, 0x88, 0x2c, 0x9a, 0x9b, 0x80,
-    0x77, 0x1e, 0xb4, 0x99, 0x5d, 0x70, 0x2d, 0x4a,
-    0x3e, 0x73, 0x33, 0x91, 0xb2, 0xa0, 0xf5, 0x3f,
-    0x41, 0x6d, 0x9f, 0x90, 0x7e, 0x55, 0xcf, 0xf8,
+    0xad, 0xf5, 0x4d, 0x88, 0x2c, 0x9a, 0x9b, 0x80, 0x77, 0x1e, 0xb4, 0x99, 0x5d, 0x70, 0x2d, 0x4a,
+    0x3e, 0x73, 0x33, 0x91, 0xb2, 0xa0, 0xf5, 0x3f, 0x41, 0x6d, 0x9f, 0x90, 0x7e, 0x55, 0xcf, 0xf8,
 ];
 
 /// IFAC flag bit in the first byte of a packet header.
@@ -63,12 +61,7 @@ impl IfacAuthenticator {
         let ifac_origin_hash = hash::full_hash(&ifac_origin);
 
         // HKDF: derive 64-byte key, zeroizing the intermediate Vec
-        let mut ifac_key_vec = hkdf::derive_key(
-            &ifac_origin_hash,
-            Some(&IFAC_SALT),
-            &[],
-            64,
-        )?;
+        let mut ifac_key_vec = hkdf::derive_key(&ifac_origin_hash, Some(&IFAC_SALT), &[], 64)?;
 
         let mut ifac_key = [0u8; 64];
         ifac_key.copy_from_slice(&ifac_key_vec);
@@ -101,12 +94,7 @@ impl IfacAuthenticator {
         let ifac = &sig[sig.len() - self.ifac_size..];
 
         // 2. Generate mask via HKDF
-        let mask = hkdf::derive_key(
-            ifac,
-            Some(&self.ifac_key),
-            &[],
-            raw.len() + self.ifac_size,
-        )?;
+        let mask = hkdf::derive_key(ifac, Some(&self.ifac_key), &[], raw.len() + self.ifac_size)?;
 
         // 3. Assemble: [flags|0x80][hops][IFAC][payload...]
         let mut new_raw = Vec::with_capacity(raw.len() + self.ifac_size);
@@ -154,12 +142,7 @@ impl IfacAuthenticator {
         let ifac = &raw[2..2 + self.ifac_size];
 
         // 2. Generate mask
-        let mask = hkdf::derive_key(
-            ifac,
-            Some(&self.ifac_key),
-            &[],
-            raw.len(),
-        )?;
+        let mask = hkdf::derive_key(ifac, Some(&self.ifac_key), &[], raw.len())?;
 
         // 3. Unmask selectively
         let mut unmasked = Vec::with_capacity(raw.len());
@@ -234,7 +217,11 @@ mod tests {
     fn mask_sets_ifac_flag() {
         let auth = make_authenticator();
         let original = make_test_packet();
-        assert_eq!(original[0] & IFAC_FLAG, 0, "original should not have IFAC flag");
+        assert_eq!(
+            original[0] & IFAC_FLAG,
+            0,
+            "original should not have IFAC flag"
+        );
 
         let masked = auth.mask(&original).unwrap();
         assert_ne!(masked[0] & IFAC_FLAG, 0, "masked should have IFAC flag set");
@@ -247,7 +234,11 @@ mod tests {
 
         let masked = auth.mask(&original).unwrap();
         let unmasked = auth.unmask(&masked).unwrap();
-        assert_eq!(unmasked[0] & IFAC_FLAG, 0, "unmasked should not have IFAC flag");
+        assert_eq!(
+            unmasked[0] & IFAC_FLAG,
+            0,
+            "unmasked should not have IFAC flag"
+        );
     }
 
     #[test]
@@ -300,7 +291,10 @@ mod tests {
         assert_eq!(original[0] & IFAC_FLAG, 0);
 
         let result = auth.unmask(&original);
-        assert!(matches!(result, Err(ReticulumError::IfacVerificationFailed)));
+        assert!(matches!(
+            result,
+            Err(ReticulumError::IfacVerificationFailed)
+        ));
     }
 
     #[test]
@@ -366,7 +360,10 @@ mod tests {
 
             let masked = auth.mask(&pkt).unwrap();
             let unmasked = auth.unmask(&masked).unwrap();
-            assert_eq!(unmasked, pkt, "roundtrip failed for payload_size={payload_size}");
+            assert_eq!(
+                unmasked, pkt,
+                "roundtrip failed for payload_size={payload_size}"
+            );
         }
     }
 
@@ -392,7 +389,10 @@ mod tests {
     #[test]
     fn new_with_no_credentials_rejected() {
         let result = IfacAuthenticator::new(None, None, 8);
-        assert!(matches!(result, Err(ReticulumError::IfacMissingCredentials)));
+        assert!(matches!(
+            result,
+            Err(ReticulumError::IfacMissingCredentials)
+        ));
     }
 
     #[test]

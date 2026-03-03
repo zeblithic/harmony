@@ -119,25 +119,37 @@ mod tests {
     #[test]
     fn dot_in_app_name_rejected() {
         let result = DestinationName::from_name("bad.name", &[]);
-        assert!(matches!(result, Err(ReticulumError::InvalidDestinationName)));
+        assert!(matches!(
+            result,
+            Err(ReticulumError::InvalidDestinationName)
+        ));
     }
 
     #[test]
     fn dot_in_aspect_rejected() {
         let result = DestinationName::from_name("app", &["bad.aspect"]);
-        assert!(matches!(result, Err(ReticulumError::InvalidDestinationName)));
+        assert!(matches!(
+            result,
+            Err(ReticulumError::InvalidDestinationName)
+        ));
     }
 
     #[test]
     fn empty_app_name_rejected() {
         let result = DestinationName::from_name("", &[]);
-        assert!(matches!(result, Err(ReticulumError::InvalidDestinationName)));
+        assert!(matches!(
+            result,
+            Err(ReticulumError::InvalidDestinationName)
+        ));
     }
 
     #[test]
     fn empty_aspect_rejected() {
         let result = DestinationName::from_name("app", &[""]);
-        assert!(matches!(result, Err(ReticulumError::InvalidDestinationName)));
+        assert!(matches!(
+            result,
+            Err(ReticulumError::InvalidDestinationName)
+        ));
     }
 
     #[test]

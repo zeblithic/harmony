@@ -84,7 +84,11 @@ impl Identity {
     }
 
     /// Verify an Ed25519 signature against this identity.
-    pub fn verify(&self, message: &[u8], signature: &[u8; SIGNATURE_LENGTH]) -> Result<(), IdentityError> {
+    pub fn verify(
+        &self,
+        message: &[u8],
+        signature: &[u8; SIGNATURE_LENGTH],
+    ) -> Result<(), IdentityError> {
         let sig = Signature::from_bytes(signature);
         self.verifying_key
             .verify(message, &sig)
@@ -112,10 +116,7 @@ impl Identity {
         let shared_secret = ephemeral_secret.diffie_hellman(&self.encryption_key);
 
         // HKDF: derive 64-byte Fernet key from shared secret
-        let mut derived = hkdf::derive_key_256(
-            shared_secret.as_bytes(),
-            Some(&self.address_hash),
-        );
+        let mut derived = hkdf::derive_key_256(shared_secret.as_bytes(), Some(&self.address_hash));
 
         // Fernet encrypt
         let token = harmony_crypto::fernet::encrypt(rng, &derived, plaintext)?;
@@ -163,11 +164,9 @@ impl PrivateIdentity {
 
         // Delegate address derivation to Identity::from_public_keys (single source of truth).
         // Ed25519 keys from generate() are always valid, so unwrap is safe.
-        let identity = Identity::from_public_keys(
-            encryption_key.as_bytes(),
-            verifying_key.as_bytes(),
-        )
-        .expect("keys from generate() are always valid");
+        let identity =
+            Identity::from_public_keys(encryption_key.as_bytes(), verifying_key.as_bytes())
+                .expect("keys from generate() are always valid");
 
         Self {
             identity,
@@ -199,10 +198,8 @@ impl PrivateIdentity {
         let shared_secret = self.encryption_secret.diffie_hellman(&ephemeral_pub);
 
         // HKDF: derive 64-byte Fernet key
-        let mut derived = hkdf::derive_key_256(
-            shared_secret.as_bytes(),
-            Some(&self.identity.address_hash),
-        );
+        let mut derived =
+            hkdf::derive_key_256(shared_secret.as_bytes(), Some(&self.identity.address_hash));
 
         // Fernet decrypt
         let result = harmony_crypto::fernet::decrypt(&derived, token)
@@ -243,10 +240,8 @@ impl PrivateIdentity {
         let verifying_key = signing_key.verifying_key();
 
         // Delegate address derivation to Identity::from_public_keys (single source of truth).
-        let identity = Identity::from_public_keys(
-            encryption_key.as_bytes(),
-            verifying_key.as_bytes(),
-        )?;
+        let identity =
+            Identity::from_public_keys(encryption_key.as_bytes(), verifying_key.as_bytes())?;
 
         Ok(Self {
             identity,
@@ -337,10 +332,7 @@ mod tests {
         assert_eq!(priv_bytes.len(), 64);
 
         let restored = PrivateIdentity::from_private_bytes(&priv_bytes).unwrap();
-        assert_eq!(
-            restored.identity.address_hash,
-            id.identity.address_hash
-        );
+        assert_eq!(restored.identity.address_hash, id.identity.address_hash);
         assert_eq!(
             restored.public_identity().to_public_bytes(),
             id.public_identity().to_public_bytes()
@@ -422,7 +414,10 @@ mod tests {
         let plaintext = b"hello from alice";
 
         // Bob encrypts to Alice's public identity
-        let ciphertext = alice.public_identity().encrypt(&mut OsRng, plaintext).unwrap();
+        let ciphertext = alice
+            .public_identity()
+            .encrypt(&mut OsRng, plaintext)
+            .unwrap();
 
         // Alice decrypts with her private key
         let decrypted = alice.decrypt(&ciphertext).unwrap();
@@ -441,7 +436,10 @@ mod tests {
     fn encrypt_decrypt_large_payload() {
         let id = PrivateIdentity::generate(&mut OsRng);
         let plaintext = vec![0xABu8; 8192];
-        let ciphertext = id.public_identity().encrypt(&mut OsRng, &plaintext).unwrap();
+        let ciphertext = id
+            .public_identity()
+            .encrypt(&mut OsRng, &plaintext)
+            .unwrap();
         let decrypted = id.decrypt(&ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
     }
@@ -470,7 +468,10 @@ mod tests {
         let alice = PrivateIdentity::generate(&mut OsRng);
         let bob = PrivateIdentity::generate(&mut OsRng);
 
-        let ciphertext = alice.public_identity().encrypt(&mut OsRng, b"for alice only").unwrap();
+        let ciphertext = alice
+            .public_identity()
+            .encrypt(&mut OsRng, b"for alice only")
+            .unwrap();
         let result = bob.decrypt(&ciphertext);
         assert!(result.is_err());
     }

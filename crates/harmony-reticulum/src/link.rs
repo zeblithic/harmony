@@ -21,6 +21,7 @@ use crate::error::ReticulumError;
 use crate::packet::{
     DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType, PropagationType,
 };
+use crate::resource::LinkCrypto;
 
 // ── Wire format constants ────────────────────────────────────────────
 
@@ -386,7 +387,10 @@ impl Link {
             return Err(ReticulumError::LinkAlreadyClosed);
         }
 
-        let key = self.derived_key.as_ref().ok_or(ReticulumError::LinkNotActive)?;
+        let key = self
+            .derived_key
+            .as_ref()
+            .ok_or(ReticulumError::LinkNotActive)?;
         let plaintext = fernet::decrypt(key, &rtt_packet.data)
             .map_err(|e| ReticulumError::Identity(e.into()))?;
 
@@ -464,10 +468,7 @@ impl Link {
     }
 
     /// Validate an identification packet and store the remote identity.
-    pub fn validate_identification(
-        &mut self,
-        packet: &Packet,
-    ) -> Result<Identity, ReticulumError> {
+    pub fn validate_identification(&mut self, packet: &Packet) -> Result<Identity, ReticulumError> {
         self.require_active()?;
         let key = self.derived_key.as_ref().unwrap();
 
@@ -500,10 +501,7 @@ impl Link {
     // ── Close ───────────────────────────────────────────────────────
 
     /// Build a link close packet.
-    pub fn build_close(
-        &self,
-        rng: &mut impl CryptoRngCore,
-    ) -> Result<Packet, ReticulumError> {
+    pub fn build_close(&self, rng: &mut impl CryptoRngCore) -> Result<Packet, ReticulumError> {
         self.require_active()?;
         let key = self.derived_key.as_ref().unwrap();
 
@@ -534,8 +532,8 @@ impl Link {
         self.require_active()?;
         let key = self.derived_key.as_ref().unwrap();
 
-        let plaintext = fernet::decrypt(key, &packet.data)
-            .map_err(|e| ReticulumError::Identity(e.into()))?;
+        let plaintext =
+            fernet::decrypt(key, &packet.data).map_err(|e| ReticulumError::Identity(e.into()))?;
 
         if plaintext.len() < LINK_CLOSE_SIZE {
             return Err(ReticulumError::LinkNotActive);
@@ -583,6 +581,35 @@ impl Link {
             LinkState::Closed => Err(ReticulumError::LinkAlreadyClosed),
             _ => Err(ReticulumError::LinkNotActive),
         }
+    }
+}
+
+impl LinkCrypto for Link {
+    fn encrypt(
+        &self,
+        rng: &mut dyn CryptoRngCore,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ReticulumError> {
+        self.require_active()?;
+        let key = self.derived_key.as_ref().unwrap();
+        fernet::encrypt(rng, key, plaintext).map_err(|e| ReticulumError::Identity(e.into()))
+    }
+
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, ReticulumError> {
+        self.require_active()?;
+        let key = self.derived_key.as_ref().unwrap();
+        fernet::decrypt(key, ciphertext).map_err(|e| ReticulumError::Identity(e.into()))
+    }
+
+    fn link_id(&self) -> &[u8; 16] {
+        &self.link_id
+    }
+
+    fn mdu(&self) -> usize {
+        // Fernet overhead: version(1) + timestamp(8) + IV(16) + padding(16 max) + HMAC(32) = ~73
+        // MTU(500) - Header Type1(19) - Fernet(73) = 408
+        // Python uses SDU=383. Match Python for interop.
+        383
     }
 }
 
@@ -780,6 +807,22 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
+    // ── LinkCrypto trait ────────────────────────────────────────────
+
+    #[test]
+    fn link_crypto_trait_roundtrip() {
+        use crate::resource::LinkCrypto;
+        let (initiator, _responder) = setup_active_link();
+
+        // Use LinkCrypto trait methods
+        let plaintext = b"testing LinkCrypto trait impl";
+        let encrypted = LinkCrypto::encrypt(&initiator, &mut OsRng, plaintext).unwrap();
+        let decrypted = LinkCrypto::decrypt(&initiator, &encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+        assert_eq!(LinkCrypto::link_id(&initiator).len(), 16);
+        assert_eq!(LinkCrypto::mdu(&initiator), 383);
+    }
+
     // ── Identification ──────────────────────────────────────────────
 
     #[test]
@@ -925,8 +968,7 @@ mod tests {
         let (responder_priv, dest_name) = setup_handshake();
         let responder_pub = responder_priv.public_identity();
 
-        let (initiator, _request) =
-            Link::initiate(&mut OsRng, responder_pub, &dest_name).unwrap();
+        let (initiator, _request) = Link::initiate(&mut OsRng, responder_pub, &dest_name).unwrap();
 
         // Link is Pending, not Active
         assert!(matches!(
@@ -988,7 +1030,10 @@ mod tests {
 
         assert!(matches!(
             Link::respond(&responder_priv, &dest_name, &short_packet),
-            Err(ReticulumError::LinkRequestTooShort { minimum: 67, actual: 30 })
+            Err(ReticulumError::LinkRequestTooShort {
+                minimum: 67,
+                actual: 30
+            })
         ));
     }
 
@@ -1022,7 +1067,10 @@ mod tests {
 
         assert!(matches!(
             initiator.complete_handshake(&mut OsRng, &short_proof, 0.01),
-            Err(ReticulumError::LinkProofTooShort { minimum: 99, actual: 50 })
+            Err(ReticulumError::LinkProofTooShort {
+                minimum: 99,
+                actual: 50
+            })
         ));
     }
 
@@ -1035,8 +1083,7 @@ mod tests {
 
         let (mut initiator, request) =
             Link::initiate(&mut OsRng, responder_pub, &dest_name).unwrap();
-        let (_, mut proof_packet) =
-            Link::respond(&responder_priv, &dest_name, &request).unwrap();
+        let (_, mut proof_packet) = Link::respond(&responder_priv, &dest_name, &request).unwrap();
 
         // Tamper with signature in proof data
         let mut data = proof_packet.data.to_vec();
