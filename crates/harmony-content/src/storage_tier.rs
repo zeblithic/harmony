@@ -148,6 +148,11 @@ impl<B: BlobStore> StorageTier<B> {
         }
     }
 
+    // Note: `transit_admitted` is always incremented because `ContentStore::store()`
+    // handles W-TinyLFU admission internally and we can't observe whether the item
+    // was actually retained. A future refinement could check `cache.contains(&cid)`
+    // after store and use `transit_rejected` when the item was dropped. For now,
+    // the metric means "offered to cache" rather than "retained by cache".
     fn handle_transit(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
         self.cache.store(cid, data);
         self.metrics.transit_admitted += 1;
@@ -340,6 +345,28 @@ mod tests {
         // Content should now be queryable
         let query_actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });
         assert_eq!(query_actions.len(), 1);
+    }
+
+    #[test]
+    fn transit_duplicate_still_counted() {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let data = b"repeated transit";
+        let cid = ContentId::for_blob(data).unwrap();
+
+        tier.handle(StorageTierEvent::TransitContent {
+            cid,
+            data: data.to_vec(),
+        });
+        tier.handle(StorageTierEvent::TransitContent {
+            cid,
+            data: data.to_vec(),
+        });
+
+        assert_eq!(tier.metrics().transit_admitted, 2);
     }
 
     #[test]
