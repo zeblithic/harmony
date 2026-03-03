@@ -39,12 +39,14 @@ impl<S: BlobStore> ContentStore<S> {
     /// The sketch width is `capacity * 2` and the halving threshold is
     /// `capacity * 10`.
     pub fn new(store: S, capacity: usize) -> Self {
+        assert!(capacity >= 1, "ContentStore capacity must be at least 1");
+
         let window_cap = std::cmp::max(1, capacity / 100);
         let protected_cap = capacity / 5;
-        let probation_cap = std::cmp::max(1, capacity.saturating_sub(window_cap + protected_cap));
+        let probation_cap = capacity.saturating_sub(window_cap + protected_cap);
 
-        let sketch_width = capacity * 2;
-        let halving_threshold = (capacity as u64) * 10;
+        let sketch_width = std::cmp::max(2, capacity * 2);
+        let halving_threshold = std::cmp::max(1, (capacity as u64) * 10);
 
         ContentStore {
             store,
@@ -137,38 +139,45 @@ impl<S: BlobStore> ContentStore<S> {
 
     /// Try to admit the window evictee (candidate) into probation.
     ///
-    /// Peeks at probation's LRU victim and compares frequencies. If the
-    /// candidate has higher frequency, it replaces the victim. Otherwise
-    /// the candidate is dropped and probation is untouched.
+    /// If probation has space, admit directly. Otherwise compare the
+    /// candidate's frequency against the least-recently-used *non-pinned*
+    /// probation entry. Pinned candidates are always admitted. Pinned
+    /// victims are never evicted — the scan skips them.
     fn admission_challenge(&mut self, candidate: ContentId) {
-        if let Some(victim) = self.probation.peek_lru() {
-            if self.probation.len() < self.probation.capacity() {
-                // Probation has space — admit directly.
-                self.probation.insert(candidate);
-                return;
-            }
-            // Victim is pinned — drop candidate, pinned items win unconditionally.
-            if self.pinned.contains(&victim) {
-                self.store_remove(&candidate);
-                return;
-            }
+        // Probation has space — admit directly, no challenge needed.
+        if self.probation.len() < self.probation.capacity() {
+            self.probation.insert(candidate);
+            return;
+        }
 
-            // Probation full — compare frequencies.
-            let candidate_freq = self.sketch.estimate(&candidate);
-            let victim_freq = self.sketch.estimate(&victim);
-
-            if candidate_freq > victim_freq {
-                // Candidate wins — evict victim, admit candidate.
+        // Pinned candidates are always admitted — never drop a pinned CID.
+        if self.pinned.contains(&candidate) {
+            if let Some(victim) = self.probation.peek_lru_excluding(&self.pinned) {
                 self.probation.remove(&victim);
                 self.store_remove(&victim);
-                self.probation.insert(candidate);
-            } else {
-                // Victim wins — drop candidate entirely.
-                self.store_remove(&candidate);
             }
-        } else {
-            // Probation is empty — admit directly.
             self.probation.insert(candidate);
+            return;
+        }
+
+        // Find the first non-pinned victim for the frequency challenge.
+        let Some(victim) = self.probation.peek_lru_excluding(&self.pinned) else {
+            // All probation entries are pinned — drop unpinned candidate.
+            self.store_remove(&candidate);
+            return;
+        };
+
+        let candidate_freq = self.sketch.estimate(&candidate);
+        let victim_freq = self.sketch.estimate(&victim);
+
+        if candidate_freq > victim_freq {
+            // Candidate wins — evict victim, admit candidate.
+            self.probation.remove(&victim);
+            self.store_remove(&victim);
+            self.probation.insert(candidate);
+        } else {
+            // Victim wins — drop candidate entirely.
+            self.store_remove(&candidate);
         }
     }
 
@@ -345,5 +354,119 @@ mod tests {
         // Unpin and verify it becomes evictable.
         cs.unpin(&pinned_cid);
         assert!(!cs.is_pinned(&pinned_cid));
+    }
+
+    #[test]
+    fn capacity_one_segments_do_not_exceed_capacity() {
+        let store = MemoryBlobStore::new();
+        let cs = ContentStore::new(store, 1);
+        let total = cs.window.capacity() + cs.probation.capacity() + cs.protected.capacity();
+        assert!(
+            total <= 1,
+            "segments sum to {total}, exceeds capacity 1"
+        );
+    }
+
+    #[test]
+    fn capacity_two_segments_do_not_exceed_capacity() {
+        let store = MemoryBlobStore::new();
+        let cs = ContentStore::new(store, 2);
+        let total = cs.window.capacity() + cs.probation.capacity() + cs.protected.capacity();
+        assert!(
+            total <= 2,
+            "segments sum to {total}, exceeds capacity 2"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity must be at least 1")]
+    fn zero_capacity_panics() {
+        let store = MemoryBlobStore::new();
+        let _cs = ContentStore::new(store, 0);
+    }
+
+    #[test]
+    fn pinned_candidate_survives_admission_challenge() {
+        // Regression: pinned CID evicted from window must not be dropped
+        // even when it loses the frequency comparison.
+        //
+        // Capacity 10: window=1, protected=2, probation=7.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 10);
+
+        // Fill probation with 7 hot items.
+        let hot: Vec<ContentId> = (0..7)
+            .map(|i| {
+                let data = format!("hot-{i}");
+                cs.insert(data.as_bytes()).unwrap()
+            })
+            .collect();
+        for cid in &hot {
+            for _ in 0..10 {
+                cs.record_access(cid);
+            }
+        }
+
+        // Insert a pinned item with zero extra frequency (just the 1 from insert).
+        // It enters window, gets pushed to admission_challenge by the next insert.
+        let pinned = cs.insert(b"pinned-low-freq").unwrap();
+        cs.pin(pinned);
+
+        // Push it out of window — triggers admission challenge.
+        let _pusher = cs.insert(b"pusher-after-pin").unwrap();
+
+        // The pinned item should survive despite lower frequency.
+        assert!(
+            cs.window.contains(&pinned)
+                || cs.probation.contains(&pinned)
+                || cs.protected.contains(&pinned),
+            "pinned candidate should survive admission challenge"
+        );
+    }
+
+    #[test]
+    fn pinned_victim_skipped_in_admission() {
+        // Regression: when probation's tail is pinned, the admission
+        // challenge should skip it and compare against the next non-pinned
+        // entry instead of dropping the candidate.
+        //
+        // Capacity 10: window=1, protected=2, probation=7.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 10);
+
+        // Fill probation: insert 7 items (each pushes the previous out of window).
+        let items: Vec<ContentId> = (0..7)
+            .map(|i| {
+                let data = format!("prob-{i}");
+                cs.insert(data.as_bytes()).unwrap()
+            })
+            .collect();
+
+        // Pin the LRU tail of probation (first inserted = least recent).
+        let tail_cid = items[0];
+        cs.pin(tail_cid);
+
+        // Give the next candidate high frequency so it would beat non-pinned victims.
+        let candidate_data = b"high-freq-candidate";
+        let candidate = ContentId::for_blob(candidate_data).unwrap();
+        for _ in 0..10 {
+            cs.sketch.increment(&candidate);
+        }
+
+        // Store the data and admit — triggers admission challenge.
+        cs.store(candidate, candidate_data.to_vec());
+
+        // Candidate should have been admitted (beating a non-pinned victim).
+        assert!(
+            cs.window.contains(&candidate)
+                || cs.probation.contains(&candidate)
+                || cs.protected.contains(&candidate),
+            "candidate should be admitted when pinned victim is skipped"
+        );
+        // Pinned tail should still be tracked.
+        assert!(
+            cs.probation.contains(&tail_cid),
+            "pinned victim should remain in probation"
+        );
     }
 }

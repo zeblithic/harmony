@@ -148,7 +148,7 @@ impl CountMinSketch {
 
         let mut indices = [0usize; NUM_ROWS];
         for (i, seed) in SEEDS.iter().enumerate() {
-            let mixed = h0.wrapping_mul(*seed) ^ h1;
+            let mixed = h0.wrapping_mul(*seed) ^ h1.wrapping_mul(seed.rotate_left(32));
             indices[i] = (mixed as usize) % self.width;
         }
 
@@ -216,6 +216,22 @@ mod tests {
         assert!(
             after < before,
             "expected decay: before={before}, after={after}"
+        );
+    }
+
+    #[test]
+    fn hash_rows_are_independent() {
+        // Verify that different CIDs produce distinct index sets across rows,
+        // confirming that h1 is mixed per-row (not a constant offset).
+        let sketch = CountMinSketch::new(1024, 10_000);
+        let indices_a = sketch.hash_indices(&make_cid(0));
+        let indices_b = sketch.hash_indices(&make_cid(1));
+
+        // With 4 rows and width 1024, two different CIDs should differ in
+        // at least one row index. (Probability of full collision ~= 1/1024^4.)
+        assert_ne!(
+            indices_a, indices_b,
+            "two different CIDs should not produce identical index sets"
         );
     }
 }

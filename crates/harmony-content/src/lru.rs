@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cid::ContentId;
 
@@ -97,6 +97,22 @@ impl Lru {
     /// Peek at the tail (least recently used) CID without removing it.
     pub fn peek_lru(&self) -> Option<ContentId> {
         self.tail.map(|idx| self.entries[idx].cid)
+    }
+
+    /// Find the least-recently-used CID that is NOT in `exclude`.
+    ///
+    /// Walks from tail toward head, skipping excluded entries. Returns
+    /// `None` if every entry is in the exclusion set (or the LRU is empty).
+    pub fn peek_lru_excluding(&self, exclude: &HashSet<ContentId>) -> Option<ContentId> {
+        let mut idx = self.tail;
+        while let Some(i) = idx {
+            let cid = self.entries[i].cid;
+            if !exclude.contains(&cid) {
+                return Some(cid);
+            }
+            idx = self.entries[i].prev;
+        }
+        None
     }
 
     /// Returns `true` if the LRU contains the given CID.
@@ -244,5 +260,33 @@ mod tests {
         assert_eq!(lru.len(), 1);
         assert_eq!(lru.insert(c2), None);
         assert_eq!(lru.len(), 2);
+    }
+
+    #[test]
+    fn peek_lru_excluding_skips_excluded() {
+        let mut lru = Lru::new(4);
+        let c0 = make_cid(0); // oldest (tail)
+        let c1 = make_cid(1);
+        let c2 = make_cid(2);
+        let c3 = make_cid(3); // newest (head)
+        lru.insert(c0);
+        lru.insert(c1);
+        lru.insert(c2);
+        lru.insert(c3);
+
+        // Exclude the two oldest entries — should return c2.
+        let mut exclude = HashSet::new();
+        exclude.insert(c0);
+        exclude.insert(c1);
+        assert_eq!(lru.peek_lru_excluding(&exclude), Some(c2));
+
+        // Exclude all — should return None.
+        exclude.insert(c2);
+        exclude.insert(c3);
+        assert_eq!(lru.peek_lru_excluding(&exclude), None);
+
+        // Empty exclude — should return tail.
+        let empty = HashSet::new();
+        assert_eq!(lru.peek_lru_excluding(&empty), Some(c0));
     }
 }
