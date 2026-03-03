@@ -405,14 +405,15 @@ impl ResourceSender {
         }
 
         let flag = payload[0];
-        let rest = if flag == HASHMAP_IS_EXHAUSTED {
-            // Skip the 4-byte last_map_hash
+        let (last_map_hash, rest) = if flag == HASHMAP_IS_EXHAUSTED {
             if payload.len() < 1 + MAPHASH_LEN + 16 {
                 return vec![];
             }
-            &payload[1 + MAPHASH_LEN..]
+            let mut lmh = [0u8; MAPHASH_LEN];
+            lmh.copy_from_slice(&payload[1..1 + MAPHASH_LEN]);
+            (Some(lmh), &payload[1 + MAPHASH_LEN..])
         } else {
-            &payload[1..]
+            (None, &payload[1..])
         };
 
         if rest.len() < 16 {
@@ -429,6 +430,58 @@ impl ResourceSender {
         let map_data = &rest[16..];
         if map_data.len() % MAPHASH_LEN != 0 {
             return vec![];
+        }
+
+        // If the receiver signaled hashmap exhaustion, respond with an HMU
+        // before sending any requested parts.
+        if flag == HASHMAP_IS_EXHAUSTED {
+            if let Some(ref lmh) = last_map_hash {
+                if let Some(hmu_actions) = self.build_hmu(lmh) {
+                    // Build a reverse lookup from map_hash -> part index.
+                    let mut index_map: HashMap<MapHash, usize> = HashMap::new();
+                    for (i, mh) in self.map_hashes.iter().enumerate() {
+                        index_map.insert(*mh, i);
+                    }
+
+                    self.state = SenderState::Transferring;
+                    let mut actions = vec![ResourceAction::SenderStateChanged];
+
+                    // Send the HMU first so the receiver can install new hashes.
+                    actions.extend(hmu_actions);
+
+                    // Then send any requested parts.
+                    let requested_count = map_data.len() / MAPHASH_LEN;
+                    for chunk_idx in 0..requested_count {
+                        let offset = chunk_idx * MAPHASH_LEN;
+                        let mut mh = [0u8; MAPHASH_LEN];
+                        mh.copy_from_slice(&map_data[offset..offset + MAPHASH_LEN]);
+
+                        if let Some(&part_idx) = index_map.get(&mh) {
+                            actions.push(ResourceAction::SendPacket {
+                                context: PacketContext::Resource.as_byte(),
+                                plaintext: self.parts[part_idx].clone(),
+                            });
+                            self.sent_parts += 1;
+                        }
+                    }
+
+                    if self.sent_parts >= self.parts.len() {
+                        self.state = SenderState::AwaitingProof;
+                        actions.push(ResourceAction::SenderStateChanged);
+                        let timeout = self.last_activity
+                            + self.rtt_ms.unwrap_or(DEFAULT_TIMEOUT_MS)
+                                * PROOF_TIMEOUT_FACTOR as u64;
+                        actions.push(ResourceAction::ScheduleTimeout {
+                            deadline_ms: timeout,
+                        });
+                    }
+
+                    let progress = self.sent_parts as f32 / self.parts.len().max(1) as f32;
+                    actions.push(ResourceAction::Progress { fraction: progress });
+
+                    return actions;
+                }
+            }
         }
 
         // Build a reverse lookup from map_hash -> part index.
@@ -471,6 +524,41 @@ impl ResourceSender {
         actions.push(ResourceAction::Progress { fraction: progress });
 
         actions
+    }
+
+    /// Build a hashmap update (HMU) packet containing map hashes that the
+    /// receiver has not yet received.
+    ///
+    /// Given the `last_map_hash` the receiver already has, this finds the
+    /// corresponding part index and sends all remaining hashes after it.
+    ///
+    /// HMU wire format: `[resource_hash:16][msgpack([segment_index, hashmap_bytes])]`
+    fn build_hmu(&self, last_map_hash: &MapHash) -> Option<Vec<ResourceAction>> {
+        let part_idx = self.map_hashes.iter().position(|mh| mh == last_map_hash)?;
+
+        let start = part_idx + 1;
+        if start >= self.parts.len() {
+            return None;
+        }
+
+        let hashes: Vec<u8> = self.map_hashes[start..]
+            .iter()
+            .flat_map(|h| h.iter().copied())
+            .collect();
+
+        // Build HMU: [resource_hash:16][msgpack([segment_index, hashmap_bytes])]
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&self.resource_hash);
+
+        use rmp::encode::*;
+        write_array_len(&mut pkt, 2).expect("write array len");
+        write_u32(&mut pkt, start as u32).expect("write segment index");
+        write_bin(&mut pkt, &hashes).expect("write hashmap bytes");
+
+        Some(vec![ResourceAction::SendPacket {
+            context: PacketContext::ResourceHmu.as_byte(),
+            plaintext: pkt,
+        }])
     }
 
     fn handle_proof(&mut self, payload: &[u8]) -> Vec<ResourceAction> {
@@ -667,10 +755,7 @@ impl ResourceReceiver {
     pub fn handle_event(&mut self, event: ResourceEvent, payload: &[u8]) -> Vec<ResourceAction> {
         match event {
             ResourceEvent::PartReceived => self.handle_part(payload),
-            ResourceEvent::HashmapUpdateReceived => {
-                // Stub for Task 7.
-                vec![]
-            }
+            ResourceEvent::HashmapUpdateReceived => self.handle_hmu(payload),
             ResourceEvent::CancelReceived => self.handle_cancel_received(),
             ResourceEvent::Timeout { now_ms } => self.handle_timeout(now_ms),
             _ => vec![],
@@ -818,6 +903,67 @@ impl ResourceReceiver {
         actions
     }
 
+    /// Handle an incoming hashmap update (HMU) packet from the sender.
+    ///
+    /// Parses the HMU, installs new map hashes into the receiver's hashmap,
+    /// and issues a new request for the next window of parts.
+    fn handle_hmu(&mut self, payload: &[u8]) -> Vec<ResourceAction> {
+        if self.state != ReceiverState::Transferring {
+            return vec![];
+        }
+
+        if payload.len() < 16 {
+            return vec![];
+        }
+
+        let mut recv_hash = [0u8; 16];
+        recv_hash.copy_from_slice(&payload[..16]);
+        if recv_hash != self.resource_hash {
+            return vec![];
+        }
+
+        // Parse msgpack: [segment_index, hashmap_bytes]
+        let mut rd = &payload[16..];
+        let arr_len = match rmp::decode::read_array_len(&mut rd) {
+            Ok(len) => len,
+            Err(_) => return vec![],
+        };
+        if arr_len != 2 {
+            return vec![];
+        }
+
+        let _segment: u32 = match rmp::decode::read_int(&mut rd) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let hash_len = match rmp::decode::read_bin_len(&mut rd) {
+            Ok(len) => len as usize,
+            Err(_) => return vec![],
+        };
+
+        if rd.len() < hash_len {
+            return vec![];
+        }
+        let hash_data = &rd[..hash_len];
+
+        // Install new hashes into the hashmap starting from hashmap_height.
+        for chunk in hash_data.chunks_exact(MAPHASH_LEN) {
+            let idx = self.hashmap_height;
+            if idx < self.total_parts {
+                let mut mh = [0u8; MAPHASH_LEN];
+                mh.copy_from_slice(chunk);
+                if self.hashmap[idx].is_none() {
+                    self.hashmap[idx] = Some(mh);
+                }
+                self.hashmap_height += 1;
+            }
+        }
+
+        // Now re-request with the new hashes available.
+        self.request_next(self.last_activity)
+    }
+
     fn handle_cancel_received(&mut self) -> Vec<ResourceAction> {
         match self.state {
             ReceiverState::Complete | ReceiverState::Failed | ReceiverState::Corrupt => vec![],
@@ -938,15 +1084,31 @@ impl ResourceReceiver {
             return vec![];
         }
 
-        // Build RESOURCE_REQ packet: [flag:1][resource_hash:16][map_hashes:N*4]
+        // Build RESOURCE_REQ packet.
+        // Normal:    [flag:1][resource_hash:16][map_hashes:N*4]
+        // Exhausted: [0xFF][last_map_hash:4][resource_hash:16][map_hashes:N*4]
         let flag = if exhausted {
             HASHMAP_IS_EXHAUSTED
         } else {
             HASHMAP_IS_NOT_EXHAUSTED
         };
 
-        let mut packet = Vec::with_capacity(1 + 16 + requested_hashes.len() * MAPHASH_LEN);
+        let extra = if exhausted { MAPHASH_LEN } else { 0 };
+        let mut packet = Vec::with_capacity(1 + extra + 16 + requested_hashes.len() * MAPHASH_LEN);
         packet.push(flag);
+
+        if exhausted {
+            // Include the last known map hash so the sender knows where to
+            // resume. Use the hash at hashmap_height - 1 (the last populated
+            // slot), or fall back to zeros if none are populated yet.
+            let last_mh = if self.hashmap_height > 0 {
+                self.hashmap[self.hashmap_height - 1].unwrap_or([0u8; MAPHASH_LEN])
+            } else {
+                [0u8; MAPHASH_LEN]
+            };
+            packet.extend_from_slice(&last_mh);
+        }
+
         packet.extend_from_slice(&self.resource_hash);
         for mh in &requested_hashes {
             packet.extend_from_slice(mh);
@@ -2669,5 +2831,380 @@ mod tests {
         assert!(proof_actions
             .iter()
             .any(|a| matches!(a, ResourceAction::ProofValidated)));
+    }
+
+    // -- Hashmap Update (HMU) tests -----------------------------------------
+
+    #[test]
+    fn hmu_extends_receiver_hashmap() {
+        // Create a sender with 10 parts (MDU=20, data=200 bytes).
+        // Then create a receiver with a partial hashmap (only the first 4
+        // hashes populated), simulating a large resource where the initial
+        // advertisement didn't include all hashes.
+        use rand::rngs::OsRng;
+
+        let mock = MockLinkCrypto::new(20);
+        let data: Vec<u8> = (0..200u8).collect();
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, &data, 1000).unwrap();
+        assert_eq!(sender.part_count(), 10);
+
+        let adv_actions = sender.advertise(1000);
+        let adv_plaintext = extract_send(&adv_actions, PacketContext::ResourceAdv.as_byte());
+
+        // Accept the full advertisement, then manually truncate the hashmap
+        // to simulate a partial hashmap from a segmented advertisement.
+        let (mut receiver, _initial_actions) =
+            ResourceReceiver::accept(&adv_plaintext, 2000).unwrap();
+
+        // Truncate: keep only the first 4 hashes, clear the rest.
+        let truncate_at = 4;
+        for slot in receiver.hashmap.iter_mut().skip(truncate_at) {
+            *slot = None;
+        }
+        receiver.hashmap_height = truncate_at;
+
+        // Build an HMU packet containing the remaining 6 hashes (indices 4..10).
+        let remaining_hashes: Vec<u8> = sender.map_hashes[truncate_at..]
+            .iter()
+            .flat_map(|h| h.iter().copied())
+            .collect();
+
+        let mut hmu_pkt = Vec::new();
+        hmu_pkt.extend_from_slice(&sender.resource_hash);
+        {
+            use rmp::encode::*;
+            write_array_len(&mut hmu_pkt, 2).unwrap();
+            write_u32(&mut hmu_pkt, truncate_at as u32).unwrap();
+            write_bin(&mut hmu_pkt, &remaining_hashes).unwrap();
+        }
+
+        // Before HMU, hashmap_height is 4.
+        assert_eq!(receiver.hashmap_height, 4);
+
+        // Feed the HMU to the receiver.
+        let actions = receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &hmu_pkt);
+
+        // After HMU, hashmap_height should be 10 (all hashes installed).
+        assert_eq!(receiver.hashmap_height, 10);
+        assert_eq!(
+            receiver.hashmap_height, receiver.total_parts,
+            "all hashmap slots should now be populated"
+        );
+
+        // All hashmap slots should have Some values.
+        for (i, slot) in receiver.hashmap.iter().enumerate() {
+            assert!(
+                slot.is_some(),
+                "hashmap slot {} should be populated after HMU",
+                i
+            );
+        }
+
+        // The HMU handler should have emitted a new request for parts.
+        let has_req = actions.iter().any(|a| {
+            matches!(a, ResourceAction::SendPacket { context, .. }
+                if *context == PacketContext::ResourceReq.as_byte())
+        });
+        assert!(has_req, "HMU should trigger a new resource request");
+    }
+
+    #[test]
+    fn sender_builds_hmu_on_exhausted_request() {
+        // Create a sender with 10 parts.
+        use rand::rngs::OsRng;
+
+        let mock = MockLinkCrypto::new(20);
+        let data: Vec<u8> = (0..200u8).collect();
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, &data, 1000).unwrap();
+        assert_eq!(sender.part_count(), 10);
+        sender.advertise(1000);
+
+        // Build an exhausted RESOURCE_REQ: the receiver knows hashes 0..4
+        // and signals it needs more.
+        //   [0xFF][last_map_hash:4][resource_hash:16][requested_map_hashes:N*4]
+        let last_known_idx = 3; // 0-based, last hash the receiver has
+        let last_map_hash = sender.map_hashes[last_known_idx];
+
+        let mut req = Vec::new();
+        req.push(HASHMAP_IS_EXHAUSTED);
+        req.extend_from_slice(&last_map_hash);
+        req.extend_from_slice(&sender.resource_hash);
+        // Request parts 0..4 (the ones we have hashes for).
+        for mh in &sender.map_hashes[..4] {
+            req.extend_from_slice(mh);
+        }
+
+        let actions = sender.handle_event(ResourceEvent::RequestReceived, &req);
+
+        // Should emit an HMU packet.
+        let hmu_packets = collect_sends(&actions, PacketContext::ResourceHmu.as_byte());
+        assert_eq!(hmu_packets.len(), 1, "sender should emit exactly one HMU");
+
+        // Verify the HMU packet structure: [resource_hash:16][msgpack([index, hashes])]
+        let hmu = &hmu_packets[0];
+        assert!(
+            hmu.len() > 16,
+            "HMU should be larger than just resource hash"
+        );
+
+        let mut hmu_rh = [0u8; 16];
+        hmu_rh.copy_from_slice(&hmu[..16]);
+        assert_eq!(
+            hmu_rh, sender.resource_hash,
+            "HMU should contain the resource hash"
+        );
+
+        // Parse the msgpack payload.
+        let mut rd = &hmu[16..];
+        let arr_len = rmp::decode::read_array_len(&mut rd).unwrap();
+        assert_eq!(arr_len, 2);
+
+        let seg_idx: u32 = rmp::decode::read_int(&mut rd).unwrap();
+        assert_eq!(
+            seg_idx,
+            (last_known_idx + 1) as u32,
+            "segment index should be the first new hash position"
+        );
+
+        let hash_len = rmp::decode::read_bin_len(&mut rd).unwrap() as usize;
+        // Should contain hashes for parts 4..10 = 6 hashes * 4 bytes = 24 bytes.
+        let expected_hash_count = sender.part_count() - (last_known_idx + 1);
+        assert_eq!(
+            hash_len,
+            expected_hash_count * MAPHASH_LEN,
+            "HMU should contain {} hash bytes",
+            expected_hash_count * MAPHASH_LEN
+        );
+
+        // Should also emit Resource data packets for the 4 requested parts.
+        let resource_packets = collect_sends(&actions, PacketContext::Resource.as_byte());
+        assert_eq!(resource_packets.len(), 4, "sender should emit 4 data parts");
+
+        // Sender should be in Transferring state (not all parts sent yet).
+        assert_eq!(sender.state(), SenderState::Transferring);
+    }
+
+    #[test]
+    fn full_roundtrip_with_hmu() {
+        // End-to-end test: create a sender with 10 parts, build a receiver
+        // with a partial hashmap (first 4 hashes only), and drive the full
+        // protocol exchange including HMU to completion.
+        use rand::rngs::OsRng;
+
+        let mock = MockLinkCrypto::new(20);
+        let data: Vec<u8> = (0..200u8).collect();
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, &data, 1000).unwrap();
+        assert_eq!(sender.part_count(), 10);
+
+        let adv_actions = sender.advertise(1000);
+        let adv_plaintext = extract_send(&adv_actions, PacketContext::ResourceAdv.as_byte());
+
+        // Create receiver and truncate its hashmap to simulate partial adv.
+        let (mut receiver, _) = ResourceReceiver::accept(&adv_plaintext, 2000).unwrap();
+        let truncate_at = 4;
+        for slot in receiver.hashmap.iter_mut().skip(truncate_at) {
+            *slot = None;
+        }
+        receiver.hashmap_height = truncate_at;
+
+        // Reset receiver state for a clean run.
+        receiver.outstanding_parts = 0;
+        receiver.req_sent_at = None;
+
+        let req_ctx = PacketContext::ResourceReq.as_byte();
+        let hmu_ctx = PacketContext::ResourceHmu.as_byte();
+        let resource_ctx = PacketContext::Resource.as_byte();
+
+        // Round 1: receiver requests parts with the 4 hashes it knows.
+        // With window=4, it will request 4 parts, all of which it has hashes for.
+        let round1_actions = receiver.request_next(3000);
+        let req1 = extract_send(&round1_actions, req_ctx);
+
+        // Feed request to sender.
+        let sender_actions1 = sender.handle_event(ResourceEvent::RequestReceived, &req1);
+        let parts1 = collect_sends(&sender_actions1, resource_ctx);
+        assert_eq!(parts1.len(), 4, "round 1 should yield 4 parts");
+
+        // Feed parts to receiver. The last part completing the window will
+        // internally call request_next, which hits hashmap exhaustion.
+        let mut last_part_actions = Vec::new();
+        for part in &parts1 {
+            last_part_actions = receiver.handle_event(ResourceEvent::PartReceived, part);
+        }
+        assert_eq!(receiver.received_count, 4);
+        assert_eq!(receiver.state(), ReceiverState::Transferring);
+
+        // The last handle_part should have internally emitted an exhausted request
+        // because hashmap[4] is None.
+        let req2 = extract_send(&last_part_actions, req_ctx);
+        assert_eq!(
+            req2[0], HASHMAP_IS_EXHAUSTED,
+            "request should signal hashmap exhaustion"
+        );
+
+        // Feed the exhausted request to sender -- it should respond with HMU + parts.
+        let sender_actions2 = sender.handle_event(ResourceEvent::RequestReceived, &req2);
+        let hmu_packets = collect_sends(&sender_actions2, hmu_ctx);
+        assert_eq!(
+            hmu_packets.len(),
+            1,
+            "sender should emit HMU on exhausted request"
+        );
+
+        // Feed the HMU to the receiver. This installs the remaining hashes and
+        // emits a new request for the next window of parts.
+        let hmu_actions =
+            receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &hmu_packets[0]);
+        assert_eq!(
+            receiver.hashmap_height, 10,
+            "all hashes should be installed after HMU"
+        );
+
+        // The exhausted request may also have sent data parts for the hashes
+        // the receiver included. Since the exhausted request had no requested
+        // map hashes beyond the known 4 (which were already received), there
+        // might be 0 parts. Check anyway.
+        let parts2 = collect_sends(&sender_actions2, resource_ctx);
+        for part in &parts2 {
+            receiver.handle_event(ResourceEvent::PartReceived, part);
+        }
+
+        // Now drive remaining rounds using the request from the HMU handler
+        // and subsequent requests from handle_part.
+        let mut pending_req = find_send(&hmu_actions, req_ctx);
+        let mut max_rounds = 10;
+        while receiver.state() == ReceiverState::Transferring && max_rounds > 0 {
+            max_rounds -= 1;
+
+            let next_req = match pending_req.take() {
+                Some(r) => r,
+                None => {
+                    // Need to manually trigger a request.
+                    let req_actions = receiver.request_next(5000 + (10 - max_rounds) as u64 * 1000);
+                    match find_send(&req_actions, req_ctx) {
+                        Some(r) => r,
+                        None => break,
+                    }
+                }
+            };
+
+            let sender_resp = sender.handle_event(ResourceEvent::RequestReceived, &next_req);
+            let parts = collect_sends(&sender_resp, resource_ctx);
+
+            let mut last_actions = Vec::new();
+            for part in &parts {
+                last_actions = receiver.handle_event(ResourceEvent::PartReceived, part);
+            }
+
+            // If the last part's actions contain a new request, capture it.
+            pending_req = find_send(&last_actions, req_ctx);
+        }
+
+        // The receiver should have all 10 parts and be in Assembling state.
+        assert_eq!(
+            receiver.received_count, 10,
+            "receiver should have all 10 parts"
+        );
+        assert_eq!(receiver.state(), ReceiverState::Assembling);
+
+        // Finalize and verify.
+        let finalize_actions = receiver.finalize(&mock).unwrap();
+        assert_eq!(receiver.state(), ReceiverState::Complete);
+
+        let recovered = finalize_actions
+            .iter()
+            .find_map(|a| match a {
+                ResourceAction::Completed { data } => Some(data.clone()),
+                _ => None,
+            })
+            .expect("finalize should emit Completed");
+        assert_eq!(recovered, data, "recovered data should match original");
+
+        // Verify proof on sender side.
+        let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions = sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        assert_eq!(sender.state(), SenderState::Complete);
+        assert!(proof_actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::ProofValidated)));
+    }
+
+    #[test]
+    fn hmu_ignores_wrong_resource_hash() {
+        let (_sender, mut receiver) = make_sender_and_receiver();
+
+        // Build an HMU with a wrong resource hash.
+        let mut hmu_pkt = Vec::new();
+        hmu_pkt.extend_from_slice(&[0xFF; 16]); // wrong hash
+        {
+            use rmp::encode::*;
+            write_array_len(&mut hmu_pkt, 2).unwrap();
+            write_u32(&mut hmu_pkt, 0).unwrap();
+            write_bin(&mut hmu_pkt, &[0xAA; 8]).unwrap();
+        }
+
+        let actions = receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &hmu_pkt);
+        assert!(actions.is_empty(), "HMU with wrong hash should be ignored");
+    }
+
+    #[test]
+    fn hmu_ignores_truncated_payload() {
+        let (_sender, mut receiver) = make_sender_and_receiver();
+
+        // Payload too short (less than 16 bytes).
+        let actions = receiver.handle_event(ResourceEvent::HashmapUpdateReceived, &[0x01; 10]);
+        assert!(actions.is_empty(), "truncated HMU should be ignored");
+    }
+
+    #[test]
+    fn exhausted_request_includes_last_map_hash() {
+        // Verify that when a receiver emits an exhausted request, it includes
+        // the last known map hash in the correct position.
+        use rand::rngs::OsRng;
+
+        let mock = MockLinkCrypto::new(20);
+        let data: Vec<u8> = (0..200u8).collect();
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, &data, 1000).unwrap();
+        assert_eq!(sender.part_count(), 10);
+
+        let adv_actions = sender.advertise(1000);
+        let adv_plaintext = extract_send(&adv_actions, PacketContext::ResourceAdv.as_byte());
+
+        let (mut receiver, _) = ResourceReceiver::accept(&adv_plaintext, 2000).unwrap();
+
+        // Truncate hashmap to 4 entries.
+        let truncate_at = 4;
+        for slot in receiver.hashmap.iter_mut().skip(truncate_at) {
+            *slot = None;
+        }
+        receiver.hashmap_height = truncate_at;
+        receiver.consecutive_completed = truncate_at; // pretend first 4 are done
+        for i in 0..truncate_at {
+            receiver.parts[i] = Some(vec![0x42]); // dummy data
+        }
+        receiver.received_count = truncate_at;
+        receiver.outstanding_parts = 0;
+
+        let actions = receiver.request_next(5000);
+        let req = extract_send(&actions, PacketContext::ResourceReq.as_byte());
+
+        // Verify the exhausted flag.
+        assert_eq!(req[0], HASHMAP_IS_EXHAUSTED);
+
+        // Extract last_map_hash from position [1..5].
+        let mut last_mh = [0u8; MAPHASH_LEN];
+        last_mh.copy_from_slice(&req[1..1 + MAPHASH_LEN]);
+
+        // It should be the hash at index truncate_at - 1 = 3.
+        let expected_last_mh = receiver.hashmap[truncate_at - 1].unwrap();
+        assert_eq!(
+            last_mh, expected_last_mh,
+            "exhausted request should contain the last known map hash"
+        );
+
+        // Resource hash should follow at [5..21].
+        let mut rh = [0u8; 16];
+        rh.copy_from_slice(&req[1 + MAPHASH_LEN..1 + MAPHASH_LEN + 16]);
+        assert_eq!(rh, receiver.resource_hash);
     }
 }
