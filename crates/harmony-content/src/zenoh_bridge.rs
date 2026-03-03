@@ -62,10 +62,12 @@ pub fn handle_content_query<S: BlobStore>(
 }
 
 /// Handle new content being stored: produce an announcement action.
-pub fn handle_content_stored(cid: &ContentId, size: u32) -> Vec<ContentBridgeAction> {
+///
+/// The payload size is derived from the CID itself (the authoritative source)
+/// to prevent inconsistencies between announcements and actual content.
+pub fn handle_content_stored(cid: &ContentId) -> Vec<ContentBridgeAction> {
     let key_expr = cid_to_announce_key_expr(cid);
-    // Minimal announcement payload: just the size as 4 bytes big-endian.
-    let payload = size.to_be_bytes().to_vec();
+    let payload = cid.payload_size().to_be_bytes().to_vec();
     vec![ContentBridgeAction::Publish { key_expr, payload }]
 }
 
@@ -126,9 +128,8 @@ mod tests {
     #[test]
     fn content_stored_triggers_announcement() {
         let cid = ContentId::for_blob(b"new content to announce").unwrap();
-        let size = cid.payload_size();
 
-        let actions = handle_content_stored(&cid, size);
+        let actions = handle_content_stored(&cid);
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             ContentBridgeAction::Publish { key_expr, payload } => {
@@ -139,7 +140,7 @@ mod tests {
                 // Payload should be 4 bytes (size as big-endian u32).
                 assert_eq!(payload.len(), 4);
                 let announced_size = u32::from_be_bytes(payload[..4].try_into().unwrap());
-                assert_eq!(announced_size, size);
+                assert_eq!(announced_size, cid.payload_size());
             }
             other => panic!("expected Publish, got {other:?}"),
         }

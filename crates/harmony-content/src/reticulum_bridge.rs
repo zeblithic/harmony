@@ -26,8 +26,9 @@ pub fn pack_for_transport(cid: &ContentId, data: &[u8]) -> Vec<u8> {
 /// Returns `ContentError` if the data is too short or the hash doesn't match.
 pub fn unpack_from_transport(transport_data: &[u8]) -> Result<(ContentId, Vec<u8>), ContentError> {
     if transport_data.len() < CID_HEADER_LEN {
-        return Err(ContentError::InvalidBundleLength {
+        return Err(ContentError::TransportDataTooShort {
             len: transport_data.len(),
+            min: CID_HEADER_LEN,
         });
     }
 
