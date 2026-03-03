@@ -31,15 +31,15 @@ If no PR number is provided, infer from the current branch's associated PR.
 Fetch ALL of these in parallel:
 
 ```bash
-# All reviews (Greptile, Bugbot, humans)
+# Bugbot reviews (cursor[bot] posts GitHub PR reviews)
 gh api repos/{owner}/{repo}/pulls/{number}/reviews \
-  --jq '.[] | {user: .user.login, state: .state, submitted: .submitted_at}'
+  --jq '.[] | select(.user.login == "cursor[bot]") | {user: .user.login, state: .state, submitted: .submitted_at}'
 
 # All inline review comments with timestamps
 gh api repos/{owner}/{repo}/pulls/{number}/comments \
   --jq '.[] | {user: .user.login, created: .created_at, id: .id}'
 
-# All PR-level comments (includes "bugbot run" triggers)
+# All PR-level comments — Greptile posts here (NOT as a GitHub review)
 gh pr view {number} --comments --json comments \
   --jq '.comments[] | {author: .author.login, body: .body, created: .createdAt}'
 
@@ -47,11 +47,15 @@ gh pr view {number} --comments --json comments \
 gh pr view {number} --json commits \
   --jq '.commits[-1] | {sha: .oid, date: .committedDate}'
 
-# Reactions on comments (thumbs-up signals completion)
-# Check the "bugbot run" trigger comments for reactions
+# Reactions on trigger comments (thumbs-up = reviewer approved)
+# This is the primary approval signal for BOTH Bugbot and Greptile
 gh api repos/{owner}/{repo}/issues/{number}/comments \
   --jq '.[] | select(.body == "bugbot run" or .body == "@greptile") | {id: .id, body: .body, created: .created_at, reactions: .reactions}'
 ```
+
+**How each reviewer works:**
+- **Bugbot (`cursor[bot]`)**: Posts GitHub PR **reviews** (shows in reviews API). Signals approval via thumbs-up on "bugbot run" trigger comment.
+- **Greptile (`greptile-apps`)**: Posts PR **comments** (NOT reviews — won't appear in reviews API). Signals approval via thumbs-up on "@greptile" trigger comment.
 
 ### 3. Determine review state
 
@@ -59,7 +63,7 @@ Apply these rules in order to determine the current state:
 
 #### State: REVIEWS_PENDING
 
-**Condition:** "bugbot run" or "@greptile" comment exists that is newer than the latest `cursor[bot]` or `greptile-apps[bot]` response, AND either:
+**Condition:** "bugbot run" or "@greptile" comment exists that is newer than the latest `cursor[bot]` review or `greptile-apps` comment, AND either:
 - The trigger comment has an "eyes" reaction (reviewer acknowledged, working on it)
 - Less than 3 minutes have passed since the trigger comment (still starting up)
 
@@ -79,13 +83,13 @@ Apply these rules in order to determine the current state:
 
 #### State: REVIEWS_COMPLETE_WITH_FEEDBACK
 
-**Condition:** Both `cursor[bot]` and `greptile-apps[bot]` have posted reviews that are newer than the latest push, AND at least one found issues.
+**Condition:** Both `cursor[bot]` (via review) and `greptile-apps` (via comment) have responded newer than the latest push, AND at least one found issues.
 
 **Action:** Report the issues summary. Print: "Reviews complete with feedback. Fix issues locally, then push + re-trigger when ready. Safe to use `bd` commands during fix work."
 
 #### State: REVIEWS_COMPLETE_ALL_CLEAR
 
-**Condition:** Both `cursor[bot]` and `greptile-apps[bot]` have posted reviews newer than the latest push, with no HIGH severity issues and/or thumbs-up reactions on trigger comments.
+**Condition:** Both `cursor[bot]` (via review) and `greptile-apps` (via comment) have responded newer than the latest push, with no HIGH severity issues and/or thumbs-up reactions on trigger comments.
 
 **Action:** Report: "All reviews passed. Ready for `/finishtask` to merge."
 

@@ -44,21 +44,28 @@ Fetch the review signals and verify ALL of these conditions:
 # Latest commit timestamp
 gh pr view {number} --json commits --jq '.commits[-1] | {sha: .oid, date: .committedDate}'
 
-# Latest reviews from both bots
+# Bugbot reviews (cursor[bot] posts GitHub PR reviews)
 gh api repos/{owner}/{repo}/pulls/{number}/reviews \
-  --jq '.[] | select(.user.login == "cursor[bot]" or .user.login == "greptile-apps[bot]") | {user: .user.login, submitted: .submitted_at}'
+  --jq '.[] | select(.user.login == "cursor[bot]") | {user: .user.login, state: .state, submitted: .submitted_at}'
 
-# Thumbs-up on trigger comments (approval signal)
+# Greptile responses (greptile-apps posts PR comments, NOT GitHub reviews)
+gh pr view {number} --comments --json comments \
+  --jq '.comments[] | select(.author.login == "greptile-apps") | {author: .author.login, created: .createdAt, bodyPreview: (.body | .[0:80])}'
+
+# Thumbs-up on trigger comments (approval signal for BOTH reviewers)
 gh api repos/{owner}/{repo}/issues/{number}/comments \
   --jq '.[] | select(.body == "bugbot run" or .body == "@greptile") | {body: .body, created: .created_at, thumbsup: .reactions["+1"]}'
 ```
 
+**How each reviewer signals completion:**
+- **Bugbot (`cursor[bot]`)**: Posts a GitHub PR **review** (shows in reviews API). Approval = thumbs-up on "bugbot run" trigger comment.
+- **Greptile (`greptile-apps`)**: Posts a PR **comment** (NOT a review — won't appear in reviews API). Approval = thumbs-up on "@greptile" trigger comment.
+
 **A PR is ready to merge when:**
-1. Both `cursor[bot]` and `greptile-apps[bot]` have posted reviews
-2. Their reviews are **newer** than the latest commit (not stale)
-3. The most recent "bugbot run" and "@greptile" trigger comments have thumbs-up reactions (approval)
-4. There are **no additional commits** after the approval reviews
-5. No unresolved HIGH severity issues
+1. `cursor[bot]` has posted a review AND `greptile-apps` has posted a comment — both newer than the latest commit
+2. The most recent "bugbot run" and "@greptile" trigger comments have thumbs-up reactions (approval)
+3. There are **no additional commits** after the approval responses
+4. No unresolved HIGH severity issues
 
 **If any condition fails:**
 - If reviews are stale (commits after latest review): warn and suggest pushing + re-triggering reviews
