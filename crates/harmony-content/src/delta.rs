@@ -39,7 +39,6 @@ pub fn compute_delta(old_bundle: &[u8], new_bundle: &[u8]) -> Result<Vec<u8>, Co
         .count();
 
     // Find longest common suffix (after the prefix).
-    let _old_remaining = old_cids.len() - prefix_len;
     let new_remaining = new_cids.len() - prefix_len;
     let suffix_len = old_cids[prefix_len..]
         .iter()
@@ -155,8 +154,7 @@ pub fn apply_delta(old_bundle: &[u8], delta: &[u8]) -> Result<Vec<u8>, ContentEr
 pub fn encode_update(old_bundle: &[u8], new_bundle: &[u8]) -> Result<Vec<u8>, ContentError> {
     let delta = compute_delta(old_bundle, new_bundle)?;
 
-    // +1 for the tag byte in both cases.
-    if delta.len() + 1 < new_bundle.len() + 1 {
+    if delta.len() < new_bundle.len() {
         let mut result = Vec::with_capacity(1 + delta.len());
         result.push(UPDATE_DELTA);
         result.extend_from_slice(&delta);
