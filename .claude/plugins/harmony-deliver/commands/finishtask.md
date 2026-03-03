@@ -1,7 +1,7 @@
 ---
-description: Finalize reviewed PR — merge, clean up branches, find next task
+description: Merge reviewed PR, clean up branches, return to latest main
 argument-hint: [pr-number]
-allowed-tools: Bash(git checkout:*), Bash(git branch:*), Bash(git pull:*), Bash(git push:*), Bash(git log:*), Bash(git status:*), Bash(gh pr merge:*), Bash(gh pr view:*), Bash(bd list:*), Bash(bd show:*)
+allowed-tools: Bash(git checkout:*), Bash(git branch:*), Bash(git pull:*), Bash(git push:*), Bash(git log:*), Bash(git status:*), Bash(gh pr merge:*), Bash(gh pr view:*)
 ---
 
 ## Context
@@ -9,7 +9,6 @@ allowed-tools: Bash(git checkout:*), Bash(git branch:*), Bash(git pull:*), Bash(
 - Current branch: !`git branch --show-current`
 - Git status: !`git status --short`
 - Open PRs: !`gh pr list --state open --limit 5 2>/dev/null || echo "(gh not available)"`
-- Active beads: !`bd list 2>/dev/null | head -10 || echo "(no beads)"`
 
 ## Arguments
 
@@ -17,7 +16,7 @@ PR number (optional): $ARGUMENTS
 
 If no PR number is provided, infer from the current branch's associated PR.
 
-## Finalize Workflow
+## Finish Task Workflow
 
 Complete ALL steps below in order. These steps are sequential — each depends on the previous.
 
@@ -50,15 +49,18 @@ Complete ALL steps below in order. These steps are sequential — each depends o
   ```
 - Use `-d` (not `-D`) so git confirms the branch is fully merged first
 
-### 5. Survey beads for next work
+### 5. Report
 
-- Run `bd list` to show all available beads
-- Analyze which tasks are ready to work on (considering dependencies, priorities)
-- Suggest the most promising next task with a brief rationale
-- If a bead has dependencies, note whether they're satisfied
+Print a clean summary:
 
-### 6. Report
+```
+Merged:  PR #<number> — <title>
+Branch:  <branch-name> deleted (local + remote)
+Main:    up to date
+```
 
-- Confirm the PR was merged and branches cleaned up
-- Show the suggested next bead(s) to work on
-- Ask if I should start working on the suggested task
+Then print:
+
+> Task complete. Use `/findtask` to survey what's next.
+
+**STOP HERE. The human will invoke `/findtask` when ready for the next cycle.**

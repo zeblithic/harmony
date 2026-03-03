@@ -426,9 +426,6 @@ name = "harmony-content"
 version = "0.1.0"
 dependencies = [
  "harmony-crypto",
- "harmony-identity",
- "harmony-reticulum",
- "harmony-zenoh",
  "hex",
  "thiserror",
 ]

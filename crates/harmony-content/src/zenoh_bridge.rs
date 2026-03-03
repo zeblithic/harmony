@@ -12,15 +12,6 @@ const HEX_PREFIXES: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
 ];
 
-/// Inbound events the caller feeds into the bridge.
-#[derive(Debug, Clone)]
-pub enum ContentBridgeEvent {
-    /// A remote peer is querying for content we might have.
-    ContentQuery { query_id: u64, cid: ContentId },
-    /// Local store ingested new content (trigger announcement).
-    ContentStored { cid: ContentId },
-}
-
 /// Outbound actions the bridge returns for the caller to execute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentBridgeAction {
@@ -40,9 +31,14 @@ pub fn content_queryable_key_exprs() -> Vec<String> {
         .collect()
 }
 
-/// Convert a CID to its content key expression: `harmony/content/{hex_cid}`.
+/// Convert a CID to its content key expression: `harmony/content/{prefix}/{hex_cid}`.
+///
+/// The first hex character becomes a path segment matching the shard queryable
+/// (`harmony/content/a/**`), and the full hex CID is the next segment.
 pub fn cid_to_key_expr(cid: &ContentId) -> String {
-    format!("harmony/content/{}", hex::encode(cid.to_bytes()))
+    let hex_cid = hex::encode(cid.to_bytes());
+    let (prefix, _) = hex_cid.split_at(1);
+    format!("harmony/content/{prefix}/{hex_cid}")
 }
 
 /// Convert a CID to its announce key expression: `harmony/announce/{hex_cid}`.
@@ -102,6 +98,29 @@ mod tests {
 
         let actions = handle_content_query(&store, 99, &cid);
         assert!(actions.is_empty(), "cache miss should produce no actions");
+    }
+
+    #[test]
+    fn cid_key_expr_matches_shard_structure() {
+        let cid = ContentId::for_blob(b"shard routing test").unwrap();
+        let key_expr = cid_to_key_expr(&cid);
+        let hex_cid = hex::encode(cid.to_bytes());
+        let first_char = &hex_cid[..1];
+
+        // Key expr must be harmony/content/{prefix}/{full_hex} — a 4-segment path
+        // so that the shard pattern harmony/content/{prefix}/** matches it.
+        let expected = format!("harmony/content/{first_char}/{hex_cid}");
+        assert_eq!(key_expr, expected);
+
+        // Verify the shard prefix is one of the 16 registered shards.
+        let shards = content_queryable_key_exprs();
+        let shard_prefix = format!("harmony/content/{first_char}/");
+        assert!(
+            shards
+                .iter()
+                .any(|s| s.starts_with(&shard_prefix[..shard_prefix.len() - 1])),
+            "CID prefix '{first_char}' should match one of the 16 registered shard queryables"
+        );
     }
 
     #[test]
