@@ -16,14 +16,9 @@ const HEX_PREFIXES: [char; 16] = [
 #[derive(Debug, Clone)]
 pub enum ContentBridgeEvent {
     /// A remote peer is querying for content we might have.
-    ContentQuery {
-        query_id: u64,
-        cid: ContentId,
-    },
+    ContentQuery { query_id: u64, cid: ContentId },
     /// Local store ingested new content (trigger announcement).
-    ContentStored {
-        cid: ContentId,
-    },
+    ContentStored { cid: ContentId },
 }
 
 /// Outbound actions the bridge returns for the caller to execute.
