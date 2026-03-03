@@ -5,4 +5,5 @@ pub mod cid;
 pub mod dag;
 pub mod delta;
 pub mod error;
+pub mod lru;
 pub mod sketch;
