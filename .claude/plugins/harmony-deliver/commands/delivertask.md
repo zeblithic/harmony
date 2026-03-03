@@ -1,7 +1,7 @@
 ---
-description: Deliver bead work — commit, push, PR, trigger agent reviews
+description: Close bead, push task branch, create PR, trigger agent reviews, then stop
 argument-hint: [bead-id]
-allowed-tools: Bash(git add:*), Bash(git status:*), Bash(git commit:*), Bash(git push:*), Bash(git checkout:*), Bash(git branch:*), Bash(git diff:*), Bash(git log:*), Bash(gh pr create:*), Bash(gh pr comment:*), Bash(bd show:*), Bash(bd list:*)
+allowed-tools: Bash(git add:*), Bash(git status:*), Bash(git commit:*), Bash(git push:*), Bash(git checkout:*), Bash(git branch:*), Bash(git diff:*), Bash(git log:*), Bash(gh pr create:*), Bash(gh pr comment:*), Bash(bd show:*), Bash(bd list:*), Bash(bd close:*)
 ---
 
 ## Context
@@ -27,32 +27,20 @@ Complete ALL steps below. Use parallel tool calls where steps are independent.
 - Determine which bead this delivery is for (from `$ARGUMENTS`, active beads, or branch name)
 - If a bead ID is provided, run `bd show <bead-id>` to get its title
 
-### 2. Close the bead
-
-- Close the bead with `bd close <bead-id> --reason "Delivered — PR pending review"`
-- Once work goes up for review, the PR is the state tracker — the bead's job is done
-
-### 3. Ensure work is on a task branch (NOT main)
+### 2. Ensure work is on a task branch (NOT main)
 
 **CRITICAL: `bd` auto-commits and pushes to the current branch. If on main, this pushes unreviewed code. All work MUST be on a task branch.**
 
 - Branch naming convention: `jake-<crate-short>-<slug>` derived from the bead title
-- Example: bead "W-TinyLFU cache admission" on `harmony-content` becomes `jake-content-wtinylfu-cache`
 
-**If already on a task branch:** proceed to step 4.
+**If already on a task branch:** proceed to step 3.
 
-**If on main with uncommitted changes:**
-- Create task branch from main: `git checkout -b jake-<crate>-<slug>`
-- Stage and commit on the task branch
+**If on main:** STOP and warn the user. Do not attempt to retroactively fix this — ask the user how to proceed.
 
-**If on main with commits already pushed (retroactive PR):**
-- This is the worst case — unreviewed code landed on main via `bd` auto-push
-- Find the last clean main commit (before our work began)
-- Create task branch from that clean point: `git checkout -b jake-<crate>-<slug> <clean-sha>`
-- Cherry-pick the work commits (skip `bd: backup` commits): `git cherry-pick <sha1> <sha2> ...`
-- Push the task branch: `git push -u origin jake-<crate>-<slug>`
-- Reset main: `git checkout main && git reset --hard <clean-sha> && git push --force origin main`
-- **Warn the user this required a force-push to main**
+### 3. Close the bead
+
+- Close the bead with `bd close <bead-id> --reason "Delivered — PR pending review"`
+- Once work goes up for review, the PR is the state tracker — the bead's job is done
 
 ### 4. Stage and commit (if needed)
 
@@ -87,21 +75,29 @@ EOF
 )"
 ```
 
-### 7. Trigger Bugbot review
+### 7. Trigger reviews
 
-After the PR is created, immediately comment on it:
+After the PR is created, immediately trigger Bugbot:
 
 ```
 gh pr comment <pr-number> --body "bugbot run"
 ```
 
-Greptile reviews trigger automatically on PR creation — no action needed for Greptile.
+**First delivery:** Greptile triggers automatically on PR creation — no action needed.
+**Re-delivery (pushing fixes after feedback):** Greptile does NOT auto-trigger on subsequent pushes. Trigger it explicitly:
 
-### 8. Report
+```
+gh pr comment <pr-number> --body "@greptile"
+```
+
+### 8. Stop and report
 
 - Print the PR URL
 - Print this reminder:
 
-> Do NOT push additional changes while reviews are in progress.
-> Pushing resets both Greptile and Bugbot review agents.
-> Make local fixes and wait for the signal to push again.
+> **Waiting for reviews.** The PR is now in `REVIEWS_PENDING` state.
+> - Do NOT push or run `bd` commands — pushing cancels Bugbot.
+> - Use `/monitorreviews` to check review status.
+> - When reviews are complete and any feedback is addressed, use `/finishtask` to merge.
+
+**STOP HERE. Do not proceed further. The human will review and invoke `/finishtask` when ready.**

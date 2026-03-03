@@ -389,10 +389,7 @@ mod tests {
         let store = MemoryBlobStore::new();
         let cs = ContentStore::new(store, 1);
         let total = cs.window.capacity() + cs.probation.capacity() + cs.protected.capacity();
-        assert!(
-            total <= 1,
-            "segments sum to {total}, exceeds capacity 1"
-        );
+        assert!(total <= 1, "segments sum to {total}, exceeds capacity 1");
     }
 
     #[test]
@@ -400,10 +397,7 @@ mod tests {
         let store = MemoryBlobStore::new();
         let cs = ContentStore::new(store, 2);
         let total = cs.window.capacity() + cs.probation.capacity() + cs.protected.capacity();
-        assert!(
-            total <= 2,
-            "segments sum to {total}, exceeds capacity 2"
-        );
+        assert!(total <= 2, "segments sum to {total}, exceeds capacity 2");
     }
 
     #[test]

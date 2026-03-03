@@ -10,6 +10,4 @@ description = "Content-addressed storage primitives for the Harmony decentralize
 [dependencies]
 harmony-crypto.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-hex.workspace = true
+hex = { workspace = true }

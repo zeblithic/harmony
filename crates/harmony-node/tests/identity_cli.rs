@@ -169,5 +169,8 @@ fn identity_show_rejects_wrong_length_key() {
         .expect("failed to run");
     assert!(!output.status.success(), "should fail on wrong-length key");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("expected 64 bytes"), "error message: {stderr}");
+    assert!(
+        stderr.contains("expected 64 bytes"),
+        "error message: {stderr}"
+    );
 }

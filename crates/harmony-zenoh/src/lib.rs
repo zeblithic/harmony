@@ -3,6 +3,7 @@ pub mod error;
 pub mod keyspace;
 pub mod liveliness;
 pub mod pubsub;
+pub mod queryable;
 pub mod session;
 pub mod subscription;
 
@@ -13,5 +14,6 @@ pub use liveliness::{
     LivelinessAction, LivelinessEvent, LivelinessRouter, LivelinessSubscriberId, TokenId,
 };
 pub use pubsub::{PubSubAction, PubSubEvent, PubSubRouter, PublisherId};
+pub use queryable::{QueryId, QueryableAction, QueryableEvent, QueryableId, QueryableRouter};
 pub use session::{ExprId, Session, SessionAction, SessionConfig, SessionEvent, SessionState};
 pub use subscription::{SubscriptionId, SubscriptionTable};
