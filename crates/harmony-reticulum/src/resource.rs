@@ -1963,4 +1963,346 @@ mod tests {
             .any(|a| matches!(a, ResourceAction::ReceiverStateChanged));
         assert!(has_state_change);
     }
+
+    // -- Round-trip integration helpers --------------------------------------
+
+    /// Extract the plaintext from the first SendPacket action matching the
+    /// given context byte. Panics if no matching action is found.
+    fn extract_send(actions: &[ResourceAction], ctx_byte: u8) -> Vec<u8> {
+        find_send(actions, ctx_byte).expect("expected SendPacket action")
+    }
+
+    /// Find the plaintext from the first SendPacket action matching the
+    /// given context byte, returning `None` if not found.
+    fn find_send(actions: &[ResourceAction], ctx_byte: u8) -> Option<Vec<u8>> {
+        actions.iter().find_map(|a| match a {
+            ResourceAction::SendPacket { context, plaintext } if *context == ctx_byte => {
+                Some(plaintext.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// Collect all SendPacket plaintexts matching the given context byte.
+    fn collect_sends(actions: &[ResourceAction], ctx_byte: u8) -> Vec<Vec<u8>> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                ResourceAction::SendPacket { context, plaintext } if *context == ctx_byte => {
+                    Some(plaintext.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Run a full sender-receiver round-trip protocol exchange and return the
+    /// data recovered by the receiver. This helper handles multi-round windowed
+    /// transfers automatically.
+    fn run_roundtrip(
+        sender: &mut ResourceSender,
+        receiver: &mut ResourceReceiver,
+        initial_actions: Vec<ResourceAction>,
+        mock: &MockLinkCrypto,
+    ) -> (Vec<u8>, Vec<ResourceAction>) {
+        let resource_ctx = PacketContext::Resource.as_byte();
+        let req_ctx = PacketContext::ResourceReq.as_byte();
+
+        // The initial_actions from accept() should contain a ResourceReq.
+        let mut pending_req = find_send(&initial_actions, req_ctx);
+
+        // Loop: feed requests to sender, get parts, feed parts to receiver.
+        loop {
+            let req_plaintext = match pending_req.take() {
+                Some(r) => r,
+                None => panic!("expected a ResourceReq but none was emitted"),
+            };
+
+            // Feed request to sender -> get part packets.
+            let sender_actions =
+                sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+            let part_packets = collect_sends(&sender_actions, resource_ctx);
+            assert!(!part_packets.is_empty(), "sender should emit at least one part");
+
+            // Feed each part to receiver.
+            let mut last_receiver_actions = Vec::new();
+            for part in &part_packets {
+                last_receiver_actions =
+                    receiver.handle_event(ResourceEvent::PartReceived, part);
+            }
+
+            if receiver.state() == ReceiverState::Assembling {
+                // All parts received, finalize.
+                let finalize_actions = receiver.finalize(mock).expect("finalize should succeed");
+                return (
+                    finalize_actions
+                        .iter()
+                        .find_map(|a| match a {
+                            ResourceAction::Completed { data } => Some(data.clone()),
+                            _ => None,
+                        })
+                        .expect("finalize should emit Completed"),
+                    finalize_actions,
+                );
+            }
+
+            // Not done yet — extract the next request from the receiver's actions.
+            pending_req = find_send(&last_receiver_actions, req_ctx);
+        }
+    }
+
+    // -- Full round-trip integration tests ----------------------------------
+
+    #[test]
+    fn full_roundtrip_small_data() {
+        use rand::rngs::OsRng;
+
+        let mock = MockLinkCrypto::new(64);
+        let data = b"Hello, resource transfer!";
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, data, 1000).unwrap();
+
+        // Sender advertises.
+        let adv_actions = sender.advertise(1000);
+        let adv_plaintext = extract_send(&adv_actions, PacketContext::ResourceAdv.as_byte());
+
+        // Receiver accepts advertisement.
+        let (mut receiver, rx_actions) = ResourceReceiver::accept(&adv_plaintext, 2000).unwrap();
+        assert_eq!(receiver.state(), ReceiverState::Transferring);
+
+        // The initial actions should contain a ResourceReq.
+        let req_plaintext = extract_send(&rx_actions, PacketContext::ResourceReq.as_byte());
+
+        // Feed the request to sender.
+        let sender_actions =
+            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+
+        // Sender responds with Resource data parts.
+        let part_packets = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
+        assert_eq!(part_packets.len(), sender.part_count());
+
+        // Feed each part to receiver.
+        for part in &part_packets {
+            receiver.handle_event(ResourceEvent::PartReceived, part);
+        }
+
+        // Receiver should be Assembling after all parts.
+        assert_eq!(receiver.state(), ReceiverState::Assembling);
+
+        // Finalize: decrypt and produce proof.
+        let finalize_actions = receiver.finalize(&mock).unwrap();
+        assert_eq!(receiver.state(), ReceiverState::Complete);
+
+        // Verify the recovered data matches the original.
+        let recovered = finalize_actions
+            .iter()
+            .find_map(|a| match a {
+                ResourceAction::Completed { data } => Some(data.clone()),
+                _ => None,
+            })
+            .expect("finalize should emit Completed");
+        assert_eq!(recovered, data);
+
+        // Extract proof and feed to sender.
+        let proof_plaintext = extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+
+        // Sender should validate the proof and reach Complete.
+        assert_eq!(sender.state(), SenderState::Complete);
+        let has_validated = proof_actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::ProofValidated));
+        assert!(has_validated);
+    }
+
+    #[test]
+    fn full_roundtrip_multipart() {
+        use rand::rngs::OsRng;
+
+        // MDU of 20, data of 200 bytes -> 10 parts; window starts at 4,
+        // so we need multiple request/response rounds.
+        let mock = MockLinkCrypto::new(20);
+        let data: Vec<u8> = (0..200u8).collect();
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, &data, 1000).unwrap();
+        assert_eq!(sender.part_count(), 10);
+
+        // Sender advertises.
+        let adv_actions = sender.advertise(1000);
+        let adv_plaintext = extract_send(&adv_actions, PacketContext::ResourceAdv.as_byte());
+
+        // Receiver accepts.
+        let (mut receiver, initial_actions) =
+            ResourceReceiver::accept(&adv_plaintext, 2000).unwrap();
+        assert_eq!(receiver.state(), ReceiverState::Transferring);
+
+        // Run the multi-round protocol via the helper.
+        let (recovered, finalize_actions) =
+            run_roundtrip(&mut sender, &mut receiver, initial_actions, &mock);
+
+        // Verify the recovered data matches the original.
+        assert_eq!(recovered, data);
+        assert_eq!(receiver.state(), ReceiverState::Complete);
+
+        // Verify the sender accepted the proof.
+        let proof_plaintext =
+            extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        assert_eq!(sender.state(), SenderState::Complete);
+        assert!(proof_actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::ProofValidated)));
+    }
+
+    #[test]
+    fn roundtrip_single_byte() {
+        use rand::rngs::OsRng;
+
+        let mock = MockLinkCrypto::new(64);
+        let data = &[0x42u8];
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, data, 1000).unwrap();
+        assert_eq!(sender.part_count(), 1);
+
+        let adv_actions = sender.advertise(1000);
+        let adv_plaintext = extract_send(&adv_actions, PacketContext::ResourceAdv.as_byte());
+
+        let (mut receiver, rx_actions) = ResourceReceiver::accept(&adv_plaintext, 2000).unwrap();
+        let req_plaintext = extract_send(&rx_actions, PacketContext::ResourceReq.as_byte());
+
+        // Sender sends the single part.
+        let sender_actions =
+            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let parts = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
+        assert_eq!(parts.len(), 1);
+
+        // Feed the part to receiver.
+        receiver.handle_event(ResourceEvent::PartReceived, &parts[0]);
+        assert_eq!(receiver.state(), ReceiverState::Assembling);
+
+        // Finalize.
+        let finalize_actions = receiver.finalize(&mock).unwrap();
+        assert_eq!(receiver.state(), ReceiverState::Complete);
+
+        let recovered = finalize_actions
+            .iter()
+            .find_map(|a| match a {
+                ResourceAction::Completed { data } => Some(data.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(recovered, data);
+
+        // Verify proof.
+        let proof_plaintext =
+            extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        assert_eq!(sender.state(), SenderState::Complete);
+        assert!(proof_actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::ProofValidated)));
+    }
+
+    #[test]
+    fn roundtrip_exact_sdu_boundary() {
+        use rand::rngs::OsRng;
+
+        // MDU 50, data 100 bytes -> exactly 2 parts.
+        let mock = MockLinkCrypto::new(50);
+        let data = vec![0xDD; 100];
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, &data, 1000).unwrap();
+        assert_eq!(sender.part_count(), 2);
+
+        let adv_actions = sender.advertise(1000);
+        let adv_plaintext = extract_send(&adv_actions, PacketContext::ResourceAdv.as_byte());
+
+        let (mut receiver, rx_actions) = ResourceReceiver::accept(&adv_plaintext, 2000).unwrap();
+        let req_plaintext = extract_send(&rx_actions, PacketContext::ResourceReq.as_byte());
+
+        // Both parts fit in one window (window=4 > 2 parts).
+        let sender_actions =
+            sender.handle_event(ResourceEvent::RequestReceived, &req_plaintext);
+        let parts = collect_sends(&sender_actions, PacketContext::Resource.as_byte());
+        assert_eq!(parts.len(), 2);
+
+        // Feed parts to receiver.
+        for part in &parts {
+            receiver.handle_event(ResourceEvent::PartReceived, part);
+        }
+        assert_eq!(receiver.state(), ReceiverState::Assembling);
+
+        // Finalize and verify.
+        let finalize_actions = receiver.finalize(&mock).unwrap();
+        assert_eq!(receiver.state(), ReceiverState::Complete);
+
+        let recovered = finalize_actions
+            .iter()
+            .find_map(|a| match a {
+                ResourceAction::Completed { data } => Some(data.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(recovered, data);
+
+        // Verify proof.
+        let proof_plaintext =
+            extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+        assert_eq!(sender.state(), SenderState::Complete);
+        assert!(proof_actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::ProofValidated)));
+    }
+
+    #[test]
+    fn roundtrip_proof_validates_sender() {
+        use rand::rngs::OsRng;
+
+        // Medium-sized transfer: 150 bytes with MDU 30 -> 5 parts.
+        let mock = MockLinkCrypto::new(30);
+        let data: Vec<u8> = (0..150u8).collect();
+        let mut sender = ResourceSender::new(&mut OsRng, &mock, &data, 1000).unwrap();
+        assert_eq!(sender.part_count(), 5);
+
+        let adv_actions = sender.advertise(1000);
+        let adv_plaintext = extract_send(&adv_actions, PacketContext::ResourceAdv.as_byte());
+
+        let (mut receiver, initial_actions) =
+            ResourceReceiver::accept(&adv_plaintext, 2000).unwrap();
+
+        // Run the full protocol exchange.
+        let (recovered, finalize_actions) =
+            run_roundtrip(&mut sender, &mut receiver, initial_actions, &mock);
+        assert_eq!(recovered, data);
+
+        // The sender should be in AwaitingProof after all parts are sent.
+        // (run_roundtrip doesn't feed the proof to sender.)
+        assert!(
+            sender.state() == SenderState::AwaitingProof
+                || sender.state() == SenderState::Transferring,
+            "sender should be AwaitingProof or Transferring after sending all parts, got {:?}",
+            sender.state()
+        );
+
+        // Feed the proof to sender.
+        let proof_plaintext =
+            extract_send(&finalize_actions, PacketContext::ResourcePrf.as_byte());
+        let proof_actions =
+            sender.handle_event(ResourceEvent::ProofReceived, &proof_plaintext);
+
+        // Sender should validate the proof and reach Complete.
+        assert_eq!(sender.state(), SenderState::Complete);
+        let has_proof_validated = proof_actions
+            .iter()
+            .any(|a| matches!(a, ResourceAction::ProofValidated));
+        assert!(
+            has_proof_validated,
+            "sender should emit ProofValidated action"
+        );
+
+        // Verify both sides are in terminal Complete state.
+        assert_eq!(sender.state(), SenderState::Complete);
+        assert_eq!(receiver.state(), ReceiverState::Complete);
+    }
 }
