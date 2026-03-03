@@ -71,3 +71,31 @@ fn identity_show_rejects_invalid_hex() {
         .expect("failed to run");
     assert!(!output.status.success(), "should fail on bad hex");
 }
+
+#[test]
+fn identity_sign_produces_valid_signature() {
+    let new_output = harmony_cmd()
+        .args(["identity", "new"])
+        .output()
+        .unwrap();
+    let new_stdout = String::from_utf8_lossy(&new_output.stdout);
+    let new_lines: Vec<&str> = new_stdout.lines().collect();
+    let priv_hex = new_lines[2].trim_start_matches("Private key:").trim();
+
+    let sign_output = harmony_cmd()
+        .args(["identity", "sign", priv_hex, "hello harmony"])
+        .output()
+        .unwrap();
+    assert!(sign_output.status.success());
+
+    let sign_stdout = String::from_utf8_lossy(&sign_output.stdout);
+    let sig_line = sign_stdout.lines().next().expect("should have output");
+    assert!(sig_line.starts_with("Signature:"), "line: {sig_line}");
+    let sig_hex = sig_line.trim_start_matches("Signature:").trim();
+    assert_eq!(
+        sig_hex.len(),
+        128,
+        "signature should be 128 hex chars (64 bytes)"
+    );
+    hex::decode(sig_hex).expect("signature should be valid hex");
+}

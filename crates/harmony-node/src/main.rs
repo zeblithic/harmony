@@ -89,7 +89,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Public key: {}", hex::encode(pub_id.to_public_bytes()));
                 Ok(())
             }
-            IdentityAction::Sign { .. } => todo!("identity sign"),
+            IdentityAction::Sign { private_key, message } => {
+                let bytes = decode_hex_key(&private_key, 64, "private key")?;
+                let id =
+                    harmony_identity::PrivateIdentity::from_private_bytes(&bytes)?;
+                let signature = id.sign(message.as_bytes());
+                println!("Signature: {}", hex::encode(signature));
+                Ok(())
+            }
             IdentityAction::Verify { .. } => todo!("identity verify"),
         },
     }
