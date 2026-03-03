@@ -89,8 +89,6 @@ impl<S: BlobStore> ContentStore<S> {
     /// the window segment. If the window overflows, the evicted candidate
     /// faces an admission challenge against the probation LRU victim.
     fn admit(&mut self, cid: ContentId) {
-        self.sketch.increment(&cid);
-
         // Already tracked — just update placement.
         if self.window.contains(&cid)
             || self.probation.contains(&cid)
@@ -100,7 +98,8 @@ impl<S: BlobStore> ContentStore<S> {
             return;
         }
 
-        // New CID — insert into window.
+        // New CID — increment sketch once, then insert into window.
+        self.sketch.increment(&cid);
         if let Some(candidate) = self.window.insert(cid) {
             // Window overflowed — run admission challenge.
             self.admission_challenge(candidate);
@@ -109,28 +108,33 @@ impl<S: BlobStore> ContentStore<S> {
 
     /// Try to admit the window evictee (candidate) into probation.
     ///
-    /// Insert the candidate into probation. If probation was full and evicts
-    /// its LRU victim, compare the candidate's estimated frequency against
-    /// the victim's. If the victim had equal or higher frequency, undo the
-    /// admission: remove the candidate, re-insert the victim. This ensures
-    /// hot items survive the admission challenge.
+    /// Peeks at probation's LRU victim and compares frequencies. If the
+    /// candidate has higher frequency, it replaces the victim. Otherwise
+    /// the candidate is dropped and probation is untouched.
     fn admission_challenge(&mut self, candidate: ContentId) {
-        if let Some(victim) = self.probation.insert(candidate) {
-            // Probation was full — compare frequencies.
+        if let Some(victim) = self.probation.peek_lru() {
+            if self.probation.len() < self.probation.capacity() {
+                // Probation has space — admit directly.
+                self.probation.insert(candidate);
+                return;
+            }
+            // Probation full — compare frequencies.
             let candidate_freq = self.sketch.estimate(&candidate);
             let victim_freq = self.sketch.estimate(&victim);
 
             if candidate_freq > victim_freq {
-                // Candidate wins — victim is evicted.
+                // Candidate wins — evict victim, admit candidate.
+                self.probation.remove(&victim);
                 self.store_remove(&victim);
+                self.probation.insert(candidate);
             } else {
-                // Victim wins — undo: remove candidate, re-insert victim.
-                self.probation.remove(&candidate);
+                // Victim wins — drop candidate entirely.
                 self.store_remove(&candidate);
-                self.probation.insert(victim);
             }
+        } else {
+            // Probation is empty — admit directly.
+            self.probation.insert(candidate);
         }
-        // If no eviction, probation had space — candidate admitted directly.
     }
 
     /// Remove a CID from the backing store.

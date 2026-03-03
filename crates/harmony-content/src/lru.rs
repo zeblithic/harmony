@@ -114,6 +114,11 @@ impl Lru {
         self.len == 0
     }
 
+    /// Returns the maximum capacity of this LRU.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
