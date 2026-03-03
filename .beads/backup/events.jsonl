@@ -78,3 +78,4 @@
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:55:34Z","event_type":"created","id":78,"issue_id":"harmony-2hp","new_value":"","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:55:40Z","event_type":"created","id":79,"issue_id":"harmony-313","new_value":"","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T19:55:48Z","event_type":"created","id":80,"issue_id":"harmony-0p5","new_value":"","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-02T21:35:43Z","event_type":"closed","id":81,"issue_id":"harmony-jnk","new_value":"Implemented in PR #20: harmony-content crate with ContentId, CidType, checksum, constructors, canonical vectors. 37 tests.","old_value":""}
