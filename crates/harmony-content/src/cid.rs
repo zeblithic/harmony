@@ -865,4 +865,54 @@ mod tests {
         assert!(s.contains("Blob"));
         assert!(s.contains("12")); // data length
     }
+
+    // -----------------------------------------------------------------------
+    // Task 8: Canonical test vectors
+    // -----------------------------------------------------------------------
+    // These exist so other language implementations can verify byte-identical CID output.
+
+    #[test]
+    fn canonical_vector_empty_blob() {
+        let cid = ContentId::for_blob(b"").unwrap();
+        let bytes = cid.to_bytes();
+        // SHA-256("")[:28] = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b
+        assert_eq!(
+            hex::encode(&bytes[..CONTENT_HASH_LEN]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b",
+        );
+        assert_eq!(cid.payload_size(), 0);
+        assert_eq!(cid.cid_type(), CidType::Blob);
+        // Record the full 32-byte hex for cross-language verification
+        let full_hex = hex::encode(bytes);
+        // Verify it's deterministic by re-creating
+        let cid2 = ContentId::for_blob(b"").unwrap();
+        assert_eq!(hex::encode(cid2.to_bytes()), full_hex);
+    }
+
+    #[test]
+    fn canonical_vector_hello_blob() {
+        let cid = ContentId::for_blob(b"hello").unwrap();
+        let bytes = cid.to_bytes();
+        // SHA-256("hello")[:28] = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362
+        assert_eq!(
+            hex::encode(&bytes[..CONTENT_HASH_LEN]),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362",
+        );
+        assert_eq!(cid.payload_size(), 5);
+        assert_eq!(cid.cid_type(), CidType::Blob);
+    }
+
+    #[test]
+    fn canonical_vector_bundle_of_two_blobs() {
+        let blob_a = ContentId::for_blob(b"aaa").unwrap();
+        let blob_b = ContentId::for_blob(b"bbb").unwrap();
+        let children = [blob_a, blob_b];
+        let bundle_bytes = children_to_bytes(&children);
+        let bundle = ContentId::for_bundle(&bundle_bytes, &children).unwrap();
+        assert_eq!(bundle.payload_size(), 64); // 2 x 32 bytes
+        assert_eq!(bundle.cid_type(), CidType::Bundle(1));
+        // The hash is SHA-256 of the 64-byte bundle payload
+        let full = harmony_crypto::hash::full_hash(&bundle_bytes);
+        assert_eq!(&bundle.hash, &full[..CONTENT_HASH_LEN]);
+    }
 }
