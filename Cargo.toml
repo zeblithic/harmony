@@ -4,6 +4,7 @@ members = [
     "crates/harmony-content",
     "crates/harmony-crypto",
     "crates/harmony-identity",
+    "crates/harmony-node",
     "crates/harmony-reticulum",
     "crates/harmony-zenoh",
 ]
