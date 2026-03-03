@@ -83,6 +83,12 @@ pub mod reticulum {
 // ── Tier 2: Storage ─────────────────────────────────────────────────
 
 /// Content storage key expressions.
+///
+/// Note: `harmony-content/src/zenoh_bridge.rs` currently duplicates some of
+/// these constants (`HEX_PREFIXES`, shard patterns, announce keys). That
+/// crate doesn't depend on `harmony-zenoh`, so it can't import from here.
+/// The `StorageTier` wrapper (harmony-k5ed) will unify by having
+/// `harmony-content` depend on these canonical definitions.
 pub mod content {
     /// Base prefix: `harmony/content`
     pub const PREFIX: &str = "harmony/content";
@@ -122,8 +128,11 @@ pub mod content {
     }
 
     /// Content fetch key: `harmony/content/{prefix}/{cid_hex}`
+    ///
+    /// The first hex character is used as the shard prefix. If `cid_hex`
+    /// is empty, returns a key with no shard segment (caller error).
     pub fn fetch_key(cid_hex: &str) -> String {
-        let prefix = &cid_hex[..1];
+        let prefix = cid_hex.get(..1).unwrap_or("");
         format!("{PREFIX}/{prefix}/{cid_hex}")
     }
 
@@ -357,6 +366,13 @@ mod tests {
     fn content_fetch_key_uses_first_char_as_shard() {
         let key = content::fetch_key("abc123def456");
         assert_eq!(key, "harmony/content/a/abc123def456");
+    }
+
+    #[test]
+    fn content_fetch_key_empty_does_not_panic() {
+        // Empty CID hex is a caller error, but must not panic.
+        let key = content::fetch_key("");
+        assert_eq!(key, "harmony/content//");
     }
 
     #[test]
