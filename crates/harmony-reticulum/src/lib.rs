@@ -10,6 +10,7 @@ pub mod node;
 pub mod packet;
 pub mod packet_hashlist;
 pub mod path_table;
+pub mod resource;
 
 pub use announce::{build_announce, build_random_hash, validate_announce, ValidatedAnnounce};
 pub use context::PacketContext;
@@ -26,3 +27,7 @@ pub use packet::{
 pub use node::{AnnounceRateConfig, DropReason, InterfaceConfig, Node, NodeAction, NodeEvent};
 pub use packet_hashlist::PacketHashlist;
 pub use path_table::{PathEntry, PathTable, PathUpdateResult};
+pub use resource::{
+    LinkCrypto, ReceiverState, ResourceAction, ResourceEvent, ResourceHash, ResourceReceiver,
+    ResourceSender, SenderState,
+};
