@@ -567,4 +567,51 @@ mod tests {
             "chunk_all must match multi-feed streaming results"
         );
     }
+
+    #[test]
+    fn deduplication_insert_only_affects_nearby_chunks() {
+        let config = small_config();
+
+        // Create original data
+        let original: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
+        let original_ranges = chunk_all(&original, &config).unwrap();
+        let original_chunks: Vec<&[u8]> = original_ranges
+            .iter()
+            .map(|r| &original[r.clone()])
+            .collect();
+
+        // Insert 10 bytes near the middle
+        let insert_pos = 1024;
+        let mut modified = original[..insert_pos].to_vec();
+        modified.extend_from_slice(&[0xDE; 10]);
+        modified.extend_from_slice(&original[insert_pos..]);
+
+        let modified_ranges = chunk_all(&modified, &config).unwrap();
+        let modified_chunks: Vec<&[u8]> = modified_ranges
+            .iter()
+            .map(|r| &modified[r.clone()])
+            .collect();
+
+        // Count how many chunks from the original appear unchanged in the modified version
+        let mut shared = 0;
+        for orig_chunk in &original_chunks {
+            if modified_chunks.contains(orig_chunk) {
+                shared += 1;
+            }
+        }
+
+        // At least some chunks should be shared (CDC property).
+        assert!(
+            shared > 0,
+            "CDC should preserve some chunks after a small edit, but none were shared"
+        );
+        // The total number of chunks shouldn't wildly change
+        let count_diff =
+            (original_ranges.len() as isize - modified_ranges.len() as isize).unsigned_abs();
+        assert!(
+            count_diff <= 2,
+            "chunk count changed by {} — expected at most 2 for a small insertion",
+            count_diff
+        );
+    }
 }
