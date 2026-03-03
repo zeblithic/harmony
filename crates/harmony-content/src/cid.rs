@@ -1,1 +1,512 @@
-// Placeholder — will be populated in Task 2.
+/// Length of the truncated SHA-256 content hash in bytes.
+pub const CONTENT_HASH_LEN: usize = 28;
+
+/// Maximum payload size expressible in 20 bits.
+pub const MAX_PAYLOAD_SIZE: usize = 0xF_FFFF; // 1,048,575 bytes
+
+/// Number of bits used for the type tag + checksum field.
+pub const TAG_BITS: u32 = 12;
+
+/// Bitmask for the 12-bit tag field (lower 12 bits of the last u32).
+pub const TAG_MASK: u32 = 0xFFF;
+
+/// A 32-byte content identifier.
+///
+/// Layout (big-endian):
+/// - Bytes 0--27: truncated SHA-256 content hash (224 bits)
+/// - Bytes 28--31: big-endian u32 where bits \[31:12\] = payload size,
+///   bits \[11:0\] = type tag + checksum
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct ContentId {
+    /// First 28 bytes of SHA-256(content).
+    pub hash: [u8; CONTENT_HASH_LEN],
+    /// Big-endian u32: upper 20 bits = size, lower 12 bits = tag+checksum.
+    pub size_and_tag: [u8; 4],
+}
+
+impl ContentId {
+    /// Extract the payload size from the packed u32 (upper 20 bits).
+    pub fn payload_size(&self) -> u32 {
+        let packed = u32::from_be_bytes(self.size_and_tag);
+        packed >> TAG_BITS
+    }
+
+    /// Extract the 12-bit tag field (lower 12 bits).
+    pub fn tag(&self) -> u16 {
+        let packed = u32::from_be_bytes(self.size_and_tag);
+        (packed & TAG_MASK) as u16
+    }
+
+    /// Decode the CID type from the 12-bit tag field.
+    pub fn cid_type(&self) -> CidType {
+        let (cid_type, _checksum) = CidType::decode(self.tag());
+        cid_type
+    }
+}
+
+impl std::fmt::Debug for ContentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ContentId({}, {}B, {:?})",
+            hex_prefix(&self.hash),
+            self.payload_size(),
+            self.cid_type(),
+        )
+    }
+}
+
+/// Format the first 4 bytes of a hash as hex for debug display.
+fn hex_prefix(hash: &[u8; CONTENT_HASH_LEN]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}...",
+        hash[0], hash[1], hash[2], hash[3]
+    )
+}
+
+// ---------------------------------------------------------------------------
+// CidType enum with unary tag encode/decode
+// ---------------------------------------------------------------------------
+
+/// The type of a [`ContentId`], encoded as a unary prefix in the 12-bit tag field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CidType {
+    /// Leaf data blob (depth 0). Tag prefix: `0`.
+    Blob,
+    /// Interior bundle node at the given depth (1--7). Tag prefix: `depth`
+    /// leading 1-bits then `0`.
+    Bundle(u8),
+    /// Inline metadata (hash field repurposed). Tag prefix: `1111_1111_0`.
+    InlineMetadata,
+    /// Reserved type A. Tag prefix: `1111_1111_10`.
+    ReservedA,
+    /// Reserved type B. Tag prefix: `1111_1111_110`.
+    ReservedB,
+    /// Reserved type C. Tag prefix: `1111_1111_1110`.
+    ReservedC,
+    /// Reserved type D. Tag prefix: `1111_1111_1111`.
+    ReservedD,
+}
+
+impl CidType {
+    /// Return the tree depth for this CID type.
+    ///
+    /// - `Blob` => 0
+    /// - `Bundle(d)` => d
+    /// - All others => 0
+    pub fn depth(&self) -> u8 {
+        match self {
+            CidType::Blob => 0,
+            CidType::Bundle(d) => *d,
+            _ => 0,
+        }
+    }
+
+    /// Return the number of prefix bits consumed by the unary encoding.
+    fn prefix_len(&self) -> u32 {
+        match self {
+            CidType::Blob => 1, // "0"
+            CidType::Bundle(d) => {
+                // d leading 1-bits + terminating 0 = d+1
+                u32::from(*d) + 1
+            }
+            CidType::InlineMetadata => 9, // "1111_1111_0"
+            CidType::ReservedA => 10,     // "1111_1111_10"
+            CidType::ReservedB => 11,     // "1111_1111_110"
+            CidType::ReservedC => 12,     // "1111_1111_1110"
+            CidType::ReservedD => 12,     // "1111_1111_1111" (all bits used)
+        }
+    }
+
+    /// Number of bits available for the checksum.
+    pub fn checksum_bits(&self) -> u32 {
+        TAG_BITS - self.prefix_len()
+    }
+
+    /// Encode this CID type and a checksum into a 12-bit tag value.
+    ///
+    /// The checksum is truncated to fit the available bits.
+    pub fn encode(&self, checksum: u16) -> u16 {
+        let prefix_len = self.prefix_len();
+        let cksum_bits = TAG_BITS - prefix_len;
+
+        // Build the prefix in the top bits of a 12-bit field.
+        let prefix: u16 = match self {
+            CidType::Blob => {
+                // bit 11 = 0 => prefix is just 0 at the top
+                0
+            }
+            CidType::Bundle(d) => {
+                // d leading 1-bits at top, then a 0
+                // e.g. depth=1: "10" at top => 0b10_0000_0000_00 shifted
+                let ones = (1u16 << *d) - 1; // d bits of 1
+                ones << (TAG_BITS as u16 - *d as u16)
+                // The 0 terminator is implicit (next bit is 0)
+            }
+            CidType::InlineMetadata => {
+                // "1111_1111_0" = 8 ones at top, then 0
+                0xFF << (TAG_BITS as u16 - 8)
+                // = 0xFF0 >> ... wait, let me be precise:
+                // 8 ones shifted to top of 12 bits = 0b1111_1111_0000 = 0xFF0
+            }
+            CidType::ReservedA => {
+                // "1111_1111_10" = 9 ones at top, then 0
+                // 9 ones = 0b1_1111_1111 = 0x1FF
+                0x1FF << (TAG_BITS as u16 - 9)
+                // = 0xFF8
+            }
+            CidType::ReservedB => {
+                // "1111_1111_110" = 10 ones, then 0
+                0x3FF << (TAG_BITS as u16 - 10)
+                // = 0xFFC
+            }
+            CidType::ReservedC => {
+                // "1111_1111_1110" = 11 ones, then 0
+                0x7FF << (TAG_BITS as u16 - 11)
+                // = 0xFFE
+            }
+            CidType::ReservedD => {
+                // "1111_1111_1111" = all 12 bits set
+                0xFFF
+            }
+        };
+
+        if cksum_bits == 0 {
+            return prefix;
+        }
+
+        // Mask the checksum to fit
+        let cksum_mask = (1u16 << cksum_bits) - 1;
+        let masked_checksum = checksum & cksum_mask;
+
+        prefix | masked_checksum
+    }
+
+    /// Decode a 12-bit tag value into a `CidType` and the embedded checksum.
+    pub fn decode(tag: u16) -> (CidType, u16) {
+        // Shift the 12-bit tag to the top of a u16 so we can use leading_zeros
+        // to count unary 1-bits.
+        let shifted = tag << (16 - TAG_BITS);
+        let leading_ones = (!shifted).leading_zeros();
+
+        match leading_ones {
+            0 => {
+                // Bit 11 = 0 => Blob, 11-bit checksum
+                let checksum = tag & 0x7FF;
+                (CidType::Blob, checksum)
+            }
+            d @ 1..=7 => {
+                // Bundle(d): d leading 1-bits + terminating 0
+                let cksum_bits = TAG_BITS - (d + 1);
+                let checksum = if cksum_bits > 0 {
+                    tag & ((1u16 << cksum_bits) - 1)
+                } else {
+                    0
+                };
+                (CidType::Bundle(d as u8), checksum)
+            }
+            8 => {
+                // 8 leading 1-bits, then...
+                // Check bit position 3 (from LSB) to distinguish InlineMetadata
+                // from deeper prefixes. The 9th bit (index 3) should be 0 for
+                // InlineMetadata.
+                // After 8 ones, bits [3:0] remain. Bit 3 = 0 => InlineMetadata.
+                let remaining = tag & 0xF; // bottom 4 bits
+                if remaining & 0x8 == 0 {
+                    // bit 3 = 0 => InlineMetadata, 3-bit checksum
+                    (CidType::InlineMetadata, tag & 0x7)
+                } else if remaining & 0x4 == 0 {
+                    // bit 3 = 1, bit 2 = 0 => ReservedA, 2-bit checksum
+                    (CidType::ReservedA, tag & 0x3)
+                } else if remaining & 0x2 == 0 {
+                    // bits 3,2 = 1,1; bit 1 = 0 => ReservedB, 1-bit checksum
+                    (CidType::ReservedB, tag & 0x1)
+                } else if remaining & 0x1 == 0 {
+                    // bits 3,2,1 = 1,1,1; bit 0 = 0 => ReservedC, 0-bit checksum
+                    (CidType::ReservedC, 0)
+                } else {
+                    // All bits = 1 => ReservedD, 0-bit checksum
+                    (CidType::ReservedD, 0)
+                }
+            }
+            _ => {
+                // 9+ leading ones means bits 8..=11 are all 1, plus more.
+                // This falls into the reserved region. We need to check
+                // the remaining bits manually.
+                // Actually, with a 12-bit field shifted to u16 top,
+                // 9+ leading ones means at least bits 11..3 are 1.
+                // We decode the remaining low bits.
+                let remaining = tag & 0xF;
+                if remaining & 0x8 == 0 {
+                    (CidType::InlineMetadata, tag & 0x7)
+                } else if remaining & 0x4 == 0 {
+                    (CidType::ReservedA, tag & 0x3)
+                } else if remaining & 0x2 == 0 {
+                    (CidType::ReservedB, tag & 0x1)
+                } else if remaining & 0x1 == 0 {
+                    (CidType::ReservedC, 0)
+                } else {
+                    (CidType::ReservedD, 0)
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Checksum computation
+// ---------------------------------------------------------------------------
+
+/// Compute a checksum over the CID's hash, size, and type, truncated to fit
+/// the available checksum bits for the given CID type.
+pub fn compute_checksum(hash: &[u8; CONTENT_HASH_LEN], size: u32, cid_type: &CidType) -> u16 {
+    use harmony_crypto::hash::full_hash;
+
+    let cksum_bits = cid_type.checksum_bits();
+    if cksum_bits == 0 {
+        return 0;
+    }
+
+    let mut input = Vec::with_capacity(CONTENT_HASH_LEN + 4 + 1);
+    input.extend_from_slice(hash);
+    input.extend_from_slice(&size.to_be_bytes());
+    input.push(cid_type.depth());
+    let digest = full_hash(&input);
+
+    let raw = u16::from_be_bytes([digest[0], digest[1]]);
+    raw & ((1u16 << cksum_bits) - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Task 2: ContentId struct
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn content_id_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<ContentId>(), 32);
+    }
+
+    #[test]
+    fn content_id_payload_size_and_tag() {
+        let mut cid = ContentId {
+            hash: [0u8; CONTENT_HASH_LEN],
+            size_and_tag: [0; 4],
+        };
+        // Set size = 1000, tag = 0x123
+        let packed: u32 = (1000 << TAG_BITS) | 0x123;
+        cid.size_and_tag = packed.to_be_bytes();
+
+        assert_eq!(cid.payload_size(), 1000);
+        assert_eq!(cid.tag(), 0x123);
+    }
+
+    #[test]
+    fn content_id_debug_format() {
+        let cid = ContentId {
+            hash: [0xAB; CONTENT_HASH_LEN],
+            size_and_tag: ((512u32 << TAG_BITS) | 0).to_be_bytes(),
+        };
+        let debug = format!("{:?}", cid);
+        assert!(debug.contains("ContentId("));
+        assert!(debug.contains("abababab..."));
+        assert!(debug.contains("512B"));
+        assert!(debug.contains("Blob"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3: CidType encode/decode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn blob_tag_round_trip() {
+        let max_checksum: u16 = 0x7FF; // 11 bits
+        let tag = CidType::Blob.encode(max_checksum);
+        let (decoded_type, decoded_checksum) = CidType::decode(tag);
+        assert_eq!(decoded_type, CidType::Blob);
+        assert_eq!(decoded_checksum, max_checksum);
+    }
+
+    #[test]
+    fn bundle_l1_tag_round_trip() {
+        let max_checksum: u16 = 0x3FF; // 10 bits
+        let tag = CidType::Bundle(1).encode(max_checksum);
+        let (decoded_type, decoded_checksum) = CidType::decode(tag);
+        assert_eq!(decoded_type, CidType::Bundle(1));
+        assert_eq!(decoded_checksum, max_checksum);
+    }
+
+    #[test]
+    fn bundle_l7_tag_round_trip() {
+        let max_checksum: u16 = 0xF; // 4 bits
+        let tag = CidType::Bundle(7).encode(max_checksum);
+        let (decoded_type, decoded_checksum) = CidType::decode(tag);
+        assert_eq!(decoded_type, CidType::Bundle(7));
+        assert_eq!(decoded_checksum, max_checksum);
+    }
+
+    #[test]
+    fn inline_metadata_tag_round_trip() {
+        let max_checksum: u16 = 0x7; // 3 bits
+        let tag = CidType::InlineMetadata.encode(max_checksum);
+        let (decoded_type, decoded_checksum) = CidType::decode(tag);
+        assert_eq!(decoded_type, CidType::InlineMetadata);
+        assert_eq!(decoded_checksum, max_checksum);
+    }
+
+    #[test]
+    fn all_bundle_depths_round_trip() {
+        for depth in 1..=7u8 {
+            let cid_type = CidType::Bundle(depth);
+            let cksum_bits = cid_type.checksum_bits();
+            let max_checksum = if cksum_bits > 0 {
+                (1u16 << cksum_bits) - 1
+            } else {
+                0
+            };
+            let tag = cid_type.encode(max_checksum);
+            let (decoded_type, decoded_checksum) = CidType::decode(tag);
+            assert_eq!(
+                decoded_type, cid_type,
+                "round-trip failed for Bundle({})",
+                depth
+            );
+            assert_eq!(
+                decoded_checksum, max_checksum,
+                "checksum round-trip failed for Bundle({})",
+                depth
+            );
+        }
+    }
+
+    #[test]
+    fn depth_returns_correct_values() {
+        assert_eq!(CidType::Blob.depth(), 0);
+        assert_eq!(CidType::Bundle(1).depth(), 1);
+        assert_eq!(CidType::Bundle(5).depth(), 5);
+        assert_eq!(CidType::Bundle(7).depth(), 7);
+        assert_eq!(CidType::InlineMetadata.depth(), 0);
+        assert_eq!(CidType::ReservedA.depth(), 0);
+        assert_eq!(CidType::ReservedB.depth(), 0);
+        assert_eq!(CidType::ReservedC.depth(), 0);
+        assert_eq!(CidType::ReservedD.depth(), 0);
+    }
+
+    #[test]
+    fn reserved_types_round_trip() {
+        // ReservedA: 2-bit checksum
+        let tag = CidType::ReservedA.encode(0x3);
+        let (t, c) = CidType::decode(tag);
+        assert_eq!(t, CidType::ReservedA);
+        assert_eq!(c, 0x3);
+
+        // ReservedB: 1-bit checksum
+        let tag = CidType::ReservedB.encode(0x1);
+        let (t, c) = CidType::decode(tag);
+        assert_eq!(t, CidType::ReservedB);
+        assert_eq!(c, 0x1);
+
+        // ReservedC: 0-bit checksum
+        let tag = CidType::ReservedC.encode(0);
+        let (t, c) = CidType::decode(tag);
+        assert_eq!(t, CidType::ReservedC);
+        assert_eq!(c, 0);
+
+        // ReservedD: 0-bit checksum
+        let tag = CidType::ReservedD.encode(0);
+        let (t, c) = CidType::decode(tag);
+        assert_eq!(t, CidType::ReservedD);
+        assert_eq!(c, 0);
+    }
+
+    #[test]
+    fn blob_zero_checksum() {
+        let tag = CidType::Blob.encode(0);
+        let (t, c) = CidType::decode(tag);
+        assert_eq!(t, CidType::Blob);
+        assert_eq!(c, 0);
+        assert_eq!(tag, 0);
+    }
+
+    #[test]
+    fn checksum_bits_are_correct() {
+        assert_eq!(CidType::Blob.checksum_bits(), 11);
+        assert_eq!(CidType::Bundle(1).checksum_bits(), 10);
+        assert_eq!(CidType::Bundle(2).checksum_bits(), 9);
+        assert_eq!(CidType::Bundle(3).checksum_bits(), 8);
+        assert_eq!(CidType::Bundle(4).checksum_bits(), 7);
+        assert_eq!(CidType::Bundle(5).checksum_bits(), 6);
+        assert_eq!(CidType::Bundle(6).checksum_bits(), 5);
+        assert_eq!(CidType::Bundle(7).checksum_bits(), 4);
+        assert_eq!(CidType::InlineMetadata.checksum_bits(), 3);
+        assert_eq!(CidType::ReservedA.checksum_bits(), 2);
+        assert_eq!(CidType::ReservedB.checksum_bits(), 1);
+        assert_eq!(CidType::ReservedC.checksum_bits(), 0);
+        assert_eq!(CidType::ReservedD.checksum_bits(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4: Checksum computation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_checksum_deterministic() {
+        let hash = [0xAA; CONTENT_HASH_LEN];
+        let size = 1024u32;
+        let cid_type = CidType::Blob;
+
+        let c1 = compute_checksum(&hash, size, &cid_type);
+        let c2 = compute_checksum(&hash, size, &cid_type);
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn compute_checksum_varies_with_input() {
+        let hash_a = [0xAA; CONTENT_HASH_LEN];
+        let hash_b = [0xBB; CONTENT_HASH_LEN];
+        let size = 1024u32;
+        let cid_type = CidType::Blob;
+
+        let ca = compute_checksum(&hash_a, size, &cid_type);
+        let cb = compute_checksum(&hash_b, size, &cid_type);
+        // Different inputs should (with overwhelming probability) yield
+        // different checksums.
+        assert_ne!(ca, cb);
+    }
+
+    #[test]
+    fn checksum_fits_within_available_bits() {
+        let hash = [0x42; CONTENT_HASH_LEN];
+        let size = 999u32;
+
+        for depth in 0..=7u8 {
+            let cid_type = if depth == 0 {
+                CidType::Blob
+            } else {
+                CidType::Bundle(depth)
+            };
+            let cksum_bits = cid_type.checksum_bits();
+            let max_val = if cksum_bits > 0 {
+                (1u16 << cksum_bits) - 1
+            } else {
+                0
+            };
+            let checksum = compute_checksum(&hash, size, &cid_type);
+            assert!(
+                checksum <= max_val,
+                "checksum {} exceeds max {} for depth {}",
+                checksum,
+                max_val,
+                depth
+            );
+        }
+
+        // Also check InlineMetadata (3-bit checksum)
+        let checksum = compute_checksum(&hash, size, &CidType::InlineMetadata);
+        assert!(checksum <= 0x7);
+    }
+}
