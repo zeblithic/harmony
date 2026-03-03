@@ -213,6 +213,9 @@ mod tests {
             sketch.increment(&make_cid(i));
         }
         let after = sketch.estimate(&cid);
-        assert!(after < before, "expected decay: before={before}, after={after}");
+        assert!(
+            after < before,
+            "expected decay: before={before}, after={after}"
+        );
     }
 }

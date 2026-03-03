@@ -228,9 +228,7 @@ mod tests {
         // The hot items should still be accessible in the cache segments.
         for cid in &hot {
             assert!(
-                cs.window.contains(cid)
-                    || cs.probation.contains(cid)
-                    || cs.protected.contains(cid),
+                cs.window.contains(cid) || cs.probation.contains(cid) || cs.protected.contains(cid),
                 "hot CID should still be in cache"
             );
         }
@@ -277,9 +275,7 @@ mod tests {
 
         // The hot item should survive the scan.
         assert!(
-            cs.window.contains(&hot)
-                || cs.probation.contains(&hot)
-                || cs.protected.contains(&hot),
+            cs.window.contains(&hot) || cs.probation.contains(&hot) || cs.protected.contains(&hot),
             "hot CID should survive sequential scan"
         );
     }
