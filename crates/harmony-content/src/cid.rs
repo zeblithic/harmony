@@ -431,10 +431,10 @@ pub fn compute_checksum(hash: &[u8; CONTENT_HASH_LEN], size: u32, cid_type: &Cid
         return 0;
     }
 
-    let mut input = Vec::with_capacity(CONTENT_HASH_LEN + 4 + 1);
-    input.extend_from_slice(hash);
-    input.extend_from_slice(&size.to_be_bytes());
-    input.push(cid_type.depth());
+    let mut input = [0u8; CONTENT_HASH_LEN + 4 + 1];
+    input[..CONTENT_HASH_LEN].copy_from_slice(hash);
+    input[CONTENT_HASH_LEN..CONTENT_HASH_LEN + 4].copy_from_slice(&size.to_be_bytes());
+    input[CONTENT_HASH_LEN + 4] = cid_type.depth();
     let digest = full_hash(&input);
 
     let raw = u16::from_be_bytes([digest[0], digest[1]]);
@@ -882,11 +882,11 @@ mod tests {
         );
         assert_eq!(cid.payload_size(), 0);
         assert_eq!(cid.cid_type(), CidType::Blob);
-        // Record the full 32-byte hex for cross-language verification
-        let full_hex = hex::encode(bytes);
-        // Verify it's deterministic by re-creating
-        let cid2 = ContentId::for_blob(b"").unwrap();
-        assert_eq!(hex::encode(cid2.to_bytes()), full_hex);
+        // Full 32-byte canonical hex (hash + packed size/tag/checksum)
+        assert_eq!(
+            hex::encode(bytes),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b0000026d",
+        );
     }
 
     #[test]
@@ -900,6 +900,11 @@ mod tests {
         );
         assert_eq!(cid.payload_size(), 5);
         assert_eq!(cid.cid_type(), CidType::Blob);
+        // Full 32-byte canonical hex
+        assert_eq!(
+            hex::encode(bytes),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e7304336200005156",
+        );
     }
 
     #[test]
@@ -914,5 +919,11 @@ mod tests {
         // The hash is SHA-256 of the 64-byte bundle payload
         let full = harmony_crypto::hash::full_hash(&bundle_bytes);
         assert_eq!(&bundle.hash, &full[..CONTENT_HASH_LEN]);
+        // Full 32-byte canonical hex
+        assert_eq!(
+            hex::encode(bundle.to_bytes()),
+            "5c9f61c811d592b287972b0fa001f1d5d286b0f49c25e749b0eb83cd000409ca",
+        );
     }
+
 }
