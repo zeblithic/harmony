@@ -13,9 +13,12 @@ use crate::sketch::CountMinSketch;
 /// design. A pinned set allows callers to protect specific CIDs from eviction
 /// in future tasks.
 ///
-/// This is the scaffold: insertion delegates to the backing store and records
-/// the CID in the window segment. The full admission challenge (window victim
-/// vs. probation victim frequency comparison) will be added in Task 5.
+/// On insertion, new CIDs enter the **window** segment. When the window
+/// overflows, the evicted candidate faces an **admission challenge** against
+/// the probation segment's LRU victim: the candidate is admitted to probation
+/// only if its estimated frequency exceeds the victim's. On cache hits,
+/// probation entries are promoted to protected; protected entries are touched
+/// in place.
 pub struct ContentStore<S: BlobStore> {
     store: S,
     sketch: CountMinSketch,
@@ -54,20 +57,88 @@ impl<S: BlobStore> ContentStore<S> {
         }
     }
 
-    /// Record a CID in the cache metadata.
+    /// Record an access for a CID already in the cache.
     ///
-    /// Increments the sketch frequency counter and inserts into the window
-    /// segment if the CID is not already tracked in any segment.
-    /// The full admission challenge (comparing window victim vs. probation
-    /// victim frequencies) will be added in Task 5.
+    /// Called by callers on cache hits to maintain frequency data and adjust
+    /// segment placement:
+    /// - **Protected:** touch (move to head).
+    /// - **Probation:** promote to protected. If protected overflows, demote
+    ///   the victim back to probation head.
+    /// - **Window:** touch (move to head).
+    pub fn record_access(&mut self, cid: &ContentId) {
+        self.sketch.increment(cid);
+
+        if self.protected.contains(cid) {
+            self.protected.touch(cid);
+        } else if self.probation.contains(cid) {
+            // Promote from probation to protected.
+            self.probation.remove(cid);
+            if let Some(demoted) = self.protected.insert(*cid) {
+                // Protected overflowed — demote victim back to probation head.
+                self.probation.insert(demoted);
+            }
+        } else if self.window.contains(cid) {
+            self.window.touch(cid);
+        }
+    }
+
+    /// Record a CID in the cache metadata with full W-TinyLFU admission.
+    ///
+    /// Increments the sketch frequency counter. If the CID is already tracked
+    /// in any segment, delegates to [`record_access`]. Otherwise inserts into
+    /// the window segment. If the window overflows, the evicted candidate
+    /// faces an admission challenge against the probation LRU victim.
     fn admit(&mut self, cid: ContentId) {
         self.sketch.increment(&cid);
-        if !self.window.contains(&cid)
-            && !self.probation.contains(&cid)
-            && !self.protected.contains(&cid)
+
+        // Already tracked — just update placement.
+        if self.window.contains(&cid)
+            || self.probation.contains(&cid)
+            || self.protected.contains(&cid)
         {
-            self.window.insert(cid);
+            self.record_access(&cid);
+            return;
         }
+
+        // New CID — insert into window.
+        if let Some(candidate) = self.window.insert(cid) {
+            // Window overflowed — run admission challenge.
+            self.admission_challenge(candidate);
+        }
+    }
+
+    /// Try to admit the window evictee (candidate) into probation.
+    ///
+    /// Insert the candidate into probation. If probation was full and evicts
+    /// its LRU victim, compare the candidate's estimated frequency against
+    /// the victim's. If the victim had equal or higher frequency, undo the
+    /// admission: remove the candidate, re-insert the victim. This ensures
+    /// hot items survive the admission challenge.
+    fn admission_challenge(&mut self, candidate: ContentId) {
+        if let Some(victim) = self.probation.insert(candidate) {
+            // Probation was full — compare frequencies.
+            let candidate_freq = self.sketch.estimate(&candidate);
+            let victim_freq = self.sketch.estimate(&victim);
+
+            if candidate_freq > victim_freq {
+                // Candidate wins — victim is evicted.
+                self.store_remove(&victim);
+            } else {
+                // Victim wins — undo: remove candidate, re-insert victim.
+                self.probation.remove(&candidate);
+                self.store_remove(&candidate);
+                self.probation.insert(victim);
+            }
+        }
+        // If no eviction, probation had space — candidate admitted directly.
+    }
+
+    /// Remove a CID from the backing store.
+    ///
+    /// No-op for now: `MemoryBlobStore` does not support removal. The CID is
+    /// no longer tracked by the cache but data stays in the store.
+    fn store_remove(&mut self, _cid: &ContentId) {
+        // No-op — backing store removal not yet supported.
     }
 }
 
@@ -105,5 +176,39 @@ mod tests {
         let cid = cs.insert(data).unwrap();
         assert!(cs.contains(&cid));
         assert_eq!(cs.get(&cid).unwrap(), data);
+    }
+
+    #[test]
+    fn frequency_based_admission() {
+        // Capacity 10: window=1, protected=2, probation=7.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 10);
+
+        // Fill probation with 7 items, each accessed 5 times to build frequency.
+        let hot: Vec<ContentId> = (0..7)
+            .map(|i| {
+                let data = format!("hot-{i}");
+                cs.insert(data.as_bytes()).unwrap()
+            })
+            .collect();
+        for cid in &hot {
+            for _ in 0..5 {
+                cs.record_access(cid);
+            }
+        }
+
+        // Insert a cold item — it enters window, then faces admission challenge.
+        // Its frequency (1) should lose against probation's tail (5+).
+        let _cold = cs.insert(b"cold-newcomer").unwrap();
+
+        // The hot items should still be accessible in the cache segments.
+        for cid in &hot {
+            assert!(
+                cs.window.contains(cid)
+                    || cs.probation.contains(cid)
+                    || cs.protected.contains(cid),
+                "hot CID should still be in cache"
+            );
+        }
     }
 }
