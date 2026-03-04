@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use harmony_compute::{ComputeResult, ComputeRuntime, IORequest, IOResponse, InstructionBudget};
 
@@ -20,6 +20,9 @@ struct WorkflowState {
     /// Cached IO responses from a prior execution (used during recovery replay).
     /// Populated from WorkflowHistory.events on recover(). Consumed during replay.
     replay_cache: HashMap<[u8; 32], Option<Vec<u8>>>,
+    /// Cached output for completed workflows. Allows re-emitting WorkflowComplete
+    /// when a duplicate submit arrives after the workflow has already finished.
+    completed_output: Option<Vec<u8>>,
 }
 
 /// Sans-I/O workflow engine that orchestrates WASM workflow execution.
@@ -35,6 +38,9 @@ pub struct WorkflowEngine {
     budget: InstructionBudget,
     workflows: HashMap<WorkflowId, WorkflowState>,
     active: Option<WorkflowId>,
+    /// FIFO queue of pending workflow IDs for deterministic scheduling.
+    /// Using a VecDeque instead of relying on HashMap iteration order.
+    pending_queue: VecDeque<WorkflowId>,
 }
 
 impl WorkflowEngine {
@@ -46,6 +52,7 @@ impl WorkflowEngine {
             budget,
             workflows: HashMap::new(),
             active: None,
+            pending_queue: VecDeque::new(),
         }
     }
 
@@ -77,12 +84,22 @@ impl WorkflowEngine {
             }
         }
 
-        // Otherwise, find the next pending workflow and start it.
-        let next = self
-            .workflows
-            .iter()
-            .find(|(_, state)| state.status == WorkflowStatus::Pending)
-            .map(|(id, _)| *id);
+        // Otherwise, pop the next pending workflow from the FIFO queue.
+        let next = loop {
+            match self.pending_queue.pop_front() {
+                Some(id) => {
+                    // Verify it's still pending (could have been removed or failed).
+                    if self
+                        .workflows
+                        .get(&id)
+                        .is_some_and(|s| s.status == WorkflowStatus::Pending)
+                    {
+                        break Some(id);
+                    }
+                }
+                None => break None,
+            }
+        };
 
         if let Some(wf_id) = next {
             let state = self.workflows.get_mut(&wf_id).expect("workflow must exist");
@@ -138,6 +155,14 @@ impl WorkflowEngine {
     ) -> Vec<WorkflowAction> {
         let wf_id = history.workflow_id;
 
+        // Don't overwrite an existing workflow (could be currently executing).
+        if self.workflows.contains_key(&wf_id) {
+            return vec![WorkflowAction::WorkflowFailed {
+                workflow_id: wf_id,
+                error: "workflow already exists, cannot recover over it".into(),
+            }];
+        }
+
         // Validate module bytes match the recorded hash.
         let actual_hash = harmony_crypto::hash::blake3_hash(&module_bytes);
         if actual_hash != history.module_hash {
@@ -169,9 +194,11 @@ impl WorkflowEngine {
             module_bytes: Some(module_bytes),
             saved_session: None,
             replay_cache,
+            completed_output: None,
         };
 
         self.workflows.insert(wf_id, state);
+        self.pending_queue.push_back(wf_id);
         Vec::new() // Will execute on next tick()
     }
 
@@ -186,9 +213,29 @@ impl WorkflowEngine {
         let module_hash = harmony_crypto::hash::blake3_hash(&module);
         let wf_id = WorkflowId::new(&module_hash, &input);
 
-        // Dedup: if this workflow already exists, skip.
-        if self.workflows.contains_key(&wf_id) {
-            return Vec::new();
+        // Dedup: if this workflow already exists, re-emit result for completed
+        // workflows so callers always get a reply.
+        if let Some(existing) = self.workflows.get(&wf_id) {
+            return match &existing.status {
+                WorkflowStatus::Complete => {
+                    if let Some(output) = &existing.completed_output {
+                        vec![WorkflowAction::WorkflowComplete {
+                            workflow_id: wf_id,
+                            output: output.clone(),
+                        }]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                WorkflowStatus::Failed => {
+                    vec![WorkflowAction::WorkflowFailed {
+                        workflow_id: wf_id,
+                        error: "workflow previously failed".into(),
+                    }]
+                }
+                // Still running — caller will get a reply when it completes.
+                _ => Vec::new(),
+            };
         }
 
         let state = WorkflowState {
@@ -204,9 +251,11 @@ impl WorkflowEngine {
             module_bytes: Some(module),
             saved_session: None,
             replay_cache: HashMap::new(),
+            completed_output: None,
         };
 
         self.workflows.insert(wf_id, state);
+        self.pending_queue.push_back(wf_id);
         Vec::new()
     }
 
@@ -279,6 +328,7 @@ impl WorkflowEngine {
             ComputeResult::Complete { output } => {
                 if let Some(state) = self.workflows.get_mut(&wf_id) {
                     state.status = WorkflowStatus::Complete;
+                    state.completed_output = Some(output.clone());
                 }
                 self.active = None;
                 vec![
@@ -289,7 +339,11 @@ impl WorkflowEngine {
                     WorkflowAction::PersistHistory { workflow_id: wf_id },
                 ]
             }
-            ComputeResult::Yielded { .. } => {
+            ComputeResult::Yielded { fuel_consumed } => {
+                // Accumulate fuel consumed across yield points.
+                if let Some(state) = self.workflows.get_mut(&wf_id) {
+                    state.history.total_fuel_consumed += fuel_consumed;
+                }
                 // Keep active set; status stays Executing. Resume on next tick.
                 Vec::new()
             }
@@ -480,6 +534,50 @@ mod tests {
         // Dedup: no actions, count still 1.
         assert!(actions.is_empty());
         assert_eq!(engine.workflow_count(), 1);
+    }
+
+    #[test]
+    fn duplicate_submit_after_completion_re_emits_result() {
+        let mut engine = make_engine();
+        let module = ADD_WAT.as_bytes().to_vec();
+        let input = add_input(3, 7);
+
+        // Submit and run to completion.
+        engine.handle(WorkflowEvent::Submit {
+            module: module.clone(),
+            input: input.clone(),
+            hint: ComputeHint::PreferLocal,
+        });
+        for _ in 0..10 {
+            let actions = engine.tick();
+            if actions
+                .iter()
+                .any(|a| matches!(a, WorkflowAction::WorkflowComplete { .. }))
+            {
+                break;
+            }
+        }
+
+        // Submit the same module+input again AFTER completion.
+        let actions = engine.handle(WorkflowEvent::Submit {
+            module,
+            input,
+            hint: ComputeHint::PreferLocal,
+        });
+
+        // Should re-emit WorkflowComplete with the cached output.
+        let complete = actions
+            .iter()
+            .find(|a| matches!(a, WorkflowAction::WorkflowComplete { .. }))
+            .expect("should re-emit WorkflowComplete for completed workflow");
+
+        match complete {
+            WorkflowAction::WorkflowComplete { output, .. } => {
+                let result = i32::from_le_bytes(output[..4].try_into().unwrap());
+                assert_eq!(result, 10, "should return same result as original");
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -880,5 +978,40 @@ mod tests {
             "should fail with hash mismatch, got: {actions:?}"
         );
         assert_eq!(engine.workflow_count(), 0, "should not create workflow on mismatch");
+    }
+
+    #[test]
+    fn recover_rejects_if_workflow_already_exists() {
+        let mut engine = make_engine_high_fuel();
+        let module = FETCH_WAT.as_bytes().to_vec();
+        let cid = [0x66; 32];
+
+        // Submit and start executing the workflow.
+        engine.handle(WorkflowEvent::Submit {
+            module: module.clone(),
+            input: cid.to_vec(),
+            hint: ComputeHint::PreferLocal,
+        });
+        engine.tick(); // Starts executing
+
+        // Now try to recover the same workflow — should fail.
+        let module_hash = harmony_crypto::hash::blake3_hash(&module);
+        let wf_id = WorkflowId::new(&module_hash, &cid);
+        let history = WorkflowHistory {
+            workflow_id: wf_id,
+            module_hash,
+            input: cid.to_vec(),
+            events: vec![],
+            total_fuel_consumed: 0,
+        };
+
+        let actions = engine.recover(history, module);
+
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], WorkflowAction::WorkflowFailed { error, .. } if error.contains("already exists")),
+            "should reject recover over existing workflow, got: {actions:?}"
+        );
+        assert_eq!(engine.workflow_count(), 1, "original workflow should be untouched");
     }
 }
