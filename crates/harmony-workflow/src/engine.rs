@@ -322,8 +322,11 @@ impl WorkflowEngine {
         }
 
         // Resume the first workflow immediately.
+        // Set status to Executing BEFORE resume so find_all_waiting_for_io
+        // won't rediscover it if resume_with_io returns Yielded.
         let first = waiting[0];
         let state = self.workflows.get_mut(&first).expect("workflow must exist");
+        state.status = WorkflowStatus::Executing;
         state.history.events.push(HistoryEvent::IoResolved {
             cid,
             data: Some(data.clone()),
@@ -363,8 +366,11 @@ impl WorkflowEngine {
         }
 
         // Resume the first workflow immediately.
+        // Set status to Executing BEFORE resume so find_all_waiting_for_io
+        // won't rediscover it if resume_with_io returns Yielded.
         let first = waiting[0];
         let state = self.workflows.get_mut(&first).expect("workflow must exist");
+        state.status = WorkflowStatus::Executing;
         state
             .history
             .events
@@ -467,17 +473,20 @@ impl WorkflowEngine {
                         .expect("NeedsIO implies session");
                     state.saved_session = Some(saved_session);
                     state.status = WorkflowStatus::WaitingForIo { cid };
+                    self.active = None;
+
+                    return vec![
+                        WorkflowAction::FetchContent {
+                            workflow_id: wf_id,
+                            cid,
+                        },
+                        WorkflowAction::PersistHistory { workflow_id: wf_id },
+                    ];
                 }
 
+                // Workflow not found — still clear active, but emit nothing.
                 self.active = None;
-
-                vec![
-                    WorkflowAction::FetchContent {
-                        workflow_id: wf_id,
-                        cid,
-                    },
-                    WorkflowAction::PersistHistory { workflow_id: wf_id },
-                ]
+                Vec::new()
             }
         }
     }
