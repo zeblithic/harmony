@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use crate::cid::ContentId;
 
@@ -26,6 +27,16 @@ struct LruEntry {
     prev: Option<usize>,
     next: Option<usize>,
     occupied: bool,
+}
+
+impl fmt::Debug for Lru {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Lru")
+            .field("len", &self.len)
+            .field("capacity", &self.capacity)
+            .field("free_slots", &self.free.len())
+            .finish()
+    }
 }
 
 impl Lru {
@@ -220,6 +231,17 @@ mod tests {
 
     fn make_cid(i: usize) -> ContentId {
         ContentId::for_blob(format!("lru-test-{i}").as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn debug_impl_shows_summary() {
+        let mut lru = Lru::new(4);
+        lru.insert(make_cid(0));
+        lru.insert(make_cid(1));
+        let dbg = format!("{lru:?}");
+        assert!(dbg.contains("len: 2"));
+        assert!(dbg.contains("capacity: 4"));
+        assert!(dbg.contains("free_slots: 0"));
     }
 
     #[test]
