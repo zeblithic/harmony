@@ -282,6 +282,23 @@ impl<B: BlobStore> NodeRuntime<B> {
         self.workflow.workflow_count()
     }
 
+    /// Calculate the effective compute fuel budget based on data-plane queue depth.
+    ///
+    /// At zero depth, returns the full base budget. As combined queue depth
+    /// approaches `high_water`, fuel shrinks linearly toward `floor_fraction * base`.
+    /// Above high_water, fuel stays at the floor.
+    pub fn effective_fuel(&self) -> u64 {
+        let base = self.workflow.budget().fuel;
+        let ac = &self.schedule.adaptive_compute;
+        if ac.high_water == 0 {
+            return (base as f64 * ac.floor_fraction).round() as u64;
+        }
+        let combined = self.router_queue.len() + self.storage_queue.len();
+        let load_factor = (combined as f64 / ac.high_water as f64).min(1.0);
+        let scale = 1.0 - load_factor * (1.0 - ac.floor_fraction);
+        (base as f64 * scale).round() as u64
+    }
+
     /// Push an event into the runtime's internal priority queues.
     pub fn push_event(&mut self, event: RuntimeEvent) {
         match event {
@@ -1246,5 +1263,43 @@ mod tests {
             assert_eq!(result_code, 5);
             assert_eq!(&payload[5..], &content);
         }
+    }
+
+    // ── Adaptive compute fuel tests ─────────────────────────────────
+
+    #[test]
+    fn effective_fuel_scales_with_queue_depth() {
+        use harmony_content::blob::MemoryBlobStore;
+
+        let mut config = NodeConfig::default();
+        config.compute_budget = InstructionBudget { fuel: 1000 };
+        config.schedule.adaptive_compute.high_water = 10;
+        config.schedule.adaptive_compute.floor_fraction = 0.1;
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Empty queues → full budget
+        assert_eq!(rt.effective_fuel(), 1000);
+
+        // Push 5 router events (half of high_water=10)
+        for i in 0..5 {
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+        }
+        // load_factor = 5/10 = 0.5
+        // effective = 1000 * (1.0 - 0.5 * 0.9) = 1000 * 0.55 = 550
+        assert_eq!(rt.effective_fuel(), 550);
+
+        // Push 5 more (at high_water)
+        for i in 5..10 {
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+        }
+        // load_factor = 10/10 = 1.0 → floor
+        // effective = 1000 * 0.1 = 100
+        assert_eq!(rt.effective_fuel(), 100);
+
+        // Push beyond high_water — stays at floor
+        for i in 10..20 {
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+        }
+        assert_eq!(rt.effective_fuel(), 100);
     }
 }

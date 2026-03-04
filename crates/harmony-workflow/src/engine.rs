@@ -66,6 +66,11 @@ impl WorkflowEngine {
         }
     }
 
+    /// Read-only access to the per-slice instruction budget.
+    pub fn budget(&self) -> InstructionBudget {
+        self.budget
+    }
+
     /// Dispatch an inbound event and return any resulting actions.
     pub fn handle(&mut self, event: WorkflowEvent) -> Vec<WorkflowAction> {
         match event {
