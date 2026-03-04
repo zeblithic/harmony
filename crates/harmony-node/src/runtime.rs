@@ -393,6 +393,9 @@ impl<B: BlobStore> NodeRuntime<B> {
                 ComputeTierAction::FetchModule { cid } => {
                     out.push(RuntimeAction::FetchContent { cid });
                 }
+                ComputeTierAction::FetchContent { cid, .. } => {
+                    out.push(RuntimeAction::FetchContent { cid });
+                }
             }
         }
     }

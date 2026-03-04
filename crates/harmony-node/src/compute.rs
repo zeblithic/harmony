@@ -29,6 +29,10 @@ pub enum ComputeTierEvent {
     ModuleFetched { cid: [u8; 32], module: Vec<u8> },
     /// A previously requested module fetch has failed.
     ModuleFetchFailed { cid: [u8; 32] },
+    /// Content data has been fetched for a suspended compute task.
+    ContentFetched { cid: [u8; 32], data: Vec<u8> },
+    /// Content fetch failed for a suspended compute task.
+    ContentFetchFailed { cid: [u8; 32] },
 }
 
 // ── Actions (outbound) ────────────────────────────────────────────────
@@ -44,6 +48,8 @@ pub enum ComputeTierAction {
     SendReply { query_id: u64, payload: Vec<u8> },
     /// Request the storage layer to fetch a WASM module by CID.
     FetchModule { cid: [u8; 32] },
+    /// Request the storage/network layer to fetch content by CID for a suspended task.
+    FetchContent { query_id: u64, cid: [u8; 32] },
 }
 
 // ── Internal types (private) ──────────────────────────────────────────
@@ -64,6 +70,9 @@ enum ComputeTask {
         cid: [u8; 32],
         input: Vec<u8>,
     },
+    /// Execution suspended waiting for content to be fetched.
+    /// The execution state lives in WasmiRuntime.session (HostTrap pending).
+    WaitingForContent { query_id: u64, cid: [u8; 32] },
 }
 
 /// Tracks the currently executing computation.
@@ -176,6 +185,49 @@ impl ComputeTier {
                 }
                 actions
             }
+            ComputeTierEvent::ContentFetched { cid, data } => {
+                // Find the WaitingForContent task matching this CID.
+                let pos = self.queue.iter().position(|t| {
+                    matches!(t, ComputeTask::WaitingForContent { cid: c, .. } if *c == cid)
+                });
+                let Some(pos) = pos else {
+                    return Vec::new(); // No matching task — drop silently.
+                };
+                let Some(ComputeTask::WaitingForContent { query_id, .. }) =
+                    self.queue.remove(pos)
+                else {
+                    return Vec::new();
+                };
+
+                // Resume the runtime with the fetched content.
+                self.active = Some(ActiveExecution { query_id });
+                let result = self.runtime.resume_with_io(
+                    harmony_compute::IOResponse::ContentReady { data },
+                    self.budget,
+                );
+                self.handle_compute_result(result)
+            }
+            ComputeTierEvent::ContentFetchFailed { cid } => {
+                let pos = self.queue.iter().position(|t| {
+                    matches!(t, ComputeTask::WaitingForContent { cid: c, .. } if *c == cid)
+                });
+                let Some(pos) = pos else {
+                    return Vec::new();
+                };
+                let Some(ComputeTask::WaitingForContent { query_id, .. }) =
+                    self.queue.remove(pos)
+                else {
+                    return Vec::new();
+                };
+
+                // Resume with ContentNotFound — the module will see -1.
+                self.active = Some(ActiveExecution { query_id });
+                let result = self.runtime.resume_with_io(
+                    harmony_compute::IOResponse::ContentNotFound,
+                    self.budget,
+                );
+                self.handle_compute_result(result)
+            }
         }
     }
 
@@ -221,7 +273,7 @@ impl ComputeTier {
     /// - `Complete` -> `SendReply` with `[0x00, output...]` payload
     /// - `Yielded` -> no action (auto-resume on next tick)
     /// - `Failed` -> `SendReply` with `[0x01, error_utf8...]` payload
-    /// - `NeedsIO` -> `SendReply` with `[0x01, error_utf8...]` payload (not yet supported)
+    /// - `NeedsIO` -> `WaitingForContent` in queue + `FetchContent` action
     ///
     /// All wire format encoding (`[0x00]` success / `[0x01]` error tags) is
     /// consolidated here — callers treat payloads as opaque bytes.
@@ -254,11 +306,17 @@ impl ComputeTier {
                 payload.extend_from_slice(format!("{error}").as_bytes());
                 vec![ComputeTierAction::SendReply { query_id, payload }]
             }
-            ComputeResult::NeedsIO { .. } => {
-                self.active = None;
-                let mut payload = vec![0x01];
-                payload.extend_from_slice(b"NeedsIO not yet supported");
-                vec![ComputeTierAction::SendReply { query_id, payload }]
+            ComputeResult::NeedsIO { request } => {
+                match request {
+                    harmony_compute::IORequest::FetchContent { cid } => {
+                        self.queue.push_back(ComputeTask::WaitingForContent {
+                            query_id,
+                            cid,
+                        });
+                        self.active = None;
+                        vec![ComputeTierAction::FetchContent { query_id, cid }]
+                    }
+                }
             }
         }
     }
@@ -662,5 +720,150 @@ pub(crate) mod tests {
         assert!(matches!(&actions[0], ComputeTierAction::SendReply { query_id: 70, payload } if payload[0] == 0x01));
         assert!(matches!(&actions[1], ComputeTierAction::SendReply { query_id: 71, payload } if payload[0] == 0x01));
         assert_eq!(tier.queue_len(), 0);
+    }
+
+    // ── Content I/O tests ───────────────────────────────────────────────
+
+    /// WAT module that calls harmony.fetch_content.
+    /// Input: [cid: 32 bytes]
+    /// Output: [result_code: i32 LE] [fetched_data if result > 0]
+    pub(crate) const FETCH_WAT: &str = r#"
+    (module
+      (import "harmony" "fetch_content" (func $fetch (param i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+        (local $result i32)
+        (local $out_ptr i32)
+        (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+        (local.set $result
+          (call $fetch
+            (local.get $input_ptr)
+            (i32.add (local.get $out_ptr) (i32.const 4))
+            (i32.const 1024)))
+        (i32.store (local.get $out_ptr) (local.get $result))
+        (if (result i32) (i32.gt_s (local.get $result) (i32.const 0))
+          (then (i32.add (i32.const 4) (local.get $result)))
+          (else (i32.const 4)))))
+"#;
+
+    #[test]
+    fn needs_io_emits_fetch_content() {
+        let mut tier = make_tier();
+        let cid = [0xAB; 32];
+
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 100,
+            module: FETCH_WAT.as_bytes().to_vec(),
+            input: cid.to_vec(),
+        });
+
+        let actions = tier.tick();
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], ComputeTierAction::FetchContent { query_id: 100, cid: c } if *c == cid),
+            "expected FetchContent for the CID, got: {actions:?}"
+        );
+
+        assert!(!tier.has_active());
+        assert_eq!(tier.queue_len(), 1); // WaitingForContent in queue
+    }
+
+    #[test]
+    fn content_fetched_resumes_task() {
+        let mut tier = make_tier();
+        let cid = [0xCD; 32];
+        let content = b"fetched data";
+
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 101,
+            module: FETCH_WAT.as_bytes().to_vec(),
+            input: cid.to_vec(),
+        });
+
+        let actions = tier.tick();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], ComputeTierAction::FetchContent { .. }));
+
+        let actions = tier.handle(ComputeTierEvent::ContentFetched {
+            cid,
+            data: content.to_vec(),
+        });
+
+        assert_eq!(actions.len(), 1);
+        if let ComputeTierAction::SendReply { query_id, payload } = &actions[0] {
+            assert_eq!(*query_id, 101);
+            assert_eq!(payload[0], 0x00, "success tag");
+            let result_code = i32::from_le_bytes(payload[1..5].try_into().unwrap());
+            assert_eq!(result_code, content.len() as i32);
+            assert_eq!(&payload[5..], content);
+        } else {
+            panic!("expected SendReply, got: {actions:?}");
+        }
+    }
+
+    #[test]
+    fn content_fetch_failed_returns_error_to_module() {
+        let mut tier = make_tier();
+        let cid = [0xEF; 32];
+
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 102,
+            module: FETCH_WAT.as_bytes().to_vec(),
+            input: cid.to_vec(),
+        });
+
+        tier.tick();
+
+        let actions = tier.handle(ComputeTierEvent::ContentFetchFailed { cid });
+
+        assert_eq!(actions.len(), 1);
+        if let ComputeTierAction::SendReply { query_id, payload } = &actions[0] {
+            assert_eq!(*query_id, 102);
+            assert_eq!(payload[0], 0x00, "success tag — module completed normally");
+            let result_code = i32::from_le_bytes(payload[1..5].try_into().unwrap());
+            assert_eq!(result_code, -1, "not-found result code");
+        } else {
+            panic!("expected SendReply, got: {actions:?}");
+        }
+    }
+
+    #[test]
+    fn waiting_for_content_does_not_block_queue() {
+        let mut tier = make_tier();
+        let cid = [0x11; 32];
+
+        // First: module that calls fetch_content (will block on IO).
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 110,
+            module: FETCH_WAT.as_bytes().to_vec(),
+            input: cid.to_vec(),
+        });
+
+        // Second: simple add module (should not be blocked).
+        let mut input = Vec::new();
+        input.extend_from_slice(&4i32.to_le_bytes());
+        input.extend_from_slice(&6i32.to_le_bytes());
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 111,
+            module: ADD_WAT.as_bytes().to_vec(),
+            input,
+        });
+
+        // First tick: executes fetch module → NeedsIO → WaitingForContent.
+        let actions = tier.tick();
+        assert!(matches!(&actions[0], ComputeTierAction::FetchContent { .. }));
+        assert!(!tier.has_active());
+
+        // Second tick: should skip WaitingForContent and execute the add module.
+        let actions = tier.tick();
+        assert_eq!(actions.len(), 1);
+        if let ComputeTierAction::SendReply { query_id, payload } = &actions[0] {
+            assert_eq!(*query_id, 111);
+            assert_eq!(payload[0], 0x00);
+            let sum = i32::from_le_bytes(payload[1..5].try_into().unwrap());
+            assert_eq!(sum, 10);
+        } else {
+            panic!("expected add result, got: {actions:?}");
+        }
     }
 }
