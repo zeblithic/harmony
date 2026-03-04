@@ -195,7 +195,7 @@ impl WorkflowEngine {
 
         let saved = self.budget;
         self.budget = budget;
-        // SAFETY: guard restores self.budget on drop (normal return or panic).
+        // Guard restores self.budget on drop (normal return or panic).
         let guard = BudgetGuard { engine: self, saved };
         let result = guard.engine.tick();
         // Explicit drop triggers restore before we return.

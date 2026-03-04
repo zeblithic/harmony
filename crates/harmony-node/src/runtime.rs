@@ -423,7 +423,12 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// When limits are `None` (the default), all queued events are drained.
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
         let mut actions = Vec::new();
-        let effective_fuel = self.effective_fuel(); // capture before draining queues
+        // Note: fuel is captured once before any tier executes. When Compute is
+        // promoted via starvation, it still runs with this pre-tick fuel value —
+        // promotion reorders execution but does not bypass adaptive scaling.
+        // Operators tuning both starvation_threshold and adaptive_compute should
+        // be aware that promotion does not grant additional fuel budget.
+        let effective_fuel = self.effective_fuel();
         let threshold = self.schedule.starvation_threshold;
 
         // Determine tier order: promote starved tiers to front.
