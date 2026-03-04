@@ -1,0 +1,13 @@
+[package]
+name = "harmony-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Durable execution orchestration with event-sourced history for the Harmony decentralized stack"
+
+[dependencies]
+harmony-compute.workspace = true
+harmony-crypto.workspace = true
+thiserror.workspace = true

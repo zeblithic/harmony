@@ -1,7 +1,7 @@
 ---
 description: Check the review status of a PR and determine what action is needed next
 argument-hint: [pr-number]
-allowed-tools: Bash(gh pr view:*), Bash(gh pr comments:*), Bash(gh api:*), Bash(git log:*), Bash(git branch:*)
+allowed-tools: Bash(gh pr view:*), Bash(gh pr comments:*), Bash(gh api:*), Bash(git log:*), Bash(git branch:*), Bash(bash scripts/review-state.sh:*), Bash(cd:*)
 ---
 
 ## Context
@@ -20,117 +20,38 @@ If no PR number is provided, infer from the current branch's associated PR.
 
 ## Review Monitoring Workflow
 
-### 1. Identify the PR
+### 1. Run the review-state script
 
-- If `$ARGUMENTS` provides a PR number, use it
-- Otherwise: `gh pr view --json number,title,url,state,headRefName`
-- If no open PR found, report and stop
-
-### 2. Gather review signals
-
-Fetch ALL of these in parallel:
+The script deterministically gathers all review signals and derives the state machine state. It handles pagination and checks both API endpoints.
 
 ```bash
-# Bugbot reviews (cursor[bot] posts GitHub PR reviews)
-gh api repos/{owner}/{repo}/pulls/{number}/reviews \
-  --jq '.[] | select(.user.login == "cursor[bot]") | {user: .user.login, state: .state, submitted: .submitted_at}'
-
-# All inline review comments with timestamps
-gh api repos/{owner}/{repo}/pulls/{number}/comments \
-  --jq '.[] | {user: .user.login, created: .created_at, id: .id}'
-
-# All PR-level comments — Greptile posts here (NOT as a GitHub review)
-gh pr view {number} --comments --json comments \
-  --jq '.comments[] | {author: .author.login, body: .body, created: .createdAt}'
-
-# Latest commit SHA and timestamp
-gh pr view {number} --json commits \
-  --jq '.commits[-1] | {sha: .oid, date: .committedDate}'
-
-# Reactions on trigger comments (thumbs-up = reviewer COMPLETED, NOT "all clear")
-gh api repos/{owner}/{repo}/issues/{number}/comments \
-  --jq '.[] | select(.body == "bugbot run" or .body == "@greptile") | {id: .id, body: .body, created: .created_at, reactions: .reactions}'
+cd /Users/zeblith/work/zeblithic/harmony && bash scripts/review-state.sh [PR_NUMBER]
 ```
 
-**How each reviewer works:**
-- **Bugbot (`cursor[bot]`)**: Posts GitHub PR **reviews** (shows in reviews API). Thumbs-up on "bugbot run" trigger means it finished — NOT that it found no issues.
-- **Greptile (`greptile-apps`)**: Posts PR **comments** (NOT reviews — won't appear in reviews API). Thumbs-up on "@greptile" trigger means it finished — NOT that it found no issues.
+This script outputs: trigger timestamps, reaction counts, latest responses from each bot, new comment counts, derived state, and recommended action. It also prints any new findings.
 
-**CRITICAL: Thumbs-up = "completed review", not "approved". You MUST read the actual review content to determine whether there are actionable issues.**
+### 2. Parse the script output
 
-### 3. Determine review state
+The script output contains ALL findings with full bodies from both reviewers. Parse the output to:
+- Extract the `--- STATE ---` section for the status table
+- Extract all findings from the `--- BUGBOT ---` and `--- GREPTILE ---` sections for the issue summary
+- No additional API calls needed — the script handles pagination and both endpoints (inline PR comments for Bugbot, issue comments for Greptile).
 
-Apply these rules in order to determine the current state:
+**CRITICAL: Thumbs-up on trigger comments = "completed review", NOT "approved". The script extracts full finding bodies — read them to determine whether there are actionable issues.**
 
-#### State: REVIEWS_PENDING
+### 3. Report
 
-**Condition:** "bugbot run" or "@greptile" comment exists that is newer than the latest `cursor[bot]` review or `greptile-apps` comment, AND either:
-- The trigger comment has an "eyes" reaction (reviewer acknowledged, working on it)
-- Less than 3 minutes have passed since the trigger comment (still starting up)
-
-**Action:** Report "Reviews in progress. Do NOT push or run `bd` commands." and STOP.
-
-#### State: BUGBOT_STUCK
-
-**Condition:** "bugbot run" comment exists, more than 3 minutes old, no "eyes" reaction, no `cursor[bot]` response after it.
-
-**Action:** Report "Bugbot may be stuck. Recommend re-triggering with `gh pr comment {number} --body 'bugbot run'`"
-
-#### State: BUGBOT_CANCELED
-
-**Condition:** Commits exist AFTER the latest `cursor[bot]` review. The push canceled the Bugbot run.
-
-**Action:** Report "Bugbot results are stale (commits pushed after last review). Need to re-trigger: `gh pr comment {number} --body 'bugbot run'`"
-
-#### When both reviewers have responded: READ the actual content
-
-**Before classifying as ALL_CLEAR or WITH_FEEDBACK, you MUST read the review content:**
-
-```bash
-# Bugbot's latest review body (may have inline comments too)
-gh api repos/{owner}/{repo}/pulls/{number}/reviews \
-  --jq '[.[] | select(.user.login == "cursor[bot]")] | last | .body'
-
-# Bugbot's inline review comments
-gh api repos/{owner}/{repo}/pulls/{number}/comments \
-  --jq '.[] | select(.user.login == "cursor[bot]") | {path: .path, body: .body[:300]}'
-
-# Greptile's latest comment body
-gh pr view {number} --comments --json comments \
-  --jq '[.comments[] | select(.author.login == "greptile-apps")] | last | .body'
-```
-
-**Scan both for:** suggestions, code changes, severity labels, "could"/"should"/"consider" language, ```suggestion blocks. Any actionable feedback = WITH_FEEDBACK.
-
-#### State: REVIEWS_COMPLETE_WITH_FEEDBACK
-
-**Condition:** Both reviewers have responded newer than the latest push, AND the actual review content contains actionable suggestions, issues, or code changes.
-
-**Action:** Summarize the specific issues from BOTH reviewers. Print: "Reviews complete with feedback. Fix issues locally, then push + re-trigger when ready. Safe to use `bd` commands during fix work."
-
-#### State: REVIEWS_COMPLETE_ALL_CLEAR
-
-**Condition:** Both reviewers have responded newer than the latest push, AND you have read the actual review content and confirmed it contains NO actionable suggestions or issues — only praise or acknowledgment.
-
-**Action:** Report: "All reviews passed. Ready for `/finishtask` to merge."
-
-#### State: PARTIAL_REVIEWS
-
-**Condition:** Only one reviewer has responded so far.
-
-**Action:** Report which reviewer is done and which is still pending. Print: "Waiting for remaining reviewer(s). Do NOT push."
-
-### 4. Report
-
-Print a clean status table:
+Print a clean status table based on the script output:
 
 ```
 PR:        #<number> — <title>
 Bugbot:    <pending|running|complete (N issues)|stale>
 Greptile:  <pending|running|complete (N issues)|stale>
-State:     <REVIEWS_PENDING|BUGBOT_STUCK|REVIEWS_COMPLETE_WITH_FEEDBACK|REVIEWS_COMPLETE_ALL_CLEAR|PARTIAL_REVIEWS>
-Action:    <what to do next>
+State:     <state from script>
+Action:    <action from script>
 ```
+
+If REVIEWS_COMPLETE_WITH_FEEDBACK, summarize the specific issues from BOTH reviewers.
 
 If the state is REVIEWS_PENDING or PARTIAL_REVIEWS, suggest: "While waiting for reviews, this is a good time to `/compact` if context is getting long."
 

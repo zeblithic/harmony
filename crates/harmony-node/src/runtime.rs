@@ -4,7 +4,7 @@
 // only by tests until the async event loop is wired.
 #![allow(dead_code)]
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use harmony_compute::InstructionBudget;
@@ -14,10 +14,9 @@ use harmony_content::storage_tier::{
     StorageBudget, StorageMetrics, StorageTier, StorageTierAction, StorageTierEvent,
 };
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
+use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
 use harmony_zenoh::namespace::content as content_ns;
 use harmony_zenoh::queryable::{QueryableAction, QueryableEvent, QueryableId, QueryableRouter};
-
-use crate::compute::{ComputeTier, ComputeTierAction, ComputeTierEvent};
 
 /// Configuration for a Harmony node runtime.
 #[derive(Debug, Clone)]
@@ -89,8 +88,11 @@ pub enum RuntimeAction {
     SendReply { query_id: u64, payload: Vec<u8> },
     /// Tier 2: Publish a message (e.g., content availability announcement).
     Publish { key_expr: String, payload: Vec<u8> },
-    /// Tier 3: Fetch a WASM module by CID from Tier 2 / network.
+    /// Tier 2/3: Fetch content by CID from storage / network.
     FetchContent { cid: [u8; 32] },
+    /// Tier 3: Fetch a WASM module by CID. The caller must route the response
+    /// to `RuntimeEvent::ModuleFetchResponse` (not `ContentFetchResponse`).
+    FetchModule { cid: [u8; 32] },
     /// Setup: Declare a queryable key expression.
     DeclareQueryable { key_expr: String },
     /// Setup: Subscribe to a key expression.
@@ -111,8 +113,8 @@ pub struct NodeRuntime<B: BlobStore> {
     queryable_router: QueryableRouter,
     // Tier 2: Content storage
     storage: StorageTier<B>,
-    // Tier 3: Compute
-    compute: ComputeTier,
+    // Tier 3: Compute (workflow engine)
+    workflow: WorkflowEngine,
     // Internal priority queues
     router_queue: VecDeque<NodeEvent>,
     storage_queue: VecDeque<StorageTierEvent>,
@@ -120,8 +122,16 @@ pub struct NodeRuntime<B: BlobStore> {
     storage_queryable_ids: HashSet<QueryableId>,
     // Queryable IDs belonging to the compute tier
     compute_queryable_ids: HashSet<QueryableId>,
-    // Pending compute actions buffered between push_event and tick
-    pending_compute_actions: Vec<ComputeTierAction>,
+    // Pending workflow actions buffered between push_event and tick
+    pending_workflow_actions: Vec<WorkflowAction>,
+    // Direct runtime actions buffered from push_event (error replies, module fetches, etc.)
+    pending_direct_actions: Vec<RuntimeAction>,
+    // Maps WorkflowId -> query_ids for reply routing (multiple callers may
+    // submit the same module+input; the engine deduplicates but all callers
+    // need a reply).
+    workflow_to_query: HashMap<WorkflowId, Vec<u64>>,
+    // Maps module CID -> Vec<(query_id, input)> for CID-based requests pending module fetch
+    cid_to_query: HashMap<[u8; 32], Vec<(u64, Vec<u8>)>>,
 }
 
 impl<B: BlobStore> NodeRuntime<B> {
@@ -160,7 +170,7 @@ impl<B: BlobStore> NodeRuntime<B> {
         }
 
         // Tier 3: Compute — register activity queryable
-        let compute = ComputeTier::new(
+        let workflow = WorkflowEngine::new(
             Box::new(harmony_compute::WasmiRuntime::new()),
             config.compute_budget,
         );
@@ -178,12 +188,15 @@ impl<B: BlobStore> NodeRuntime<B> {
             router,
             queryable_router,
             storage,
-            compute,
+            workflow,
             router_queue: VecDeque::new(),
             storage_queue: VecDeque::new(),
             storage_queryable_ids,
             compute_queryable_ids,
-            pending_compute_actions: Vec::new(),
+            pending_workflow_actions: Vec::new(),
+            pending_direct_actions: Vec::new(),
+            workflow_to_query: HashMap::new(),
+            cid_to_query: HashMap::new(),
         };
 
         (rt, actions)
@@ -204,9 +217,9 @@ impl<B: BlobStore> NodeRuntime<B> {
         self.storage_queue.len()
     }
 
-    /// Number of tasks in the Tier 3 (compute) queue.
+    /// Number of workflows tracked by the Tier 3 (compute) engine.
     pub fn compute_queue_len(&self) -> usize {
-        self.compute.queue_len()
+        self.workflow.workflow_count()
     }
 
     /// Push an event into the runtime's internal priority queues.
@@ -241,24 +254,56 @@ impl<B: BlobStore> NodeRuntime<B> {
                 key_expr,
                 payload,
             } => {
-                let compute_actions = self.route_compute_query(query_id, key_expr, payload);
-                self.pending_compute_actions.extend(compute_actions);
+                let workflow_actions = self.route_compute_query(query_id, key_expr, payload);
+                self.pending_workflow_actions.extend(workflow_actions);
             }
             RuntimeEvent::ModuleFetchResponse { cid, result } => {
-                let event = match result {
-                    Ok(module) => ComputeTierEvent::ModuleFetched { cid, module },
-                    Err(_) => ComputeTierEvent::ModuleFetchFailed { cid },
-                };
-                let actions = self.compute.handle(event);
-                self.pending_compute_actions.extend(actions);
+                match result {
+                    Ok(module) => {
+                        // Convert pending CID-based requests to inline Submit now
+                        // that we have the module bytes. SubmitByCid is stubbed in
+                        // the workflow engine, so we go through Submit instead.
+                        // TODO: Remove this manual handling when the engine's
+                        // SubmitByCid/ModuleFetched stubs are implemented.
+                        // See engine.rs WorkflowEvent::SubmitByCid stub comment.
+                        // TODO: blake3_hash is computed once here but also re-computed
+                        // inside handle_submit for each call. For large WASM modules
+                        // with many pending queries, consider passing pre-computed hash.
+                        if let Some(pending) = self.cid_to_query.remove(&cid) {
+                            let module_hash = harmony_crypto::hash::blake3_hash(&module);
+                            for (query_id, input) in pending {
+                                let wf_id = WorkflowId::new(&module_hash, &input);
+                                self.workflow_to_query.entry(wf_id).or_default().push(query_id);
+                                let actions = self.workflow.handle(WorkflowEvent::Submit {
+                                    module: module.clone(),
+                                    input,
+                                    hint: ComputeHint::PreferLocal,
+                                });
+                                self.pending_workflow_actions.extend(actions);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Fail all pending CID-based requests for this module.
+                        if let Some(pending) = self.cid_to_query.remove(&cid) {
+                            for (query_id, _input) in pending {
+                                let error_msg = format!("module not found: {}", hex::encode(cid));
+                                let mut payload = vec![0x01];
+                                payload.extend_from_slice(error_msg.as_bytes());
+                                self.pending_direct_actions
+                                    .push(RuntimeAction::SendReply { query_id, payload });
+                            }
+                        }
+                    }
+                }
             }
             RuntimeEvent::ContentFetchResponse { cid, result } => {
                 let event = match result {
-                    Ok(data) => ComputeTierEvent::ContentFetched { cid, data },
-                    Err(_) => ComputeTierEvent::ContentFetchFailed { cid },
+                    Ok(data) => WorkflowEvent::ContentFetched { cid, data },
+                    Err(_) => WorkflowEvent::ContentFetchFailed { cid },
                 };
-                let actions = self.compute.handle(event);
-                self.pending_compute_actions.extend(actions);
+                let actions = self.workflow.handle(event);
+                self.pending_workflow_actions.extend(actions);
             }
         }
     }
@@ -267,7 +312,7 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// 1. Drain ALL Tier 1 (router) events — router is never starved.
     /// 2. Drain ALL Tier 2 (storage) events — storage actions are I/O-bound
     ///    and handled externally; building them here is cheap.
-    /// 3. Dispatch pending compute actions, then run ONE Tier 3 compute slice.
+    /// 3. Dispatch pending workflow actions, then run ONE Tier 3 compute slice.
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
         let mut actions = Vec::new();
 
@@ -286,11 +331,14 @@ impl<B: BlobStore> NodeRuntime<B> {
             self.dispatch_storage_actions(storage_actions, &mut actions);
         }
 
-        // Tier 3: dispatch any pending compute actions, then one compute slice (lowest priority)
-        let pending = std::mem::take(&mut self.pending_compute_actions);
-        self.dispatch_compute_actions(pending, &mut actions);
-        let compute_actions = self.compute.tick();
-        self.dispatch_compute_actions(compute_actions, &mut actions);
+        // Tier 3: emit any direct replies buffered from push_event
+        actions.append(&mut self.pending_direct_actions);
+
+        // Tier 3: dispatch any pending workflow actions, then one compute slice (lowest priority)
+        let pending = std::mem::take(&mut self.pending_workflow_actions);
+        self.dispatch_workflow_actions(pending, &mut actions);
+        let workflow_actions = self.workflow.tick();
+        self.dispatch_workflow_actions(workflow_actions, &mut actions);
 
         actions
     }
@@ -336,27 +384,123 @@ impl<B: BlobStore> NodeRuntime<B> {
         }
     }
 
+    /// Route a compute query by parsing its payload and submitting to the workflow engine.
+    ///
+    /// Returns `WorkflowAction`s to be buffered as pending. For CID-based requests,
+    /// also emits `FetchModule` as a direct action (stored in `pending_direct_actions`).
     fn route_compute_query(
         &mut self,
         query_id: u64,
         _key_expr: String,
         payload: Vec<u8>,
-    ) -> Vec<ComputeTierAction> {
-        let event = match self.parse_compute_payload(query_id, payload) {
-            Some(evt) => evt,
+    ) -> Vec<WorkflowAction> {
+        let parsed = match self.parse_compute_payload(payload) {
+            Some(p) => p,
             None => {
                 let mut payload = vec![0x01];
-                    payload.extend_from_slice(b"malformed compute payload");
-                    return vec![ComputeTierAction::SendReply {
-                        query_id,
-                        payload,
-                    }];
+                payload.extend_from_slice(b"malformed compute payload");
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload });
+                return Vec::new();
             }
         };
-        self.compute.handle(event)
+
+        match parsed {
+            ParsedCompute::Inline { module, input } => {
+                // Compute workflow ID and store the query_id mapping.
+                // Multiple callers may submit the same module+input; the engine
+                // deduplicates but we track all query_ids so every caller gets a reply.
+                let module_hash = harmony_crypto::hash::blake3_hash(&module);
+                let wf_id = WorkflowId::new(&module_hash, &input);
+                self.workflow_to_query.entry(wf_id).or_default().push(query_id);
+                self.workflow.handle(WorkflowEvent::Submit {
+                    module,
+                    input,
+                    hint: ComputeHint::PreferLocal,
+                })
+            }
+            ParsedCompute::ByCid { module_cid, input } => {
+                // Store the pending mapping and emit FetchModule.
+                // TODO: When module fetch completes, each pending query is
+                // converted to a Submit. If the engine dedup-returns immediately
+                // (workflow already complete), the reply is sent right away. But
+                // the first Submit's completion action also removes from
+                // workflow_to_query, potentially missing later callers. Consider
+                // accumulating all query_ids before dispatching any actions.
+                let already_pending = self.cid_to_query.contains_key(&module_cid);
+                self.cid_to_query
+                    .entry(module_cid)
+                    .or_default()
+                    .push((query_id, input));
+                if !already_pending {
+                    self.pending_direct_actions
+                        .push(RuntimeAction::FetchModule { cid: module_cid });
+                }
+                Vec::new()
+            }
+        }
     }
 
-    fn parse_compute_payload(&self, query_id: u64, payload: Vec<u8>) -> Option<ComputeTierEvent> {
+    /// Translate workflow actions into runtime actions.
+    ///
+    /// Wire format encoding (`[0x00]` success / `[0x01]` error tags) is handled
+    /// here — the workflow engine emits semantic actions (`WorkflowComplete` with
+    /// raw output) and the node encodes them for the wire.
+    fn dispatch_workflow_actions(
+        &mut self,
+        workflow_actions: Vec<WorkflowAction>,
+        out: &mut Vec<RuntimeAction>,
+    ) {
+        for action in workflow_actions {
+            match action {
+                WorkflowAction::WorkflowComplete {
+                    workflow_id,
+                    output,
+                } => {
+                    if let Some(query_ids) = self.workflow_to_query.remove(&workflow_id) {
+                        let mut payload = vec![0x00];
+                        payload.extend_from_slice(&output);
+                        for query_id in query_ids {
+                            out.push(RuntimeAction::SendReply {
+                                query_id,
+                                payload: payload.clone(),
+                            });
+                        }
+                    }
+                }
+                WorkflowAction::WorkflowFailed { workflow_id, error } => {
+                    if let Some(query_ids) = self.workflow_to_query.remove(&workflow_id) {
+                        let mut payload = vec![0x01];
+                        payload.extend_from_slice(error.as_bytes());
+                        for query_id in query_ids {
+                            out.push(RuntimeAction::SendReply {
+                                query_id,
+                                payload: payload.clone(),
+                            });
+                        }
+                    }
+                }
+                WorkflowAction::FetchContent { cid, .. } => {
+                    out.push(RuntimeAction::FetchContent { cid });
+                }
+                WorkflowAction::FetchModule { cid } => {
+                    out.push(RuntimeAction::FetchModule { cid });
+                }
+                WorkflowAction::PersistHistory { workflow_id: _workflow_id } => {
+                    // TODO: Persist history (e.g., via Zenoh PUT or write-ahead log)
+                    // BEFORE compacting. compact_workflow() clears replay_cache,
+                    // saved_session, and module_bytes — after compaction, crash
+                    // recovery via deterministic replay is impossible.
+                    //
+                    // Compaction is intentionally deferred until persistence is
+                    // implemented. Until then, workflows retain their full
+                    // in-memory state at the cost of higher memory usage.
+                }
+            }
+        }
+    }
+
+    fn parse_compute_payload(&self, payload: Vec<u8>) -> Option<ParsedCompute> {
         if payload.is_empty() {
             return None;
         }
@@ -373,11 +517,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                 }
                 let module = payload[5..5 + module_len].to_vec();
                 let input = payload[5 + module_len..].to_vec();
-                Some(ComputeTierEvent::ExecuteInline {
-                    query_id,
-                    module,
-                    input,
-                })
+                Some(ParsedCompute::Inline { module, input })
             }
             // CID reference: [0x01] [cid: 32 bytes] [input_bytes]
             0x01 => {
@@ -386,33 +526,12 @@ impl<B: BlobStore> NodeRuntime<B> {
                 }
                 let cid: [u8; 32] = payload[1..33].try_into().ok()?;
                 let input = payload[33..].to_vec();
-                Some(ComputeTierEvent::ExecuteByCid {
-                    query_id,
+                Some(ParsedCompute::ByCid {
                     module_cid: cid,
                     input,
                 })
             }
             _ => None,
-        }
-    }
-
-    fn dispatch_compute_actions(
-        &mut self,
-        compute_actions: Vec<ComputeTierAction>,
-        out: &mut Vec<RuntimeAction>,
-    ) {
-        for action in compute_actions {
-            match action {
-                ComputeTierAction::SendReply { query_id, payload } => {
-                    out.push(RuntimeAction::SendReply { query_id, payload });
-                }
-                ComputeTierAction::FetchModule { cid } => {
-                    out.push(RuntimeAction::FetchContent { cid });
-                }
-                ComputeTierAction::FetchContent { cid, .. } => {
-                    out.push(RuntimeAction::FetchContent { cid });
-                }
-            }
         }
     }
 
@@ -438,8 +557,8 @@ impl<B: BlobStore> NodeRuntime<B> {
                         self.storage_queue.push_back(event);
                     }
                 } else if self.compute_queryable_ids.contains(&queryable_id) {
-                    let compute_actions = self.route_compute_query(query_id, key_expr, payload);
-                    self.pending_compute_actions.extend(compute_actions);
+                    let workflow_actions = self.route_compute_query(query_id, key_expr, payload);
+                    self.pending_workflow_actions.extend(workflow_actions);
                 }
             }
         }
@@ -491,6 +610,18 @@ impl<B: BlobStore> NodeRuntime<B> {
     }
 }
 
+/// Parsed compute payload variants (internal).
+enum ParsedCompute {
+    Inline {
+        module: Vec<u8>,
+        input: Vec<u8>,
+    },
+    ByCid {
+        module_cid: [u8; 32],
+        input: Vec<u8>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +669,7 @@ mod tests {
             payload: vec![],
         };
         let _a4 = RuntimeAction::FetchContent { cid: [0u8; 32] };
+        let _a4b = RuntimeAction::FetchModule { cid: [0u8; 32] };
         let _a5 = RuntimeAction::DeclareQueryable {
             key_expr: "harmony/content/a/**".into(),
         };
@@ -920,13 +1052,19 @@ mod tests {
 
         let actions = rt.tick();
         let reply = actions.iter().find_map(|a| match a {
-            RuntimeAction::SendReply { query_id: 200, payload } => Some(payload),
+            RuntimeAction::SendReply {
+                query_id: 200,
+                payload,
+            } => Some(payload),
             _ => None,
         });
         let payload = reply.expect("should emit error reply for oversized module");
         assert_eq!(payload[0], 0x01, "error tag");
         let msg = std::str::from_utf8(&payload[1..]).unwrap();
-        assert!(msg.contains("malformed"), "error message should mention malformed payload");
+        assert!(
+            msg.contains("malformed"),
+            "error message should mention malformed payload"
+        );
     }
 
     #[test]
@@ -952,7 +1090,10 @@ mod tests {
         let fetch = actions
             .iter()
             .find(|a| matches!(a, RuntimeAction::FetchContent { .. }));
-        assert!(fetch.is_some(), "should emit FetchContent, got: {actions:?}");
+        assert!(
+            fetch.is_some(),
+            "should emit FetchContent, got: {actions:?}"
+        );
 
         // Deliver content via ContentFetchResponse.
         let content = b"resolved content";
@@ -966,7 +1107,10 @@ mod tests {
         let reply = actions
             .iter()
             .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 300, .. }));
-        assert!(reply.is_some(), "should emit SendReply for query 300, got: {actions:?}");
+        assert!(
+            reply.is_some(),
+            "should emit SendReply for query 300, got: {actions:?}"
+        );
 
         if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
             assert_eq!(payload[0], 0x00, "success tag");
@@ -997,7 +1141,9 @@ mod tests {
         // Tick 1: execute → NeedsIO → FetchContent
         let actions = rt.tick();
         assert!(
-            actions.iter().any(|a| matches!(a, RuntimeAction::FetchContent { cid: c } if *c == cid)),
+            actions
+                .iter()
+                .any(|a| matches!(a, RuntimeAction::FetchContent { cid: c } if *c == cid)),
             "tick 1 should emit FetchContent"
         );
 

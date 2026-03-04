@@ -1,7 +1,7 @@
 ---
 description: Merge reviewed PR, clean up branches, return to latest main
 argument-hint: [pr-number]
-allowed-tools: Bash(git checkout:*), Bash(git branch:*), Bash(git pull:*), Bash(git push:*), Bash(git log:*), Bash(git status:*), Bash(gh pr merge:*), Bash(gh pr view:*), Bash(gh api:*), Bash(git add:*), Bash(git commit:*), Bash(git diff:*)
+allowed-tools: Bash(git checkout:*), Bash(git branch:*), Bash(git pull:*), Bash(git push:*), Bash(git log:*), Bash(git status:*), Bash(gh pr merge:*), Bash(gh pr view:*), Bash(gh api:*), Bash(git add:*), Bash(git commit:*), Bash(git diff:*), Bash(bash scripts/finish-task.sh:*), Bash(bash scripts/review-state.sh:*), Bash(cd:*)
 ---
 
 ## Context
@@ -22,90 +22,68 @@ If no PR number is provided, infer from the current branch's associated PR.
 
 ## Finish Task Workflow
 
-Complete ALL steps below in order. These steps are sequential — each depends on the previous.
+### Quick path (preferred)
 
-### 1. Identify the PR
-
-- If `$ARGUMENTS` provides a PR number, use it
-- Otherwise, check if the current branch has an open PR: `gh pr view --json number,title,state`
-- Print the PR title and number for confirmation
-
-### 2. Check for uncommitted local changes
-
-- If there are unstaged or uncommitted changes, stage and commit them before proceeding
-- These are changes that need to be part of the PR before merge
-- Use `git add <specific-files>` and commit with a clear message
-
-### 3. Verify review state (the "ready to merge" check)
-
-Fetch the review signals and verify ALL of these conditions:
+If there are no uncommitted changes, use the finish-task script which handles everything atomically:
 
 ```bash
-# Latest commit timestamp
-gh pr view {number} --json commits --jq '.commits[-1] | {sha: .oid, date: .committedDate}'
-
-# Bugbot reviews (cursor[bot] posts GitHub PR reviews)
-gh api repos/{owner}/{repo}/pulls/{number}/reviews \
-  --jq '.[] | select(.user.login == "cursor[bot]") | {user: .user.login, state: .state, submitted: .submitted_at}'
-
-# Greptile responses (greptile-apps posts PR comments, NOT GitHub reviews)
-gh pr view {number} --comments --json comments \
-  --jq '.comments[] | select(.author.login == "greptile-apps") | {author: .author.login, created: .createdAt, bodyPreview: (.body | .[0:80])}'
-
-# Thumbs-up on trigger comments (approval signal for BOTH reviewers)
-gh api repos/{owner}/{repo}/issues/{number}/comments \
-  --jq '.[] | select(.body == "bugbot run" or .body == "@greptile") | {body: .body, created: .created_at, thumbsup: .reactions["+1"]}'
+cd /Users/zeblith/work/zeblithic/harmony && bash scripts/finish-task.sh [PR_NUMBER]
 ```
 
-**How each reviewer signals completion:**
-- **Bugbot (`cursor[bot]`)**: Posts a GitHub PR **review** (shows in reviews API). Approval = thumbs-up on "bugbot run" trigger comment.
-- **Greptile (`greptile-apps`)**: Posts a PR **comment** (NOT a review — won't appear in reviews API). Approval = thumbs-up on "@greptile" trigger comment.
+The script: checks review state → merges (standard merge) → switches to main → pulls → deletes local branch → reports. It refuses to merge unless state is `REVIEWS_COMPLETE_ALL_CLEAR` (use `--force` to override).
 
-**A PR is ready to merge when:**
-1. `cursor[bot]` has posted a review AND `greptile-apps` has posted a comment — both newer than the latest commit
-2. The most recent "bugbot run" and "@greptile" trigger comments have thumbs-up reactions (approval)
-3. There are **no additional commits** after the approval responses
-4. No unresolved HIGH severity issues
+If the script succeeds, print the output and stop. If it fails, fall back to the manual steps below.
 
-**If any condition fails:**
-- If reviews are stale (commits after latest review): warn and suggest pushing + re-triggering reviews
-- If a reviewer hasn't responded: warn and suggest `/monitorreviews`
-- If there are unresolved issues: warn and list them
-- The human can override any of these ("merge it anyway") — but flag it clearly
+### Manual path (when script can't handle it)
 
-### 4. Merge the PR
+Use this when there are uncommitted changes or the script needs to be overridden.
 
-- Use standard merge (not squash, not rebase):
-  ```
-  gh pr merge <number> --merge --delete-branch
-  ```
-- The `--delete-branch` flag handles remote branch cleanup automatically
+#### 1. Identify the PR
 
-### 5. Switch to main and pull
+- If `$ARGUMENTS` provides a PR number, use it
+- Otherwise: `gh pr view --json number,title,state`
 
-- `git checkout main`
-- `git pull origin main`
-- Verify the merge commit is present in the log: `git log --oneline -3`
+#### 2. Handle uncommitted local changes
 
-### 6. Delete local task branch
+- Stage and commit any remaining changes before merging
+- Use `git add <specific-files>` and commit with a clear message
 
-- Delete the local task branch that was just merged:
-  ```
-  git branch -d <branch-name>
-  ```
-- Use `-d` (not `-D`) so git confirms the branch is fully merged first
+#### 3. Verify review state
 
-### 7. Report
+```bash
+cd /Users/zeblith/work/zeblithic/harmony && bash scripts/review-state.sh {number}
+```
 
-Print a clean summary:
+If not `REVIEWS_COMPLETE_ALL_CLEAR`, read the actual findings:
+
+```bash
+# Bugbot inline comments (findings on diff lines) — PAGINATED
+gh api "repos/zeblithic/harmony/pulls/{number}/comments?per_page=100" --paginate \
+  --jq '.[] | select(.user.login == "cursor[bot]") | {path: .path, line: .line, body: .body[:300]}'
+
+# Greptile comments — PAGINATED
+gh api "repos/zeblithic/harmony/issues/{number}/comments?per_page=100" --paginate \
+  --jq '[.[] | select(.user.login == "greptile-apps[bot]")] | last | .body'
+```
+
+The human can override ("merge it anyway") — but flag the state clearly.
+
+#### 4. Merge, switch to main, clean up
+
+```bash
+gh pr merge <number> --merge --delete-branch
+git checkout main && git pull origin main
+git branch -d <branch-name>
+git log --oneline -3
+```
+
+#### 5. Report
 
 ```
 Merged:  PR #<number> — <title>
 Branch:  <branch-name> deleted (local + remote)
 Main:    up to date
 ```
-
-Then print:
 
 > Task complete. Use `/findtask` to survey what's next.
 

@@ -182,8 +182,7 @@ impl WasmtimeRuntime {
 
                     // Cache miss — store IO request and trap.
                     let host = caller.data_mut();
-                    host.io_request =
-                        Some(crate::types::IORequest::FetchContent { cid });
+                    host.io_request = Some(crate::types::IORequest::FetchContent { cid });
                     host.io_write_target = Some((out_ptr as u32, out_cap as u32));
 
                     Err(wasmtime::Error::msg("harmony_io_trap"))
@@ -340,7 +339,9 @@ impl WasmtimeRuntime {
                 if let Some(io_request) = host_data.io_request.clone() {
                     // Host function trapped with an IO request — NeedsIO.
                     (
-                        ComputeResult::NeedsIO { request: io_request },
+                        ComputeResult::NeedsIO {
+                            request: io_request,
+                        },
                         Some((host_data, fuel_consumed, mem_snapshot)),
                     )
                 } else {
@@ -802,10 +803,7 @@ mod tests {
             InstructionBudget { fuel: 1_000_000 },
         );
         assert!(matches!(result, ComputeResult::NeedsIO { .. }));
-        let fuel_after_execute = rt
-            .snapshot()
-            .expect("snapshot after execute")
-            .fuel_consumed;
+        let fuel_after_execute = rt.snapshot().expect("snapshot after execute").fuel_consumed;
         assert!(fuel_after_execute > 0, "should have consumed some fuel");
 
         // Round 2: resume_with_io -> Complete. Re-executes from scratch.
@@ -816,10 +814,7 @@ mod tests {
             InstructionBudget { fuel: 1_000_000 },
         );
         assert!(matches!(result, ComputeResult::Complete { .. }));
-        let fuel_after_replay = rt
-            .snapshot()
-            .expect("snapshot after replay")
-            .fuel_consumed;
+        let fuel_after_replay = rt.snapshot().expect("snapshot after replay").fuel_consumed;
 
         // Total must be strictly greater than either individual round,
         // confirming accumulation (not replacement).

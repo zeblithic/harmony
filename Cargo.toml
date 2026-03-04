@@ -7,13 +7,14 @@ members = [
     "crates/harmony-identity",
     "crates/harmony-node",
     "crates/harmony-reticulum",
+    "crates/harmony-workflow",
     "crates/harmony-zenoh",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0 OR MIT"
 repository = "https://github.com/zeblithic/harmony"
 rust-version = "1.75"
 
@@ -50,4 +51,5 @@ harmony-content = { path = "crates/harmony-content" }
 harmony-crypto = { path = "crates/harmony-crypto" }
 harmony-identity = { path = "crates/harmony-identity" }
 harmony-reticulum = { path = "crates/harmony-reticulum" }
+harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }

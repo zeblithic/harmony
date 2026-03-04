@@ -1,14 +1,11 @@
 ---
 description: Survey beads and project state to determine what to work on next
-allowed-tools: Bash(bd list:*), Bash(bd show:*), Bash(bd ready:*), Bash(git log:*), Bash(git branch:*), Bash(gh pr list:*)
+allowed-tools: Bash(bd list:*), Bash(bd show:*), Bash(bd ready:*), Bash(git log:*), Bash(git branch:*), Bash(gh pr list:*), Bash(bash scripts/survey-work.sh:*), Bash(cd:*)
 ---
 
 ## Context
 
 - Harmony repo: `/Users/zeblith/work/zeblithic/harmony`
-- Available beads: !`cd /Users/zeblith/work/zeblithic/harmony && bd ready 2>/dev/null || echo "(bd not available)"`
-- All beads: !`cd /Users/zeblith/work/zeblithic/harmony && bd list 2>/dev/null || echo "(bd not available)"`
-- Recent merges: !`cd /Users/zeblith/work/zeblithic/harmony && git log --oneline --merges -5 2>/dev/null || echo "(no merges)"`
 - Current branch: !`cd /Users/zeblith/work/zeblithic/harmony && git branch --show-current 2>/dev/null || echo "(not in repo)"`
 - Open PRs: !`cd /Users/zeblith/work/zeblithic/harmony && gh pr list --state open --limit 5 2>/dev/null || echo "(no open PRs)"`
 
@@ -20,9 +17,13 @@ Help determine the most promising next unit of work.
 
 ### 1. Survey available work
 
-- Review the beads listed above (both `ready` and `list` output)
-- For each candidate bead, run `bd show <bead-id>` to understand its scope, dependencies, and description
-- Check if any beads have unsatisfied dependencies (blocked)
+Run the survey script to gather all context in one shot:
+
+```bash
+cd /Users/zeblith/work/zeblithic/harmony && bash scripts/survey-work.sh
+```
+
+This outputs: current state, recent merges, all ready beads with details, and the full bead list. Use this output to understand what's available.
 
 ### 2. Assess context
 

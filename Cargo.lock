@@ -830,8 +830,10 @@ dependencies = [
  "clap",
  "harmony-compute",
  "harmony-content",
+ "harmony-crypto",
  "harmony-identity",
  "harmony-reticulum",
+ "harmony-workflow",
  "harmony-zenoh",
  "hex",
  "rand",
@@ -851,6 +853,15 @@ dependencies = [
  "thiserror 2.0.18",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "harmony-workflow"
+version = "0.1.0"
+dependencies = [
+ "harmony-compute",
+ "harmony-crypto",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
