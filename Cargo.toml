@@ -7,6 +7,7 @@ members = [
     "crates/harmony-identity",
     "crates/harmony-node",
     "crates/harmony-reticulum",
+    "crates/harmony-workflow",
     "crates/harmony-zenoh",
 ]
 
@@ -50,4 +51,5 @@ harmony-content = { path = "crates/harmony-content" }
 harmony-crypto = { path = "crates/harmony-crypto" }
 harmony-identity = { path = "crates/harmony-identity" }
 harmony-reticulum = { path = "crates/harmony-reticulum" }
+harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }

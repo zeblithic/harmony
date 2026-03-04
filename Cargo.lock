@@ -854,6 +854,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-workflow"
+version = "0.1.0"
+dependencies = [
+ "harmony-compute",
+ "harmony-crypto",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harmony-zenoh"
 version = "0.1.0"
 dependencies = [
