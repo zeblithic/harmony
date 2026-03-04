@@ -35,6 +35,15 @@ impl HostState {
             io_write_target: None,
         }
     }
+
+    fn with_cache(io_cache: HashMap<[u8; 32], Vec<u8>>, not_found_cids: HashSet<[u8; 32]>) -> Self {
+        Self {
+            io_cache,
+            not_found_cids,
+            io_request: None,
+            io_write_target: None,
+        }
+    }
 }
 
 /// Saved session state for snapshot, take/restore, and future NeedsIO replay.
@@ -44,18 +53,14 @@ impl HostState {
 /// accumulated IO cache state.
 struct WasmtimeSession {
     /// Original module bytes (needed for re-execution on replay).
-    #[allow(dead_code)] // Read by Task 5 (resume_with_io).
     module_bytes: Vec<u8>,
     /// BLAKE3 hash of the module bytes.
     module_hash: [u8; 32],
     /// Original input bytes (needed for re-execution on replay).
-    #[allow(dead_code)] // Read by Task 5 (resume_with_io).
     input: Vec<u8>,
     /// Cached IO responses from prior rounds.
-    #[allow(dead_code)] // Read by Task 5 (resume_with_io).
     io_cache: HashMap<[u8; 32], Vec<u8>>,
     /// CIDs that returned not-found in prior rounds.
-    #[allow(dead_code)] // Read by Task 5 (resume_with_io).
     not_found_cids: HashSet<[u8; 32]>,
     /// Total fuel consumed across all execution slices.
     total_fuel_consumed: u64,
@@ -91,8 +96,8 @@ impl WasmtimeRuntime {
 
     /// Core execution helper: compiles module, runs `compute`, returns result.
     ///
-    /// This is called by `execute()` and (in future tasks) by `resume_with_io()`
-    /// which replays execution with cached IO responses.
+    /// This is called by `execute()` and by `resume_with_io()` which replays
+    /// execution with cached IO responses.
     fn run_module(
         &self,
         module_bytes: &[u8],
@@ -407,13 +412,67 @@ impl ComputeRuntime for WasmtimeRuntime {
 
     fn resume_with_io(
         &mut self,
-        _response: crate::types::IOResponse,
-        _budget: InstructionBudget,
+        response: crate::types::IOResponse,
+        budget: InstructionBudget,
     ) -> ComputeResult {
-        // Placeholder — Task 5 implements NeedsIO support via deterministic replay.
-        ComputeResult::Failed {
-            error: ComputeError::NoPendingExecution,
+        let mut session = match self.session.take() {
+            Some(s) => s,
+            None => {
+                return ComputeResult::Failed {
+                    error: ComputeError::NoPendingExecution,
+                };
+            }
+        };
+
+        let pending_cid = match session.pending_cid.take() {
+            Some(cid) => cid,
+            None => {
+                self.session = Some(session);
+                return ComputeResult::Failed {
+                    error: ComputeError::NoPendingExecution,
+                };
+            }
+        };
+
+        // Cache the IO response keyed by the pending CID.
+        match response {
+            crate::types::IOResponse::ContentReady { data } => {
+                session.io_cache.insert(pending_cid, data);
+            }
+            crate::types::IOResponse::ContentNotFound => {
+                session.not_found_cids.insert(pending_cid);
+            }
         }
+
+        // Re-execute the module from scratch with the updated IO cache.
+        // The host function will find the CID in cache and return data
+        // immediately (deterministic replay).
+        let host_state = HostState::with_cache(session.io_cache, session.not_found_cids);
+        let (result, session_data) =
+            self.run_module(&session.module_bytes, &session.input, budget, host_state);
+
+        // Update session for potential further NeedsIO rounds or snapshot.
+        if let Some((host_data, fuel_consumed, mem_snapshot)) = session_data {
+            let new_pending_cid = match &result {
+                ComputeResult::NeedsIO { request } => match request {
+                    crate::types::IORequest::FetchContent { cid } => Some(*cid),
+                },
+                _ => None,
+            };
+            let total_fuel = session.total_fuel_consumed + fuel_consumed;
+            self.session = Some(WasmtimeSession {
+                module_bytes: session.module_bytes,
+                module_hash: session.module_hash,
+                input: session.input,
+                io_cache: host_data.io_cache,
+                not_found_cids: host_data.not_found_cids,
+                total_fuel_consumed: total_fuel,
+                pending_cid: new_pending_cid,
+                memory_snapshot: mem_snapshot,
+            });
+        }
+
+        result
     }
 
     fn has_pending(&self) -> bool {
@@ -632,5 +691,91 @@ mod tests {
 
         // After NeedsIO, has_pending should be true.
         assert!(rt.has_pending(), "should have pending after NeedsIO");
+    }
+
+    #[test]
+    fn resume_with_io_replays_with_content() {
+        let mut rt = WasmtimeRuntime::new().expect("engine creation");
+        let cid = [0xCD; 32];
+        let content = b"hello from storage";
+
+        // First: execute triggers NeedsIO.
+        let result = rt.execute(
+            FETCH_WAT.as_bytes(),
+            &cid,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(result, ComputeResult::NeedsIO { .. }));
+
+        // Resume with content — should replay and complete.
+        let result = rt.resume_with_io(
+            crate::types::IOResponse::ContentReady {
+                data: content.to_vec(),
+            },
+            InstructionBudget { fuel: 1_000_000 },
+        );
+
+        match result {
+            ComputeResult::Complete { output } => {
+                // FETCH_WAT output: [result_code: i32 LE] [data if result > 0]
+                let result_code = i32::from_le_bytes(output[..4].try_into().unwrap());
+                assert_eq!(result_code, content.len() as i32);
+                assert_eq!(&output[4..], content);
+            }
+            other => panic!("expected Complete after replay, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_with_io_content_not_found() {
+        let mut rt = WasmtimeRuntime::new().expect("engine creation");
+        let cid = [0xEF; 32];
+
+        let result = rt.execute(
+            FETCH_WAT.as_bytes(),
+            &cid,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(result, ComputeResult::NeedsIO { .. }));
+
+        let result = rt.resume_with_io(
+            crate::types::IOResponse::ContentNotFound,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+
+        match result {
+            ComputeResult::Complete { output } => {
+                let result_code = i32::from_le_bytes(output[..4].try_into().unwrap());
+                assert_eq!(result_code, -1, "not-found result code");
+            }
+            other => panic!("expected Complete with -1, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_content_replay_then_complete() {
+        let mut rt = WasmtimeRuntime::new().expect("engine creation");
+        let cid = [0x42; 32];
+        let content = b"deterministic replay works";
+
+        // Execute -> NeedsIO.
+        let result = rt.execute(
+            FETCH_WAT.as_bytes(),
+            &cid,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(result, ComputeResult::NeedsIO { .. }));
+
+        // Resume -> Complete.
+        let result = rt.resume_with_io(
+            crate::types::IOResponse::ContentReady {
+                data: content.to_vec(),
+            },
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(result, ComputeResult::Complete { .. }));
+
+        // After completion, no pending execution.
+        assert!(!rt.has_pending());
     }
 }
