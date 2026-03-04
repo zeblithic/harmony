@@ -123,8 +123,10 @@ pub struct NodeRuntime<B: BlobStore> {
     pending_workflow_actions: Vec<WorkflowAction>,
     // Direct runtime actions buffered from push_event (e.g., error replies for module fetch failures)
     pending_direct_replies: Vec<RuntimeAction>,
-    // Maps WorkflowId -> query_id for reply routing
-    workflow_to_query: HashMap<WorkflowId, u64>,
+    // Maps WorkflowId -> query_ids for reply routing (multiple callers may
+    // submit the same module+input; the engine deduplicates but all callers
+    // need a reply).
+    workflow_to_query: HashMap<WorkflowId, Vec<u64>>,
     // Maps module CID -> Vec<(query_id, input)> for CID-based requests pending module fetch
     cid_to_query: HashMap<[u8; 32], Vec<(u64, Vec<u8>)>>,
 }
@@ -262,7 +264,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                             let module_hash = harmony_crypto::hash::blake3_hash(&module);
                             for (query_id, input) in pending {
                                 let wf_id = WorkflowId::new(&module_hash, &input);
-                                self.workflow_to_query.entry(wf_id).or_insert(query_id);
+                                self.workflow_to_query.entry(wf_id).or_default().push(query_id);
                                 let actions = self.workflow.handle(WorkflowEvent::Submit {
                                     module: module.clone(),
                                     input,
@@ -397,11 +399,11 @@ impl<B: BlobStore> NodeRuntime<B> {
         match parsed {
             ParsedCompute::Inline { module, input } => {
                 // Compute workflow ID and store the query_id mapping.
-                // Use or_insert to preserve the first caller's mapping on dedup
-                // (WorkflowEngine silently discards duplicate submits).
+                // Multiple callers may submit the same module+input; the engine
+                // deduplicates but we track all query_ids so every caller gets a reply.
                 let module_hash = harmony_crypto::hash::blake3_hash(&module);
                 let wf_id = WorkflowId::new(&module_hash, &input);
-                self.workflow_to_query.entry(wf_id).or_insert(query_id);
+                self.workflow_to_query.entry(wf_id).or_default().push(query_id);
                 self.workflow.handle(WorkflowEvent::Submit {
                     module,
                     input,
@@ -440,17 +442,27 @@ impl<B: BlobStore> NodeRuntime<B> {
                     workflow_id,
                     output,
                 } => {
-                    if let Some(query_id) = self.workflow_to_query.remove(&workflow_id) {
+                    if let Some(query_ids) = self.workflow_to_query.remove(&workflow_id) {
                         let mut payload = vec![0x00];
                         payload.extend_from_slice(&output);
-                        out.push(RuntimeAction::SendReply { query_id, payload });
+                        for query_id in query_ids {
+                            out.push(RuntimeAction::SendReply {
+                                query_id,
+                                payload: payload.clone(),
+                            });
+                        }
                     }
                 }
                 WorkflowAction::WorkflowFailed { workflow_id, error } => {
-                    if let Some(query_id) = self.workflow_to_query.remove(&workflow_id) {
+                    if let Some(query_ids) = self.workflow_to_query.remove(&workflow_id) {
                         let mut payload = vec![0x01];
                         payload.extend_from_slice(error.as_bytes());
-                        out.push(RuntimeAction::SendReply { query_id, payload });
+                        for query_id in query_ids {
+                            out.push(RuntimeAction::SendReply {
+                                query_id,
+                                payload: payload.clone(),
+                            });
+                        }
                     }
                 }
                 WorkflowAction::FetchContent { cid, .. } => {

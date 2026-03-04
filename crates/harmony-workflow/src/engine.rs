@@ -138,6 +138,15 @@ impl WorkflowEngine {
     ) -> Vec<WorkflowAction> {
         let wf_id = history.workflow_id;
 
+        // Validate module bytes match the recorded hash.
+        let actual_hash = harmony_crypto::hash::blake3_hash(&module_bytes);
+        if actual_hash != history.module_hash {
+            return vec![WorkflowAction::WorkflowFailed {
+                workflow_id: wf_id,
+                error: "module hash mismatch during recovery".into(),
+            }];
+        }
+
         // Build replay cache from history's IoResolved events.
         let mut replay_cache = HashMap::new();
         for event in &history.events {
@@ -300,8 +309,10 @@ impl WorkflowEngine {
                 if let Some(state) = self.workflows.get_mut(&wf_id) {
                     state.history.events.push(HistoryEvent::IoRequested { cid });
 
-                    // Check replay cache BEFORE extracting session.
-                    if let Some(cached_data) = state.replay_cache.remove(&cid) {
+                    // Check replay cache BEFORE extracting session. Use get() (not
+                    // remove) so a workflow that fetches the same CID twice can replay
+                    // both requests from the cache.
+                    if let Some(cached_data) = state.replay_cache.get(&cid).cloned() {
                         // Cache hit: feed cached data immediately, no external fetch.
                         state.history.events.push(HistoryEvent::IoResolved {
                             cid,
@@ -843,5 +854,31 @@ mod tests {
                 .any(|a| matches!(a, WorkflowAction::FetchContent { .. })),
             "should emit FetchContent for IO beyond recorded history"
         );
+    }
+
+    #[test]
+    fn recover_rejects_module_hash_mismatch() {
+        let module_hash = harmony_crypto::hash::blake3_hash(FETCH_WAT.as_bytes());
+        let cid = [0x55; 32];
+        let wf_id = WorkflowId::new(&module_hash, &cid);
+
+        let history = WorkflowHistory {
+            workflow_id: wf_id,
+            module_hash,
+            input: cid.to_vec(),
+            events: vec![],
+            total_fuel_consumed: 0,
+        };
+
+        let mut engine = make_engine_high_fuel();
+        // Pass wrong module bytes — should fail.
+        let actions = engine.recover(history, b"wrong module bytes".to_vec());
+
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], WorkflowAction::WorkflowFailed { error, .. } if error.contains("hash mismatch")),
+            "should fail with hash mismatch, got: {actions:?}"
+        );
+        assert_eq!(engine.workflow_count(), 0, "should not create workflow on mismatch");
     }
 }
