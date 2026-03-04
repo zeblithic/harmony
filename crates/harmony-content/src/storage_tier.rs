@@ -23,18 +23,20 @@ pub struct StorageMetrics {
     pub transit_admitted: u64,
     pub transit_rejected: u64,
     pub publishes_stored: u64,
+    pub publishes_rejected: u64,
 }
 
 impl StorageMetrics {
-    /// Serialize metrics as 6 big-endian u64s (48 bytes).
+    /// Serialize metrics as 7 big-endian u64s (56 bytes).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(48);
+        let mut buf = Vec::with_capacity(56);
         buf.extend_from_slice(&self.queries_served.to_be_bytes());
         buf.extend_from_slice(&self.cache_hits.to_be_bytes());
         buf.extend_from_slice(&self.cache_misses.to_be_bytes());
         buf.extend_from_slice(&self.transit_admitted.to_be_bytes());
         buf.extend_from_slice(&self.transit_rejected.to_be_bytes());
         buf.extend_from_slice(&self.publishes_stored.to_be_bytes());
+        buf.extend_from_slice(&self.publishes_rejected.to_be_bytes());
         buf
     }
 }
@@ -168,11 +170,19 @@ impl<B: BlobStore> StorageTier<B> {
     fn handle_publish(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
         // Publish comes from local apps — still verify as defense-in-depth.
         if !Self::verify_cid(&cid, &data) {
+            self.metrics.publishes_rejected += 1;
             return vec![];
         }
         self.cache.store(cid, data);
-        self.metrics.publishes_stored += 1;
-        vec![self.make_announce_action(&cid)]
+        // TODO: Pin published content to guarantee admission (deferred).
+        // For now, check if W-TinyLFU retained it — same as transit.
+        if self.cache.contains(&cid) {
+            self.metrics.publishes_stored += 1;
+            vec![self.make_announce_action(&cid)]
+        } else {
+            self.metrics.publishes_rejected += 1;
+            vec![]
+        }
     }
 
     /// Verify that a CID actually matches the hash of the data.
@@ -222,6 +232,7 @@ mod tests {
         assert_eq!(m.transit_admitted, 0);
         assert_eq!(m.transit_rejected, 0);
         assert_eq!(m.publishes_stored, 0);
+        assert_eq!(m.publishes_rejected, 0);
     }
 
     #[test]
@@ -299,7 +310,7 @@ mod tests {
         match &actions[0] {
             StorageTierAction::SendStatsReply { query_id, payload } => {
                 assert_eq!(*query_id, 77);
-                assert_eq!(payload.len(), 48);
+                assert_eq!(payload.len(), 56);
                 let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
                 assert_eq!(queries, 1); // one ContentQuery was processed
             }
@@ -425,6 +436,7 @@ mod tests {
 
         assert!(actions.is_empty(), "mismatched CID should produce no actions");
         assert_eq!(tier.metrics().publishes_stored, 0);
+        assert_eq!(tier.metrics().publishes_rejected, 1);
     }
 
     #[test]
