@@ -96,8 +96,9 @@ pub enum RuntimeAction {
 ///
 /// Events are pushed via [`push_event`](Self::push_event) into internal
 /// priority queues. Each [`tick`](Self::tick) drains ALL Tier 1 events,
-/// then processes ONE Tier 2 event, then dispatches Tier 3 compute —
-/// the router is never starved and storage takes priority over compute.
+/// then drains ALL Tier 2 events, then runs one Tier 3 compute slice —
+/// information flow (router + storage) is never starved, and compute
+/// gets whatever budget remains after the data plane is serviced.
 pub struct NodeRuntime<B: BlobStore> {
     // Tier 1: Reticulum packet router
     router: Node,
@@ -248,7 +249,8 @@ impl<B: BlobStore> NodeRuntime<B> {
 
     /// Run one iteration of the priority event loop.
     /// 1. Drain ALL Tier 1 (router) events — router is never starved.
-    /// 2. Process ONE Tier 2 (storage) event.
+    /// 2. Drain ALL Tier 2 (storage) events — storage actions are I/O-bound
+    ///    and handled externally; building them here is cheap.
     /// 3. Dispatch pending compute actions, then run ONE Tier 3 compute slice.
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
         let mut actions = Vec::new();
@@ -259,8 +261,11 @@ impl<B: BlobStore> NodeRuntime<B> {
             self.dispatch_router_actions(node_actions, &mut actions);
         }
 
-        // Tier 2: process ONE storage event (middle priority)
-        if let Some(event) = self.storage_queue.pop_front() {
+        // Tier 2: drain ALL storage events (middle priority)
+        // In sans-I/O, processing storage events only builds action lists —
+        // actual I/O (network sends, disk writes) happens when the caller
+        // executes the actions. No reason to throttle.
+        while let Some(event) = self.storage_queue.pop_front() {
             let storage_actions = self.storage.handle(event);
             self.dispatch_storage_actions(storage_actions, &mut actions);
         }
@@ -604,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_drains_all_router_events_before_storage() {
+    fn tick_drains_all_router_and_storage_events() {
         let (mut rt, _) = make_runtime();
 
         for i in 0..3 {
@@ -624,23 +629,16 @@ mod tests {
         assert_eq!(rt.router_queue_len(), 3);
         assert_eq!(rt.storage_queue_len(), 2);
 
+        // One tick should drain ALL router and ALL storage events.
         let actions = rt.tick();
         assert_eq!(rt.router_queue_len(), 0);
-        assert_eq!(rt.storage_queue_len(), 1);
+        assert_eq!(rt.storage_queue_len(), 0);
 
         let reply_count = actions
             .iter()
             .filter(|a| matches!(a, RuntimeAction::SendReply { .. }))
             .count();
-        assert_eq!(reply_count, 1);
-
-        let actions2 = rt.tick();
-        assert_eq!(rt.storage_queue_len(), 0);
-        let reply_count2 = actions2
-            .iter()
-            .filter(|a| matches!(a, RuntimeAction::SendReply { .. }))
-            .count();
-        assert_eq!(reply_count2, 1);
+        assert_eq!(reply_count, 2);
     }
 
     #[test]

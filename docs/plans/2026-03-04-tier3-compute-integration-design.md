@@ -45,7 +45,7 @@ pub enum ComputeTierAction {
 
 ```rust
 enum ComputeTask {
-    Ready { query_id: u64, module: Vec<u8>, input: Vec<u8> },
+    Ready { query_id: u64, module: Arc<Vec<u8>>, input: Vec<u8> },
     WaitingForModule { query_id: u64, cid: [u8; 32], input: Vec<u8> },
 }
 
@@ -63,7 +63,7 @@ pub struct ComputeTier {
 
 ### tick() Lifecycle
 
-1. If no active execution and queue has a Ready task → dequeue, call `runtime.execute()`, store ActiveExecution
+1. If no active execution and queue has a Ready task → dequeue (skipping WaitingForModule to avoid head-of-line blocking), call `runtime.execute()`, store ActiveExecution
 2. If active execution exists → call `runtime.resume(budget)`
 3. Match ComputeResult:
    - Complete → emit SendReply, clear active
@@ -106,11 +106,13 @@ FetchContent { cid: [u8; 32] },
 
 ```rust
 // Tier 1: drain ALL router events
-// Tier 2: process ONE storage event
-// Tier 3: one compute slice
+// Tier 2: drain ALL storage events (I/O-bound; action building is cheap)
+// Tier 3: one compute slice (CPU-bound; fuel-limited)
 let compute_actions = self.compute.tick();
 self.dispatch_compute_actions(compute_actions, &mut actions);
 ```
+
+**Rationale:** In sans-I/O, processing storage events only builds action lists — actual I/O (network sends, disk writes) happens when the external caller executes the actions. Information flow (router + storage) is never throttled; compute gets whatever budget remains after the data plane is fully serviced.
 
 ### Query Routing
 
@@ -130,15 +132,24 @@ Reply success: [0x00] [output_bytes]
 Reply error:   [0x01] [error_message_utf8]
 ```
 
+## Future: Content Read Access for WASM
+
+WASM compute tasks should eventually have automatic read access to the content-addressed storage system. Since all content is immutable and auditable (CID = hash of content), there is no trust boundary to enforce for reads — a module can request any blob/bundle by CID and the runtime resolves it through the existing Tier 2 storage layer.
+
+This connects to the existing `NeedsIO` path: when a WASM module emits a host call to read a CID, the runtime suspends the task, resolves the CID via storage (local cache or network fetch), and resumes the task with the data. The entire planet becomes a read-only data layer with a tiny mutable indirection layer (name → CID mappings) on top.
+
+This is tracked as a future bead.
+
 ## Out of Scope (YAGNI)
 
 - Adaptive budgeting (scale fuel with router load / battery)
-- NeedsIO handling (emit SendError for now)
+- NeedsIO handling — content read access (emit error for now; see above)
 - Capacity advertisement on `harmony/compute/capacity/{node_addr}`
 - Result publishing on `harmony/compute/result/{id}`
 - Workflow/checkpoint storage via Zenoh
 - Multiple WasmiRuntime pool
 - wasmtime JIT runtime
+- Configurable/dynamic tier scheduling (currently: drain-all/drain-all/one-slice)
 
 ## Files
 

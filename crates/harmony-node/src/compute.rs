@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use harmony_compute::{ComputeRuntime, InstructionBudget, WasmiRuntime};
 
@@ -53,9 +54,11 @@ pub enum ComputeTierAction {
 /// A compute task waiting in the queue.
 enum ComputeTask {
     /// Module bytes are available; ready to execute.
+    /// Module uses `Arc` so that multiple tasks waiting for the same CID
+    /// can share the bytes without cloning up to 10 MB per task.
     Ready {
         query_id: u64,
-        module: Vec<u8>,
+        module: Arc<Vec<u8>>,
         input: Vec<u8>,
     },
     /// Waiting for the module to be fetched from storage.
@@ -105,7 +108,7 @@ impl ComputeTier {
             } => {
                 self.queue.push_back(ComputeTask::Ready {
                     query_id,
-                    module,
+                    module: Arc::new(module),
                     input,
                 });
                 Vec::new()
@@ -132,7 +135,8 @@ impl ComputeTier {
             }
             ComputeTierEvent::ModuleFetched { cid, module } => {
                 // Promote ALL tasks waiting for this CID, preserving FIFO order.
-                // Drain the queue and rebuild, upgrading matching tasks in-place.
+                // Wrap module in Arc so multiple promoted tasks share the bytes.
+                let module = Arc::new(module);
                 let old_queue = std::mem::take(&mut self.queue);
                 for task in old_queue {
                     match task {
@@ -143,7 +147,7 @@ impl ComputeTier {
                         } if c == cid => {
                             self.queue.push_back(ComputeTask::Ready {
                                 query_id,
-                                module: module.clone(),
+                                module: Arc::clone(&module),
                                 input,
                             });
                         }
@@ -182,7 +186,9 @@ impl ComputeTier {
     ///
     /// If there is an active (yielded) execution, resumes it with the configured
     /// fuel budget. Otherwise, dequeues the next [`ComputeTask::Ready`] task and
-    /// begins execution.
+    /// begins execution. `WaitingForModule` tasks are skipped — they cannot
+    /// execute until their module arrives, and blocking behind them would cause
+    /// head-of-line blocking for ready inline tasks.
     pub fn tick(&mut self) -> Vec<ComputeTierAction> {
         // If there's an active execution, resume it.
         if self.active.is_some() {
