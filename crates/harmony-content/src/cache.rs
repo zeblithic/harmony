@@ -351,7 +351,12 @@ mod tests {
         cs.pin(cid);
         let dbg = format!("{cs:?}");
         assert!(dbg.contains("ContentStore"));
+        assert!(dbg.contains("sketch:"), "sketch field should appear");
         assert!(dbg.contains("CountMinSketch"));
+        assert!(dbg.contains("window:"), "window Lru field should appear");
+        assert!(dbg.contains("probation:"), "probation Lru field should appear");
+        assert!(dbg.contains("protected:"), "protected Lru field should appear");
+        assert!(dbg.contains("Lru"), "Lru Debug impl should be used for segments");
         assert!(dbg.contains("pinned_count: 1"));
         assert!(dbg.contains(".."), "should use finish_non_exhaustive()");
     }
