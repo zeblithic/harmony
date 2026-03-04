@@ -30,32 +30,14 @@ cd /Users/zeblith/work/zeblithic/harmony && bash scripts/review-state.sh [PR_NUM
 
 This script outputs: trigger timestamps, reaction counts, latest responses from each bot, new comment counts, derived state, and recommended action. It also prints any new findings.
 
-### 2. If state is REVIEWS_COMPLETE_WITH_FEEDBACK or REVIEWS_COMPLETE_ALL_CLEAR: READ the actual content
+### 2. Parse the script output
 
-The script gives you the state and a summary of findings, but you MUST still read the full review content to understand details.
+The script output contains ALL findings with full bodies from both reviewers. Parse the output to:
+- Extract the `--- STATE ---` section for the status table
+- Extract all findings from the `--- BUGBOT ---` and `--- GREPTILE ---` sections for the issue summary
+- No additional API calls needed — the script handles pagination and both endpoints (inline PR comments for Bugbot, issue comments for Greptile).
 
-**Where each reviewer posts findings — CRITICAL:**
-- **Bugbot (`cursor[bot]`)** posts findings as **inline PR review comments on the diff** — accessible via `pulls/{number}/comments` API (NOT the `issues/{number}/comments` endpoint). These show up as comments on specific lines of code in the PR.
-- **Greptile (`greptile-apps[bot]`)** posts findings as **PR-level issue comments** — accessible via `issues/{number}/comments` API or `gh pr view --comments`.
-- **These are DIFFERENT API endpoints.** You must check BOTH.
-
-```bash
-# Bugbot inline review comments (findings on specific diff lines) — PAGINATED
-gh api "repos/zeblithic/harmony/pulls/{number}/comments?per_page=100" --paginate \
-  --jq '.[] | select(.user.login == "cursor[bot]") | {path: .path, line: .line, created: .created_at, body: .body[:300]}'
-
-# Bugbot's latest PR review body (summary, may be empty if only inline comments)
-gh api "repos/zeblithic/harmony/pulls/{number}/reviews?per_page=100" --paginate \
-  --jq '[.[] | select(.user.login == "cursor[bot]")] | last | .body'
-
-# Greptile's latest comment body — PAGINATED
-gh api "repos/zeblithic/harmony/issues/{number}/comments?per_page=100" --paginate \
-  --jq '[.[] | select(.user.login == "greptile-apps[bot]")] | last | .body'
-```
-
-**Scan both for:** suggestions, code changes, severity labels, "could"/"should"/"consider" language, ```suggestion blocks. Any actionable feedback = WITH_FEEDBACK.
-
-**CRITICAL: Thumbs-up on trigger comments = "completed review", NOT "approved". You MUST read the actual review content to determine whether there are actionable issues.**
+**CRITICAL: Thumbs-up on trigger comments = "completed review", NOT "approved". The script extracts full finding bodies — read them to determine whether there are actionable issues.**
 
 ### 3. Report
 
