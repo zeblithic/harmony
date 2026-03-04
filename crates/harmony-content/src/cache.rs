@@ -70,7 +70,12 @@ impl<S: BlobStore> ContentStore<S> {
     /// The `capacity` is split across three LRU segments:
     /// - **window:** 1% of capacity (at least 1)
     /// - **protected:** 20% of capacity
-    /// - **probation:** remainder (at least 1)
+    /// - **probation:** remainder
+    ///
+    /// At small capacities the splits degenerate: capacity=1 gives a single
+    /// window slot with no probation or protected (effectively MRU).
+    /// capacity=2..=4 gives window=1 + probation only (no protected).
+    /// capacity=5 is the minimum for all three segments to be non-zero.
     ///
     /// The sketch width is `capacity * 2` and the halving threshold is
     /// `capacity * 10`.
@@ -469,26 +474,40 @@ mod tests {
 
     #[test]
     fn frequency_based_admission() {
-        // Capacity 10: window=1, protected=2, probation=7.
+        // Capacity 4: window=1, protected=0, probation=3.
+        // Zero protected capacity means record_access builds sketch frequency
+        // without moving items out of probation (promote bounces back).
         let store = MemoryBlobStore::new();
-        let mut cs = ContentStore::new(store, 10);
+        let mut cs = ContentStore::new(store, 4);
 
-        // Fill probation with 7 items, each accessed 5 times to build frequency.
-        let hot: Vec<ContentId> = (0..7)
+        // Fill probation with 3 hot items, each accessed 5 times.
+        let hot: Vec<ContentId> = (0..3)
             .map(|i| {
                 let data = format!("hot-{i}");
                 cs.insert(data.as_bytes()).unwrap()
             })
             .collect();
+        // Push the last hot item out of window so all 3 are in probation.
+        let _spacer = cs.insert(b"spacer").unwrap();
         for cid in &hot {
             for _ in 0..5 {
                 cs.record_access(cid);
             }
         }
+        assert_eq!(cs.probation.len(), 3, "probation should be full");
 
-        // Insert a cold item — it enters window, then faces admission challenge.
-        // Its frequency (1) should lose against probation's tail (5+).
-        let _cold = cs.insert(b"cold-newcomer").unwrap();
+        // Insert a cold item — it enters window, pushing _spacer to admission.
+        // _spacer has low frequency so it may be rejected. Then insert another
+        // to push the cold item itself into the admission challenge.
+        let cold = cs.insert(b"cold-newcomer").unwrap();
+        let _pusher = cs.insert(b"pusher").unwrap();
+
+        // The cold item should have been rejected by the admission challenge:
+        // its frequency (1) loses against the probation tail's frequency (5+).
+        assert!(
+            !cs.probation.contains(&cold) && !cs.protected.contains(&cold),
+            "cold item should be rejected from main cache segments"
+        );
 
         // The hot items should still be accessible in the cache segments.
         for cid in &hot {
@@ -546,6 +565,41 @@ mod tests {
     }
 
     #[test]
+    fn scan_resistance_probation_resident() {
+        // Variant: hot item stays in probation (not promoted to protected),
+        // exercising the admission challenge frequency comparison directly.
+        //
+        // Capacity 4: window=1, protected=0, probation=3.
+        // Zero protected cap means record_access builds sketch frequency
+        // without promoting items out of probation.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 4);
+
+        // Insert a hot item, push it to probation, build frequency.
+        let hot = cs.insert(b"frequently-accessed").unwrap();
+        let _pusher = cs.insert(b"push-to-probation").unwrap();
+        assert!(cs.probation.contains(&hot));
+        for _ in 0..10 {
+            cs.record_access(&hot);
+        }
+
+        // Sequential scan: insert 20 cold items.
+        // Each scan item enters window, then faces admission_challenge
+        // against the probation tail. The hot item's high frequency should
+        // protect it from eviction.
+        for i in 0..20 {
+            let data = format!("scan-item-{i}");
+            cs.insert(data.as_bytes()).unwrap();
+        }
+
+        // The hot item should survive — its frequency beats every cold item.
+        assert!(
+            cs.probation.contains(&hot),
+            "high-frequency probation item should survive sequential scan"
+        );
+    }
+
+    #[test]
     fn pin_exempts_from_eviction() {
         // Small cache: capacity 5 → window=1, protected=1, probation=3.
         let store = MemoryBlobStore::new();
@@ -576,19 +630,49 @@ mod tests {
     }
 
     #[test]
-    fn capacity_one_segments_do_not_exceed_capacity() {
+    fn capacity_one_segment_splits() {
+        // capacity=1: window gets the minimum of 1, leaving 0 for both
+        // probation and protected. Effectively a 1-entry MRU cache with
+        // no admission challenge (nothing to challenge against).
         let store = MemoryBlobStore::new();
         let cs = ContentStore::new(store, 1);
-        let total = cs.window.capacity() + cs.probation.capacity() + cs.protected.capacity();
-        assert!(total <= 1, "segments sum to {total}, exceeds capacity 1");
+        assert_eq!(cs.window.capacity(), 1);
+        assert_eq!(cs.probation.capacity(), 0);
+        assert_eq!(cs.protected.capacity(), 0);
     }
 
     #[test]
-    fn capacity_two_segments_do_not_exceed_capacity() {
+    fn capacity_two_segment_splits() {
+        // capacity=2: window=1, probation=1, protected=0.
+        // Minimum viable W-TinyLFU: one window slot feeds admission
+        // challenge against a single probation entry.
         let store = MemoryBlobStore::new();
         let cs = ContentStore::new(store, 2);
-        let total = cs.window.capacity() + cs.probation.capacity() + cs.protected.capacity();
-        assert!(total <= 2, "segments sum to {total}, exceeds capacity 2");
+        assert_eq!(cs.window.capacity(), 1);
+        assert_eq!(cs.probation.capacity(), 1);
+        assert_eq!(cs.protected.capacity(), 0);
+    }
+
+    #[test]
+    fn capacity_four_segment_splits() {
+        // capacity=4: window=1, probation=3, protected=0.
+        // Still no protected segment (4/5 = 0).
+        let store = MemoryBlobStore::new();
+        let cs = ContentStore::new(store, 4);
+        assert_eq!(cs.window.capacity(), 1);
+        assert_eq!(cs.probation.capacity(), 3);
+        assert_eq!(cs.protected.capacity(), 0);
+    }
+
+    #[test]
+    fn capacity_five_segment_splits() {
+        // capacity=5: window=1, probation=3, protected=1.
+        // First capacity where all three segments are non-zero.
+        let store = MemoryBlobStore::new();
+        let cs = ContentStore::new(store, 5);
+        assert_eq!(cs.window.capacity(), 1);
+        assert_eq!(cs.probation.capacity(), 3);
+        assert_eq!(cs.protected.capacity(), 1);
     }
 
     #[test]
