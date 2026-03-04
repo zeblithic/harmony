@@ -287,7 +287,7 @@ impl<B: BlobStore> NodeRuntime<B> {
         let after_prefix = key_expr
             .strip_prefix(content_ns::PREFIX)?
             .strip_prefix('/')?;
-        let cid_hex = after_prefix.get(2..)?; // skip shard char + "/"
+        let (_shard, cid_hex) = after_prefix.split_once('/')?;
         let cid_bytes: [u8; 32] = hex::decode(cid_hex).ok()?.try_into().ok()?;
         let cid = ContentId::from_bytes(cid_bytes);
         Some(StorageTierEvent::ContentQuery { query_id, cid })
