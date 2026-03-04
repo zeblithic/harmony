@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 
 use crate::blob::BlobStore;
 use crate::cid::ContentId;
@@ -19,6 +20,29 @@ use crate::sketch::CountMinSketch;
 /// only if its estimated frequency exceeds the victim's. On cache hits,
 /// probation entries are promoted to protected; protected entries are touched
 /// in place.
+///
+/// ## Pin Scope Limitation
+///
+/// Pin checking currently only covers the **admission challenge** path
+/// (window→probation eviction). Two other eviction paths do **not** check
+/// pins:
+///
+/// 1. **Window eviction:** When the window segment overflows, the tail is
+///    evicted unconditionally and sent to the admission challenge. If a pinned
+///    CID is the window tail, it will be evicted from window — but it survives
+///    because `admission_challenge` always admits pinned candidates.
+///
+/// 2. **Protected→probation demotion:** When a probation item is promoted to
+///    protected and protected overflows, the protected tail is demoted back to
+///    probation unconditionally. A pinned CID in protected can be demoted to
+///    probation, but it remains tracked (not lost).
+///
+/// In both cases, pinned CIDs are never fully dropped from the cache — they
+/// just move between segments. However, when `store_remove` gets a real
+/// implementation (backing store cleanup on eviction), any eviction path that
+/// doesn't check pins could incorrectly remove backing data for a pinned CID.
+/// Before implementing `store_remove`, all eviction paths must be audited to
+/// skip pinned CIDs.
 pub struct ContentStore<S: BlobStore> {
     store: S,
     sketch: CountMinSketch,
@@ -26,6 +50,18 @@ pub struct ContentStore<S: BlobStore> {
     probation: Lru,
     protected: Lru,
     pinned: HashSet<ContentId>,
+}
+
+impl<S: BlobStore> fmt::Debug for ContentStore<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContentStore")
+            .field("sketch", &self.sketch)
+            .field("window", &self.window)
+            .field("probation", &self.probation)
+            .field("protected", &self.protected)
+            .field("pinned_count", &self.pinned.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S: BlobStore> ContentStore<S> {
@@ -270,6 +306,12 @@ impl<S: BlobStore> ContentStore<S> {
     ///
     /// No-op for now: `MemoryBlobStore` does not support removal. The CID is
     /// no longer tracked by the cache but data stays in the store.
+    ///
+    /// **WARNING:** Before implementing this, audit ALL eviction paths to check
+    /// pins. Currently only `admission_challenge` checks the pinned set.
+    /// Window eviction and protected→probation demotion do not. A real
+    /// `store_remove` on those paths would destroy backing data for pinned CIDs.
+    /// See the "Pin Scope Limitation" section on [`ContentStore`].
     fn store_remove(&mut self, _cid: &ContentId) {
         // No-op — backing store removal not yet supported.
     }
@@ -300,6 +342,23 @@ impl<S: BlobStore> BlobStore for ContentStore<S> {
 mod tests {
     use super::*;
     use crate::blob::MemoryBlobStore;
+
+    #[test]
+    fn debug_impl_shows_summary() {
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 100);
+        let cid = cs.insert(b"test").unwrap();
+        cs.pin(cid);
+        let dbg = format!("{cs:?}");
+        assert!(dbg.contains("ContentStore"));
+        assert!(dbg.contains("sketch:"), "sketch field should appear");
+        assert!(dbg.contains("CountMinSketch"));
+        assert!(dbg.contains("window:"), "window Lru field should appear");
+        assert!(dbg.contains("probation:"), "probation Lru field should appear");
+        assert!(dbg.contains("protected:"), "protected Lru field should appear");
+        assert!(dbg.contains("Lru"), "Lru Debug impl should be used for segments");
+        assert!(dbg.contains("pinned_count: 1, .."), "should use finish_non_exhaustive()");
+    }
 
     #[test]
     fn content_store_implements_blobstore() {

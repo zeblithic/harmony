@@ -5,6 +5,8 @@
 //! byte: the high nibble holds even-indexed counters and the low nibble holds
 //! odd-indexed counters.
 
+use std::fmt;
+
 use crate::cid::ContentId;
 
 /// Number of independent hash rows in the sketch.
@@ -34,6 +36,16 @@ pub struct CountMinSketch {
     total_increments: u64,
     /// When `total_increments` reaches this threshold, all counters are halved.
     halving_threshold: u64,
+}
+
+impl fmt::Debug for CountMinSketch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountMinSketch")
+            .field("width", &self.width)
+            .field("total_increments", &self.total_increments)
+            .field("halving_threshold", &self.halving_threshold)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CountMinSketch {
@@ -163,6 +175,16 @@ mod tests {
 
     fn make_cid(i: usize) -> ContentId {
         ContentId::for_blob(format!("sketch-test-{i}").as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn debug_impl_shows_summary() {
+        let sketch = CountMinSketch::new(256, 10_000);
+        let dbg = format!("{sketch:?}");
+        assert!(dbg.contains("width: 256"));
+        assert!(dbg.contains("total_increments: 0"));
+        assert!(dbg.contains("halving_threshold: 10000"));
+        assert!(dbg.contains(".."), "should use finish_non_exhaustive()");
     }
 
     #[test]
