@@ -7,7 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 description = "WASM compute engine with cooperative yielding for the Harmony decentralized stack"
 
+[features]
+default = []
+wasmtime = ["dep:wasmtime"]
+
 [dependencies]
 harmony-crypto.workspace = true
 thiserror.workspace = true
 wasmi = { workspace = true }
+wasmtime = { workspace = true, optional = true }

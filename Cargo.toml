@@ -42,6 +42,7 @@ hex = "0.4"
 
 # WASM runtime
 wasmi = "1"
+wasmtime = "38"
 
 # Internal crates
 harmony-compute = { path = "crates/harmony-compute" }
