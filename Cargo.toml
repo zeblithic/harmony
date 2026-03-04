@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/harmony-compute",
     "crates/harmony-content",
     "crates/harmony-crypto",
     "crates/harmony-identity",
@@ -39,7 +40,11 @@ thiserror = "2"
 rmp = "0.8"
 hex = "0.4"
 
+# WASM runtime
+wasmi = "1"
+
 # Internal crates
+harmony-compute = { path = "crates/harmony-compute" }
 harmony-content = { path = "crates/harmony-content" }
 harmony-crypto = { path = "crates/harmony-crypto" }
 harmony-identity = { path = "crates/harmony-identity" }
