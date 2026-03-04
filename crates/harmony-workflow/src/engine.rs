@@ -435,10 +435,13 @@ impl WorkflowEngine {
                         state.status = WorkflowStatus::Failed;
                     }
                     self.active = None;
-                    return vec![WorkflowAction::WorkflowFailed {
-                        workflow_id: wf_id,
-                        error: error.to_string(),
-                    }];
+                    return vec![
+                        WorkflowAction::WorkflowFailed {
+                            workflow_id: wf_id,
+                            error: error.to_string(),
+                        },
+                        WorkflowAction::PersistHistory { workflow_id: wf_id },
+                    ];
                 }
                 ComputeResult::NeedsIO { request } => {
                     let IORequest::FetchContent { cid } = request;
