@@ -3,9 +3,15 @@
 // Types defined here are consumed by later tasks in this binary crate.
 #![allow(dead_code)]
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use harmony_content::storage_tier::StorageBudget;
+use harmony_content::blob::BlobStore;
+use harmony_content::storage_tier::{
+    StorageBudget, StorageMetrics, StorageTier, StorageTierAction, StorageTierEvent,
+};
+use harmony_reticulum::node::{Node, NodeEvent};
+use harmony_zenoh::queryable::{QueryableId, QueryableRouter};
 
 /// Configuration for a Harmony node runtime.
 #[derive(Debug, Clone)]
@@ -64,6 +70,87 @@ pub enum RuntimeAction {
     Subscribe { key_expr: String },
 }
 
+/// Sans-I/O node runtime wiring Tier 1 (Router) and Tier 2 (Storage).
+///
+/// Events are pushed via [`push_event`](Self::push_event) into internal
+/// priority queues. Each [`tick`](Self::tick) drains ALL Tier 1 events
+/// before processing ONE Tier 2 event — the router is never starved.
+pub struct NodeRuntime<B: BlobStore> {
+    // Tier 1: Reticulum packet router
+    router: Node,
+    // Tier 1/2: Zenoh query dispatch
+    queryable_router: QueryableRouter,
+    // Tier 2: Content storage
+    storage: StorageTier<B>,
+    // Internal priority queues
+    router_queue: VecDeque<NodeEvent>,
+    storage_queue: VecDeque<StorageTierEvent>,
+    // Queryable IDs belonging to the storage tier
+    storage_queryable_ids: HashSet<QueryableId>,
+}
+
+impl<B: BlobStore> NodeRuntime<B> {
+    /// Construct a new node runtime, returning startup actions the caller
+    /// must execute (queryable declarations, subscriptions).
+    pub fn new(config: NodeConfig, store: B) -> (Self, Vec<RuntimeAction>) {
+        let router = Node::new();
+        let mut queryable_router = QueryableRouter::new();
+
+        let (storage, storage_startup) = StorageTier::new(store, config.storage_budget);
+
+        let mut actions = Vec::new();
+        let mut storage_queryable_ids = HashSet::new();
+
+        // Process storage startup actions: register queryables and subscriptions
+        for action in storage_startup {
+            match action {
+                StorageTierAction::DeclareQueryables { key_exprs } => {
+                    for key_expr in &key_exprs {
+                        if let Ok((qid, _qactions)) = queryable_router.declare(key_expr) {
+                            storage_queryable_ids.insert(qid);
+                            actions.push(RuntimeAction::DeclareQueryable {
+                                key_expr: key_expr.clone(),
+                            });
+                        }
+                    }
+                }
+                StorageTierAction::DeclareSubscribers { key_exprs } => {
+                    for key_expr in key_exprs {
+                        actions.push(RuntimeAction::Subscribe { key_expr });
+                    }
+                }
+                _ => {} // other startup actions not expected
+            }
+        }
+
+        let rt = Self {
+            router,
+            queryable_router,
+            storage,
+            router_queue: VecDeque::new(),
+            storage_queue: VecDeque::new(),
+            storage_queryable_ids,
+        };
+
+        (rt, actions)
+    }
+
+    /// Read-only access to storage metrics.
+    pub fn metrics(&self) -> &StorageMetrics {
+        self.storage.metrics()
+    }
+
+    /// Number of pending Tier 1 (router) events.
+    pub fn router_queue_len(&self) -> usize {
+        self.router_queue.len()
+    }
+
+    /// Number of pending Tier 2 (storage) events.
+    pub fn storage_queue_len(&self) -> usize {
+        self.storage_queue.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +200,46 @@ mod tests {
     fn node_config_defaults() {
         let config = NodeConfig::default();
         assert_eq!(config.storage_budget.cache_capacity, 1024);
+    }
+
+    use harmony_content::blob::MemoryBlobStore;
+
+    fn make_runtime() -> (NodeRuntime<MemoryBlobStore>, Vec<RuntimeAction>) {
+        let config = NodeConfig::default();
+        NodeRuntime::new(config, MemoryBlobStore::new())
+    }
+
+    #[test]
+    fn constructor_returns_startup_actions() {
+        let (_, actions) = make_runtime();
+
+        let queryable_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::DeclareQueryable { .. }))
+            .count();
+        let subscribe_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::Subscribe { .. }))
+            .count();
+
+        // 16 shard queryables + 1 stats queryable = 17
+        assert_eq!(queryable_count, 17);
+        // transit + publish subscriptions = 2
+        assert_eq!(subscribe_count, 2);
+    }
+
+    #[test]
+    fn metrics_start_at_zero() {
+        let (rt, _) = make_runtime();
+        let m = rt.metrics();
+        assert_eq!(m.queries_served, 0);
+        assert_eq!(m.cache_hits, 0);
+    }
+
+    #[test]
+    fn queues_start_empty() {
+        let (rt, _) = make_runtime();
+        assert_eq!(rt.router_queue_len(), 0);
+        assert_eq!(rt.storage_queue_len(), 0);
     }
 }
