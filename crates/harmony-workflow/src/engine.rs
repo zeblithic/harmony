@@ -173,14 +173,25 @@ impl WorkflowEngine {
 
     /// Remove a completed or failed workflow from the engine.
     ///
-    /// Returns `true` if the workflow was removed. Only removes workflows in
-    /// terminal states (`Complete` or `Failed`) — active workflows are not
-    /// removable. The caller should invoke this after persisting the history
-    /// and dispatching all replies to prevent unbounded memory growth.
-    pub fn remove_workflow(&mut self, id: &WorkflowId) -> bool {
-        match self.workflows.get(id).map(|s| &s.status) {
-            Some(WorkflowStatus::Complete | WorkflowStatus::Failed) => {
-                self.workflows.remove(id);
+    /// Strip heavy data from a terminal workflow while preserving its entry
+    /// for dedup. Only compacts workflows in terminal states (`Complete` or
+    /// `Failed`). The caller should invoke this after persisting the history
+    /// and dispatching all replies to limit memory growth.
+    ///
+    /// The workflow entry is retained (with status + completed_output) so that
+    /// duplicate submissions return the cached result instead of re-executing.
+    pub fn compact_workflow(&mut self, id: &WorkflowId) -> bool {
+        match self.workflows.get_mut(id) {
+            Some(state)
+                if state.status == WorkflowStatus::Complete
+                    || state.status == WorkflowStatus::Failed =>
+            {
+                state.module_bytes = None;
+                state.saved_session = None;
+                state.replay_cache.clear();
+                state.history.events.clear();
+                state.history.input.clear();
+                state.deferred_io = None;
                 true
             }
             _ => false,
@@ -233,7 +244,7 @@ impl WorkflowEngine {
                 module_hash: history.module_hash,
                 input: history.input.clone(),
                 events: Vec::new(), // Fresh event log for this execution
-                total_fuel_consumed: 0,
+                total_fuel_consumed: history.total_fuel_consumed,
             },
             hint: ComputeHint::PreferLocal,
             module_bytes: Some(module_bytes),

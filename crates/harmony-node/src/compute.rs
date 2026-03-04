@@ -7,9 +7,6 @@
 //! of using `ComputeTier` directly. This module is retained for its own unit tests
 //! and the WAT test constants referenced by runtime integration tests.
 
-// Non-test items are used only by this module's own #[cfg(test)] tests.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -18,6 +15,7 @@ use harmony_compute::{ComputeRuntime, InstructionBudget};
 // ── Events (inbound) ──────────────────────────────────────────────────
 
 /// Inbound events for the compute tier.
+#[allow(dead_code)] // Used by this module's own #[cfg(test)] tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComputeTierEvent {
     /// Execute an inline WASM module with the given input.
@@ -48,6 +46,7 @@ pub enum ComputeTierEvent {
 ///
 /// Wire format encoding (`[0x00]` success / `[0x01]` error tags) is fully
 /// handled inside [`ComputeTier`] — `SendReply` payloads are opaque to callers.
+#[allow(dead_code)] // Used by this module's own #[cfg(test)] tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComputeTierAction {
     /// Send a computation result (success or error) back to the querier.
@@ -61,7 +60,7 @@ pub enum ComputeTierAction {
 
 // ── Internal types (private) ──────────────────────────────────────────
 
-/// A compute task waiting in the queue.
+#[allow(dead_code)]
 enum ComputeTask {
     /// Module bytes are available; ready to execute.
     /// Module uses `Arc` so that multiple tasks waiting for the same CID
@@ -87,7 +86,7 @@ enum ComputeTask {
     },
 }
 
-/// Tracks the currently executing computation.
+#[allow(dead_code)]
 struct ActiveExecution {
     query_id: u64,
 }
@@ -98,6 +97,7 @@ struct ActiveExecution {
 ///
 /// Wraps a [`WasmiRuntime`] with a task queue. The caller feeds events
 /// via [`handle`](Self::handle) and drives execution via [`tick`](Self::tick).
+#[allow(dead_code)] // Used by this module's own #[cfg(test)] tests.
 pub struct ComputeTier {
     runtime: Box<dyn ComputeRuntime>,
     queue: VecDeque<ComputeTask>,
@@ -105,6 +105,7 @@ pub struct ComputeTier {
     budget: InstructionBudget,
 }
 
+#[allow(dead_code)]
 impl ComputeTier {
     /// Create a new compute tier with the given per-slice instruction budget.
     pub fn new(runtime: Box<dyn ComputeRuntime>, budget: InstructionBudget) -> Self {

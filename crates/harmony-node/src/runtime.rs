@@ -121,8 +121,8 @@ pub struct NodeRuntime<B: BlobStore> {
     compute_queryable_ids: HashSet<QueryableId>,
     // Pending workflow actions buffered between push_event and tick
     pending_workflow_actions: Vec<WorkflowAction>,
-    // Direct runtime actions buffered from push_event (e.g., error replies for module fetch failures)
-    pending_direct_replies: Vec<RuntimeAction>,
+    // Direct runtime actions buffered from push_event (error replies, module fetches, etc.)
+    pending_direct_actions: Vec<RuntimeAction>,
     // Maps WorkflowId -> query_ids for reply routing (multiple callers may
     // submit the same module+input; the engine deduplicates but all callers
     // need a reply).
@@ -191,7 +191,7 @@ impl<B: BlobStore> NodeRuntime<B> {
             storage_queryable_ids,
             compute_queryable_ids,
             pending_workflow_actions: Vec::new(),
-            pending_direct_replies: Vec::new(),
+            pending_direct_actions: Vec::new(),
             workflow_to_query: HashMap::new(),
             cid_to_query: HashMap::new(),
         };
@@ -281,7 +281,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                                 let error_msg = format!("module not found: {}", hex::encode(cid));
                                 let mut payload = vec![0x01];
                                 payload.extend_from_slice(error_msg.as_bytes());
-                                self.pending_direct_replies
+                                self.pending_direct_actions
                                     .push(RuntimeAction::SendReply { query_id, payload });
                             }
                         }
@@ -323,7 +323,7 @@ impl<B: BlobStore> NodeRuntime<B> {
         }
 
         // Tier 3: emit any direct replies buffered from push_event
-        actions.append(&mut self.pending_direct_replies);
+        actions.append(&mut self.pending_direct_actions);
 
         // Tier 3: dispatch any pending workflow actions, then one compute slice (lowest priority)
         let pending = std::mem::take(&mut self.pending_workflow_actions);
@@ -378,7 +378,7 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// Route a compute query by parsing its payload and submitting to the workflow engine.
     ///
     /// Returns `WorkflowAction`s to be buffered as pending. For CID-based requests,
-    /// also emits `FetchModule` as a direct action (stored in `pending_direct_replies`).
+    /// also emits `FetchModule` as a direct action (stored in `pending_direct_actions`).
     fn route_compute_query(
         &mut self,
         query_id: u64,
@@ -390,7 +390,7 @@ impl<B: BlobStore> NodeRuntime<B> {
             None => {
                 let mut payload = vec![0x01];
                 payload.extend_from_slice(b"malformed compute payload");
-                self.pending_direct_replies
+                self.pending_direct_actions
                     .push(RuntimeAction::SendReply { query_id, payload });
                 return Vec::new();
             }
@@ -418,7 +418,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                     .or_default()
                     .push((query_id, input));
                 if !already_pending {
-                    self.pending_direct_replies
+                    self.pending_direct_actions
                         .push(RuntimeAction::FetchContent { cid: module_cid });
                 }
                 Vec::new()
@@ -452,8 +452,8 @@ impl<B: BlobStore> NodeRuntime<B> {
                             });
                         }
                     }
-                    // Clean up engine state to prevent unbounded memory growth.
-                    self.workflow.remove_workflow(&workflow_id);
+                    // Compact engine state: strip heavy data, keep dedup entry.
+                    self.workflow.compact_workflow(&workflow_id);
                 }
                 WorkflowAction::WorkflowFailed { workflow_id, error } => {
                     if let Some(query_ids) = self.workflow_to_query.remove(&workflow_id) {
@@ -466,7 +466,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                             });
                         }
                     }
-                    self.workflow.remove_workflow(&workflow_id);
+                    self.workflow.compact_workflow(&workflow_id);
                 }
                 WorkflowAction::FetchContent { cid, .. } => {
                     out.push(RuntimeAction::FetchContent { cid });
