@@ -22,6 +22,9 @@ enum Commands {
         /// W-TinyLFU cache capacity (number of items)
         #[arg(long, default_value_t = 1024)]
         cache_capacity: usize,
+        /// WASM compute fuel budget per tick
+        #[arg(long, default_value_t = 100_000)]
+        compute_budget: u64,
     },
 }
 
@@ -128,8 +131,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
-        Commands::Run { cache_capacity } => {
+        Commands::Run {
+            cache_capacity,
+            compute_budget,
+        } => {
             use crate::runtime::{NodeConfig, NodeRuntime, RuntimeAction};
+            use harmony_compute::InstructionBudget;
             use harmony_content::blob::MemoryBlobStore;
             use harmony_content::storage_tier::StorageBudget;
 
@@ -138,14 +145,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     cache_capacity,
                     max_pinned_bytes: 100_000_000,
                 },
-                ..NodeConfig::default()
+                compute_budget: InstructionBudget {
+                    fuel: compute_budget,
+                },
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 
             println!("Harmony node runtime initialized");
-            println!("  Cache capacity: {cache_capacity} items");
-            println!("  Router queue:   {} pending", rt.router_queue_len());
-            println!("  Storage queue:  {} pending", rt.storage_queue_len());
+            println!("  Cache capacity:   {cache_capacity} items");
+            println!("  Compute budget:   {compute_budget} fuel/tick");
+            println!("  Router queue:     {} pending", rt.router_queue_len());
+            println!("  Storage queue:    {} pending", rt.storage_queue_len());
+            println!("  Compute queue:    {} pending", rt.compute_queue_len());
             println!("\nStartup actions:");
             for action in &startup_actions {
                 match action {
@@ -184,6 +195,16 @@ mod tests {
     fn cli_parses_run_command() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
         assert!(matches!(cli.command, Commands::Run { .. }));
+    }
+
+    #[test]
+    fn cli_parses_run_with_compute_budget() {
+        let cli = Cli::try_parse_from(["harmony", "run", "--compute-budget", "50000"]).unwrap();
+        if let Commands::Run { compute_budget, .. } = cli.command {
+            assert_eq!(compute_budget, 50000);
+        } else {
+            panic!("expected Run command");
+        }
     }
 
     #[test]
