@@ -282,6 +282,11 @@ impl<B: BlobStore> NodeRuntime<B> {
         self.workflow.workflow_count()
     }
 
+    /// Current starvation counters (router, storage, compute).
+    pub fn starvation_counters(&self) -> (u32, u32, u32) {
+        (self.router_starved, self.storage_starved, self.compute_starved)
+    }
+
     /// Calculate the effective compute fuel budget based on data-plane queue depth.
     ///
     /// At zero depth, returns the full base budget. As combined queue depth
@@ -386,50 +391,71 @@ impl<B: BlobStore> NodeRuntime<B> {
     }
 
     /// Run one iteration of the priority event loop.
-    /// 1. Drain Tier 1 (router) events, up to `router_max_per_tick` if set.
-    /// 2. Drain Tier 2 (storage) events, up to `storage_max_per_tick` if set.
-    /// 3. Dispatch pending workflow actions, then run ONE Tier 3 compute slice.
     ///
+    /// Default order: Router → Storage → Compute. When a tier's starvation
+    /// counter reaches the configured threshold, it is promoted to the front
+    /// of the processing order for that tick.
+    ///
+    /// Within each tier, at most `max_per_tick` events are drained (if set).
     /// When limits are `None` (the default), all queued events are drained.
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
         let mut actions = Vec::new();
+        let threshold = self.schedule.starvation_threshold;
 
-        // Tier 1: drain router events (up to max_per_tick if set)
-        let router_limit = self.schedule.router_max_per_tick.unwrap_or(usize::MAX);
-        let mut router_processed = 0;
-        while router_processed < router_limit {
-            match self.router_queue.pop_front() {
-                Some(event) => {
-                    let node_actions = self.router.handle_event(event);
-                    self.dispatch_router_actions(node_actions, &mut actions);
-                    router_processed += 1;
+        // Determine tier order: promote starved tiers to front.
+        // Default order: [0=Router, 1=Storage, 2=Compute]
+        let mut order = [0u8, 1, 2];
+        let starved = [self.router_starved, self.storage_starved, self.compute_starved];
+        // Stable sort: starved tiers (>= threshold) move to front, preserving original priority order
+        order.sort_by_key(|&tier| if starved[tier as usize] >= threshold { 0 } else { 1 });
+
+        for &tier in &order {
+            match tier {
+                0 => {
+                    // Tier 1: Router
+                    let limit = self.schedule.router_max_per_tick.unwrap_or(usize::MAX);
+                    let mut processed = 0;
+                    while processed < limit {
+                        match self.router_queue.pop_front() {
+                            Some(event) => {
+                                let node_actions = self.router.handle_event(event);
+                                self.dispatch_router_actions(node_actions, &mut actions);
+                                processed += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    if processed > 0 { self.router_starved = 0; } else { self.router_starved += 1; }
                 }
-                None => break,
+                1 => {
+                    // Tier 2: Storage
+                    let limit = self.schedule.storage_max_per_tick.unwrap_or(usize::MAX);
+                    let mut processed = 0;
+                    while processed < limit {
+                        match self.storage_queue.pop_front() {
+                            Some(event) => {
+                                let storage_actions = self.storage.handle(event);
+                                self.dispatch_storage_actions(storage_actions, &mut actions);
+                                processed += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    if processed > 0 { self.storage_starved = 0; } else { self.storage_starved += 1; }
+                }
+                2 => {
+                    // Tier 3: Compute — emit direct replies, dispatch pending workflow actions, tick
+                    actions.append(&mut self.pending_direct_actions);
+                    let pending = std::mem::take(&mut self.pending_workflow_actions);
+                    self.dispatch_workflow_actions(pending, &mut actions);
+                    let workflow_actions = self.workflow.tick();
+                    let had_work = !workflow_actions.is_empty();
+                    self.dispatch_workflow_actions(workflow_actions, &mut actions);
+                    if had_work { self.compute_starved = 0; } else { self.compute_starved += 1; }
+                }
+                _ => unreachable!(),
             }
         }
-
-        // Tier 2: drain storage events (up to max_per_tick if set)
-        let storage_limit = self.schedule.storage_max_per_tick.unwrap_or(usize::MAX);
-        let mut storage_processed = 0;
-        while storage_processed < storage_limit {
-            match self.storage_queue.pop_front() {
-                Some(event) => {
-                    let storage_actions = self.storage.handle(event);
-                    self.dispatch_storage_actions(storage_actions, &mut actions);
-                    storage_processed += 1;
-                }
-                None => break,
-            }
-        }
-
-        // Tier 3: emit any direct replies buffered from push_event
-        actions.append(&mut self.pending_direct_actions);
-
-        // Tier 3: dispatch any pending workflow actions, then one compute slice (lowest priority)
-        let pending = std::mem::take(&mut self.pending_workflow_actions);
-        self.dispatch_workflow_actions(pending, &mut actions);
-        let workflow_actions = self.workflow.tick();
-        self.dispatch_workflow_actions(workflow_actions, &mut actions);
 
         actions
     }
@@ -1366,5 +1392,76 @@ mod tests {
             .filter(|a| matches!(a, RuntimeAction::SendReply { .. }))
             .count();
         assert_eq!(reply_count, 1);
+    }
+
+    // ── Starvation tracking tests ─────────────────────────────────
+
+    #[test]
+    fn starvation_counters_track_idle_ticks() {
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(1);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // No events at all → all tiers idle
+        rt.tick();
+        assert_eq!(rt.starvation_counters(), (1, 1, 1));
+
+        // Push router event only
+        rt.push_event(RuntimeEvent::TimerTick { now: 1000 });
+        rt.tick();
+        // Router processed → reset to 0. Storage/compute still idle → increment.
+        assert_eq!(rt.starvation_counters(), (0, 2, 2));
+
+        // Push storage event only
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 1,
+            key_expr: "harmony/content/stats".into(),
+            payload: vec![],
+        });
+        rt.tick();
+        // Router idle → 1. Storage processed → 0. Compute still idle → 3.
+        assert_eq!(rt.starvation_counters(), (1, 0, 3));
+    }
+
+    #[test]
+    fn starvation_promotes_starved_tier() {
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(1);
+        config.schedule.starvation_threshold = 3;
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Push many router events but no storage events
+        for i in 0..10 {
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+        }
+
+        // Also push 1 storage event
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 50,
+            key_expr: "harmony/content/stats".into(),
+            payload: vec![],
+        });
+
+        // Tick 1: router=1, storage=1 (processes the stats query)
+        let actions = rt.tick();
+        assert!(actions.iter().any(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. })));
+
+        rt.tick(); // tick 2: router=1, storage=0 (starved=1)
+        rt.tick(); // tick 3: router=1, storage=0 (starved=2)
+        rt.tick(); // tick 4: router=1, storage=0 (starved=3 → threshold hit)
+
+        // Now push a storage event — it should be promoted ahead of router
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 60,
+            key_expr: "harmony/content/stats".into(),
+            payload: vec![],
+        });
+
+        // Tick 5: storage should be promoted and process its event
+        let actions = rt.tick();
+        assert!(
+            actions.iter().any(|a| matches!(a, RuntimeAction::SendReply { query_id: 60, .. })),
+            "starved storage tier should be promoted and process its event"
+        );
     }
 }
