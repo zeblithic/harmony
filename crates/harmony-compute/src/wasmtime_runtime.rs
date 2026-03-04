@@ -15,8 +15,6 @@ use crate::types::{Checkpoint, ComputeResult, InstructionBudget};
 ///
 /// When a WASM module calls `harmony.fetch_content`, the host function
 /// stores the IO request and write target here before trapping.
-/// Fields used by Tasks 4-5 when host functions are registered.
-#[allow(dead_code)]
 struct HostState {
     /// Cached IO responses keyed by CID (for deterministic replay).
     io_cache: HashMap<[u8; 32], Vec<u8>>,
@@ -44,18 +42,20 @@ impl HostState {
 /// Unlike WasmiRuntime, wasmtime does not support resumable calls, so we
 /// store enough information to re-execute the module from scratch with
 /// accumulated IO cache state.
-/// Fields used by Tasks 4-5 for deterministic replay with IO cache.
-#[allow(dead_code)]
 struct WasmtimeSession {
     /// Original module bytes (needed for re-execution on replay).
+    #[allow(dead_code)] // Read by Task 5 (resume_with_io).
     module_bytes: Vec<u8>,
     /// BLAKE3 hash of the module bytes.
     module_hash: [u8; 32],
     /// Original input bytes (needed for re-execution on replay).
+    #[allow(dead_code)] // Read by Task 5 (resume_with_io).
     input: Vec<u8>,
     /// Cached IO responses from prior rounds.
+    #[allow(dead_code)] // Read by Task 5 (resume_with_io).
     io_cache: HashMap<[u8; 32], Vec<u8>>,
     /// CIDs that returned not-found in prior rounds.
+    #[allow(dead_code)] // Read by Task 5 (resume_with_io).
     not_found_cids: HashSet<[u8; 32]>,
     /// Total fuel consumed across all execution slices.
     total_fuel_consumed: u64,
@@ -131,8 +131,57 @@ impl WasmtimeRuntime {
             );
         }
 
-        // Set up Linker — no host functions registered in Task 3.
-        let linker = wasmtime::Linker::new(&self.engine);
+        // Set up Linker with host function imports.
+        let mut linker = wasmtime::Linker::new(&self.engine);
+        linker
+            .func_wrap(
+                "harmony",
+                "fetch_content",
+                |mut caller: wasmtime::Caller<'_, HostState>,
+                 cid_ptr: i32,
+                 out_ptr: i32,
+                 out_cap: i32|
+                 -> Result<i32, wasmtime::Error> {
+                    // Read 32-byte CID from WASM memory.
+                    let memory = caller
+                        .get_export("memory")
+                        .and_then(|e| e.into_memory())
+                        .ok_or_else(|| wasmtime::Error::msg("missing exported memory"))?;
+
+                    let mut cid = [0u8; 32];
+                    memory
+                        .read(&caller, cid_ptr as usize, &mut cid)
+                        .map_err(|e| wasmtime::Error::msg(format!("failed to read CID: {e}")))?;
+
+                    // Check not_found_cids first — known-missing CIDs return -1 immediately.
+                    if caller.data().not_found_cids.contains(&cid) {
+                        return Ok(-1);
+                    }
+
+                    // Check the IO cache for this CID.
+                    if let Some(data) = caller.data().io_cache.get(&cid).cloned() {
+                        // Cache hit — write data to output buffer.
+                        if data.len() > out_cap as usize {
+                            return Ok(-2); // Buffer too small.
+                        }
+                        memory
+                            .write(&mut caller, out_ptr as usize, &data)
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("failed to write data: {e}"))
+                            })?;
+                        return Ok(data.len() as i32);
+                    }
+
+                    // Cache miss — store IO request and trap.
+                    let host = caller.data_mut();
+                    host.io_request =
+                        Some(crate::types::IORequest::FetchContent { cid });
+                    host.io_write_target = Some((out_ptr as u32, out_cap as u32));
+
+                    Err(wasmtime::Error::msg("harmony_io_trap"))
+                },
+            )
+            .expect("failed to register harmony.fetch_content");
 
         // Instantiate the module.
         let instance = match linker.instantiate(&mut store, &module) {
@@ -275,23 +324,28 @@ impl WasmtimeRuntime {
                 )
             }
             Err(e) => {
-                // When fuel runs out, wasmtime returns an error (not a resumable state).
-                // We report this as a Failed result.
                 let remaining_fuel = store.get_fuel().unwrap_or(0);
                 let fuel_consumed = budget.fuel.saturating_sub(remaining_fuel);
-
-                // Capture memory snapshot even on failure (for diagnostics).
                 let mem_snapshot = memory.data(&store).to_vec();
                 let host_data = store.into_data();
 
-                (
-                    ComputeResult::Failed {
-                        error: ComputeError::Trap {
-                            reason: e.to_string(),
+                if let Some(io_request) = host_data.io_request.clone() {
+                    // Host function trapped with an IO request — NeedsIO.
+                    (
+                        ComputeResult::NeedsIO { request: io_request },
+                        Some((host_data, fuel_consumed, mem_snapshot)),
+                    )
+                } else {
+                    // Genuine error (fuel exhaustion, trap, etc.)
+                    (
+                        ComputeResult::Failed {
+                            error: ComputeError::Trap {
+                                reason: e.to_string(),
+                            },
                         },
-                    },
-                    Some((host_data, fuel_consumed, mem_snapshot)),
-                )
+                        Some((host_data, fuel_consumed, mem_snapshot)),
+                    )
+                }
             }
         }
     }
@@ -322,6 +376,12 @@ impl ComputeRuntime for WasmtimeRuntime {
 
         // Store session for snapshot/take_session regardless of outcome.
         if let Some((host_data, fuel_consumed, mem_snapshot)) = session_data {
+            let pending_cid = match &result {
+                ComputeResult::NeedsIO { request } => match request {
+                    crate::types::IORequest::FetchContent { cid } => Some(*cid),
+                },
+                _ => None,
+            };
             self.session = Some(WasmtimeSession {
                 module_bytes: module_bytes.to_vec(),
                 module_hash,
@@ -329,7 +389,7 @@ impl ComputeRuntime for WasmtimeRuntime {
                 io_cache: host_data.io_cache,
                 not_found_cids: host_data.not_found_cids,
                 total_fuel_consumed: fuel_consumed,
-                pending_cid: None,
+                pending_cid,
                 memory_snapshot: mem_snapshot,
             });
         }
@@ -357,9 +417,9 @@ impl ComputeRuntime for WasmtimeRuntime {
     }
 
     fn has_pending(&self) -> bool {
-        // Wasmtime does not support cooperative yielding, so there is never
-        // a pending execution.
-        false
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.pending_cid.is_some())
     }
 
     fn take_session(&mut self) -> Option<Box<dyn std::any::Any>> {
@@ -524,7 +584,53 @@ mod tests {
 
         assert!(
             !rt.has_pending(),
-            "has_pending() should always be false for wasmtime"
+            "has_pending() should be false after complete"
         );
+    }
+
+    /// WAT module that calls harmony.fetch_content — same ABI as wasmi tests.
+    /// Input: [cid: 32 bytes]
+    /// Output: [result_code: i32 LE] [fetched_data if result > 0]
+    const FETCH_WAT: &str = r#"
+        (module
+          (import "harmony" "fetch_content" (func $fetch (param i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+            (local $result i32)
+            (local $out_ptr i32)
+            (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+            (local.set $result
+              (call $fetch
+                (local.get $input_ptr)
+                (i32.add (local.get $out_ptr) (i32.const 4))
+                (i32.const 1024)))
+            (i32.store (local.get $out_ptr) (local.get $result))
+            (if (result i32) (i32.gt_s (local.get $result) (i32.const 0))
+              (then (i32.add (i32.const 4) (local.get $result)))
+              (else (i32.const 4)))))
+    "#;
+
+    #[test]
+    fn host_function_triggers_needs_io() {
+        let mut rt = WasmtimeRuntime::new().expect("engine creation");
+        let cid = [0xAB; 32];
+
+        let result = rt.execute(
+            FETCH_WAT.as_bytes(),
+            &cid,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+
+        match result {
+            ComputeResult::NeedsIO { request } => match request {
+                crate::types::IORequest::FetchContent { cid: req_cid } => {
+                    assert_eq!(req_cid, cid, "requested CID should match input");
+                }
+            },
+            other => panic!("expected NeedsIO, got: {other:?}"),
+        }
+
+        // After NeedsIO, has_pending should be true.
+        assert!(rt.has_pending(), "should have pending after NeedsIO");
     }
 }
