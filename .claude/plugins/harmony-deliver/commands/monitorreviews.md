@@ -132,4 +132,6 @@ State:     <REVIEWS_PENDING|BUGBOT_STUCK|REVIEWS_COMPLETE_WITH_FEEDBACK|REVIEWS_
 Action:    <what to do next>
 ```
 
+If the state is REVIEWS_PENDING or PARTIAL_REVIEWS, suggest: "While waiting for reviews, this is a good time to `/compact` if context is getting long."
+
 **STOP HERE. Report the state and recommended action, then yield to the human.**
