@@ -7,11 +7,13 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use harmony_content::blob::BlobStore;
+use harmony_content::cid::ContentId;
 use harmony_content::storage_tier::{
     StorageBudget, StorageMetrics, StorageTier, StorageTierAction, StorageTierEvent,
 };
-use harmony_reticulum::node::{Node, NodeEvent};
-use harmony_zenoh::queryable::{QueryableId, QueryableRouter};
+use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
+use harmony_zenoh::namespace::content as content_ns;
+use harmony_zenoh::queryable::{QueryableAction, QueryableEvent, QueryableId, QueryableRouter};
 
 /// Configuration for a Harmony node runtime.
 #[derive(Debug, Clone)]
@@ -149,6 +151,157 @@ impl<B: BlobStore> NodeRuntime<B> {
     pub fn storage_queue_len(&self) -> usize {
         self.storage_queue.len()
     }
+
+    /// Push an event into the runtime's internal priority queues.
+    pub fn push_event(&mut self, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::InboundPacket {
+                interface_name,
+                raw,
+                now,
+            } => {
+                self.router_queue
+                    .push_back(NodeEvent::InboundPacket { interface_name, raw, now });
+            }
+            RuntimeEvent::TimerTick { now } => {
+                self.router_queue.push_back(NodeEvent::TimerTick { now });
+            }
+            RuntimeEvent::QueryReceived {
+                query_id,
+                key_expr,
+                payload,
+            } => {
+                self.route_query(query_id, key_expr, payload);
+            }
+            RuntimeEvent::SubscriptionMessage { key_expr, payload } => {
+                self.route_subscription(key_expr, payload);
+            }
+        }
+    }
+
+    /// Run one iteration of the priority event loop.
+    /// 1. Drain ALL Tier 1 (router) events -- router is never starved.
+    /// 2. Process ONE Tier 2 (storage) event.
+    pub fn tick(&mut self) -> Vec<RuntimeAction> {
+        let mut actions = Vec::new();
+
+        // Tier 1: drain ALL router events (highest priority)
+        while let Some(event) = self.router_queue.pop_front() {
+            let node_actions = self.router.handle_event(event);
+            self.dispatch_router_actions(node_actions, &mut actions);
+        }
+
+        // Tier 2: process ONE storage event (middle priority)
+        if let Some(event) = self.storage_queue.pop_front() {
+            let storage_actions = self.storage.handle(event);
+            self.dispatch_storage_actions(storage_actions, &mut actions);
+        }
+
+        actions
+    }
+
+    fn dispatch_router_actions(
+        &mut self,
+        node_actions: Vec<NodeAction>,
+        out: &mut Vec<RuntimeAction>,
+    ) {
+        for action in node_actions {
+            if let NodeAction::SendOnInterface { interface_name, raw } = action {
+                out.push(RuntimeAction::SendOnInterface { interface_name, raw });
+            }
+            // Other router actions are diagnostics -- drop for now.
+        }
+    }
+
+    fn dispatch_storage_actions(
+        &mut self,
+        storage_actions: Vec<StorageTierAction>,
+        out: &mut Vec<RuntimeAction>,
+    ) {
+        for action in storage_actions {
+            match action {
+                StorageTierAction::SendReply { query_id, payload } => {
+                    out.push(RuntimeAction::SendReply { query_id, payload });
+                }
+                StorageTierAction::AnnounceContent { key_expr, payload } => {
+                    out.push(RuntimeAction::Publish { key_expr, payload });
+                }
+                StorageTierAction::SendStatsReply { query_id, payload } => {
+                    out.push(RuntimeAction::SendReply { query_id, payload });
+                }
+                _ => {} // DeclareQueryables/DeclareSubscribers only at startup
+            }
+        }
+    }
+
+    fn route_query(&mut self, query_id: u64, key_expr: String, payload: Vec<u8>) {
+        let event = QueryableEvent::QueryReceived {
+            query_id,
+            key_expr: key_expr.clone(),
+            payload,
+        };
+        let Ok(actions) = self.queryable_router.handle_event(event) else {
+            return;
+        };
+        for action in actions {
+            if let QueryableAction::DeliverQuery {
+                queryable_id,
+                query_id,
+                key_expr,
+                ..
+            } = action
+            {
+                if self.storage_queryable_ids.contains(&queryable_id) {
+                    if let Some(event) = self.parse_storage_query(query_id, &key_expr) {
+                        self.storage_queue.push_back(event);
+                    }
+                }
+            }
+        }
+    }
+
+    fn route_subscription(&mut self, key_expr: String, payload: Vec<u8>) {
+        if let Some(event) = self.parse_subscription_event(&key_expr, payload) {
+            self.storage_queue.push_back(event);
+        }
+    }
+
+    fn parse_storage_query(&self, query_id: u64, key_expr: &str) -> Option<StorageTierEvent> {
+        // Stats query: harmony/content/stats/{node_addr}
+        if key_expr.starts_with(content_ns::STATS) {
+            return Some(StorageTierEvent::StatsQuery { query_id });
+        }
+        // Content query: harmony/content/{prefix}/{cid_hex}
+        let after_prefix = key_expr.strip_prefix(content_ns::PREFIX)?.strip_prefix('/')?;
+        let cid_hex = after_prefix.get(2..)?; // skip shard char + "/"
+        let cid_bytes: [u8; 32] = hex::decode(cid_hex).ok()?.try_into().ok()?;
+        let cid = ContentId::from_bytes(cid_bytes);
+        Some(StorageTierEvent::ContentQuery { query_id, cid })
+    }
+
+    fn parse_subscription_event(
+        &self,
+        key_expr: &str,
+        payload: Vec<u8>,
+    ) -> Option<StorageTierEvent> {
+        if let Some(cid_hex) = key_expr
+            .strip_prefix(content_ns::TRANSIT)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            let cid_bytes: [u8; 32] = hex::decode(cid_hex).ok()?.try_into().ok()?;
+            let cid = ContentId::from_bytes(cid_bytes);
+            return Some(StorageTierEvent::TransitContent { cid, data: payload });
+        }
+        if let Some(cid_hex) = key_expr
+            .strip_prefix(content_ns::PUBLISH)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            let cid_bytes: [u8; 32] = hex::decode(cid_hex).ok()?.try_into().ok()?;
+            let cid = ContentId::from_bytes(cid_bytes);
+            return Some(StorageTierEvent::PublishContent { cid, data: payload });
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -241,5 +394,84 @@ mod tests {
         let (rt, _) = make_runtime();
         assert_eq!(rt.router_queue_len(), 0);
         assert_eq!(rt.storage_queue_len(), 0);
+    }
+
+    #[test]
+    fn push_event_classifies_router_events() {
+        let (mut rt, _) = make_runtime();
+        rt.push_event(RuntimeEvent::InboundPacket {
+            interface_name: "lo".into(),
+            raw: vec![0u8; 20],
+            now: 1000,
+        });
+        rt.push_event(RuntimeEvent::TimerTick { now: 1001 });
+        assert_eq!(rt.router_queue_len(), 2);
+        assert_eq!(rt.storage_queue_len(), 0);
+    }
+
+    #[test]
+    fn push_event_routes_query_to_storage() {
+        let (mut rt, _) = make_runtime();
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 1,
+            key_expr: "harmony/content/a/abc123".into(),
+            payload: vec![],
+        });
+        // Key expr "harmony/content/a/abc123" matches shard queryable "harmony/content/a/**",
+        // but the CID hex "c123" is too short to decode as 32 bytes, so
+        // parse_storage_query drops it. Use a stats query instead -- always matches.
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 2,
+            key_expr: "harmony/content/stats".into(),
+            payload: vec![],
+        });
+        assert_eq!(rt.storage_queue_len(), 1); // only stats query matched
+    }
+
+    #[test]
+    fn tick_drains_all_router_events_before_storage() {
+        let (mut rt, _) = make_runtime();
+
+        for i in 0..3 {
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+        }
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 10,
+            key_expr: "harmony/content/stats".into(),
+            payload: vec![],
+        });
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 11,
+            key_expr: "harmony/content/stats".into(),
+            payload: vec![],
+        });
+
+        assert_eq!(rt.router_queue_len(), 3);
+        assert_eq!(rt.storage_queue_len(), 2);
+
+        let actions = rt.tick();
+        assert_eq!(rt.router_queue_len(), 0);
+        assert_eq!(rt.storage_queue_len(), 1);
+
+        let reply_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendReply { .. }))
+            .count();
+        assert_eq!(reply_count, 1);
+
+        let actions2 = rt.tick();
+        assert_eq!(rt.storage_queue_len(), 0);
+        let reply_count2 = actions2
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendReply { .. }))
+            .count();
+        assert_eq!(reply_count2, 1);
+    }
+
+    #[test]
+    fn tick_with_empty_queues_returns_nothing() {
+        let (mut rt, _) = make_runtime();
+        let actions = rt.tick();
+        assert!(actions.is_empty());
     }
 }
