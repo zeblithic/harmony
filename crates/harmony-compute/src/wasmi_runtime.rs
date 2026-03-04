@@ -305,16 +305,22 @@ impl ComputeRuntime for WasmiRuntime {
         let invocation = match session.pending.take() {
             Some(inv) => inv,
             None => {
+                // Restore session so snapshot() still works.
+                self.session = Some(session);
                 return ComputeResult::Failed {
                     error: ComputeError::NoPendingExecution,
                 };
             }
         };
 
-        session
-            .store
-            .set_fuel(budget.fuel)
-            .expect("fuel metering is enabled");
+        if let Err(e) = session.store.set_fuel(budget.fuel) {
+            self.session = Some(session);
+            return ComputeResult::Failed {
+                error: ComputeError::Trap {
+                    reason: format!("failed to set fuel: {e}"),
+                },
+            };
+        }
 
         let fuel_before = session.total_fuel_consumed;
         let input_len = session.input_len;
@@ -620,5 +626,34 @@ mod tests {
         let rt = WasmiRuntime::new();
         let result = rt.snapshot();
         assert!(matches!(result, Err(ComputeError::NoPendingExecution)));
+    }
+
+    #[test]
+    fn resume_without_pending_preserves_session_for_snapshot() {
+        let mut rt = WasmiRuntime::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(&100_i32.to_le_bytes());
+        input.extend_from_slice(&200_i32.to_le_bytes());
+
+        let result = rt.execute(
+            ADD_WAT.as_bytes(),
+            &input,
+            InstructionBudget { fuel: 100_000 },
+        );
+        assert!(matches!(result, ComputeResult::Complete { .. }));
+
+        // resume() on a completed execution should fail but NOT destroy the session.
+        let resume_result = rt.resume(InstructionBudget { fuel: 100_000 });
+        assert!(matches!(
+            resume_result,
+            ComputeResult::Failed {
+                error: ComputeError::NoPendingExecution
+            }
+        ));
+
+        // snapshot() should still work because the session was preserved.
+        let checkpoint = rt.snapshot().expect("session should be preserved after resume");
+        assert!(checkpoint.fuel_consumed > 0);
+        assert!(!checkpoint.memory.is_empty());
     }
 }
