@@ -304,11 +304,12 @@ impl<B: BlobStore> NodeRuntime<B> {
         let base = self.workflow.budget().fuel;
         let ac = &self.schedule.adaptive_compute;
         if ac.high_water == 0 {
-            return (base as f64 * ac.floor_fraction).round() as u64;
+            return (base as f64 * ac.floor_fraction.clamp(0.0, 1.0)).round() as u64;
         }
         let combined = self.router_queue.len() + self.storage_queue.len();
         let load_factor = (combined as f64 / ac.high_water as f64).min(1.0);
-        let scale = 1.0 - load_factor * (1.0 - ac.floor_fraction);
+        let floor = ac.floor_fraction.clamp(0.0, 1.0);
+        let scale = 1.0 - load_factor * (1.0 - floor);
         (base as f64 * scale).round() as u64
     }
 
@@ -418,6 +419,10 @@ impl<B: BlobStore> NodeRuntime<B> {
         // Stable sort: starved tiers (>= threshold) move to front, preserving original priority order
         order.sort_by_key(|&tier| if starved[tier as usize] >= threshold { 0 } else { 1 });
 
+        // Emit direct replies (error responses, module fetch requests) buffered from
+        // push_event. These are cross-tier concerns and should not move with tier reordering.
+        actions.append(&mut self.pending_direct_actions);
+
         for &tier in &order {
             match tier {
                 0 => {
@@ -453,8 +458,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                     if processed > 0 { self.storage_starved = 0; } else { self.storage_starved += 1; }
                 }
                 2 => {
-                    // Tier 3: Compute — emit direct replies, dispatch pending workflow actions, tick
-                    actions.append(&mut self.pending_direct_actions);
+                    // Tier 3: Compute — dispatch pending workflow actions, then one slice
                     let pending = std::mem::take(&mut self.pending_workflow_actions);
                     self.dispatch_workflow_actions(pending, &mut actions);
                     let effective_budget = InstructionBudget { fuel: effective_fuel };
