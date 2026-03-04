@@ -1,21 +1,65 @@
-MIT License
+Harmony — Dual License (Apache-2.0 OR MIT)
 
-Copyright (c) 2026 zeblithic
+Copyright 2026 The Zeblithic Foundation and Contributors
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software is licensed under your choice of either:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+  * Apache License, Version 2.0
+    (./LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0)
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+  * MIT License
+    (./LICENSE-MIT or https://opensource.org/licenses/MIT)
+
+at your option.
+
+The MIT fallback exists solely to accommodate license-compatibility
+constraints (e.g., GPLv2-only dependencies). Where no such constraint
+exists, the Apache-2.0 license is preferred because it includes an
+explicit patent grant that protects all downstream users.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this work by you, as defined in the
+Apache-2.0 license, shall be dual-licensed as above, without any
+additional terms or conditions.
+
+────────────────────────────────────────────────────────────────────
+
+PATENT DEDICATION
+
+Any patents that derive from, are embodied in, or relate to this
+software — whether held now or in the future by the authors,
+contributors, or the Zeblithic Foundation — are hereby irrevocably
+dedicated to the Open Invention Network (OIN) and its licensees under
+the OIN License Agreement.
+
+We respectfully request that the Open Invention Network extend its
+patent non-aggression shield to this software and its community to the
+fullest extent of its portfolio and mission.
+
+Patents exist to protect inventors from exploitation. They must never
+be used to prevent people from building the tools they need to govern
+their own information. This dedication ensures that Harmony's
+innovations remain free for all to use, improve, and share.
+
+────────────────────────────────────────────────────────────────────
+
+ETHICAL USE APPEAL
+
+This software is free to use for any purpose under the terms above.
+No legal restriction accompanies this section — it is an appeal to
+conscience, not a license condition.
+
+Harmony exists to return sovereignty over information to the people
+who create it. We ask that those who profit from this work honor its
+spirit:
+
+  * For-profit entities: Consider contributing 1% of profits derived
+    from Harmony back to the Zeblithic Foundation.
+
+  * Financial intermediaries: Consider contributing 5% of profits
+    from transactions mediated by Harmony.
+
+These are requests, not requirements. The code is free. The appeal
+is to your better nature.
+
+See MANIFESTO.md for the full vision behind this project.
