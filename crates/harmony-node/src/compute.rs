@@ -94,8 +94,66 @@ impl ComputeTier {
     }
 
     /// Process an inbound event, returning any immediate actions.
-    pub fn handle(&mut self, _event: ComputeTierEvent) -> Vec<ComputeTierAction> {
-        Vec::new()
+    pub fn handle(&mut self, event: ComputeTierEvent) -> Vec<ComputeTierAction> {
+        match event {
+            ComputeTierEvent::ExecuteInline {
+                query_id,
+                module,
+                input,
+            } => {
+                self.queue.push_back(ComputeTask::Ready {
+                    query_id,
+                    module,
+                    input,
+                });
+                Vec::new()
+            }
+            ComputeTierEvent::ExecuteByCid {
+                query_id,
+                module_cid,
+                input,
+            } => {
+                self.queue.push_back(ComputeTask::WaitingForModule {
+                    query_id,
+                    cid: module_cid,
+                    input,
+                });
+                vec![ComputeTierAction::FetchModule { cid: module_cid }]
+            }
+            ComputeTierEvent::ModuleFetched { cid, module } => {
+                if let Some(pos) = self.queue.iter().position(|t| {
+                    matches!(t, ComputeTask::WaitingForModule { cid: c, .. } if *c == cid)
+                }) {
+                    if let Some(ComputeTask::WaitingForModule {
+                        query_id, input, ..
+                    }) = self.queue.remove(pos)
+                    {
+                        self.queue.push_back(ComputeTask::Ready {
+                            query_id,
+                            module,
+                            input,
+                        });
+                    }
+                }
+                Vec::new()
+            }
+            ComputeTierEvent::ModuleFetchFailed { cid } => {
+                let mut actions = Vec::new();
+                if let Some(pos) = self.queue.iter().position(|t| {
+                    matches!(t, ComputeTask::WaitingForModule { cid: c, .. } if *c == cid)
+                }) {
+                    if let Some(ComputeTask::WaitingForModule { query_id, .. }) =
+                        self.queue.remove(pos)
+                    {
+                        actions.push(ComputeTierAction::SendError {
+                            query_id,
+                            error: format!("module not found: {}", hex::encode(cid)),
+                        });
+                    }
+                }
+                actions
+            }
+        }
     }
 
     /// Run one iteration of the compute loop, returning any resulting actions.
@@ -118,6 +176,19 @@ impl ComputeTier {
 mod tests {
     use super::*;
 
+    /// WAT module: reads two i32s from input, writes their sum as output.
+    pub(crate) const ADD_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+        (i32.store
+          (i32.add (local.get $input_ptr) (local.get $input_len))
+          (i32.add
+            (i32.load (local.get $input_ptr))
+            (i32.load (i32.add (local.get $input_ptr) (i32.const 4)))))
+        (i32.const 4)))
+"#;
+
     fn make_tier() -> ComputeTier {
         ComputeTier::new(InstructionBudget { fuel: 100_000 })
     }
@@ -134,5 +205,77 @@ mod tests {
         let tier = make_tier();
         assert_eq!(tier.queue_len(), 0);
         assert!(!tier.has_active());
+    }
+
+    #[test]
+    fn handle_execute_inline_queues_ready_task() {
+        let mut tier = make_tier();
+        let actions = tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 1,
+            module: ADD_WAT.as_bytes().to_vec(),
+            input: vec![1, 2, 3, 4],
+        });
+        assert!(actions.is_empty());
+        assert_eq!(tier.queue_len(), 1);
+    }
+
+    #[test]
+    fn handle_execute_by_cid_emits_fetch() {
+        let mut tier = make_tier();
+        let cid = [0xAB; 32];
+        let actions = tier.handle(ComputeTierEvent::ExecuteByCid {
+            query_id: 2,
+            module_cid: cid,
+            input: vec![5, 6],
+        });
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0], ComputeTierAction::FetchModule { cid });
+        assert_eq!(tier.queue_len(), 1);
+    }
+
+    #[test]
+    fn handle_module_fetched_promotes_to_ready() {
+        let mut tier = make_tier();
+        let cid = [0xCD; 32];
+        // First, enqueue a task waiting for a module.
+        tier.handle(ComputeTierEvent::ExecuteByCid {
+            query_id: 3,
+            module_cid: cid,
+            input: vec![7, 8],
+        });
+        assert_eq!(tier.queue_len(), 1);
+
+        // Now deliver the module.
+        let actions = tier.handle(ComputeTierEvent::ModuleFetched {
+            cid,
+            module: ADD_WAT.as_bytes().to_vec(),
+        });
+        assert!(actions.is_empty());
+        assert_eq!(tier.queue_len(), 1); // still 1, but promoted to Ready
+    }
+
+    #[test]
+    fn handle_module_fetch_failed_returns_error() {
+        let mut tier = make_tier();
+        let cid = [0xEF; 32];
+        // Enqueue a task waiting for a module.
+        tier.handle(ComputeTierEvent::ExecuteByCid {
+            query_id: 4,
+            module_cid: cid,
+            input: vec![9, 10],
+        });
+        assert_eq!(tier.queue_len(), 1);
+
+        // Signal fetch failure.
+        let actions = tier.handle(ComputeTierEvent::ModuleFetchFailed { cid });
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0],
+            ComputeTierAction::SendError {
+                query_id: 4,
+                error: format!("module not found: {}", hex::encode(cid)),
+            }
+        );
+        assert_eq!(tier.queue_len(), 0);
     }
 }
