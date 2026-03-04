@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use harmony_compute::{InstructionBudget, WasmiRuntime};
+use harmony_compute::{ComputeRuntime, InstructionBudget, WasmiRuntime};
 
 // ── Events (inbound) ──────────────────────────────────────────────────
 
@@ -121,9 +121,9 @@ impl ComputeTier {
                 vec![ComputeTierAction::FetchModule { cid: module_cid }]
             }
             ComputeTierEvent::ModuleFetched { cid, module } => {
-                if let Some(pos) = self.queue.iter().position(|t| {
-                    matches!(t, ComputeTask::WaitingForModule { cid: c, .. } if *c == cid)
-                }) {
+                if let Some(pos) = self.queue.iter().position(
+                    |t| matches!(t, ComputeTask::WaitingForModule { cid: c, .. } if *c == cid),
+                ) {
                     if let Some(ComputeTask::WaitingForModule {
                         query_id, input, ..
                     }) = self.queue.remove(pos)
@@ -139,9 +139,9 @@ impl ComputeTier {
             }
             ComputeTierEvent::ModuleFetchFailed { cid } => {
                 let mut actions = Vec::new();
-                if let Some(pos) = self.queue.iter().position(|t| {
-                    matches!(t, ComputeTask::WaitingForModule { cid: c, .. } if *c == cid)
-                }) {
+                if let Some(pos) = self.queue.iter().position(
+                    |t| matches!(t, ComputeTask::WaitingForModule { cid: c, .. } if *c == cid),
+                ) {
                     if let Some(ComputeTask::WaitingForModule { query_id, .. }) =
                         self.queue.remove(pos)
                     {
@@ -157,8 +157,84 @@ impl ComputeTier {
     }
 
     /// Run one iteration of the compute loop, returning any resulting actions.
+    ///
+    /// If there is an active (yielded) execution, resumes it with the configured
+    /// fuel budget. Otherwise, dequeues the next [`ComputeTask::Ready`] task and
+    /// begins execution.
     pub fn tick(&mut self) -> Vec<ComputeTierAction> {
-        Vec::new()
+        // If there's an active execution, resume it.
+        if self.active.is_some() {
+            let result = self.runtime.resume(self.budget);
+            return self.handle_compute_result(result);
+        }
+
+        // Otherwise, try to dequeue the next Ready task.
+        let ready_pos = self
+            .queue
+            .iter()
+            .position(|t| matches!(t, ComputeTask::Ready { .. }));
+        let Some(pos) = ready_pos else {
+            return Vec::new();
+        };
+        let Some(ComputeTask::Ready {
+            query_id,
+            module,
+            input,
+        }) = self.queue.remove(pos)
+        else {
+            return Vec::new();
+        };
+
+        self.active = Some(ActiveExecution { query_id });
+        let result = self.runtime.execute(&module, &input, self.budget);
+        self.handle_compute_result(result)
+    }
+
+    /// Process the result of a WASM execution or resumption.
+    ///
+    /// Maps [`harmony_compute::ComputeResult`] variants to [`ComputeTierAction`]s:
+    /// - `Complete` -> `SendReply` with `[0x00, output...]` payload
+    /// - `Yielded` -> no action (auto-resume on next tick)
+    /// - `Failed` -> `SendError`
+    /// - `NeedsIO` -> `SendError` (not yet supported)
+    fn handle_compute_result(
+        &mut self,
+        result: harmony_compute::ComputeResult,
+    ) -> Vec<ComputeTierAction> {
+        use harmony_compute::ComputeResult;
+
+        let query_id = self
+            .active
+            .as_ref()
+            .expect("must have active execution")
+            .query_id;
+
+        match result {
+            ComputeResult::Complete { output } => {
+                self.active = None;
+                let mut payload = vec![0x00];
+                payload.extend_from_slice(&output);
+                vec![ComputeTierAction::SendReply { query_id, payload }]
+            }
+            ComputeResult::Yielded { .. } => {
+                // Auto-resume on next tick — no action needed.
+                Vec::new()
+            }
+            ComputeResult::Failed { error } => {
+                self.active = None;
+                vec![ComputeTierAction::SendError {
+                    query_id,
+                    error: format!("{error}"),
+                }]
+            }
+            ComputeResult::NeedsIO { .. } => {
+                self.active = None;
+                vec![ComputeTierAction::SendError {
+                    query_id,
+                    error: "NeedsIO not yet supported".into(),
+                }]
+            }
+        }
     }
 
     /// Number of tasks waiting in the queue.
@@ -186,6 +262,26 @@ mod tests {
           (i32.add
             (i32.load (local.get $input_ptr))
             (i32.load (i32.add (local.get $input_ptr) (i32.const 4)))))
+        (i32.const 4)))
+"#;
+
+    /// WAT module: loop `count` times, write count as output.
+    pub(crate) const LOOP_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+        (local $count i32)
+        (local $i i32)
+        (local.set $count (i32.load (local.get $input_ptr)))
+        (local.set $i (i32.const 0))
+        (block $break
+          (loop $loop
+            (br_if $break (i32.ge_u (local.get $i) (local.get $count)))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $loop)))
+        (i32.store
+          (i32.add (local.get $input_ptr) (local.get $input_len))
+          (local.get $i))
         (i32.const 4)))
 "#;
 
@@ -277,5 +373,171 @@ mod tests {
             }
         );
         assert_eq!(tier.queue_len(), 0);
+    }
+
+    // ── tick() / handle_compute_result() tests ──────────────────────────
+
+    #[test]
+    fn execute_inline_completes() {
+        let mut tier = make_tier();
+        // Input: two i32s in little-endian: 3 and 7
+        let mut input = Vec::new();
+        input.extend_from_slice(&3i32.to_le_bytes());
+        input.extend_from_slice(&7i32.to_le_bytes());
+
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 10,
+            module: ADD_WAT.as_bytes().to_vec(),
+            input,
+        });
+        assert_eq!(tier.queue_len(), 1);
+
+        let actions = tier.tick();
+        assert_eq!(actions.len(), 1);
+
+        // Expect SendReply with 0x00 prefix + sum (10) as LE i32 bytes.
+        let mut expected_payload = vec![0x00];
+        expected_payload.extend_from_slice(&10i32.to_le_bytes());
+        assert_eq!(
+            actions[0],
+            ComputeTierAction::SendReply {
+                query_id: 10,
+                payload: expected_payload,
+            }
+        );
+        assert!(!tier.has_active());
+    }
+
+    #[test]
+    fn execute_invalid_module_returns_error() {
+        let mut tier = make_tier();
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 20,
+            module: b"not wasm".to_vec(),
+            input: vec![],
+        });
+
+        let actions = tier.tick();
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(
+                &actions[0],
+                ComputeTierAction::SendError { query_id: 20, .. }
+            ),
+            "expected SendError for query_id 20, got: {actions:?}"
+        );
+        assert!(!tier.has_active());
+    }
+
+    #[test]
+    fn yielded_task_auto_resumes() {
+        // Use a small fuel budget so the loop yields multiple times.
+        let mut tier = ComputeTier::new(InstructionBudget { fuel: 10_000 });
+
+        // Input: count = 50_000
+        let input = 50_000_i32.to_le_bytes().to_vec();
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 30,
+            module: LOOP_WAT.as_bytes().to_vec(),
+            input,
+        });
+
+        // First tick should yield (empty actions, but active).
+        let actions = tier.tick();
+        assert!(
+            actions.is_empty(),
+            "first tick should yield, got: {actions:?}"
+        );
+        assert!(
+            tier.has_active(),
+            "should have active execution after yield"
+        );
+
+        // Loop ticks until SendReply appears.
+        let mut tick_count = 1u32;
+        let reply = loop {
+            let actions = tier.tick();
+            tick_count += 1;
+            if !actions.is_empty() {
+                break actions;
+            }
+            assert!(tick_count < 10_000, "too many ticks without completion");
+        };
+
+        // Should have taken multiple ticks.
+        assert!(
+            tick_count > 1,
+            "should have yielded at least once, but completed in {tick_count} ticks"
+        );
+
+        // Verify the reply payload: 0x00 prefix + count (50_000) as LE i32 bytes.
+        assert_eq!(reply.len(), 1);
+        let mut expected_payload = vec![0x00];
+        expected_payload.extend_from_slice(&50_000_i32.to_le_bytes());
+        assert_eq!(
+            reply[0],
+            ComputeTierAction::SendReply {
+                query_id: 30,
+                payload: expected_payload,
+            }
+        );
+        assert!(!tier.has_active());
+    }
+
+    #[test]
+    fn multiple_tasks_queued_fifo() {
+        let mut tier = make_tier();
+
+        // Task 1: 3 + 7 = 10
+        let mut input1 = Vec::new();
+        input1.extend_from_slice(&3i32.to_le_bytes());
+        input1.extend_from_slice(&7i32.to_le_bytes());
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 40,
+            module: ADD_WAT.as_bytes().to_vec(),
+            input: input1,
+        });
+
+        // Task 2: 100 + 200 = 300
+        let mut input2 = Vec::new();
+        input2.extend_from_slice(&100i32.to_le_bytes());
+        input2.extend_from_slice(&200i32.to_le_bytes());
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 41,
+            module: ADD_WAT.as_bytes().to_vec(),
+            input: input2,
+        });
+
+        assert_eq!(tier.queue_len(), 2);
+
+        // First tick: completes task 1.
+        let actions = tier.tick();
+        assert_eq!(actions.len(), 1);
+        let mut expected1 = vec![0x00];
+        expected1.extend_from_slice(&10i32.to_le_bytes());
+        assert_eq!(
+            actions[0],
+            ComputeTierAction::SendReply {
+                query_id: 40,
+                payload: expected1,
+            }
+        );
+
+        // Second tick: completes task 2.
+        let actions = tier.tick();
+        assert_eq!(actions.len(), 1);
+        let mut expected2 = vec![0x00];
+        expected2.extend_from_slice(&300i32.to_le_bytes());
+        assert_eq!(
+            actions[0],
+            ComputeTierAction::SendReply {
+                query_id: 41,
+                payload: expected2,
+            }
+        );
+
+        // Third tick: nothing left.
+        let actions = tier.tick();
+        assert!(actions.is_empty());
     }
 }

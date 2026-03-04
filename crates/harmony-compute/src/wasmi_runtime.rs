@@ -652,7 +652,9 @@ mod tests {
         ));
 
         // snapshot() should still work because the session was preserved.
-        let checkpoint = rt.snapshot().expect("session should be preserved after resume");
+        let checkpoint = rt
+            .snapshot()
+            .expect("session should be preserved after resume");
         assert!(checkpoint.fuel_consumed > 0);
         assert!(!checkpoint.memory.is_empty());
     }
