@@ -37,7 +37,7 @@ if [[ -z "$PR_NUMBER" ]]; then
 fi
 
 # Fetch PR metadata
-PR_META=$(gh pr view "$PR_NUMBER" --json number,title,url,commits)
+PR_META=$(gh pr view "$PR_NUMBER" --json number,title,url,commits,createdAt)
 PR_TITLE=$(echo "$PR_META" | jq -r '.title')
 PR_URL=$(echo "$PR_META" | jq -r '.url')
 
@@ -66,7 +66,7 @@ ALL_PR_REVIEWS=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" --pa
 # ── 4. Trigger detection with reactions ─────────────────────────────
 
 # Latest "bugbot run" trigger
-BUGBOT_TRIGGER_JSON=$(echo "$ALL_ISSUE_COMMENTS" | jq '[.[] | select(.body | test("^bugbot run$"; "m"))] | last // empty')
+BUGBOT_TRIGGER_JSON=$(echo "$ALL_ISSUE_COMMENTS" | jq '[.[] | select(.body == "bugbot run")] | last // empty')
 BUGBOT_TRIGGER_DATE=$(echo "$BUGBOT_TRIGGER_JSON" | jq -r '.created_at // empty' 2>/dev/null)
 BUGBOT_TRIGGER_ID=$(echo "$BUGBOT_TRIGGER_JSON" | jq -r '.id // empty' 2>/dev/null)
 
@@ -79,7 +79,7 @@ if [[ -n "$BUGBOT_TRIGGER_ID" && "$BUGBOT_TRIGGER_ID" != "null" ]]; then
 fi
 
 # Latest "@greptile" trigger — only match comments by humans (not greptile-apps[bot] itself)
-GREPTILE_TRIGGER_JSON=$(echo "$ALL_ISSUE_COMMENTS" | jq '[.[] | select((.body | test("^@greptile$"; "m")) and .user.login != "greptile-apps[bot]")] | last // empty')
+GREPTILE_TRIGGER_JSON=$(echo "$ALL_ISSUE_COMMENTS" | jq '[.[] | select(.body == "@greptile" and .user.login != "greptile-apps[bot]")] | last // empty')
 GREPTILE_TRIGGER_DATE=$(echo "$GREPTILE_TRIGGER_JSON" | jq -r '.created_at // empty' 2>/dev/null)
 GREPTILE_TRIGGER_ID=$(echo "$GREPTILE_TRIGGER_JSON" | jq -r '.id // empty' 2>/dev/null)
 
@@ -87,7 +87,7 @@ GREPTILE_TRIGGER_ID=$(echo "$GREPTILE_TRIGGER_JSON" | jq -r '.id // empty' 2>/de
 # use PR creation time as baseline so the initial auto-triggered review is captured.
 GREPTILE_AUTO_TRIGGER=false
 if [[ -z "$GREPTILE_TRIGGER_DATE" ]]; then
-  GREPTILE_TRIGGER_DATE=$(gh pr view "$PR_NUMBER" --json createdAt --jq '.createdAt' 2>/dev/null || echo "")
+  GREPTILE_TRIGGER_DATE=$(echo "$PR_META" | jq -r '.createdAt // empty')
   GREPTILE_AUTO_TRIGGER=true
 fi
 
@@ -176,7 +176,8 @@ if [[ "$BUGBOT_HAS_RESPONSE" == "true" ]]; then
       echo "  File: ${f_file}"
       echo "  Line: ${f_line}"
       echo "  Severity: ${f_severity}"
-      echo "  Body: ${f_body}"
+      echo "  Body:"
+      echo "$f_body" | sed 's/^/    /'
       echo ""
     done < <(echo "$BUGBOT_INLINE_COMMENTS" | jq -c '.[]')
   fi
@@ -211,8 +212,10 @@ if [[ -n "$GREPTILE_TRIGGER_DATE" ]]; then
   if [[ "$GREPTILE_COMMENT_COUNT" -gt 0 ]]; then
     GREPTILE_HAS_RESPONSE=true
 
-    # Count individual findings: look for file reference patterns (backtick-quoted paths)
-    # and "Greptile Summary" sections. Each distinct issue block counts.
+    # Heuristic: count bold-backtick file references (**`path`**) as a proxy for
+    # distinct findings. Over-counts if a finding references multiple files;
+    # under-counts if Greptile uses plain code fences. Fallback to comment count
+    # if no file-ref patterns found.
     GREPTILE_ISSUE_COUNT=$(echo "$GREPTILE_RESPONSE_COMMENTS" | jq -r \
       '[.[] | .body | [scan("\\*\\*`[^`]+`\\*\\*")] | length] | add // 0' 2>/dev/null || echo "0")
     # If no file-ref patterns found, count comments themselves as findings
@@ -237,7 +240,8 @@ if [[ "$GREPTILE_HAS_RESPONSE" == "true" ]]; then
       c_date=$(echo "$comment_json" | jq -r '.created_at // "?"')
       c_body=$(echo "$comment_json" | jq -r '.body // ""')
       echo "Comment (${c_date}):"
-      echo "  Body: ${c_body}"
+      echo "  Body:"
+      echo "$c_body" | sed 's/^/    /'
       echo ""
     done < <(echo "$GREPTILE_RESPONSE_COMMENTS" | jq -c '.[]')
   fi
@@ -306,9 +310,8 @@ elif [[ "$LAST_COMMIT_EPOCH" -gt "$LATEST_TRIGGER_EPOCH" ]]; then
   ACTION="Re-trigger reviews: comment 'bugbot run' and '@greptile' on the PR."
 
 elif [[ "$HAS_BUGBOT_TRIGGER" == "true" && "$BUGBOT_HAS_RESPONSE" == "false" ]]; then
-  # Check rule 3: Bugbot stuck?
-  BUGBOT_TRIGGER_EPOCH_VAL=$(to_epoch "$BUGBOT_TRIGGER_DATE")
-  ELAPSED=$(( NOW_EPOCH - BUGBOT_TRIGGER_EPOCH_VAL ))
+  # Check rule 3: Bugbot stuck? (BUGBOT_TRIGGER_EPOCH computed above)
+  ELAPSED=$(( NOW_EPOCH - BUGBOT_TRIGGER_EPOCH ))
   if [[ "$ELAPSED" -gt 180 && "$BUGBOT_TRIGGER_EYES" -eq 0 ]]; then
     STATE="BUGBOT_STUCK"
     BUGBOT_STATE_LABEL="stuck (no eyes after ${ELAPSED}s)"
