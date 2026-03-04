@@ -11,6 +11,7 @@ name = "harmony"
 path = "src/main.rs"
 
 [dependencies]
+harmony-compute.workspace = true
 harmony-content.workspace = true
 harmony-identity = { path = "../harmony-identity" }
 harmony-reticulum.workspace = true

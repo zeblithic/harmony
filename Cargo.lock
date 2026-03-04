@@ -496,6 +496,7 @@ name = "harmony-node"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "harmony-compute",
  "harmony-content",
  "harmony-identity",
  "harmony-reticulum",
