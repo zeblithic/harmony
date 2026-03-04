@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use harmony_compute::{ComputeRuntime, InstructionBudget, WasmiRuntime};
+use harmony_compute::{ComputeRuntime, InstructionBudget};
 
 // ── Events (inbound) ──────────────────────────────────────────────────
 
@@ -92,7 +92,7 @@ struct ActiveExecution {
 /// Wraps a [`WasmiRuntime`] with a task queue. The caller feeds events
 /// via [`handle`](Self::handle) and drives execution via [`tick`](Self::tick).
 pub struct ComputeTier {
-    runtime: WasmiRuntime,
+    runtime: Box<dyn ComputeRuntime>,
     queue: VecDeque<ComputeTask>,
     active: Option<ActiveExecution>,
     budget: InstructionBudget,
@@ -100,9 +100,9 @@ pub struct ComputeTier {
 
 impl ComputeTier {
     /// Create a new compute tier with the given per-slice instruction budget.
-    pub fn new(budget: InstructionBudget) -> Self {
+    pub fn new(runtime: Box<dyn ComputeRuntime>, budget: InstructionBudget) -> Self {
         Self {
-            runtime: WasmiRuntime::new(),
+            runtime,
             queue: VecDeque::new(),
             active: None,
             budget,
@@ -391,7 +391,10 @@ pub(crate) mod tests {
 "#;
 
     fn make_tier() -> ComputeTier {
-        ComputeTier::new(InstructionBudget { fuel: 100_000 })
+        ComputeTier::new(
+            Box::new(harmony_compute::WasmiRuntime::new()),
+            InstructionBudget { fuel: 100_000 },
+        )
     }
 
     #[test]
@@ -538,7 +541,10 @@ pub(crate) mod tests {
     #[test]
     fn yielded_task_auto_resumes() {
         // Use a small fuel budget so the loop yields multiple times.
-        let mut tier = ComputeTier::new(InstructionBudget { fuel: 10_000 });
+        let mut tier = ComputeTier::new(
+            Box::new(harmony_compute::WasmiRuntime::new()),
+            InstructionBudget { fuel: 10_000 },
+        );
 
         // Input: count = 50_000
         let input = 50_000_i32.to_le_bytes().to_vec();
