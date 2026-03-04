@@ -20,7 +20,7 @@ pub struct StorageMetrics {
     pub queries_served: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
-    pub transit_admitted: u64,
+    pub transit_stored: u64,
     pub transit_rejected: u64,
     pub publishes_stored: u64,
     pub publishes_rejected: u64,
@@ -33,7 +33,7 @@ impl StorageMetrics {
         buf.extend_from_slice(&self.queries_served.to_be_bytes());
         buf.extend_from_slice(&self.cache_hits.to_be_bytes());
         buf.extend_from_slice(&self.cache_misses.to_be_bytes());
-        buf.extend_from_slice(&self.transit_admitted.to_be_bytes());
+        buf.extend_from_slice(&self.transit_stored.to_be_bytes());
         buf.extend_from_slice(&self.transit_rejected.to_be_bytes());
         buf.extend_from_slice(&self.publishes_stored.to_be_bytes());
         buf.extend_from_slice(&self.publishes_rejected.to_be_bytes());
@@ -77,6 +77,8 @@ pub enum StorageTierAction {
 /// actions.
 pub struct StorageTier<B: BlobStore> {
     cache: ContentStore<B>,
+    /// Reserved for future byte-based pin limits. Currently only count-based
+    /// limits are enforced via [`ContentStore::pin_limit`].
     #[allow(dead_code)]
     budget: StorageBudget,
     metrics: StorageMetrics,
@@ -166,7 +168,9 @@ impl<B: BlobStore> StorageTier<B> {
         // Use store_preadmitted to avoid double-incrementing the sketch
         // counter (should_admit already incremented it).
         self.cache.store_preadmitted(cid, data);
-        self.metrics.transit_admitted += 1;
+        self.metrics.transit_stored += 1;
+        // Re-announcing already-cached content is intentional: it refreshes
+        // the announcement TTL so peers know the content is still available.
         vec![self.make_announce_action(&cid)]
     }
 
@@ -183,12 +187,16 @@ impl<B: BlobStore> StorageTier<B> {
         vec![self.make_announce_action(&cid)]
     }
 
-    /// Verify that a CID's hash matches the hash of the data.
+    /// Verify that a CID is consistent with the given data.
     ///
-    /// Uses hash-only comparison so it works for all content types
-    /// (blobs, bundles, inline metadata), not just blobs.
+    /// Checks three things:
+    /// 1. The truncated SHA-256 hash matches the data.
+    /// 2. The payload size field matches the actual data length.
+    /// 3. The internal checksum is valid (hash + size + type are consistent).
     fn verify_cid(cid: &ContentId, data: &[u8]) -> bool {
         cid.verify_hash(data)
+            && cid.payload_size() as usize == data.len()
+            && cid.verify_checksum().is_ok()
     }
 
     /// Build an AnnounceContent action for a stored CID.
@@ -227,7 +235,7 @@ mod tests {
         assert_eq!(m.queries_served, 0);
         assert_eq!(m.cache_hits, 0);
         assert_eq!(m.cache_misses, 0);
-        assert_eq!(m.transit_admitted, 0);
+        assert_eq!(m.transit_stored, 0);
         assert_eq!(m.transit_rejected, 0);
         assert_eq!(m.publishes_stored, 0);
         assert_eq!(m.publishes_rejected, 0);
@@ -369,7 +377,7 @@ mod tests {
             }
             other => panic!("expected AnnounceContent, got {other:?}"),
         }
-        assert_eq!(tier.metrics().transit_admitted, 1);
+        assert_eq!(tier.metrics().transit_stored, 1);
 
         // Content should now be queryable
         let query_actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });
@@ -395,7 +403,7 @@ mod tests {
             data: data.to_vec(),
         });
 
-        assert_eq!(tier.metrics().transit_admitted, 2);
+        assert_eq!(tier.metrics().transit_stored, 2);
     }
 
     #[test]
@@ -426,7 +434,7 @@ mod tests {
                 tier.handle(StorageTierEvent::ContentQuery { query_id: 0, cid });
             }
         }
-        let admitted_before = tier.metrics().transit_admitted;
+        let admitted_before = tier.metrics().transit_stored;
         let rejected_before = tier.metrics().transit_rejected;
 
         // Cold transit item with zero frequency should be rejected.
@@ -442,9 +450,9 @@ mod tests {
             "cold transit item should be rejected by W-TinyLFU, got: {actions:?}"
         );
         assert_eq!(
-            tier.metrics().transit_admitted,
+            tier.metrics().transit_stored,
             admitted_before,
-            "transit_admitted should not increase for rejected item"
+            "transit_stored should not increase for rejected item"
         );
         assert_eq!(
             tier.metrics().transit_rejected,
@@ -476,7 +484,7 @@ mod tests {
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], StorageTierAction::AnnounceContent { .. }));
-        assert_eq!(tier.metrics().transit_admitted, 1);
+        assert_eq!(tier.metrics().transit_stored, 1);
     }
 
     #[test]
@@ -496,7 +504,7 @@ mod tests {
 
         assert!(actions.is_empty(), "mismatched CID should produce no actions");
         assert_eq!(tier.metrics().transit_rejected, 1);
-        assert_eq!(tier.metrics().transit_admitted, 0);
+        assert_eq!(tier.metrics().transit_stored, 0);
     }
 
     #[test]
@@ -516,6 +524,36 @@ mod tests {
         assert!(actions.is_empty(), "mismatched CID should produce no actions");
         assert_eq!(tier.metrics().publishes_stored, 0);
         assert_eq!(tier.metrics().publishes_rejected, 1);
+    }
+
+    #[test]
+    fn transit_rejects_cid_with_wrong_size_field() {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+
+        // Craft a CID with correct hash but wrong payload_size by mutating
+        // the size bits in the last 4 bytes.
+        let data = b"correct data";
+        let real_cid = ContentId::for_blob(data).unwrap();
+        let mut bytes = real_cid.to_bytes();
+        // Corrupt the size: set size to 999 instead of 12.
+        let packed = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
+        let tag_only = packed & 0xFFF; // preserve lower 12 tag bits
+        let fake_packed = (999u32 << 12) | tag_only;
+        bytes[28..32].copy_from_slice(&fake_packed.to_be_bytes());
+        let bad_cid = ContentId::from_bytes(bytes);
+
+        // Hash matches but size is wrong — should be rejected.
+        assert!(bad_cid.verify_hash(data), "hash should still match");
+        let actions = tier.handle(StorageTierEvent::TransitContent {
+            cid: bad_cid,
+            data: data.to_vec(),
+        });
+        assert!(actions.is_empty(), "wrong size CID should be rejected");
+        assert_eq!(tier.metrics().transit_rejected, 1);
     }
 
     #[test]
