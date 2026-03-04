@@ -324,10 +324,12 @@ impl<B: BlobStore> NodeRuntime<B> {
         let event = match self.parse_compute_payload(query_id, payload) {
             Some(evt) => evt,
             None => {
-                return vec![ComputeTierAction::SendError {
-                    query_id,
-                    error: "malformed compute payload".into(),
-                }];
+                let mut payload = vec![0x01];
+                    payload.extend_from_slice(b"malformed compute payload");
+                    return vec![ComputeTierAction::SendReply {
+                        query_id,
+                        payload,
+                    }];
             }
         };
         self.compute.handle(event)
@@ -344,7 +346,8 @@ impl<B: BlobStore> NodeRuntime<B> {
                     return None;
                 }
                 let module_len = u32::from_le_bytes(payload[1..5].try_into().ok()?) as usize;
-                if payload.len() < 5 + module_len {
+                const MAX_MODULE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+                if module_len > MAX_MODULE_BYTES || payload.len() < 5 + module_len {
                     return None;
                 }
                 let module = payload[5..5 + module_len].to_vec();
@@ -384,11 +387,6 @@ impl<B: BlobStore> NodeRuntime<B> {
                 }
                 ComputeTierAction::FetchModule { cid } => {
                     out.push(RuntimeAction::FetchContent { cid });
-                }
-                ComputeTierAction::SendError { query_id, error } => {
-                    let mut payload = vec![0x01];
-                    payload.extend_from_slice(error.as_bytes());
-                    out.push(RuntimeAction::SendReply { query_id, payload });
                 }
             }
         }
@@ -883,5 +881,24 @@ mod tests {
             .any(|a| matches!(a, RuntimeAction::SendReply { query_id: 20, .. }));
         assert!(storage_reply, "should have storage reply");
         assert!(compute_reply, "should have compute reply");
+    }
+
+    #[test]
+    fn oversized_module_len_rejected() {
+        let (mut rt, _) = make_runtime();
+
+        // Build a payload with module_len = 0xFFFFFFFF (way over 10MB cap).
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 10]); // dummy bytes
+
+        rt.push_event(RuntimeEvent::ComputeQuery {
+            query_id: 200,
+            key_expr: "harmony/compute/activity/test".into(),
+            payload,
+        });
+
+        // Malformed payload should be silently dropped (no crash, no compute task queued).
+        assert_eq!(rt.compute_queue_len(), 0);
     }
 }

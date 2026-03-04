@@ -36,14 +36,16 @@ pub enum ComputeTierEvent {
 // ── Actions (outbound) ────────────────────────────────────────────────
 
 /// Outbound actions returned by the compute tier.
+///
+/// Wire format encoding (`[0x00]` success / `[0x01]` error tags) is fully
+/// handled inside [`ComputeTier`] — `SendReply` payloads are opaque to callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComputeTierAction {
-    /// Send a successful computation result back to the querier.
+    /// Send a computation result (success or error) back to the querier.
+    /// Payload is already wire-encoded with the appropriate tag byte.
     SendReply { query_id: u64, payload: Vec<u8> },
     /// Request the storage layer to fetch a WASM module by CID.
     FetchModule { cid: [u8; 32] },
-    /// Send an error response back to the querier.
-    SendError { query_id: u64, error: String },
 }
 
 // ── Internal types (private) ──────────────────────────────────────────
@@ -113,42 +115,62 @@ impl ComputeTier {
                 module_cid,
                 input,
             } => {
+                // Only emit FetchModule if no task is already waiting for this CID.
+                let already_waiting = self.queue.iter().any(|t| {
+                    matches!(t, ComputeTask::WaitingForModule { cid, .. } if *cid == module_cid)
+                });
                 self.queue.push_back(ComputeTask::WaitingForModule {
                     query_id,
                     cid: module_cid,
                     input,
                 });
-                vec![ComputeTierAction::FetchModule { cid: module_cid }]
+                if already_waiting {
+                    Vec::new()
+                } else {
+                    vec![ComputeTierAction::FetchModule { cid: module_cid }]
+                }
             }
             ComputeTierEvent::ModuleFetched { cid, module } => {
-                if let Some(pos) = self.queue.iter().position(
-                    |t| matches!(t, ComputeTask::WaitingForModule { cid: c, .. } if *c == cid),
-                ) {
-                    if let Some(ComputeTask::WaitingForModule {
-                        query_id, input, ..
-                    }) = self.queue.remove(pos)
-                    {
-                        self.queue.push_back(ComputeTask::Ready {
+                // Promote ALL tasks waiting for this CID, preserving FIFO order.
+                // Drain the queue and rebuild, upgrading matching tasks in-place.
+                let old_queue = std::mem::take(&mut self.queue);
+                for task in old_queue {
+                    match task {
+                        ComputeTask::WaitingForModule {
+                            cid: c,
                             query_id,
-                            module,
                             input,
-                        });
+                        } if c == cid => {
+                            self.queue.push_back(ComputeTask::Ready {
+                                query_id,
+                                module: module.clone(),
+                                input,
+                            });
+                        }
+                        other => self.queue.push_back(other),
                     }
                 }
                 Vec::new()
             }
             ComputeTierEvent::ModuleFetchFailed { cid } => {
+                // Fail ALL tasks waiting for this CID, preserving error order.
                 let mut actions = Vec::new();
-                if let Some(pos) = self.queue.iter().position(
-                    |t| matches!(t, ComputeTask::WaitingForModule { cid: c, .. } if *c == cid),
-                ) {
-                    if let Some(ComputeTask::WaitingForModule { query_id, .. }) =
-                        self.queue.remove(pos)
-                    {
-                        actions.push(ComputeTierAction::SendError {
-                            query_id,
-                            error: format!("module not found: {}", hex::encode(cid)),
-                        });
+                let old_queue = std::mem::take(&mut self.queue);
+                for task in old_queue {
+                    match task {
+                        ComputeTask::WaitingForModule {
+                            cid: c, query_id, ..
+                        } if c == cid => {
+                            let error_msg =
+                                format!("module not found: {}", hex::encode(cid));
+                            let mut payload = vec![0x01];
+                            payload.extend_from_slice(error_msg.as_bytes());
+                            actions.push(ComputeTierAction::SendReply {
+                                query_id,
+                                payload,
+                            });
+                        }
+                        other => self.queue.push_back(other),
                     }
                 }
                 actions
@@ -195,8 +217,11 @@ impl ComputeTier {
     /// Maps [`harmony_compute::ComputeResult`] variants to [`ComputeTierAction`]s:
     /// - `Complete` -> `SendReply` with `[0x00, output...]` payload
     /// - `Yielded` -> no action (auto-resume on next tick)
-    /// - `Failed` -> `SendError`
-    /// - `NeedsIO` -> `SendError` (not yet supported)
+    /// - `Failed` -> `SendReply` with `[0x01, error_utf8...]` payload
+    /// - `NeedsIO` -> `SendReply` with `[0x01, error_utf8...]` payload (not yet supported)
+    ///
+    /// All wire format encoding (`[0x00]` success / `[0x01]` error tags) is
+    /// consolidated here — callers treat payloads as opaque bytes.
     fn handle_compute_result(
         &mut self,
         result: harmony_compute::ComputeResult,
@@ -222,17 +247,15 @@ impl ComputeTier {
             }
             ComputeResult::Failed { error } => {
                 self.active = None;
-                vec![ComputeTierAction::SendError {
-                    query_id,
-                    error: format!("{error}"),
-                }]
+                let mut payload = vec![0x01];
+                payload.extend_from_slice(format!("{error}").as_bytes());
+                vec![ComputeTierAction::SendReply { query_id, payload }]
             }
             ComputeResult::NeedsIO { .. } => {
                 self.active = None;
-                vec![ComputeTierAction::SendError {
-                    query_id,
-                    error: "NeedsIO not yet supported".into(),
-                }]
+                let mut payload = vec![0x01];
+                payload.extend_from_slice(b"NeedsIO not yet supported");
+                vec![ComputeTierAction::SendReply { query_id, payload }]
             }
         }
     }
@@ -365,13 +388,14 @@ pub(crate) mod tests {
         // Signal fetch failure.
         let actions = tier.handle(ComputeTierEvent::ModuleFetchFailed { cid });
         assert_eq!(actions.len(), 1);
-        assert_eq!(
-            actions[0],
-            ComputeTierAction::SendError {
-                query_id: 4,
-                error: format!("module not found: {}", hex::encode(cid)),
-            }
-        );
+        if let ComputeTierAction::SendReply { query_id, payload } = &actions[0] {
+            assert_eq!(*query_id, 4);
+            assert_eq!(payload[0], 0x01);
+            let error_msg = std::str::from_utf8(&payload[1..]).unwrap();
+            assert!(error_msg.contains("module not found"));
+        } else {
+            panic!("expected SendReply with error tag, got: {:?}", actions[0]);
+        }
         assert_eq!(tier.queue_len(), 0);
     }
 
@@ -422,9 +446,9 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 &actions[0],
-                ComputeTierAction::SendError { query_id: 20, .. }
+                ComputeTierAction::SendReply { query_id: 20, payload } if payload[0] == 0x01
             ),
-            "expected SendError for query_id 20, got: {actions:?}"
+            "expected SendReply with error tag for query_id 20, got: {actions:?}"
         );
         assert!(!tier.has_active());
     }
@@ -539,5 +563,100 @@ pub(crate) mod tests {
         // Third tick: nothing left.
         let actions = tier.tick();
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn duplicate_cid_requests_emit_single_fetch() {
+        let mut tier = make_tier();
+        let cid = [0xAA; 32];
+
+        // First request for this CID: should emit FetchModule.
+        let actions = tier.handle(ComputeTierEvent::ExecuteByCid {
+            query_id: 50,
+            module_cid: cid,
+            input: vec![1],
+        });
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0], ComputeTierAction::FetchModule { cid });
+
+        // Second request for same CID: should NOT emit FetchModule.
+        let actions = tier.handle(ComputeTierEvent::ExecuteByCid {
+            query_id: 51,
+            module_cid: cid,
+            input: vec![2],
+        });
+        assert!(actions.is_empty(), "duplicate CID should not re-fetch");
+        assert_eq!(tier.queue_len(), 2);
+    }
+
+    #[test]
+    fn module_fetched_promotes_all_waiting_tasks() {
+        let mut tier = make_tier();
+        let cid = [0xBB; 32];
+
+        // Two queries for the same CID.
+        tier.handle(ComputeTierEvent::ExecuteByCid {
+            query_id: 60,
+            module_cid: cid,
+            input: {
+                let mut v = Vec::new();
+                v.extend_from_slice(&5i32.to_le_bytes());
+                v.extend_from_slice(&3i32.to_le_bytes());
+                v
+            },
+        });
+        tier.handle(ComputeTierEvent::ExecuteByCid {
+            query_id: 61,
+            module_cid: cid,
+            input: {
+                let mut v = Vec::new();
+                v.extend_from_slice(&10i32.to_le_bytes());
+                v.extend_from_slice(&20i32.to_le_bytes());
+                v
+            },
+        });
+        assert_eq!(tier.queue_len(), 2);
+
+        // Deliver the module — both should be promoted.
+        tier.handle(ComputeTierEvent::ModuleFetched {
+            cid,
+            module: ADD_WAT.as_bytes().to_vec(),
+        });
+        assert_eq!(tier.queue_len(), 2); // both promoted to Ready
+
+        // Tick twice — both should complete.
+        let a1 = tier.tick();
+        assert_eq!(a1.len(), 1);
+        assert!(matches!(&a1[0], ComputeTierAction::SendReply { query_id: 60, .. }));
+
+        let a2 = tier.tick();
+        assert_eq!(a2.len(), 1);
+        assert!(matches!(&a2[0], ComputeTierAction::SendReply { query_id: 61, .. }));
+    }
+
+    #[test]
+    fn module_fetch_failed_errors_all_waiting_tasks() {
+        let mut tier = make_tier();
+        let cid = [0xCC; 32];
+
+        // Two queries for the same CID.
+        tier.handle(ComputeTierEvent::ExecuteByCid {
+            query_id: 70,
+            module_cid: cid,
+            input: vec![1],
+        });
+        tier.handle(ComputeTierEvent::ExecuteByCid {
+            query_id: 71,
+            module_cid: cid,
+            input: vec![2],
+        });
+        assert_eq!(tier.queue_len(), 2);
+
+        // Signal fetch failure — both should get errors.
+        let actions = tier.handle(ComputeTierEvent::ModuleFetchFailed { cid });
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(&actions[0], ComputeTierAction::SendReply { query_id: 70, payload } if payload[0] == 0x01));
+        assert!(matches!(&actions[1], ComputeTierAction::SendReply { query_id: 71, payload } if payload[0] == 0x01));
+        assert_eq!(tier.queue_len(), 0);
     }
 }
