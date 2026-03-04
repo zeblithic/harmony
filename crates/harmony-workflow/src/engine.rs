@@ -17,6 +17,9 @@ struct WorkflowState {
     module_bytes: Option<Vec<u8>>,
     /// Saved runtime session for a workflow suspended on IO.
     saved_session: Option<Box<dyn std::any::Any>>,
+    /// Cached IO responses from a prior execution (used during recovery replay).
+    /// Populated from WorkflowHistory.events on recover(). Consumed during replay.
+    replay_cache: HashMap<[u8; 32], Option<Vec<u8>>>,
 }
 
 /// Sans-I/O workflow engine that orchestrates WASM workflow execution.
@@ -122,6 +125,47 @@ impl WorkflowEngine {
         self.workflows.len()
     }
 
+    /// Recover a workflow from a persisted history.
+    ///
+    /// Re-submits the module for execution. During replay, if `fetch_content`
+    /// is called for a CID present in the history as `IoResolved`, the cached
+    /// data is fed immediately (no external fetch). If execution reaches
+    /// beyond the recorded history, new IO requests are emitted normally.
+    pub fn recover(
+        &mut self,
+        history: WorkflowHistory,
+        module_bytes: Vec<u8>,
+    ) -> Vec<WorkflowAction> {
+        let wf_id = history.workflow_id;
+
+        // Build replay cache from history's IoResolved events.
+        let mut replay_cache = HashMap::new();
+        for event in &history.events {
+            if let HistoryEvent::IoResolved { cid, data } = event {
+                replay_cache.insert(*cid, data.clone());
+            }
+        }
+
+        // Create workflow state with replay cache populated.
+        let state = WorkflowState {
+            status: WorkflowStatus::Pending,
+            history: WorkflowHistory {
+                workflow_id: wf_id,
+                module_hash: history.module_hash,
+                input: history.input.clone(),
+                events: Vec::new(), // Fresh event log for this execution
+                total_fuel_consumed: 0,
+            },
+            hint: ComputeHint::PreferLocal,
+            module_bytes: Some(module_bytes),
+            saved_session: None,
+            replay_cache,
+        };
+
+        self.workflows.insert(wf_id, state);
+        Vec::new() // Will execute on next tick()
+    }
+
     // --- Private helpers ---
 
     fn handle_submit(
@@ -150,6 +194,7 @@ impl WorkflowEngine {
             hint,
             module_bytes: Some(module),
             saved_session: None,
+            replay_cache: HashMap::new(),
         };
 
         self.workflows.insert(wf_id, state);
@@ -255,6 +300,28 @@ impl WorkflowEngine {
                 if let Some(state) = self.workflows.get_mut(&wf_id) {
                     state.history.events.push(HistoryEvent::IoRequested { cid });
 
+                    // Check replay cache BEFORE extracting session.
+                    if let Some(cached_data) = state.replay_cache.remove(&cid) {
+                        // Cache hit: feed cached data immediately, no external fetch.
+                        state.history.events.push(HistoryEvent::IoResolved {
+                            cid,
+                            data: cached_data.clone(),
+                        });
+                        // Resume execution with cached data.
+                        let result = match cached_data {
+                            Some(data) => self.runtime.resume_with_io(
+                                IOResponse::ContentReady { data },
+                                self.budget,
+                            ),
+                            None => self.runtime.resume_with_io(
+                                IOResponse::ContentNotFound,
+                                self.budget,
+                            ),
+                        };
+                        return self.handle_compute_result(wf_id, result);
+                    }
+
+                    // Cache miss: normal path — extract session, emit FetchContent.
                     let saved_session = self
                         .runtime
                         .take_session()
@@ -677,6 +744,110 @@ mod tests {
         assert_eq!(
             engine.workflow_status(&wf_id),
             Some(&WorkflowStatus::WaitingForIo { cid })
+        );
+    }
+
+    // --- Recovery tests (Task 5) ---
+
+    #[test]
+    fn recover_replays_from_history() {
+        // First: run a workflow to completion with IO.
+        let mut engine = make_engine_high_fuel();
+        let cid = [0x33; 32];
+        let content = b"recovery test data";
+
+        engine.handle(WorkflowEvent::Submit {
+            module: FETCH_WAT.as_bytes().to_vec(),
+            input: cid.to_vec(),
+            hint: ComputeHint::PreferLocal,
+        });
+        engine.tick(); // -> NeedsIO
+        engine.handle(WorkflowEvent::ContentFetched {
+            cid,
+            data: content.to_vec(),
+        });
+
+        let module_hash = harmony_crypto::hash::blake3_hash(FETCH_WAT.as_bytes());
+        let wf_id = WorkflowId::new(&module_hash, &cid);
+        let history = engine.take_history(&wf_id).unwrap();
+
+        // Now: create a FRESH engine and recover from the history.
+        let mut engine2 = make_engine_high_fuel();
+        let _actions = engine2.recover(history, FETCH_WAT.as_bytes().to_vec());
+
+        // Tick to completion. Since all IO is cached, should complete
+        // without emitting any FetchContent actions.
+        let mut all_actions = Vec::new();
+        for _ in 0..100 {
+            let actions = engine2.tick();
+            let done = actions
+                .iter()
+                .any(|a| matches!(a, WorkflowAction::WorkflowComplete { .. }));
+            all_actions.extend(actions);
+            if done {
+                break;
+            }
+        }
+
+        // Verify no FetchContent was emitted (all IO was cached).
+        assert!(
+            !all_actions
+                .iter()
+                .any(|a| matches!(a, WorkflowAction::FetchContent { .. })),
+            "recovery should not emit FetchContent for cached IO"
+        );
+
+        let complete = all_actions
+            .iter()
+            .find(|a| matches!(a, WorkflowAction::WorkflowComplete { .. }));
+        assert!(
+            complete.is_some(),
+            "recovery should complete, got: {all_actions:?}"
+        );
+
+        if let Some(WorkflowAction::WorkflowComplete { output, .. }) = complete {
+            let result_code = i32::from_le_bytes(output[..4].try_into().unwrap());
+            assert_eq!(result_code, content.len() as i32);
+            assert_eq!(&output[4..], content);
+        }
+    }
+
+    #[test]
+    fn recover_with_new_io_beyond_history() {
+        // Create a history with NO recorded IO (as if module crashed at NeedsIO).
+        let module_hash = harmony_crypto::hash::blake3_hash(FETCH_WAT.as_bytes());
+        let cid = [0x44; 32];
+        let wf_id = WorkflowId::new(&module_hash, &cid);
+
+        let history = WorkflowHistory {
+            workflow_id: wf_id,
+            module_hash,
+            input: cid.to_vec(),
+            events: vec![], // No recorded IO
+            total_fuel_consumed: 0,
+        };
+
+        let mut engine = make_engine_high_fuel();
+        engine.recover(history, FETCH_WAT.as_bytes().to_vec());
+
+        // Tick: module calls fetch_content -> NeedsIO -> FetchContent (not cached).
+        let mut all_actions = Vec::new();
+        for _ in 0..100 {
+            let actions = engine.tick();
+            all_actions.extend(actions.clone());
+            if actions
+                .iter()
+                .any(|a| matches!(a, WorkflowAction::FetchContent { .. }))
+            {
+                break;
+            }
+        }
+
+        assert!(
+            all_actions
+                .iter()
+                .any(|a| matches!(a, WorkflowAction::FetchContent { .. })),
+            "should emit FetchContent for IO beyond recorded history"
         );
     }
 }
