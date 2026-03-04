@@ -70,6 +70,11 @@ pub enum RuntimeEvent {
         cid: [u8; 32],
         result: Result<Vec<u8>, String>,
     },
+    /// Tier 3: Content fetch response for a suspended compute task.
+    ContentFetchResponse {
+        cid: [u8; 32],
+        result: Result<Vec<u8>, String>,
+    },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -240,6 +245,14 @@ impl<B: BlobStore> NodeRuntime<B> {
                 let event = match result {
                     Ok(module) => ComputeTierEvent::ModuleFetched { cid, module },
                     Err(_) => ComputeTierEvent::ModuleFetchFailed { cid },
+                };
+                let actions = self.compute.handle(event);
+                self.pending_compute_actions.extend(actions);
+            }
+            RuntimeEvent::ContentFetchResponse { cid, result } => {
+                let event = match result {
+                    Ok(data) => ComputeTierEvent::ContentFetched { cid, data },
+                    Err(_) => ComputeTierEvent::ContentFetchFailed { cid },
                 };
                 let actions = self.compute.handle(event);
                 self.pending_compute_actions.extend(actions);
@@ -911,5 +924,98 @@ mod tests {
         assert_eq!(payload[0], 0x01, "error tag");
         let msg = std::str::from_utf8(&payload[1..]).unwrap();
         assert!(msg.contains("malformed"), "error message should mention malformed payload");
+    }
+
+    #[test]
+    fn content_fetch_response_routes_to_compute() {
+        let (mut rt, _) = make_runtime();
+        let cid = [0xAB; 32];
+
+        // Submit a compute query with a fetch module.
+        let module = crate::compute::tests::FETCH_WAT.as_bytes();
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&(module.len() as u32).to_le_bytes());
+        payload.extend_from_slice(module);
+        payload.extend_from_slice(&cid); // CID as input
+
+        rt.push_event(RuntimeEvent::ComputeQuery {
+            query_id: 300,
+            key_expr: "harmony/compute/activity/test".into(),
+            payload,
+        });
+
+        // tick → NeedsIO → FetchContent action
+        let actions = rt.tick();
+        let fetch = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::FetchContent { .. }));
+        assert!(fetch.is_some(), "should emit FetchContent, got: {actions:?}");
+
+        // Deliver content via ContentFetchResponse.
+        let content = b"resolved content";
+        rt.push_event(RuntimeEvent::ContentFetchResponse {
+            cid,
+            result: Ok(content.to_vec()),
+        });
+
+        // tick → dispatches pending compute actions → SendReply
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 300, .. }));
+        assert!(reply.is_some(), "should emit SendReply for query 300, got: {actions:?}");
+
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload[0], 0x00, "success tag");
+            let result_code = i32::from_le_bytes(payload[1..5].try_into().unwrap());
+            assert_eq!(result_code, content.len() as i32);
+        }
+    }
+
+    #[test]
+    fn compute_content_read_round_trip() {
+        let (mut rt, _) = make_runtime();
+        let cid = [0x42; 32];
+        let content = vec![10, 20, 30, 40, 50];
+
+        // Submit inline compute query with fetch module.
+        let module = crate::compute::tests::FETCH_WAT.as_bytes();
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&(module.len() as u32).to_le_bytes());
+        payload.extend_from_slice(module);
+        payload.extend_from_slice(&cid);
+
+        rt.push_event(RuntimeEvent::ComputeQuery {
+            query_id: 400,
+            key_expr: "harmony/compute/activity/fetch".into(),
+            payload,
+        });
+
+        // Tick 1: execute → NeedsIO → FetchContent
+        let actions = rt.tick();
+        assert!(
+            actions.iter().any(|a| matches!(a, RuntimeAction::FetchContent { cid: c } if *c == cid)),
+            "tick 1 should emit FetchContent"
+        );
+
+        // External IO resolves the content.
+        rt.push_event(RuntimeEvent::ContentFetchResponse {
+            cid,
+            result: Ok(content.clone()),
+        });
+
+        // Tick 2: resume compute → SendReply
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 400, .. }));
+        assert!(reply.is_some(), "tick 2 should emit SendReply");
+
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload[0], 0x00);
+            let result_code = i32::from_le_bytes(payload[1..5].try_into().unwrap());
+            assert_eq!(result_code, 5);
+            assert_eq!(&payload[5..], &content);
+        }
     }
 }
