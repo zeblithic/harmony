@@ -263,6 +263,9 @@ impl<B: BlobStore> NodeRuntime<B> {
                         // Convert pending CID-based requests to inline Submit now
                         // that we have the module bytes. SubmitByCid is stubbed in
                         // the workflow engine, so we go through Submit instead.
+                        // TODO: Remove this manual handling when the engine's
+                        // SubmitByCid/ModuleFetched stubs are implemented.
+                        // See engine.rs WorkflowEvent::SubmitByCid stub comment.
                         // TODO: blake3_hash is computed once here but also re-computed
                         // inside handle_submit for each call. For large WASM modules
                         // with many pending queries, consider passing pre-computed hash.

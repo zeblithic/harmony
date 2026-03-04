@@ -76,7 +76,11 @@ impl WorkflowEngine {
             } => self.handle_submit(module, input, hint),
             WorkflowEvent::ContentFetched { cid, data } => self.handle_content_fetched(cid, data),
             WorkflowEvent::ContentFetchFailed { cid } => self.handle_content_fetch_failed(cid),
-            // Stubs for future tasks.
+            // Stubs for future tasks. Currently, NodeRuntime handles module
+            // fetching externally via cid_to_query and converts results into
+            // inline Submit events. When these stubs are implemented, remove
+            // the manual handling in NodeRuntime::push_event(ModuleFetchResponse)
+            // to avoid double-submission. See runtime.rs ModuleFetchResponse arm.
             WorkflowEvent::SubmitByCid { .. }
             | WorkflowEvent::ModuleFetched { .. }
             | WorkflowEvent::ModuleFetchFailed { .. } => Vec::new(),
@@ -407,6 +411,11 @@ impl WorkflowEngine {
                     .history
                     .events
                     .push(HistoryEvent::IoResolved { cid, data: data.clone() });
+                // NOTE: Status is set to Executing here even though the workflow
+                // won't actually resume until a future tick() picks it up from
+                // deferred_resume_queue. Callers of workflow_status() will briefly
+                // see Executing for a still-suspended workflow. Acceptable for now;
+                // a DeferredResume status could improve observability later.
                 state.status = WorkflowStatus::Executing;
                 state.deferred_io = Some(io_response.clone());
                 self.deferred_resume_queue.push_back(wf_id);
