@@ -173,13 +173,14 @@ impl WorkflowEngine {
 
     /// Remove a completed or failed workflow from the engine.
     ///
-    /// Strip heavy data from a terminal workflow while preserving its entry
-    /// for dedup. Only compacts workflows in terminal states (`Complete` or
-    /// `Failed`). The caller should invoke this after persisting the history
-    /// and dispatching all replies to limit memory growth.
+    /// Strip runtime-heavy data from a terminal workflow while preserving
+    /// its entry for dedup and its history for persistence/recovery.
     ///
-    /// The workflow entry is retained (with status + completed_output) so that
-    /// duplicate submissions return the cached result instead of re-executing.
+    /// Only compacts workflows in terminal states (`Complete` or `Failed`).
+    /// Clears module bytes, sessions, and replay cache but retains
+    /// `history.events` and `history.input` — those are needed for crash
+    /// recovery via deterministic replay and must survive until the caller
+    /// has persisted the history externally.
     pub fn compact_workflow(&mut self, id: &WorkflowId) -> bool {
         match self.workflows.get_mut(id) {
             Some(state)
@@ -189,9 +190,11 @@ impl WorkflowEngine {
                 state.module_bytes = None;
                 state.saved_session = None;
                 state.replay_cache.clear();
-                state.history.events.clear();
-                state.history.input.clear();
                 state.deferred_io = None;
+                // NOTE: history.events and history.input are intentionally
+                // preserved — they are the durable checkpoint for crash
+                // recovery. Clear them only after external persistence
+                // confirms the data is safely stored.
                 true
             }
             _ => false,
