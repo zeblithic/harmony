@@ -39,6 +39,8 @@ pub struct TierSchedule {
     /// Adaptive compute fuel scaling under data-plane load.
     pub adaptive_compute: AdaptiveCompute,
     /// Ticks without processing before a tier is promoted in tick order.
+    /// A value of `0` means all tiers are always considered starved and no
+    /// reordering occurs (equivalent to disabling starvation-based promotion).
     pub starvation_threshold: u32,
 }
 
@@ -439,7 +441,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                             None => break,
                         }
                     }
-                    if processed > 0 { self.router_starved = 0; } else { self.router_starved += 1; }
+                    if processed > 0 { self.router_starved = 0; } else { self.router_starved = self.router_starved.saturating_add(1); }
                 }
                 1 => {
                     // Tier 2: Storage
@@ -455,7 +457,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                             None => break,
                         }
                     }
-                    if processed > 0 { self.storage_starved = 0; } else { self.storage_starved += 1; }
+                    if processed > 0 { self.storage_starved = 0; } else { self.storage_starved = self.storage_starved.saturating_add(1); }
                 }
                 2 => {
                     // Tier 3: Compute — dispatch pending workflow actions, then one slice
@@ -466,7 +468,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                     let workflow_actions = self.workflow.tick_with_budget(effective_budget);
                     let had_work = had_pending || !workflow_actions.is_empty();
                     self.dispatch_workflow_actions(workflow_actions, &mut actions);
-                    if had_work { self.compute_starved = 0; } else { self.compute_starved += 1; }
+                    if had_work { self.compute_starved = 0; } else { self.compute_starved = self.compute_starved.saturating_add(1); }
                 }
                 _ => unreachable!(),
             }
