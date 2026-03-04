@@ -442,7 +442,10 @@ impl ComputeRuntime for WasmiRuntime {
 
         let invocation = match session.pending.take() {
             Some(PendingResumable::HostTrap(inv)) => inv,
-            Some(PendingResumable::OutOfFuel(_)) => {
+            Some(out_of_fuel @ PendingResumable::OutOfFuel(_)) => {
+                // OutOfFuel requires resume(), not resume_with_io().
+                // Restore the pending state so resume() can use it.
+                session.pending = Some(out_of_fuel);
                 self.session = Some(session);
                 return ComputeResult::Failed {
                     error: ComputeError::NoPendingExecution,
@@ -460,6 +463,7 @@ impl ComputeRuntime for WasmiRuntime {
         let (out_ptr, out_cap) = match session.store.data().io_write_target {
             Some(target) => target,
             None => {
+                self.session = Some(session);
                 return ComputeResult::Failed {
                     error: ComputeError::Trap {
                         reason: "resume_with_io: no write target stored".into(),
@@ -478,6 +482,7 @@ impl ComputeRuntime for WasmiRuntime {
                     let memory = match session.instance.get_memory(&session.store, "memory") {
                         Some(mem) => mem,
                         None => {
+                            self.session = Some(session);
                             return ComputeResult::Failed {
                                 error: ComputeError::ExportNotFound {
                                     name: "memory".into(),
@@ -489,10 +494,12 @@ impl ComputeRuntime for WasmiRuntime {
                         .write(&mut session.store, out_ptr as usize, data)
                         .is_err()
                     {
+                        let have = memory.data_size(&session.store);
+                        self.session = Some(session);
                         return ComputeResult::Failed {
                             error: ComputeError::MemoryTooSmall {
                                 need: out_ptr as usize + data.len(),
-                                have: memory.data_size(&session.store),
+                                have,
                             },
                         };
                     }
