@@ -321,27 +321,33 @@ impl WorkflowEngine {
             return Vec::new();
         }
 
-        // Resume the first workflow immediately.
-        // Set status to Executing BEFORE resume so find_all_waiting_for_io
-        // won't rediscover it if resume_with_io returns Yielded.
-        let first = waiting[0];
-        let state = self.workflows.get_mut(&first).expect("workflow must exist");
-        state.status = WorkflowStatus::Executing;
-        state.history.events.push(HistoryEvent::IoResolved {
-            cid,
-            data: Some(data.clone()),
-        });
-        let saved_session = state
-            .saved_session
-            .take()
-            .expect("WaitingForIo implies saved session");
-        self.runtime.restore_session(saved_session);
-        self.active = Some(first);
+        // If a workflow is currently active (yielded mid-execution), we cannot
+        // restore a different session without destroying the active one. Defer
+        // ALL waiting workflows so they resume after the active one completes.
+        let immediate_resume = self.active.is_none();
 
-        // Defer remaining workflows: store IO response for tick() to resume.
-        // Set status to Executing so find_all_waiting_for_io won't rediscover
-        // them if a duplicate ContentFetched arrives for the same CID.
-        for &wf_id in &waiting[1..] {
+        if immediate_resume {
+            // Resume the first workflow immediately.
+            // Set status to Executing BEFORE resume so find_all_waiting_for_io
+            // won't rediscover it if resume_with_io returns Yielded.
+            let first = waiting[0];
+            let state = self.workflows.get_mut(&first).expect("workflow must exist");
+            state.status = WorkflowStatus::Executing;
+            state.history.events.push(HistoryEvent::IoResolved {
+                cid,
+                data: Some(data.clone()),
+            });
+            let saved_session = state
+                .saved_session
+                .take()
+                .expect("WaitingForIo implies saved session");
+            self.runtime.restore_session(saved_session);
+            self.active = Some(first);
+        }
+
+        // Defer remaining workflows (or all, if an active workflow is running).
+        let defer_start = if immediate_resume { 1 } else { 0 };
+        for &wf_id in &waiting[defer_start..] {
             if let Some(state) = self.workflows.get_mut(&wf_id) {
                 state.history.events.push(HistoryEvent::IoResolved {
                     cid,
@@ -353,10 +359,14 @@ impl WorkflowEngine {
             }
         }
 
-        let result = self
-            .runtime
-            .resume_with_io(IOResponse::ContentReady { data }, self.budget);
-        self.handle_compute_result(first, result)
+        if immediate_resume {
+            let result = self
+                .runtime
+                .resume_with_io(IOResponse::ContentReady { data }, self.budget);
+            self.handle_compute_result(waiting[0], result)
+        } else {
+            Vec::new()
+        }
     }
 
     fn handle_content_fetch_failed(&mut self, cid: [u8; 32]) -> Vec<WorkflowAction> {
@@ -365,25 +375,33 @@ impl WorkflowEngine {
             return Vec::new();
         }
 
-        // Resume the first workflow immediately.
-        // Set status to Executing BEFORE resume so find_all_waiting_for_io
-        // won't rediscover it if resume_with_io returns Yielded.
-        let first = waiting[0];
-        let state = self.workflows.get_mut(&first).expect("workflow must exist");
-        state.status = WorkflowStatus::Executing;
-        state
-            .history
-            .events
-            .push(HistoryEvent::IoResolved { cid, data: None });
-        let saved_session = state
-            .saved_session
-            .take()
-            .expect("WaitingForIo implies saved session");
-        self.runtime.restore_session(saved_session);
-        self.active = Some(first);
+        // If a workflow is currently active (yielded mid-execution), we cannot
+        // restore a different session without destroying the active one. Defer
+        // ALL waiting workflows so they resume after the active one completes.
+        let immediate_resume = self.active.is_none();
 
-        // Defer remaining workflows (set Executing to avoid rediscovery).
-        for &wf_id in &waiting[1..] {
+        if immediate_resume {
+            // Resume the first workflow immediately.
+            // Set status to Executing BEFORE resume so find_all_waiting_for_io
+            // won't rediscover it if resume_with_io returns Yielded.
+            let first = waiting[0];
+            let state = self.workflows.get_mut(&first).expect("workflow must exist");
+            state.status = WorkflowStatus::Executing;
+            state
+                .history
+                .events
+                .push(HistoryEvent::IoResolved { cid, data: None });
+            let saved_session = state
+                .saved_session
+                .take()
+                .expect("WaitingForIo implies saved session");
+            self.runtime.restore_session(saved_session);
+            self.active = Some(first);
+        }
+
+        // Defer remaining workflows (or all, if an active workflow is running).
+        let defer_start = if immediate_resume { 1 } else { 0 };
+        for &wf_id in &waiting[defer_start..] {
             if let Some(state) = self.workflows.get_mut(&wf_id) {
                 state
                     .history
@@ -395,10 +413,14 @@ impl WorkflowEngine {
             }
         }
 
-        let result = self
-            .runtime
-            .resume_with_io(IOResponse::ContentNotFound, self.budget);
-        self.handle_compute_result(first, result)
+        if immediate_resume {
+            let result = self
+                .runtime
+                .resume_with_io(IOResponse::ContentNotFound, self.budget);
+            self.handle_compute_result(waiting[0], result)
+        } else {
+            Vec::new()
+        }
     }
 
     fn handle_compute_result(
@@ -1175,5 +1197,181 @@ mod tests {
         assert_eq!(completed.len(), 2, "both workflows should complete");
         assert!(completed.contains(&wf_a), "workflow A should complete");
         assert!(completed.contains(&wf_b), "workflow B should complete");
+    }
+
+    /// Scriptable mock runtime that returns pre-programmed results.
+    /// Used to test engine logic without depending on wasmi's fuel semantics.
+    struct ScriptedRuntime {
+        results: std::cell::RefCell<VecDeque<ComputeResult>>,
+        pending: bool,
+        session: Option<Box<dyn std::any::Any>>,
+    }
+
+    impl ScriptedRuntime {
+        fn new(results: Vec<ComputeResult>) -> Self {
+            Self {
+                results: std::cell::RefCell::new(VecDeque::from(results)),
+                pending: false,
+                session: None,
+            }
+        }
+
+        fn process_result(&mut self) -> ComputeResult {
+            let result = self
+                .results
+                .borrow_mut()
+                .pop_front()
+                .expect("ScriptedRuntime: no more scripted results");
+            match &result {
+                ComputeResult::Yielded { .. } | ComputeResult::NeedsIO { .. } => {
+                    self.pending = true;
+                    if self.session.is_none() {
+                        self.session = Some(Box::new(()));
+                    }
+                }
+                _ => {
+                    self.pending = false;
+                }
+            }
+            result
+        }
+    }
+
+    impl ComputeRuntime for ScriptedRuntime {
+        fn execute(
+            &mut self,
+            _module: &[u8],
+            _input: &[u8],
+            _budget: InstructionBudget,
+        ) -> ComputeResult {
+            // New execution creates a fresh session.
+            self.session = Some(Box::new(()));
+            self.process_result()
+        }
+
+        fn resume(&mut self, _budget: InstructionBudget) -> ComputeResult {
+            self.process_result()
+        }
+
+        fn resume_with_io(
+            &mut self,
+            _response: IOResponse,
+            _budget: InstructionBudget,
+        ) -> ComputeResult {
+            self.process_result()
+        }
+
+        fn has_pending(&self) -> bool {
+            self.pending
+        }
+
+        fn take_session(&mut self) -> Option<Box<dyn std::any::Any>> {
+            self.pending = false;
+            self.session.take()
+        }
+
+        fn restore_session(&mut self, session: Box<dyn std::any::Any>) {
+            self.session = Some(session);
+            self.pending = true;
+        }
+
+        fn snapshot(&self) -> Result<harmony_compute::Checkpoint, harmony_compute::ComputeError> {
+            Err(harmony_compute::ComputeError::NoPendingExecution)
+        }
+    }
+
+    #[test]
+    fn content_fetched_while_active_defers_io_workflow() {
+        let cid = [0x88; 32];
+
+        // Script: B executes→NeedsIO, A executes→Yielded, A resumes→Complete, B resumes→Complete
+        let runtime = ScriptedRuntime::new(vec![
+            // tick 1: B executes → NeedsIO (requests cid)
+            ComputeResult::NeedsIO {
+                request: IORequest::FetchContent { cid },
+            },
+            // tick 2: A executes → Yielded (active, mid-execution)
+            ComputeResult::Yielded { fuel_consumed: 10 },
+            // tick 3: A resumes → Complete
+            ComputeResult::Complete {
+                output: vec![1, 2, 3, 4],
+            },
+            // tick 4: B resumes with IO → Complete
+            ComputeResult::Complete {
+                output: vec![5, 6, 7, 8],
+            },
+        ]);
+
+        let mut engine = WorkflowEngine::new(
+            Box::new(runtime),
+            InstructionBudget { fuel: 100_000 },
+        );
+
+        let module_b = b"module_b".to_vec();
+        let module_a = b"module_a".to_vec();
+        let module_b_hash = harmony_crypto::hash::blake3_hash(&module_b);
+        let module_a_hash = harmony_crypto::hash::blake3_hash(&module_a);
+        let wf_b = WorkflowId::new(&module_b_hash, &cid);
+        let input_a = b"input_a".to_vec();
+        let wf_a = WorkflowId::new(&module_a_hash, &input_a);
+
+        // Submit B (IO-requesting workflow).
+        engine.handle(WorkflowEvent::Submit {
+            module: module_b,
+            input: cid.to_vec(),
+            hint: ComputeHint::PreferLocal,
+        });
+
+        // Tick 1: B executes → NeedsIO → WaitingForIo, active cleared.
+        let actions = engine.tick();
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, WorkflowAction::FetchContent { .. })));
+        assert_eq!(
+            engine.workflow_status(&wf_b),
+            Some(&WorkflowStatus::WaitingForIo { cid })
+        );
+
+        // Submit A (simple computation).
+        engine.handle(WorkflowEvent::Submit {
+            module: module_a,
+            input: input_a,
+            hint: ComputeHint::PreferLocal,
+        });
+
+        // Tick 2: A executes → Yielded → active = Some(A).
+        let actions = engine.tick();
+        assert!(actions.is_empty(), "Yielded should produce no actions");
+        assert_eq!(
+            engine.workflow_status(&wf_a),
+            Some(&WorkflowStatus::Executing)
+        );
+
+        // Deliver content for B while A is active (yielded).
+        // Before the fix, this would destroy A's runtime session.
+        let actions = engine.handle(WorkflowEvent::ContentFetched {
+            cid,
+            data: b"content".to_vec(),
+        });
+
+        // B should be DEFERRED — not immediately resumed.
+        assert!(
+            actions.is_empty(),
+            "B should be deferred when A is active, not immediately resumed"
+        );
+
+        // Tick 3: Priority 1 resumes A → Complete.
+        let actions = engine.tick();
+        let a_complete = actions
+            .iter()
+            .any(|a| matches!(a, WorkflowAction::WorkflowComplete { workflow_id, .. } if *workflow_id == wf_a));
+        assert!(a_complete, "A should complete on this tick");
+
+        // Tick 4: Priority 2 resumes B (deferred) → Complete.
+        let actions = engine.tick();
+        let b_complete = actions
+            .iter()
+            .any(|a| matches!(a, WorkflowAction::WorkflowComplete { workflow_id, .. } if *workflow_id == wf_b));
+        assert!(b_complete, "B should complete on this tick");
     }
 }
