@@ -38,34 +38,34 @@ Complete ALL steps below in order. These steps are sequential — each depends o
 
 ### 3. Verify review state (the "ready to merge" check)
 
-Fetch the review signals and verify ALL of these conditions:
+Run the review-state script first for a deterministic check:
 
 ```bash
-# Latest commit timestamp
-gh pr view {number} --json commits --jq '.commits[-1] | {sha: .oid, date: .committedDate}'
-
-# Bugbot reviews (cursor[bot] posts GitHub PR reviews)
-gh api repos/{owner}/{repo}/pulls/{number}/reviews \
-  --jq '.[] | select(.user.login == "cursor[bot]") | {user: .user.login, state: .state, submitted: .submitted_at}'
-
-# Greptile responses (greptile-apps posts PR comments, NOT GitHub reviews)
-gh pr view {number} --comments --json comments \
-  --jq '.comments[] | select(.author.login == "greptile-apps") | {author: .author.login, created: .createdAt, bodyPreview: (.body | .[0:80])}'
-
-# Thumbs-up on trigger comments (approval signal for BOTH reviewers)
-gh api repos/{owner}/{repo}/issues/{number}/comments \
-  --jq '.[] | select(.body == "bugbot run" or .body == "@greptile") | {body: .body, created: .created_at, thumbsup: .reactions["+1"]}'
+cd /Users/zeblith/work/zeblithic/harmony && bash scripts/review-state.sh {number}
 ```
 
-**How each reviewer signals completion:**
-- **Bugbot (`cursor[bot]`)**: Posts a GitHub PR **review** (shows in reviews API). Approval = thumbs-up on "bugbot run" trigger comment.
-- **Greptile (`greptile-apps`)**: Posts a PR **comment** (NOT a review — won't appear in reviews API). Approval = thumbs-up on "@greptile" trigger comment.
+If the script reports `REVIEWS_COMPLETE_ALL_CLEAR`, proceed to merge.
+
+If it reports anything else, fetch detail to explain why:
+
+```bash
+# Bugbot inline review comments (findings on diff lines) — PAGINATED
+gh api "repos/zeblithic/harmony/pulls/{number}/comments?per_page=100" --paginate \
+  --jq '.[] | select(.user.login == "cursor[bot]") | {path: .path, line: .line, created: .created_at, body: .body[:300]}'
+
+# Greptile's latest comment — PAGINATED
+gh api "repos/zeblithic/harmony/issues/{number}/comments?per_page=100" --paginate \
+  --jq '[.[] | select(.user.login == "greptile-apps[bot]")] | last | .body'
+```
+
+**Where each reviewer posts findings:**
+- **Bugbot (`cursor[bot]`)**: Inline PR **review comments** on the diff (`pulls/{number}/comments` API)
+- **Greptile (`greptile-apps[bot]`)**: PR-level **issue comments** (`issues/{number}/comments` API)
 
 **A PR is ready to merge when:**
-1. `cursor[bot]` has posted a review AND `greptile-apps` has posted a comment — both newer than the latest commit
-2. The most recent "bugbot run" and "@greptile" trigger comments have thumbs-up reactions (approval)
+1. `cursor[bot]` has posted a review/inline comments AND `greptile-apps[bot]` has posted a comment — both newer than the latest commit
+2. No unresolved HIGH severity issues in the actual review content
 3. There are **no additional commits** after the approval responses
-4. No unresolved HIGH severity issues
 
 **If any condition fails:**
 - If reviews are stale (commits after latest review): warn and suggest pushing + re-triggering reviews
@@ -85,17 +85,10 @@ gh api repos/{owner}/{repo}/issues/{number}/comments \
 
 - `git checkout main`
 - `git pull origin main`
+- Delete the local task branch: `git branch -d <branch-name>` (safe — git confirms fully merged)
 - Verify the merge commit is present in the log: `git log --oneline -3`
 
-### 6. Delete local task branch
-
-- Delete the local task branch that was just merged:
-  ```
-  git branch -d <branch-name>
-  ```
-- Use `-d` (not `-D`) so git confirms the branch is fully merged first
-
-### 7. Report
+### 6. Report
 
 Print a clean summary:
 

@@ -93,6 +93,19 @@ impl WorkflowEngine {
                 let result = self.runtime.resume(self.budget);
                 return self.handle_compute_result(wf_id, result);
             }
+            // Runtime lost the session — fail the orphaned workflow to prevent
+            // it from staying in Executing state forever.
+            if let Some(state) = self.workflows.get_mut(&wf_id) {
+                state.status = WorkflowStatus::Failed;
+            }
+            self.active = None;
+            return vec![
+                WorkflowAction::WorkflowFailed {
+                    workflow_id: wf_id,
+                    error: "runtime session lost while workflow was active".into(),
+                },
+                WorkflowAction::PersistHistory { workflow_id: wf_id },
+            ];
         }
 
         // Priority 2: resume a workflow with deferred IO (multiple workflows
@@ -255,7 +268,7 @@ impl WorkflowEngine {
                 module_hash: history.module_hash,
                 input: history.input.clone(),
                 events: Vec::new(), // Fresh event log for this execution
-                total_fuel_consumed: history.total_fuel_consumed,
+                total_fuel_consumed: 0, // Reset: recovery re-executes from scratch
             },
             hint: ComputeHint::PreferLocal,
             module_bytes: Some(module_bytes),
