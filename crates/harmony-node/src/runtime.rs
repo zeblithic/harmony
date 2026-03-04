@@ -400,6 +400,7 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// When limits are `None` (the default), all queued events are drained.
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
         let mut actions = Vec::new();
+        let effective_fuel = self.effective_fuel(); // capture before draining queues
         let threshold = self.schedule.starvation_threshold;
 
         // Determine tier order: promote starved tiers to front.
@@ -448,7 +449,8 @@ impl<B: BlobStore> NodeRuntime<B> {
                     actions.append(&mut self.pending_direct_actions);
                     let pending = std::mem::take(&mut self.pending_workflow_actions);
                     self.dispatch_workflow_actions(pending, &mut actions);
-                    let workflow_actions = self.workflow.tick();
+                    let effective_budget = InstructionBudget { fuel: effective_fuel };
+                    let workflow_actions = self.workflow.tick_with_budget(effective_budget);
                     let had_work = !workflow_actions.is_empty();
                     self.dispatch_workflow_actions(workflow_actions, &mut actions);
                     if had_work { self.compute_starved = 0; } else { self.compute_starved += 1; }
@@ -1463,5 +1465,27 @@ mod tests {
             actions.iter().any(|a| matches!(a, RuntimeAction::SendReply { query_id: 60, .. })),
             "starved storage tier should be promoted and process its event"
         );
+    }
+
+    #[test]
+    fn adaptive_fuel_reduces_compute_under_load() {
+        let mut config = NodeConfig::default();
+        config.compute_budget = InstructionBudget { fuel: 1000 };
+        config.schedule.adaptive_compute.high_water = 10;
+        config.schedule.adaptive_compute.floor_fraction = 0.1;
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Verify full fuel with empty queues
+        assert_eq!(rt.effective_fuel(), 1000);
+
+        // Push 10 router events (= high_water) → fuel at floor
+        for i in 0..10 {
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+        }
+        assert_eq!(rt.effective_fuel(), 100);
+
+        // After tick drains them all, fuel should recover
+        rt.tick();
+        assert_eq!(rt.effective_fuel(), 1000);
     }
 }

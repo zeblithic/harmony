@@ -178,6 +178,15 @@ impl WorkflowEngine {
         }
     }
 
+    /// Run one compute slice with a specific fuel budget (for adaptive scheduling).
+    pub fn tick_with_budget(&mut self, budget: InstructionBudget) -> Vec<WorkflowAction> {
+        let saved = self.budget;
+        self.budget = budget;
+        let result = self.tick();
+        self.budget = saved;
+        result
+    }
+
     /// Query the current status of a workflow.
     pub fn workflow_status(&self, id: &WorkflowId) -> Option<&WorkflowStatus> {
         self.workflows.get(id).map(|s| &s.status)
