@@ -34,7 +34,7 @@ impl fmt::Debug for Lru {
         f.debug_struct("Lru")
             .field("len", &self.len)
             .field("capacity", &self.capacity)
-            .field("free_slots", &self.free.len())
+            .field("recycled_slots", &self.free.len())
             .finish_non_exhaustive()
     }
 }
@@ -241,7 +241,7 @@ mod tests {
         let dbg = format!("{lru:?}");
         assert!(dbg.contains("len: 2"));
         assert!(dbg.contains("capacity: 4"));
-        assert!(dbg.contains("free_slots: 0"));
+        assert!(dbg.contains("recycled_slots: 0"));
         assert!(dbg.contains(".."), "should use finish_non_exhaustive()");
     }
 
