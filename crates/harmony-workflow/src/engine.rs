@@ -18,11 +18,18 @@ struct WorkflowState {
     /// Saved runtime session for a workflow suspended on IO.
     saved_session: Option<Box<dyn std::any::Any>>,
     /// Cached IO responses from a prior execution (used during recovery replay).
-    /// Populated from WorkflowHistory.events on recover(). Consumed during replay.
+    /// Populated from WorkflowHistory.events on recover().
+    ///
+    /// Keyed by CID. In a content-addressed system, the same CID always maps to
+    /// the same data, so a flat HashMap is correct — a CID cannot return different
+    /// results across fetches.
     replay_cache: HashMap<[u8; 32], Option<Vec<u8>>>,
     /// Cached output for completed workflows. Allows re-emitting WorkflowComplete
     /// when a duplicate submit arrives after the workflow has already finished.
     completed_output: Option<Vec<u8>>,
+    /// IO response waiting to be delivered. Set when multiple workflows are
+    /// waiting for the same CID and this workflow wasn't the first to be resumed.
+    deferred_io: Option<IOResponse>,
 }
 
 /// Sans-I/O workflow engine that orchestrates WASM workflow execution.
@@ -41,6 +48,8 @@ pub struct WorkflowEngine {
     /// FIFO queue of pending workflow IDs for deterministic scheduling.
     /// Using a VecDeque instead of relying on HashMap iteration order.
     pending_queue: VecDeque<WorkflowId>,
+    /// Workflows with deferred IO responses, ready to be resumed on next tick.
+    deferred_resume_queue: VecDeque<WorkflowId>,
 }
 
 impl WorkflowEngine {
@@ -53,6 +62,7 @@ impl WorkflowEngine {
             workflows: HashMap::new(),
             active: None,
             pending_queue: VecDeque::new(),
+            deferred_resume_queue: VecDeque::new(),
         }
     }
 
@@ -73,10 +83,11 @@ impl WorkflowEngine {
         }
     }
 
-    /// Advance execution: resume an active yielded workflow, or start the
-    /// next pending workflow. Returns actions produced by the execution step.
+    /// Advance execution: resume an active yielded workflow, resume a
+    /// workflow with deferred IO, or start the next pending workflow.
+    /// Returns actions produced by the execution step.
     pub fn tick(&mut self) -> Vec<WorkflowAction> {
-        // If there is an active workflow with a pending resumable, resume it.
+        // Priority 1: resume an active workflow that yielded mid-execution.
         if let Some(wf_id) = self.active {
             if self.runtime.has_pending() {
                 let result = self.runtime.resume(self.budget);
@@ -84,7 +95,25 @@ impl WorkflowEngine {
             }
         }
 
-        // Otherwise, pop the next pending workflow from the FIFO queue.
+        // Priority 2: resume a workflow with deferred IO (multiple workflows
+        // were waiting for the same CID; only the first was resumed immediately).
+        if let Some(wf_id) = self.deferred_resume_queue.pop_front() {
+            if let Some(state) = self.workflows.get_mut(&wf_id) {
+                if let Some(io_response) = state.deferred_io.take() {
+                    let saved_session = state
+                        .saved_session
+                        .take()
+                        .expect("deferred IO implies saved session");
+                    self.runtime.restore_session(saved_session);
+                    self.active = Some(wf_id);
+
+                    let result = self.runtime.resume_with_io(io_response, self.budget);
+                    return self.handle_compute_result(wf_id, result);
+                }
+            }
+        }
+
+        // Priority 3: pop the next pending workflow from the FIFO queue.
         let next = loop {
             match self.pending_queue.pop_front() {
                 Some(id) => {
@@ -195,6 +224,7 @@ impl WorkflowEngine {
             saved_session: None,
             replay_cache,
             completed_output: None,
+            deferred_io: None,
         };
 
         self.workflows.insert(wf_id, state);
@@ -252,6 +282,7 @@ impl WorkflowEngine {
             saved_session: None,
             replay_cache: HashMap::new(),
             completed_output: None,
+            deferred_io: None,
         };
 
         self.workflows.insert(wf_id, state);
@@ -259,64 +290,89 @@ impl WorkflowEngine {
         Vec::new()
     }
 
-    /// Find the workflow waiting for IO on a specific CID.
-    fn find_waiting_for_io(&self, cid: &[u8; 32]) -> Option<WorkflowId> {
+    /// Find all workflows waiting for IO on a specific CID.
+    fn find_all_waiting_for_io(&self, cid: &[u8; 32]) -> Vec<WorkflowId> {
         self.workflows
             .iter()
-            .find(|(_, state)| state.status == WorkflowStatus::WaitingForIo { cid: *cid })
+            .filter(|(_, state)| state.status == WorkflowStatus::WaitingForIo { cid: *cid })
             .map(|(id, _)| *id)
+            .collect()
     }
 
     fn handle_content_fetched(&mut self, cid: [u8; 32], data: Vec<u8>) -> Vec<WorkflowAction> {
-        let wf_id = match self.find_waiting_for_io(&cid) {
-            Some(id) => id,
-            None => return Vec::new(),
-        };
+        let waiting = self.find_all_waiting_for_io(&cid);
+        if waiting.is_empty() {
+            return Vec::new();
+        }
 
-        let state = self.workflows.get_mut(&wf_id).expect("workflow must exist");
-
+        // Resume the first workflow immediately.
+        let first = waiting[0];
+        let state = self.workflows.get_mut(&first).expect("workflow must exist");
         state.history.events.push(HistoryEvent::IoResolved {
             cid,
             data: Some(data.clone()),
         });
-
         let saved_session = state
             .saved_session
             .take()
             .expect("WaitingForIo implies saved session");
         self.runtime.restore_session(saved_session);
-        self.active = Some(wf_id);
+        self.active = Some(first);
+
+        // Defer remaining workflows: store IO response for tick() to resume.
+        for &wf_id in &waiting[1..] {
+            if let Some(state) = self.workflows.get_mut(&wf_id) {
+                state.history.events.push(HistoryEvent::IoResolved {
+                    cid,
+                    data: Some(data.clone()),
+                });
+                state.deferred_io = Some(IOResponse::ContentReady { data: data.clone() });
+                self.deferred_resume_queue.push_back(wf_id);
+            }
+        }
 
         let result = self
             .runtime
             .resume_with_io(IOResponse::ContentReady { data }, self.budget);
-        self.handle_compute_result(wf_id, result)
+        self.handle_compute_result(first, result)
     }
 
     fn handle_content_fetch_failed(&mut self, cid: [u8; 32]) -> Vec<WorkflowAction> {
-        let wf_id = match self.find_waiting_for_io(&cid) {
-            Some(id) => id,
-            None => return Vec::new(),
-        };
+        let waiting = self.find_all_waiting_for_io(&cid);
+        if waiting.is_empty() {
+            return Vec::new();
+        }
 
-        let state = self.workflows.get_mut(&wf_id).expect("workflow must exist");
-
+        // Resume the first workflow immediately.
+        let first = waiting[0];
+        let state = self.workflows.get_mut(&first).expect("workflow must exist");
         state
             .history
             .events
             .push(HistoryEvent::IoResolved { cid, data: None });
-
         let saved_session = state
             .saved_session
             .take()
             .expect("WaitingForIo implies saved session");
         self.runtime.restore_session(saved_session);
-        self.active = Some(wf_id);
+        self.active = Some(first);
+
+        // Defer remaining workflows.
+        for &wf_id in &waiting[1..] {
+            if let Some(state) = self.workflows.get_mut(&wf_id) {
+                state
+                    .history
+                    .events
+                    .push(HistoryEvent::IoResolved { cid, data: None });
+                state.deferred_io = Some(IOResponse::ContentNotFound);
+                self.deferred_resume_queue.push_back(wf_id);
+            }
+        }
 
         let result = self
             .runtime
             .resume_with_io(IOResponse::ContentNotFound, self.budget);
-        self.handle_compute_result(wf_id, result)
+        self.handle_compute_result(first, result)
     }
 
     fn handle_compute_result(
@@ -1013,5 +1069,82 @@ mod tests {
             "should reject recover over existing workflow, got: {actions:?}"
         );
         assert_eq!(engine.workflow_count(), 1, "original workflow should be untouched");
+    }
+
+    #[test]
+    fn multiple_workflows_waiting_for_same_cid_all_resume() {
+        let mut engine = make_engine_high_fuel();
+        let cid = [0x77; 32];
+        let content = b"shared content";
+
+        // Submit two different workflows that both fetch the same CID.
+        // Use different inputs so they get different WorkflowIds.
+        let module = FETCH_WAT.as_bytes().to_vec();
+        let module_hash = harmony_crypto::hash::blake3_hash(&module);
+
+        // Workflow A: input = cid (fetches cid[0..32] from input)
+        engine.handle(WorkflowEvent::Submit {
+            module: module.clone(),
+            input: cid.to_vec(),
+            hint: ComputeHint::PreferLocal,
+        });
+        let wf_a = WorkflowId::new(&module_hash, &cid);
+
+        // Workflow B: same CID but with extra byte to get a different WorkflowId.
+        let mut input_b = cid.to_vec();
+        input_b.push(0xFF); // extra byte — WASM only reads first 32 bytes as CID
+        engine.handle(WorkflowEvent::Submit {
+            module: module.clone(),
+            input: input_b.clone(),
+            hint: ComputeHint::PreferLocal,
+        });
+        let wf_b = WorkflowId::new(&module_hash, &input_b);
+
+        assert_ne!(wf_a, wf_b, "workflows should have different IDs");
+
+        // Tick A to NeedsIO → WaitingForIo.
+        engine.tick();
+        assert_eq!(
+            engine.workflow_status(&wf_a),
+            Some(&WorkflowStatus::WaitingForIo { cid })
+        );
+
+        // Tick B to NeedsIO → WaitingForIo.
+        engine.tick();
+        assert_eq!(
+            engine.workflow_status(&wf_b),
+            Some(&WorkflowStatus::WaitingForIo { cid })
+        );
+
+        // Deliver content once — should resume one immediately and defer the other.
+        let mut all_actions = engine.handle(WorkflowEvent::ContentFetched {
+            cid,
+            data: content.to_vec(),
+        });
+
+        // One workflow should complete immediately.
+        let first_complete: Vec<_> = all_actions
+            .iter()
+            .filter_map(|a| match a {
+                WorkflowAction::WorkflowComplete { workflow_id, .. } => Some(*workflow_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first_complete.len(), 1, "exactly one should complete immediately");
+
+        // Tick to resume the deferred workflow.
+        all_actions.extend(engine.tick());
+
+        // Both workflows should now be complete.
+        let completed: Vec<_> = all_actions
+            .iter()
+            .filter_map(|a| match a {
+                WorkflowAction::WorkflowComplete { workflow_id, .. } => Some(*workflow_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed.len(), 2, "both workflows should complete");
+        assert!(completed.contains(&wf_a), "workflow A should complete");
+        assert!(completed.contains(&wf_b), "workflow B should complete");
     }
 }
