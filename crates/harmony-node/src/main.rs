@@ -1,3 +1,4 @@
+mod compute;
 mod runtime;
 
 use clap::{Parser, Subcommand};
