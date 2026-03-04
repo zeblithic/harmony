@@ -78,10 +78,18 @@ if [[ -n "$BUGBOT_TRIGGER_ID" && "$BUGBOT_TRIGGER_ID" != "null" ]]; then
   BUGBOT_TRIGGER_THUMBSUP=$(echo "$BUGBOT_REACTIONS" | jq -r '.["+1"] // 0')
 fi
 
-# Latest "@greptile" trigger
-GREPTILE_TRIGGER_JSON=$(echo "$ALL_ISSUE_COMMENTS" | jq '[.[] | select(.body | test("@greptile"; "m"))] | last // empty')
+# Latest "@greptile" trigger — only match comments by humans (not greptile-apps[bot] itself)
+GREPTILE_TRIGGER_JSON=$(echo "$ALL_ISSUE_COMMENTS" | jq '[.[] | select((.body | test("^@greptile$"; "m")) and .user.login != "greptile-apps[bot]")] | last // empty')
 GREPTILE_TRIGGER_DATE=$(echo "$GREPTILE_TRIGGER_JSON" | jq -r '.created_at // empty' 2>/dev/null)
 GREPTILE_TRIGGER_ID=$(echo "$GREPTILE_TRIGGER_JSON" | jq -r '.id // empty' 2>/dev/null)
+
+# Greptile auto-triggers on PR creation. If no explicit @greptile comment exists,
+# use PR creation time as baseline so the initial auto-triggered review is captured.
+GREPTILE_AUTO_TRIGGER=false
+if [[ -z "$GREPTILE_TRIGGER_DATE" ]]; then
+  GREPTILE_TRIGGER_DATE=$(gh pr view "$PR_NUMBER" --json createdAt --jq '.createdAt' 2>/dev/null || echo "")
+  GREPTILE_AUTO_TRIGGER=true
+fi
 
 GREPTILE_TRIGGER_EYES=0
 GREPTILE_TRIGGER_THUMBSUP=0
@@ -99,7 +107,11 @@ else
   echo "Latest \"bugbot run\": none"
 fi
 if [[ -n "$GREPTILE_TRIGGER_DATE" ]]; then
-  echo "Latest \"@greptile\":  ${GREPTILE_TRIGGER_DATE} (eyes: ${GREPTILE_TRIGGER_EYES}, thumbsup: ${GREPTILE_TRIGGER_THUMBSUP})"
+  if [[ "$GREPTILE_AUTO_TRIGGER" == "true" ]]; then
+    echo "Latest \"@greptile\":  auto (PR created ${GREPTILE_TRIGGER_DATE})"
+  else
+    echo "Latest \"@greptile\":  ${GREPTILE_TRIGGER_DATE} (eyes: ${GREPTILE_TRIGGER_EYES}, thumbsup: ${GREPTILE_TRIGGER_THUMBSUP})"
+  fi
 else
   echo "Latest \"@greptile\":  none"
 fi
