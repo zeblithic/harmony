@@ -74,7 +74,7 @@ impl<S: BlobStore> ContentStore<S> {
     ///
     /// At small capacities the splits degenerate: capacity=1 gives a single
     /// window slot with no probation or protected (effectively MRU).
-    /// capacity=2..4 gives window=1 + probation only (no protected).
+    /// capacity=2..=4 gives window=1 + probation only (no protected).
     /// capacity=5 is the minimum for all three segments to be non-zero.
     ///
     /// The sketch width is `capacity * 2` and the halving threshold is
