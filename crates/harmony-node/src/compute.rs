@@ -249,7 +249,7 @@ impl ComputeTier {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// WAT module: reads two i32s from input, writes their sum as output.

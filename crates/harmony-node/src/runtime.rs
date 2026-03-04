@@ -1,4 +1,4 @@
-//! Node runtime: priority event loop wiring Tier 1 (Router) + Tier 2 (Storage).
+//! Node runtime: priority event loop wiring Tier 1 (Router) + Tier 2 (Storage) + Tier 3 (Compute).
 
 // Remaining dead code (RuntimeEvent, push_event, tick, metrics, etc.) is consumed
 // only by tests until the async event loop is wired.
@@ -7,6 +7,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
+use harmony_compute::InstructionBudget;
 use harmony_content::blob::BlobStore;
 use harmony_content::cid::ContentId;
 use harmony_content::storage_tier::{
@@ -16,11 +17,15 @@ use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_zenoh::namespace::content as content_ns;
 use harmony_zenoh::queryable::{QueryableAction, QueryableEvent, QueryableId, QueryableRouter};
 
+use crate::compute::{ComputeTier, ComputeTierAction, ComputeTierEvent};
+
 /// Configuration for a Harmony node runtime.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// Storage tier capacity limits.
     pub storage_budget: StorageBudget,
+    /// Compute tier per-slice instruction budget.
+    pub compute_budget: InstructionBudget,
 }
 
 impl Default for NodeConfig {
@@ -30,6 +35,7 @@ impl Default for NodeConfig {
                 cache_capacity: 1024,
                 max_pinned_bytes: 100_000_000,
             },
+            compute_budget: InstructionBudget { fuel: 100_000 },
         }
     }
 }
@@ -53,6 +59,17 @@ pub enum RuntimeEvent {
     },
     /// Tier 2: Zenoh subscription message (transit or publish).
     SubscriptionMessage { key_expr: String, payload: Vec<u8> },
+    /// Tier 3: Compute query received (activity request).
+    ComputeQuery {
+        query_id: u64,
+        key_expr: String,
+        payload: Vec<u8>,
+    },
+    /// Tier 3: Module fetch response for a CID-referenced compute request.
+    ModuleFetchResponse {
+        cid: [u8; 32],
+        result: Result<Vec<u8>, String>,
+    },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -67,17 +84,20 @@ pub enum RuntimeAction {
     SendReply { query_id: u64, payload: Vec<u8> },
     /// Tier 2: Publish a message (e.g., content availability announcement).
     Publish { key_expr: String, payload: Vec<u8> },
+    /// Tier 3: Fetch a WASM module by CID from Tier 2 / network.
+    FetchContent { cid: [u8; 32] },
     /// Setup: Declare a queryable key expression.
     DeclareQueryable { key_expr: String },
     /// Setup: Subscribe to a key expression.
     Subscribe { key_expr: String },
 }
 
-/// Sans-I/O node runtime wiring Tier 1 (Router) and Tier 2 (Storage).
+/// Sans-I/O node runtime wiring Tier 1 (Router), Tier 2 (Storage), and Tier 3 (Compute).
 ///
 /// Events are pushed via [`push_event`](Self::push_event) into internal
-/// priority queues. Each [`tick`](Self::tick) drains ALL Tier 1 events
-/// before processing ONE Tier 2 event — the router is never starved.
+/// priority queues. Each [`tick`](Self::tick) drains ALL Tier 1 events,
+/// then processes ONE Tier 2 event, then dispatches Tier 3 compute —
+/// the router is never starved and storage takes priority over compute.
 pub struct NodeRuntime<B: BlobStore> {
     // Tier 1: Reticulum packet router
     router: Node,
@@ -85,11 +105,17 @@ pub struct NodeRuntime<B: BlobStore> {
     queryable_router: QueryableRouter,
     // Tier 2: Content storage
     storage: StorageTier<B>,
+    // Tier 3: Compute
+    compute: ComputeTier,
     // Internal priority queues
     router_queue: VecDeque<NodeEvent>,
     storage_queue: VecDeque<StorageTierEvent>,
     // Queryable IDs belonging to the storage tier
     storage_queryable_ids: HashSet<QueryableId>,
+    // Queryable IDs belonging to the compute tier
+    compute_queryable_ids: HashSet<QueryableId>,
+    // Pending compute actions buffered between push_event and tick
+    pending_compute_actions: Vec<ComputeTierAction>,
 }
 
 impl<B: BlobStore> NodeRuntime<B> {
@@ -127,13 +153,28 @@ impl<B: BlobStore> NodeRuntime<B> {
             }
         }
 
+        // Tier 3: Compute — register activity queryable
+        let compute = ComputeTier::new(config.compute_budget);
+        let mut compute_queryable_ids = HashSet::new();
+
+        let (qid, _) = queryable_router
+            .declare(harmony_zenoh::namespace::compute::ACTIVITY_SUB)
+            .expect("static key expression must be valid");
+        compute_queryable_ids.insert(qid);
+        actions.push(RuntimeAction::DeclareQueryable {
+            key_expr: harmony_zenoh::namespace::compute::ACTIVITY_SUB.to_string(),
+        });
+
         let rt = Self {
             router,
             queryable_router,
             storage,
+            compute,
             router_queue: VecDeque::new(),
             storage_queue: VecDeque::new(),
             storage_queryable_ids,
+            compute_queryable_ids,
+            pending_compute_actions: Vec::new(),
         };
 
         (rt, actions)
@@ -152,6 +193,11 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// Number of pending Tier 2 (storage) events.
     pub fn storage_queue_len(&self) -> usize {
         self.storage_queue.len()
+    }
+
+    /// Number of tasks in the Tier 3 (compute) queue.
+    pub fn compute_queue_len(&self) -> usize {
+        self.compute.queue_len()
     }
 
     /// Push an event into the runtime's internal priority queues.
@@ -181,6 +227,22 @@ impl<B: BlobStore> NodeRuntime<B> {
             RuntimeEvent::SubscriptionMessage { key_expr, payload } => {
                 self.route_subscription(key_expr, payload);
             }
+            RuntimeEvent::ComputeQuery {
+                query_id,
+                key_expr,
+                payload,
+            } => {
+                let compute_actions = self.route_compute_query(query_id, key_expr, payload);
+                self.pending_compute_actions.extend(compute_actions);
+            }
+            RuntimeEvent::ModuleFetchResponse { cid, result } => {
+                let event = match result {
+                    Ok(module) => ComputeTierEvent::ModuleFetched { cid, module },
+                    Err(_) => ComputeTierEvent::ModuleFetchFailed { cid },
+                };
+                let actions = self.compute.handle(event);
+                self.pending_compute_actions.extend(actions);
+            }
         }
     }
 
@@ -201,6 +263,12 @@ impl<B: BlobStore> NodeRuntime<B> {
             let storage_actions = self.storage.handle(event);
             self.dispatch_storage_actions(storage_actions, &mut actions);
         }
+
+        // Tier 3: dispatch any pending compute actions, then one compute slice (lowest priority)
+        let pending = std::mem::take(&mut self.pending_compute_actions);
+        self.dispatch_compute_actions(pending, &mut actions);
+        let compute_actions = self.compute.tick();
+        self.dispatch_compute_actions(compute_actions, &mut actions);
 
         actions
     }
@@ -246,6 +314,85 @@ impl<B: BlobStore> NodeRuntime<B> {
         }
     }
 
+    fn route_compute_query(
+        &mut self,
+        query_id: u64,
+        _key_expr: String,
+        payload: Vec<u8>,
+    ) -> Vec<ComputeTierAction> {
+        let event = match self.parse_compute_payload(query_id, payload) {
+            Some(evt) => evt,
+            None => {
+                return vec![ComputeTierAction::SendError {
+                    query_id,
+                    error: "malformed compute payload".into(),
+                }];
+            }
+        };
+        self.compute.handle(event)
+    }
+
+    fn parse_compute_payload(&self, query_id: u64, payload: Vec<u8>) -> Option<ComputeTierEvent> {
+        if payload.is_empty() {
+            return None;
+        }
+        match payload[0] {
+            // Inline: [0x00] [module_len: u32 LE] [module_bytes] [input_bytes]
+            0x00 => {
+                if payload.len() < 5 {
+                    return None;
+                }
+                let module_len = u32::from_le_bytes(payload[1..5].try_into().ok()?) as usize;
+                if payload.len() < 5 + module_len {
+                    return None;
+                }
+                let module = payload[5..5 + module_len].to_vec();
+                let input = payload[5 + module_len..].to_vec();
+                Some(ComputeTierEvent::ExecuteInline {
+                    query_id,
+                    module,
+                    input,
+                })
+            }
+            // CID reference: [0x01] [cid: 32 bytes] [input_bytes]
+            0x01 => {
+                if payload.len() < 33 {
+                    return None;
+                }
+                let cid: [u8; 32] = payload[1..33].try_into().ok()?;
+                let input = payload[33..].to_vec();
+                Some(ComputeTierEvent::ExecuteByCid {
+                    query_id,
+                    module_cid: cid,
+                    input,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn dispatch_compute_actions(
+        &self,
+        compute_actions: Vec<ComputeTierAction>,
+        out: &mut Vec<RuntimeAction>,
+    ) {
+        for action in compute_actions {
+            match action {
+                ComputeTierAction::SendReply { query_id, payload } => {
+                    out.push(RuntimeAction::SendReply { query_id, payload });
+                }
+                ComputeTierAction::FetchModule { cid } => {
+                    out.push(RuntimeAction::FetchContent { cid });
+                }
+                ComputeTierAction::SendError { query_id, error } => {
+                    let mut payload = vec![0x01];
+                    payload.extend_from_slice(error.as_bytes());
+                    out.push(RuntimeAction::SendReply { query_id, payload });
+                }
+            }
+        }
+    }
+
     fn route_query(&mut self, query_id: u64, key_expr: String, payload: Vec<u8>) {
         let event = QueryableEvent::QueryReceived {
             query_id,
@@ -260,13 +407,16 @@ impl<B: BlobStore> NodeRuntime<B> {
                 queryable_id,
                 query_id,
                 key_expr,
-                ..
+                payload,
             } = action
             {
                 if self.storage_queryable_ids.contains(&queryable_id) {
                     if let Some(event) = self.parse_storage_query(query_id, &key_expr) {
                         self.storage_queue.push_back(event);
                     }
+                } else if self.compute_queryable_ids.contains(&queryable_id) {
+                    let compute_actions = self.route_compute_query(query_id, key_expr, payload);
+                    self.pending_compute_actions.extend(compute_actions);
                 }
             }
         }
@@ -339,6 +489,15 @@ mod tests {
             key_expr: "harmony/content/transit/abc".into(),
             payload: vec![1, 2, 3],
         };
+        let _e5 = RuntimeEvent::ComputeQuery {
+            query_id: 1,
+            key_expr: "harmony/compute/activity/test".into(),
+            payload: vec![0x00],
+        };
+        let _e6 = RuntimeEvent::ModuleFetchResponse {
+            cid: [0u8; 32],
+            result: Ok(vec![1, 2, 3]),
+        };
     }
 
     #[test]
@@ -355,10 +514,11 @@ mod tests {
             key_expr: "harmony/announce/abc".into(),
             payload: vec![],
         };
-        let _a4 = RuntimeAction::DeclareQueryable {
+        let _a4 = RuntimeAction::FetchContent { cid: [0u8; 32] };
+        let _a5 = RuntimeAction::DeclareQueryable {
             key_expr: "harmony/content/a/**".into(),
         };
-        let _a5 = RuntimeAction::Subscribe {
+        let _a6 = RuntimeAction::Subscribe {
             key_expr: "harmony/content/transit/**".into(),
         };
     }
@@ -367,6 +527,7 @@ mod tests {
     fn node_config_defaults() {
         let config = NodeConfig::default();
         assert_eq!(config.storage_budget.cache_capacity, 1024);
+        assert_eq!(config.compute_budget.fuel, 100_000);
     }
 
     use harmony_content::blob::MemoryBlobStore;
@@ -389,8 +550,8 @@ mod tests {
             .filter(|a| matches!(a, RuntimeAction::Subscribe { .. }))
             .count();
 
-        // 16 shard queryables + 1 stats queryable = 17
-        assert_eq!(queryable_count, 17);
+        // 16 shard queryables + 1 stats queryable + 1 compute activity queryable = 18
+        assert_eq!(queryable_count, 18);
         // transit + publish subscriptions = 2
         assert_eq!(subscribe_count, 2);
     }
@@ -408,6 +569,7 @@ mod tests {
         let (rt, _) = make_runtime();
         assert_eq!(rt.router_queue_len(), 0);
         assert_eq!(rt.storage_queue_len(), 0);
+        assert_eq!(rt.compute_queue_len(), 0);
     }
 
     #[test]
@@ -633,5 +795,92 @@ mod tests {
             payload: vec![1, 2, 3],
         });
         assert_eq!(rt.storage_queue_len(), 0);
+    }
+
+    // ── Tier 3: Compute integration tests ────────────────────────────
+
+    #[test]
+    fn startup_declares_compute_queryable() {
+        let (_, actions) = make_runtime();
+        let compute_queryables: Vec<_> = actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    RuntimeAction::DeclareQueryable { key_expr } if key_expr.starts_with("harmony/compute")
+                )
+            })
+            .collect();
+        assert_eq!(compute_queryables.len(), 1);
+    }
+
+    #[test]
+    fn compute_inline_round_trip() {
+        let (mut rt, _) = make_runtime();
+
+        let module = crate::compute::tests::ADD_WAT.as_bytes();
+        let mut input = Vec::new();
+        input.extend_from_slice(&5i32.to_le_bytes());
+        input.extend_from_slice(&3i32.to_le_bytes());
+
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&(module.len() as u32).to_le_bytes());
+        payload.extend_from_slice(module);
+        payload.extend_from_slice(&input);
+
+        rt.push_event(RuntimeEvent::ComputeQuery {
+            query_id: 99,
+            key_expr: "harmony/compute/activity/test".into(),
+            payload,
+        });
+
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 99, .. }));
+        assert!(reply.is_some(), "compute query should produce a reply");
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload[0], 0x00); // success tag
+            let sum = i32::from_le_bytes(payload[1..5].try_into().unwrap());
+            assert_eq!(sum, 8);
+        }
+    }
+
+    #[test]
+    fn tick_priority_order_with_compute() {
+        let (mut rt, _) = make_runtime();
+
+        // Queue a router event, a storage event, and a compute event
+        rt.push_event(RuntimeEvent::TimerTick { now: 1000 });
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 10,
+            key_expr: "harmony/content/stats".into(),
+            payload: vec![],
+        });
+
+        let module = crate::compute::tests::ADD_WAT.as_bytes();
+        let mut input = Vec::new();
+        input.extend_from_slice(&1i32.to_le_bytes());
+        input.extend_from_slice(&2i32.to_le_bytes());
+        let mut compute_payload = vec![0x00];
+        compute_payload.extend_from_slice(&(module.len() as u32).to_le_bytes());
+        compute_payload.extend_from_slice(module);
+        compute_payload.extend_from_slice(&input);
+
+        rt.push_event(RuntimeEvent::ComputeQuery {
+            query_id: 20,
+            key_expr: "harmony/compute/activity/test".into(),
+            payload: compute_payload,
+        });
+
+        let actions = rt.tick();
+        let storage_reply = actions
+            .iter()
+            .any(|a| matches!(a, RuntimeAction::SendReply { query_id: 10, .. }));
+        let compute_reply = actions
+            .iter()
+            .any(|a| matches!(a, RuntimeAction::SendReply { query_id: 20, .. }));
+        assert!(storage_reply, "should have storage reply");
+        assert!(compute_reply, "should have compute reply");
     }
 }

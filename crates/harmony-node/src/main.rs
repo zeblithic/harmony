@@ -138,6 +138,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     cache_capacity,
                     max_pinned_bytes: 100_000_000,
                 },
+                ..NodeConfig::default()
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 
