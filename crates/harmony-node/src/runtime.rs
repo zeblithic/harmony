@@ -160,7 +160,10 @@ impl<B: BlobStore> NodeRuntime<B> {
         }
 
         // Tier 3: Compute — register activity queryable
-        let compute = ComputeTier::new(config.compute_budget);
+        let compute = ComputeTier::new(
+            Box::new(harmony_compute::WasmiRuntime::new()),
+            config.compute_budget,
+        );
         let mut compute_queryable_ids = HashSet::new();
 
         let (qid, _) = queryable_router
