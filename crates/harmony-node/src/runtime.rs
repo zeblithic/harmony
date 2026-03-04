@@ -460,10 +460,11 @@ impl<B: BlobStore> NodeRuntime<B> {
                 2 => {
                     // Tier 3: Compute — dispatch pending workflow actions, then one slice
                     let pending = std::mem::take(&mut self.pending_workflow_actions);
+                    let had_pending = !pending.is_empty();
                     self.dispatch_workflow_actions(pending, &mut actions);
                     let effective_budget = InstructionBudget { fuel: effective_fuel };
                     let workflow_actions = self.workflow.tick_with_budget(effective_budget);
-                    let had_work = !workflow_actions.is_empty();
+                    let had_work = had_pending || !workflow_actions.is_empty();
                     self.dispatch_workflow_actions(workflow_actions, &mut actions);
                     if had_work { self.compute_starved = 0; } else { self.compute_starved += 1; }
                 }

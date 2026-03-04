@@ -179,11 +179,27 @@ impl WorkflowEngine {
     }
 
     /// Run one compute slice with a specific fuel budget (for adaptive scheduling).
+    ///
+    /// Uses a drop guard to restore the original budget even if `tick()` panics
+    /// (e.g. from WASM execution), preventing permanent budget corruption.
     pub fn tick_with_budget(&mut self, budget: InstructionBudget) -> Vec<WorkflowAction> {
+        struct BudgetGuard<'a> {
+            engine: &'a mut WorkflowEngine,
+            saved: InstructionBudget,
+        }
+        impl<'a> Drop for BudgetGuard<'a> {
+            fn drop(&mut self) {
+                self.engine.budget = self.saved;
+            }
+        }
+
         let saved = self.budget;
         self.budget = budget;
-        let result = self.tick();
-        self.budget = saved;
+        // SAFETY: guard restores self.budget on drop (normal return or panic).
+        let guard = BudgetGuard { engine: self, saved };
+        let result = guard.engine.tick();
+        // Explicit drop triggers restore before we return.
+        drop(guard);
         result
     }
 
