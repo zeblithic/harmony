@@ -264,9 +264,20 @@ impl ComputeRuntime for WasmiRuntime {
             };
 
         let input_len = input.len();
+        let input_len_i32: i32 = match input_len.try_into() {
+            Ok(v) => v,
+            Err(_) => {
+                return ComputeResult::Failed {
+                    error: ComputeError::MemoryTooSmall {
+                        need: input_len,
+                        have: i32::MAX as usize,
+                    },
+                };
+            }
+        };
 
         // Call compute with resumable API to support fuel exhaustion.
-        let call_result = compute_func.call_resumable(&mut store, (0i32, input_len as i32));
+        let call_result = compute_func.call_resumable(&mut store, (0i32, input_len_i32));
 
         self.handle_call_result(
             call_result,
@@ -594,7 +605,9 @@ mod tests {
             other => panic!("expected Yielded, got {other:?}"),
         };
 
-        let checkpoint = rt.snapshot().expect("should have active session after yield");
+        let checkpoint = rt
+            .snapshot()
+            .expect("should have active session after yield");
 
         let expected_hash = harmony_crypto::hash::blake3_hash(LOOP_WAT.as_bytes());
         assert_eq!(checkpoint.module_hash, expected_hash);
