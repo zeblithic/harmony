@@ -177,6 +177,12 @@ pub struct NodeRuntime<B: BlobStore> {
     workflow_to_query: HashMap<WorkflowId, Vec<u64>>,
     // Maps module CID -> Vec<(query_id, input)> for CID-based requests pending module fetch
     cid_to_query: HashMap<[u8; 32], Vec<(u64, Vec<u8>)>>,
+    // Tier scheduling configuration
+    schedule: TierSchedule,
+    // Starvation counters: incremented when a tier has no events in a tick, reset on processing
+    router_starved: u32,
+    storage_starved: u32,
+    compute_starved: u32,
 }
 
 impl<B: BlobStore> NodeRuntime<B> {
@@ -242,9 +248,18 @@ impl<B: BlobStore> NodeRuntime<B> {
             pending_direct_actions: Vec::new(),
             workflow_to_query: HashMap::new(),
             cid_to_query: HashMap::new(),
+            schedule: config.schedule.clone(),
+            router_starved: 0,
+            storage_starved: 0,
+            compute_starved: 0,
         };
 
         (rt, actions)
+    }
+
+    /// Read-only access to the tier schedule configuration.
+    pub fn schedule(&self) -> &TierSchedule {
+        &self.schedule
     }
 
     /// Read-only access to storage metrics.
@@ -670,6 +685,16 @@ enum ParsedCompute {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_exposes_schedule() {
+        use harmony_content::blob::MemoryBlobStore;
+
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(5);
+        let (rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        assert_eq!(rt.schedule().router_max_per_tick, Some(5));
+    }
 
     #[test]
     fn runtime_event_variants_exist() {
