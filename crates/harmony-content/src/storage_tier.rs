@@ -506,7 +506,10 @@ mod tests {
         });
 
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], StorageTierAction::AnnounceContent { .. }));
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::AnnounceContent { .. }
+        ));
         assert_eq!(tier.metrics().transit_stored, 1);
     }
 
@@ -525,7 +528,10 @@ mod tests {
             data: b"tampered data".to_vec(),
         });
 
-        assert!(actions.is_empty(), "mismatched CID should produce no actions");
+        assert!(
+            actions.is_empty(),
+            "mismatched CID should produce no actions"
+        );
         assert_eq!(tier.metrics().transit_rejected, 1);
         assert_eq!(tier.metrics().transit_stored, 0);
     }
@@ -544,7 +550,10 @@ mod tests {
             data: b"different".to_vec(),
         });
 
-        assert!(actions.is_empty(), "mismatched CID should produce no actions");
+        assert!(
+            actions.is_empty(),
+            "mismatched CID should produce no actions"
+        );
         assert_eq!(tier.metrics().publishes_stored, 0);
         assert_eq!(tier.metrics().publishes_rejected, 1);
     }
