@@ -107,6 +107,20 @@ impl WasmiRuntime {
                         .expect("bounds already checked");
                 }
 
+                // Compute fuel consumed and store session for snapshot().
+                let remaining_fuel = ctx.store.get_fuel().unwrap_or(0);
+                let fuel_this_slice = ctx.fuel_budget.saturating_sub(remaining_fuel);
+                let total_fuel = ctx.fuel_before + fuel_this_slice;
+
+                self.session = Some(WasmiSession {
+                    store: ctx.store,
+                    instance: ctx.instance,
+                    module_hash: ctx.module_hash,
+                    input_len: ctx.input_len,
+                    total_fuel_consumed: total_fuel,
+                    pending: None,
+                });
+
                 ComputeResult::Complete { output }
             }
             Ok(wasmi::TypedResumableCall::OutOfFuel(pending)) => {
@@ -312,8 +326,25 @@ impl ComputeRuntime for WasmiRuntime {
     }
 
     fn snapshot(&self) -> Result<Checkpoint, ComputeError> {
-        // Stub: full implementation in Task 5.
-        Err(ComputeError::NoPendingExecution)
+        let session = self
+            .session
+            .as_ref()
+            .ok_or(ComputeError::NoPendingExecution)?;
+
+        let memory = session
+            .instance
+            .get_memory(&session.store, "memory")
+            .ok_or_else(|| ComputeError::ExportNotFound {
+                name: "memory".into(),
+            })?;
+
+        let memory_data = memory.data(&session.store).to_vec();
+
+        Ok(Checkpoint {
+            module_hash: session.module_hash,
+            memory: memory_data,
+            fuel_consumed: session.total_fuel_consumed,
+        })
     }
 }
 
@@ -506,5 +537,47 @@ mod tests {
             }
         }
         assert!(resume_count > 0, "should have yielded at least once");
+    }
+
+    #[test]
+    fn snapshot_after_execute_captures_memory() {
+        let mut rt = WasmiRuntime::new();
+        let mut input = Vec::new();
+        input.extend_from_slice(&100_i32.to_le_bytes());
+        input.extend_from_slice(&200_i32.to_le_bytes());
+
+        let result = rt.execute(
+            ADD_WAT.as_bytes(),
+            &input,
+            InstructionBudget { fuel: 100_000 },
+        );
+        assert!(matches!(result, ComputeResult::Complete { .. }));
+
+        let checkpoint = rt.snapshot().expect("should have active session");
+
+        // Module hash should be deterministic
+        let expected_hash = harmony_crypto::hash::blake3_hash(ADD_WAT.as_bytes());
+        assert_eq!(checkpoint.module_hash, expected_hash);
+
+        // Memory should contain input and output data
+        assert!(!checkpoint.memory.is_empty());
+        // Input at offset 0: 100 (le bytes)
+        let a = i32::from_le_bytes(checkpoint.memory[0..4].try_into().unwrap());
+        assert_eq!(a, 100);
+        // Input at offset 4: 200 (le bytes)
+        let b = i32::from_le_bytes(checkpoint.memory[4..8].try_into().unwrap());
+        assert_eq!(b, 200);
+        // Output at offset 8: 300 (le bytes)
+        let sum = i32::from_le_bytes(checkpoint.memory[8..12].try_into().unwrap());
+        assert_eq!(sum, 300);
+
+        assert!(checkpoint.fuel_consumed > 0);
+    }
+
+    #[test]
+    fn snapshot_without_session_returns_error() {
+        let rt = WasmiRuntime::new();
+        let result = rt.snapshot();
+        assert!(matches!(result, Err(ComputeError::NoPendingExecution)));
     }
 }
