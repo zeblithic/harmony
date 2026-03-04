@@ -1,7 +1,7 @@
 ---
 name: task-lifecycle
 description: Use when the user mentions tasks, beads, delivery, PRs, merging, shipping, finding work, claiming work, review status, bugbot, greptile, or any part of the development lifecycle. Also use proactively when work appears complete (tests passing, clippy clean) to suggest /delivertask, when a PR is merged to suggest /findtask, or when reviews may be complete to suggest /monitorreviews. Provides the zeblithic/harmony 4-step task lifecycle with review state machine.
-version: 3.0.0
+version: 3.1.0
 ---
 
 # Harmony Task Lifecycle
@@ -104,7 +104,8 @@ The review cycle lives in the gap between `/delivertask` and `/finishtask`. Use 
 | "eyes" emoji on "@greptile" comment | Comment reactions | Greptile acknowledged, working |
 | `cursor[bot]` review with inline comments | PR reviews | Bugbot finished — check for issues |
 | `greptile-apps[bot]` review with analysis | PR reviews | Greptile finished — check for issues |
-| Thumbs-up on trigger comment | Comment reactions | Reviewer finished with no blocking issues |
+| Thumbs-up on trigger comment (with formal review) | Comment reactions | Reviewer finished — read review for issues |
+| Thumbs-up on trigger comment (no formal review, no eyes) | Comment reactions | Reviewer finished with no issues (trivial change) |
 | Commits newer than latest reviewer response | PR commits vs review timestamps | Reviewer results are **stale** — need re-trigger |
 | "bugbot run" as last comment, >3 min, no response | PR comments | Bugbot may be stuck — re-trigger |
 

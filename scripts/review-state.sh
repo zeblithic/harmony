@@ -140,6 +140,12 @@ if [[ -n "$BUGBOT_TRIGGER_DATE" ]]; then
     BUGBOT_HAS_RESPONSE=true
   fi
 
+  # Thumbs-up on trigger without formal review = "reviewed, no issues"
+  # This happens when the change is trivial (e.g., applying the reviewer's own suggestion).
+  if [[ "$BUGBOT_HAS_RESPONSE" == "false" && "$BUGBOT_TRIGGER_THUMBSUP" -gt 0 && "$BUGBOT_TRIGGER_EYES" -eq 0 ]]; then
+    BUGBOT_HAS_RESPONSE=true
+  fi
+
   # Count issues (inline comments are findings)
   BUGBOT_ISSUE_COUNT="$BUGBOT_INLINE_COUNT"
 else
@@ -222,6 +228,12 @@ if [[ -n "$GREPTILE_TRIGGER_DATE" ]]; then
     if [[ "$GREPTILE_ISSUE_COUNT" -eq 0 ]]; then
       GREPTILE_ISSUE_COUNT="$GREPTILE_COMMENT_COUNT"
     fi
+  fi
+
+  # Thumbs-up on trigger without formal response = "reviewed, no issues"
+  # This happens when the change is trivial (e.g., applying the reviewer's own suggestion).
+  if [[ "$GREPTILE_HAS_RESPONSE" == "false" && "$GREPTILE_TRIGGER_THUMBSUP" -gt 0 && "$GREPTILE_TRIGGER_EYES" -eq 0 ]]; then
+    GREPTILE_HAS_RESPONSE=true
   fi
 else
   GREPTILE_RESPONSE_COMMENTS="[]"
