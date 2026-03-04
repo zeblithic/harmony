@@ -307,69 +307,33 @@ impl WorkflowEngine {
     }
 
     /// Find all workflows waiting for IO on a specific CID.
+    /// Returns results sorted by WorkflowId bytes for deterministic scheduling.
     fn find_all_waiting_for_io(&self, cid: &[u8; 32]) -> Vec<WorkflowId> {
-        self.workflows
+        let mut waiting: Vec<WorkflowId> = self
+            .workflows
             .iter()
             .filter(|(_, state)| state.status == WorkflowStatus::WaitingForIo { cid: *cid })
             .map(|(id, _)| *id)
-            .collect()
+            .collect();
+        waiting.sort_by_key(|id| *id.as_bytes());
+        waiting
     }
 
     fn handle_content_fetched(&mut self, cid: [u8; 32], data: Vec<u8>) -> Vec<WorkflowAction> {
-        let waiting = self.find_all_waiting_for_io(&cid);
-        if waiting.is_empty() {
-            return Vec::new();
-        }
-
-        // If a workflow is currently active (yielded mid-execution), we cannot
-        // restore a different session without destroying the active one. Defer
-        // ALL waiting workflows so they resume after the active one completes.
-        let immediate_resume = self.active.is_none();
-
-        if immediate_resume {
-            // Resume the first workflow immediately.
-            // Set status to Executing BEFORE resume so find_all_waiting_for_io
-            // won't rediscover it if resume_with_io returns Yielded.
-            let first = waiting[0];
-            let state = self.workflows.get_mut(&first).expect("workflow must exist");
-            state.status = WorkflowStatus::Executing;
-            state.history.events.push(HistoryEvent::IoResolved {
-                cid,
-                data: Some(data.clone()),
-            });
-            let saved_session = state
-                .saved_session
-                .take()
-                .expect("WaitingForIo implies saved session");
-            self.runtime.restore_session(saved_session);
-            self.active = Some(first);
-        }
-
-        // Defer remaining workflows (or all, if an active workflow is running).
-        let defer_start = if immediate_resume { 1 } else { 0 };
-        for &wf_id in &waiting[defer_start..] {
-            if let Some(state) = self.workflows.get_mut(&wf_id) {
-                state.history.events.push(HistoryEvent::IoResolved {
-                    cid,
-                    data: Some(data.clone()),
-                });
-                state.status = WorkflowStatus::Executing;
-                state.deferred_io = Some(IOResponse::ContentReady { data: data.clone() });
-                self.deferred_resume_queue.push_back(wf_id);
-            }
-        }
-
-        if immediate_resume {
-            let result = self
-                .runtime
-                .resume_with_io(IOResponse::ContentReady { data }, self.budget);
-            self.handle_compute_result(waiting[0], result)
-        } else {
-            Vec::new()
-        }
+        self.handle_io_resolution(cid, Some(data.clone()), IOResponse::ContentReady { data })
     }
 
     fn handle_content_fetch_failed(&mut self, cid: [u8; 32]) -> Vec<WorkflowAction> {
+        self.handle_io_resolution(cid, None, IOResponse::ContentNotFound)
+    }
+
+    /// Common handler for IO resolution (content fetched or fetch failed).
+    fn handle_io_resolution(
+        &mut self,
+        cid: [u8; 32],
+        data: Option<Vec<u8>>,
+        io_response: IOResponse,
+    ) -> Vec<WorkflowAction> {
         let waiting = self.find_all_waiting_for_io(&cid);
         if waiting.is_empty() {
             return Vec::new();
@@ -390,7 +354,7 @@ impl WorkflowEngine {
             state
                 .history
                 .events
-                .push(HistoryEvent::IoResolved { cid, data: None });
+                .push(HistoryEvent::IoResolved { cid, data: data.clone() });
             let saved_session = state
                 .saved_session
                 .take()
@@ -406,9 +370,9 @@ impl WorkflowEngine {
                 state
                     .history
                     .events
-                    .push(HistoryEvent::IoResolved { cid, data: None });
+                    .push(HistoryEvent::IoResolved { cid, data: data.clone() });
                 state.status = WorkflowStatus::Executing;
-                state.deferred_io = Some(IOResponse::ContentNotFound);
+                state.deferred_io = Some(io_response.clone());
                 self.deferred_resume_queue.push_back(wf_id);
             }
         }
@@ -416,99 +380,106 @@ impl WorkflowEngine {
         if immediate_resume {
             let result = self
                 .runtime
-                .resume_with_io(IOResponse::ContentNotFound, self.budget);
+                .resume_with_io(io_response, self.budget);
             self.handle_compute_result(waiting[0], result)
         } else {
             Vec::new()
         }
     }
 
+    /// Process a compute result, iteratively handling replay-cache hits in the
+    /// NeedsIO path to avoid unbounded recursion for workflows with many cached
+    /// IO entries (e.g., large Merkle DAG traversals).
     fn handle_compute_result(
         &mut self,
         wf_id: WorkflowId,
         result: ComputeResult,
     ) -> Vec<WorkflowAction> {
-        match result {
-            ComputeResult::Complete { output } => {
-                if let Some(state) = self.workflows.get_mut(&wf_id) {
-                    state.status = WorkflowStatus::Complete;
-                    state.completed_output = Some(output.clone());
-                }
-                self.active = None;
-                vec![
-                    WorkflowAction::WorkflowComplete {
-                        workflow_id: wf_id,
-                        output,
-                    },
-                    WorkflowAction::PersistHistory { workflow_id: wf_id },
-                ]
-            }
-            ComputeResult::Yielded { fuel_consumed } => {
-                // Accumulate fuel consumed across yield points.
-                if let Some(state) = self.workflows.get_mut(&wf_id) {
-                    state.history.total_fuel_consumed += fuel_consumed;
-                }
-                // Keep active set; status stays Executing. Resume on next tick.
-                Vec::new()
-            }
-            ComputeResult::Failed { error } => {
-                if let Some(state) = self.workflows.get_mut(&wf_id) {
-                    state.status = WorkflowStatus::Failed;
-                }
-                self.active = None;
-                vec![WorkflowAction::WorkflowFailed {
-                    workflow_id: wf_id,
-                    error: error.to_string(),
-                }]
-            }
-            ComputeResult::NeedsIO { request } => {
-                let IORequest::FetchContent { cid } = request;
+        let mut current_result = result;
 
-                if let Some(state) = self.workflows.get_mut(&wf_id) {
-                    state.history.events.push(HistoryEvent::IoRequested { cid });
-
-                    // Check replay cache BEFORE extracting session. Use get() (not
-                    // remove) so a workflow that fetches the same CID twice can replay
-                    // both requests from the cache.
-                    if let Some(cached_data) = state.replay_cache.get(&cid).cloned() {
-                        // Cache hit: feed cached data immediately, no external fetch.
-                        state.history.events.push(HistoryEvent::IoResolved {
-                            cid,
-                            data: cached_data.clone(),
-                        });
-                        // Resume execution with cached data.
-                        let result = match cached_data {
-                            Some(data) => self
-                                .runtime
-                                .resume_with_io(IOResponse::ContentReady { data }, self.budget),
-                            None => self
-                                .runtime
-                                .resume_with_io(IOResponse::ContentNotFound, self.budget),
-                        };
-                        return self.handle_compute_result(wf_id, result);
+        loop {
+            match current_result {
+                ComputeResult::Complete { output } => {
+                    if let Some(state) = self.workflows.get_mut(&wf_id) {
+                        state.status = WorkflowStatus::Complete;
+                        state.completed_output = Some(output.clone());
                     }
-
-                    // Cache miss: normal path — extract session, emit FetchContent.
-                    let saved_session = self
-                        .runtime
-                        .take_session()
-                        .expect("NeedsIO implies session");
-                    state.saved_session = Some(saved_session);
-                    state.status = WorkflowStatus::WaitingForIo { cid };
                     self.active = None;
-
                     return vec![
-                        WorkflowAction::FetchContent {
+                        WorkflowAction::WorkflowComplete {
                             workflow_id: wf_id,
-                            cid,
+                            output,
                         },
                         WorkflowAction::PersistHistory { workflow_id: wf_id },
                     ];
                 }
+                ComputeResult::Yielded { fuel_consumed } => {
+                    if let Some(state) = self.workflows.get_mut(&wf_id) {
+                        state.history.total_fuel_consumed += fuel_consumed;
+                    }
+                    return Vec::new();
+                }
+                ComputeResult::Failed { error } => {
+                    if let Some(state) = self.workflows.get_mut(&wf_id) {
+                        state.status = WorkflowStatus::Failed;
+                    }
+                    self.active = None;
+                    return vec![WorkflowAction::WorkflowFailed {
+                        workflow_id: wf_id,
+                        error: error.to_string(),
+                    }];
+                }
+                ComputeResult::NeedsIO { request } => {
+                    let IORequest::FetchContent { cid } = request;
 
-                // Workflow not found — still clear active, but emit nothing.
-                self.active = None;
-                Vec::new()
+                    if let Some(state) = self.workflows.get_mut(&wf_id) {
+                        state.history.events.push(HistoryEvent::IoRequested { cid });
+
+                        // Check replay cache BEFORE extracting session. Use get() (not
+                        // remove) so a workflow that fetches the same CID twice can replay
+                        // both requests from the cache.
+                        if let Some(cached_data) = state.replay_cache.get(&cid).cloned() {
+                            // Cache hit: feed cached data immediately, no external fetch.
+                            state.history.events.push(HistoryEvent::IoResolved {
+                                cid,
+                                data: cached_data.clone(),
+                            });
+                            // Resume and loop (iterative, not recursive).
+                            current_result = match cached_data {
+                                Some(data) => self.runtime.resume_with_io(
+                                    IOResponse::ContentReady { data },
+                                    self.budget,
+                                ),
+                                None => self.runtime.resume_with_io(
+                                    IOResponse::ContentNotFound,
+                                    self.budget,
+                                ),
+                            };
+                            continue;
+                        }
+
+                        // Cache miss: normal path — extract session, emit FetchContent.
+                        let saved_session = self
+                            .runtime
+                            .take_session()
+                            .expect("NeedsIO implies session");
+                        state.saved_session = Some(saved_session);
+                        state.status = WorkflowStatus::WaitingForIo { cid };
+                        self.active = None;
+
+                        return vec![
+                            WorkflowAction::FetchContent {
+                                workflow_id: wf_id,
+                                cid,
+                            },
+                            WorkflowAction::PersistHistory { workflow_id: wf_id },
+                        ];
+                    }
+
+                    // Workflow not found — still clear active, but emit nothing.
+                    self.active = None;
+                    return Vec::new();
+                }
             }
         }
     }
