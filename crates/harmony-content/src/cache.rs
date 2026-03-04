@@ -60,7 +60,7 @@ impl<S: BlobStore> fmt::Debug for ContentStore<S> {
             .field("probation", &self.probation)
             .field("protected", &self.protected)
             .field("pinned_count", &self.pinned.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -353,6 +353,7 @@ mod tests {
         assert!(dbg.contains("ContentStore"));
         assert!(dbg.contains("CountMinSketch"));
         assert!(dbg.contains("pinned_count: 1"));
+        assert!(dbg.contains(".."), "should use finish_non_exhaustive()");
     }
 
     #[test]

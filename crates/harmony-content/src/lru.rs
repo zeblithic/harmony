@@ -35,7 +35,7 @@ impl fmt::Debug for Lru {
             .field("len", &self.len)
             .field("capacity", &self.capacity)
             .field("free_slots", &self.free.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -242,6 +242,7 @@ mod tests {
         assert!(dbg.contains("len: 2"));
         assert!(dbg.contains("capacity: 4"));
         assert!(dbg.contains("free_slots: 0"));
+        assert!(dbg.contains(".."), "should use finish_non_exhaustive()");
     }
 
     #[test]

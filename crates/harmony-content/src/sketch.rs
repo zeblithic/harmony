@@ -44,7 +44,7 @@ impl fmt::Debug for CountMinSketch {
             .field("width", &self.width)
             .field("total_increments", &self.total_increments)
             .field("halving_threshold", &self.halving_threshold)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -184,6 +184,7 @@ mod tests {
         assert!(dbg.contains("width: 256"));
         assert!(dbg.contains("total_increments: 0"));
         assert!(dbg.contains("halving_threshold: 10000"));
+        assert!(dbg.contains(".."), "should use finish_non_exhaustive()");
     }
 
     #[test]
