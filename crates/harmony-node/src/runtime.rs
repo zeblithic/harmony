@@ -247,8 +247,9 @@ impl<B: BlobStore> NodeRuntime<B> {
     }
 
     /// Run one iteration of the priority event loop.
-    /// 1. Drain ALL Tier 1 (router) events -- router is never starved.
+    /// 1. Drain ALL Tier 1 (router) events — router is never starved.
     /// 2. Process ONE Tier 2 (storage) event.
+    /// 3. Dispatch pending compute actions, then run ONE Tier 3 compute slice.
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
         let mut actions = Vec::new();
 
@@ -372,7 +373,7 @@ impl<B: BlobStore> NodeRuntime<B> {
     }
 
     fn dispatch_compute_actions(
-        &self,
+        &mut self,
         compute_actions: Vec<ComputeTierAction>,
         out: &mut Vec<RuntimeAction>,
     ) {
