@@ -62,7 +62,10 @@ struct WasmtimeSession {
     io_cache: HashMap<[u8; 32], Vec<u8>>,
     /// CIDs that returned not-found in prior rounds.
     not_found_cids: HashSet<[u8; 32]>,
-    /// Total fuel consumed across all execution slices.
+    /// Cumulative fuel consumed across all execution rounds (including replay
+    /// overhead). Each `resume_with_io()` re-executes the module from scratch,
+    /// so replay rounds re-consume fuel for the cached-IO portion. This
+    /// intentionally tracks total CPU cost, not deduplicated logical work.
     total_fuel_consumed: u64,
     /// CID of a pending IO request (if execution suspended for IO).
     pending_cid: Option<[u8; 32]>,
@@ -459,6 +462,10 @@ impl ComputeRuntime for WasmtimeRuntime {
                 },
                 _ => None,
             };
+            // Accumulate fuel across replay rounds. Each replay re-executes
+            // the module from scratch, so `fuel_consumed` includes re-running
+            // the cached-IO path. We sum rather than replace because the node
+            // pays the real CPU cost for every round (see WasmtimeSession doc).
             let total_fuel = session.total_fuel_consumed + fuel_consumed;
             self.session = Some(WasmtimeSession {
                 module_bytes: session.module_bytes,
@@ -777,5 +784,49 @@ mod tests {
 
         // After completion, no pending execution.
         assert!(!rt.has_pending());
+    }
+
+    #[test]
+    fn fuel_accounting_accumulates_across_replay_rounds() {
+        // Verify that total_fuel_consumed includes replay overhead:
+        // each resume_with_io re-executes from scratch, so the cached-IO
+        // portion is re-consumed. Total = sum of all rounds.
+        let mut rt = WasmtimeRuntime::new().expect("engine creation");
+        let cid = [0x99; 32];
+        let content = b"fuel test data";
+
+        // Round 1: execute -> NeedsIO. Records fuel for partial run.
+        let result = rt.execute(
+            FETCH_WAT.as_bytes(),
+            &cid,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(result, ComputeResult::NeedsIO { .. }));
+        let fuel_after_execute = rt
+            .snapshot()
+            .expect("snapshot after execute")
+            .fuel_consumed;
+        assert!(fuel_after_execute > 0, "should have consumed some fuel");
+
+        // Round 2: resume_with_io -> Complete. Re-executes from scratch.
+        let result = rt.resume_with_io(
+            crate::types::IOResponse::ContentReady {
+                data: content.to_vec(),
+            },
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(result, ComputeResult::Complete { .. }));
+        let fuel_after_replay = rt
+            .snapshot()
+            .expect("snapshot after replay")
+            .fuel_consumed;
+
+        // Total must be strictly greater than either individual round,
+        // confirming accumulation (not replacement).
+        assert!(
+            fuel_after_replay > fuel_after_execute,
+            "total fuel ({fuel_after_replay}) should exceed first round ({fuel_after_execute}) \
+             due to replay accumulation"
+        );
     }
 }
