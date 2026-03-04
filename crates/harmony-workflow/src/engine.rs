@@ -506,6 +506,9 @@ impl WorkflowEngine {
                         state.status = WorkflowStatus::WaitingForIo { cid };
                         self.active = None;
 
+                        // NOTE: Multiple workflows requesting the same CID will each
+                        // emit a FetchContent action. Deduplication is left to the
+                        // caller (NodeRuntime) or the storage layer (CAS).
                         return vec![
                             WorkflowAction::FetchContent {
                                 workflow_id: wf_id,

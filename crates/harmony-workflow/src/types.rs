@@ -64,6 +64,12 @@ pub struct WorkflowHistory {
     /// Ordered sequence of IO events recorded during execution.
     pub events: Vec<HistoryEvent>,
     /// Total fuel consumed across all execution rounds.
+    ///
+    /// NOTE: Currently only updated for `Yielded` compute results. Fuel consumed
+    /// in `Complete` and `NeedsIO` slices is not yet tracked because those
+    /// `ComputeResult` variants don't carry a `fuel_consumed` field. This means
+    /// workflows that complete in a single tick report 0 fuel. Do not rely on
+    /// this field for billing/enforcement until this limitation is resolved.
     pub total_fuel_consumed: u64,
 }
 

@@ -88,8 +88,11 @@ pub enum RuntimeAction {
     SendReply { query_id: u64, payload: Vec<u8> },
     /// Tier 2: Publish a message (e.g., content availability announcement).
     Publish { key_expr: String, payload: Vec<u8> },
-    /// Tier 3: Fetch a WASM module by CID from Tier 2 / network.
+    /// Tier 2/3: Fetch content by CID from storage / network.
     FetchContent { cid: [u8; 32] },
+    /// Tier 3: Fetch a WASM module by CID. The caller must route the response
+    /// to `RuntimeEvent::ModuleFetchResponse` (not `ContentFetchResponse`).
+    FetchModule { cid: [u8; 32] },
     /// Setup: Declare a queryable key expression.
     DeclareQueryable { key_expr: String },
     /// Setup: Subscribe to a key expression.
@@ -428,7 +431,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                     .push((query_id, input));
                 if !already_pending {
                     self.pending_direct_actions
-                        .push(RuntimeAction::FetchContent { cid: module_cid });
+                        .push(RuntimeAction::FetchModule { cid: module_cid });
                 }
                 Vec::new()
             }
@@ -478,13 +481,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                     out.push(RuntimeAction::FetchContent { cid });
                 }
                 WorkflowAction::FetchModule { cid } => {
-                    // TODO: When SubmitByCid is un-stubbed in the engine, this
-                    // will need a separate RuntimeAction::FetchModule variant so
-                    // the response routes to ModuleFetchResponse rather than
-                    // ContentFetchResponse. Currently only the ByCid path in
-                    // handle_compute (above) uses FetchModule, and responses
-                    // arrive via ModuleFetchResponse already.
-                    out.push(RuntimeAction::FetchContent { cid });
+                    out.push(RuntimeAction::FetchModule { cid });
                 }
                 WorkflowAction::PersistHistory { workflow_id: _workflow_id } => {
                     // TODO: Persist history (e.g., via Zenoh PUT or write-ahead log)
@@ -669,6 +666,7 @@ mod tests {
             payload: vec![],
         };
         let _a4 = RuntimeAction::FetchContent { cid: [0u8; 32] };
+        let _a4b = RuntimeAction::FetchModule { cid: [0u8; 32] };
         let _a5 = RuntimeAction::DeclareQueryable {
             key_expr: "harmony/content/a/**".into(),
         };
