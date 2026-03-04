@@ -8,7 +8,7 @@ struct HostState;
 /// Holds the active WASM execution session state for resumption.
 ///
 /// Fields are populated during `execute()` and consumed by `resume()`
-/// and `snapshot()` (Task 5).
+/// and `snapshot()`.
 struct WasmiSession {
     store: wasmi::Store<HostState>,
     instance: wasmi::Instance,
@@ -108,6 +108,8 @@ impl WasmiRuntime {
                 }
 
                 // Compute fuel consumed and store session for snapshot().
+                // get_fuel() only fails when fuel metering is disabled;
+                // WasmiRuntime::new() always enables it.
                 let remaining_fuel = ctx.store.get_fuel().unwrap_or(0);
                 let fuel_this_slice = ctx.fuel_budget.saturating_sub(remaining_fuel);
                 let total_fuel = ctx.fuel_before + fuel_this_slice;
@@ -125,6 +127,8 @@ impl WasmiRuntime {
             }
             Ok(wasmi::TypedResumableCall::OutOfFuel(pending)) => {
                 // Execution ran out of fuel -- store session for resumption.
+                // get_fuel() only fails when fuel metering is disabled;
+                // WasmiRuntime::new() always enables it.
                 let remaining_fuel = ctx.store.get_fuel().unwrap_or(0);
                 let fuel_this_slice = ctx.fuel_budget.saturating_sub(remaining_fuel);
                 let total_fuel = ctx.fuel_before + fuel_this_slice;
@@ -572,6 +576,30 @@ mod tests {
         assert_eq!(sum, 300);
 
         assert!(checkpoint.fuel_consumed > 0);
+    }
+
+    #[test]
+    fn snapshot_after_yield_captures_memory() {
+        let mut rt = WasmiRuntime::new();
+        let input = 10_000_i32.to_le_bytes();
+
+        let result = rt.execute(
+            LOOP_WAT.as_bytes(),
+            &input,
+            InstructionBudget { fuel: 10_000 },
+        );
+
+        let yielded_fuel = match result {
+            ComputeResult::Yielded { fuel_consumed } => fuel_consumed,
+            other => panic!("expected Yielded, got {other:?}"),
+        };
+
+        let checkpoint = rt.snapshot().expect("should have active session after yield");
+
+        let expected_hash = harmony_crypto::hash::blake3_hash(LOOP_WAT.as_bytes());
+        assert_eq!(checkpoint.module_hash, expected_hash);
+        assert!(!checkpoint.memory.is_empty());
+        assert_eq!(checkpoint.fuel_consumed, yielded_fuel);
     }
 
     #[test]
