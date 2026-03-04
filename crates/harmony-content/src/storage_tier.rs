@@ -156,15 +156,16 @@ impl<B: BlobStore> StorageTier<B> {
             self.metrics.transit_rejected += 1;
             return vec![];
         }
-        self.cache.store(cid, data);
-        // Check if W-TinyLFU actually retained the content.
-        if self.cache.contains(&cid) {
-            self.metrics.transit_admitted += 1;
-            vec![self.make_announce_action(&cid)]
-        } else {
+        // Pre-store admission check: compare frequency against probation's LRU.
+        // Rejected items still get their sketch counter incremented so repeated
+        // transits build popularity for future admission.
+        if !self.cache.should_admit(&cid) {
             self.metrics.transit_rejected += 1;
-            vec![]
+            return vec![];
         }
+        self.cache.store(cid, data);
+        self.metrics.transit_admitted += 1;
+        vec![self.make_announce_action(&cid)]
     }
 
     fn handle_publish(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
@@ -173,16 +174,11 @@ impl<B: BlobStore> StorageTier<B> {
             self.metrics.publishes_rejected += 1;
             return vec![];
         }
+        // Publish always stores — bypasses admission filter.
+        // TODO: Pin published content to guarantee long-term retention (deferred).
         self.cache.store(cid, data);
-        // TODO: Pin published content to guarantee admission (deferred).
-        // For now, check if W-TinyLFU retained it — same as transit.
-        if self.cache.contains(&cid) {
-            self.metrics.publishes_stored += 1;
-            vec![self.make_announce_action(&cid)]
-        } else {
-            self.metrics.publishes_rejected += 1;
-            vec![]
-        }
+        self.metrics.publishes_stored += 1;
+        vec![self.make_announce_action(&cid)]
     }
 
     /// Verify that a CID actually matches the hash of the data.
@@ -398,6 +394,61 @@ mod tests {
         });
 
         assert_eq!(tier.metrics().transit_admitted, 2);
+    }
+
+    #[test]
+    fn transit_cold_item_rejected_by_admission() {
+        // Tiny cache (capacity 3: window=1, protected=0, probation=2).
+        // Fill probation with hot items, then send a cold transit item that
+        // should fail the pre-store admission check.
+        let budget = StorageBudget {
+            cache_capacity: 3,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+
+        // Fill cache: 3 items → window=1, probation=2.
+        for i in 0..3 {
+            let data = format!("hot-{i}");
+            let cid = ContentId::for_blob(data.as_bytes()).unwrap();
+            tier.handle(StorageTierEvent::TransitContent {
+                cid,
+                data: data.into_bytes(),
+            });
+        }
+        // Boost frequency of the probation items via queries.
+        for i in 0..2 {
+            let data = format!("hot-{i}");
+            let cid = ContentId::for_blob(data.as_bytes()).unwrap();
+            for _ in 0..10 {
+                tier.handle(StorageTierEvent::ContentQuery { query_id: 0, cid });
+            }
+        }
+        let admitted_before = tier.metrics().transit_admitted;
+        let rejected_before = tier.metrics().transit_rejected;
+
+        // Cold transit item with zero frequency should be rejected.
+        let cold_data = b"cold-newcomer-will-lose";
+        let cold_cid = ContentId::for_blob(cold_data).unwrap();
+        let actions = tier.handle(StorageTierEvent::TransitContent {
+            cid: cold_cid,
+            data: cold_data.to_vec(),
+        });
+
+        assert!(
+            actions.is_empty(),
+            "cold transit item should be rejected by W-TinyLFU, got: {actions:?}"
+        );
+        assert_eq!(
+            tier.metrics().transit_admitted,
+            admitted_before,
+            "transit_admitted should not increase for rejected item"
+        );
+        assert_eq!(
+            tier.metrics().transit_rejected,
+            rejected_before + 1,
+            "transit_rejected should increase for rejected item"
+        );
     }
 
     #[test]
