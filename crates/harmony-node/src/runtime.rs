@@ -896,7 +896,17 @@ mod tests {
             payload,
         });
 
-        // Malformed payload should be silently dropped (no crash, no compute task queued).
+        // Malformed payload: no compute task queued, but error reply emitted.
         assert_eq!(rt.compute_queue_len(), 0);
+
+        let actions = rt.tick();
+        let reply = actions.iter().find_map(|a| match a {
+            RuntimeAction::SendReply { query_id: 200, payload } => Some(payload),
+            _ => None,
+        });
+        let payload = reply.expect("should emit error reply for oversized module");
+        assert_eq!(payload[0], 0x01, "error tag");
+        let msg = std::str::from_utf8(&payload[1..]).unwrap();
+        assert!(msg.contains("malformed"), "error message should mention malformed payload");
     }
 }

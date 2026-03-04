@@ -3,9 +3,6 @@
 //! Accepts [`ComputeTierEvent`]s, enqueues compute tasks, and returns
 //! [`ComputeTierAction`]s for the caller to execute (send replies, fetch modules).
 
-// Scaffolding: types and methods are consumed only by tests until wired into NodeRuntime.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -272,6 +269,7 @@ impl ComputeTier {
     }
 
     /// Whether there is an active (in-progress) execution.
+    #[cfg(test)]
     pub fn has_active(&self) -> bool {
         self.active.is_some()
     }
