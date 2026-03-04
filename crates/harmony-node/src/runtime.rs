@@ -260,6 +260,9 @@ impl<B: BlobStore> NodeRuntime<B> {
                         // Convert pending CID-based requests to inline Submit now
                         // that we have the module bytes. SubmitByCid is stubbed in
                         // the workflow engine, so we go through Submit instead.
+                        // TODO: blake3_hash is computed once here but also re-computed
+                        // inside handle_submit for each call. For large WASM modules
+                        // with many pending queries, consider passing pre-computed hash.
                         if let Some(pending) = self.cid_to_query.remove(&cid) {
                             let module_hash = harmony_crypto::hash::blake3_hash(&module);
                             for (query_id, input) in pending {
@@ -412,6 +415,12 @@ impl<B: BlobStore> NodeRuntime<B> {
             }
             ParsedCompute::ByCid { module_cid, input } => {
                 // Store the pending mapping and emit FetchModule.
+                // TODO: When module fetch completes, each pending query is
+                // converted to a Submit. If the engine dedup-returns immediately
+                // (workflow already complete), the reply is sent right away. But
+                // the first Submit's completion action also removes from
+                // workflow_to_query, potentially missing later callers. Consider
+                // accumulating all query_ids before dispatching any actions.
                 let already_pending = self.cid_to_query.contains_key(&module_cid);
                 self.cid_to_query
                     .entry(module_cid)
@@ -469,6 +478,12 @@ impl<B: BlobStore> NodeRuntime<B> {
                     out.push(RuntimeAction::FetchContent { cid });
                 }
                 WorkflowAction::FetchModule { cid } => {
+                    // TODO: When SubmitByCid is un-stubbed in the engine, this
+                    // will need a separate RuntimeAction::FetchModule variant so
+                    // the response routes to ModuleFetchResponse rather than
+                    // ContentFetchResponse. Currently only the ByCid path in
+                    // handle_compute (above) uses FetchModule, and responses
+                    // arrive via ModuleFetchResponse already.
                     out.push(RuntimeAction::FetchContent { cid });
                 }
                 WorkflowAction::PersistHistory { workflow_id } => {

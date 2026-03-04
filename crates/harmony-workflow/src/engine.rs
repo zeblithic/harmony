@@ -175,7 +175,7 @@ impl WorkflowEngine {
     }
 
     /// Clone the workflow's history for persistence or inspection.
-    pub fn take_history(&self, id: &WorkflowId) -> Option<WorkflowHistory> {
+    pub fn clone_history(&self, id: &WorkflowId) -> Option<WorkflowHistory> {
         self.workflows.get(id).map(|s| s.history.clone())
     }
 
@@ -208,6 +208,11 @@ impl WorkflowEngine {
                 // preserved — they are the durable checkpoint for crash
                 // recovery. Clear them only after external persistence
                 // confirms the data is safely stored.
+                //
+                // TODO: completed_output is also preserved so duplicate
+                // submits can re-emit the result. For workflows producing
+                // large outputs, consider bounding by size or TTL to
+                // prevent unbounded memory growth.
                 true
             }
             _ => false,
@@ -244,13 +249,9 @@ impl WorkflowEngine {
             }];
         }
 
-        // Validate module bytes match the recorded hash.
-        if actual_hash != history.module_hash {
-            return vec![WorkflowAction::WorkflowFailed {
-                workflow_id: wf_id,
-                error: "module hash mismatch during recovery".into(),
-            }];
-        }
+        // NOTE: No separate module_hash check needed here — the WorkflowId
+        // validation above already guarantees actual_hash == history.module_hash
+        // via BLAKE3 collision resistance (ID = BLAKE3(hash || input)).
 
         // Build replay cache from history's IoResolved events.
         let mut replay_cache = HashMap::new();
@@ -737,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn take_history_returns_workflow_history() {
+    fn clone_history_returns_workflow_history() {
         let mut engine = make_engine();
 
         let module = ADD_WAT.as_bytes().to_vec();
@@ -753,7 +754,7 @@ mod tests {
         });
 
         let history = engine
-            .take_history(&wf_id)
+            .clone_history(&wf_id)
             .expect("history should exist after submit");
 
         assert_eq!(history.workflow_id, wf_id);
@@ -828,7 +829,7 @@ mod tests {
         }
 
         // History should have IoRequested.
-        let history = engine.take_history(&wf_id).expect("history should exist");
+        let history = engine.clone_history(&wf_id).expect("history should exist");
         assert_eq!(history.events.len(), 1);
         assert!(matches!(&history.events[0], HistoryEvent::IoRequested { cid: c } if *c == cid));
     }
@@ -900,7 +901,7 @@ mod tests {
         });
 
         // History should have both IoRequested and IoResolved.
-        let history = engine.take_history(&wf_id).expect("history should exist");
+        let history = engine.clone_history(&wf_id).expect("history should exist");
         assert_eq!(history.events.len(), 2);
 
         assert!(matches!(&history.events[0], HistoryEvent::IoRequested { cid: c } if *c == cid));
@@ -988,7 +989,7 @@ mod tests {
 
         let module_hash = harmony_crypto::hash::blake3_hash(FETCH_WAT.as_bytes());
         let wf_id = WorkflowId::new(&module_hash, &cid);
-        let history = engine.take_history(&wf_id).unwrap();
+        let history = engine.clone_history(&wf_id).unwrap();
 
         // Now: create a FRESH engine and recover from the history.
         let mut engine2 = make_engine_high_fuel();
