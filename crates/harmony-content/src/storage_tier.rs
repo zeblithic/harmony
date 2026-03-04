@@ -15,6 +15,9 @@ pub struct StorageBudget {
 }
 
 /// Observable metrics for the storage tier.
+///
+/// Fields are public for read convenience. External mutation is prevented
+/// because [`StorageTier`] only exposes metrics via `&StorageMetrics`.
 #[derive(Debug, Clone, Default)]
 pub struct StorageMetrics {
     pub queries_served: u64,
@@ -27,16 +30,33 @@ pub struct StorageMetrics {
 }
 
 impl StorageMetrics {
-    /// Serialize metrics as 7 big-endian u64s (56 bytes).
+    /// Serialize metrics as big-endian u64s.
+    ///
+    /// Uses exhaustive destructuring so adding a field without updating
+    /// serialization is a compile error.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(56);
-        buf.extend_from_slice(&self.queries_served.to_be_bytes());
-        buf.extend_from_slice(&self.cache_hits.to_be_bytes());
-        buf.extend_from_slice(&self.cache_misses.to_be_bytes());
-        buf.extend_from_slice(&self.transit_stored.to_be_bytes());
-        buf.extend_from_slice(&self.transit_rejected.to_be_bytes());
-        buf.extend_from_slice(&self.publishes_stored.to_be_bytes());
-        buf.extend_from_slice(&self.publishes_rejected.to_be_bytes());
+        let Self {
+            queries_served,
+            cache_hits,
+            cache_misses,
+            transit_stored,
+            transit_rejected,
+            publishes_stored,
+            publishes_rejected,
+        } = self;
+        let fields: &[u64] = &[
+            *queries_served,
+            *cache_hits,
+            *cache_misses,
+            *transit_stored,
+            *transit_rejected,
+            *publishes_stored,
+            *publishes_rejected,
+        ];
+        let mut buf = Vec::with_capacity(fields.len() * 8);
+        for &val in fields {
+            buf.extend_from_slice(&val.to_be_bytes());
+        }
         buf
     }
 }
@@ -200,6 +220,9 @@ impl<B: BlobStore> StorageTier<B> {
     }
 
     /// Build an AnnounceContent action for a stored CID.
+    ///
+    /// Returns one action per store. Batching and rate-limiting belong in the
+    /// I/O bridge layer, not this sans-I/O state machine.
     fn make_announce_action(&self, cid: &ContentId) -> StorageTierAction {
         let cid_hex = hex::encode(cid.to_bytes());
         let key_expr = announce_ns::key(&cid_hex);
