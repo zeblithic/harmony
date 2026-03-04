@@ -1,6 +1,7 @@
 //! Node runtime: priority event loop wiring Tier 1 (Router) + Tier 2 (Storage).
 
-// Types defined here are consumed by later tasks in this binary crate.
+// Remaining dead code (RuntimeEvent, push_event, tick, metrics, etc.) is consumed
+// only by tests until the async event loop is wired.
 #![allow(dead_code)]
 
 use std::collections::{HashSet, VecDeque};

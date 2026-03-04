@@ -16,6 +16,12 @@ enum Commands {
         #[command(subcommand)]
         action: IdentityAction,
     },
+    /// Start the Harmony node runtime
+    Run {
+        /// W-TinyLFU cache capacity (number of items)
+        #[arg(long, default_value_t = 1024)]
+        cache_capacity: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -121,5 +127,70 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
+        Commands::Run { cache_capacity } => {
+            use crate::runtime::{NodeConfig, NodeRuntime, RuntimeAction};
+            use harmony_content::blob::MemoryBlobStore;
+            use harmony_content::storage_tier::StorageBudget;
+
+            let config = NodeConfig {
+                storage_budget: StorageBudget {
+                    cache_capacity,
+                    max_pinned_bytes: 100_000_000,
+                },
+            };
+            let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+            println!("Harmony node runtime initialized");
+            println!("  Cache capacity: {cache_capacity} items");
+            println!("  Router queue:   {} pending", rt.router_queue_len());
+            println!("  Storage queue:  {} pending", rt.storage_queue_len());
+            println!("\nStartup actions:");
+            for action in &startup_actions {
+                match action {
+                    RuntimeAction::DeclareQueryable { key_expr } => {
+                        println!("  queryable: {key_expr}");
+                    }
+                    RuntimeAction::Subscribe { key_expr } => {
+                        println!("  subscribe: {key_expr}");
+                    }
+                    _ => {}
+                }
+            }
+            println!(
+                "\n{} queryables, {} subscriptions declared",
+                startup_actions
+                    .iter()
+                    .filter(|a| matches!(a, RuntimeAction::DeclareQueryable { .. }))
+                    .count(),
+                startup_actions
+                    .iter()
+                    .filter(|a| matches!(a, RuntimeAction::Subscribe { .. }))
+                    .count(),
+            );
+            println!("\nNode ready. (Event loop requires async runtime — not yet wired.)");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_parses_run_command() {
+        let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
+        assert!(matches!(cli.command, Commands::Run { .. }));
+    }
+
+    #[test]
+    fn cli_parses_run_with_cache_capacity() {
+        let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "2048"]).unwrap();
+        if let Commands::Run { cache_capacity, .. } = cli.command {
+            assert_eq!(cache_capacity, 2048);
+        } else {
+            panic!("expected Run command");
+        }
     }
 }
