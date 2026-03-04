@@ -386,26 +386,40 @@ impl<B: BlobStore> NodeRuntime<B> {
     }
 
     /// Run one iteration of the priority event loop.
-    /// 1. Drain ALL Tier 1 (router) events — router is never starved.
-    /// 2. Drain ALL Tier 2 (storage) events — storage actions are I/O-bound
-    ///    and handled externally; building them here is cheap.
+    /// 1. Drain Tier 1 (router) events, up to `router_max_per_tick` if set.
+    /// 2. Drain Tier 2 (storage) events, up to `storage_max_per_tick` if set.
     /// 3. Dispatch pending workflow actions, then run ONE Tier 3 compute slice.
+    ///
+    /// When limits are `None` (the default), all queued events are drained.
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
         let mut actions = Vec::new();
 
-        // Tier 1: drain ALL router events (highest priority)
-        while let Some(event) = self.router_queue.pop_front() {
-            let node_actions = self.router.handle_event(event);
-            self.dispatch_router_actions(node_actions, &mut actions);
+        // Tier 1: drain router events (up to max_per_tick if set)
+        let router_limit = self.schedule.router_max_per_tick.unwrap_or(usize::MAX);
+        let mut router_processed = 0;
+        while router_processed < router_limit {
+            match self.router_queue.pop_front() {
+                Some(event) => {
+                    let node_actions = self.router.handle_event(event);
+                    self.dispatch_router_actions(node_actions, &mut actions);
+                    router_processed += 1;
+                }
+                None => break,
+            }
         }
 
-        // Tier 2: drain ALL storage events (middle priority)
-        // In sans-I/O, processing storage events only builds action lists —
-        // actual I/O (network sends, disk writes) happens when the caller
-        // executes the actions. No reason to throttle.
-        while let Some(event) = self.storage_queue.pop_front() {
-            let storage_actions = self.storage.handle(event);
-            self.dispatch_storage_actions(storage_actions, &mut actions);
+        // Tier 2: drain storage events (up to max_per_tick if set)
+        let storage_limit = self.schedule.storage_max_per_tick.unwrap_or(usize::MAX);
+        let mut storage_processed = 0;
+        while storage_processed < storage_limit {
+            match self.storage_queue.pop_front() {
+                Some(event) => {
+                    let storage_actions = self.storage.handle(event);
+                    self.dispatch_storage_actions(storage_actions, &mut actions);
+                    storage_processed += 1;
+                }
+                None => break,
+            }
         }
 
         // Tier 3: emit any direct replies buffered from push_event
@@ -1301,5 +1315,56 @@ mod tests {
             rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
         }
         assert_eq!(rt.effective_fuel(), 100);
+    }
+
+    #[test]
+    fn router_max_per_tick_caps_drain() {
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(2);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Push 5 router events
+        for i in 0..5 {
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+        }
+        assert_eq!(rt.router_queue_len(), 5);
+
+        // Tick should drain only 2
+        rt.tick();
+        assert_eq!(rt.router_queue_len(), 3);
+
+        // Next tick drains 2 more
+        rt.tick();
+        assert_eq!(rt.router_queue_len(), 1);
+
+        // Final tick drains the last one
+        rt.tick();
+        assert_eq!(rt.router_queue_len(), 0);
+    }
+
+    #[test]
+    fn storage_max_per_tick_caps_drain() {
+        let mut config = NodeConfig::default();
+        config.schedule.storage_max_per_tick = Some(1);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Push 3 storage events (stats queries)
+        for i in 0..3 {
+            rt.push_event(RuntimeEvent::QueryReceived {
+                query_id: 100 + i,
+                key_expr: "harmony/content/stats".into(),
+                payload: vec![],
+            });
+        }
+        assert_eq!(rt.storage_queue_len(), 3);
+
+        // Tick should drain only 1
+        let actions = rt.tick();
+        assert_eq!(rt.storage_queue_len(), 2);
+        let reply_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendReply { .. }))
+            .count();
+        assert_eq!(reply_count, 1);
     }
 }
