@@ -199,6 +199,15 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// Construct a new node runtime, returning startup actions the caller
     /// must execute (queryable declarations, subscriptions).
     pub fn new(config: NodeConfig, store: B) -> (Self, Vec<RuntimeAction>) {
+        assert!(
+            config.schedule.router_max_per_tick.map_or(true, |n| n > 0),
+            "router_max_per_tick must be None or > 0"
+        );
+        assert!(
+            config.schedule.storage_max_per_tick.map_or(true, |n| n > 0),
+            "storage_max_per_tick must be None or > 0"
+        );
+
         let router = Node::new();
         let mut queryable_router = QueryableRouter::new();
 
@@ -302,6 +311,9 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// At zero depth, returns the full base budget. As combined queue depth
     /// approaches `high_water`, fuel shrinks linearly toward `floor_fraction * base`.
     /// Above high_water, fuel stays at the floor.
+    ///
+    /// Special case: if `high_water` is 0, always returns `floor_fraction * base`
+    /// regardless of queue depth (adaptive scaling is effectively maximally aggressive).
     pub fn effective_fuel(&self) -> u64 {
         let base = self.workflow.budget().fuel;
         let ac = &self.schedule.adaptive_compute;
@@ -1463,23 +1475,61 @@ mod tests {
         let actions = rt.tick();
         assert!(actions.iter().any(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. })));
 
-        rt.tick(); // tick 2: router=1, storage=0 (starved=1)
-        rt.tick(); // tick 3: router=1, storage=0 (starved=2)
-        rt.tick(); // tick 4: router=1, storage=0 (starved=3 → threshold hit)
+        // Verify default order: router actions appear before storage actions.
+        // SendOnInterface (router) should precede SendReply (storage) if any router events produce output.
+        // At minimum, starvation counters confirm storage is not yet starved.
+        assert_eq!(rt.starvation_counters().1, 0, "storage processed, counter should be 0");
 
-        // Now push a storage event — it should be promoted ahead of router
+        rt.tick(); // tick 2: router=1, storage=0 (starved=1)
+        assert_eq!(rt.starvation_counters().1, 1);
+        rt.tick(); // tick 3: router=1, storage=0 (starved=2)
+        assert_eq!(rt.starvation_counters().1, 2);
+        rt.tick(); // tick 4: router=1, storage=0 (starved=3 → threshold hit)
+        assert_eq!(rt.starvation_counters().1, 3, "storage should hit starvation threshold");
+
+        // Now push both a storage event AND a router event.
+        // Without promotion, default order is [Router, Storage, Compute].
+        // With promotion, storage (starved=3 >= threshold=3) moves to front: [Storage, Router, Compute].
         rt.push_event(RuntimeEvent::QueryReceived {
             query_id: 60,
             key_expr: "harmony/content/stats".into(),
             payload: vec![],
         });
+        rt.push_event(RuntimeEvent::TimerTick { now: 2000 });
 
-        // Tick 5: storage should be promoted and process its event
+        // Tick 5: storage promoted → its actions should appear before router actions in output
         let actions = rt.tick();
         assert!(
             actions.iter().any(|a| matches!(a, RuntimeAction::SendReply { query_id: 60, .. })),
-            "starved storage tier should be promoted and process its event"
+            "promoted storage tier should process its event"
         );
+
+        // Verify promotion resets the starvation counter
+        assert_eq!(rt.starvation_counters().1, 0, "storage counter should reset after processing");
+
+        // Verify ordering: SendReply (storage) should appear before SendOnInterface (router)
+        // because storage was promoted to process first.
+        let reply_pos = actions.iter().position(|a| matches!(a, RuntimeAction::SendReply { query_id: 60, .. }));
+        let send_pos = actions.iter().position(|a| matches!(a, RuntimeAction::SendOnInterface { .. }));
+        if let (Some(r), Some(s)) = (reply_pos, send_pos) {
+            assert!(r < s, "promoted storage actions should appear before router actions");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "router_max_per_tick must be None or > 0")]
+    fn zero_router_limit_panics() {
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(0);
+        let _ = NodeRuntime::new(config, MemoryBlobStore::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "storage_max_per_tick must be None or > 0")]
+    fn zero_storage_limit_panics() {
+        let mut config = NodeConfig::default();
+        config.schedule.storage_max_per_tick = Some(0);
+        let _ = NodeRuntime::new(config, MemoryBlobStore::new());
     }
 
     #[test]
