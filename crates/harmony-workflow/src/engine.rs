@@ -212,7 +212,16 @@ impl WorkflowEngine {
         history: WorkflowHistory,
         module_bytes: Vec<u8>,
     ) -> Vec<WorkflowAction> {
-        let wf_id = history.workflow_id;
+        // Validate workflow ID is correctly derived from hash+input.
+        let actual_hash = harmony_crypto::hash::blake3_hash(&module_bytes);
+        let expected_id = WorkflowId::new(&actual_hash, &history.input);
+        if history.workflow_id != expected_id {
+            return vec![WorkflowAction::WorkflowFailed {
+                workflow_id: history.workflow_id,
+                error: "workflow ID does not match module hash + input".into(),
+            }];
+        }
+        let wf_id = expected_id;
 
         // Don't overwrite an existing workflow (could be currently executing).
         if self.workflows.contains_key(&wf_id) {
@@ -223,7 +232,6 @@ impl WorkflowEngine {
         }
 
         // Validate module bytes match the recorded hash.
-        let actual_hash = harmony_crypto::hash::blake3_hash(&module_bytes);
         if actual_hash != history.module_hash {
             return vec![WorkflowAction::WorkflowFailed {
                 workflow_id: wf_id,
@@ -1064,13 +1072,15 @@ mod tests {
         };
 
         let mut engine = make_engine_high_fuel();
-        // Pass wrong module bytes — should fail.
+        // Pass wrong module bytes — ID derivation check catches this before
+        // the hash mismatch check since the wrong bytes produce a different ID.
         let actions = engine.recover(history, b"wrong module bytes".to_vec());
 
         assert_eq!(actions.len(), 1);
         assert!(
-            matches!(&actions[0], WorkflowAction::WorkflowFailed { error, .. } if error.contains("hash mismatch")),
-            "should fail with hash mismatch, got: {actions:?}"
+            matches!(&actions[0], WorkflowAction::WorkflowFailed { error, .. }
+                if error.contains("does not match") || error.contains("hash mismatch")),
+            "should fail validation, got: {actions:?}"
         );
         assert_eq!(engine.workflow_count(), 0, "should not create workflow on mismatch");
     }
