@@ -51,17 +51,17 @@ pub enum RuntimeEvent {
         payload: Vec<u8>,
     },
     /// Tier 2: Zenoh subscription message (transit or publish).
-    SubscriptionMessage {
-        key_expr: String,
-        payload: Vec<u8>,
-    },
+    SubscriptionMessage { key_expr: String, payload: Vec<u8> },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAction {
     /// Tier 1: Send raw packet on a network interface.
-    SendOnInterface { interface_name: Arc<str>, raw: Vec<u8> },
+    SendOnInterface {
+        interface_name: Arc<str>,
+        raw: Vec<u8>,
+    },
     /// Tier 2: Reply to a content or stats query.
     SendReply { query_id: u64, payload: Vec<u8> },
     /// Tier 2: Publish a message (e.g., content availability announcement).
@@ -160,8 +160,11 @@ impl<B: BlobStore> NodeRuntime<B> {
                 raw,
                 now,
             } => {
-                self.router_queue
-                    .push_back(NodeEvent::InboundPacket { interface_name, raw, now });
+                self.router_queue.push_back(NodeEvent::InboundPacket {
+                    interface_name,
+                    raw,
+                    now,
+                });
             }
             RuntimeEvent::TimerTick { now } => {
                 self.router_queue.push_back(NodeEvent::TimerTick { now });
@@ -206,8 +209,15 @@ impl<B: BlobStore> NodeRuntime<B> {
         out: &mut Vec<RuntimeAction>,
     ) {
         for action in node_actions {
-            if let NodeAction::SendOnInterface { interface_name, raw } = action {
-                out.push(RuntimeAction::SendOnInterface { interface_name, raw });
+            if let NodeAction::SendOnInterface {
+                interface_name,
+                raw,
+            } = action
+            {
+                out.push(RuntimeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                });
             }
             // Other router actions are diagnostics -- drop for now.
         }
@@ -272,7 +282,9 @@ impl<B: BlobStore> NodeRuntime<B> {
             return Some(StorageTierEvent::StatsQuery { query_id });
         }
         // Content query: harmony/content/{prefix}/{cid_hex}
-        let after_prefix = key_expr.strip_prefix(content_ns::PREFIX)?.strip_prefix('/')?;
+        let after_prefix = key_expr
+            .strip_prefix(content_ns::PREFIX)?
+            .strip_prefix('/')?;
         let cid_hex = after_prefix.get(2..)?; // skip shard char + "/"
         let cid_bytes: [u8; 32] = hex::decode(cid_hex).ok()?.try_into().ok()?;
         let cid = ContentId::from_bytes(cid_bytes);
@@ -473,5 +485,151 @@ mod tests {
         let (mut rt, _) = make_runtime();
         let actions = rt.tick();
         assert!(actions.is_empty());
+    }
+
+    use harmony_content::cid::ContentId;
+
+    /// Helper: build a valid CID hex string for test data.
+    fn cid_hex_for(data: &[u8]) -> (ContentId, String) {
+        let cid = ContentId::for_blob(data).unwrap();
+        let hex = hex::encode(cid.to_bytes());
+        (cid, hex)
+    }
+
+    #[test]
+    fn publish_then_query_round_trip() {
+        let (mut rt, _) = make_runtime();
+        let data = b"round trip test data";
+        let (_cid, cid_hex) = cid_hex_for(data);
+
+        // Publish via subscription message
+        let publish_key = format!("harmony/content/publish/{cid_hex}");
+        rt.push_event(RuntimeEvent::SubscriptionMessage {
+            key_expr: publish_key,
+            payload: data.to_vec(),
+        });
+        let publish_actions = rt.tick();
+
+        // Should get an AnnounceContent → Publish action
+        assert!(
+            publish_actions
+                .iter()
+                .any(|a| matches!(a, RuntimeAction::Publish { .. })),
+            "expected Publish action from publish event"
+        );
+
+        // Query the same CID
+        let first_char = &cid_hex[..1];
+        let query_key = format!("harmony/content/{first_char}/{cid_hex}");
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 42,
+            key_expr: query_key,
+            payload: vec![],
+        });
+        let query_actions = rt.tick();
+
+        // Should get a SendReply with the original data
+        let reply = query_actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 42, .. }));
+        assert!(reply.is_some(), "expected SendReply for query_id 42");
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload.as_slice(), data);
+        }
+    }
+
+    #[test]
+    fn transit_content_admitted_and_queryable() {
+        let (mut rt, _) = make_runtime();
+        let data = b"transit data";
+        let (_cid, cid_hex) = cid_hex_for(data);
+
+        // Transit via subscription
+        let transit_key = format!("harmony/content/transit/{cid_hex}");
+        rt.push_event(RuntimeEvent::SubscriptionMessage {
+            key_expr: transit_key,
+            payload: data.to_vec(),
+        });
+        let transit_actions = rt.tick();
+        assert!(
+            transit_actions
+                .iter()
+                .any(|a| matches!(a, RuntimeAction::Publish { .. })),
+            "admitted transit should produce announcement"
+        );
+
+        // Query it back
+        let first_char = &cid_hex[..1];
+        let query_key = format!("harmony/content/{first_char}/{cid_hex}");
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 99,
+            key_expr: query_key,
+            payload: vec![],
+        });
+        let query_actions = rt.tick();
+        assert!(
+            query_actions
+                .iter()
+                .any(|a| matches!(a, RuntimeAction::SendReply { query_id: 99, .. })),
+            "cached transit content should be queryable"
+        );
+    }
+
+    #[test]
+    fn stats_query_returns_metrics() {
+        let (mut rt, _) = make_runtime();
+
+        // Do a content query first (to bump metrics)
+        let (_, cid_hex) = cid_hex_for(b"anything");
+        let first_char = &cid_hex[..1];
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 1,
+            key_expr: format!("harmony/content/{first_char}/{cid_hex}"),
+            payload: vec![],
+        });
+        rt.tick();
+
+        // Now query stats
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 50,
+            key_expr: "harmony/content/stats".into(),
+            payload: vec![],
+        });
+        let actions = rt.tick();
+
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. }));
+        assert!(reply.is_some(), "stats query should produce reply");
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            // 7 metrics × 8 bytes = 56 bytes
+            assert_eq!(payload.len(), 56);
+            // First metric is queries_served, should be 1
+            let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
+            assert_eq!(queries, 1);
+        }
+    }
+
+    #[test]
+    fn malformed_query_key_silently_dropped() {
+        let (mut rt, _) = make_runtime();
+        // Invalid CID hex (not 64 chars)
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 1,
+            key_expr: "harmony/content/a/not_valid_hex".into(),
+            payload: vec![],
+        });
+        // Should not panic, event is silently dropped
+        assert_eq!(rt.storage_queue_len(), 0);
+    }
+
+    #[test]
+    fn malformed_subscription_key_silently_dropped() {
+        let (mut rt, _) = make_runtime();
+        rt.push_event(RuntimeEvent::SubscriptionMessage {
+            key_expr: "harmony/content/transit/bad_hex".into(),
+            payload: vec![1, 2, 3],
+        });
+        assert_eq!(rt.storage_queue_len(), 0);
     }
 }
