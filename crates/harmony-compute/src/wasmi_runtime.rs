@@ -23,7 +23,6 @@ impl HostState {
 }
 
 /// A suspended WASM execution that can be resumed.
-#[allow(dead_code)] // HostTrap inner value used by resume_with_io() in a later task.
 enum PendingResumable {
     /// Execution ran out of fuel (cooperative yield).
     OutOfFuel(wasmi::TypedResumableCallOutOfFuel<i32>),
@@ -175,12 +174,16 @@ impl WasmiRuntime {
             Ok(wasmi::TypedResumableCall::HostTrap(pending)) => {
                 // Check HostState for an IO request placed by a host function.
                 if let Some(request) = ctx.store.data().io_request.clone() {
+                    let remaining_fuel = ctx.store.get_fuel().unwrap_or(0);
+                    let fuel_this_slice = ctx.fuel_budget.saturating_sub(remaining_fuel);
+                    let total_fuel = ctx.fuel_before + fuel_this_slice;
+
                     self.session = Some(WasmiSession {
                         store: ctx.store,
                         instance: ctx.instance,
                         module_hash: ctx.module_hash,
                         input_len: ctx.input_len,
-                        total_fuel_consumed: ctx.fuel_before,
+                        total_fuel_consumed: total_fuel,
                         pending: Some(PendingResumable::HostTrap(pending)),
                     });
                     ComputeResult::NeedsIO { request }
@@ -425,11 +428,114 @@ impl ComputeRuntime for WasmiRuntime {
 
     fn resume_with_io(
         &mut self,
-        _response: crate::types::IOResponse,
+        response: crate::types::IOResponse,
         budget: InstructionBudget,
     ) -> ComputeResult {
-        // Delegate to resume() for now — full I/O support is implemented in a later task.
-        self.resume(budget)
+        let mut session = match self.session.take() {
+            Some(s) => s,
+            None => {
+                return ComputeResult::Failed {
+                    error: ComputeError::NoPendingExecution,
+                };
+            }
+        };
+
+        let invocation = match session.pending.take() {
+            Some(PendingResumable::HostTrap(inv)) => inv,
+            Some(PendingResumable::OutOfFuel(_)) => {
+                self.session = Some(session);
+                return ComputeResult::Failed {
+                    error: ComputeError::NoPendingExecution,
+                };
+            }
+            None => {
+                self.session = Some(session);
+                return ComputeResult::Failed {
+                    error: ComputeError::NoPendingExecution,
+                };
+            }
+        };
+
+        // Read write target from HostState.
+        let (out_ptr, out_cap) = match session.store.data().io_write_target {
+            Some(target) => target,
+            None => {
+                return ComputeResult::Failed {
+                    error: ComputeError::Trap {
+                        reason: "resume_with_io: no write target stored".into(),
+                    },
+                };
+            }
+        };
+
+        // Determine return value and optionally write data to WASM memory.
+        let return_val: i32 = match &response {
+            crate::types::IOResponse::ContentReady { data } => {
+                if data.len() > out_cap as usize {
+                    -2 // buffer too small
+                } else {
+                    // Write data into WASM memory at out_ptr.
+                    let memory = match session.instance.get_memory(&session.store, "memory") {
+                        Some(mem) => mem,
+                        None => {
+                            return ComputeResult::Failed {
+                                error: ComputeError::ExportNotFound {
+                                    name: "memory".into(),
+                                },
+                            };
+                        }
+                    };
+                    if memory
+                        .write(&mut session.store, out_ptr as usize, data)
+                        .is_err()
+                    {
+                        return ComputeResult::Failed {
+                            error: ComputeError::MemoryTooSmall {
+                                need: out_ptr as usize + data.len(),
+                                have: memory.data_size(&session.store),
+                            },
+                        };
+                    }
+                    data.len() as i32
+                }
+            }
+            crate::types::IOResponse::ContentNotFound => -1,
+        };
+
+        // Clear the IO state from HostState.
+        let host = session.store.data_mut();
+        host.io_request = None;
+        host.io_write_target = None;
+
+        // Set fuel budget for the resumed execution.
+        if let Err(e) = session.store.set_fuel(budget.fuel) {
+            self.session = Some(session);
+            return ComputeResult::Failed {
+                error: ComputeError::Trap {
+                    reason: format!("failed to set fuel: {e}"),
+                },
+            };
+        }
+
+        let fuel_before = session.total_fuel_consumed;
+        let input_len = session.input_len;
+        let module_hash = session.module_hash;
+        let instance = session.instance;
+
+        // Resume the host trap with the return value.
+        let call_result = invocation.resume(&mut session.store, &[wasmi::Val::I32(return_val)]);
+
+        self.handle_call_result(
+            call_result,
+            ExecContext {
+                store: session.store,
+                instance,
+                module_hash,
+                input_len,
+                fuel_before,
+                fuel_budget: budget.fuel,
+            },
+        )
     }
 
     fn has_pending(&self) -> bool {
@@ -764,6 +870,154 @@ mod tests {
             rt.has_pending(),
             "should have pending execution after NeedsIO"
         );
+    }
+
+    #[test]
+    fn resume_with_content_ready() {
+        use crate::types::IOResponse;
+
+        let mut rt = WasmiRuntime::new();
+        let cid = [0xAB; 32];
+        let content = b"hello world";
+
+        // Execute — should get NeedsIO
+        let result = rt.execute(
+            FETCH_WAT.as_bytes(),
+            &cid,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(result, ComputeResult::NeedsIO { .. }));
+
+        // Resume with content
+        let result = rt.resume_with_io(
+            IOResponse::ContentReady {
+                data: content.to_vec(),
+            },
+            InstructionBudget { fuel: 1_000_000 },
+        );
+
+        match result {
+            ComputeResult::Complete { output } => {
+                // Output: [result_code: i32 LE] [data]
+                let result_code = i32::from_le_bytes(output[0..4].try_into().unwrap());
+                assert_eq!(result_code, content.len() as i32);
+                assert_eq!(&output[4..], content);
+            }
+            other => panic!("expected Complete, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_with_content_not_found() {
+        use crate::types::IOResponse;
+
+        let mut rt = WasmiRuntime::new();
+        let cid = [0xCD; 32];
+
+        let result = rt.execute(
+            FETCH_WAT.as_bytes(),
+            &cid,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(result, ComputeResult::NeedsIO { .. }));
+
+        let result = rt.resume_with_io(
+            IOResponse::ContentNotFound,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+
+        match result {
+            ComputeResult::Complete { output } => {
+                let result_code = i32::from_le_bytes(output[0..4].try_into().unwrap());
+                assert_eq!(result_code, -1, "content not found should return -1");
+            }
+            other => panic!("expected Complete, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_with_buffer_too_small() {
+        use crate::types::IOResponse;
+
+        // WAT with tiny buffer capacity (2 bytes)
+        let small_buf_wat = r#"
+            (module
+              (import "harmony" "fetch_content" (func $fetch (param i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (local.set $result
+                  (call $fetch
+                    (local.get $input_ptr)
+                    (i32.add (local.get $out_ptr) (i32.const 4))
+                    (i32.const 2)))
+                (i32.store (local.get $out_ptr) (local.get $result))
+                (i32.const 4)))
+        "#;
+
+        let mut rt = WasmiRuntime::new();
+        let cid = [0xEF; 32];
+
+        let result = rt.execute(
+            small_buf_wat.as_bytes(),
+            &cid,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(result, ComputeResult::NeedsIO { .. }));
+
+        // Content is 10 bytes, but buffer is only 2
+        let result = rt.resume_with_io(
+            IOResponse::ContentReady {
+                data: vec![0u8; 10],
+            },
+            InstructionBudget { fuel: 1_000_000 },
+        );
+
+        match result {
+            ComputeResult::Complete { output } => {
+                let result_code = i32::from_le_bytes(output[0..4].try_into().unwrap());
+                assert_eq!(result_code, -2, "buffer too small should return -2");
+            }
+            other => panic!("expected Complete, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_content_then_complete() {
+        use crate::types::{IORequest, IOResponse};
+
+        let mut rt = WasmiRuntime::new();
+        let cid = [0x42; 32];
+        let content = vec![10, 20, 30, 40, 50];
+
+        // Full cycle: execute → NeedsIO → resume_with_io → Complete
+        let result = rt.execute(
+            FETCH_WAT.as_bytes(),
+            &cid,
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(
+            matches!(result, ComputeResult::NeedsIO { request: IORequest::FetchContent { cid: c } } if c == cid)
+        );
+        assert!(rt.has_pending());
+
+        let result = rt.resume_with_io(
+            IOResponse::ContentReady {
+                data: content.clone(),
+            },
+            InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            ComputeResult::Complete { output } => {
+                let result_code = i32::from_le_bytes(output[0..4].try_into().unwrap());
+                assert_eq!(result_code, 5);
+                assert_eq!(&output[4..], &content);
+            }
+            other => panic!("expected Complete, got: {other:?}"),
+        }
+        assert!(!rt.has_pending());
     }
 
     #[test]
