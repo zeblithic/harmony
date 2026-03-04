@@ -47,15 +47,16 @@ gh pr view {number} --comments --json comments \
 gh pr view {number} --json commits \
   --jq '.commits[-1] | {sha: .oid, date: .committedDate}'
 
-# Reactions on trigger comments (thumbs-up = reviewer approved)
-# This is the primary approval signal for BOTH Bugbot and Greptile
+# Reactions on trigger comments (thumbs-up = reviewer COMPLETED, NOT "all clear")
 gh api repos/{owner}/{repo}/issues/{number}/comments \
   --jq '.[] | select(.body == "bugbot run" or .body == "@greptile") | {id: .id, body: .body, created: .created_at, reactions: .reactions}'
 ```
 
 **How each reviewer works:**
-- **Bugbot (`cursor[bot]`)**: Posts GitHub PR **reviews** (shows in reviews API). Signals approval via thumbs-up on "bugbot run" trigger comment.
-- **Greptile (`greptile-apps`)**: Posts PR **comments** (NOT reviews — won't appear in reviews API). Signals approval via thumbs-up on "@greptile" trigger comment.
+- **Bugbot (`cursor[bot]`)**: Posts GitHub PR **reviews** (shows in reviews API). Thumbs-up on "bugbot run" trigger means it finished — NOT that it found no issues.
+- **Greptile (`greptile-apps`)**: Posts PR **comments** (NOT reviews — won't appear in reviews API). Thumbs-up on "@greptile" trigger means it finished — NOT that it found no issues.
+
+**CRITICAL: Thumbs-up = "completed review", not "approved". You MUST read the actual review content to determine whether there are actionable issues.**
 
 ### 3. Determine review state
 
@@ -81,15 +82,35 @@ Apply these rules in order to determine the current state:
 
 **Action:** Report "Bugbot results are stale (commits pushed after last review). Need to re-trigger: `gh pr comment {number} --body 'bugbot run'`"
 
+#### When both reviewers have responded: READ the actual content
+
+**Before classifying as ALL_CLEAR or WITH_FEEDBACK, you MUST read the review content:**
+
+```bash
+# Bugbot's latest review body (may have inline comments too)
+gh api repos/{owner}/{repo}/pulls/{number}/reviews \
+  --jq '[.[] | select(.user.login == "cursor[bot]")] | last | .body'
+
+# Bugbot's inline review comments
+gh api repos/{owner}/{repo}/pulls/{number}/comments \
+  --jq '.[] | select(.user.login == "cursor[bot]") | {path: .path, body: .body[:300]}'
+
+# Greptile's latest comment body
+gh pr view {number} --comments --json comments \
+  --jq '[.comments[] | select(.author.login == "greptile-apps")] | last | .body'
+```
+
+**Scan both for:** suggestions, code changes, severity labels, "could"/"should"/"consider" language, ```suggestion blocks. Any actionable feedback = WITH_FEEDBACK.
+
 #### State: REVIEWS_COMPLETE_WITH_FEEDBACK
 
-**Condition:** Both `cursor[bot]` (via review) and `greptile-apps` (via comment) have responded newer than the latest push, AND at least one found issues.
+**Condition:** Both reviewers have responded newer than the latest push, AND the actual review content contains actionable suggestions, issues, or code changes.
 
-**Action:** Report the issues summary. Print: "Reviews complete with feedback. Fix issues locally, then push + re-trigger when ready. Safe to use `bd` commands during fix work."
+**Action:** Summarize the specific issues from BOTH reviewers. Print: "Reviews complete with feedback. Fix issues locally, then push + re-trigger when ready. Safe to use `bd` commands during fix work."
 
 #### State: REVIEWS_COMPLETE_ALL_CLEAR
 
-**Condition:** Both `cursor[bot]` (via review) and `greptile-apps` (via comment) have responded newer than the latest push, with no HIGH severity issues and/or thumbs-up reactions on trigger comments.
+**Condition:** Both reviewers have responded newer than the latest push, AND you have read the actual review content and confirmed it contains NO actionable suggestions or issues — only praise or acknowledgment.
 
 **Action:** Report: "All reviews passed. Ready for `/finishtask` to merge."
 
@@ -110,5 +131,7 @@ Greptile:  <pending|running|complete (N issues)|stale>
 State:     <REVIEWS_PENDING|BUGBOT_STUCK|REVIEWS_COMPLETE_WITH_FEEDBACK|REVIEWS_COMPLETE_ALL_CLEAR|PARTIAL_REVIEWS>
 Action:    <what to do next>
 ```
+
+If the state is REVIEWS_PENDING or PARTIAL_REVIEWS, suggest: "While waiting for reviews, this is a good time to `/compact` if context is getting long."
 
 **STOP HERE. Report the state and recommended action, then yield to the human.**

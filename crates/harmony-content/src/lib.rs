@@ -10,4 +10,5 @@ pub mod lru;
 pub mod sketch;
 
 pub mod reticulum_bridge;
+pub mod storage_tier;
 pub mod zenoh_bridge;

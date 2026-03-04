@@ -110,6 +110,63 @@ impl<S: BlobStore> ContentStore<S> {
         Some(data)
     }
 
+    /// Check whether a CID is tracked in the cache's LRU segments.
+    ///
+    /// Unlike [`BlobStore::contains`] (which checks the backing store and may
+    /// find data that W-TinyLFU rejected but `store_remove` didn't clean up),
+    /// this checks the actual admission state in window/probation/protected.
+    pub fn is_admitted(&self, cid: &ContentId) -> bool {
+        self.window.contains(cid)
+            || self.probation.contains(cid)
+            || self.protected.contains(cid)
+    }
+
+    /// Pre-store admission check for transit/opportunistic content.
+    ///
+    /// Returns `true` if the CID should be stored based on W-TinyLFU frequency
+    /// estimation. Always increments the sketch counter so repeated transits of
+    /// the same CID build frequency over time — even rejected items accumulate
+    /// popularity, making future admission more likely.
+    ///
+    /// This is separate from [`store`](BlobStore::store) because `store()`
+    /// unconditionally adds the item to the window segment. For transit content,
+    /// we want to reject cold items upfront rather than storing and announcing
+    /// them only for them to be immediately evicted.
+    pub fn should_admit(&mut self, cid: &ContentId) -> bool {
+        // Already in cache — always admit.
+        if self.window.contains(cid)
+            || self.probation.contains(cid)
+            || self.protected.contains(cid)
+        {
+            return true;
+        }
+
+        // Track popularity even for rejected items.
+        self.sketch.increment(cid);
+
+        // If probation has space, any new item can be admitted.
+        if self.probation.len() < self.probation.capacity() {
+            return true;
+        }
+
+        // Compare against probation's LRU victim.
+        let freq = self.sketch.estimate(cid);
+        match self.probation.peek_lru_excluding(&self.pinned) {
+            Some(victim) => freq > self.sketch.estimate(&victim),
+            None => true, // All pinned — admit by default.
+        }
+    }
+
+    /// Store data for a CID that was already checked by [`should_admit`].
+    ///
+    /// Skips the sketch increment in [`admit`] since `should_admit()` already
+    /// incremented it. Use this to avoid double-counting frequency for transit
+    /// content that goes through the pre-store admission check.
+    pub fn store_preadmitted(&mut self, cid: ContentId, data: Vec<u8>) {
+        self.store.store(cid, data);
+        self.admit(cid, true);
+    }
+
     /// Record an access for a CID already in the cache.
     ///
     /// Called by callers on cache hits to maintain frequency data and adjust
@@ -137,11 +194,13 @@ impl<S: BlobStore> ContentStore<S> {
 
     /// Record a CID in the cache metadata with full W-TinyLFU admission.
     ///
-    /// Increments the sketch frequency counter. If the CID is already tracked
-    /// in any segment, delegates to [`record_access`]. Otherwise inserts into
-    /// the window segment. If the window overflows, the evicted candidate
-    /// faces an admission challenge against the probation LRU victim.
-    fn admit(&mut self, cid: ContentId) {
+    /// Increments the sketch frequency counter (unless `skip_increment` is true,
+    /// indicating the caller already incremented via [`should_admit`]). If the
+    /// CID is already tracked in any segment, delegates to [`record_access`].
+    /// Otherwise inserts into the window segment. If the window overflows, the
+    /// evicted candidate faces an admission challenge against the probation LRU
+    /// victim.
+    fn admit(&mut self, cid: ContentId, skip_increment: bool) {
         // Already tracked — just update placement.
         if self.window.contains(&cid)
             || self.probation.contains(&cid)
@@ -151,8 +210,10 @@ impl<S: BlobStore> ContentStore<S> {
             return;
         }
 
-        // New CID — increment sketch once, then insert into window.
-        self.sketch.increment(&cid);
+        // New CID — increment sketch (unless pre-incremented by should_admit).
+        if !skip_increment {
+            self.sketch.increment(&cid);
+        }
         if let Some(candidate) = self.window.insert(cid) {
             // Window overflowed — run admission challenge.
             self.admission_challenge(candidate);
@@ -221,13 +282,13 @@ impl<S: BlobStore> ContentStore<S> {
 impl<S: BlobStore> BlobStore for ContentStore<S> {
     fn insert(&mut self, data: &[u8]) -> Result<ContentId, ContentError> {
         let cid = self.store.insert(data)?;
-        self.admit(cid);
+        self.admit(cid, false);
         Ok(cid)
     }
 
     fn store(&mut self, cid: ContentId, data: Vec<u8>) {
         self.store.store(cid, data);
-        self.admit(cid);
+        self.admit(cid, false);
     }
 
     fn get(&self, cid: &ContentId) -> Option<&[u8]> {
@@ -274,6 +335,75 @@ mod tests {
         // Miss returns None.
         let bogus = ContentId::for_blob(b"nonexistent").unwrap();
         assert_eq!(cs.get_and_record(&bogus), None);
+    }
+
+    #[test]
+    fn store_preadmitted_does_not_double_increment() {
+        // Verify that should_admit + store_preadmitted results in exactly
+        // one sketch increment, same as a plain store().
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 100);
+
+        let data_a = b"via-preadmitted";
+        let cid_a = ContentId::for_blob(data_a).unwrap();
+        assert!(cs.should_admit(&cid_a));
+        cs.store_preadmitted(cid_a, data_a.to_vec());
+        let freq_a = cs.sketch.estimate(&cid_a);
+
+        let data_b = b"via-plain-store";
+        let cid_b = ContentId::for_blob(data_b).unwrap();
+        cs.store(cid_b, data_b.to_vec());
+        let freq_b = cs.sketch.estimate(&cid_b);
+
+        assert_eq!(freq_a, freq_b, "preadmitted and plain store should have same frequency");
+    }
+
+    #[test]
+    fn should_admit_rejects_cold_item_against_hot_probation() {
+        // A cold CID (freq 1) should lose the admission check against
+        // hot probation items (freq 10+).
+        //
+        // Capacity 3: window=1, protected=0, probation=2.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 3);
+
+        // Fill probation: insert 3 items → window=1 + probation=2.
+        let hot_a = cs.insert(b"hot-a").unwrap();
+        let hot_b = cs.insert(b"hot-b").unwrap();
+        let _window_item = cs.insert(b"window").unwrap();
+
+        // Boost hot items' frequency (they stay in probation since protected=0).
+        for _ in 0..10 {
+            cs.record_access(&hot_a);
+            cs.record_access(&hot_b);
+        }
+
+        // Cold CID with no frequency history should be rejected.
+        let cold_cid = ContentId::for_blob(b"cold-newcomer").unwrap();
+        assert!(!cs.should_admit(&cold_cid), "cold CID should be rejected");
+
+        // But calling should_admit built some frequency. After enough calls,
+        // the CID should eventually be admitted.
+        for _ in 0..15 {
+            cs.should_admit(&cold_cid);
+        }
+        assert!(cs.should_admit(&cold_cid), "warmed-up CID should be admitted");
+    }
+
+    #[test]
+    fn is_admitted_reflects_lru_not_backing_store() {
+        // Verify that is_admitted checks LRU segments, not the backing store.
+        // A CID stored via the backing store directly won't appear in LRU.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 10);
+
+        // Store directly into backing store (bypassing admit).
+        let cid = ContentId::for_blob(b"test").unwrap();
+        cs.store.store(cid, b"test".to_vec());
+
+        // Backing store has it, but LRU segments don't.
+        assert!(cs.contains(&cid), "backing store has the data");
+        assert!(!cs.is_admitted(&cid), "LRU segments don't track it");
     }
 
     #[test]

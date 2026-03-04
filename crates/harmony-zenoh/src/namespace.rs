@@ -84,11 +84,9 @@ pub mod reticulum {
 
 /// Content storage key expressions.
 ///
-/// Note: `harmony-content/src/zenoh_bridge.rs` currently duplicates some of
-/// these constants (`HEX_PREFIXES`, shard patterns, announce keys). That
-/// crate doesn't depend on `harmony-zenoh`, so it can't import from here.
-/// The `StorageTier` wrapper (harmony-k5ed) will unify by having
-/// `harmony-content` depend on these canonical definitions.
+/// Canonical source for all content-tier Zenoh key patterns. The
+/// `harmony-content` crate depends on `harmony-zenoh` and re-exports
+/// these helpers via `zenoh_bridge` and `StorageTier`.
 pub mod content {
     /// Base prefix: `harmony/content`
     pub const PREFIX: &str = "harmony/content";

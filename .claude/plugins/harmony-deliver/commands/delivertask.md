@@ -102,5 +102,6 @@ gh pr comment <pr-number> --body "@greptile"
 > - Do NOT push or run `bd` commands — pushing cancels Bugbot.
 > - Use `/monitorreviews` to check review status.
 > - When reviews are complete and any feedback is addressed, use `/finishtask` to merge.
+> - **Good time to `/compact`** — reviews take a few minutes, reclaim context while waiting.
 
 **STOP HERE. Do not proceed further. The human will review and invoke `/finishtask` when ready.**

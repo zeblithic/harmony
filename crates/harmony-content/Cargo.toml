@@ -11,3 +11,4 @@ description = "Content-addressed storage primitives for the Harmony decentralize
 harmony-crypto.workspace = true
 thiserror.workspace = true
 hex = { workspace = true }
+harmony-zenoh.workspace = true
