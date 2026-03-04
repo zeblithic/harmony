@@ -486,10 +486,15 @@ impl<B: BlobStore> NodeRuntime<B> {
                     // arrive via ModuleFetchResponse already.
                     out.push(RuntimeAction::FetchContent { cid });
                 }
-                WorkflowAction::PersistHistory { workflow_id } => {
-                    // Future: persist history via Zenoh before compacting.
-                    // Compact after persist to preserve history for crash recovery.
-                    self.workflow.compact_workflow(&workflow_id);
+                WorkflowAction::PersistHistory { workflow_id: _workflow_id } => {
+                    // TODO: Persist history (e.g., via Zenoh PUT or write-ahead log)
+                    // BEFORE compacting. compact_workflow() clears replay_cache,
+                    // saved_session, and module_bytes — after compaction, crash
+                    // recovery via deterministic replay is impossible.
+                    //
+                    // Compaction is intentionally deferred until persistence is
+                    // implemented. Until then, workflows retain their full
+                    // in-memory state at the cost of higher memory usage.
                 }
             }
         }
