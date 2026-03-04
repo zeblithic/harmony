@@ -156,7 +156,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("  Compute budget:   {compute_budget} fuel/tick");
             println!("  Router queue:     {} pending", rt.router_queue_len());
             println!("  Storage queue:    {} pending", rt.storage_queue_len());
-            println!("  Compute queue:    {} pending", rt.compute_queue_len());
+            println!("  Compute queue:    {} tracked", rt.compute_queue_len());
             println!("\nStartup actions:");
             for action in &startup_actions {
                 match action {
