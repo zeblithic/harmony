@@ -1,1 +1,2 @@
-// WorkflowEngine state machine — implemented in Task 4.
+/// Sans-I/O workflow engine -- implemented in Task 3.
+pub struct WorkflowEngine;
