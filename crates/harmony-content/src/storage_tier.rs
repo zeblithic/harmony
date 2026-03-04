@@ -163,7 +163,9 @@ impl<B: BlobStore> StorageTier<B> {
             self.metrics.transit_rejected += 1;
             return vec![];
         }
-        self.cache.store(cid, data);
+        // Use store_preadmitted to avoid double-incrementing the sketch
+        // counter (should_admit already incremented it).
+        self.cache.store_preadmitted(cid, data);
         self.metrics.transit_admitted += 1;
         vec![self.make_announce_action(&cid)]
     }
@@ -181,12 +183,12 @@ impl<B: BlobStore> StorageTier<B> {
         vec![self.make_announce_action(&cid)]
     }
 
-    /// Verify that a CID actually matches the hash of the data.
+    /// Verify that a CID's hash matches the hash of the data.
+    ///
+    /// Uses hash-only comparison so it works for all content types
+    /// (blobs, bundles, inline metadata), not just blobs.
     fn verify_cid(cid: &ContentId, data: &[u8]) -> bool {
-        match ContentId::for_blob(data) {
-            Ok(computed) => computed == *cid,
-            Err(_) => false, // e.g., data too large
-        }
+        cid.verify_hash(data)
     }
 
     /// Build an AnnounceContent action for a stored CID.
@@ -449,6 +451,32 @@ mod tests {
             rejected_before + 1,
             "transit_rejected should increase for rejected item"
         );
+    }
+
+    #[test]
+    fn transit_admits_bundle_content() {
+        // Bundle CIDs have a different type tag than blobs. Verify that
+        // transit handles bundles correctly (hash-only verification).
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+
+        let blob_a = ContentId::for_blob(b"child-a").unwrap();
+        let blob_b = ContentId::for_blob(b"child-b").unwrap();
+        let children = [blob_a, blob_b];
+        let bundle_bytes: Vec<u8> = children.iter().flat_map(|c| c.to_bytes()).collect();
+        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &children).unwrap();
+
+        let actions = tier.handle(StorageTierEvent::TransitContent {
+            cid: bundle_cid,
+            data: bundle_bytes,
+        });
+
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], StorageTierAction::AnnounceContent { .. }));
+        assert_eq!(tier.metrics().transit_admitted, 1);
     }
 
     #[test]

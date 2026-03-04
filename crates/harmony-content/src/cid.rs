@@ -46,6 +46,15 @@ impl ContentId {
         cid_type
     }
 
+    /// Verify that this CID's hash matches the hash of the given data.
+    ///
+    /// Only checks the truncated SHA-256 hash, not the type tag or size,
+    /// so this works for blobs, bundles, and any other content type.
+    pub fn verify_hash(&self, data: &[u8]) -> bool {
+        let full = harmony_crypto::hash::full_hash(data);
+        self.hash == full[..CONTENT_HASH_LEN]
+    }
+
     /// Create a CID for a raw data blob.
     pub fn for_blob(data: &[u8]) -> Result<Self, ContentError> {
         if data.len() > MAX_PAYLOAD_SIZE {
@@ -681,6 +690,31 @@ mod tests {
         let cid = ContentId::for_blob(data).unwrap();
         let full = harmony_crypto::hash::full_hash(data);
         assert_eq!(&cid.hash, &full[..CONTENT_HASH_LEN]);
+    }
+
+    #[test]
+    fn verify_hash_matches_for_blob() {
+        let data = b"verify this";
+        let cid = ContentId::for_blob(data).unwrap();
+        assert!(cid.verify_hash(data));
+        assert!(!cid.verify_hash(b"wrong data"));
+    }
+
+    #[test]
+    fn verify_hash_matches_for_bundle() {
+        // Bundle CID has a different type tag than blob, but verify_hash
+        // should still pass because it only checks the hash portion.
+        let blob_a = ContentId::for_blob(b"child-a").unwrap();
+        let blob_b = ContentId::for_blob(b"child-b").unwrap();
+        let children = [blob_a, blob_b];
+        let bundle_bytes: Vec<u8> = children.iter().flat_map(|c| c.to_bytes()).collect();
+        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &children).unwrap();
+
+        assert!(bundle_cid.verify_hash(&bundle_bytes));
+        assert!(!bundle_cid.verify_hash(b"wrong data"));
+
+        // Confirm it's actually a bundle type, not blob.
+        assert_ne!(bundle_cid.cid_type(), CidType::Blob);
     }
 
     #[test]
