@@ -452,6 +452,8 @@ impl<B: BlobStore> NodeRuntime<B> {
                             });
                         }
                     }
+                    // Clean up engine state to prevent unbounded memory growth.
+                    self.workflow.remove_workflow(&workflow_id);
                 }
                 WorkflowAction::WorkflowFailed { workflow_id, error } => {
                     if let Some(query_ids) = self.workflow_to_query.remove(&workflow_id) {
@@ -464,6 +466,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                             });
                         }
                     }
+                    self.workflow.remove_workflow(&workflow_id);
                 }
                 WorkflowAction::FetchContent { cid, .. } => {
                     out.push(RuntimeAction::FetchContent { cid });

@@ -171,6 +171,22 @@ impl WorkflowEngine {
         self.workflows.len()
     }
 
+    /// Remove a completed or failed workflow from the engine.
+    ///
+    /// Returns `true` if the workflow was removed. Only removes workflows in
+    /// terminal states (`Complete` or `Failed`) — active workflows are not
+    /// removable. The caller should invoke this after persisting the history
+    /// and dispatching all replies to prevent unbounded memory growth.
+    pub fn remove_workflow(&mut self, id: &WorkflowId) -> bool {
+        match self.workflows.get(id).map(|s| &s.status) {
+            Some(WorkflowStatus::Complete | WorkflowStatus::Failed) => {
+                self.workflows.remove(id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Recover a workflow from a persisted history.
     ///
     /// Re-submits the module for execution. During replay, if `fetch_content`
@@ -320,12 +336,15 @@ impl WorkflowEngine {
         self.active = Some(first);
 
         // Defer remaining workflows: store IO response for tick() to resume.
+        // Set status to Executing so find_all_waiting_for_io won't rediscover
+        // them if a duplicate ContentFetched arrives for the same CID.
         for &wf_id in &waiting[1..] {
             if let Some(state) = self.workflows.get_mut(&wf_id) {
                 state.history.events.push(HistoryEvent::IoResolved {
                     cid,
                     data: Some(data.clone()),
                 });
+                state.status = WorkflowStatus::Executing;
                 state.deferred_io = Some(IOResponse::ContentReady { data: data.clone() });
                 self.deferred_resume_queue.push_back(wf_id);
             }
@@ -357,13 +376,14 @@ impl WorkflowEngine {
         self.runtime.restore_session(saved_session);
         self.active = Some(first);
 
-        // Defer remaining workflows.
+        // Defer remaining workflows (set Executing to avoid rediscovery).
         for &wf_id in &waiting[1..] {
             if let Some(state) = self.workflows.get_mut(&wf_id) {
                 state
                     .history
                     .events
                     .push(HistoryEvent::IoResolved { cid, data: None });
+                state.status = WorkflowStatus::Executing;
                 state.deferred_io = Some(IOResponse::ContentNotFound);
                 self.deferred_resume_queue.push_back(wf_id);
             }
