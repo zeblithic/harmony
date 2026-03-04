@@ -24,6 +24,15 @@ pub enum IORequest {
     FetchContent { cid: [u8; 32] },
 }
 
+/// Response to an I/O request, provided by the caller after resolving externally.
+#[derive(Debug, Clone)]
+pub enum IOResponse {
+    /// Content was found and is ready.
+    ContentReady { data: Vec<u8> },
+    /// Content was not found.
+    ContentNotFound,
+}
+
 /// Result of executing a WASM computation slice.
 #[derive(Debug)]
 pub enum ComputeResult {
@@ -103,5 +112,19 @@ mod tests {
             error: ComputeError::NoPendingExecution,
         };
         assert!(matches!(result, ComputeResult::Failed { .. }));
+    }
+
+    #[test]
+    fn io_response_content_ready() {
+        let resp = IOResponse::ContentReady {
+            data: vec![1, 2, 3],
+        };
+        assert!(matches!(resp, IOResponse::ContentReady { data } if data == vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn io_response_content_not_found() {
+        let resp = IOResponse::ContentNotFound;
+        assert!(matches!(resp, IOResponse::ContentNotFound));
     }
 }

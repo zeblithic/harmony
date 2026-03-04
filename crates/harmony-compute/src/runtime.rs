@@ -18,8 +18,29 @@ pub trait ComputeRuntime {
     /// Resume a previously yielded execution with additional fuel.
     fn resume(&mut self, budget: InstructionBudget) -> ComputeResult;
 
+    /// Resume a suspended execution that was waiting for I/O, providing the response.
+    fn resume_with_io(
+        &mut self,
+        response: crate::types::IOResponse,
+        budget: InstructionBudget,
+    ) -> ComputeResult;
+
     /// Whether there is a suspended execution that can be resumed.
     fn has_pending(&self) -> bool;
+
+    /// Extract the current session state for external storage.
+    ///
+    /// Used by the compute tier to save a suspended task's execution state
+    /// before starting another task (since the runtime has a single session slot).
+    /// Returns `None` if no session exists.
+    fn take_session(&mut self) -> Option<Box<dyn std::any::Any>>;
+
+    /// Restore a previously extracted session state.
+    ///
+    /// Must be called before `resume()` or `resume_with_io()` on a task
+    /// whose session was previously extracted with `take_session()`.
+    /// Panics if the boxed type doesn't match the runtime's session type.
+    fn restore_session(&mut self, session: Box<dyn std::any::Any>);
 
     /// Take a serializable snapshot of the current execution state.
     fn snapshot(&self) -> Result<Checkpoint, ComputeError>;
@@ -49,9 +70,25 @@ mod tests {
             }
         }
 
+        fn resume_with_io(
+            &mut self,
+            _response: crate::types::IOResponse,
+            _budget: InstructionBudget,
+        ) -> ComputeResult {
+            ComputeResult::Failed {
+                error: ComputeError::NoPendingExecution,
+            }
+        }
+
         fn has_pending(&self) -> bool {
             false
         }
+
+        fn take_session(&mut self) -> Option<Box<dyn std::any::Any>> {
+            None
+        }
+
+        fn restore_session(&mut self, _session: Box<dyn std::any::Any>) {}
 
         fn snapshot(&self) -> Result<Checkpoint, ComputeError> {
             Err(ComputeError::NoPendingExecution)
@@ -69,5 +106,20 @@ mod tests {
     fn mock_runtime_has_no_pending() {
         let rt = MockRuntime;
         assert!(!rt.has_pending());
+    }
+
+    #[test]
+    fn mock_runtime_resume_with_io() {
+        let mut rt = MockRuntime;
+        let result = rt.resume_with_io(
+            crate::types::IOResponse::ContentNotFound,
+            InstructionBudget { fuel: 1000 },
+        );
+        assert!(matches!(
+            result,
+            ComputeResult::Failed {
+                error: ComputeError::NoPendingExecution
+            }
+        ));
     }
 }
