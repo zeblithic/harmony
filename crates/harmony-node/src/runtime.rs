@@ -25,6 +25,50 @@ pub struct NodeConfig {
     pub storage_budget: StorageBudget,
     /// Compute tier per-slice instruction budget.
     pub compute_budget: InstructionBudget,
+    /// Per-tick scheduling strategy for the three-tier event loop.
+    pub schedule: TierSchedule,
+}
+
+/// Per-tick scheduling strategy for the three-tier event loop.
+#[derive(Debug, Clone)]
+pub struct TierSchedule {
+    /// Max router events to process per tick. `None` = drain all.
+    pub router_max_per_tick: Option<usize>,
+    /// Max storage events to process per tick. `None` = drain all.
+    pub storage_max_per_tick: Option<usize>,
+    /// Adaptive compute fuel scaling under data-plane load.
+    pub adaptive_compute: AdaptiveCompute,
+    /// Ticks without processing before a tier is promoted in tick order.
+    pub starvation_threshold: u32,
+}
+
+/// Controls how compute fuel scales with data-plane queue depth.
+#[derive(Debug, Clone)]
+pub struct AdaptiveCompute {
+    /// Combined router+storage queue depth at which fuel starts shrinking.
+    pub high_water: usize,
+    /// Minimum fuel as fraction of base budget (0.0..=1.0).
+    pub floor_fraction: f64,
+}
+
+impl Default for TierSchedule {
+    fn default() -> Self {
+        Self {
+            router_max_per_tick: None,
+            storage_max_per_tick: None,
+            adaptive_compute: AdaptiveCompute::default(),
+            starvation_threshold: 10,
+        }
+    }
+}
+
+impl Default for AdaptiveCompute {
+    fn default() -> Self {
+        Self {
+            high_water: 50,
+            floor_fraction: 0.1,
+        }
+    }
 }
 
 impl Default for NodeConfig {
@@ -35,6 +79,7 @@ impl Default for NodeConfig {
                 max_pinned_bytes: 100_000_000,
             },
             compute_budget: InstructionBudget { fuel: 100_000 },
+            schedule: TierSchedule::default(),
         }
     }
 }
@@ -683,6 +728,16 @@ mod tests {
         let config = NodeConfig::default();
         assert_eq!(config.storage_budget.cache_capacity, 1024);
         assert_eq!(config.compute_budget.fuel, 100_000);
+    }
+
+    #[test]
+    fn tier_schedule_defaults() {
+        let schedule = TierSchedule::default();
+        assert!(schedule.router_max_per_tick.is_none());
+        assert!(schedule.storage_max_per_tick.is_none());
+        assert_eq!(schedule.starvation_threshold, 10);
+        assert_eq!(schedule.adaptive_compute.high_water, 50);
+        assert!((schedule.adaptive_compute.floor_fraction - 0.1).abs() < f64::EPSILON);
     }
 
     use harmony_content::blob::MemoryBlobStore;
