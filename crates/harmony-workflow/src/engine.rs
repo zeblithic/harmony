@@ -243,10 +243,10 @@ impl WorkflowEngine {
 
         let state = self.workflows.get_mut(&wf_id).expect("workflow must exist");
 
-        state.history.events.push(HistoryEvent::IoResolved {
-            cid,
-            data: None,
-        });
+        state
+            .history
+            .events
+            .push(HistoryEvent::IoResolved { cid, data: None });
 
         let saved_session = state
             .saved_session
@@ -309,14 +309,12 @@ impl WorkflowEngine {
                         });
                         // Resume execution with cached data.
                         let result = match cached_data {
-                            Some(data) => self.runtime.resume_with_io(
-                                IOResponse::ContentReady { data },
-                                self.budget,
-                            ),
-                            None => self.runtime.resume_with_io(
-                                IOResponse::ContentNotFound,
-                                self.budget,
-                            ),
+                            Some(data) => self
+                                .runtime
+                                .resume_with_io(IOResponse::ContentReady { data }, self.budget),
+                            None => self
+                                .runtime
+                                .resume_with_io(IOResponse::ContentNotFound, self.budget),
                         };
                         return self.handle_compute_result(wf_id, result);
                     }
@@ -607,9 +605,7 @@ mod tests {
         // History should have IoRequested.
         let history = engine.take_history(&wf_id).expect("history should exist");
         assert_eq!(history.events.len(), 1);
-        assert!(
-            matches!(&history.events[0], HistoryEvent::IoRequested { cid: c } if *c == cid)
-        );
+        assert!(matches!(&history.events[0], HistoryEvent::IoRequested { cid: c } if *c == cid));
     }
 
     #[test]
@@ -682,9 +678,7 @@ mod tests {
         let history = engine.take_history(&wf_id).expect("history should exist");
         assert_eq!(history.events.len(), 2);
 
-        assert!(
-            matches!(&history.events[0], HistoryEvent::IoRequested { cid: c } if *c == cid)
-        );
+        assert!(matches!(&history.events[0], HistoryEvent::IoRequested { cid: c } if *c == cid));
         assert!(
             matches!(&history.events[1], HistoryEvent::IoResolved { cid: c, data: Some(d) } if *c == cid && *d == content)
         );

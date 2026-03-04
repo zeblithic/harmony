@@ -17,8 +17,10 @@ path = "src/main.rs"
 [dependencies]
 harmony-compute.workspace = true
 harmony-content.workspace = true
+harmony-crypto.workspace = true
 harmony-identity = { path = "../harmony-identity" }
 harmony-reticulum.workspace = true
+harmony-workflow.workspace = true
 harmony-zenoh.workspace = true
 clap = { version = "4", features = ["derive"] }
 hex.workspace = true

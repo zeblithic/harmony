@@ -2,6 +2,13 @@
 //!
 //! Accepts [`ComputeTierEvent`]s, enqueues compute tasks, and returns
 //! [`ComputeTierAction`]s for the caller to execute (send replies, fetch modules).
+//!
+//! NOTE: `NodeRuntime` now delegates to `harmony_workflow::WorkflowEngine` instead
+//! of using `ComputeTier` directly. This module is retained for its own unit tests
+//! and the WAT test constants referenced by runtime integration tests.
+
+// Non-test items are used only by this module's own #[cfg(test)] tests.
+#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -176,14 +183,10 @@ impl ComputeTier {
                         ComputeTask::WaitingForModule {
                             cid: c, query_id, ..
                         } if c == cid => {
-                            let error_msg =
-                                format!("module not found: {}", hex::encode(cid));
+                            let error_msg = format!("module not found: {}", hex::encode(cid));
                             let mut payload = vec![0x01];
                             payload.extend_from_slice(error_msg.as_bytes());
-                            actions.push(ComputeTierAction::SendReply {
-                                query_id,
-                                payload,
-                            });
+                            actions.push(ComputeTierAction::SendReply { query_id, payload });
                         }
                         other => self.queue.push_back(other),
                     }
@@ -192,9 +195,9 @@ impl ComputeTier {
             }
             ComputeTierEvent::ContentFetched { cid, data } => {
                 // Find the WaitingForContent task matching this CID.
-                let pos = self.queue.iter().position(|t| {
-                    matches!(t, ComputeTask::WaitingForContent { cid: c, .. } if *c == cid)
-                });
+                let pos = self.queue.iter().position(
+                    |t| matches!(t, ComputeTask::WaitingForContent { cid: c, .. } if *c == cid),
+                );
                 let Some(pos) = pos else {
                     return Vec::new(); // No matching task — drop silently.
                 };
@@ -217,9 +220,9 @@ impl ComputeTier {
                 self.handle_compute_result(result)
             }
             ComputeTierEvent::ContentFetchFailed { cid } => {
-                let pos = self.queue.iter().position(|t| {
-                    matches!(t, ComputeTask::WaitingForContent { cid: c, .. } if *c == cid)
-                });
+                let pos = self.queue.iter().position(
+                    |t| matches!(t, ComputeTask::WaitingForContent { cid: c, .. } if *c == cid),
+                );
                 let Some(pos) = pos else {
                     return Vec::new();
                 };
@@ -235,10 +238,9 @@ impl ComputeTier {
                 // Restore the saved session before resuming.
                 self.runtime.restore_session(saved_session);
                 self.active = Some(ActiveExecution { query_id });
-                let result = self.runtime.resume_with_io(
-                    harmony_compute::IOResponse::ContentNotFound,
-                    self.budget,
-                );
+                let result = self
+                    .runtime
+                    .resume_with_io(harmony_compute::IOResponse::ContentNotFound, self.budget);
                 self.handle_compute_result(result)
             }
         }
@@ -715,11 +717,17 @@ pub(crate) mod tests {
         // Tick twice — both should complete.
         let a1 = tier.tick();
         assert_eq!(a1.len(), 1);
-        assert!(matches!(&a1[0], ComputeTierAction::SendReply { query_id: 60, .. }));
+        assert!(matches!(
+            &a1[0],
+            ComputeTierAction::SendReply { query_id: 60, .. }
+        ));
 
         let a2 = tier.tick();
         assert_eq!(a2.len(), 1);
-        assert!(matches!(&a2[0], ComputeTierAction::SendReply { query_id: 61, .. }));
+        assert!(matches!(
+            &a2[0],
+            ComputeTierAction::SendReply { query_id: 61, .. }
+        ));
     }
 
     #[test]
@@ -743,8 +751,12 @@ pub(crate) mod tests {
         // Signal fetch failure — both should get errors.
         let actions = tier.handle(ComputeTierEvent::ModuleFetchFailed { cid });
         assert_eq!(actions.len(), 2);
-        assert!(matches!(&actions[0], ComputeTierAction::SendReply { query_id: 70, payload } if payload[0] == 0x01));
-        assert!(matches!(&actions[1], ComputeTierAction::SendReply { query_id: 71, payload } if payload[0] == 0x01));
+        assert!(
+            matches!(&actions[0], ComputeTierAction::SendReply { query_id: 70, payload } if payload[0] == 0x01)
+        );
+        assert!(
+            matches!(&actions[1], ComputeTierAction::SendReply { query_id: 71, payload } if payload[0] == 0x01)
+        );
         assert_eq!(tier.queue_len(), 0);
     }
 
@@ -808,7 +820,10 @@ pub(crate) mod tests {
 
         let actions = tier.tick();
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], ComputeTierAction::FetchContent { .. }));
+        assert!(matches!(
+            &actions[0],
+            ComputeTierAction::FetchContent { .. }
+        ));
 
         let actions = tier.handle(ComputeTierEvent::ContentFetched {
             cid,
@@ -877,7 +892,10 @@ pub(crate) mod tests {
 
         // First tick: executes fetch module → NeedsIO → WaitingForContent.
         let actions = tier.tick();
-        assert!(matches!(&actions[0], ComputeTierAction::FetchContent { .. }));
+        assert!(matches!(
+            &actions[0],
+            ComputeTierAction::FetchContent { .. }
+        ));
         assert!(!tier.has_active());
 
         // Second tick: should skip WaitingForContent and execute the add module.
@@ -923,10 +941,7 @@ pub(crate) mod tests {
         let actions = tier.tick();
         assert!(matches!(
             &actions[0],
-            ComputeTierAction::FetchContent {
-                query_id: 120,
-                ..
-            }
+            ComputeTierAction::FetchContent { query_id: 120, .. }
         ));
 
         // Tick 2: Task B executes → completes (this would have destroyed
@@ -935,10 +950,7 @@ pub(crate) mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            ComputeTierAction::SendReply {
-                query_id: 121,
-                ..
-            }
+            ComputeTierAction::SendReply { query_id: 121, .. }
         ));
 
         // Now deliver content for Task A — it must resume successfully.
