@@ -71,8 +71,13 @@ enum ComputeTask {
         input: Vec<u8>,
     },
     /// Execution suspended waiting for content to be fetched.
-    /// The execution state lives in WasmiRuntime.session (HostTrap pending).
-    WaitingForContent { query_id: u64, cid: [u8; 32] },
+    /// The saved session holds the HostTrap pending invocation, extracted from
+    /// the runtime so that other tasks can execute without clobbering it.
+    WaitingForContent {
+        query_id: u64,
+        cid: [u8; 32],
+        saved_session: Box<dyn std::any::Any>,
+    },
 }
 
 /// Tracks the currently executing computation.
@@ -193,13 +198,17 @@ impl ComputeTier {
                 let Some(pos) = pos else {
                     return Vec::new(); // No matching task — drop silently.
                 };
-                let Some(ComputeTask::WaitingForContent { query_id, .. }) =
-                    self.queue.remove(pos)
+                let Some(ComputeTask::WaitingForContent {
+                    query_id,
+                    saved_session,
+                    ..
+                }) = self.queue.remove(pos)
                 else {
                     return Vec::new();
                 };
 
-                // Resume the runtime with the fetched content.
+                // Restore the saved session before resuming.
+                self.runtime.restore_session(saved_session);
                 self.active = Some(ActiveExecution { query_id });
                 let result = self.runtime.resume_with_io(
                     harmony_compute::IOResponse::ContentReady { data },
@@ -214,13 +223,17 @@ impl ComputeTier {
                 let Some(pos) = pos else {
                     return Vec::new();
                 };
-                let Some(ComputeTask::WaitingForContent { query_id, .. }) =
-                    self.queue.remove(pos)
+                let Some(ComputeTask::WaitingForContent {
+                    query_id,
+                    saved_session,
+                    ..
+                }) = self.queue.remove(pos)
                 else {
                     return Vec::new();
                 };
 
-                // Resume with ContentNotFound — the module will see -1.
+                // Restore the saved session before resuming.
+                self.runtime.restore_session(saved_session);
                 self.active = Some(ActiveExecution { query_id });
                 let result = self.runtime.resume_with_io(
                     harmony_compute::IOResponse::ContentNotFound,
@@ -309,9 +322,16 @@ impl ComputeTier {
             ComputeResult::NeedsIO { request } => {
                 match request {
                     harmony_compute::IORequest::FetchContent { cid } => {
+                        // Extract the session from the runtime so another task can
+                        // execute without clobbering the HostTrap continuation.
+                        let saved_session = self
+                            .runtime
+                            .take_session()
+                            .expect("NeedsIO implies active session");
                         self.queue.push_back(ComputeTask::WaitingForContent {
                             query_id,
                             cid,
+                            saved_session,
                         });
                         self.active = None;
                         vec![ComputeTierAction::FetchContent { query_id, cid }]
@@ -864,6 +884,72 @@ pub(crate) mod tests {
             assert_eq!(sum, 10);
         } else {
             panic!("expected add result, got: {actions:?}");
+        }
+    }
+
+    /// Regression test: executing another task must NOT destroy a NeedsIO task's
+    /// suspended session state. The saved session is extracted from the runtime
+    /// on NeedsIO and restored before resume_with_io.
+    #[test]
+    fn needs_io_session_survives_other_task_execution() {
+        let mut tier = make_tier();
+        let cid = [0x22; 32];
+        let content = b"hello from storage";
+
+        // Task A: fetch_content module — will suspend on NeedsIO.
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 120,
+            module: FETCH_WAT.as_bytes().to_vec(),
+            input: cid.to_vec(),
+        });
+
+        // Task B: simple add module.
+        let mut input_b = Vec::new();
+        input_b.extend_from_slice(&1i32.to_le_bytes());
+        input_b.extend_from_slice(&2i32.to_le_bytes());
+        tier.handle(ComputeTierEvent::ExecuteInline {
+            query_id: 121,
+            module: ADD_WAT.as_bytes().to_vec(),
+            input: input_b,
+        });
+
+        // Tick 1: Task A executes → NeedsIO → WaitingForContent.
+        let actions = tier.tick();
+        assert!(matches!(
+            &actions[0],
+            ComputeTierAction::FetchContent {
+                query_id: 120,
+                ..
+            }
+        ));
+
+        // Tick 2: Task B executes → completes (this would have destroyed
+        // Task A's session before the fix).
+        let actions = tier.tick();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            ComputeTierAction::SendReply {
+                query_id: 121,
+                ..
+            }
+        ));
+
+        // Now deliver content for Task A — it must resume successfully.
+        let actions = tier.handle(ComputeTierEvent::ContentFetched {
+            cid,
+            data: content.to_vec(),
+        });
+
+        assert_eq!(actions.len(), 1);
+        if let ComputeTierAction::SendReply { query_id, payload } = &actions[0] {
+            assert_eq!(*query_id, 120);
+            assert_eq!(payload[0], 0x00, "success tag");
+            let result_code = i32::from_le_bytes(payload[1..5].try_into().unwrap());
+            assert_eq!(result_code, content.len() as i32);
+            assert_eq!(&payload[5..], content);
+        } else {
+            panic!("expected SendReply for task A, got: {actions:?}");
         }
     }
 }

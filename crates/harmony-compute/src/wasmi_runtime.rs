@@ -549,6 +549,20 @@ impl ComputeRuntime for WasmiRuntime {
         self.session.as_ref().is_some_and(|s| s.pending.is_some())
     }
 
+    fn take_session(&mut self) -> Option<Box<dyn std::any::Any>> {
+        self.session
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::any::Any>)
+    }
+
+    fn restore_session(&mut self, session: Box<dyn std::any::Any>) {
+        self.session = Some(
+            *session
+                .downcast::<WasmiSession>()
+                .expect("restore_session: type mismatch — expected WasmiSession"),
+        );
+    }
+
     fn snapshot(&self) -> Result<Checkpoint, ComputeError> {
         let session = self
             .session
