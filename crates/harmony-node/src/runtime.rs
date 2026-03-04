@@ -109,12 +109,13 @@ impl<B: BlobStore> NodeRuntime<B> {
             match action {
                 StorageTierAction::DeclareQueryables { key_exprs } => {
                     for key_expr in &key_exprs {
-                        if let Ok((qid, _qactions)) = queryable_router.declare(key_expr) {
-                            storage_queryable_ids.insert(qid);
-                            actions.push(RuntimeAction::DeclareQueryable {
-                                key_expr: key_expr.clone(),
-                            });
-                        }
+                        let (qid, _qactions) = queryable_router
+                            .declare(key_expr)
+                            .expect("static key expression must be valid");
+                        storage_queryable_ids.insert(qid);
+                        actions.push(RuntimeAction::DeclareQueryable {
+                            key_expr: key_expr.clone(),
+                        });
                     }
                 }
                 StorageTierAction::DeclareSubscribers { key_exprs } => {
