@@ -18,6 +18,13 @@ pub trait ComputeRuntime {
     /// Resume a previously yielded execution with additional fuel.
     fn resume(&mut self, budget: InstructionBudget) -> ComputeResult;
 
+    /// Resume a suspended execution that was waiting for I/O, providing the response.
+    fn resume_with_io(
+        &mut self,
+        response: crate::types::IOResponse,
+        budget: InstructionBudget,
+    ) -> ComputeResult;
+
     /// Whether there is a suspended execution that can be resumed.
     fn has_pending(&self) -> bool;
 
@@ -49,6 +56,16 @@ mod tests {
             }
         }
 
+        fn resume_with_io(
+            &mut self,
+            _response: crate::types::IOResponse,
+            _budget: InstructionBudget,
+        ) -> ComputeResult {
+            ComputeResult::Failed {
+                error: ComputeError::NoPendingExecution,
+            }
+        }
+
         fn has_pending(&self) -> bool {
             false
         }
@@ -69,5 +86,20 @@ mod tests {
     fn mock_runtime_has_no_pending() {
         let rt = MockRuntime;
         assert!(!rt.has_pending());
+    }
+
+    #[test]
+    fn mock_runtime_resume_with_io() {
+        let mut rt = MockRuntime;
+        let result = rt.resume_with_io(
+            crate::types::IOResponse::ContentNotFound,
+            InstructionBudget { fuel: 1000 },
+        );
+        assert!(matches!(
+            result,
+            ComputeResult::Failed {
+                error: ComputeError::NoPendingExecution
+            }
+        ));
     }
 }

@@ -342,6 +342,15 @@ impl ComputeRuntime for WasmiRuntime {
         )
     }
 
+    fn resume_with_io(
+        &mut self,
+        _response: crate::types::IOResponse,
+        budget: InstructionBudget,
+    ) -> ComputeResult {
+        // Delegate to resume() for now — full I/O support is implemented in a later task.
+        self.resume(budget)
+    }
+
     fn has_pending(&self) -> bool {
         self.session.as_ref().is_some_and(|s| s.pending.is_some())
     }
