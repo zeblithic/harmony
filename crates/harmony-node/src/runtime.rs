@@ -147,10 +147,18 @@ pub enum RuntimeAction {
 /// Sans-I/O node runtime wiring Tier 1 (Router), Tier 2 (Storage), and Tier 3 (Compute).
 ///
 /// Events are pushed via [`push_event`](Self::push_event) into internal
-/// priority queues. Each [`tick`](Self::tick) drains ALL Tier 1 events,
-/// then drains ALL Tier 2 events, then runs one Tier 3 compute slice —
-/// information flow (router + storage) is never starved, and compute
-/// gets whatever budget remains after the data plane is serviced.
+/// priority queues. Each [`tick`](Self::tick) processes events according to
+/// the [`TierSchedule`] configuration:
+///
+/// - **Router/Storage:** drain up to `max_per_tick` events (default: drain all).
+/// - **Compute:** one execution slice with fuel scaled by data-plane queue depth
+///   (see [`AdaptiveCompute`]).
+/// - **Starvation protection:** tiers idle beyond `starvation_threshold` ticks
+///   are promoted in tick order.
+///
+/// With default configuration, behavior is: drain all router events, drain all
+/// storage events, then run one compute slice — information flow is never
+/// starved and compute gets whatever budget remains.
 pub struct NodeRuntime<B: BlobStore> {
     // Tier 1: Reticulum packet router
     router: Node,
