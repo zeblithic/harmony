@@ -452,8 +452,6 @@ impl<B: BlobStore> NodeRuntime<B> {
                             });
                         }
                     }
-                    // Compact engine state: strip heavy data, keep dedup entry.
-                    self.workflow.compact_workflow(&workflow_id);
                 }
                 WorkflowAction::WorkflowFailed { workflow_id, error } => {
                     if let Some(query_ids) = self.workflow_to_query.remove(&workflow_id) {
@@ -466,7 +464,6 @@ impl<B: BlobStore> NodeRuntime<B> {
                             });
                         }
                     }
-                    self.workflow.compact_workflow(&workflow_id);
                 }
                 WorkflowAction::FetchContent { cid, .. } => {
                     out.push(RuntimeAction::FetchContent { cid });
@@ -474,8 +471,10 @@ impl<B: BlobStore> NodeRuntime<B> {
                 WorkflowAction::FetchModule { cid } => {
                     out.push(RuntimeAction::FetchContent { cid });
                 }
-                WorkflowAction::PersistHistory { .. } => {
-                    // No-op for now (future: Zenoh persistence).
+                WorkflowAction::PersistHistory { workflow_id } => {
+                    // Future: persist history via Zenoh before compacting.
+                    // Compact after persist to preserve history for crash recovery.
+                    self.workflow.compact_workflow(&workflow_id);
                 }
             }
         }
