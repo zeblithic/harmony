@@ -43,7 +43,10 @@ pub enum HistoryEvent {
     /// WASM module requested content by CID (fetch_content call).
     IoRequested { cid: [u8; 32] },
     /// Content was resolved — data is `Some` if found, `None` if not found.
-    IoResolved { cid: [u8; 32], data: Option<Vec<u8>> },
+    IoResolved {
+        cid: [u8; 32],
+        data: Option<Vec<u8>>,
+    },
 }
 
 /// The complete event log for a workflow — this IS the durable checkpoint.
@@ -110,11 +113,20 @@ pub enum WorkflowAction {
     /// Fetch a WASM module by CID from storage.
     FetchModule { cid: [u8; 32] },
     /// Fetch content by CID (IO request from WASM during execution).
-    FetchContent { workflow_id: WorkflowId, cid: [u8; 32] },
+    FetchContent {
+        workflow_id: WorkflowId,
+        cid: [u8; 32],
+    },
     /// Workflow completed successfully — here is the output.
-    WorkflowComplete { workflow_id: WorkflowId, output: Vec<u8> },
+    WorkflowComplete {
+        workflow_id: WorkflowId,
+        output: Vec<u8>,
+    },
     /// Workflow failed.
-    WorkflowFailed { workflow_id: WorkflowId, error: String },
+    WorkflowFailed {
+        workflow_id: WorkflowId,
+        error: String,
+    },
     /// The workflow's history changed — caller should persist it.
     PersistHistory { workflow_id: WorkflowId },
 }
@@ -166,7 +178,9 @@ mod tests {
             cid,
             data: Some(vec![1, 2, 3]),
         };
-        assert!(matches!(resolved, HistoryEvent::IoResolved { data: Some(d), .. } if d == vec![1, 2, 3]));
+        assert!(
+            matches!(resolved, HistoryEvent::IoResolved { data: Some(d), .. } if d == vec![1, 2, 3])
+        );
     }
 
     #[test]
