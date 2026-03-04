@@ -116,9 +116,7 @@ impl<S: BlobStore> ContentStore<S> {
     /// find data that W-TinyLFU rejected but `store_remove` didn't clean up),
     /// this checks the actual admission state in window/probation/protected.
     pub fn is_admitted(&self, cid: &ContentId) -> bool {
-        self.window.contains(cid)
-            || self.probation.contains(cid)
-            || self.protected.contains(cid)
+        self.window.contains(cid) || self.probation.contains(cid) || self.protected.contains(cid)
     }
 
     /// Pre-store admission check for transit/opportunistic content.
@@ -134,9 +132,7 @@ impl<S: BlobStore> ContentStore<S> {
     /// them only for them to be immediately evicted.
     pub fn should_admit(&mut self, cid: &ContentId) -> bool {
         // Already in cache — always admit.
-        if self.window.contains(cid)
-            || self.probation.contains(cid)
-            || self.protected.contains(cid)
+        if self.window.contains(cid) || self.probation.contains(cid) || self.protected.contains(cid)
         {
             return true;
         }
@@ -355,7 +351,10 @@ mod tests {
         cs.store(cid_b, data_b.to_vec());
         let freq_b = cs.sketch.estimate(&cid_b);
 
-        assert_eq!(freq_a, freq_b, "preadmitted and plain store should have same frequency");
+        assert_eq!(
+            freq_a, freq_b,
+            "preadmitted and plain store should have same frequency"
+        );
     }
 
     #[test]
@@ -387,7 +386,10 @@ mod tests {
         for _ in 0..15 {
             cs.should_admit(&cold_cid);
         }
-        assert!(cs.should_admit(&cold_cid), "warmed-up CID should be admitted");
+        assert!(
+            cs.should_admit(&cold_cid),
+            "warmed-up CID should be admitted"
+        );
     }
 
     #[test]
