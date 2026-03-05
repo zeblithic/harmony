@@ -5,3 +5,4 @@ pub mod registry;
 pub mod smtp;
 pub mod spam;
 pub mod smtp_parse;
+pub mod trust;
