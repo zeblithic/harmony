@@ -40,4 +40,7 @@ pub enum MailError {
 
     #[error("mime type too long: {len} bytes, maximum 255")]
     MimeTypeTooLong { len: usize },
+
+    #[error("unknown SMTP command: {0}")]
+    UnknownCommand(String),
 }
