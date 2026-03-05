@@ -5,6 +5,7 @@ members = [
     "crates/harmony-content",
     "crates/harmony-crypto",
     "crates/harmony-identity",
+    "crates/harmony-mail",
     "crates/harmony-node",
     "crates/harmony-reticulum",
     "crates/harmony-workflow",
@@ -44,6 +45,12 @@ hex = "0.4"
 # WASM runtime
 wasmi = "1"
 wasmtime = "38"
+
+# CLI and runtime
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
 
 # Internal crates
 harmony-compute = { path = "crates/harmony-compute" }
