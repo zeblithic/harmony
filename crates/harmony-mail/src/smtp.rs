@@ -40,8 +40,6 @@ pub enum SmtpState {
     RcptToReceived,
     /// DATA command accepted, receiving message body.
     DataReceiving,
-    /// Message body received and queued for delivery.
-    MessageComplete,
     /// Session closed.
     Closed,
 }
@@ -86,8 +84,16 @@ pub enum SmtpEvent {
 /// Actions emitted by the state machine for the I/O layer to execute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmtpAction {
-    /// Send an SMTP response line.
+    /// Send a single-line SMTP response (e.g. `250 OK`).
     SendResponse(u16, String),
+    /// Send a multi-line EHLO response with structured capabilities.
+    ///
+    /// The I/O layer formats this as `250-{greeting}\r\n` followed by
+    /// `250-{cap}\r\n` for each capability except the last, which uses `250 {cap}\r\n`.
+    SendEhloResponse {
+        greeting: String,
+        capabilities: Vec<String>,
+    },
     /// Initiate TLS upgrade.
     StartTls,
     /// Check SPF for the sender domain.
@@ -184,17 +190,30 @@ impl SmtpSession {
     }
 
     fn handle_ehlo(&mut self, domain: String) -> Vec<SmtpAction> {
-        if self.state != SmtpState::GreetingSent {
-            return vec![SmtpAction::SendResponse(
-                503,
-                "Bad sequence of commands".to_string(),
-            )];
+        // RFC 5321 §4.1.4: EHLO is valid from any post-greeting state and acts
+        // as an implicit RSET. Reject only from Connected (no greeting yet),
+        // DataReceiving (mid-transfer), and Closed.
+        match self.state {
+            SmtpState::Connected | SmtpState::DataReceiving | SmtpState::Closed => {
+                return vec![SmtpAction::SendResponse(
+                    503,
+                    "Bad sequence of commands".to_string(),
+                )];
+            }
+            SmtpState::GreetingSent => {}
+            // Implicit RSET for any post-EHLO state.
+            _ => {
+                self.mail_from = None;
+                self.resolved_recipients.clear();
+                self.pending_rcpt = None;
+                self.data.clear();
+            }
         }
+
         self.ehlo_domain = Some(domain);
         self.state = SmtpState::Ready;
 
         let mut capabilities = vec![
-            format!("{} Hello", self.config.domain),
             format!("SIZE {}", self.config.message_size_display()),
             "8BITMIME".to_string(),
         ];
@@ -202,10 +221,10 @@ impl SmtpSession {
             capabilities.push("STARTTLS".to_string());
         }
 
-        vec![SmtpAction::SendResponse(
-            250,
-            capabilities.join("\n"),
-        )]
+        vec![SmtpAction::SendEhloResponse {
+            greeting: format!("{} Hello", self.config.domain),
+            capabilities,
+        }]
     }
 
     fn handle_mail_from(&mut self, address: String) -> Vec<SmtpAction> {
@@ -280,7 +299,16 @@ impl SmtpSession {
         self.resolved_recipients.clear();
         self.pending_rcpt = None;
         self.data.clear();
-        self.state = SmtpState::Ready;
+        // RFC 5321 §4.1.1.5: RSET resets the mail transaction, not the session.
+        // Only advance to Ready if EHLO has already been completed.
+        match self.state {
+            SmtpState::Connected | SmtpState::GreetingSent => {
+                // Pre-EHLO: keep current state, don't let client skip handshake.
+            }
+            _ => {
+                self.state = SmtpState::Ready;
+            }
+        }
         vec![SmtpAction::SendResponse(250, "OK".to_string())]
     }
 
@@ -313,7 +341,6 @@ impl SmtpSession {
         if self.state != SmtpState::DataReceiving {
             return vec![];
         }
-        self.state = SmtpState::MessageComplete;
         let recipients = std::mem::take(&mut self.resolved_recipients);
         let actions = vec![
             SmtpAction::DeliverToHarmony {
@@ -441,20 +468,77 @@ mod tests {
         assert_eq!(session.state, SmtpState::Ready);
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            SmtpAction::SendResponse(code, msg) => {
-                assert_eq!(*code, 250);
-                assert!(msg.contains("SIZE"), "EHLO response should list SIZE: {msg}");
+            SmtpAction::SendEhloResponse {
+                greeting,
+                capabilities,
+            } => {
                 assert!(
-                    msg.contains("8BITMIME"),
-                    "EHLO response should list 8BITMIME: {msg}"
+                    greeting.contains("Hello"),
+                    "greeting should contain Hello: {greeting}"
                 );
+                let caps = capabilities.join(" ");
+                assert!(caps.contains("SIZE"), "should list SIZE: {caps}");
+                assert!(caps.contains("8BITMIME"), "should list 8BITMIME: {caps}");
                 assert!(
-                    msg.contains("STARTTLS"),
-                    "EHLO response should list STARTTLS when not TLS: {msg}"
+                    caps.contains("STARTTLS"),
+                    "should list STARTTLS when not TLS: {caps}"
                 );
             }
-            other => panic!("expected SendResponse, got {other:?}"),
+            other => panic!("expected SendEhloResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ehlo_after_ready_resets_transaction() {
+        // RFC 5321 §4.1.4: EHLO at any point acts as implicit RSET.
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        assert_eq!(session.state, SmtpState::MailFromReceived);
+
+        // Re-issue EHLO mid-transaction.
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+            domain: "new-sender.example.com".to_string(),
+        }));
+
+        assert_eq!(session.state, SmtpState::Ready);
+        assert!(session.mail_from.is_none(), "EHLO should clear mail_from");
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], SmtpAction::SendEhloResponse { .. }),
+            "expected SendEhloResponse, got {:?}",
+            actions[0]
+        );
+    }
+
+    #[test]
+    fn rset_before_ehlo_preserves_state() {
+        // RFC 5321 §4.1.1.5: RSET before EHLO must not advance past GreetingSent.
+        let mut session = connected_session();
+        assert_eq!(session.state, SmtpState::GreetingSent);
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Rset));
+
+        assert_eq!(
+            actions[0],
+            SmtpAction::SendResponse(250, "OK".to_string())
+        );
+        assert_eq!(
+            session.state,
+            SmtpState::GreetingSent,
+            "RSET before EHLO should not advance to Ready"
+        );
+
+        // Client must still issue EHLO to proceed.
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@example.com".to_string(),
+        }));
+        assert_eq!(
+            actions[0],
+            SmtpAction::SendResponse(503, "Bad sequence of commands".to_string()),
+            "MAIL FROM should be rejected before EHLO"
+        );
     }
 
     #[test]

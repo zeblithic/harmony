@@ -209,54 +209,73 @@ pub struct AggregatedTrust {
 
 /// Compute a trust score from raw metrics.
 ///
-/// Formula: `1.0 - (spam * 0.4 + bounce * 0.3 + (1.0 - dkim) * 0.15 + (1.0 - spf) * 0.15)`
+/// Formula: `1.0 - (spam * 0.35 + bounce * 0.25 + (1-dkim) * 0.15 + (1-spf) * 0.15 + (1-availability) * 0.10)`
 /// Result is clamped to 0.0..=1.0.
 fn metrics_to_score(m: &TrustMetrics) -> f32 {
     let raw = 1.0
-        - (m.spam_ratio * 0.4
-            + m.bounce_ratio * 0.3
+        - (m.spam_ratio * 0.35
+            + m.bounce_ratio * 0.25
             + (1.0 - m.dkim_pass_ratio) * 0.15
-            + (1.0 - m.spf_pass_ratio) * 0.15);
+            + (1.0 - m.spf_pass_ratio) * 0.15
+            + (1.0 - m.availability) * 0.10);
     raw.clamp(0.0, 1.0)
 }
 
-/// Aggregate trust reports into a single weighted trust score.
+/// Aggregate trust reports into a single trust score using weighted median.
 ///
 /// Each report's metrics are converted to a score using [`metrics_to_score`],
-/// then weighted by the reporter's weight from `reporter_weights`. Reports
+/// then the weighted median is computed using `reporter_weights`. Reports
 /// from reporters not present in the weights map are ignored.
+///
+/// Weighted median is used instead of weighted mean for robustness: a single
+/// malicious reporter cannot skew the aggregate even with extreme values.
 ///
 /// Returns `None` if no reports match any reporter in the weights map.
 pub fn aggregate_trust(
     reports: &[TrustReport],
     reporter_weights: &HashMap<[u8; ADDRESS_HASH_LENGTH], f32>,
 ) -> Option<AggregatedTrust> {
-    let mut weighted_sum = 0.0_f32;
-    let mut total_weight = 0.0_f32;
+    let mut scored: Vec<(f32, f32)> = Vec::new(); // (score, weight)
     let mut gateway_address = None;
-    let mut report_count = 0_usize;
 
     for report in reports {
         if let Some(&weight) = reporter_weights.get(&report.reporter_address) {
             if gateway_address.is_none() {
                 gateway_address = Some(report.subject_address);
             }
-            let score = metrics_to_score(&report.metrics);
-            weighted_sum += score * weight;
-            total_weight += weight;
-            report_count += 1;
+            scored.push((metrics_to_score(&report.metrics), weight));
         }
     }
 
-    if report_count == 0 || total_weight == 0.0 {
+    if scored.is_empty() {
         return None;
     }
 
-    let trust_score = (weighted_sum / total_weight).clamp(0.0, 1.0);
+    let report_count = scored.len();
+
+    // Sort by score for weighted median computation.
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total_weight: f32 = scored.iter().map(|(_, w)| w).sum();
+    if total_weight == 0.0 {
+        return None;
+    }
+
+    // Weighted median: find the score where cumulative weight reaches half.
+    let half = total_weight / 2.0;
+    let mut cumulative = 0.0_f32;
+    let mut trust_score = scored[0].0;
+    for &(score, weight) in &scored {
+        cumulative += weight;
+        if cumulative >= half {
+            trust_score = score;
+            break;
+        }
+    }
 
     Some(AggregatedTrust {
         gateway_address: gateway_address.unwrap(),
-        trust_score,
+        trust_score: trust_score.clamp(0.0, 1.0),
         report_count,
     })
 }
@@ -331,13 +350,13 @@ mod tests {
 
         let metrics = TrustMetrics {
             messages_received: 100,
-            spam_ratio: 0.1,       // contributes 0.1 * 0.4 = 0.04
-            bounce_ratio: 0.05,    // contributes 0.05 * 0.3 = 0.015
+            spam_ratio: 0.1,       // contributes 0.1 * 0.35 = 0.035
+            bounce_ratio: 0.05,    // contributes 0.05 * 0.25 = 0.0125
             dkim_pass_ratio: 0.95, // contributes (1-0.95) * 0.15 = 0.0075
             spf_pass_ratio: 0.90,  // contributes (1-0.90) * 0.15 = 0.015
-            availability: 0.99,
+            availability: 0.99,    // contributes (1-0.99) * 0.10 = 0.001
         };
-        // Expected score = 1.0 - (0.04 + 0.015 + 0.0075 + 0.015) = 1.0 - 0.0775 = 0.9225
+        // Expected score = 1.0 - (0.035 + 0.0125 + 0.0075 + 0.015 + 0.001) = 1.0 - 0.071 = 0.929
 
         let report = TrustReport::new(
             &reporter,
@@ -354,7 +373,7 @@ mod tests {
         assert_eq!(result.report_count, 1);
         assert_eq!(result.gateway_address, subject.public_identity().address_hash);
 
-        let expected = 0.9225_f32;
+        let expected = 0.929_f32;
         assert!(
             (result.trust_score - expected).abs() < 1e-5,
             "expected ~{}, got {}",
@@ -378,7 +397,7 @@ mod tests {
             spf_pass_ratio: 1.0,
             availability: 1.0,
         };
-        // Score A = 1.0 - (0 + 0 + 0 + 0) = 1.0
+        // Score A = 1.0
 
         // Reporter B: bad metrics -> low score
         let metrics_b = TrustMetrics {
@@ -389,8 +408,8 @@ mod tests {
             spf_pass_ratio: 0.0,
             availability: 0.5,
         };
-        // Score B = 1.0 - (0.5*0.4 + 0.5*0.3 + 1.0*0.15 + 1.0*0.15)
-        //         = 1.0 - (0.2 + 0.15 + 0.15 + 0.15) = 1.0 - 0.65 = 0.35
+        // Score B = 1.0 - (0.5*0.35 + 0.5*0.25 + 1.0*0.15 + 1.0*0.15 + 0.5*0.10)
+        //         = 1.0 - 0.65 = 0.35
 
         let report_a = TrustReport::new(
             &reporter_a,
@@ -415,9 +434,10 @@ mod tests {
         let result = aggregate_trust(&[report_a, report_b], &weights).unwrap();
         assert_eq!(result.report_count, 2);
 
-        // Weighted average = (1.0 * 0.8 + 0.35 * 0.2) / (0.8 + 0.2)
-        //                  = (0.8 + 0.07) / 1.0 = 0.87
-        let expected = 0.87_f32;
+        // Weighted median: sorted by score [(0.35, w=0.2), (1.0, w=0.8)].
+        // Cumulative at 0.35: 0.2 < 0.5, at 1.0: 1.0 >= 0.5.
+        // Median = 1.0 (the high-weight good reporter dominates).
+        let expected = 1.0_f32;
         assert!(
             (result.trust_score - expected).abs() < 1e-5,
             "expected ~{}, got {}",
