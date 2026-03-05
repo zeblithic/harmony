@@ -17,6 +17,7 @@ harmony-identity.workspace = true
 harmony-content.workspace = true
 harmony-reticulum.workspace = true
 harmony-zenoh.workspace = true
+ed25519-dalek.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 rand_core.workspace = true

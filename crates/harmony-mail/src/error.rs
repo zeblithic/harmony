@@ -43,4 +43,7 @@ pub enum MailError {
 
     #[error("unknown SMTP command: {0}")]
     UnknownCommand(String),
+
+    #[error("invalid identity bytes in registration")]
+    InvalidIdentity,
 }
