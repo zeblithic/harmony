@@ -28,4 +28,16 @@ pub enum MailError {
 
     #[error("truncated message: expected {expected} more bytes")]
     Truncated { expected: usize },
+
+    #[error("invalid UTF-8 in {field}")]
+    InvalidUtf8 { field: &'static str },
+
+    #[error("invalid in_reply_to flag: {0}")]
+    InvalidInReplyToFlag(u8),
+
+    #[error("filename too long: {len} bytes, maximum 255")]
+    FilenameTooLong { len: usize },
+
+    #[error("mime type too long: {len} bytes, maximum 255")]
+    MimeTypeTooLong { len: usize },
 }
