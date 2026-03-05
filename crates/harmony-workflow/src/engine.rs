@@ -66,6 +66,11 @@ impl WorkflowEngine {
         }
     }
 
+    /// Read-only access to the per-slice instruction budget.
+    pub fn budget(&self) -> InstructionBudget {
+        self.budget
+    }
+
     /// Dispatch an inbound event and return any resulting actions.
     pub fn handle(&mut self, event: WorkflowEvent) -> Vec<WorkflowAction> {
         match event {
@@ -171,6 +176,31 @@ impl WorkflowEngine {
         } else {
             Vec::new()
         }
+    }
+
+    /// Run one compute slice with a specific fuel budget (for adaptive scheduling).
+    ///
+    /// Uses a drop guard to restore the original budget even if `tick()` panics
+    /// (e.g. from WASM execution), preventing permanent budget corruption.
+    pub fn tick_with_budget(&mut self, budget: InstructionBudget) -> Vec<WorkflowAction> {
+        struct BudgetGuard<'a> {
+            engine: &'a mut WorkflowEngine,
+            saved: InstructionBudget,
+        }
+        impl<'a> Drop for BudgetGuard<'a> {
+            fn drop(&mut self) {
+                self.engine.budget = self.saved;
+            }
+        }
+
+        let saved = self.budget;
+        self.budget = budget;
+        // Guard restores self.budget on drop (normal return or panic).
+        let guard = BudgetGuard { engine: self, saved };
+        let result = guard.engine.tick();
+        // Explicit drop triggers restore before we return.
+        drop(guard);
+        result
     }
 
     /// Query the current status of a workflow.

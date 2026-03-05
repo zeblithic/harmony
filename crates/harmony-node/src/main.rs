@@ -148,6 +148,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 compute_budget: InstructionBudget {
                     fuel: compute_budget,
                 },
+                schedule: Default::default(),
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 
