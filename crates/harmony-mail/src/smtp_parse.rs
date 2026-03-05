@@ -226,6 +226,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_null_sender() {
+        // RFC 5321 §4.5.5: MAIL FROM:<> is the null sender for bounces/DSNs.
+        let cmd = parse_command(b"MAIL FROM:<>\r\n").unwrap();
+        assert_eq!(
+            cmd,
+            SmtpCommand::MailFrom {
+                address: String::new()
+            }
+        );
+    }
+
+    #[test]
     fn parse_unknown_command() {
         let result = parse_command(b"VRFY user\r\n");
         assert!(result.is_err());

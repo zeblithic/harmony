@@ -97,11 +97,11 @@ pub struct SpamVerdict {
 /// - Gateway trust < 0.3: +2
 /// - First contact: +1
 ///
-/// **Thresholds:**
+/// **Thresholds** (default `reject_threshold` = 5):
 /// - score <= 0: `Deliver`
-/// - score 1-4: `DeliverWithScore`
-/// - score >= 5: `Reject`
-pub fn score(signals: &SpamSignals) -> SpamVerdict {
+/// - score 1..(reject_threshold-1): `DeliverWithScore`
+/// - score >= reject_threshold: `Reject`
+pub fn score(signals: &SpamSignals, reject_threshold: i32) -> SpamVerdict {
     let mut s: i32 = 0;
 
     // Layer 1: Connection-level
@@ -158,7 +158,7 @@ pub fn score(signals: &SpamSignals) -> SpamVerdict {
 
     let action = if s <= 0 {
         SpamAction::Deliver
-    } else if s <= 4 {
+    } else if s < reject_threshold {
         SpamAction::DeliverWithScore
     } else {
         SpamAction::Reject
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn clean_message_passes() {
-        let verdict = score(&clean_signals());
+        let verdict = score(&clean_signals(), 5);
         assert!(verdict.score <= 0, "expected score <= 0, got {}", verdict.score);
         assert_eq!(verdict.action, SpamAction::Deliver);
     }
@@ -201,7 +201,7 @@ mod tests {
             dnsbl_listed: true,
             ..clean_signals()
         };
-        let verdict = score(&signals);
+        let verdict = score(&signals, 5);
         assert!(verdict.score >= 5, "expected score >= 5, got {}", verdict.score);
         assert_eq!(verdict.action, SpamAction::Reject);
     }
@@ -217,7 +217,7 @@ mod tests {
             dkim_result: DkimResult::Missing,
             ..clean_signals()
         };
-        let verdict = score(&signals);
+        let verdict = score(&signals, 5);
         // Expected: 0 (base) + 1 (SPF SoftFail) + 1 (DKIM Missing) - 3 (known) - 2 (trust) = -3
         assert!(verdict.score <= 0, "expected score <= 0, got {}", verdict.score);
         assert_eq!(verdict.action, SpamAction::Deliver);
@@ -229,10 +229,23 @@ mod tests {
             has_executable_attachment: true,
             ..clean_signals()
         };
-        let verdict = score(&signals);
+        let verdict = score(&signals, 5);
         // Expected: 0 (base) + 5 (executable) = 5
         assert!(verdict.score >= 5, "expected score >= 5, got {}", verdict.score);
         assert_eq!(verdict.action, SpamAction::Reject);
+    }
+
+    #[test]
+    fn custom_reject_threshold() {
+        // Executable attachment (+5) is rejected at default threshold 5,
+        // but should be borderline at threshold 10.
+        let signals = SpamSignals {
+            has_executable_attachment: true,
+            ..clean_signals()
+        };
+        let verdict = score(&signals, 10);
+        assert_eq!(verdict.score, 5);
+        assert_eq!(verdict.action, SpamAction::DeliverWithScore);
     }
 
     #[test]
@@ -245,7 +258,7 @@ mod tests {
             first_contact: true,
             ..clean_signals()
         };
-        let verdict = score(&signals);
+        let verdict = score(&signals, 5);
         assert!(
             (1..=4).contains(&verdict.score),
             "expected score in 1..=4, got {}",

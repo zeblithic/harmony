@@ -239,11 +239,14 @@ impl SmtpSession {
         self.state = SmtpState::MailFromReceived;
 
         let mut actions = vec![SmtpAction::SendResponse(250, "OK".to_string())];
-        if let Some(peer_ip) = self.peer_ip {
-            actions.push(SmtpAction::CheckSpf {
-                sender_domain,
-                peer_ip,
-            });
+        // Skip SPF for null sender (MAIL FROM:<>) — RFC 5321 §4.5.5 bounce/DSN.
+        if !sender_domain.is_empty() {
+            if let Some(peer_ip) = self.peer_ip {
+                actions.push(SmtpAction::CheckSpf {
+                    sender_domain,
+                    peer_ip,
+                });
+            }
         }
         actions
     }
@@ -253,6 +256,15 @@ impl SmtpSession {
             return vec![SmtpAction::SendResponse(
                 503,
                 "Bad sequence of commands".to_string(),
+            )];
+        }
+
+        // Guard: reject if a previous RCPT TO resolution is still in flight.
+        // The I/O layer must feed HarmonyResolved before the next RCPT TO.
+        if self.pending_rcpt.is_some() {
+            return vec![SmtpAction::SendResponse(
+                421,
+                "4.7.0 Previous recipient resolution pending".to_string(),
             )];
         }
 
@@ -697,5 +709,51 @@ mod tests {
         }
         // State should remain Ready.
         assert_eq!(session.state, SmtpState::Ready);
+    }
+
+    #[test]
+    fn null_sender_skips_spf() {
+        // MAIL FROM:<> is the RFC 5321 §4.5.5 null sender for bounces/DSNs.
+        // Should NOT emit CheckSpf with an empty domain.
+        let mut session = ready_session();
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: String::new(),
+        }));
+
+        assert_eq!(session.state, SmtpState::MailFromReceived);
+        // Should only have the 250 OK — no CheckSpf action.
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0],
+            SmtpAction::SendResponse(250, "OK".to_string())
+        );
+    }
+
+    #[test]
+    fn concurrent_rcpt_to_rejected() {
+        // Second RCPT TO while first resolution is pending should be rejected.
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+
+        // First RCPT TO — starts resolution.
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        assert!(session.pending_rcpt.is_some());
+
+        // Second RCPT TO before resolution completes — should be rejected.
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "carol@harmony.example.com".to_string(),
+        }));
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => {
+                assert_eq!(*code, 421, "should reject with 421 temporary failure");
+            }
+            other => panic!("expected SendResponse(421, ...), got {other:?}"),
+        }
     }
 }

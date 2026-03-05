@@ -242,6 +242,10 @@ pub fn aggregate_trust(
         if let Some(&weight) = reporter_weights.get(&report.reporter_address) {
             if gateway_address.is_none() {
                 gateway_address = Some(report.subject_address);
+            } else if gateway_address != Some(report.subject_address) {
+                // Skip reports for a different subject — caller should pre-filter,
+                // but we guard against silent data mixing in this trust-sensitive path.
+                continue;
             }
             scored.push((metrics_to_score(&report.metrics), weight));
         }
@@ -442,6 +446,59 @@ mod tests {
             (result.trust_score - expected).abs() < 1e-5,
             "expected ~{}, got {}",
             expected,
+            result.trust_score
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_skips_mismatched_subjects() {
+        let reporter = PrivateIdentity::generate(&mut OsRng);
+        let subject_a = PrivateIdentity::generate(&mut OsRng);
+        let subject_b = PrivateIdentity::generate(&mut OsRng);
+
+        let good_metrics = TrustMetrics {
+            messages_received: 100,
+            spam_ratio: 0.0,
+            bounce_ratio: 0.0,
+            dkim_pass_ratio: 1.0,
+            spf_pass_ratio: 1.0,
+            availability: 1.0,
+        };
+        let bad_metrics = TrustMetrics {
+            messages_received: 100,
+            spam_ratio: 1.0,
+            bounce_ratio: 1.0,
+            dkim_pass_ratio: 0.0,
+            spf_pass_ratio: 0.0,
+            availability: 0.0,
+        };
+
+        // Report about subject A (good) and subject B (bad).
+        let report_a = TrustReport::new(
+            &reporter,
+            subject_a.public_identity().address_hash,
+            "good.example.com".to_string(),
+            (1_700_000_000, 1_700_086_400),
+            good_metrics,
+        );
+        let report_b = TrustReport::new(
+            &reporter,
+            subject_b.public_identity().address_hash,
+            "bad.example.com".to_string(),
+            (1_700_000_000, 1_700_086_400),
+            bad_metrics,
+        );
+
+        let mut weights = HashMap::new();
+        weights.insert(reporter.public_identity().address_hash, 1.0);
+
+        // Subject B's bad report should be skipped — only subject A's score counts.
+        let result = aggregate_trust(&[report_a, report_b], &weights).unwrap();
+        assert_eq!(result.report_count, 1, "should only count report for first subject");
+        assert_eq!(result.gateway_address, subject_a.public_identity().address_hash);
+        assert!(
+            (result.trust_score - 1.0).abs() < 1e-5,
+            "should reflect only subject A's perfect score, got {}",
             result.trust_score
         );
     }
