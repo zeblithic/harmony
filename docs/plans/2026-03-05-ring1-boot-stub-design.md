@@ -1,4 +1,4 @@
-# Ring 1: Minimal x86_64 Boot Stub (Multiboot2) — Design
+# Ring 1: Minimal x86_64 Boot Stub — Design
 
 **Date:** 2026-03-05
 **Bead:** harmony-cpo
@@ -11,7 +11,7 @@ The Harmony unikernel (Ring 1) needs a minimal bootable x86_64 image that proves
 
 ## Approach
 
-**Controlled boot**: Use the `bootloader` crate for the multiboot2/page-table/GDT ceremony. Everything after the Rust entry point is ours: serial, heap, IDT, platform trait impls, event loop.
+**Controlled boot**: Use the `bootloader` crate (v0.11) for the BIOS boot ceremony (page tables, GDT, long mode). The crate implements its own two-stage boot protocol — not multiboot2/GRUB. Everything after the Rust entry point is ours: serial, heap, platform trait impls, event loop.
 
 ## Crate Structure
 

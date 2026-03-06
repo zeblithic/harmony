@@ -5,6 +5,7 @@ members = [
     "crates/harmony-content",
     "crates/harmony-crypto",
     "crates/harmony-identity",
+    "crates/harmony-mail",
     "crates/harmony-node",
     "crates/harmony-platform",
     "crates/harmony-reticulum",
@@ -48,6 +49,11 @@ hex = "0.4"
 # WASM runtime
 wasmi = "1"
 wasmtime = "38"
+
+# CLI and config
+serde = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
 
 # Internal crates — default-features = false so bare-metal consumers
 # (harmony-os/harmony-boot) can compile the dependency graph without std.

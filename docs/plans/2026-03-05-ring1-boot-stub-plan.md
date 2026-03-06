@@ -56,14 +56,14 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Ring 0 — harmony core (consumed under MIT license arm)
-harmony-crypto = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-platform = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-reticulum = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-zenoh = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-content = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-compute = { git = "https://github.com/zeblithic/harmony.git" }
-harmony-workflow = { git = "https://github.com/zeblithic/harmony.git" }
+harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-platform = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-reticulum = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-zenoh = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-content = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-compute = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-workflow = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 # Note: harmony-node is a binary crate (no lib target), not usable as a dependency
 
 # Internal workspace crates

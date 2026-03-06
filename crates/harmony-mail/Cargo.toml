@@ -1,0 +1,25 @@
+[package]
+name = "harmony-mail"
+description = "SMTP-to-Harmony bridge gateway for decentralized email"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "harmony-mail"
+path = "src/main.rs"
+
+[dependencies]
+harmony-identity.workspace = true
+ed25519-dalek.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+rand.workspace = true
+rand_core.workspace = true
