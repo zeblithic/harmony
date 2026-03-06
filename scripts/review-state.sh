@@ -208,26 +208,34 @@ GREPTILE_ISSUE_COUNT=0
 GREPTILE_LATEST_COMMENT=""
 GREPTILE_COMMENT_COUNT=0
 
+GREPTILE_INLINE_COMMENTS="[]"
+GREPTILE_INLINE_COUNT=0
+
 if [[ -n "$GREPTILE_TRIGGER_DATE" ]]; then
-  # Greptile posts issue comments (not inline review comments)
+  # Greptile posts issue comments (summary) AND inline PR review comments (findings)
   GREPTILE_RESPONSE_COMMENTS=$(echo "$ALL_ISSUE_COMMENTS" | jq \
     "[.[] | select(.user.login == \"greptile-apps[bot]\" and .created_at > \"$GREPTILE_TRIGGER_DATE\")]" 2>/dev/null)
   GREPTILE_COMMENT_COUNT=$(echo "$GREPTILE_RESPONSE_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
   GREPTILE_LATEST_COMMENT=$(echo "$GREPTILE_RESPONSE_COMMENTS" | jq -r 'last // empty | .created_at // empty' 2>/dev/null)
 
-  if [[ "$GREPTILE_COMMENT_COUNT" -gt 0 ]]; then
-    GREPTILE_HAS_RESPONSE=true
+  # Inline PR comments from greptile-apps[bot] after trigger (this is where findings live)
+  GREPTILE_INLINE_COMMENTS=$(echo "$ALL_PR_COMMENTS" | jq \
+    "[.[] | select(.user.login == \"greptile-apps[bot]\" and .created_at > \"$GREPTILE_TRIGGER_DATE\")]" 2>/dev/null)
+  GREPTILE_INLINE_COUNT=$(echo "$GREPTILE_INLINE_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
 
-    # Heuristic: count bold-backtick file references (**`path`**) as a proxy for
-    # distinct findings. Over-counts if a finding references multiple files;
-    # under-counts if Greptile uses plain code fences. Fallback to comment count
-    # if no file-ref patterns found.
-    GREPTILE_ISSUE_COUNT=$(echo "$GREPTILE_RESPONSE_COMMENTS" | jq -r \
-      '[.[] | .body | [scan("\\*\\*`[^`]+`\\*\\*")] | length] | add // 0' 2>/dev/null || echo "0")
-    # If no file-ref patterns found, count comments themselves as findings
-    if [[ "$GREPTILE_ISSUE_COUNT" -eq 0 ]]; then
-      GREPTILE_ISSUE_COUNT="$GREPTILE_COMMENT_COUNT"
-    fi
+  # Also check PR reviews (Greptile posts formal reviews with empty bodies)
+  GREPTILE_LATEST_REVIEW=$(echo "$ALL_PR_REVIEWS" | jq -r \
+    "[.[] | select(.user.login == \"greptile-apps[bot]\" and .submitted_at > \"$GREPTILE_TRIGGER_DATE\")] | last // empty | .submitted_at // empty" 2>/dev/null)
+
+  # Track the latest timestamp from any response type
+  if [[ -z "$GREPTILE_LATEST_COMMENT" && -n "$GREPTILE_LATEST_REVIEW" ]]; then
+    GREPTILE_LATEST_COMMENT="$GREPTILE_LATEST_REVIEW"
+  fi
+
+  if [[ "$GREPTILE_COMMENT_COUNT" -gt 0 || "$GREPTILE_INLINE_COUNT" -gt 0 || -n "$GREPTILE_LATEST_REVIEW" ]]; then
+    GREPTILE_HAS_RESPONSE=true
+    # Inline PR comments are the actual findings
+    GREPTILE_ISSUE_COUNT="$GREPTILE_INLINE_COUNT"
   fi
 
   # Thumbs-up on trigger without formal response = "reviewed, no issues"
@@ -242,26 +250,39 @@ fi
 if [[ "$GREPTILE_HAS_RESPONSE" == "true" ]]; then
   echo "Status: complete"
   echo "Latest comment: ${GREPTILE_LATEST_COMMENT}"
-  echo "Comments after trigger: ${GREPTILE_COMMENT_COUNT}"
+  echo "Issue comments after trigger: ${GREPTILE_COMMENT_COUNT}"
+  echo "Inline comments after trigger: ${GREPTILE_INLINE_COUNT}"
   echo "Issues found: ${GREPTILE_ISSUE_COUNT}"
 
-  # Print each comment body
+  # Print each inline finding (these are the actual code issues)
+  if [[ "$GREPTILE_INLINE_COUNT" -gt 0 ]]; then
+    echo ""
+    local_idx=0
+    while IFS= read -r finding_json; do
+      local_idx=$((local_idx + 1))
+      f_file=$(echo "$finding_json" | jq -r '.path // "unknown"')
+      f_line=$(echo "$finding_json" | jq -r '.line // .original_line // "?"')
+      f_body=$(echo "$finding_json" | jq -r '.body // ""')
+      echo "Finding ${local_idx}:"
+      echo "  File: ${f_file}"
+      echo "  Line: ${f_line}"
+      echo "  Body:"
+      echo "$f_body" | sed 's/^/    /'
+      echo ""
+    done < <(echo "$GREPTILE_INLINE_COMMENTS" | jq -c '.[]')
+  fi
+
+  # Print summary comment if present
   if [[ "$GREPTILE_COMMENT_COUNT" -gt 0 ]]; then
     echo ""
-    while IFS= read -r comment_json; do
-      c_date=$(echo "$comment_json" | jq -r '.created_at // "?"')
-      c_body=$(echo "$comment_json" | jq -r '.body // ""')
-      echo "Comment (${c_date}):"
-      echo "  Body:"
-      echo "$c_body" | sed 's/^/    /'
-      echo ""
-    done < <(echo "$GREPTILE_RESPONSE_COMMENTS" | jq -c '.[]')
+    echo "Summary comment:"
+    echo "$GREPTILE_RESPONSE_COMMENTS" | jq -r 'last // empty | .body // ""' | sed 's/^/    /'
+    echo ""
   fi
 else
   if [[ -n "$GREPTILE_TRIGGER_DATE" ]]; then
     echo "Status: pending"
     echo "Triggered at: ${GREPTILE_TRIGGER_DATE}"
-    echo "Comments after trigger: 0"
     echo "Issues found: 0"
   else
     echo "Status: not triggered"
