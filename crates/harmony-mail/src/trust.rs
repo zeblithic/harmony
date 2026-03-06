@@ -250,6 +250,9 @@ pub fn aggregate_trust(
 
     for report in reports {
         if let Some(&weight) = reporter_weights.get(&report.reporter_address) {
+            if !weight.is_finite() || weight <= 0.0 {
+                continue; // skip invalid weights
+            }
             if gateway_address.is_none() {
                 gateway_address = Some(report.subject_address);
             } else if gateway_address != Some(report.subject_address) {
@@ -484,6 +487,64 @@ mod tests {
             availability: 1.0,
         };
         assert_eq!(metrics_to_score(&metrics), 0.0);
+    }
+
+    #[test]
+    fn aggregate_trust_skips_nan_weight() {
+        let reporter = PrivateIdentity::generate(&mut OsRng);
+        let subject = PrivateIdentity::generate(&mut OsRng);
+
+        let metrics = TrustMetrics {
+            messages_received: 100,
+            spam_ratio: 0.0,
+            bounce_ratio: 0.0,
+            dkim_pass_ratio: 1.0,
+            spf_pass_ratio: 1.0,
+            availability: 1.0,
+        };
+
+        let report = TrustReport::new(
+            &reporter,
+            subject.public_identity().address_hash,
+            "peer.example.com".to_string(),
+            (1_700_000_000, 1_700_086_400),
+            metrics,
+        );
+
+        let mut weights = HashMap::new();
+        weights.insert(reporter.public_identity().address_hash, f32::NAN);
+
+        // NaN weight should be skipped, yielding no valid reports.
+        assert!(aggregate_trust(&[report], &weights).is_none());
+    }
+
+    #[test]
+    fn aggregate_trust_skips_negative_weight() {
+        let reporter = PrivateIdentity::generate(&mut OsRng);
+        let subject = PrivateIdentity::generate(&mut OsRng);
+
+        let metrics = TrustMetrics {
+            messages_received: 100,
+            spam_ratio: 0.0,
+            bounce_ratio: 0.0,
+            dkim_pass_ratio: 1.0,
+            spf_pass_ratio: 1.0,
+            availability: 1.0,
+        };
+
+        let report = TrustReport::new(
+            &reporter,
+            subject.public_identity().address_hash,
+            "peer.example.com".to_string(),
+            (1_700_000_000, 1_700_086_400),
+            metrics,
+        );
+
+        let mut weights = HashMap::new();
+        weights.insert(reporter.public_identity().address_hash, -1.0);
+
+        // Negative weight should be skipped.
+        assert!(aggregate_trust(&[report], &weights).is_none());
     }
 
     #[test]

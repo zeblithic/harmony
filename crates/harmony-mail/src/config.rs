@@ -62,14 +62,25 @@ pub struct TlsConfig {
 }
 
 impl TlsConfig {
-    /// Validate that manual mode has both cert and key paths.
+    /// Validate TLS configuration:
+    /// - Manual mode: cert and key paths are required.
+    /// - Acme mode: acme_email is required for certificate registration.
     pub fn validate(&self) -> Result<(), String> {
-        if self.mode == TlsMode::Manual {
-            if self.cert.is_none() {
-                return Err("tls.cert is required when mode = \"manual\"".to_string());
+        match self.mode {
+            TlsMode::Manual => {
+                if self.cert.is_none() {
+                    return Err("tls.cert is required when mode = \"manual\"".to_string());
+                }
+                if self.key.is_none() {
+                    return Err("tls.key is required when mode = \"manual\"".to_string());
+                }
             }
-            if self.key.is_none() {
-                return Err("tls.key is required when mode = \"manual\"".to_string());
+            TlsMode::Acme => {
+                if self.acme_email.is_none() {
+                    return Err(
+                        "tls.acme_email is required when mode = \"acme\"".to_string(),
+                    );
+                }
             }
         }
         Ok(())
@@ -269,6 +280,7 @@ mx_host = "mx.minimal.example"
 identity_key = "/tmp/test.key"
 
 [tls]
+acme_email = "admin@minimal.example"
 
 [dkim]
 key = "/tmp/dkim.key"
@@ -297,7 +309,10 @@ node_config = "/tmp/node.toml"
         assert_eq!(config.gateway.listen_submission_starttls, "0.0.0.0:587");
         assert_eq!(config.tls.mode, TlsMode::Acme);
         assert_eq!(config.tls.acme_challenge, "dns-01");
-        assert!(config.tls.acme_email.is_none());
+        assert_eq!(
+            config.tls.acme_email.as_deref(),
+            Some("admin@minimal.example")
+        );
         assert_eq!(config.dkim.selector, "harmony");
         assert_eq!(config.dkim.algorithm, "ed25519");
         assert!(config.spam.dnsbl.is_empty());
@@ -366,6 +381,35 @@ node_config = "/tmp/node.toml"
 
         let result = Config::from_toml(bad_mode);
         assert!(result.is_err(), "invalid TLS mode should fail deserialization");
+    }
+
+    #[test]
+    fn tls_acme_mode_requires_email() {
+        let acme_no_email = r#"
+[domain]
+name = "example.com"
+mx_host = "mail.example.com"
+
+[gateway]
+identity_key = "/tmp/test.key"
+
+[tls]
+mode = "acme"
+
+[dkim]
+key = "/tmp/dkim.key"
+
+[spam]
+
+[outbound]
+queue_path = "/tmp/queue"
+
+[harmony]
+node_config = "/tmp/node.toml"
+"#;
+
+        let result = Config::from_toml(acme_no_email);
+        assert!(result.is_err(), "acme mode without acme_email should fail validation");
     }
 
     #[test]

@@ -130,40 +130,18 @@ impl NameRegistration {
 
     /// Serialize to bytes for announce payload or storage.
     ///
-    /// Format: `name_len(u16) + name + namespace_len(u16) + namespace +
-    /// domain_len(u16) + domain + identity_public_bytes(64) +
-    /// registered_at(u64 BE) + user_signature(64) + domain_signature(64)`
+    /// Format: `canonical_bytes + user_signature(64) + domain_signature(64)`
     pub fn to_bytes(&self) -> Vec<u8> {
-        let name_bytes = self.name.as_bytes();
-        let namespace_bytes = self.namespace.as_bytes();
-        let domain_bytes = self.domain.as_bytes();
-        let identity_bytes = self.identity.to_public_bytes();
-
-        let capacity = 2 + name_bytes.len()
-            + 2 + namespace_bytes.len()
-            + 2 + domain_bytes.len()
-            + PUBLIC_KEY_LENGTH
-            + 8
-            + SIGNATURE_LENGTH * 2;
-
-        let mut buf = Vec::with_capacity(capacity);
-
-        buf.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
-        buf.extend_from_slice(name_bytes);
-
-        buf.extend_from_slice(&(namespace_bytes.len() as u16).to_be_bytes());
-        buf.extend_from_slice(namespace_bytes);
-
-        buf.extend_from_slice(&(domain_bytes.len() as u16).to_be_bytes());
-        buf.extend_from_slice(domain_bytes);
-
-        buf.extend_from_slice(&identity_bytes);
-
-        buf.extend_from_slice(&self.registered_at.to_be_bytes());
-
+        let mut buf = Self::canonical_bytes(
+            &self.name,
+            &self.namespace,
+            &self.domain,
+            &self.identity,
+            self.registered_at,
+        );
+        buf.reserve(SIGNATURE_LENGTH * 2);
         buf.extend_from_slice(&self.user_signature);
         buf.extend_from_slice(&self.domain_signature);
-
         buf
     }
 
