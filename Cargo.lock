@@ -816,6 +816,8 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "harmony-crypto",
+ "harmony-platform",
+ "hashbrown 0.15.5",
  "hex",
  "rand",
  "rand_core",

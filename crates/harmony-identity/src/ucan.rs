@@ -4,36 +4,34 @@
 //! proof references, and configurable revocation. Follows UCAN authorization
 //! principles with a compact binary format optimized for kernel verification.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
-use hashbrown::{HashMap, HashSet};
 use harmony_crypto::hash;
-use harmony_platform::EntropySource;
+use hashbrown::{HashMap, HashSet};
 
-use crate::identity::{Identity, PrivateIdentity, ADDRESS_HASH_LENGTH, SIGNATURE_LENGTH};
+use crate::identity::{Identity, ADDRESS_HASH_LENGTH, SIGNATURE_LENGTH};
 use crate::IdentityError;
 
 /// Maximum size of the resource field in bytes.
 pub const MAX_RESOURCE_SIZE: usize = 256;
 
-/// Capability types that can be granted by a UCAN token.
+/// Capability types matching the Ring 2 microkernel's resource model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CapabilityType {
-    /// Read/write access to content-addressed memory.
+    /// Access to a memory region.
     Memory = 0,
-    /// Access to network transport interfaces.
-    Network = 1,
-    /// Access to identity operations (signing, key management).
-    Identity = 2,
-    /// Access to persistent storage.
-    Storage = 3,
-    /// Access to publish/subscribe messaging.
-    Messaging = 4,
-    /// Access to workflow execution.
-    Workflow = 5,
-    /// Access to compute resources (WASM execution).
+    /// Permission to send 9P messages to a server.
+    Endpoint = 1,
+    /// Permission to receive a hardware interrupt.
+    Interrupt = 2,
+    /// Access to a hardware I/O port range.
+    IOPort = 3,
+    /// Right to sign with a specific Harmony identity.
+    Identity = 4,
+    /// Right to read/write a CID range in the blob store.
+    Content = 5,
+    /// Right to execute WASM with a fuel budget.
     Compute = 6,
 }
 
@@ -43,11 +41,11 @@ impl TryFrom<u8> for CapabilityType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Memory),
-            1 => Ok(Self::Network),
-            2 => Ok(Self::Identity),
-            3 => Ok(Self::Storage),
-            4 => Ok(Self::Messaging),
-            5 => Ok(Self::Workflow),
+            1 => Ok(Self::Endpoint),
+            2 => Ok(Self::Interrupt),
+            3 => Ok(Self::IOPort),
+            4 => Ok(Self::Identity),
+            5 => Ok(Self::Content),
             6 => Ok(Self::Compute),
             _ => Err(UcanError::InvalidEncoding),
         }
@@ -151,10 +149,15 @@ const MIN_TOKEN_SIZE: usize = ADDRESS_HASH_LENGTH  // issuer
     + 8                                             // expires_at
     + 16                                            // nonce
     + 1                                             // has_proof
-    + SIGNATURE_LENGTH;                             // signature
+    + SIGNATURE_LENGTH; // signature
 
 impl UcanToken {
     /// Serialize the token to its binary wire format.
+    ///
+    /// The caller must ensure `resource.len() <= MAX_RESOURCE_SIZE` (enforced
+    /// by the creation APIs `issue_root_token` / `delegate`). The length is
+    /// stored as a `u16`, so resources exceeding 65 535 bytes would be silently
+    /// truncated — but `MAX_RESOURCE_SIZE` (256) makes that unreachable.
     pub fn to_bytes(&self) -> Vec<u8> {
         let resource_len = self.resource.len() as u16;
         let proof_size = if self.proof.is_some() { 32 } else { 0 };
@@ -198,8 +201,7 @@ impl UcanToken {
         let capability = CapabilityType::try_from(data[pos])?;
         pos += 1;
 
-        let resource_len =
-            u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        let resource_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
         if resource_len > MAX_RESOURCE_SIZE {
@@ -214,12 +216,16 @@ impl UcanToken {
         pos += resource_len;
 
         let not_before = u64::from_be_bytes(
-            data[pos..pos + 8].try_into().map_err(|_| UcanError::InvalidEncoding)?,
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| UcanError::InvalidEncoding)?,
         );
         pos += 8;
 
         let expires_at = u64::from_be_bytes(
-            data[pos..pos + 8].try_into().map_err(|_| UcanError::InvalidEncoding)?,
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| UcanError::InvalidEncoding)?,
         );
         pos += 8;
 
@@ -265,6 +271,10 @@ impl UcanToken {
     }
 
     /// Compute the BLAKE3 content hash of this token's wire representation.
+    ///
+    /// The hash covers the entire serialized form including the signature,
+    /// so each signed token instance has a unique content hash. This is how
+    /// child tokens reference their parent in the proof chain.
     pub fn content_hash(&self) -> [u8; 32] {
         hash::blake3_hash(&self.to_bytes())
     }
@@ -275,13 +285,6 @@ impl UcanToken {
         // The signature is always the last SIGNATURE_LENGTH bytes.
         bytes[..bytes.len() - SIGNATURE_LENGTH].to_vec()
     }
-}
-
-/// A revocation record for a UCAN token.
-#[derive(Debug, Clone)]
-pub struct Revocation {
-    /// The hash of the token being revoked.
-    pub token_hash: [u8; 32],
 }
 
 /// Resolves proof chain references to their full tokens.
@@ -391,6 +394,7 @@ impl RevocationSet for MemoryRevocationSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PrivateIdentity;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
@@ -436,7 +440,7 @@ mod tests {
         UcanToken {
             issuer: [0x11; ADDRESS_HASH_LENGTH],
             audience: [0x22; ADDRESS_HASH_LENGTH],
-            capability: CapabilityType::Storage,
+            capability: CapabilityType::Content,
             resource: alloc::vec![0xFF; 10],
             not_before: 1_700_000_000,
             expires_at: 1_700_086_400,
