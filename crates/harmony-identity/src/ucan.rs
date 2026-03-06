@@ -393,6 +393,73 @@ impl RevocationSet for MemoryRevocationSet {
     }
 }
 
+/// A signed revocation record — invalidates a specific token and all its downstream delegations.
+#[derive(Debug, Clone)]
+pub struct Revocation {
+    /// Address hash of the revoking identity (must be the token's issuer).
+    pub issuer: [u8; ADDRESS_HASH_LENGTH],
+    /// BLAKE3 hash of the token being revoked.
+    pub token_hash: [u8; 32],
+    /// Timestamp of revocation.
+    pub revoked_at: u64,
+    /// Ed25519 signature over issuer + token_hash + revoked_at.
+    pub signature: [u8; SIGNATURE_LENGTH],
+}
+
+/// Exact wire size of a serialized revocation record.
+const REVOCATION_SIZE: usize = ADDRESS_HASH_LENGTH + 32 + 8 + SIGNATURE_LENGTH;
+
+impl Revocation {
+    /// Serialize to binary: `[16B issuer][32B token_hash][8B revoked_at][64B signature]`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(REVOCATION_SIZE);
+        buf.extend_from_slice(&self.issuer);
+        buf.extend_from_slice(&self.token_hash);
+        buf.extend_from_slice(&self.revoked_at.to_be_bytes());
+        buf.extend_from_slice(&self.signature);
+        buf
+    }
+
+    /// Deserialize from binary.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, UcanError> {
+        if bytes.len() != REVOCATION_SIZE {
+            return Err(UcanError::InvalidEncoding);
+        }
+
+        let mut pos = 0;
+
+        let mut issuer = [0u8; ADDRESS_HASH_LENGTH];
+        issuer.copy_from_slice(&bytes[pos..pos + ADDRESS_HASH_LENGTH]);
+        pos += ADDRESS_HASH_LENGTH;
+
+        let mut token_hash = [0u8; 32];
+        token_hash.copy_from_slice(&bytes[pos..pos + 32]);
+        pos += 32;
+
+        let revoked_at = u64::from_be_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+
+        let mut signature = [0u8; SIGNATURE_LENGTH];
+        signature.copy_from_slice(&bytes[pos..pos + SIGNATURE_LENGTH]);
+
+        Ok(Self {
+            issuer,
+            token_hash,
+            revoked_at,
+            signature,
+        })
+    }
+
+    /// Serialize the signable portion (everything except the signature).
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ADDRESS_HASH_LENGTH + 32 + 8);
+        buf.extend_from_slice(&self.issuer);
+        buf.extend_from_slice(&self.token_hash);
+        buf.extend_from_slice(&self.revoked_at.to_be_bytes());
+        buf
+    }
+}
+
 /// Verify a UCAN token and its delegation chain.
 ///
 /// Fully sans-I/O: the caller provides current time, proof resolution,
@@ -578,6 +645,24 @@ impl PrivateIdentity {
         let signable = token.signable_bytes();
         token.signature = self.sign(&signable);
         Ok(token)
+    }
+
+    /// Revoke a token that this identity issued.
+    ///
+    /// Creates a signed revocation record. Only the issuer of a token can
+    /// revoke it. Revoking a parent implicitly invalidates all downstream
+    /// delegations (chain verification fails if any link is revoked).
+    pub fn revoke(&self, token: &UcanToken, revoked_at: u64) -> Revocation {
+        let mut revocation = Revocation {
+            issuer: self.identity.address_hash,
+            token_hash: token.content_hash(),
+            revoked_at,
+            signature: [0u8; SIGNATURE_LENGTH],
+        };
+
+        let signable = revocation.signable_bytes();
+        revocation.signature = self.sign(&signable);
+        revocation
     }
 }
 
@@ -1148,5 +1233,99 @@ mod tests {
         // max_depth=1 means only 1 delegation hop allowed (root + 1 child)
         let result = verify_token(&t3, 0, &proofs, &ids, &MemoryRevocationSet::new(), 1);
         assert!(matches!(result, Err(UcanError::ChainTooDeep(1))));
+    }
+
+    // ── Task 8: Revocation tests ──────────────────────────────────────
+
+    #[test]
+    fn revocation_serialize_deserialize() {
+        let revocation = Revocation {
+            issuer: [1u8; 16],
+            token_hash: [2u8; 32],
+            revoked_at: 12345,
+            signature: [3u8; 64],
+        };
+        let bytes = revocation.to_bytes();
+        let restored = Revocation::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.issuer, [1u8; 16]);
+        assert_eq!(restored.token_hash, [2u8; 32]);
+        assert_eq!(restored.revoked_at, 12345);
+        assert_eq!(restored.signature, [3u8; 64]);
+    }
+
+    #[test]
+    fn revocation_truncated_bytes_rejected() {
+        assert!(matches!(
+            Revocation::from_bytes(&[0u8; 10]),
+            Err(UcanError::InvalidEncoding)
+        ));
+    }
+
+    #[test]
+    fn create_and_verify_revocation() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+
+        let token = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Content, &[], 0, 0)
+            .unwrap();
+
+        let revocation = issuer.revoke(&token, 5000);
+
+        // Verify the revocation signature
+        let signable = revocation.signable_bytes();
+        issuer
+            .public_identity()
+            .verify(&signable, &revocation.signature)
+            .unwrap();
+        assert_eq!(revocation.token_hash, token.content_hash());
+        assert_eq!(revocation.revoked_at, 5000);
+    }
+
+    #[test]
+    fn revoked_parent_invalidates_child() {
+        let mut rng = test_rng();
+        let root = PrivateIdentity::generate(&mut rng);
+        let delegate = PrivateIdentity::generate(&mut rng);
+
+        let root_token = root
+            .issue_root_token(
+                &mut rng,
+                &delegate.identity.address_hash,
+                CapabilityType::Content,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        let child_token = delegate
+            .delegate(
+                &mut rng,
+                &root_token,
+                &[0xDD; 16],
+                CapabilityType::Content,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        let mut proofs = MemoryProofStore::new();
+        proofs.insert(root_token.clone());
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(root.public_identity().clone());
+        ids.insert(delegate.public_identity().clone());
+        let mut revocations = MemoryRevocationSet::new();
+
+        // Child verifies before revocation
+        assert!(verify_token(&child_token, 0, &proofs, &ids, &revocations, 5).is_ok());
+
+        // Revoke the root token
+        revocations.insert(root_token.content_hash());
+
+        // Child now fails because parent is revoked
+        let result = verify_token(&child_token, 0, &proofs, &ids, &revocations, 5);
+        assert!(matches!(result, Err(UcanError::Revoked)));
     }
 }
