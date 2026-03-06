@@ -83,7 +83,7 @@ BRANCH=$(git branch --show-current)
 WORKTREE=$(git rev-parse --show-toplevel)
 
 # 2. Switch to main repo FIRST (escape the worktree CWD)
-MAIN_REPO=$(git worktree list --porcelain | head -1 | awk '{print $2}')
+MAIN_REPO=$(git worktree list --porcelain | head -1 | sed 's/^worktree //')
 cd "$MAIN_REPO"
 
 # 3. Remove the worktree (frees the local branch)

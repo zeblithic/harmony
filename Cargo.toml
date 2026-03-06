@@ -43,6 +43,8 @@ zeroize = { version = "1", default-features = false, features = ["derive", "allo
 subtle = { version = "2", default-features = false }
 thiserror = { version = "2", default-features = false }
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher", "inline-more", "allocator-api2", "equivalent"] }
+# rmp 0.8 has no `alloc` feature — only `std` (default). The no_std surface
+# (encode/decode on byte slices) works without any features enabled.
 rmp = { version = "0.8", default-features = false }
 hex = "0.4"
 
