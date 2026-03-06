@@ -494,13 +494,18 @@ pub fn verify_token(
 /// Verify a revocation record's signature and issuer match.
 ///
 /// Checks that:
-/// 1. `revocation.issuer` matches `token.issuer` (only the issuer can revoke)
-/// 2. The Ed25519 signature over the signable bytes is valid
+/// 1. `revocation.token_hash` matches `token.content_hash()` (targets this token)
+/// 2. `revocation.issuer` matches `token.issuer` (only the issuer can revoke)
+/// 3. The Ed25519 signature over the signable bytes is valid
 pub fn verify_revocation(
     revocation: &Revocation,
     token: &UcanToken,
     identities: &impl IdentityResolver,
 ) -> Result<(), UcanError> {
+    if revocation.token_hash != token.content_hash() {
+        return Err(UcanError::ProofNotFound);
+    }
+
     if revocation.issuer != token.issuer {
         return Err(UcanError::NotIssuer);
     }
@@ -1460,6 +1465,33 @@ mod tests {
 
         let result = verify_revocation(&revocation, &token, &ids);
         assert!(matches!(result, Err(UcanError::SignatureInvalid)));
+    }
+
+    #[test]
+    fn verify_revocation_wrong_token_rejected() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+
+        let token_a = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Content, &[], 0, 0)
+            .unwrap();
+        let token_b = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Memory, &[], 0, 0)
+            .unwrap();
+
+        // Revoke token A, then try to verify against token B
+        let revocation = issuer.revoke(&token_a, 5000).unwrap();
+
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+
+        // Should pass against token A
+        verify_revocation(&revocation, &token_a, &ids).unwrap();
+        // Should fail against token B (wrong token hash)
+        assert!(matches!(
+            verify_revocation(&revocation, &token_b, &ids),
+            Err(UcanError::ProofNotFound)
+        ));
     }
 
     #[test]
