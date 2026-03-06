@@ -6,6 +6,7 @@ members = [
     "crates/harmony-crypto",
     "crates/harmony-identity",
     "crates/harmony-node",
+    "crates/harmony-platform",
     "crates/harmony-reticulum",
     "crates/harmony-workflow",
     "crates/harmony-zenoh",
@@ -51,6 +52,7 @@ harmony-compute = { path = "crates/harmony-compute" }
 harmony-content = { path = "crates/harmony-content" }
 harmony-crypto = { path = "crates/harmony-crypto" }
 harmony-identity = { path = "crates/harmony-identity" }
+harmony-platform = { path = "crates/harmony-platform" }
 harmony-reticulum = { path = "crates/harmony-reticulum" }
 harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
