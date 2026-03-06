@@ -1,18 +1,18 @@
 ---
 description: Merge reviewed PR, clean up branches, return to latest main
 argument-hint: [pr-number]
-allowed-tools: Bash(git checkout:*), Bash(git branch:*), Bash(git pull:*), Bash(git push:*), Bash(git log:*), Bash(git status:*), Bash(gh pr merge:*), Bash(gh pr view:*), Bash(gh api:*), Bash(git add:*), Bash(git commit:*), Bash(git diff:*), Bash(bash scripts/finish-task.sh:*), Bash(bash scripts/review-state.sh:*), Bash(cd:*)
+allowed-tools: Bash(git checkout:*), Bash(git branch:*), Bash(git pull:*), Bash(git push:*), Bash(git log:*), Bash(git status:*), Bash(git worktree:*), Bash(git rev-parse:*), Bash(gh pr merge:*), Bash(gh pr view:*), Bash(gh api:*), Bash(git add:*), Bash(git commit:*), Bash(git diff:*), Bash(bash scripts/finish-task.sh:*), Bash(bash scripts/review-state.sh:*), Bash(cd:*), Bash(pwd:*)
 ---
 
 ## Context
 
 - Harmony repo: `/Users/zeblith/work/zeblithic/harmony`
-- Current branch: !`cd /Users/zeblith/work/zeblithic/harmony && git branch --show-current 2>/dev/null || echo "(not in repo)"`
-- Git status: !`cd /Users/zeblith/work/zeblithic/harmony && git status --short 2>/dev/null`
-- Uncommitted changes: !`cd /Users/zeblith/work/zeblithic/harmony && git diff --stat 2>/dev/null`
+- Session directory: !`pwd`
+- Git root: !`git rev-parse --show-toplevel 2>/dev/null || echo "(not in repo)"`
+- Current branch: !`git branch --show-current 2>/dev/null || echo "(not in repo)"`
+- Git status: !`git status --short 2>/dev/null`
+- Uncommitted changes: !`git diff --stat 2>/dev/null`
 - Open PRs: !`cd /Users/zeblith/work/zeblithic/harmony && gh pr list --state open --limit 5 2>/dev/null || echo "(gh not available)"`
-
-**All workflow commands must run from the harmony repo.** Start with: `cd /Users/zeblith/work/zeblithic/harmony`
 
 ## Arguments
 
@@ -24,13 +24,17 @@ If no PR number is provided, infer from the current branch's associated PR.
 
 ### Quick path (preferred)
 
-If there are no uncommitted changes, use the finish-task script which handles everything atomically:
+If there are no uncommitted changes, use the finish-task script which handles everything atomically — including worktree cleanup:
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony && bash scripts/finish-task.sh [PR_NUMBER]
+bash scripts/finish-task.sh [PR_NUMBER]
 ```
 
-The script: checks review state → merges (standard merge) → switches to main → pulls → deletes local branch → reports. It refuses to merge unless state is `REVIEWS_COMPLETE_ALL_CLEAR` (use `--force` to override).
+**In a worktree:** The script auto-detects worktrees. Run it from wherever you are (worktree or main repo). It will: check review state → merge (standard merge) → remove worktree (if applicable) → switch to main → pull → delete local branch → report.
+
+**In main repo:** Same behavior minus worktree cleanup.
+
+The script refuses to merge unless state is `REVIEWS_COMPLETE_ALL_CLEAR` (use `--force` to override).
 
 If the script succeeds, print the output and stop. If it fails, fall back to the manual steps below.
 
@@ -51,7 +55,7 @@ Use this when there are uncommitted changes or the script needs to be overridden
 #### 3. Verify review state
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony && bash scripts/review-state.sh {number}
+bash scripts/review-state.sh {number}
 ```
 
 If not `REVIEWS_COMPLETE_ALL_CLEAR`, read the actual findings:
@@ -72,6 +76,19 @@ The human can override ("merge it anyway") — but flag the state clearly.
 
 ```bash
 gh pr merge <number> --merge --delete-branch
+```
+
+**If in a worktree:**
+```bash
+cd /Users/zeblith/work/zeblithic/harmony   # main repo
+git worktree remove <worktree-path>         # remove the worktree
+git branch -d <branch-name>                 # delete local branch
+git pull origin main
+git log --oneline -3
+```
+
+**If in main repo (standard):**
+```bash
 git checkout main && git pull origin main
 git branch -d <branch-name>
 git log --oneline -3

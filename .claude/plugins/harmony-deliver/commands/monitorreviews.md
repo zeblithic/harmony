@@ -1,16 +1,18 @@
 ---
 description: Check the review status of a PR and determine what action is needed next
 argument-hint: [pr-number]
-allowed-tools: Bash(gh pr view:*), Bash(gh pr comments:*), Bash(gh api:*), Bash(git log:*), Bash(git branch:*), Bash(bash scripts/review-state.sh:*), Bash(cd:*)
+allowed-tools: Bash(gh pr view:*), Bash(gh pr comments:*), Bash(gh api:*), Bash(git log:*), Bash(git branch:*), Bash(bash scripts/review-state.sh:*), Bash(cd:*), Bash(pwd:*)
 ---
 
 ## Context
 
 - Harmony repo: `/Users/zeblith/work/zeblithic/harmony`
-- Current branch: !`cd /Users/zeblith/work/zeblithic/harmony && git branch --show-current 2>/dev/null || echo "(not in repo)"`
+- Session directory: !`pwd`
+- Git root: !`git rev-parse --show-toplevel 2>/dev/null || echo "(not in repo)"`
+- Current branch: !`git branch --show-current 2>/dev/null || echo "(not in repo)"`
 - Open PRs: !`cd /Users/zeblith/work/zeblithic/harmony && gh pr list --state open --limit 5 2>/dev/null || echo "(gh not available)"`
 
-**All workflow commands must run from the harmony repo.** Start with: `cd /Users/zeblith/work/zeblithic/harmony`
+**Worktree note:** The review-state script uses the GitHub API with explicit repo paths, so it works from either the main repo or a worktree. Run it from wherever you are.
 
 ## Arguments
 
@@ -25,7 +27,7 @@ If no PR number is provided, infer from the current branch's associated PR.
 The script deterministically gathers all review signals and derives the state machine state. It handles pagination and checks both API endpoints.
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony && bash scripts/review-state.sh [PR_NUMBER]
+bash scripts/review-state.sh [PR_NUMBER]
 ```
 
 This script outputs: trigger timestamps, reaction counts, latest responses from each bot, new comment counts, derived state, and recommended action. It also prints any new findings.

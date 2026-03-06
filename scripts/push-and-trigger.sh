@@ -10,8 +10,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_DIR"
+
+# Work from the caller's git root — supports both main repo and worktrees.
+# (git rev-parse --show-toplevel returns the worktree root when in a worktree,
+# or the main repo root when in the main checkout.)
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+cd "$GIT_ROOT"
 
 OWNER="zeblithic"
 REPO="harmony"
