@@ -22,7 +22,16 @@ thiserror = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["rand_core/getrandom"]
+std = [
+    "rand_core/getrandom",
+    "sha2/std",
+    "blake3/std",
+    "hmac/std",
+    "hkdf/std",
+    "chacha20poly1305/getrandom",
+    "subtle/std",
+    "thiserror/std",
+]
 
 [dev-dependencies]
 rand = { workspace = true }

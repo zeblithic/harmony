@@ -19,7 +19,14 @@ hashbrown = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
-std = ["harmony-crypto/std", "harmony-platform/std", "rand_core/getrandom"]
+std = [
+    "harmony-crypto/std",
+    "harmony-platform/std",
+    "rand_core/getrandom",
+    "ed25519-dalek/std",
+    "x25519-dalek/getrandom",
+    "thiserror/std",
+]
 test-utils = ["dep:hashbrown"]
 
 [dev-dependencies]
