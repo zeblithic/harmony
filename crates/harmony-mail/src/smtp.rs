@@ -198,6 +198,9 @@ impl SmtpSession {
             SmtpCommand::Quit => self.handle_quit(),
             SmtpCommand::Rset => self.handle_rset(),
             // RFC 5321 §4.1.1.9: NOOP always succeeds during an active session.
+            // No pending_rcpt guard: NOOP is a no-op that doesn't affect mail
+            // state. Response ordering for pipelined clients is the I/O layer's
+            // responsibility — the state machine emits actions in command order.
             SmtpCommand::Noop => {
                 if self.state == SmtpState::Closed {
                     return vec![];
@@ -220,10 +223,8 @@ impl SmtpSession {
         // as an implicit RSET. Reject only from Connected (no greeting yet),
         // DataReceiving (mid-transfer), and Closed.
         match self.state {
-            SmtpState::Connected
-            | SmtpState::DataReceiving
-            | SmtpState::DeliveryPending
-            | SmtpState::Closed => {
+            SmtpState::Closed => return vec![],
+            SmtpState::Connected | SmtpState::DataReceiving | SmtpState::DeliveryPending => {
                 return vec![SmtpAction::SendResponse(
                     503,
                     "Bad sequence of commands".to_string(),
@@ -266,10 +267,8 @@ impl SmtpSession {
         // RFC 5321 §4.1.1.1: HELO is the RFC 821 greeting — single-line response,
         // no capability advertisement. Same state transitions as EHLO.
         match self.state {
-            SmtpState::Connected
-            | SmtpState::DataReceiving
-            | SmtpState::DeliveryPending
-            | SmtpState::Closed => {
+            SmtpState::Closed => return vec![],
+            SmtpState::Connected | SmtpState::DataReceiving | SmtpState::DeliveryPending => {
                 return vec![SmtpAction::SendResponse(
                     503,
                     "Bad sequence of commands".to_string(),
@@ -396,11 +395,14 @@ impl SmtpSession {
     }
 
     fn handle_rset(&mut self) -> Vec<SmtpAction> {
-        // Reject RSET during data collection, delivery, or after close — these states require
-        // their respective completion events before accepting new commands, or are terminal.
+        if self.state == SmtpState::Closed {
+            return vec![];
+        }
+        // Reject RSET during data collection or delivery — these states require
+        // their respective completion events before accepting new commands.
         if matches!(
             self.state,
-            SmtpState::DeliveryPending | SmtpState::DataReceiving | SmtpState::Closed
+            SmtpState::DeliveryPending | SmtpState::DataReceiving
         ) {
             return vec![SmtpAction::SendResponse(
                 503,
@@ -1375,18 +1377,41 @@ mod tests {
     }
 
     #[test]
-    fn rset_on_closed_session_rejected() {
-        // Pipelined RSET after close should not resurrect the session to Ready.
+    fn rset_on_closed_session_returns_empty() {
+        // Pipelined RSET after close should not emit actions on a dead session.
         let mut session = ready_session();
         session.handle(SmtpEvent::Command(SmtpCommand::Quit));
         assert_eq!(session.state, SmtpState::Closed);
 
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Rset));
         assert_eq!(session.state, SmtpState::Closed, "Closed is terminal — RSET must not change it");
-        match &actions[0] {
-            SmtpAction::SendResponse(code, _) => assert_eq!(*code, 503),
-            other => panic!("expected 503, got {other:?}"),
-        }
+        assert!(actions.is_empty(), "RSET on Closed must not emit actions");
+    }
+
+    #[test]
+    fn ehlo_on_closed_session_returns_empty() {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::Quit));
+        assert_eq!(session.state, SmtpState::Closed);
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+            domain: "example.com".to_string(),
+        }));
+        assert!(actions.is_empty(), "EHLO on Closed must not emit actions");
+        assert_eq!(session.state, SmtpState::Closed);
+    }
+
+    #[test]
+    fn helo_on_closed_session_returns_empty() {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::Quit));
+        assert_eq!(session.state, SmtpState::Closed);
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Helo {
+            domain: "example.com".to_string(),
+        }));
+        assert!(actions.is_empty(), "HELO on Closed must not emit actions");
+        assert_eq!(session.state, SmtpState::Closed);
     }
 
     /// Drive a session to DeliveryPending state for tests.

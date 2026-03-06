@@ -25,7 +25,8 @@ pub const MAX_RECIPIENTS: usize = 100;
 pub const MAX_ATTACHMENTS: usize = 100;
 
 /// Length of a Harmony address hash in bytes.
-pub const ADDRESS_HASH_LEN: usize = 16;
+/// Re-exported from harmony-identity to avoid duplicate constants.
+pub use harmony_identity::identity::ADDRESS_HASH_LENGTH as ADDRESS_HASH_LEN;
 
 /// Length of a content identifier (CID) in bytes.
 pub const CID_LEN: usize = 32;
