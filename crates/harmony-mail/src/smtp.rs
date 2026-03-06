@@ -366,10 +366,15 @@ impl SmtpSession {
     }
 
     fn handle_quit(&mut self) -> Vec<SmtpAction> {
-        if self.state == SmtpState::DeliveryPending {
+        // Reject QUIT during data collection or delivery — these states require their
+        // respective completion events before accepting new commands.
+        if matches!(
+            self.state,
+            SmtpState::DeliveryPending | SmtpState::DataReceiving
+        ) {
             return vec![SmtpAction::SendResponse(
                 503,
-                "Delivery in progress, wait for response".to_string(),
+                "Bad sequence of commands".to_string(),
             )];
         }
         if self.state == SmtpState::Closed {
@@ -573,6 +578,24 @@ mod tests {
         session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
             domain: "sender.example.com".to_string(),
         }));
+        session
+    }
+
+    /// Build a session in `DataReceiving` state (after EHLO, MAIL FROM, RCPT TO + resolve, DATA).
+    fn data_receiving_session() -> SmtpSession {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "bob".to_string(),
+            identity: Some([0xBB; ADDRESS_HASH_LEN]),
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Data));
+        assert_eq!(session.state, SmtpState::DataReceiving);
         session
     }
 
@@ -1210,19 +1233,7 @@ mod tests {
 
     #[test]
     fn rset_rejected_during_data_receiving() {
-        let mut session = ready_session();
-        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
-            address: "alice@sender.example.com".to_string(),
-        }));
-        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
-            address: "bob@harmony.example.com".to_string(),
-        }));
-        session.handle(SmtpEvent::HarmonyResolved {
-            local_part: "bob".to_string(),
-            identity: Some([0xBB; ADDRESS_HASH_LEN]),
-        });
-        session.handle(SmtpEvent::Command(SmtpCommand::Data));
-        assert_eq!(session.state, SmtpState::DataReceiving);
+        let mut session = data_receiving_session();
 
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Rset));
         assert_eq!(session.state, SmtpState::DataReceiving, "RSET should not change state during DataReceiving");
@@ -1327,6 +1338,22 @@ mod tests {
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Quit));
         assert!(actions.is_empty(), "QUIT on closed session should produce no actions");
         assert_eq!(session.state, SmtpState::Closed);
+    }
+
+    #[test]
+    fn quit_during_data_receiving_rejected() {
+        // QUIT during DataReceiving should be rejected with 503, consistent with RSET.
+        // The I/O layer should never send Command events during data collection, but
+        // the state machine should defensively reject them.
+        let mut session = data_receiving_session();
+        assert_eq!(session.state, SmtpState::DataReceiving);
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Quit));
+        assert_eq!(session.state, SmtpState::DataReceiving, "QUIT must not exit DataReceiving");
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => assert_eq!(*code, 503),
+            other => panic!("expected 503, got {other:?}"),
+        }
     }
 
     #[test]
