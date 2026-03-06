@@ -393,6 +393,104 @@ impl RevocationSet for MemoryRevocationSet {
     }
 }
 
+/// Verify a UCAN token and its delegation chain.
+///
+/// Fully sans-I/O: the caller provides current time, proof resolution,
+/// identity lookup, and revocation state.
+///
+/// # Arguments
+/// - `token` — the token to verify
+/// - `now` — current Unix timestamp in seconds
+/// - `proofs` — resolves parent tokens by BLAKE3 hash
+/// - `identities` — resolves issuer identities by address hash
+/// - `revocations` — checks if a token hash has been revoked
+/// - `max_depth` — maximum delegation chain depth (0 = root only)
+pub fn verify_token(
+    token: &UcanToken,
+    now: u64,
+    proofs: &impl ProofResolver,
+    identities: &impl IdentityResolver,
+    revocations: &impl RevocationSet,
+    max_depth: usize,
+) -> Result<(), UcanError> {
+    verify_token_recursive(token, now, proofs, identities, revocations, max_depth, 0)
+}
+
+fn verify_token_recursive(
+    token: &UcanToken,
+    now: u64,
+    proofs: &impl ProofResolver,
+    identities: &impl IdentityResolver,
+    revocations: &impl RevocationSet,
+    max_depth: usize,
+    current_depth: usize,
+) -> Result<(), UcanError> {
+    // 1. Check time bounds
+    if token.not_before > now {
+        return Err(UcanError::NotYetValid);
+    }
+    if token.expires_at != 0 && now > token.expires_at {
+        return Err(UcanError::Expired);
+    }
+
+    // 2. Verify signature
+    let issuer_identity = identities
+        .resolve(&token.issuer)
+        .ok_or(UcanError::IssuerNotFound)?;
+    let signable = token.signable_bytes();
+    issuer_identity
+        .verify(&signable, &token.signature)
+        .map_err(|_| UcanError::SignatureInvalid)?;
+
+    // 3. Check revocation
+    if revocations.is_revoked(&token.content_hash()) {
+        return Err(UcanError::Revoked);
+    }
+
+    // 4. If delegated, verify the chain
+    if let Some(parent_hash) = &token.proof {
+        if current_depth >= max_depth {
+            return Err(UcanError::ChainTooDeep(max_depth));
+        }
+
+        let parent = proofs
+            .resolve(parent_hash)
+            .ok_or(UcanError::ProofNotFound)?;
+
+        // Chain continuity: parent.audience must equal this token's issuer
+        if parent.audience != token.issuer {
+            return Err(UcanError::ChainBroken);
+        }
+
+        // Attenuation: capability type must match
+        if parent.capability != token.capability {
+            return Err(UcanError::CapabilityMismatch);
+        }
+
+        // Attenuation: time bounds must be narrowed
+        if token.not_before < parent.not_before {
+            return Err(UcanError::AttenuationViolation);
+        }
+        if parent.expires_at != 0 && (token.expires_at == 0 || token.expires_at > parent.expires_at)
+        {
+            return Err(UcanError::AttenuationViolation);
+        }
+
+        // Recursively verify parent
+        verify_token_recursive(
+            &parent,
+            now,
+            proofs,
+            identities,
+            revocations,
+            max_depth,
+            current_depth + 1,
+        )?;
+    }
+
+    Ok(())
+}
+
 impl PrivateIdentity {
     /// Issue a root UCAN token — claims direct ownership of a resource.
     ///
@@ -680,5 +778,103 @@ mod tests {
             .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Content, &[], 0, 0)
             .unwrap();
         assert_ne!(t1.nonce, t2.nonce);
+    }
+
+    // ── Task 6: Verification tests ────────────────────────────────────
+
+    /// Helper: set up a root token with stores for verification.
+    fn setup_root_token() -> (
+        UcanToken,
+        MemoryProofStore,
+        MemoryIdentityStore,
+        MemoryRevocationSet,
+    ) {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        let audience_hash = [0xAA; 16];
+
+        let token = issuer
+            .issue_root_token(
+                &mut rng,
+                &audience_hash,
+                CapabilityType::Content,
+                &[1, 2, 3],
+                1000,
+                2000,
+            )
+            .unwrap();
+
+        let proof_store = MemoryProofStore::new();
+        let mut id_store = MemoryIdentityStore::new();
+        id_store.insert(issuer.public_identity().clone());
+        let revocations = MemoryRevocationSet::new();
+
+        (token, proof_store, id_store, revocations)
+    }
+
+    #[test]
+    fn verify_valid_root_token() {
+        let (token, proofs, ids, revocations) = setup_root_token();
+        let result = verify_token(&token, 1500, &proofs, &ids, &revocations, 5);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_expired_token() {
+        let (token, proofs, ids, revocations) = setup_root_token();
+        let result = verify_token(&token, 3000, &proofs, &ids, &revocations, 5);
+        assert!(matches!(result, Err(UcanError::Expired)));
+    }
+
+    #[test]
+    fn verify_not_yet_valid_token() {
+        let (token, proofs, ids, revocations) = setup_root_token();
+        let result = verify_token(&token, 500, &proofs, &ids, &revocations, 5);
+        assert!(matches!(result, Err(UcanError::NotYetValid)));
+    }
+
+    #[test]
+    fn verify_no_expiry_always_valid() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        let token = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Content, &[], 0, 0)
+            .unwrap();
+
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+        let result = verify_token(
+            &token,
+            u64::MAX,
+            &MemoryProofStore::new(),
+            &ids,
+            &MemoryRevocationSet::new(),
+            5,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_revoked_token() {
+        let (token, proofs, ids, mut revocations) = setup_root_token();
+        revocations.insert(token.content_hash());
+        let result = verify_token(&token, 1500, &proofs, &ids, &revocations, 5);
+        assert!(matches!(result, Err(UcanError::Revoked)));
+    }
+
+    #[test]
+    fn verify_unknown_issuer() {
+        let (token, proofs, _, revocations) = setup_root_token();
+        let empty_ids = MemoryIdentityStore::new();
+        let result = verify_token(&token, 1500, &proofs, &empty_ids, &revocations, 5);
+        assert!(matches!(result, Err(UcanError::IssuerNotFound)));
+    }
+
+    #[test]
+    fn verify_tampered_signature() {
+        let (mut token, proofs, ids, revocations) = setup_root_token();
+        token.signature[0] ^= 0xFF;
+        let result = verify_token(&token, 1500, &proofs, &ids, &revocations, 5);
+        assert!(matches!(result, Err(UcanError::SignatureInvalid)));
     }
 }
