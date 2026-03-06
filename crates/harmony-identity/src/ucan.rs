@@ -101,6 +101,10 @@ pub enum UcanError {
     #[error("invalid binary encoding")]
     InvalidEncoding,
 
+    /// The revocation's token hash does not match the supplied token.
+    #[error("revocation targets a different token")]
+    TokenHashMismatch,
+
     /// The resource field exceeds the maximum allowed size.
     #[error("resource exceeds maximum size of {MAX_RESOURCE_SIZE} bytes")]
     ResourceTooLarge,
@@ -503,7 +507,7 @@ pub fn verify_revocation(
     identities: &impl IdentityResolver,
 ) -> Result<(), UcanError> {
     if revocation.token_hash != token.content_hash() {
-        return Err(UcanError::ProofNotFound);
+        return Err(UcanError::TokenHashMismatch);
     }
 
     if revocation.issuer != token.issuer {
@@ -572,7 +576,9 @@ fn verify_token_recursive(
             return Err(UcanError::CapabilityMismatch);
         }
 
-        // Attenuation: time bounds must be narrowed
+        // Attenuation: capability type + time bounds only.
+        // NOTE: resource bytes are intentionally not compared here; Ring 2 is
+        // responsible for resource-level attenuation (see design decision table).
         if token.not_before < parent.not_before {
             return Err(UcanError::AttenuationViolation);
         }
@@ -614,6 +620,9 @@ impl PrivateIdentity {
         if resource.len() > MAX_RESOURCE_SIZE {
             return Err(UcanError::ResourceTooLarge);
         }
+        if expires_at != 0 && not_before > expires_at {
+            return Err(UcanError::InvalidEncoding);
+        }
 
         let mut nonce = [0u8; 16];
         rng.fill_bytes(&mut nonce);
@@ -639,7 +648,9 @@ impl PrivateIdentity {
     ///
     /// Creates a child token referencing the parent by BLAKE3 hash.
     /// Enforces attenuation: capability type must match, time bounds
-    /// must be narrowed or equal.
+    /// must be narrowed or equal. **Resource bytes are NOT checked** —
+    /// resource-level attenuation (memory ranges, CID ranges, fuel budgets)
+    /// is the responsibility of Ring 2 callers.
     #[allow(clippy::too_many_arguments)]
     pub fn delegate(
         &self,
@@ -653,6 +664,9 @@ impl PrivateIdentity {
     ) -> Result<UcanToken, UcanError> {
         if resource.len() > MAX_RESOURCE_SIZE {
             return Err(UcanError::ResourceTooLarge);
+        }
+        if expires_at != 0 && not_before > expires_at {
+            return Err(UcanError::InvalidEncoding);
         }
 
         // Chain continuity: caller must be the parent's intended audience
@@ -1490,7 +1504,7 @@ mod tests {
         // Should fail against token B (wrong token hash)
         assert!(matches!(
             verify_revocation(&revocation, &token_b, &ids),
-            Err(UcanError::ProofNotFound)
+            Err(UcanError::TokenHashMismatch)
         ));
     }
 
@@ -1539,5 +1553,53 @@ mod tests {
         // Child now fails because parent is revoked
         let result = verify_token(&child_token, 0, &proofs, &ids, &revocations, 5);
         assert!(matches!(result, Err(UcanError::Revoked)));
+    }
+
+    #[test]
+    fn issue_rejects_not_before_after_expires() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        let result =
+            issuer.issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Memory, &[], 200, 100);
+        assert!(matches!(result, Err(UcanError::InvalidEncoding)));
+    }
+
+    #[test]
+    fn delegate_rejects_not_before_after_expires() {
+        let mut rng = test_rng();
+        let root = PrivateIdentity::generate(&mut rng);
+        let delegate = PrivateIdentity::generate(&mut rng);
+        let parent = root
+            .issue_root_token(
+                &mut rng,
+                &delegate.identity.address_hash,
+                CapabilityType::Memory,
+                &[],
+                0,
+                1000,
+            )
+            .unwrap();
+
+        // not_before (500) > expires_at (400)
+        let result = delegate.delegate(
+            &mut rng,
+            &parent,
+            &[0u8; 16],
+            CapabilityType::Memory,
+            &[],
+            500,
+            400,
+        );
+        assert!(matches!(result, Err(UcanError::InvalidEncoding)));
+    }
+
+    #[test]
+    fn issue_allows_zero_expires_with_any_not_before() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        // expires_at = 0 means no expiry, should be fine regardless of not_before
+        let result =
+            issuer.issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Memory, &[], 500, 0);
+        assert!(result.is_ok());
     }
 }
