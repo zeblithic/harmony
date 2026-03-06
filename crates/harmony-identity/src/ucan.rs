@@ -529,6 +529,56 @@ impl PrivateIdentity {
         token.signature = self.sign(&signable);
         Ok(token)
     }
+
+    /// Delegate a capability to another identity.
+    ///
+    /// Creates a child token referencing the parent by BLAKE3 hash.
+    /// Enforces attenuation: capability type must match, time bounds
+    /// must be narrowed or equal.
+    pub fn delegate(
+        &self,
+        rng: &mut impl EntropySource,
+        parent: &UcanToken,
+        audience: &[u8; ADDRESS_HASH_LENGTH],
+        capability: CapabilityType,
+        resource: &[u8],
+        not_before: u64,
+        expires_at: u64,
+    ) -> Result<UcanToken, UcanError> {
+        if resource.len() > MAX_RESOURCE_SIZE {
+            return Err(UcanError::ResourceTooLarge);
+        }
+
+        // Attenuation checks
+        if capability != parent.capability {
+            return Err(UcanError::CapabilityMismatch);
+        }
+        if not_before < parent.not_before {
+            return Err(UcanError::AttenuationViolation);
+        }
+        if parent.expires_at != 0 && (expires_at == 0 || expires_at > parent.expires_at) {
+            return Err(UcanError::AttenuationViolation);
+        }
+
+        let mut nonce = [0u8; 16];
+        rng.fill_bytes(&mut nonce);
+
+        let mut token = UcanToken {
+            issuer: self.identity.address_hash,
+            audience: *audience,
+            capability,
+            resource: resource.to_vec(),
+            not_before,
+            expires_at,
+            nonce,
+            proof: Some(parent.content_hash()),
+            signature: [0u8; SIGNATURE_LENGTH],
+        };
+
+        let signable = token.signable_bytes();
+        token.signature = self.sign(&signable);
+        Ok(token)
+    }
 }
 
 #[cfg(test)]
@@ -876,5 +926,227 @@ mod tests {
         token.signature[0] ^= 0xFF;
         let result = verify_token(&token, 1500, &proofs, &ids, &revocations, 5);
         assert!(matches!(result, Err(UcanError::SignatureInvalid)));
+    }
+
+    // ── Task 7: Delegation tests ──────────────────────────────────────
+
+    #[test]
+    fn delegate_creates_valid_chain() {
+        let mut rng = test_rng();
+        let root_id = PrivateIdentity::generate(&mut rng);
+        let delegate_id = PrivateIdentity::generate(&mut rng);
+        let end_user = [0xCC; 16];
+
+        let root_token = root_id
+            .issue_root_token(
+                &mut rng,
+                &delegate_id.identity.address_hash,
+                CapabilityType::Content,
+                &[1, 2, 3],
+                1000,
+                5000,
+            )
+            .unwrap();
+
+        let child_token = delegate_id
+            .delegate(
+                &mut rng,
+                &root_token,
+                &end_user,
+                CapabilityType::Content,
+                &[1, 2, 3],
+                2000,
+                4000,
+            )
+            .unwrap();
+
+        assert_eq!(child_token.issuer, delegate_id.identity.address_hash);
+        assert_eq!(child_token.audience, end_user);
+        assert_eq!(child_token.proof, Some(root_token.content_hash()));
+
+        // Verify the full chain
+        let mut proofs = MemoryProofStore::new();
+        proofs.insert(root_token);
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(root_id.public_identity().clone());
+        ids.insert(delegate_id.public_identity().clone());
+        let revocations = MemoryRevocationSet::new();
+
+        let result = verify_token(&child_token, 3000, &proofs, &ids, &revocations, 5);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn delegate_capability_mismatch_rejected() {
+        let mut rng = test_rng();
+        let root_id = PrivateIdentity::generate(&mut rng);
+        let delegate_id = PrivateIdentity::generate(&mut rng);
+
+        let root_token = root_id
+            .issue_root_token(
+                &mut rng,
+                &delegate_id.identity.address_hash,
+                CapabilityType::Content,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        let result = delegate_id.delegate(
+            &mut rng,
+            &root_token,
+            &[0u8; 16],
+            CapabilityType::Memory, // Wrong type!
+            &[],
+            0,
+            0,
+        );
+        assert!(matches!(result, Err(UcanError::CapabilityMismatch)));
+    }
+
+    #[test]
+    fn delegate_time_expansion_rejected() {
+        let mut rng = test_rng();
+        let root_id = PrivateIdentity::generate(&mut rng);
+        let delegate_id = PrivateIdentity::generate(&mut rng);
+
+        let root_token = root_id
+            .issue_root_token(
+                &mut rng,
+                &delegate_id.identity.address_hash,
+                CapabilityType::Content,
+                &[],
+                1000,
+                5000,
+            )
+            .unwrap();
+
+        // Try to expand expiry beyond parent
+        let result = delegate_id.delegate(
+            &mut rng,
+            &root_token,
+            &[0u8; 16],
+            CapabilityType::Content,
+            &[],
+            1000,
+            6000, // Beyond parent's 5000
+        );
+        assert!(matches!(result, Err(UcanError::AttenuationViolation)));
+
+        // Try to move not_before earlier than parent
+        let result = delegate_id.delegate(
+            &mut rng,
+            &root_token,
+            &[0u8; 16],
+            CapabilityType::Content,
+            &[],
+            500, // Before parent's 1000
+            5000,
+        );
+        assert!(matches!(result, Err(UcanError::AttenuationViolation)));
+    }
+
+    #[test]
+    fn three_hop_delegation_chain() {
+        let mut rng = test_rng();
+        let root = PrivateIdentity::generate(&mut rng);
+        let mid = PrivateIdentity::generate(&mut rng);
+        let leaf = PrivateIdentity::generate(&mut rng);
+        let end_user = [0xFF; 16];
+
+        let t1 = root
+            .issue_root_token(
+                &mut rng,
+                &mid.identity.address_hash,
+                CapabilityType::Compute,
+                &[10],
+                0,
+                10000,
+            )
+            .unwrap();
+
+        let t2 = mid
+            .delegate(
+                &mut rng,
+                &t1,
+                &leaf.identity.address_hash,
+                CapabilityType::Compute,
+                &[10],
+                1000,
+                9000,
+            )
+            .unwrap();
+
+        let t3 = leaf
+            .delegate(
+                &mut rng,
+                &t2,
+                &end_user,
+                CapabilityType::Compute,
+                &[10],
+                2000,
+                8000,
+            )
+            .unwrap();
+
+        let mut proofs = MemoryProofStore::new();
+        proofs.insert(t1);
+        proofs.insert(t2);
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(root.public_identity().clone());
+        ids.insert(mid.public_identity().clone());
+        ids.insert(leaf.public_identity().clone());
+        let revocations = MemoryRevocationSet::new();
+
+        assert!(verify_token(&t3, 5000, &proofs, &ids, &revocations, 5).is_ok());
+    }
+
+    #[test]
+    fn chain_exceeds_max_depth() {
+        let mut rng = test_rng();
+        let root = PrivateIdentity::generate(&mut rng);
+        let mid = PrivateIdentity::generate(&mut rng);
+        let leaf = PrivateIdentity::generate(&mut rng);
+        let end_user = [0xFF; 16];
+
+        let t1 = root
+            .issue_root_token(
+                &mut rng,
+                &mid.identity.address_hash,
+                CapabilityType::Content,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        let t2 = mid
+            .delegate(
+                &mut rng,
+                &t1,
+                &leaf.identity.address_hash,
+                CapabilityType::Content,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        let t3 = leaf
+            .delegate(&mut rng, &t2, &end_user, CapabilityType::Content, &[], 0, 0)
+            .unwrap();
+
+        let mut proofs = MemoryProofStore::new();
+        proofs.insert(t1);
+        proofs.insert(t2);
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(root.public_identity().clone());
+        ids.insert(mid.public_identity().clone());
+        ids.insert(leaf.public_identity().clone());
+
+        // max_depth=1 means only 1 delegation hop allowed (root + 1 child)
+        let result = verify_token(&t3, 0, &proofs, &ids, &MemoryRevocationSet::new(), 1);
+        assert!(matches!(result, Err(UcanError::ChainTooDeep(1))));
     }
 }
