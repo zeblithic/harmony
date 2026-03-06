@@ -351,6 +351,12 @@ impl SmtpSession {
     }
 
     fn handle_quit(&mut self) -> Vec<SmtpAction> {
+        if self.state == SmtpState::DeliveryPending {
+            return vec![SmtpAction::SendResponse(
+                503,
+                "Delivery in progress, wait for response".to_string(),
+            )];
+        }
         self.state = SmtpState::Closed;
         vec![
             SmtpAction::SendResponse(221, "Bye".to_string()),
@@ -1073,6 +1079,25 @@ mod tests {
             }
             other => panic!("expected SendResponse(552, ...), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn quit_rejected_during_delivery_pending() {
+        let mut session = delivery_pending_session();
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Quit));
+        assert_eq!(session.state, SmtpState::DeliveryPending);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _msg) => assert_eq!(*code, 503),
+            other => panic!("expected 503, got {other:?}"),
+        }
+
+        // Delivery result should still work after the rejected QUIT.
+        let actions = session.handle(SmtpEvent::DeliveryResult { success: true });
+        assert_eq!(
+            actions[0],
+            SmtpAction::SendResponse(250, "OK".to_string())
+        );
     }
 
     #[test]
