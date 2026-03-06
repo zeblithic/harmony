@@ -105,6 +105,10 @@ pub enum UcanError {
     #[error("resource exceeds maximum size of {MAX_RESOURCE_SIZE} bytes")]
     ResourceTooLarge,
 
+    /// The caller is not the token's issuer (cannot revoke).
+    #[error("only the token issuer can revoke it")]
+    NotIssuer,
+
     /// Wraps an identity error.
     #[error(transparent)]
     Identity(#[from] IdentityError),
@@ -487,6 +491,31 @@ pub fn verify_token(
     verify_token_recursive(token, now, proofs, identities, revocations, max_depth, 0)
 }
 
+/// Verify a revocation record's signature and issuer match.
+///
+/// Checks that:
+/// 1. `revocation.issuer` matches `token.issuer` (only the issuer can revoke)
+/// 2. The Ed25519 signature over the signable bytes is valid
+pub fn verify_revocation(
+    revocation: &Revocation,
+    token: &UcanToken,
+    identities: &impl IdentityResolver,
+) -> Result<(), UcanError> {
+    if revocation.issuer != token.issuer {
+        return Err(UcanError::NotIssuer);
+    }
+
+    let identity = identities
+        .resolve(&revocation.issuer)
+        .ok_or(UcanError::IssuerNotFound)?;
+    let signable = revocation.signable_bytes();
+    identity
+        .verify(&signable, &revocation.signature)
+        .map_err(|_| UcanError::SignatureInvalid)?;
+
+    Ok(())
+}
+
 fn verify_token_recursive(
     token: &UcanToken,
     now: u64,
@@ -659,10 +688,14 @@ impl PrivateIdentity {
 
     /// Revoke a token that this identity issued.
     ///
-    /// Creates a signed revocation record. Only the issuer of a token can
-    /// revoke it. Revoking a parent implicitly invalidates all downstream
-    /// delegations (chain verification fails if any link is revoked).
-    pub fn revoke(&self, token: &UcanToken, revoked_at: u64) -> Revocation {
+    /// Creates a signed revocation record. Returns `NotIssuer` if this identity
+    /// is not the token's issuer. Revoking a parent implicitly invalidates all
+    /// downstream delegations (chain verification fails if any link is revoked).
+    pub fn revoke(&self, token: &UcanToken, revoked_at: u64) -> Result<Revocation, UcanError> {
+        if self.identity.address_hash != token.issuer {
+            return Err(UcanError::NotIssuer);
+        }
+
         let mut revocation = Revocation {
             issuer: self.identity.address_hash,
             token_hash: token.content_hash(),
@@ -672,7 +705,7 @@ impl PrivateIdentity {
 
         let signable = revocation.signable_bytes();
         revocation.signature = self.sign(&signable);
-        revocation
+        Ok(revocation)
     }
 }
 
@@ -1357,16 +1390,76 @@ mod tests {
             .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Content, &[], 0, 0)
             .unwrap();
 
-        let revocation = issuer.revoke(&token, 5000);
+        let revocation = issuer.revoke(&token, 5000).unwrap();
 
-        // Verify the revocation signature
-        let signable = revocation.signable_bytes();
-        issuer
-            .public_identity()
-            .verify(&signable, &revocation.signature)
-            .unwrap();
+        // Verify using verify_revocation()
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+        verify_revocation(&revocation, &token, &ids).unwrap();
+
         assert_eq!(revocation.token_hash, token.content_hash());
         assert_eq!(revocation.revoked_at, 5000);
+    }
+
+    #[test]
+    fn revoke_by_non_issuer_rejected() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        let other = PrivateIdentity::generate(&mut rng);
+
+        let token = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Content, &[], 0, 0)
+            .unwrap();
+
+        let result = other.revoke(&token, 5000);
+        assert!(matches!(result, Err(UcanError::NotIssuer)));
+    }
+
+    #[test]
+    fn verify_revocation_wrong_issuer_rejected() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        let attacker = PrivateIdentity::generate(&mut rng);
+
+        let token = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Content, &[], 0, 0)
+            .unwrap();
+
+        // Attacker creates a token they issued, then forges a revocation
+        // with mismatched issuer field (manually constructed).
+        let forged = Revocation {
+            issuer: attacker.identity.address_hash,
+            token_hash: token.content_hash(),
+            revoked_at: 5000,
+            signature: [0u8; SIGNATURE_LENGTH],
+        };
+
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(attacker.public_identity().clone());
+        ids.insert(issuer.public_identity().clone());
+
+        let result = verify_revocation(&forged, &token, &ids);
+        assert!(matches!(result, Err(UcanError::NotIssuer)));
+    }
+
+    #[test]
+    fn verify_revocation_bad_signature_rejected() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+
+        let token = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Content, &[], 0, 0)
+            .unwrap();
+
+        // Create a valid revocation then corrupt the signature
+        let mut revocation = issuer.revoke(&token, 5000).unwrap();
+        revocation.signature[0] ^= 0xFF;
+
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(issuer.public_identity().clone());
+
+        let result = verify_revocation(&revocation, &token, &ids);
+        assert!(matches!(result, Err(UcanError::SignatureInvalid)));
     }
 
     #[test]

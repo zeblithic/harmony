@@ -8,6 +8,7 @@ pub mod ucan;
 pub use error::IdentityError;
 pub use identity::{Identity, PrivateIdentity};
 pub use ucan::{
-    verify_token, CapabilityType, IdentityResolver, MemoryIdentityStore, MemoryProofStore,
-    MemoryRevocationSet, ProofResolver, Revocation, RevocationSet, UcanError, UcanToken,
+    verify_revocation, verify_token, CapabilityType, IdentityResolver, MemoryIdentityStore,
+    MemoryProofStore, MemoryRevocationSet, ProofResolver, Revocation, RevocationSet, UcanError,
+    UcanToken,
 };
