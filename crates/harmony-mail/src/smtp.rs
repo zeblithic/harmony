@@ -199,7 +199,10 @@ impl SmtpSession {
         // as an implicit RSET. Reject only from Connected (no greeting yet),
         // DataReceiving (mid-transfer), and Closed.
         match self.state {
-            SmtpState::Connected | SmtpState::DataReceiving | SmtpState::Closed => {
+            SmtpState::Connected
+            | SmtpState::DataReceiving
+            | SmtpState::DeliveryPending
+            | SmtpState::Closed => {
                 return vec![SmtpAction::SendResponse(
                     503,
                     "Bad sequence of commands".to_string(),
@@ -211,7 +214,6 @@ impl SmtpSession {
                 self.mail_from = None;
                 self.resolved_recipients.clear();
                 self.pending_rcpt = None;
-
             }
         }
 
@@ -236,7 +238,10 @@ impl SmtpSession {
         // RFC 5321 §4.1.1.1: HELO is the RFC 821 greeting — single-line response,
         // no capability advertisement. Same state transitions as EHLO.
         match self.state {
-            SmtpState::Connected | SmtpState::DataReceiving | SmtpState::Closed => {
+            SmtpState::Connected
+            | SmtpState::DataReceiving
+            | SmtpState::DeliveryPending
+            | SmtpState::Closed => {
                 return vec![SmtpAction::SendResponse(
                     503,
                     "Bad sequence of commands".to_string(),
@@ -346,6 +351,14 @@ impl SmtpSession {
     }
 
     fn handle_rset(&mut self) -> Vec<SmtpAction> {
+        // Reject RSET while delivery is in flight — I/O layer must wait for
+        // DeliveryResult before accepting new commands.
+        if self.state == SmtpState::DeliveryPending {
+            return vec![SmtpAction::SendResponse(
+                503,
+                "Bad sequence of commands".to_string(),
+            )];
+        }
         self.mail_from = None;
         self.resolved_recipients.clear();
         self.pending_rcpt = None;
@@ -979,5 +992,57 @@ mod tests {
             }
             other => panic!("expected SendResponse(451, ...), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ehlo_rejected_during_delivery_pending() {
+        let mut session = delivery_pending_session();
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+            domain: "reset.example.com".to_string(),
+        }));
+        assert_eq!(session.state, SmtpState::DeliveryPending);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _msg) => assert_eq!(*code, 503),
+            other => panic!("expected 503, got {other:?}"),
+        }
+
+        // Delivery result should still work after the rejected EHLO.
+        let actions = session.handle(SmtpEvent::DeliveryResult { success: true });
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _msg) => assert_eq!(*code, 250),
+            other => panic!("expected 250, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rset_rejected_during_delivery_pending() {
+        let mut session = delivery_pending_session();
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Rset));
+        assert_eq!(session.state, SmtpState::DeliveryPending);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _msg) => assert_eq!(*code, 503),
+            other => panic!("expected 503, got {other:?}"),
+        }
+    }
+
+    /// Drive a session to DeliveryPending state for tests.
+    fn delivery_pending_session() -> SmtpSession {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "sender@example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "bob".to_string(),
+            identity: Some([0xBB; ADDRESS_HASH_LEN]),
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Data));
+        session.handle(SmtpEvent::DataComplete(b"Subject: test\r\n\r\nbody".to_vec()));
+        assert_eq!(session.state, SmtpState::DeliveryPending);
+        session
     }
 }

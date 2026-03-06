@@ -152,14 +152,15 @@ fn default_announce_interval() -> u64 {
 }
 
 impl Config {
-    pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(s)
+    pub fn from_toml(s: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let config: Self = toml::from_str(s)?;
+        config.tls.validate()?;
+        Ok(config)
     }
 
     pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = std::fs::read_to_string(path)?;
-        let config = Self::from_toml(&contents)?;
-        Ok(config)
+        Self::from_toml(&contents)
     }
 }
 
@@ -334,9 +335,8 @@ queue_path = "/tmp/queue"
 node_config = "/tmp/node.toml"
 "#;
 
-        let config = Config::from_toml(manual_tls).expect("should parse");
-        assert_eq!(config.tls.mode, TlsMode::Manual);
-        assert!(config.tls.validate().is_err(), "manual mode without cert/key should fail validation");
+        let result = Config::from_toml(manual_tls);
+        assert!(result.is_err(), "manual mode without cert/key should fail validation");
     }
 
     #[test]
