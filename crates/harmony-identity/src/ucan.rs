@@ -102,6 +102,10 @@ pub enum UcanError {
     #[error("invalid binary encoding")]
     InvalidEncoding,
 
+    /// The token's `not_before` timestamp exceeds its `expires_at`.
+    #[error("invalid time window: not_before exceeds expires_at")]
+    InvalidTimeWindow,
+
     /// The revocation's token hash does not match the supplied token.
     #[error("revocation targets a different token")]
     TokenHashMismatch,
@@ -509,7 +513,7 @@ pub fn verify_token(
     revocations: &impl RevocationSet,
     max_depth: usize,
 ) -> Result<(), UcanError> {
-    verify_token_recursive(token, now, proofs, identities, revocations, max_depth, 0)
+    verify_token_recursive(token, now, proofs, identities, revocations, max_depth, 0, None)
 }
 
 /// Verify a revocation record's signature and issuer match.
@@ -542,6 +546,7 @@ pub fn verify_revocation(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_token_recursive(
     token: &UcanToken,
     now: u64,
@@ -550,6 +555,11 @@ fn verify_token_recursive(
     revocations: &impl RevocationSet,
     max_depth: usize,
     current_depth: usize,
+    // Hash the caller expects this token to have (integrity check from parent
+    // frame). `None` for the outermost call. This avoids computing
+    // `content_hash()` twice per interior chain link — once as "current token"
+    // for revocation, and again as "resolved parent" for integrity.
+    expected_hash: Option<&[u8; 32]>,
 ) -> Result<(), UcanError> {
     // 1. Check time bounds
     if token.not_before > now {
@@ -559,14 +569,25 @@ fn verify_token_recursive(
         return Err(UcanError::Expired);
     }
 
-    // 2. Check revocation (cheap HashSet lookup; must precede signature
+    // 2. Compute content hash once (used for revocation + integrity).
+    let token_hash = token.content_hash();
+
+    // If the caller told us what hash to expect, verify integrity.
+    // A buggy or adversarial ProofResolver could return a different token.
+    if let Some(expected) = expected_hash {
+        if token_hash != *expected {
+            return Err(UcanError::ChainBroken);
+        }
+    }
+
+    // 3. Check revocation (cheap HashSet lookup; must precede signature
     //    verification so that a tombstoned/rotated issuer identity doesn't
     //    mask a revocation with IssuerNotFound)
-    if revocations.is_revoked(&token.content_hash()) {
+    if revocations.is_revoked(&token_hash) {
         return Err(UcanError::Revoked);
     }
 
-    // 3. Verify signature
+    // 4. Verify signature
     let issuer_identity = identities
         .resolve(&token.issuer)
         .ok_or(UcanError::IssuerNotFound)?;
@@ -575,7 +596,7 @@ fn verify_token_recursive(
         .verify(&signable, &token.signature)
         .map_err(|_| UcanError::SignatureInvalid)?;
 
-    // 4. If delegated, verify the chain
+    // 5. If delegated, verify the chain
     if let Some(parent_hash) = &token.proof {
         if current_depth >= max_depth {
             return Err(UcanError::ChainTooDeep(max_depth));
@@ -584,12 +605,6 @@ fn verify_token_recursive(
         let parent = proofs
             .resolve(parent_hash)
             .ok_or(UcanError::ProofNotFound)?;
-
-        // Integrity: resolved token must hash to the requested value.
-        // A buggy or adversarial ProofResolver could return a different token.
-        if parent.content_hash() != *parent_hash {
-            return Err(UcanError::ChainBroken);
-        }
 
         // Chain continuity: parent.audience must equal this token's issuer
         if parent.audience != token.issuer {
@@ -612,7 +627,8 @@ fn verify_token_recursive(
             return Err(UcanError::AttenuationViolation);
         }
 
-        // Recursively verify parent
+        // Recursively verify parent — pass parent_hash so the next frame can
+        // verify integrity without recomputing the hash.
         verify_token_recursive(
             &parent,
             now,
@@ -621,6 +637,7 @@ fn verify_token_recursive(
             revocations,
             max_depth,
             current_depth + 1,
+            Some(parent_hash),
         )?;
     }
 
@@ -646,7 +663,7 @@ impl PrivateIdentity {
             return Err(UcanError::ResourceTooLarge);
         }
         if expires_at != 0 && not_before > expires_at {
-            return Err(UcanError::InvalidEncoding);
+            return Err(UcanError::InvalidTimeWindow);
         }
 
         let mut nonce = [0u8; 16];
@@ -691,7 +708,7 @@ impl PrivateIdentity {
             return Err(UcanError::ResourceTooLarge);
         }
         if expires_at != 0 && not_before > expires_at {
-            return Err(UcanError::InvalidEncoding);
+            return Err(UcanError::InvalidTimeWindow);
         }
 
         // Chain continuity: caller must be the parent's intended audience
@@ -1586,7 +1603,7 @@ mod tests {
         let issuer = PrivateIdentity::generate(&mut rng);
         let result =
             issuer.issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Memory, &[], 200, 100);
-        assert!(matches!(result, Err(UcanError::InvalidEncoding)));
+        assert!(matches!(result, Err(UcanError::InvalidTimeWindow)));
     }
 
     #[test]
@@ -1615,7 +1632,7 @@ mod tests {
             500,
             400,
         );
-        assert!(matches!(result, Err(UcanError::InvalidEncoding)));
+        assert!(matches!(result, Err(UcanError::InvalidTimeWindow)));
     }
 
     #[test]
