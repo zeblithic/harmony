@@ -48,6 +48,9 @@ pub struct SpamSignals {
     // Layer 4: Harmony-native trust
     pub known_harmony_sender: bool,
     /// Gateway trust score from 0.0 to 1.0, or `None` for unknown gateways.
+    ///
+    /// Non-finite values (NaN, Infinity) are treated as unknown — no bonus or
+    /// penalty is applied, same as `None`.
     pub gateway_trust: Option<f32>,
     pub first_contact: bool,
 }
@@ -146,7 +149,9 @@ pub fn score(signals: &SpamSignals, reject_threshold: i32) -> SpamVerdict {
         s -= 3;
     }
     if let Some(trust) = signals.gateway_trust {
-        if trust >= 0.8 {
+        if !trust.is_finite() {
+            // NaN / Infinity — treat as unknown trust, no bonus or penalty.
+        } else if trust >= 0.8 {
             s -= 2;
         } else if trust < 0.3 {
             s += 2;
@@ -246,6 +251,27 @@ mod tests {
         let verdict = score(&signals, 10);
         assert_eq!(verdict.score, 5);
         assert_eq!(verdict.action, SpamAction::DeliverWithScore);
+    }
+
+    #[test]
+    fn nan_gateway_trust_treated_as_unknown() {
+        // Some(NaN) should behave the same as None — no bonus or penalty.
+        let with_nan = SpamSignals {
+            gateway_trust: Some(f32::NAN),
+            ..clean_signals()
+        };
+        let without = SpamSignals {
+            gateway_trust: None,
+            ..clean_signals()
+        };
+        assert_eq!(score(&with_nan, 5).score, score(&without, 5).score);
+
+        // Also check Infinity.
+        let with_inf = SpamSignals {
+            gateway_trust: Some(f32::INFINITY),
+            ..clean_signals()
+        };
+        assert_eq!(score(&with_inf, 5).score, score(&without, 5).score);
     }
 
     #[test]
