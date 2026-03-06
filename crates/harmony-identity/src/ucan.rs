@@ -71,8 +71,13 @@ pub enum UcanError {
     SignatureInvalid,
 
     /// The proof chain exceeds the maximum allowed depth.
-    #[error("proof chain too deep: {0} levels")]
-    ChainTooDeep(usize),
+    #[error("proof chain too deep: reached depth {depth}, limit {limit}")]
+    ChainTooDeep {
+        /// How deep the chain was when the limit was hit.
+        depth: usize,
+        /// The configured maximum depth.
+        limit: usize,
+    },
 
     /// A proof referenced by hash could not be resolved.
     #[error("proof not found in resolver")]
@@ -348,6 +353,13 @@ impl MemoryProofStore {
         let hash = token.content_hash();
         self.tokens.insert(hash, token);
     }
+
+    /// Insert a token under an explicit key, regardless of the token's actual
+    /// content hash. Useful for testing adversarial `ProofResolver` behavior
+    /// (e.g. returning the wrong token for a given hash).
+    pub fn insert_with_key(&mut self, key: [u8; 32], token: UcanToken) {
+        self.tokens.insert(key, token);
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -599,7 +611,10 @@ fn verify_token_recursive(
     // 5. If delegated, verify the chain
     if let Some(parent_hash) = &token.proof {
         if current_depth >= max_depth {
-            return Err(UcanError::ChainTooDeep(max_depth));
+            return Err(UcanError::ChainTooDeep {
+                depth: current_depth,
+                limit: max_depth,
+            });
         }
 
         let parent = proofs
@@ -1413,7 +1428,10 @@ mod tests {
 
         // max_depth=1 means only 1 delegation hop allowed (root + 1 child)
         let result = verify_token(&t3, 0, &proofs, &ids, &MemoryRevocationSet::new(), 1);
-        assert!(matches!(result, Err(UcanError::ChainTooDeep(1))));
+        assert!(matches!(
+            result,
+            Err(UcanError::ChainTooDeep { depth: 1, limit: 1 })
+        ));
     }
 
     // ── Task 8: Revocation tests ──────────────────────────────────────
@@ -1713,8 +1731,8 @@ mod tests {
         // The child's proof field points to parent's hash, but we store a
         // different token (the child itself) under that key.
         let mut proofs = MemoryProofStore::new();
-        // Manually insert wrong token under parent's hash key
-        proofs.tokens.insert(parent.content_hash(), child.clone());
+        // Insert wrong token under parent's hash key — simulates adversarial resolver
+        proofs.insert_with_key(parent.content_hash(), child.clone());
 
         let mut ids = MemoryIdentityStore::new();
         ids.insert(root_id.identity.clone());
