@@ -8,7 +8,7 @@ use ed25519_dalek::{Signature, Verifier};
 use harmony_identity::identity::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use harmony_identity::{Identity, PrivateIdentity};
 
-use crate::error::MailError;
+use crate::error::{check_u16_len, MailError};
 
 /// A name registration linking a human-readable name to a Harmony identity.
 ///
@@ -42,11 +42,15 @@ impl NameRegistration {
         domain: &str,
         identity: &Identity,
         registered_at: u64,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, MailError> {
         let name_bytes = name.as_bytes();
         let namespace_bytes = namespace.as_bytes();
         let domain_bytes = domain.as_bytes();
         let identity_bytes = identity.to_public_bytes();
+
+        check_u16_len(name, "name")?;
+        check_u16_len(namespace, "namespace")?;
+        check_u16_len(domain, "domain")?;
 
         let capacity = 2 + name_bytes.len()
             + 2 + namespace_bytes.len()
@@ -69,7 +73,7 @@ impl NameRegistration {
 
         buf.extend_from_slice(&registered_at.to_be_bytes());
 
-        buf
+        Ok(buf)
     }
 
     /// Create a new name registration, signed by both user and gateway.
@@ -81,14 +85,14 @@ impl NameRegistration {
         registered_at: u64,
         user_private: &PrivateIdentity,
         gateway_private: &PrivateIdentity,
-    ) -> Self {
+    ) -> Result<Self, MailError> {
         let canonical =
-            Self::canonical_bytes(&name, &namespace, &domain, &identity, registered_at);
+            Self::canonical_bytes(&name, &namespace, &domain, &identity, registered_at)?;
 
         let user_signature = user_private.sign(&canonical);
         let domain_signature = gateway_private.sign(&canonical);
 
-        Self {
+        Ok(Self {
             name,
             namespace,
             domain,
@@ -96,31 +100,35 @@ impl NameRegistration {
             registered_at,
             user_signature,
             domain_signature,
-        }
+        })
     }
 
     /// Verify the user's signature over the canonical registration data.
     pub fn verify_user_signature(&self) -> bool {
-        let canonical = Self::canonical_bytes(
+        let Ok(canonical) = Self::canonical_bytes(
             &self.name,
             &self.namespace,
             &self.domain,
             &self.identity,
             self.registered_at,
-        );
+        ) else {
+            return false;
+        };
         let sig = Signature::from_bytes(&self.user_signature);
         self.identity.verifying_key.verify(&canonical, &sig).is_ok()
     }
 
     /// Verify the gateway's signature over the canonical registration data.
     pub fn verify_domain_signature(&self, gateway_identity: &Identity) -> bool {
-        let canonical = Self::canonical_bytes(
+        let Ok(canonical) = Self::canonical_bytes(
             &self.name,
             &self.namespace,
             &self.domain,
             &self.identity,
             self.registered_at,
-        );
+        ) else {
+            return false;
+        };
         let sig = Signature::from_bytes(&self.domain_signature);
         gateway_identity
             .verifying_key
@@ -131,18 +139,18 @@ impl NameRegistration {
     /// Serialize to bytes for announce payload or storage.
     ///
     /// Format: `canonical_bytes + user_signature(64) + domain_signature(64)`
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MailError> {
         let mut buf = Self::canonical_bytes(
             &self.name,
             &self.namespace,
             &self.domain,
             &self.identity,
             self.registered_at,
-        );
+        )?;
         buf.reserve(SIGNATURE_LENGTH * 2);
         buf.extend_from_slice(&self.user_signature);
         buf.extend_from_slice(&self.domain_signature);
-        buf
+        Ok(buf)
     }
 
     /// Deserialize from bytes produced by [`to_bytes`](Self::to_bytes).
@@ -254,7 +262,8 @@ mod tests {
             1_700_000_000,
             &user,
             &gateway,
-        );
+        )
+        .unwrap();
 
         assert!(reg.verify_user_signature());
         assert!(reg.verify_domain_signature(gateway.public_identity()));
@@ -277,7 +286,8 @@ mod tests {
             1_700_000_000,
             &user,
             &gateway,
-        );
+        )
+        .unwrap();
 
         // Tamper with the name after signing
         reg.name = "mallory".to_string();
@@ -299,9 +309,10 @@ mod tests {
             1_700_000_042,
             &user,
             &gateway,
-        );
+        )
+        .unwrap();
 
-        let bytes = reg.to_bytes();
+        let bytes = reg.to_bytes().unwrap();
         let restored = NameRegistration::from_bytes(&bytes).expect("deserialization failed");
 
         assert_eq!(restored.name, "bob");
@@ -333,9 +344,10 @@ mod tests {
             1_700_000_042,
             &user,
             &gateway,
-        );
+        )
+        .unwrap();
 
-        let mut bytes = reg.to_bytes();
+        let mut bytes = reg.to_bytes().unwrap();
         bytes.push(0xFF); // append garbage
 
         match NameRegistration::from_bytes(&bytes) {
@@ -343,5 +355,23 @@ mod tests {
             Err(other) => panic!("expected TrailingBytes {{ count: 1 }}, got {other:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    #[test]
+    fn rejects_oversized_name() {
+        let user = PrivateIdentity::generate(&mut OsRng);
+        let gateway = PrivateIdentity::generate(&mut OsRng);
+        let oversized = "x".repeat(65536);
+
+        let result = NameRegistration::new(
+            oversized,
+            "mail".to_string(),
+            "example.harmony".to_string(),
+            user.public_identity().clone(),
+            1_700_000_000,
+            &user,
+            &gateway,
+        );
+        assert!(result.is_err());
     }
 }

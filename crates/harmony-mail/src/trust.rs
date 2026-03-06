@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use harmony_identity::identity::{ADDRESS_HASH_LENGTH, SIGNATURE_LENGTH};
 use harmony_identity::{Identity, PrivateIdentity};
 
+use crate::error::{check_u16_len, MailError};
+
 // ── Capability bitfield values ──────────────────────────────────────────
 
 /// Gateway can receive inbound SMTP mail.
@@ -50,7 +52,7 @@ impl GatewayAnnounce {
         capabilities: u16,
         user_count: u32,
         uptime_since: u64,
-    ) -> Self {
+    ) -> Result<Self, MailError> {
         let gateway_address = gateway.public_identity().address_hash;
         let mut announce = Self {
             domain,
@@ -61,29 +63,32 @@ impl GatewayAnnounce {
             uptime_since,
             signature: [0u8; SIGNATURE_LENGTH],
         };
-        let canonical = announce.canonical_bytes();
+        let canonical = announce.canonical_bytes()?;
         announce.signature = gateway.sign(&canonical);
-        announce
+        Ok(announce)
     }
 
     /// Verify the announce signature against the given gateway identity.
     pub fn verify(&self, gateway_identity: &Identity) -> bool {
-        let canonical = self.canonical_bytes();
+        let Ok(canonical) = self.canonical_bytes() else {
+            return false;
+        };
         gateway_identity.verify(&canonical, &self.signature).is_ok()
     }
 
     /// Build the canonical byte sequence of all fields (excluding signature).
     ///
-    /// Strings are length-prefixed with a u16 big-endian length.
-    fn canonical_bytes(&self) -> Vec<u8> {
+    /// Strings are length-prefixed with a u16 big-endian length. Returns an error
+    /// if any string exceeds 65535 bytes.
+    fn canonical_bytes(&self) -> Result<Vec<u8>, MailError> {
         let mut buf = Vec::new();
         // domain: length-prefixed string
-        buf.extend_from_slice(&(self.domain.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&check_u16_len(&self.domain, "domain")?.to_be_bytes());
         buf.extend_from_slice(self.domain.as_bytes());
         // gateway_address: 16 bytes
         buf.extend_from_slice(&self.gateway_address);
         // smtp_host: length-prefixed string
-        buf.extend_from_slice(&(self.smtp_host.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&check_u16_len(&self.smtp_host, "smtp_host")?.to_be_bytes());
         buf.extend_from_slice(self.smtp_host.as_bytes());
         // capabilities: 2 bytes big-endian
         buf.extend_from_slice(&self.capabilities.to_be_bytes());
@@ -91,7 +96,7 @@ impl GatewayAnnounce {
         buf.extend_from_slice(&self.user_count.to_be_bytes());
         // uptime_since: 8 bytes big-endian
         buf.extend_from_slice(&self.uptime_since.to_be_bytes());
-        buf
+        Ok(buf)
     }
 }
 
@@ -143,7 +148,7 @@ impl TrustReport {
         subject_domain: String,
         period: (u64, u64),
         metrics: TrustMetrics,
-    ) -> Self {
+    ) -> Result<Self, MailError> {
         let reporter_address = reporter.public_identity().address_hash;
         let mut report = Self {
             reporter_address,
@@ -154,28 +159,30 @@ impl TrustReport {
             metrics,
             signature: [0u8; SIGNATURE_LENGTH],
         };
-        let canonical = report.canonical_bytes();
+        let canonical = report.canonical_bytes()?;
         report.signature = reporter.sign(&canonical);
-        report
+        Ok(report)
     }
 
     /// Verify the report signature against the given reporter identity.
     pub fn verify(&self, reporter_identity: &Identity) -> bool {
-        let canonical = self.canonical_bytes();
+        let Ok(canonical) = self.canonical_bytes() else {
+            return false;
+        };
         reporter_identity
             .verify(&canonical, &self.signature)
             .is_ok()
     }
 
     /// Build the canonical byte sequence of all fields (excluding signature).
-    fn canonical_bytes(&self) -> Vec<u8> {
+    fn canonical_bytes(&self) -> Result<Vec<u8>, MailError> {
         let mut buf = Vec::new();
         // reporter_address: 16 bytes
         buf.extend_from_slice(&self.reporter_address);
         // subject_address: 16 bytes
         buf.extend_from_slice(&self.subject_address);
         // subject_domain: length-prefixed string
-        buf.extend_from_slice(&(self.subject_domain.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&check_u16_len(&self.subject_domain, "subject_domain")?.to_be_bytes());
         buf.extend_from_slice(self.subject_domain.as_bytes());
         // period_start: 8 bytes big-endian
         buf.extend_from_slice(&self.period_start.to_be_bytes());
@@ -188,7 +195,7 @@ impl TrustReport {
         buf.extend_from_slice(&self.metrics.dkim_pass_ratio.to_be_bytes());
         buf.extend_from_slice(&self.metrics.spf_pass_ratio.to_be_bytes());
         buf.extend_from_slice(&self.metrics.availability.to_be_bytes());
-        buf
+        Ok(buf)
     }
 }
 
@@ -323,7 +330,8 @@ mod tests {
             CAP_INBOUND | CAP_OUTBOUND,
             500,
             1_700_000_000,
-        );
+        )
+        .unwrap();
 
         // Signature should verify against the gateway's public identity.
         assert!(announce.verify(gateway.public_identity()));
@@ -356,7 +364,8 @@ mod tests {
             "peer.example.com".to_string(),
             (1_700_000_000, 1_700_086_400),
             metrics,
-        );
+        )
+        .unwrap();
 
         // Signature should verify against the reporter's public identity.
         assert!(report.verify(reporter.public_identity()));
@@ -389,7 +398,8 @@ mod tests {
             "peer.example.com".to_string(),
             (1_700_000_000, 1_700_086_400),
             metrics,
-        );
+        )
+        .unwrap();
 
         let mut weights = HashMap::new();
         weights.insert(reporter.public_identity().address_hash, 1.0);
@@ -442,14 +452,16 @@ mod tests {
             "peer.example.com".to_string(),
             (1_700_000_000, 1_700_086_400),
             metrics_a,
-        );
+        )
+        .unwrap();
         let report_b = TrustReport::new(
             &reporter_b,
             subject.public_identity().address_hash,
             "peer.example.com".to_string(),
             (1_700_000_000, 1_700_086_400),
             metrics_b,
-        );
+        )
+        .unwrap();
 
         let mut weights = HashMap::new();
         // Reporter A has weight 0.8, Reporter B has weight 0.2
@@ -517,7 +529,8 @@ mod tests {
             "peer.example.com".to_string(),
             (1_700_000_000, 1_700_086_400),
             metrics,
-        );
+        )
+        .unwrap();
 
         let mut weights = HashMap::new();
         weights.insert(reporter.public_identity().address_hash, f32::NAN);
@@ -546,7 +559,8 @@ mod tests {
             "peer.example.com".to_string(),
             (1_700_000_000, 1_700_086_400),
             metrics,
-        );
+        )
+        .unwrap();
 
         let mut weights = HashMap::new();
         weights.insert(reporter.public_identity().address_hash, -1.0);
@@ -585,14 +599,16 @@ mod tests {
             "good.example.com".to_string(),
             (1_700_000_000, 1_700_086_400),
             good_metrics,
-        );
+        )
+        .unwrap();
         let report_b = TrustReport::new(
             &reporter,
             subject_b.public_identity().address_hash,
             "bad.example.com".to_string(),
             (1_700_000_000, 1_700_086_400),
             bad_metrics,
-        );
+        )
+        .unwrap();
 
         let mut weights = HashMap::new();
         weights.insert(reporter.public_identity().address_hash, 1.0);
@@ -606,5 +622,46 @@ mod tests {
             "should reflect only subject A's perfect score, got {}",
             result.trust_score
         );
+    }
+
+    #[test]
+    fn gateway_announce_rejects_oversized_domain() {
+        let gateway = PrivateIdentity::generate(&mut OsRng);
+        let oversized = "x".repeat(65536);
+
+        let result = GatewayAnnounce::new(
+            oversized,
+            &gateway,
+            "smtp.example.com".to_string(),
+            CAP_INBOUND,
+            1,
+            1_700_000_000,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn trust_report_rejects_oversized_domain() {
+        let reporter = PrivateIdentity::generate(&mut OsRng);
+        let subject = PrivateIdentity::generate(&mut OsRng);
+        let oversized = "x".repeat(65536);
+
+        let metrics = TrustMetrics {
+            messages_received: 1,
+            spam_ratio: 0.0,
+            bounce_ratio: 0.0,
+            dkim_pass_ratio: 1.0,
+            spf_pass_ratio: 1.0,
+            availability: 1.0,
+        };
+
+        let result = TrustReport::new(
+            &reporter,
+            subject.public_identity().address_hash,
+            oversized,
+            (1_700_000_000, 1_700_086_400),
+            metrics,
+        );
+        assert!(result.is_err());
     }
 }

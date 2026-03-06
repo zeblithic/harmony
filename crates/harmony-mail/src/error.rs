@@ -49,4 +49,15 @@ pub enum MailError {
 
     #[error("trailing bytes after message: {count} extra bytes")]
     TrailingBytes { count: usize },
+
+    #[error("{field} too long for u16 length prefix: {len} bytes (max 65535)")]
+    StringTooLong { field: &'static str, len: usize },
+}
+
+/// Validate that a string's length fits in a u16 for length-prefixed encoding.
+pub(crate) fn check_u16_len(s: &str, field: &'static str) -> Result<u16, MailError> {
+    u16::try_from(s.len()).map_err(|_| MailError::StringTooLong {
+        field,
+        len: s.len(),
+    })
 }

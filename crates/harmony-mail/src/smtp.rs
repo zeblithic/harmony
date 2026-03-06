@@ -197,8 +197,13 @@ impl SmtpSession {
             SmtpCommand::Data => self.handle_data(),
             SmtpCommand::Quit => self.handle_quit(),
             SmtpCommand::Rset => self.handle_rset(),
-            // RFC 5321 §4.1.1.9: NOOP always succeeds regardless of session state.
-            SmtpCommand::Noop => vec![SmtpAction::SendResponse(250, "OK".to_string())],
+            // RFC 5321 §4.1.1.9: NOOP always succeeds during an active session.
+            SmtpCommand::Noop => {
+                if self.state == SmtpState::Closed {
+                    return vec![];
+                }
+                vec![SmtpAction::SendResponse(250, "OK".to_string())]
+            }
             SmtpCommand::StartTls => self.handle_starttls(),
         }
     }
@@ -1326,6 +1331,17 @@ mod tests {
             SmtpAction::SendResponse(250, "OK".to_string()),
             "NOOP must always return 250 per RFC 5321"
         );
+    }
+
+    #[test]
+    fn noop_on_closed_session_returns_empty() {
+        // Pipelined NOOP after QUIT should not emit responses on a dead session.
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::Quit));
+        assert_eq!(session.state, SmtpState::Closed);
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Noop));
+        assert!(actions.is_empty(), "NOOP on Closed must not emit actions");
     }
 
     #[test]
