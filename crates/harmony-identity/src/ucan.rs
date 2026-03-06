@@ -110,9 +110,170 @@ pub enum UcanError {
 }
 
 /// A UCAN capability token.
+///
+/// Wire format (big-endian):
+/// ```text
+/// [16B issuer][16B audience][1B capability][2B resource_len][NB resource]
+/// [8B not_before][8B expires_at][16B nonce][1B has_proof][32B proof?]
+/// [64B signature]
+/// ```
+///
+/// Minimum size (no resource, no proof): 16+16+1+2+0+8+8+16+1+0+64 = 132 bytes.
 #[derive(Debug, Clone)]
 pub struct UcanToken {
-    _placeholder: (),
+    /// Address hash of the token issuer (signer).
+    pub issuer: [u8; ADDRESS_HASH_LENGTH],
+    /// Address hash of the token audience (recipient of the capability).
+    pub audience: [u8; ADDRESS_HASH_LENGTH],
+    /// The type of capability this token grants.
+    pub capability: CapabilityType,
+    /// Opaque resource identifier scoped by the capability type.
+    pub resource: Vec<u8>,
+    /// Unix timestamp (seconds) before which this token is not valid.
+    pub not_before: u64,
+    /// Unix timestamp (seconds) after which this token expires.
+    pub expires_at: u64,
+    /// Random nonce for uniqueness (prevents content-hash collisions).
+    pub nonce: [u8; 16],
+    /// BLAKE3 hash of the parent proof token, if this is a delegated token.
+    pub proof: Option<[u8; 32]>,
+    /// Ed25519 signature over the signable portion of this token.
+    pub signature: [u8; SIGNATURE_LENGTH],
+}
+
+/// Minimum wire size of a serialized token (no resource, no proof).
+const MIN_TOKEN_SIZE: usize = ADDRESS_HASH_LENGTH  // issuer
+    + ADDRESS_HASH_LENGTH                           // audience
+    + 1                                             // capability
+    + 2                                             // resource_len
+    + 8                                             // not_before
+    + 8                                             // expires_at
+    + 16                                            // nonce
+    + 1                                             // has_proof
+    + SIGNATURE_LENGTH;                             // signature
+
+impl UcanToken {
+    /// Serialize the token to its binary wire format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let resource_len = self.resource.len() as u16;
+        let proof_size = if self.proof.is_some() { 32 } else { 0 };
+        let total = MIN_TOKEN_SIZE + self.resource.len() + proof_size;
+
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(&self.issuer);
+        buf.extend_from_slice(&self.audience);
+        buf.push(self.capability as u8);
+        buf.extend_from_slice(&resource_len.to_be_bytes());
+        buf.extend_from_slice(&self.resource);
+        buf.extend_from_slice(&self.not_before.to_be_bytes());
+        buf.extend_from_slice(&self.expires_at.to_be_bytes());
+        buf.extend_from_slice(&self.nonce);
+        if let Some(ref proof) = self.proof {
+            buf.push(1);
+            buf.extend_from_slice(proof);
+        } else {
+            buf.push(0);
+        }
+        buf.extend_from_slice(&self.signature);
+        buf
+    }
+
+    /// Deserialize a token from its binary wire format.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, UcanError> {
+        if data.len() < MIN_TOKEN_SIZE {
+            return Err(UcanError::InvalidEncoding);
+        }
+
+        let mut pos = 0;
+
+        let mut issuer = [0u8; ADDRESS_HASH_LENGTH];
+        issuer.copy_from_slice(&data[pos..pos + ADDRESS_HASH_LENGTH]);
+        pos += ADDRESS_HASH_LENGTH;
+
+        let mut audience = [0u8; ADDRESS_HASH_LENGTH];
+        audience.copy_from_slice(&data[pos..pos + ADDRESS_HASH_LENGTH]);
+        pos += ADDRESS_HASH_LENGTH;
+
+        let capability = CapabilityType::try_from(data[pos])?;
+        pos += 1;
+
+        let resource_len =
+            u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+
+        if resource_len > MAX_RESOURCE_SIZE {
+            return Err(UcanError::ResourceTooLarge);
+        }
+
+        if data.len() < MIN_TOKEN_SIZE + resource_len {
+            return Err(UcanError::InvalidEncoding);
+        }
+
+        let resource = data[pos..pos + resource_len].to_vec();
+        pos += resource_len;
+
+        let not_before = u64::from_be_bytes(
+            data[pos..pos + 8].try_into().map_err(|_| UcanError::InvalidEncoding)?,
+        );
+        pos += 8;
+
+        let expires_at = u64::from_be_bytes(
+            data[pos..pos + 8].try_into().map_err(|_| UcanError::InvalidEncoding)?,
+        );
+        pos += 8;
+
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&data[pos..pos + 16]);
+        pos += 16;
+
+        let has_proof = data[pos];
+        pos += 1;
+
+        let proof = match has_proof {
+            0 => None,
+            1 => {
+                if data.len() < pos + 32 + SIGNATURE_LENGTH {
+                    return Err(UcanError::InvalidEncoding);
+                }
+                let mut proof_hash = [0u8; 32];
+                proof_hash.copy_from_slice(&data[pos..pos + 32]);
+                pos += 32;
+                Some(proof_hash)
+            }
+            _ => return Err(UcanError::InvalidEncoding),
+        };
+
+        if data.len() < pos + SIGNATURE_LENGTH {
+            return Err(UcanError::InvalidEncoding);
+        }
+
+        let mut signature = [0u8; SIGNATURE_LENGTH];
+        signature.copy_from_slice(&data[pos..pos + SIGNATURE_LENGTH]);
+
+        Ok(Self {
+            issuer,
+            audience,
+            capability,
+            resource,
+            not_before,
+            expires_at,
+            nonce,
+            proof,
+            signature,
+        })
+    }
+
+    /// Compute the BLAKE3 content hash of this token's wire representation.
+    pub fn content_hash(&self) -> [u8; 32] {
+        hash::blake3_hash(&self.to_bytes())
+    }
+
+    /// Return the signable portion of the token (everything except the signature).
+    fn signable_bytes(&self) -> Vec<u8> {
+        let bytes = self.to_bytes();
+        // The signature is always the last SIGNATURE_LENGTH bytes.
+        bytes[..bytes.len() - SIGNATURE_LENGTH].to_vec()
+    }
 }
 
 /// A revocation record for a UCAN token.
@@ -180,5 +341,103 @@ mod tests {
     fn ucan_error_display() {
         let err = UcanError::Expired;
         assert_eq!(alloc::format!("{err}"), "token has expired");
+    }
+
+    // ── Task 3: Serialization tests ───────────────────────────────────
+
+    /// Helper: build a root token (no proof) with deterministic fields.
+    fn make_root_token() -> UcanToken {
+        UcanToken {
+            issuer: [0xAA; ADDRESS_HASH_LENGTH],
+            audience: [0xBB; ADDRESS_HASH_LENGTH],
+            capability: CapabilityType::Memory,
+            resource: alloc::vec![0x01, 0x02, 0x03],
+            not_before: 1_700_000_000,
+            expires_at: 1_700_003_600,
+            nonce: [0xCC; 16],
+            proof: None,
+            signature: [0xDD; SIGNATURE_LENGTH],
+        }
+    }
+
+    /// Helper: build a delegated token (with proof) with deterministic fields.
+    fn make_delegated_token() -> UcanToken {
+        UcanToken {
+            issuer: [0x11; ADDRESS_HASH_LENGTH],
+            audience: [0x22; ADDRESS_HASH_LENGTH],
+            capability: CapabilityType::Storage,
+            resource: alloc::vec![0xFF; 10],
+            not_before: 1_700_000_000,
+            expires_at: 1_700_086_400,
+            nonce: [0x33; 16],
+            proof: Some([0x44; 32]),
+            signature: [0x55; SIGNATURE_LENGTH],
+        }
+    }
+
+    #[test]
+    fn token_serialize_deserialize_root() {
+        let token = make_root_token();
+        let bytes = token.to_bytes();
+        let restored = UcanToken::from_bytes(&bytes).unwrap();
+
+        assert_eq!(restored.issuer, token.issuer);
+        assert_eq!(restored.audience, token.audience);
+        assert_eq!(restored.capability, token.capability);
+        assert_eq!(restored.resource, token.resource);
+        assert_eq!(restored.not_before, token.not_before);
+        assert_eq!(restored.expires_at, token.expires_at);
+        assert_eq!(restored.nonce, token.nonce);
+        assert!(restored.proof.is_none());
+        assert_eq!(restored.signature, token.signature);
+    }
+
+    #[test]
+    fn token_serialize_deserialize_delegated() {
+        let token = make_delegated_token();
+        let bytes = token.to_bytes();
+        let restored = UcanToken::from_bytes(&bytes).unwrap();
+
+        assert_eq!(restored.issuer, token.issuer);
+        assert_eq!(restored.audience, token.audience);
+        assert_eq!(restored.capability, token.capability);
+        assert_eq!(restored.resource, token.resource);
+        assert_eq!(restored.not_before, token.not_before);
+        assert_eq!(restored.expires_at, token.expires_at);
+        assert_eq!(restored.nonce, token.nonce);
+        assert_eq!(restored.proof, token.proof);
+        assert_eq!(restored.signature, token.signature);
+    }
+
+    #[test]
+    fn token_content_hash_deterministic() {
+        let token = make_root_token();
+        let h1 = token.content_hash();
+        let h2 = token.content_hash();
+        assert_eq!(h1, h2);
+
+        // A clone should produce the same hash.
+        let cloned = token.clone();
+        assert_eq!(cloned.content_hash(), h1);
+    }
+
+    #[test]
+    fn token_resource_too_large_rejected() {
+        let mut token = make_root_token();
+        token.resource = alloc::vec![0u8; MAX_RESOURCE_SIZE + 1];
+        let bytes = token.to_bytes();
+        let result = UcanToken::from_bytes(&bytes);
+        assert!(matches!(result, Err(UcanError::ResourceTooLarge)));
+    }
+
+    #[test]
+    fn token_truncated_bytes_rejected() {
+        // Anything shorter than the minimum size should fail.
+        let result = UcanToken::from_bytes(&[0u8; 10]);
+        assert!(matches!(result, Err(UcanError::InvalidEncoding)));
+
+        // One byte short of minimum.
+        let result = UcanToken::from_bytes(&[0u8; MIN_TOKEN_SIZE - 1]);
+        assert!(matches!(result, Err(UcanError::InvalidEncoding)));
     }
 }
