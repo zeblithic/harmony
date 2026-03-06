@@ -7,6 +7,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use hashbrown::{HashMap, HashSet};
 use harmony_crypto::hash;
 use harmony_platform::EntropySource;
 
@@ -302,26 +303,96 @@ pub trait RevocationSet {
 }
 
 /// In-memory proof store for testing.
+///
+/// Stores tokens keyed by their BLAKE3 content hash.
 #[derive(Debug, Default)]
 pub struct MemoryProofStore {
-    _placeholder: (),
+    tokens: HashMap<[u8; 32], UcanToken>,
+}
+
+impl MemoryProofStore {
+    /// Create a new empty proof store.
+    pub fn new() -> Self {
+        Self {
+            tokens: HashMap::new(),
+        }
+    }
+
+    /// Insert a token, keyed by its content hash.
+    pub fn insert(&mut self, token: UcanToken) {
+        let hash = token.content_hash();
+        self.tokens.insert(hash, token);
+    }
+}
+
+impl ProofResolver for MemoryProofStore {
+    fn resolve(&self, hash: &[u8; 32]) -> Option<UcanToken> {
+        self.tokens.get(hash).cloned()
+    }
 }
 
 /// In-memory identity store for testing.
+///
+/// Stores identities keyed by their address hash.
 #[derive(Debug, Default)]
 pub struct MemoryIdentityStore {
-    _placeholder: (),
+    identities: HashMap<[u8; ADDRESS_HASH_LENGTH], Identity>,
+}
+
+impl MemoryIdentityStore {
+    /// Create a new empty identity store.
+    pub fn new() -> Self {
+        Self {
+            identities: HashMap::new(),
+        }
+    }
+
+    /// Insert an identity, keyed by its address hash.
+    pub fn insert(&mut self, identity: Identity) {
+        let hash = identity.address_hash;
+        self.identities.insert(hash, identity);
+    }
+}
+
+impl IdentityResolver for MemoryIdentityStore {
+    fn resolve(&self, address_hash: &[u8; ADDRESS_HASH_LENGTH]) -> Option<Identity> {
+        self.identities.get(address_hash).cloned()
+    }
 }
 
 /// In-memory revocation set for testing.
+///
+/// Stores the BLAKE3 content hashes of revoked tokens.
 #[derive(Debug, Default)]
 pub struct MemoryRevocationSet {
-    _placeholder: (),
+    revoked: HashSet<[u8; 32]>,
+}
+
+impl MemoryRevocationSet {
+    /// Create a new empty revocation set.
+    pub fn new() -> Self {
+        Self {
+            revoked: HashSet::new(),
+        }
+    }
+
+    /// Mark a token hash as revoked.
+    pub fn insert(&mut self, hash: [u8; 32]) {
+        self.revoked.insert(hash);
+    }
+}
+
+impl RevocationSet for MemoryRevocationSet {
+    fn is_revoked(&self, token_hash: &[u8; 32]) -> bool {
+        self.revoked.contains(token_hash)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn capability_type_u8_roundtrip() {
@@ -439,5 +510,62 @@ mod tests {
         // One byte short of minimum.
         let result = UcanToken::from_bytes(&[0u8; MIN_TOKEN_SIZE - 1]);
         assert!(matches!(result, Err(UcanError::InvalidEncoding)));
+    }
+
+    // ── Task 4: Resolver and store tests ──────────────────────────────
+
+    #[test]
+    fn memory_proof_store_roundtrip() {
+        let token = make_root_token();
+        let token_hash = token.content_hash();
+
+        let mut store = MemoryProofStore::new();
+        store.insert(token.clone());
+
+        let resolved = store.resolve(&token_hash).unwrap();
+        assert_eq!(resolved.issuer, token.issuer);
+        assert_eq!(resolved.audience, token.audience);
+        assert_eq!(resolved.capability, token.capability);
+        assert_eq!(resolved.resource, token.resource);
+    }
+
+    #[test]
+    fn memory_proof_store_missing_returns_none() {
+        let store = MemoryProofStore::new();
+        let missing_hash = [0xFF; 32];
+        assert!(store.resolve(&missing_hash).is_none());
+    }
+
+    #[test]
+    fn memory_identity_store_roundtrip() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let private_id = PrivateIdentity::generate(&mut rng);
+        let identity = private_id.public_identity().clone();
+        let address = identity.address_hash;
+
+        let mut store = MemoryIdentityStore::new();
+        store.insert(identity.clone());
+
+        let resolved = store.resolve(&address).unwrap();
+        assert_eq!(resolved.address_hash, address);
+        assert_eq!(
+            resolved.verifying_key.as_bytes(),
+            identity.verifying_key.as_bytes()
+        );
+    }
+
+    #[test]
+    fn memory_revocation_set_check() {
+        let mut revocations = MemoryRevocationSet::new();
+        let hash_a = [0xAA; 32];
+        let hash_b = [0xBB; 32];
+
+        assert!(!revocations.is_revoked(&hash_a));
+        assert!(!revocations.is_revoked(&hash_b));
+
+        revocations.insert(hash_a);
+
+        assert!(revocations.is_revoked(&hash_a));
+        assert!(!revocations.is_revoked(&hash_b));
     }
 }
