@@ -212,6 +212,13 @@ impl SmtpSession {
     }
 
     fn handle_ehlo(&mut self, domain: String) -> Vec<SmtpAction> {
+        // RFC 5321 §4.1.1.1: EHLO requires a domain or address literal.
+        if domain.is_empty() {
+            return vec![SmtpAction::SendResponse(
+                501,
+                "EHLO requires a domain parameter".to_string(),
+            )];
+        }
         // RFC 5321 §4.1.4: EHLO is valid from any post-greeting state and acts
         // as an implicit RSET. Reject only from Connected (no greeting yet),
         // DataReceiving (mid-transfer), and Closed.
@@ -252,6 +259,13 @@ impl SmtpSession {
     }
 
     fn handle_helo(&mut self, domain: String) -> Vec<SmtpAction> {
+        // RFC 5321 §4.1.1.1: HELO requires a domain parameter.
+        if domain.is_empty() {
+            return vec![SmtpAction::SendResponse(
+                501,
+                "HELO requires a domain parameter".to_string(),
+            )];
+        }
         // RFC 5321 §4.1.1.1: HELO is the RFC 821 greeting — single-line response,
         // no capability advertisement. Same state transitions as EHLO.
         match self.state {
@@ -423,6 +437,9 @@ impl SmtpSession {
     }
 
     fn handle_tls_completed(&mut self) -> Vec<SmtpAction> {
+        if self.state != SmtpState::TlsNegotiating {
+            return vec![];
+        }
         self.tls = true;
         // After STARTTLS, the client must re-issue EHLO.
         self.state = SmtpState::GreetingSent;
@@ -1136,6 +1153,42 @@ mod tests {
         // TlsCompleted should transition to GreetingSent.
         session.handle(SmtpEvent::TlsCompleted);
         assert_eq!(session.state, SmtpState::GreetingSent);
+    }
+
+    #[test]
+    fn ehlo_empty_domain_rejected() {
+        let mut session = connected_session();
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+            domain: String::new(),
+        }));
+        assert_eq!(session.state, SmtpState::GreetingSent, "state should not change");
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => assert_eq!(*code, 501),
+            other => panic!("expected 501, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn helo_empty_domain_rejected() {
+        let mut session = connected_session();
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Helo {
+            domain: String::new(),
+        }));
+        assert_eq!(session.state, SmtpState::GreetingSent, "state should not change");
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => assert_eq!(*code, 501),
+            other => panic!("expected 501, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tls_completed_ignored_outside_negotiating() {
+        // TlsCompleted in Ready state should be silently ignored.
+        let mut session = ready_session();
+        assert_eq!(session.state, SmtpState::Ready);
+        let actions = session.handle(SmtpEvent::TlsCompleted);
+        assert!(actions.is_empty());
+        assert_eq!(session.state, SmtpState::Ready, "state should not change");
     }
 
     #[test]
