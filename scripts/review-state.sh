@@ -59,7 +59,7 @@ if [[ -z "$REPO" ]]; then
 fi
 
 if [[ -z "$PR_NUMBER" ]]; then
-  PR_NUMBER=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
+  PR_NUMBER=$(gh pr view --repo "$REPO" --json number --jq '.number' 2>/dev/null || echo "")
   if [[ -z "$PR_NUMBER" ]]; then
     echo "ERROR: No open PR for current branch. Pass PR number as argument."
     exit 1
@@ -67,7 +67,7 @@ if [[ -z "$PR_NUMBER" ]]; then
 fi
 
 # Fetch PR metadata
-PR_META=$(gh pr view "$PR_NUMBER" --json number,title,url,commits,createdAt)
+PR_META=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json number,title,url,commits,createdAt)
 PR_TITLE=$(echo "$PR_META" | jq -r '.title')
 PR_URL=$(echo "$PR_META" | jq -r '.url')
 
