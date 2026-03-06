@@ -436,7 +436,11 @@ impl Revocation {
         token_hash.copy_from_slice(&bytes[pos..pos + 32]);
         pos += 32;
 
-        let revoked_at = u64::from_be_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        let revoked_at = u64::from_be_bytes(
+            bytes[pos..pos + 8]
+                .try_into()
+                .map_err(|_| UcanError::InvalidEncoding)?,
+        );
         pos += 8;
 
         let mut signature = [0u8; SIGNATURE_LENGTH];
@@ -615,6 +619,11 @@ impl PrivateIdentity {
     ) -> Result<UcanToken, UcanError> {
         if resource.len() > MAX_RESOURCE_SIZE {
             return Err(UcanError::ResourceTooLarge);
+        }
+
+        // Chain continuity: caller must be the parent's intended audience
+        if parent.audience != self.identity.address_hash {
+            return Err(UcanError::ChainBroken);
         }
 
         // Attenuation checks
@@ -1060,6 +1069,83 @@ mod tests {
 
         let result = verify_token(&child_token, 3000, &proofs, &ids, &revocations, 5);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn delegate_wrong_audience_rejected() {
+        let mut rng = test_rng();
+        let root_id = PrivateIdentity::generate(&mut rng);
+        let delegate_id = PrivateIdentity::generate(&mut rng);
+        let wrong_id = PrivateIdentity::generate(&mut rng);
+
+        // Root token is addressed to delegate_id, not wrong_id
+        let root_token = root_id
+            .issue_root_token(
+                &mut rng,
+                &delegate_id.identity.address_hash,
+                CapabilityType::Content,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        // wrong_id tries to delegate — should fail at creation time
+        let result = wrong_id.delegate(
+            &mut rng,
+            &root_token,
+            &[0u8; 16],
+            CapabilityType::Content,
+            &[],
+            0,
+            0,
+        );
+        assert!(matches!(result, Err(UcanError::ChainBroken)));
+    }
+
+    #[test]
+    fn verify_chain_broken_audience_mismatch() {
+        let mut rng = test_rng();
+        let root_id = PrivateIdentity::generate(&mut rng);
+        let delegate_id = PrivateIdentity::generate(&mut rng);
+        let wrong_id = PrivateIdentity::generate(&mut rng);
+
+        // Root token addressed to delegate_id
+        let root_token = root_id
+            .issue_root_token(
+                &mut rng,
+                &delegate_id.identity.address_hash,
+                CapabilityType::Content,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        // Manually construct a child that claims root_token as proof but
+        // was signed by wrong_id (who is NOT the root's audience).
+        let mut child = UcanToken {
+            issuer: wrong_id.identity.address_hash,
+            audience: [0xEE; ADDRESS_HASH_LENGTH],
+            capability: CapabilityType::Content,
+            resource: alloc::vec![],
+            not_before: 0,
+            expires_at: 0,
+            nonce: [0u8; 16],
+            proof: Some(root_token.content_hash()),
+            signature: [0u8; SIGNATURE_LENGTH],
+        };
+        let signable = child.signable_bytes();
+        child.signature = wrong_id.sign(&signable);
+
+        let mut proofs = MemoryProofStore::new();
+        proofs.insert(root_token);
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(root_id.public_identity().clone());
+        ids.insert(wrong_id.public_identity().clone());
+
+        let result = verify_token(&child, 0, &proofs, &ids, &MemoryRevocationSet::new(), 5);
+        assert!(matches!(result, Err(UcanError::ChainBroken)));
     }
 
     #[test]
