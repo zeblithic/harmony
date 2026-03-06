@@ -210,6 +210,13 @@ impl NameRegistration {
         }
         let mut domain_signature = [0u8; SIGNATURE_LENGTH];
         domain_signature.copy_from_slice(&data[pos..pos + SIGNATURE_LENGTH]);
+        pos += SIGNATURE_LENGTH;
+
+        if pos != data.len() {
+            return Err(MailError::TrailingBytes {
+                count: data.len() - pos,
+            });
+        }
 
         Ok(Self {
             name,
@@ -327,5 +334,30 @@ mod tests {
         // Signatures should still verify after roundtrip
         assert!(restored.verify_user_signature());
         assert!(restored.verify_domain_signature(gateway.public_identity()));
+    }
+
+    #[test]
+    fn trailing_bytes_rejected() {
+        let user = PrivateIdentity::generate(&mut OsRng);
+        let gateway = PrivateIdentity::generate(&mut OsRng);
+
+        let reg = NameRegistration::new(
+            "bob".to_string(),
+            "chat".to_string(),
+            "harmony.local".to_string(),
+            user.public_identity().clone(),
+            1_700_000_042,
+            &user,
+            &gateway,
+        );
+
+        let mut bytes = reg.to_bytes();
+        bytes.push(0xFF); // append garbage
+
+        match NameRegistration::from_bytes(&bytes) {
+            Err(MailError::TrailingBytes { count: 1 }) => {}
+            Err(other) => panic!("expected TrailingBytes {{ count: 1 }}, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
     }
 }

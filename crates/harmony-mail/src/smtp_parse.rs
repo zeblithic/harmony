@@ -8,8 +8,8 @@ use crate::smtp::SmtpCommand;
 /// Parse a raw SMTP command line into an [`SmtpCommand`].
 ///
 /// The input may or may not end with `\r\n`; trailing CRLF is stripped.
-/// Command verbs are case-insensitive. Both `EHLO` and `HELO` produce
-/// [`SmtpCommand::Ehlo`].
+/// Command verbs are case-insensitive. `EHLO` produces [`SmtpCommand::Ehlo`]
+/// and `HELO` produces [`SmtpCommand::Helo`].
 pub fn parse_command(line: &[u8]) -> Result<SmtpCommand, MailError> {
     // Strip trailing \r\n if present.
     let line = match line {

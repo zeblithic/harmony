@@ -39,10 +39,21 @@ fn default_listen_submission_starttls() -> String {
     "0.0.0.0:587".to_string()
 }
 
+/// TLS provisioning mode.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    /// Automatic certificate provisioning via ACME (Let's Encrypt).
+    #[default]
+    Acme,
+    /// Manual certificate files (cert + key paths required).
+    Manual,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TlsConfig {
-    #[serde(default = "default_tls_mode")]
-    pub mode: String, // "acme" or "manual"
+    #[serde(default)]
+    pub mode: TlsMode,
     pub acme_email: Option<String>,
     #[serde(default = "default_acme_challenge")]
     pub acme_challenge: String,
@@ -50,8 +61,19 @@ pub struct TlsConfig {
     pub key: Option<String>,
 }
 
-fn default_tls_mode() -> String {
-    "acme".to_string()
+impl TlsConfig {
+    /// Validate that manual mode has both cert and key paths.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode == TlsMode::Manual {
+            if self.cert.is_none() {
+                return Err("tls.cert is required when mode = \"manual\"".to_string());
+            }
+            if self.key.is_none() {
+                return Err("tls.key is required when mode = \"manual\"".to_string());
+            }
+        }
+        Ok(())
+    }
 }
 fn default_acme_challenge() -> String {
     "dns-01".to_string()
@@ -201,7 +223,7 @@ announce_interval = 3600
         assert_eq!(config.gateway.listen_submission_starttls, "0.0.0.0:587");
 
         // TLS
-        assert_eq!(config.tls.mode, "acme");
+        assert_eq!(config.tls.mode, TlsMode::Acme);
         assert_eq!(
             config.tls.acme_email.as_deref(),
             Some("admin@example.com")
@@ -272,7 +294,7 @@ node_config = "/tmp/node.toml"
         assert_eq!(config.gateway.listen_smtp, "0.0.0.0:25");
         assert_eq!(config.gateway.listen_submission, "0.0.0.0:465");
         assert_eq!(config.gateway.listen_submission_starttls, "0.0.0.0:587");
-        assert_eq!(config.tls.mode, "acme");
+        assert_eq!(config.tls.mode, TlsMode::Acme);
         assert_eq!(config.tls.acme_challenge, "dns-01");
         assert!(config.tls.acme_email.is_none());
         assert_eq!(config.dkim.selector, "harmony");
@@ -285,6 +307,65 @@ node_config = "/tmp/node.toml"
         assert_eq!(config.outbound.retry_schedule.len(), 10);
         assert_eq!(config.harmony.trust_topic, "harmony/mail/trust/v1");
         assert_eq!(config.harmony.announce_interval, 3600);
+    }
+
+    #[test]
+    fn tls_manual_mode_requires_cert_and_key() {
+        let manual_tls = r#"
+[domain]
+name = "example.com"
+mx_host = "mail.example.com"
+
+[gateway]
+identity_key = "/tmp/test.key"
+
+[tls]
+mode = "manual"
+
+[dkim]
+key = "/tmp/dkim.key"
+
+[spam]
+
+[outbound]
+queue_path = "/tmp/queue"
+
+[harmony]
+node_config = "/tmp/node.toml"
+"#;
+
+        let config = Config::from_toml(manual_tls).expect("should parse");
+        assert_eq!(config.tls.mode, TlsMode::Manual);
+        assert!(config.tls.validate().is_err(), "manual mode without cert/key should fail validation");
+    }
+
+    #[test]
+    fn tls_invalid_mode_rejected() {
+        let bad_mode = r#"
+[domain]
+name = "example.com"
+mx_host = "mail.example.com"
+
+[gateway]
+identity_key = "/tmp/test.key"
+
+[tls]
+mode = "typo"
+
+[dkim]
+key = "/tmp/dkim.key"
+
+[spam]
+
+[outbound]
+queue_path = "/tmp/queue"
+
+[harmony]
+node_config = "/tmp/node.toml"
+"#;
+
+        let result = Config::from_toml(bad_mode);
+        assert!(result.is_err(), "invalid TLS mode should fail deserialization");
     }
 
     #[test]

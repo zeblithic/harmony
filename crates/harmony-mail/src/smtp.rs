@@ -40,6 +40,8 @@ pub enum SmtpState {
     RcptToReceived,
     /// DATA command accepted, receiving message body.
     DataReceiving,
+    /// Message data received, awaiting delivery result from I/O layer.
+    DeliveryPending,
     /// Session closed.
     Closed,
 }
@@ -73,6 +75,8 @@ pub enum SmtpEvent {
     TlsCompleted,
     /// Complete message data received (after DATA, dot-terminated).
     DataComplete(Vec<u8>),
+    /// Result of a delivery attempt initiated by [`SmtpAction::DeliverToHarmony`].
+    DeliveryResult { success: bool },
     /// Result from Harmony address resolution.
     HarmonyResolved {
         local_part: String,
@@ -153,6 +157,7 @@ impl SmtpSession {
             SmtpEvent::Command(cmd) => self.handle_command(cmd),
             SmtpEvent::TlsCompleted => self.handle_tls_completed(),
             SmtpEvent::DataComplete(bytes) => self.handle_data_complete(bytes),
+            SmtpEvent::DeliveryResult { success } => self.handle_delivery_result(success),
             SmtpEvent::HarmonyResolved {
                 local_part,
                 identity,
@@ -389,20 +394,31 @@ impl SmtpSession {
             return vec![];
         }
         let recipients = std::mem::take(&mut self.resolved_recipients);
-        let actions = vec![
-            SmtpAction::DeliverToHarmony {
-                recipients,
-                data: bytes,
-            },
-            SmtpAction::SendResponse(250, "OK".to_string()),
-        ];
+        self.state = SmtpState::DeliveryPending;
 
+        vec![SmtpAction::DeliverToHarmony {
+            recipients,
+            data: bytes,
+        }]
+    }
+
+    fn handle_delivery_result(&mut self, success: bool) -> Vec<SmtpAction> {
+        if self.state != SmtpState::DeliveryPending {
+            return vec![];
+        }
         // Reset for next message on the same connection.
         self.mail_from = None;
         self.pending_rcpt = None;
         self.state = SmtpState::Ready;
 
-        actions
+        if success {
+            vec![SmtpAction::SendResponse(250, "OK".to_string())]
+        } else {
+            vec![SmtpAction::SendResponse(
+                451,
+                "4.3.0 Delivery failed, try again later".to_string(),
+            )]
+        }
     }
 
     fn handle_harmony_resolved(
@@ -866,5 +882,61 @@ mod tests {
             Some("bob".to_string()),
             "pending_rcpt should remain unchanged"
         );
+    }
+
+    #[test]
+    fn delivery_success_sends_250() {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "bob".to_string(),
+            identity: Some([0xBB; ADDRESS_HASH_LEN]),
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Data));
+
+        let actions = session.handle(SmtpEvent::DataComplete(b"Subject: hi\r\n\r\nbody".to_vec()));
+        assert_eq!(session.state, SmtpState::DeliveryPending);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], SmtpAction::DeliverToHarmony { .. }));
+
+        // I/O layer reports success.
+        let actions = session.handle(SmtpEvent::DeliveryResult { success: true });
+        assert_eq!(session.state, SmtpState::Ready);
+        assert_eq!(
+            actions[0],
+            SmtpAction::SendResponse(250, "OK".to_string())
+        );
+    }
+
+    #[test]
+    fn delivery_failure_sends_451() {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "bob".to_string(),
+            identity: Some([0xBB; ADDRESS_HASH_LEN]),
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Data));
+        session.handle(SmtpEvent::DataComplete(b"Subject: hi\r\n\r\nbody".to_vec()));
+
+        // I/O layer reports failure.
+        let actions = session.handle(SmtpEvent::DeliveryResult { success: false });
+        assert_eq!(session.state, SmtpState::Ready);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => {
+                assert_eq!(*code, 451, "delivery failure should return 451");
+            }
+            other => panic!("expected SendResponse(451, ...), got {other:?}"),
+        }
     }
 }
