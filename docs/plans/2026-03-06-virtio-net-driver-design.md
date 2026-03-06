@@ -133,8 +133,8 @@ impl NetworkInterface for VirtioNet {
 }
 ```
 
-- `send()`: prepend 14-byte Ethernet header (src=self.mac, dst=broadcast, type=0x88B5) -> submit to TX queue -> notify
-- `receive()`: poll RX used ring -> if packet available, strip Ethernet header -> return payload bytes
+- `send()`: prepend 12-byte `virtio_net_hdr` (all zeros for no GSO) + 14-byte Ethernet header (src=self.mac, dst=broadcast, type=0x88B5) -> submit to TX queue -> notify
+- `receive()`: poll RX used ring -> if packet available, skip 12-byte `virtio_net_hdr`, strip Ethernet header -> return payload bytes
 
 ### 5. Event Loop Integration (~30 lines)
 

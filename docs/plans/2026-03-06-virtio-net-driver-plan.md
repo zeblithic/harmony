@@ -8,9 +8,11 @@
 
 **Tech Stack:** VirtIO 1.0 spec (split virtqueues, PCI modern capability structs), `x86_64` crate for port I/O, `harmony-platform::NetworkInterface` trait, QEMU socket/multicast backend.
 
-**Repos:** Primary work in `harmony-os` (`/Users/zeblith/work/zeblithic/harmony-os/`). Plan/design docs in `harmony` (`/Users/zeblith/work/zeblithic/harmony/`).
+**Repos:** Primary work in `harmony-os` (sibling repo at `../harmony-os/`). Plan/design docs in `harmony` (this repo).
 
 **Design doc:** `docs/plans/2026-03-06-virtio-net-driver-design.md`
+
+**Post-review corrections:** Code snippets below reflect the original plan. The implemented code includes these fixes: (1) All TX/RX buffers include the 12-byte `virtio_net_hdr` prefix (VirtIO 1.0 §5.1.6). (2) 64-bit PCI BARs read the upper 32 bits from the next BAR. (3) `DRIVER_OK` is set before queue notifications (§3.1.1 step 8). (4) Inbound packet actions are dispatched, not dropped. See the actual source for corrected versions.
 
 ---
 
@@ -1166,25 +1168,25 @@ git commit -m "test: verify VirtIO-net initialization in QEMU boot test"
 
 **Step 1: Run harmony workspace tests**
 
-Run: `cd /Users/zeblith/work/zeblithic/harmony && cargo test --workspace`
+Run: `cargo test --workspace` (from the harmony repo root)
 Expected: all 365+ tests pass.
 
-Run: `cd /Users/zeblith/work/zeblithic/harmony && cargo clippy --workspace`
+Run: `cargo clippy --workspace` (from the harmony repo root)
 Expected: zero warnings.
 
 **Step 2: Run harmony-os quality gate**
 
-Run: `cd /Users/zeblith/work/zeblithic/harmony-os && just check`
+Run: `just check` (from the harmony-os repo root)
 Expected: all checks pass.
 
 **Step 3: Run QEMU boot test**
 
-Run: `cd /Users/zeblith/work/zeblithic/harmony-os && just test-qemu`
+Run: `just test-qemu` (from the harmony-os repo root)
 Expected: PASSED.
 
 **Step 4: Verify formatting**
 
-Run: `cd /Users/zeblith/work/zeblithic/harmony-os && cargo fmt --all -- --check`
+Run: `cargo fmt --all -- --check` (from the harmony-os repo root)
 Expected: no formatting issues.
 
 **Step 5: Delivery**
