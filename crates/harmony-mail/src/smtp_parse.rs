@@ -78,7 +78,8 @@ pub fn parse_command(line: &[u8]) -> Result<SmtpCommand, MailError> {
 fn parse_mail_from_arg(arg: &str) -> Result<String, MailError> {
     let arg = arg.trim();
     // Strip the "FROM:" prefix (case-insensitive).
-    let after_from = if arg.len() >= 5 && arg[..5].eq_ignore_ascii_case("FROM:") {
+    // Compare at byte level to avoid panics on multi-byte UTF-8 boundaries.
+    let after_from = if arg.as_bytes().get(..5).is_some_and(|b| b.eq_ignore_ascii_case(b"FROM:")) {
         &arg[5..]
     } else {
         return Err(MailError::UnknownCommand("MAIL".to_string()));
@@ -91,7 +92,8 @@ fn parse_mail_from_arg(arg: &str) -> Result<String, MailError> {
 fn parse_rcpt_to_arg(arg: &str) -> Result<String, MailError> {
     let arg = arg.trim();
     // Strip the "TO:" prefix (case-insensitive).
-    let after_to = if arg.len() >= 3 && arg[..3].eq_ignore_ascii_case("TO:") {
+    // Compare at byte level to avoid panics on multi-byte UTF-8 boundaries.
+    let after_to = if arg.as_bytes().get(..3).is_some_and(|b| b.eq_ignore_ascii_case(b"TO:")) {
         &arg[3..]
     } else {
         return Err(MailError::UnknownCommand("RCPT".to_string()));
@@ -241,6 +243,22 @@ mod tests {
                 address: String::new()
             }
         );
+    }
+
+    #[test]
+    fn parse_mail_from_multibyte_no_panic() {
+        // Multibyte UTF-8 straddling the "FROM:" prefix boundary must not panic.
+        // "€" is 3 bytes (0xE2 0x82 0xAC), so "AB€" is 5 bytes — exactly where
+        // a naive `arg[..5]` str slice would hit a char boundary panic.
+        let result = parse_command("MAIL AB€<addr>\r\n".as_bytes());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rcpt_to_multibyte_no_panic() {
+        // Same boundary issue for "TO:" prefix (3 bytes).
+        let result = parse_command("RCPT £<addr>\r\n".as_bytes());
+        assert!(result.is_err());
     }
 
     #[test]

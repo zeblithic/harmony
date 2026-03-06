@@ -212,6 +212,16 @@ pub struct AggregatedTrust {
 /// Formula: `1.0 - (spam * 0.35 + bounce * 0.25 + (1-dkim) * 0.15 + (1-spf) * 0.15 + (1-availability) * 0.10)`
 /// Result is clamped to 0.0..=1.0.
 fn metrics_to_score(m: &TrustMetrics) -> f32 {
+    // Guard: if any metric is NaN or infinite, treat gateway as untrusted.
+    // A malicious gateway could craft NaN values to corrupt the weighted-median sort.
+    if !m.spam_ratio.is_finite()
+        || !m.bounce_ratio.is_finite()
+        || !m.dkim_pass_ratio.is_finite()
+        || !m.spf_pass_ratio.is_finite()
+        || !m.availability.is_finite()
+    {
+        return 0.0;
+    }
     let raw = 1.0
         - (m.spam_ratio * 0.35
             + m.bounce_ratio * 0.25
@@ -448,6 +458,32 @@ mod tests {
             expected,
             result.trust_score
         );
+    }
+
+    #[test]
+    fn nan_metrics_score_zero() {
+        let metrics = TrustMetrics {
+            messages_received: 100,
+            spam_ratio: f32::NAN,
+            bounce_ratio: 0.0,
+            dkim_pass_ratio: 1.0,
+            spf_pass_ratio: 1.0,
+            availability: 1.0,
+        };
+        assert_eq!(metrics_to_score(&metrics), 0.0);
+    }
+
+    #[test]
+    fn infinite_metrics_score_zero() {
+        let metrics = TrustMetrics {
+            messages_received: 100,
+            spam_ratio: 0.0,
+            bounce_ratio: f32::INFINITY,
+            dkim_pass_ratio: 1.0,
+            spf_pass_ratio: 1.0,
+            availability: 1.0,
+        };
+        assert_eq!(metrics_to_score(&metrics), 0.0);
     }
 
     #[test]

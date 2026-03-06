@@ -113,9 +113,9 @@ impl MessageFlags {
         Self(bits)
     }
 
-    /// Construct from raw bits.
+    /// Construct from raw bits, masking off reserved bits 3–7.
     pub fn from_bits(bits: u8) -> Self {
-        Self(bits)
+        Self(bits & 0b0000_0111)
     }
 
     /// Return the raw bits.
@@ -577,6 +577,13 @@ mod tests {
             let f = MessageFlags::from_bits(bits);
             assert_eq!(f.bits(), bits);
         }
+
+        // Reserved bits 3–7 are masked off on deserialize.
+        let f = MessageFlags::from_bits(0xFF);
+        assert_eq!(f.bits(), 0b111);
+        assert!(f.has_attachments());
+        assert!(f.is_reply());
+        assert!(f.is_forward());
     }
 
     /// Helper to build a simple email message for tests.
