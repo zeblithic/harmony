@@ -9,5 +9,5 @@ description = "Durable execution orchestration with event-sourced history for th
 
 [dependencies]
 harmony-compute.workspace = true
-harmony-crypto.workspace = true
+harmony-crypto = { workspace = true, features = ["std"] }
 thiserror.workspace = true

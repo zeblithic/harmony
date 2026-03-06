@@ -49,12 +49,14 @@ hex = "0.4"
 wasmi = "1"
 wasmtime = "38"
 
-# Internal crates
+# Internal crates — default-features = false so bare-metal consumers
+# (harmony-os/harmony-boot) can compile the dependency graph without std.
+# Crates that need std re-enable it via their own `std` feature.
 harmony-compute = { path = "crates/harmony-compute" }
 harmony-content = { path = "crates/harmony-content" }
-harmony-crypto = { path = "crates/harmony-crypto" }
-harmony-identity = { path = "crates/harmony-identity" }
-harmony-platform = { path = "crates/harmony-platform" }
-harmony-reticulum = { path = "crates/harmony-reticulum" }
+harmony-crypto = { path = "crates/harmony-crypto", default-features = false }
+harmony-identity = { path = "crates/harmony-identity", default-features = false }
+harmony-platform = { path = "crates/harmony-platform", default-features = false }
+harmony-reticulum = { path = "crates/harmony-reticulum", default-features = false }
 harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
