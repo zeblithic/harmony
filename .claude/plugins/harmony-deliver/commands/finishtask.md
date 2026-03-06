@@ -83,7 +83,8 @@ BRANCH=$(git branch --show-current)
 WORKTREE=$(git rev-parse --show-toplevel)
 
 # 2. Switch to main repo FIRST (escape the worktree CWD)
-cd /Users/zeblith/work/zeblithic/harmony
+MAIN_REPO=$(git worktree list --porcelain | head -1 | sed 's/^worktree //')
+cd "$MAIN_REPO"
 
 # 3. Remove the worktree (frees the local branch)
 git worktree remove "$WORKTREE"

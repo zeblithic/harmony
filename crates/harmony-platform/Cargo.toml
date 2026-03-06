@@ -14,7 +14,11 @@ hashbrown = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["rand_core/getrandom"]
+std = [
+    "rand_core/getrandom",
+    "thiserror/std",
+    "hashbrown/default-hasher",
+]
 
 [dev-dependencies]
 rand = { workspace = true }

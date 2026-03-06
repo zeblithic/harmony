@@ -22,7 +22,17 @@ thiserror = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["rand_core/getrandom"]
+std = [
+    "rand_core/getrandom",
+    "sha2/std",
+    "blake3/std",
+    "hmac/std",
+    "hkdf/std",
+    "chacha20poly1305/getrandom",
+    "subtle/std",
+    "thiserror/std",
+    # aes 0.8 is no_std-clean by default; no std feature to re-enable
+]
 
 [dev-dependencies]
 rand = { workspace = true }
