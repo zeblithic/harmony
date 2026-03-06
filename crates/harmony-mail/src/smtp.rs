@@ -197,16 +197,8 @@ impl SmtpSession {
             SmtpCommand::Data => self.handle_data(),
             SmtpCommand::Quit => self.handle_quit(),
             SmtpCommand::Rset => self.handle_rset(),
-            SmtpCommand::Noop => {
-                if self.pending_rcpt.is_some() {
-                    vec![SmtpAction::SendResponse(
-                        503,
-                        "Recipient resolution pending".to_string(),
-                    )]
-                } else {
-                    vec![SmtpAction::SendResponse(250, "OK".to_string())]
-                }
-            }
+            // RFC 5321 §4.1.1.9: NOOP always succeeds regardless of session state.
+            SmtpCommand::Noop => vec![SmtpAction::SendResponse(250, "OK".to_string())],
             SmtpCommand::StartTls => self.handle_starttls(),
         }
     }
@@ -380,6 +372,9 @@ impl SmtpSession {
                 "Delivery in progress, wait for response".to_string(),
             )];
         }
+        if self.state == SmtpState::Closed {
+            return vec![];
+        }
         self.state = SmtpState::Closed;
         self.pending_rcpt = None;
         vec![
@@ -389,9 +384,12 @@ impl SmtpSession {
     }
 
     fn handle_rset(&mut self) -> Vec<SmtpAction> {
-        // Reject RSET during data collection or delivery — these states require
-        // their respective completion events before accepting new commands.
-        if self.state == SmtpState::DeliveryPending || self.state == SmtpState::DataReceiving {
+        // Reject RSET during data collection, delivery, or after close — these states require
+        // their respective completion events before accepting new commands, or are terminal.
+        if matches!(
+            self.state,
+            SmtpState::DeliveryPending | SmtpState::DataReceiving | SmtpState::Closed
+        ) {
             return vec![SmtpAction::SendResponse(
                 503,
                 "Bad sequence of commands".to_string(),
@@ -1300,7 +1298,8 @@ mod tests {
     }
 
     #[test]
-    fn noop_rejected_while_rcpt_pending() {
+    fn noop_always_succeeds() {
+        // RFC 5321 §4.1.1.9: NOOP always returns 250, even during pending resolution.
         let mut session = ready_session();
         session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
             address: "alice@sender.example.com".to_string(),
@@ -1310,14 +1309,38 @@ mod tests {
         }));
         assert!(session.pending_rcpt.is_some());
 
-        // NOOP while resolution pending should be rejected to preserve
-        // RFC 5321 pipelining response ordering.
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Noop));
+        assert_eq!(
+            actions[0],
+            SmtpAction::SendResponse(250, "OK".to_string()),
+            "NOOP must always return 250 per RFC 5321"
+        );
+    }
+
+    #[test]
+    fn quit_on_closed_session_is_noop() {
+        // Pipelined QUIT after close should not re-emit 221/Close actions.
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::Quit));
+        assert_eq!(session.state, SmtpState::Closed);
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Quit));
+        assert!(actions.is_empty(), "QUIT on closed session should produce no actions");
+        assert_eq!(session.state, SmtpState::Closed);
+    }
+
+    #[test]
+    fn rset_on_closed_session_rejected() {
+        // Pipelined RSET after close should not resurrect the session to Ready.
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::Quit));
+        assert_eq!(session.state, SmtpState::Closed);
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Rset));
+        assert_eq!(session.state, SmtpState::Closed, "Closed is terminal — RSET must not change it");
         match &actions[0] {
-            SmtpAction::SendResponse(code, _) => {
-                assert_eq!(*code, 503, "NOOP should be rejected while resolution pending");
-            }
-            other => panic!("expected SendResponse(503, ...), got {other:?}"),
+            SmtpAction::SendResponse(code, _) => assert_eq!(*code, 503),
+            other => panic!("expected 503, got {other:?}"),
         }
     }
 

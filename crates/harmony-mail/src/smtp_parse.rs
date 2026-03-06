@@ -89,6 +89,9 @@ fn parse_mail_from_arg(arg: &str) -> Result<String, MailError> {
 }
 
 /// Parse the argument to `RCPT TO:`, extracting the address.
+///
+/// Unlike `MAIL FROM:<>` (null sender, valid for DSNs), `RCPT TO:<>` is never
+/// valid per RFC 5321 §4.1.2 — a recipient requires a non-empty mailbox.
 fn parse_rcpt_to_arg(arg: &str) -> Result<String, MailError> {
     let arg = arg.trim();
     // Strip the "TO:" prefix (case-insensitive).
@@ -99,7 +102,13 @@ fn parse_rcpt_to_arg(arg: &str) -> Result<String, MailError> {
         return Err(MailError::UnknownCommand("RCPT".to_string()));
     };
 
-    extract_address(after_to)
+    let address = extract_address(after_to)?;
+    if address.is_empty() {
+        return Err(MailError::UnknownCommand(
+            "RCPT TO requires a non-empty mailbox address".to_string(),
+        ));
+    }
+    Ok(address)
 }
 
 /// Extract an email address from a string that may be wrapped in angle brackets.
@@ -273,6 +282,14 @@ mod tests {
     fn parse_rcpt_unclosed_angle_bracket_rejected() {
         let result = parse_command(b"RCPT TO:<user@example.com\r\n");
         assert!(result.is_err(), "unclosed angle bracket should be rejected");
+    }
+
+    #[test]
+    fn parse_rcpt_to_empty_address_rejected() {
+        // RFC 5321 §4.1.2: RCPT TO requires a non-empty mailbox.
+        // Unlike MAIL FROM:<> (null sender for DSNs), RCPT TO:<> is never valid.
+        let result = parse_command(b"RCPT TO:<>\r\n");
+        assert!(result.is_err(), "RCPT TO:<> should be rejected");
     }
 
     #[test]
