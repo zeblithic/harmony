@@ -20,6 +20,7 @@ hashbrown = { workspace = true }
 [features]
 default = ["std"]
 std = ["harmony-crypto/std", "harmony-platform/std", "rand_core/getrandom"]
+test-utils = []
 
 [dev-dependencies]
 rand = { workspace = true }

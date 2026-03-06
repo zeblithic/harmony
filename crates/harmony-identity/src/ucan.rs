@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 
 use harmony_crypto::hash;
 use harmony_platform::EntropySource;
+#[cfg(any(test, feature = "test-utils"))]
 use hashbrown::{HashMap, HashSet};
 
 use crate::identity::{Identity, ADDRESS_HASH_LENGTH, SIGNATURE_LENGTH};
@@ -318,11 +319,14 @@ pub trait RevocationSet {
 /// In-memory proof store for testing.
 ///
 /// Stores tokens keyed by their BLAKE3 content hash.
+/// Only available with the `test-utils` feature or in test builds.
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Default)]
 pub struct MemoryProofStore {
     tokens: HashMap<[u8; 32], UcanToken>,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl MemoryProofStore {
     /// Create a new empty proof store.
     pub fn new() -> Self {
@@ -338,6 +342,7 @@ impl MemoryProofStore {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl ProofResolver for MemoryProofStore {
     fn resolve(&self, hash: &[u8; 32]) -> Option<UcanToken> {
         self.tokens.get(hash).cloned()
@@ -347,11 +352,14 @@ impl ProofResolver for MemoryProofStore {
 /// In-memory identity store for testing.
 ///
 /// Stores identities keyed by their address hash.
+/// Only available with the `test-utils` feature or in test builds.
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Default)]
 pub struct MemoryIdentityStore {
     identities: HashMap<[u8; ADDRESS_HASH_LENGTH], Identity>,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl MemoryIdentityStore {
     /// Create a new empty identity store.
     pub fn new() -> Self {
@@ -367,6 +375,7 @@ impl MemoryIdentityStore {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl IdentityResolver for MemoryIdentityStore {
     fn resolve(&self, address_hash: &[u8; ADDRESS_HASH_LENGTH]) -> Option<Identity> {
         self.identities.get(address_hash).cloned()
@@ -376,11 +385,14 @@ impl IdentityResolver for MemoryIdentityStore {
 /// In-memory revocation set for testing.
 ///
 /// Stores the BLAKE3 content hashes of revoked tokens.
+/// Only available with the `test-utils` feature or in test builds.
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Default)]
 pub struct MemoryRevocationSet {
     revoked: HashSet<[u8; 32]>,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl MemoryRevocationSet {
     /// Create a new empty revocation set.
     pub fn new() -> Self {
@@ -395,6 +407,7 @@ impl MemoryRevocationSet {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl RevocationSet for MemoryRevocationSet {
     fn is_revoked(&self, token_hash: &[u8; 32]) -> bool {
         self.revoked.contains(token_hash)
@@ -542,7 +555,14 @@ fn verify_token_recursive(
         return Err(UcanError::Expired);
     }
 
-    // 2. Verify signature
+    // 2. Check revocation (cheap HashSet lookup; must precede signature
+    //    verification so that a tombstoned/rotated issuer identity doesn't
+    //    mask a revocation with IssuerNotFound)
+    if revocations.is_revoked(&token.content_hash()) {
+        return Err(UcanError::Revoked);
+    }
+
+    // 3. Verify signature
     let issuer_identity = identities
         .resolve(&token.issuer)
         .ok_or(UcanError::IssuerNotFound)?;
@@ -550,11 +570,6 @@ fn verify_token_recursive(
     issuer_identity
         .verify(&signable, &token.signature)
         .map_err(|_| UcanError::SignatureInvalid)?;
-
-    // 3. Check revocation
-    if revocations.is_revoked(&token.content_hash()) {
-        return Err(UcanError::Revoked);
-    }
 
     // 4. If delegated, verify the chain
     if let Some(parent_hash) = &token.proof {
@@ -1601,5 +1616,24 @@ mod tests {
         let result =
             issuer.issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Memory, &[], 500, 0);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn revoked_token_returns_revoked_even_without_issuer_in_store() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        let token = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Memory, &[], 0, 0)
+            .unwrap();
+
+        // Revoke the token but do NOT add the issuer to the identity store
+        let mut revocations = MemoryRevocationSet::new();
+        revocations.insert(token.content_hash());
+        let ids = MemoryIdentityStore::new(); // empty — issuer not present
+        let proofs = MemoryProofStore::new();
+
+        // Should return Revoked, not IssuerNotFound
+        let result = verify_token(&token, 100, &proofs, &ids, &revocations, 10);
+        assert!(matches!(result, Err(UcanError::Revoked)));
     }
 }
