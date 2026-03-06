@@ -326,9 +326,11 @@ impl SmtpSession {
 
         // Guard: reject if a previous RCPT TO resolution is still in flight.
         // The I/O layer must feed HarmonyResolved before the next RCPT TO.
+        // Use 451 (not 503): the client's pipelining is valid — this is a
+        // temporary server-side limitation, not a protocol sequence error.
         if self.pending_rcpt.is_some() {
             return vec![SmtpAction::SendResponse(
-                503,
+                451,
                 "Previous recipient resolution pending".to_string(),
             )];
         }
@@ -956,9 +958,9 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             SmtpAction::SendResponse(code, _) => {
-                assert_eq!(*code, 503, "should reject with 503 bad sequence");
+                assert_eq!(*code, 451, "should reject with 451 temporary failure");
             }
-            other => panic!("expected SendResponse(503, ...), got {other:?}"),
+            other => panic!("expected SendResponse(451, ...), got {other:?}"),
         }
     }
 
