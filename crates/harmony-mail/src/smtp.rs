@@ -764,6 +764,55 @@ mod tests {
     }
 
     #[test]
+    fn second_rcpt_to_fails_first_still_valid() {
+        // First RCPT TO succeeds, second fails at resolution.
+        // Session should remain in RcptToReceived so DATA can proceed
+        // with the first (valid) recipient.
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+
+        // First RCPT TO — resolves successfully.
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "bob".to_string(),
+            identity: Some([0xBB; ADDRESS_HASH_LEN]),
+        });
+        assert_eq!(session.state, SmtpState::RcptToReceived);
+        assert_eq!(session.resolved_recipients.len(), 1);
+
+        // Second RCPT TO — resolution fails (user not found).
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "unknown@harmony.example.com".to_string(),
+        }));
+        let actions = session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "unknown".to_string(),
+            identity: None,
+        });
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => assert_eq!(*code, 550),
+            other => panic!("expected SendResponse(550, ...), got {other:?}"),
+        }
+
+        // State stays RcptToReceived — first recipient is still valid.
+        assert_eq!(session.state, SmtpState::RcptToReceived);
+        assert_eq!(session.resolved_recipients.len(), 1);
+
+        // DATA should succeed with the first recipient.
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Data));
+        assert_eq!(session.state, SmtpState::DataReceiving);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => assert_eq!(*code, 354),
+            other => panic!("expected SendResponse(354, ...), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn data_command_accepted_after_rcpt() {
         let mut session = ready_session();
         session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
