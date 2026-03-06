@@ -102,7 +102,7 @@ pub struct SpamVerdict {
 ///
 /// **Thresholds** (default `reject_threshold` = 5):
 /// - score <= 0: `Deliver`
-/// - score 1..(reject_threshold-1): `DeliverWithScore`
+/// - score 1..=reject_threshold-1: `DeliverWithScore`
 /// - score >= reject_threshold: `Reject`
 pub fn score(signals: &SpamSignals, reject_threshold: i32) -> SpamVerdict {
     let mut s: i32 = 0;

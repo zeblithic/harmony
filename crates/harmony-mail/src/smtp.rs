@@ -418,6 +418,11 @@ impl SmtpSession {
             SmtpState::Connected | SmtpState::GreetingSent => {
                 // Pre-EHLO: keep current state, don't let client skip handshake.
             }
+            SmtpState::TlsNegotiating => {
+                // Unreachable: blocked by handle_command()'s TlsNegotiating guard.
+                // Explicit arm prevents this state from silently advancing to Ready
+                // if the top-level guard is ever refactored.
+            }
             _ => {
                 self.state = SmtpState::Ready;
             }
