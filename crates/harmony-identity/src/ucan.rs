@@ -170,6 +170,10 @@ impl UcanToken {
     /// stored as a `u16`, so resources exceeding 65 535 bytes would be silently
     /// truncated — but `MAX_RESOURCE_SIZE` (256) makes that unreachable.
     pub fn to_bytes(&self) -> Vec<u8> {
+        debug_assert!(
+            self.resource.len() <= u16::MAX as usize,
+            "resource exceeds u16 length limit; use issue_root_token/delegate to create tokens"
+        );
         let resource_len = self.resource.len() as u16;
         let proof_size = if self.proof.is_some() { 32 } else { 0 };
         let total = MIN_TOKEN_SIZE + self.resource.len() + proof_size;
@@ -261,7 +265,7 @@ impl UcanToken {
             _ => return Err(UcanError::InvalidEncoding),
         };
 
-        if data.len() < pos + SIGNATURE_LENGTH {
+        if data.len() != pos + SIGNATURE_LENGTH {
             return Err(UcanError::InvalidEncoding);
         }
 
@@ -580,6 +584,12 @@ fn verify_token_recursive(
         let parent = proofs
             .resolve(parent_hash)
             .ok_or(UcanError::ProofNotFound)?;
+
+        // Integrity: resolved token must hash to the requested value.
+        // A buggy or adversarial ProofResolver could return a different token.
+        if parent.content_hash() != *parent_hash {
+            return Err(UcanError::ChainBroken);
+        }
 
         // Chain continuity: parent.audience must equal this token's issuer
         if parent.audience != token.issuer {
@@ -1635,5 +1645,66 @@ mod tests {
         // Should return Revoked, not IssuerNotFound
         let result = verify_token(&token, 100, &proofs, &ids, &revocations, 10);
         assert!(matches!(result, Err(UcanError::Revoked)));
+    }
+
+    #[test]
+    fn from_bytes_rejects_trailing_garbage() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        let token = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Memory, &[], 0, 0)
+            .unwrap();
+
+        let mut wire = token.to_bytes();
+        wire.push(0xFF); // trailing garbage byte
+        assert!(matches!(
+            UcanToken::from_bytes(&wire),
+            Err(UcanError::InvalidEncoding)
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_proof_with_wrong_content_hash() {
+        let mut rng = test_rng();
+        let root_id = PrivateIdentity::generate(&mut rng);
+        let child_id = PrivateIdentity::generate(&mut rng);
+
+        let parent = root_id
+            .issue_root_token(
+                &mut rng,
+                &child_id.identity.address_hash,
+                CapabilityType::Memory,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        let child = child_id
+            .delegate(
+                &mut rng,
+                &parent,
+                &[0u8; 16],
+                CapabilityType::Memory,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        // Build a proof store that returns the WRONG token for the parent hash.
+        // The child's proof field points to parent's hash, but we store a
+        // different token (the child itself) under that key.
+        let mut proofs = MemoryProofStore::new();
+        // Manually insert wrong token under parent's hash key
+        proofs.tokens.insert(parent.content_hash(), child.clone());
+
+        let mut ids = MemoryIdentityStore::new();
+        ids.insert(root_id.identity.clone());
+        ids.insert(child_id.identity.clone());
+        let revocations = MemoryRevocationSet::new();
+
+        let result = verify_token(&child, 100, &proofs, &ids, &revocations, 10);
+        assert!(matches!(result, Err(UcanError::ChainBroken)));
     }
 }
