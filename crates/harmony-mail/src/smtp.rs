@@ -308,8 +308,8 @@ impl SmtpSession {
         // The I/O layer must feed HarmonyResolved before the next RCPT TO.
         if self.pending_rcpt.is_some() {
             return vec![SmtpAction::SendResponse(
-                421,
-                "4.7.0 Previous recipient resolution pending".to_string(),
+                503,
+                "Previous recipient resolution pending".to_string(),
             )];
         }
 
@@ -339,8 +339,8 @@ impl SmtpSession {
         // Guard: don't accept DATA while a RCPT TO resolution is still in flight.
         if self.pending_rcpt.is_some() {
             return vec![SmtpAction::SendResponse(
-                421,
-                "4.7.0 Recipient resolution pending".to_string(),
+                503,
+                "Recipient resolution pending".to_string(),
             )];
         }
         self.state = SmtpState::DataReceiving;
@@ -849,9 +849,9 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             SmtpAction::SendResponse(code, _) => {
-                assert_eq!(*code, 421, "should reject with 421 temporary failure");
+                assert_eq!(*code, 503, "should reject with 503 bad sequence");
             }
-            other => panic!("expected SendResponse(421, ...), got {other:?}"),
+            other => panic!("expected SendResponse(503, ...), got {other:?}"),
         }
     }
 
@@ -954,9 +954,9 @@ mod tests {
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Data));
         match &actions[0] {
             SmtpAction::SendResponse(code, _) => {
-                assert_eq!(*code, 421, "should reject DATA while resolution pending");
+                assert_eq!(*code, 503, "should reject DATA while resolution pending");
             }
-            other => panic!("expected SendResponse(421, ...), got {other:?}"),
+            other => panic!("expected SendResponse(503, ...), got {other:?}"),
         }
         // State should remain RcptToReceived, not advance to DataReceiving.
         assert_eq!(session.state, SmtpState::RcptToReceived);

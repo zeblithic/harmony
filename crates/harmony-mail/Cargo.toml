@@ -15,11 +15,11 @@ path = "src/main.rs"
 harmony-identity.workspace = true
 ed25519-dalek.workspace = true
 thiserror.workspace = true
-rand.workspace = true
-rand_core.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 toml.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+rand.workspace = true
+rand_core.workspace = true

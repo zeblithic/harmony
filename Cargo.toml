@@ -47,7 +47,7 @@ wasmi = "1"
 wasmtime = "38"
 
 # CLI and config
-serde = { version = "1", features = ["derive"] }
+serde = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 
