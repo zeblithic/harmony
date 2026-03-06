@@ -42,6 +42,7 @@ impl Locality {
 
 /// Reticulum router key expressions.
 pub mod reticulum {
+    use alloc::{format, string::String};
     /// Base prefix: `harmony/reticulum`
     pub const PREFIX: &str = "harmony/reticulum";
 
@@ -88,6 +89,7 @@ pub mod reticulum {
 /// `harmony-content` crate depends on `harmony-zenoh` and re-exports
 /// these helpers via `zenoh_bridge` and `StorageTier`.
 pub mod content {
+    use alloc::{format, string::String, vec::Vec};
     /// Base prefix: `harmony/content`
     pub const PREFIX: &str = "harmony/content";
 
@@ -155,6 +157,7 @@ pub mod content {
 
 /// Content availability announcements.
 pub mod announce {
+    use alloc::{format, string::String};
     /// Base prefix: `harmony/announce`
     pub const PREFIX: &str = "harmony/announce";
 
@@ -171,6 +174,7 @@ pub mod announce {
 
 /// WASM compute key expressions.
 pub mod compute {
+    use alloc::{format, string::String};
     /// Base prefix: `harmony/compute`
     pub const PREFIX: &str = "harmony/compute";
 
@@ -211,6 +215,7 @@ pub mod compute {
 
 /// Durable workflow execution key expressions.
 pub mod workflow {
+    use alloc::{format, string::String};
     /// Base prefix: `harmony/workflow`
     pub const PREFIX: &str = "harmony/workflow";
 
@@ -236,6 +241,7 @@ pub mod workflow {
 
 /// Liveliness token key expressions.
 pub mod presence {
+    use alloc::{format, string::String};
     /// Base prefix: `harmony/presence`
     pub const PREFIX: &str = "harmony/presence";
 
@@ -257,6 +263,7 @@ pub mod presence {
 
 /// Community hub key expressions.
 pub mod community {
+    use alloc::{format, string::String};
     /// Base prefix: `harmony/community`
     pub const PREFIX: &str = "harmony/community";
 
@@ -268,6 +275,7 @@ pub mod community {
 
 /// Direct message inbox key expressions.
 pub mod messages {
+    use alloc::{format, string::String};
     /// Base prefix: `harmony/messages`
     pub const PREFIX: &str = "harmony/messages";
 
@@ -279,6 +287,7 @@ pub mod messages {
 
 /// Peer profile key expressions.
 pub mod profile {
+    use alloc::{format, string::String};
     /// Base prefix: `harmony/profile`
     pub const PREFIX: &str = "harmony/profile";
 

@@ -7,8 +7,13 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Content-addressed storage primitives for the Harmony decentralized stack"
 
+[features]
+default = ["std"]
+std = ["harmony-crypto/std", "harmony-zenoh/std"]
+
 [dependencies]
 harmony-crypto.workspace = true
 thiserror.workspace = true
 hex = { workspace = true }
 harmony-zenoh.workspace = true
+hashbrown = { workspace = true }

@@ -3,6 +3,8 @@
 //! This module re-exports the canonical key expression helpers from
 //! `harmony_zenoh::namespace` for callers that haven't migrated to StorageTier.
 
+use alloc::string::String;
+
 pub use harmony_zenoh::namespace::content::all_shard_patterns as content_queryable_key_exprs;
 
 use crate::cid::ContentId;

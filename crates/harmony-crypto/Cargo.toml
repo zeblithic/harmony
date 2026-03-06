@@ -20,6 +20,10 @@ zeroize = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+default = ["std"]
+std = []
+
 [dev-dependencies]
 rand = { workspace = true }
 hex = { workspace = true }

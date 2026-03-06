@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
-use std::fmt;
+use alloc::vec::Vec;
+use core::fmt;
+use hashbrown::{HashMap, HashSet};
 
 use crate::cid::ContentId;
 

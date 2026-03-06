@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use harmony_crypto::{hash, hkdf};
 use harmony_identity::identity::PrivateIdentity;
 use zeroize::Zeroize;
@@ -356,7 +357,7 @@ mod tests {
             let mut pkt = vec![0x01, 0x00]; // flags, hops
             pkt.extend_from_slice(&[0xBB; 16]); // dest hash
             pkt.push(0x00); // context
-            pkt.extend(std::iter::repeat(0xCC).take(payload_size));
+            pkt.extend(core::iter::repeat(0xCC).take(payload_size));
 
             let masked = auth.mask(&pkt).unwrap();
             let unmasked = auth.unmask(&masked).unwrap();

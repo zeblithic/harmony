@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use crate::error::ReticulumError;
 
 /// Interface mode (matches Python Interface.MODE_*).

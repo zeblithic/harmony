@@ -7,6 +7,7 @@
 //! The public identity is the concatenation: `[32B X25519 pub][32B Ed25519 pub]`
 //! The address hash is: `SHA256(public_identity)[:16]` (128-bit truncated hash)
 
+use alloc::vec::Vec;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::CryptoRngCore;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};

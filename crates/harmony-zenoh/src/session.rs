@@ -5,7 +5,8 @@
 //! graceful close. The caller drives the session via events and
 //! executes the returned actions.
 
-use std::collections::HashMap;
+use alloc::{string::String, vec, vec::Vec};
+use hashbrown::HashMap;
 
 use harmony_identity::{Identity, PrivateIdentity};
 

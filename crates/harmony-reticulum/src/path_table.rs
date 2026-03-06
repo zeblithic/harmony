@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use alloc::{sync::Arc, vec, vec::Vec};
+use hashbrown::HashMap;
 
 use harmony_crypto::hash::TRUNCATED_HASH_LENGTH;
 

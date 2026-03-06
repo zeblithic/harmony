@@ -8,6 +8,7 @@
 //! After handshake, both sides share a 64-byte Fernet key derived via
 //! `HKDF(ECDH_shared_secret, salt=link_id)`.
 
+use alloc::{vec, vec::Vec};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use harmony_crypto::{fernet, hash, hkdf};
 use harmony_identity::identity::{Identity, PrivateIdentity, SIGNATURE_LENGTH};

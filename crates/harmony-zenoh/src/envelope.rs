@@ -11,6 +11,7 @@
 
 use harmony_crypto::{aead, hkdf};
 use harmony_identity::{Identity, PrivateIdentity};
+use alloc::{string::{String, ToString}, vec::Vec};
 use rand_core::CryptoRngCore;
 use zeroize::Zeroize;
 

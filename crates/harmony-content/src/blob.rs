@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use alloc::vec::Vec;
+use hashbrown::HashMap;
 
 use crate::cid::ContentId;
 use crate::error::ContentError;

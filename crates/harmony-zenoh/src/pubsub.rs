@@ -5,8 +5,8 @@
 //! It composes with [`Session`] (peer lifecycle) and [`SubscriptionTable`]
 //! (key expression matching) without owning either.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use alloc::{string::{String, ToString}, sync::Arc, vec, vec::Vec};
+use hashbrown::HashMap;
 
 use zenoh_keyexpr::key_expr::{keyexpr, OwnedKeyExpr};
 

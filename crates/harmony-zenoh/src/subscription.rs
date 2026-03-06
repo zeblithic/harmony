@@ -4,6 +4,7 @@
 //! (including wildcards) and efficiently matches incoming messages to all
 //! interested subscribers.
 
+use alloc::{vec, vec::Vec};
 use zenoh_keyexpr::key_expr::{keyexpr, OwnedKeyExpr};
 use zenoh_keyexpr::keyexpr_tree::box_tree::KeBoxTree;
 use zenoh_keyexpr::keyexpr_tree::{
