@@ -602,6 +602,7 @@ impl PrivateIdentity {
     /// Creates a child token referencing the parent by BLAKE3 hash.
     /// Enforces attenuation: capability type must match, time bounds
     /// must be narrowed or equal.
+    #[allow(clippy::too_many_arguments)]
     pub fn delegate(
         &self,
         rng: &mut impl EntropySource,
