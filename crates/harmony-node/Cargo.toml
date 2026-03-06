@@ -18,7 +18,7 @@ path = "src/main.rs"
 harmony-compute.workspace = true
 harmony-content.workspace = true
 harmony-crypto = { workspace = true, features = ["std"] }
-harmony-identity = { path = "../harmony-identity", features = ["std"] }
+harmony-identity = { workspace = true, features = ["std"] }
 harmony-reticulum = { workspace = true, features = ["std"] }
 harmony-workflow.workspace = true
 harmony-zenoh.workspace = true

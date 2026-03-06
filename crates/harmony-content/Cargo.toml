@@ -9,7 +9,7 @@ description = "Content-addressed storage primitives for the Harmony decentralize
 
 [features]
 default = ["std"]
-std = ["harmony-crypto/std", "harmony-zenoh/std"]
+std = ["harmony-crypto/std", "harmony-zenoh/std", "thiserror/std"]
 
 [dependencies]
 harmony-crypto.workspace = true

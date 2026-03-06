@@ -8,7 +8,7 @@
 
 **Tech Stack:** `bootloader_api` 0.11, `linked_list_allocator` 0.10, `x86_64` 0.15, `bootloader` 0.11 (xtask only), Ring 0 crates with `default-features = false` for no_std.
 
-**Repos:** Primary work in `harmony-os` (`/Users/zeblith/work/zeblithic/harmony-os/`). Design doc already committed in `harmony` (`/Users/zeblith/work/zeblithic/harmony/`).
+**Repos:** Primary work in `harmony-os` (`zeblithic/harmony-os/`). Design doc already committed in `harmony` (`zeblithic/harmony/`).
 
 **Design doc:** `docs/plans/2026-03-05-ring1-boot-stub-design.md`
 
@@ -19,16 +19,16 @@
 **Context:** Create the task branch in harmony-os, add new workspace dependencies, scaffold the `harmony-boot` and `xtask` crates with minimal compilable stubs.
 
 **Files:**
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/Cargo.toml`
-- Create: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-boot/Cargo.toml`
-- Create: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-boot/src/main.rs`
-- Create: `/Users/zeblith/work/zeblithic/harmony-os/xtask/Cargo.toml`
-- Create: `/Users/zeblith/work/zeblithic/harmony-os/xtask/src/main.rs`
+- Modify: `harmony-os/Cargo.toml`
+- Create: `harmony-os/crates/harmony-boot/Cargo.toml`
+- Create: `harmony-os/crates/harmony-boot/src/main.rs`
+- Create: `harmony-os/xtask/Cargo.toml`
+- Create: `harmony-os/xtask/src/main.rs`
 
 **Step 1: Create task branch in harmony-os**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-os
+cd harmony-os  # relative to workspace root
 git checkout main && git pull origin main
 git checkout -b jake-os-boot-stub
 ```
@@ -192,7 +192,7 @@ fn run_qemu() {
 **Step 5: Verify workspace compiles**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-os
+cd harmony-os  # relative to workspace root
 cargo check -p harmony-unikernel
 cargo check -p harmony-boot --target x86_64-unknown-none
 ```
@@ -213,13 +213,13 @@ git commit -m "scaffold: harmony-boot crate and xtask for Ring 1 boot stub"
 **Context:** Convert harmony-unikernel from a placeholder to a proper no_std lib with feature flags and module structure for the portable kernel logic.
 
 **Files:**
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/Cargo.toml`
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/src/lib.rs`
-- Create: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/src/serial.rs`
-- Create: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/src/platform/mod.rs`
-- Create: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/src/platform/entropy.rs`
-- Create: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/src/platform/persistence.rs`
-- Create: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/src/event_loop.rs`
+- Modify: `harmony-os/crates/harmony-unikernel/Cargo.toml`
+- Modify: `harmony-os/crates/harmony-unikernel/src/lib.rs`
+- Create: `harmony-os/crates/harmony-unikernel/src/serial.rs`
+- Create: `harmony-os/crates/harmony-unikernel/src/platform/mod.rs`
+- Create: `harmony-os/crates/harmony-unikernel/src/platform/entropy.rs`
+- Create: `harmony-os/crates/harmony-unikernel/src/platform/persistence.rs`
+- Create: `harmony-os/crates/harmony-unikernel/src/event_loop.rs`
 
 **Step 1: Update Cargo.toml with no_std deps and features**
 
@@ -326,7 +326,7 @@ git commit -m "feat(unikernel): no_std module structure for platform, serial, ev
 **Context:** Arch-agnostic serial output writer that takes a closure for byte output. Implements `core::fmt::Write`. Provides structured `[TAG] message` logging.
 
 **Files:**
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/src/serial.rs`
+- Modify: `harmony-os/crates/harmony-unikernel/src/serial.rs`
 
 **Step 1: Write failing tests**
 
@@ -452,7 +452,7 @@ git commit -m "feat(unikernel): SerialWriter with structured [TAG] logging and h
 **Context:** Arch-agnostic entropy wrapper implementing `rand_core::RngCore + CryptoRng` (which gives `CryptoRngCore` and thus `EntropySource` via blanket impl). Takes a caller-provided `FnMut(&mut [u8])` closure — `harmony-boot` will pass RDRAND.
 
 **Files:**
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/src/platform/entropy.rs`
+- Modify: `harmony-os/crates/harmony-unikernel/src/platform/entropy.rs`
 
 **Step 1: Write implementation and tests**
 
@@ -595,7 +595,7 @@ git commit -m "feat(unikernel): KernelEntropy — arch-agnostic RngCore+CryptoRn
 **Context:** In-memory `BTreeMap`-based `PersistentState` implementation. Uses `alloc::collections::BTreeMap` to avoid `hashbrown` dependency in the unikernel crate.
 
 **Files:**
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/src/platform/persistence.rs`
+- Modify: `harmony-os/crates/harmony-unikernel/src/platform/persistence.rs`
 
 **Step 1: Write implementation and tests**
 
@@ -733,7 +733,7 @@ git commit -m "feat(unikernel): MemoryState — BTreeMap-based volatile Persiste
 **Important API note:** The Node uses `handle_event(NodeEvent) -> Vec<NodeAction>`, not a `tick()` method. The runtime's `tick()` wraps this.
 
 **Files:**
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-unikernel/src/event_loop.rs`
+- Modify: `harmony-os/crates/harmony-unikernel/src/event_loop.rs`
 
 **Step 1: Write implementation and tests**
 
@@ -897,7 +897,7 @@ git commit -m "feat(unikernel): UnikernelRuntime — event loop driving Ring 0 N
 **Context:** The x86_64-specific boot binary. Initializes serial (UART 0x3F8), heap (linked_list_allocator from boot memory map), IDT (exception handlers), RDRAND entropy, generates identity, and enters the event loop. All arch-specific code lives here.
 
 **Files:**
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/crates/harmony-boot/src/main.rs`
+- Modify: `harmony-os/crates/harmony-boot/src/main.rs`
 
 **Step 1: Write the full entry point**
 
@@ -1129,7 +1129,7 @@ Expected: compiles without errors. This does NOT run tests (bare-metal binary ca
 **Step 3: Commit**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-os
+cd harmony-os  # relative to workspace root
 git add -A
 git commit -m "feat(boot): x86_64 entry point with serial, heap, IDT, RDRAND, identity"
 ```
@@ -1141,8 +1141,8 @@ git commit -m "feat(boot): x86_64 entry point with serial, heap, IDT, RDRAND, id
 **Context:** Set up the disk image builder and QEMU launch recipes. The xtask crate uses `bootloader::BiosBoot` to wrap the kernel ELF into a bootable image. The justfile provides convenient recipes.
 
 **Files:**
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/xtask/src/main.rs` (already scaffolded in Task 1, finalize)
-- Create: `/Users/zeblith/work/zeblithic/harmony-os/justfile`
+- Modify: `harmony-os/xtask/src/main.rs` (already scaffolded in Task 1, finalize)
+- Create: `harmony-os/justfile`
 
 **Step 1: Finalize xtask (should already be correct from Task 1 scaffold)**
 
@@ -1206,7 +1206,7 @@ check: test clippy fmt-check test-qemu
 **Step 3: Verify build pipeline**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-os
+cd harmony-os  # relative to workspace root
 just build
 ```
 
@@ -1228,7 +1228,7 @@ git commit -m "build: justfile and xtask for BIOS image creation and QEMU launch
 **Step 1: Run QEMU interactively to verify output**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-os
+cd harmony-os  # relative to workspace root
 just run
 ```
 
@@ -1273,7 +1273,7 @@ git commit -m "fix(boot): adjustments from QEMU integration testing"
 **Step 1: All host tests**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-os
+cd harmony-os  # relative to workspace root
 cargo test --workspace
 ```
 
