@@ -20,16 +20,89 @@ pub const MAX_RESOURCE_SIZE: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CapabilityType {
-    /// Placeholder — will be defined in Task 2.
+    /// Read/write access to content-addressed memory.
     Memory = 0,
+    /// Access to network transport interfaces.
+    Network = 1,
+    /// Access to identity operations (signing, key management).
+    Identity = 2,
+    /// Access to persistent storage.
+    Storage = 3,
+    /// Access to publish/subscribe messaging.
+    Messaging = 4,
+    /// Access to workflow execution.
+    Workflow = 5,
+    /// Access to compute resources (WASM execution).
+    Compute = 6,
+}
+
+impl TryFrom<u8> for CapabilityType {
+    type Error = UcanError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Memory),
+            1 => Ok(Self::Network),
+            2 => Ok(Self::Identity),
+            3 => Ok(Self::Storage),
+            4 => Ok(Self::Messaging),
+            5 => Ok(Self::Workflow),
+            6 => Ok(Self::Compute),
+            _ => Err(UcanError::InvalidEncoding),
+        }
+    }
 }
 
 /// Errors produced by UCAN operations.
 #[derive(Debug, thiserror::Error)]
 pub enum UcanError {
-    /// Placeholder — will be defined in Task 2.
+    /// The token's `expires_at` timestamp has passed.
     #[error("token has expired")]
     Expired,
+
+    /// The token's `not_before` timestamp has not yet been reached.
+    #[error("token is not yet valid")]
+    NotYetValid,
+
+    /// The Ed25519 signature on the token is invalid.
+    #[error("signature verification failed")]
+    SignatureInvalid,
+
+    /// The proof chain exceeds the maximum allowed depth.
+    #[error("proof chain too deep: {0} levels")]
+    ChainTooDeep(usize),
+
+    /// A proof referenced by hash could not be resolved.
+    #[error("proof not found in resolver")]
+    ProofNotFound,
+
+    /// The proof chain is broken (audience/issuer mismatch).
+    #[error("proof chain is broken")]
+    ChainBroken,
+
+    /// The token's capability type does not match its proof's capability.
+    #[error("capability type mismatch between token and proof")]
+    CapabilityMismatch,
+
+    /// The delegated token attempts to escalate beyond its proof's authority.
+    #[error("attenuation violation: delegated token exceeds proof authority")]
+    AttenuationViolation,
+
+    /// The token has been explicitly revoked.
+    #[error("token has been revoked")]
+    Revoked,
+
+    /// The token's issuer could not be resolved to a known identity.
+    #[error("issuer identity not found")]
+    IssuerNotFound,
+
+    /// The binary encoding is malformed or contains invalid values.
+    #[error("invalid binary encoding")]
+    InvalidEncoding,
+
+    /// The resource field exceeds the maximum allowed size.
+    #[error("resource exceeds maximum size of {MAX_RESOURCE_SIZE} bytes")]
+    ResourceTooLarge,
 
     /// Wraps an identity error.
     #[error(transparent)]
@@ -83,4 +156,29 @@ pub struct MemoryIdentityStore {
 #[derive(Debug, Default)]
 pub struct MemoryRevocationSet {
     _placeholder: (),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_type_u8_roundtrip() {
+        for val in 0u8..=6 {
+            let cap = CapabilityType::try_from(val).unwrap();
+            assert_eq!(cap as u8, val);
+        }
+    }
+
+    #[test]
+    fn capability_type_invalid_value_rejected() {
+        assert!(CapabilityType::try_from(7u8).is_err());
+        assert!(CapabilityType::try_from(255u8).is_err());
+    }
+
+    #[test]
+    fn ucan_error_display() {
+        let err = UcanError::Expired;
+        assert_eq!(alloc::format!("{err}"), "token has expired");
+    }
 }
