@@ -46,8 +46,7 @@ hex = "0.4"
 wasmi = "1"
 wasmtime = "38"
 
-# CLI and runtime
-tokio = { version = "1", features = ["full"] }
+# CLI and config
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }

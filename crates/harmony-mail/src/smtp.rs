@@ -323,6 +323,13 @@ impl SmtpSession {
                 "Bad sequence of commands".to_string(),
             )];
         }
+        // Guard: don't accept DATA while a RCPT TO resolution is still in flight.
+        if self.pending_rcpt.is_some() {
+            return vec![SmtpAction::SendResponse(
+                421,
+                "4.7.0 Recipient resolution pending".to_string(),
+            )];
+        }
         self.state = SmtpState::DataReceiving;
         vec![SmtpAction::SendResponse(
             354,
@@ -882,6 +889,40 @@ mod tests {
             Some("bob".to_string()),
             "pending_rcpt should remain unchanged"
         );
+    }
+
+    #[test]
+    fn data_rejected_while_rcpt_pending() {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        // First RCPT TO resolves successfully.
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "bob".to_string(),
+            identity: Some([0xBB; ADDRESS_HASH_LEN]),
+        });
+        assert_eq!(session.state, SmtpState::RcptToReceived);
+
+        // Second RCPT TO — resolution still in flight.
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "carol@harmony.example.com".to_string(),
+        }));
+        assert!(session.pending_rcpt.is_some());
+
+        // DATA while resolution pending should be rejected.
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Data));
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => {
+                assert_eq!(*code, 421, "should reject DATA while resolution pending");
+            }
+            other => panic!("expected SendResponse(421, ...), got {other:?}"),
+        }
+        // State should remain RcptToReceived, not advance to DataReceiving.
+        assert_eq!(session.state, SmtpState::RcptToReceived);
     }
 
     #[test]
