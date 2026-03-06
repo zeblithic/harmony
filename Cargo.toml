@@ -17,7 +17,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/zeblithic/harmony"
-rust-version = "1.75"
+rust-version = "1.81"
 
 [workspace.dependencies]
 # Cryptographic primitives

@@ -1,8 +1,5 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use std::collections::HashMap;
-#[cfg(not(feature = "std"))]
 use hashbrown::HashMap;
 
 use crate::error::PlatformError;
