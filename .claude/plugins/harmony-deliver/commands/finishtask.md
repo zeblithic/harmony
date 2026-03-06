@@ -74,23 +74,32 @@ The human can override ("merge it anyway") — but flag the state clearly.
 
 #### 4. Merge, switch to main, clean up
 
-```bash
-gh pr merge <number> --merge --delete-branch
-```
+**CRITICAL ORDERING: If in a worktree, remove the worktree BEFORE merging.** `gh pr merge --delete-branch` tries to delete the local branch, which fails if a worktree is using it. Worse, if the shell CWD is inside the worktree, all subsequent commands break.
 
 **If in a worktree:**
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony   # main repo
-git worktree remove <worktree-path>         # remove the worktree
-git branch -d <branch-name>                 # delete local branch
+# 1. Save branch name before leaving the worktree
+BRANCH=$(git branch --show-current)
+WORKTREE=$(git rev-parse --show-toplevel)
+
+# 2. Switch to main repo FIRST (escape the worktree CWD)
+cd /Users/zeblith/work/zeblithic/harmony
+
+# 3. Remove the worktree (frees the local branch)
+git worktree remove "$WORKTREE"
+
+# 4. Now merge (local + remote branch deletion works cleanly)
+gh pr merge <number> --merge --delete-branch
+
+# 5. Pull and verify
 git pull origin main
 git log --oneline -3
 ```
 
 **If in main repo (standard):**
 ```bash
+gh pr merge <number> --merge --delete-branch
 git checkout main && git pull origin main
-git branch -d <branch-name>
 git log --oneline -3
 ```
 
