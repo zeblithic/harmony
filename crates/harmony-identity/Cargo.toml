@@ -9,15 +9,17 @@ rust-version.workspace = true
 
 [dependencies]
 harmony-crypto = { workspace = true }
+harmony-platform = { workspace = true }
 ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
+hashbrown = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["harmony-crypto/std", "rand_core/getrandom"]
+std = ["harmony-crypto/std", "harmony-platform/std", "rand_core/getrandom"]
 
 [dev-dependencies]
 rand = { workspace = true }
