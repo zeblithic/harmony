@@ -50,6 +50,7 @@ pub enum SmtpState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmtpCommand {
     Ehlo { domain: String },
+    Helo { domain: String },
     MailFrom { address: String },
     RcptTo { address: String },
     Data,
@@ -126,7 +127,6 @@ pub struct SmtpSession {
     resolved_recipients: Vec<[u8; ADDRESS_HASH_LEN]>,
     /// RCPT TO waiting for Harmony address resolution.
     pending_rcpt: Option<String>,
-    data: Vec<u8>,
 }
 
 impl SmtpSession {
@@ -143,7 +143,6 @@ impl SmtpSession {
             mail_from: None,
             resolved_recipients: Vec::new(),
             pending_rcpt: None,
-            data: Vec::new(),
         }
     }
 
@@ -179,6 +178,7 @@ impl SmtpSession {
     fn handle_command(&mut self, cmd: SmtpCommand) -> Vec<SmtpAction> {
         match cmd {
             SmtpCommand::Ehlo { domain } => self.handle_ehlo(domain),
+            SmtpCommand::Helo { domain } => self.handle_helo(domain),
             SmtpCommand::MailFrom { address } => self.handle_mail_from(address),
             SmtpCommand::RcptTo { address } => self.handle_rcpt_to(address),
             SmtpCommand::Data => self.handle_data(),
@@ -206,7 +206,7 @@ impl SmtpSession {
                 self.mail_from = None;
                 self.resolved_recipients.clear();
                 self.pending_rcpt = None;
-                self.data.clear();
+
             }
         }
 
@@ -225,6 +225,33 @@ impl SmtpSession {
             greeting: format!("{} Hello", self.config.domain),
             capabilities,
         }]
+    }
+
+    fn handle_helo(&mut self, domain: String) -> Vec<SmtpAction> {
+        // RFC 5321 §4.1.1.1: HELO is the RFC 821 greeting — single-line response,
+        // no capability advertisement. Same state transitions as EHLO.
+        match self.state {
+            SmtpState::Connected | SmtpState::DataReceiving | SmtpState::Closed => {
+                return vec![SmtpAction::SendResponse(
+                    503,
+                    "Bad sequence of commands".to_string(),
+                )];
+            }
+            SmtpState::GreetingSent => {}
+            _ => {
+                self.mail_from = None;
+                self.resolved_recipients.clear();
+                self.pending_rcpt = None;
+            }
+        }
+
+        self.ehlo_domain = Some(domain);
+        self.state = SmtpState::Ready;
+
+        vec![SmtpAction::SendResponse(
+            250,
+            format!("{} Hello", self.config.domain),
+        )]
     }
 
     fn handle_mail_from(&mut self, address: String) -> Vec<SmtpAction> {
@@ -310,7 +337,6 @@ impl SmtpSession {
         self.mail_from = None;
         self.resolved_recipients.clear();
         self.pending_rcpt = None;
-        self.data.clear();
         // RFC 5321 §4.1.1.5: RSET resets the mail transaction, not the session.
         // Only advance to Ready if EHLO has already been completed.
         match self.state {
@@ -331,6 +357,16 @@ impl SmtpSession {
                 "TLS already active".to_string(),
             )];
         }
+        // RFC 3207 §4.2: STARTTLS only valid before a mail transaction starts.
+        match self.state {
+            SmtpState::GreetingSent | SmtpState::Ready => {}
+            _ => {
+                return vec![SmtpAction::SendResponse(
+                    503,
+                    "STARTTLS not allowed during mail transaction".to_string(),
+                )];
+            }
+        }
         vec![
             SmtpAction::SendResponse(220, "Ready to start TLS".to_string()),
             SmtpAction::StartTls,
@@ -345,7 +381,6 @@ impl SmtpSession {
         self.mail_from = None;
         self.resolved_recipients.clear();
         self.pending_rcpt = None;
-        self.data.clear();
         vec![]
     }
 
@@ -365,7 +400,6 @@ impl SmtpSession {
         // Reset for next message on the same connection.
         self.mail_from = None;
         self.pending_rcpt = None;
-        self.data.clear();
         self.state = SmtpState::Ready;
 
         actions
@@ -373,9 +407,13 @@ impl SmtpSession {
 
     fn handle_harmony_resolved(
         &mut self,
-        _local_part: &str,
+        local_part: &str,
         identity: Option<[u8; ADDRESS_HASH_LEN]>,
     ) -> Vec<SmtpAction> {
+        // Verify the response matches our outstanding request.
+        if self.pending_rcpt.as_deref() != Some(local_part) {
+            return vec![];
+        }
         self.pending_rcpt = None;
         match identity {
             Some(hash) => {
@@ -755,5 +793,78 @@ mod tests {
             }
             other => panic!("expected SendResponse(421, ...), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn helo_returns_single_line_response() {
+        // RFC 5321 §4.1.1.1: HELO response is a single 250 line, no capabilities.
+        let mut session = connected_session();
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Helo {
+            domain: "sender.example.com".to_string(),
+        }));
+
+        assert_eq!(session.state, SmtpState::Ready);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, msg) => {
+                assert_eq!(*code, 250);
+                assert!(msg.contains("Hello"), "HELO response should greet: {msg}");
+                assert!(
+                    !msg.contains("SIZE"),
+                    "HELO response should NOT list capabilities: {msg}"
+                );
+            }
+            other => panic!("expected SendResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn starttls_rejected_mid_transaction() {
+        // RFC 3207 §4.2: STARTTLS only valid before mail transaction.
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        assert_eq!(session.state, SmtpState::MailFromReceived);
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::StartTls));
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, msg) => {
+                assert_eq!(*code, 503);
+                assert!(
+                    msg.contains("not allowed"),
+                    "should reject STARTTLS mid-transaction: {msg}"
+                );
+            }
+            other => panic!("expected SendResponse(503, ...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_resolution_ignored() {
+        // A HarmonyResolved with mismatched local_part should be silently ignored.
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        assert_eq!(session.pending_rcpt, Some("bob".to_string()));
+
+        // Stale resolution for "old_user" should be ignored.
+        let actions = session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "old_user".to_string(),
+            identity: Some([0xAA; ADDRESS_HASH_LEN]),
+        });
+
+        assert!(actions.is_empty(), "stale resolution should produce no actions");
+        assert_eq!(
+            session.pending_rcpt,
+            Some("bob".to_string()),
+            "pending_rcpt should remain unchanged"
+        );
     }
 }

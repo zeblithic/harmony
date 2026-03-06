@@ -46,4 +46,7 @@ pub enum MailError {
 
     #[error("invalid identity bytes in registration")]
     InvalidIdentity,
+
+    #[error("trailing bytes after message: {count} extra bytes")]
+    TrailingBytes { count: usize },
 }

@@ -34,11 +34,17 @@ pub fn parse_command(line: &[u8]) -> Result<SmtpCommand, MailError> {
     let verb_upper = verb.to_ascii_uppercase();
 
     match verb_upper.as_str() {
-        "EHLO" | "HELO" => {
+        "EHLO" => {
             let domain = rest
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
             Ok(SmtpCommand::Ehlo { domain })
+        }
+        "HELO" => {
+            let domain = rest
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            Ok(SmtpCommand::Helo { domain })
         }
         "MAIL" => {
             // Expect "FROM:<address> [params]"
@@ -133,7 +139,7 @@ mod tests {
         let cmd = parse_command(b"HELO sender.example.com\r\n").unwrap();
         assert_eq!(
             cmd,
-            SmtpCommand::Ehlo {
+            SmtpCommand::Helo {
                 domain: "sender.example.com".to_string()
             }
         );

@@ -411,6 +411,12 @@ impl HarmonyMessage {
             });
         }
 
+        if pos != data.len() {
+            return Err(MailError::TrailingBytes {
+                count: data.len() - pos,
+            });
+        }
+
         Ok(HarmonyMessage {
             version,
             message_type,
