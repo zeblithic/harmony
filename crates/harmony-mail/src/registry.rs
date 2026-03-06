@@ -156,7 +156,7 @@ impl NameRegistration {
         // Identity: 64 bytes
         if data.len() < pos + PUBLIC_KEY_LENGTH {
             return Err(MailError::Truncated {
-                expected: PUBLIC_KEY_LENGTH,
+                expected: (pos + PUBLIC_KEY_LENGTH) - data.len(),
             });
         }
         let identity = Identity::from_public_bytes(&data[pos..pos + PUBLIC_KEY_LENGTH])
@@ -165,7 +165,9 @@ impl NameRegistration {
 
         // registered_at: u64 big-endian
         if data.len() < pos + 8 {
-            return Err(MailError::Truncated { expected: 8 });
+            return Err(MailError::Truncated {
+                expected: (pos + 8) - data.len(),
+            });
         }
         let registered_at = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
@@ -173,7 +175,7 @@ impl NameRegistration {
         // user_signature: 64 bytes
         if data.len() < pos + SIGNATURE_LENGTH {
             return Err(MailError::Truncated {
-                expected: SIGNATURE_LENGTH,
+                expected: (pos + SIGNATURE_LENGTH) - data.len(),
             });
         }
         let mut user_signature = [0u8; SIGNATURE_LENGTH];
@@ -183,7 +185,7 @@ impl NameRegistration {
         // domain_signature: 64 bytes
         if data.len() < pos + SIGNATURE_LENGTH {
             return Err(MailError::Truncated {
-                expected: SIGNATURE_LENGTH,
+                expected: (pos + SIGNATURE_LENGTH) - data.len(),
             });
         }
         let mut domain_signature = [0u8; SIGNATURE_LENGTH];
@@ -214,13 +216,17 @@ impl NameRegistration {
         field: &'static str,
     ) -> Result<String, MailError> {
         if data.len() < *pos + 2 {
-            return Err(MailError::Truncated { expected: 2 });
+            return Err(MailError::Truncated {
+                expected: (*pos + 2) - data.len(),
+            });
         }
         let len = u16::from_be_bytes(data[*pos..*pos + 2].try_into().unwrap()) as usize;
         *pos += 2;
 
         if data.len() < *pos + len {
-            return Err(MailError::Truncated { expected: len });
+            return Err(MailError::Truncated {
+                expected: (*pos + len) - data.len(),
+            });
         }
         let s = std::str::from_utf8(&data[*pos..*pos + len])
             .map_err(|_| MailError::InvalidUtf8 { field })?;

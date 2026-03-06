@@ -40,6 +40,8 @@ pub enum SmtpState {
     RcptToReceived,
     /// DATA command accepted, receiving message body.
     DataReceiving,
+    /// STARTTLS 220 sent, awaiting TLS handshake completion.
+    TlsNegotiating,
     /// Message data received, awaiting delivery result from I/O layer.
     DeliveryPending,
     /// Session closed.
@@ -181,6 +183,12 @@ impl SmtpSession {
     }
 
     fn handle_command(&mut self, cmd: SmtpCommand) -> Vec<SmtpAction> {
+        if self.state == SmtpState::TlsNegotiating {
+            return vec![SmtpAction::SendResponse(
+                503,
+                "TLS handshake in progress".to_string(),
+            )];
+        }
         match cmd {
             SmtpCommand::Ehlo { domain } => self.handle_ehlo(domain),
             SmtpCommand::Helo { domain } => self.handle_helo(domain),
@@ -392,6 +400,7 @@ impl SmtpSession {
                 )];
             }
         }
+        self.state = SmtpState::TlsNegotiating;
         vec![
             SmtpAction::SendResponse(220, "Ready to start TLS".to_string()),
             SmtpAction::StartTls,
@@ -1064,6 +1073,35 @@ mod tests {
             }
             other => panic!("expected SendResponse(552, ...), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn commands_rejected_during_tls_negotiation() {
+        let mut session = connected_session();
+        // EHLO first, then STARTTLS.
+        session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+            domain: "sender.example.com".to_string(),
+        }));
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::StartTls));
+        assert_eq!(session.state, SmtpState::TlsNegotiating);
+        assert!(matches!(&actions[0], SmtpAction::SendResponse(220, _)));
+
+        // Any command during TLS negotiation should be rejected.
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+            domain: "attacker.example.com".to_string(),
+        }));
+        assert_eq!(session.state, SmtpState::TlsNegotiating);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, msg) => {
+                assert_eq!(*code, 503);
+                assert!(msg.contains("TLS handshake"), "should mention TLS: {msg}");
+            }
+            other => panic!("expected 503, got {other:?}"),
+        }
+
+        // TlsCompleted should transition to GreetingSent.
+        session.handle(SmtpEvent::TlsCompleted);
+        assert_eq!(session.state, SmtpState::GreetingSent);
     }
 
     /// Drive a session to DeliveryPending state for tests.
