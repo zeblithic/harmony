@@ -12,6 +12,7 @@
 //! which is safe for typical usage. For high-volume streams where billions of
 //! messages share a key, use a counter-based nonce scheme instead.
 
+use alloc::vec::Vec;
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,

@@ -1,6 +1,9 @@
+use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use core::fmt;
+#[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::sync::Arc;
+#[cfg(not(feature = "std"))]
+use hashbrown::{HashMap, HashSet};
 
 use harmony_crypto::hash;
 use harmony_identity::identity::PrivateIdentity;

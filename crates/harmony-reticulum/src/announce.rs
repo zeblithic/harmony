@@ -1,3 +1,4 @@
+use alloc::{string::String, vec::Vec};
 use harmony_crypto::hash;
 use harmony_identity::identity::{
     Identity, PrivateIdentity, ADDRESS_HASH_LENGTH, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH,

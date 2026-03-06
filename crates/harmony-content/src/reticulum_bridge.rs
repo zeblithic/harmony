@@ -4,6 +4,7 @@
 //! The CID is prepended as a 32-byte header so the receiver can verify
 //! content integrity independently of the transport hash.
 
+use alloc::vec::Vec;
 use crate::cid::ContentId;
 use crate::error::ContentError;
 

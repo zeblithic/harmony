@@ -1,5 +1,9 @@
+use alloc::vec::Vec;
+use core::fmt;
+#[cfg(feature = "std")]
 use std::collections::HashSet;
-use std::fmt;
+#[cfg(not(feature = "std"))]
+use hashbrown::HashSet;
 
 use crate::blob::BlobStore;
 use crate::cid::ContentId;
@@ -82,12 +86,12 @@ impl<S: BlobStore> ContentStore<S> {
     pub fn new(store: S, capacity: usize) -> Self {
         assert!(capacity >= 1, "ContentStore capacity must be at least 1");
 
-        let window_cap = std::cmp::max(1, capacity / 100);
+        let window_cap = core::cmp::max(1, capacity / 100);
         let protected_cap = capacity / 5;
         let probation_cap = capacity.saturating_sub(window_cap + protected_cap);
 
-        let sketch_width = std::cmp::max(2, capacity * 2);
-        let halving_threshold = std::cmp::max(1, (capacity as u64) * 10);
+        let sketch_width = core::cmp::max(2, capacity * 2);
+        let halving_threshold = core::cmp::max(1, (capacity as u64) * 10);
 
         ContentStore {
             store,

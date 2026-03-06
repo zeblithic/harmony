@@ -15,6 +15,10 @@ rand_core = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+default = ["std"]
+std = ["harmony-crypto/std", "rand_core/getrandom"]
+
 [dev-dependencies]
 rand = { workspace = true }
 hex = { workspace = true }

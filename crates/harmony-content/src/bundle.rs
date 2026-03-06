@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use crate::cid::ContentId;
 use crate::error::ContentError;
 
@@ -19,15 +20,15 @@ pub fn parse_bundle(data: &[u8]) -> Result<&[ContentId], ContentError> {
     }
 
     // Compile-time guarantee that ContentId is exactly 32 bytes.
-    const _: () = assert!(std::mem::size_of::<ContentId>() == CID_SIZE);
-    const _: () = assert!(std::mem::align_of::<ContentId>() == 1);
+    const _: () = assert!(core::mem::size_of::<ContentId>() == CID_SIZE);
+    const _: () = assert!(core::mem::align_of::<ContentId>() == 1);
 
     let count = data.len() / CID_SIZE;
 
     // SAFETY: ContentId is #[repr(C)], exactly 32 bytes, alignment 1 (byte arrays only).
     // Input is checked to be a multiple of 32 bytes. &[u8] has alignment 1, matching
     // ContentId's alignment requirement.
-    let cids = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const ContentId, count) };
+    let cids = unsafe { core::slice::from_raw_parts(data.as_ptr() as *const ContentId, count) };
     Ok(cids)
 }
 

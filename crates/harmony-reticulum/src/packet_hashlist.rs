@@ -1,4 +1,7 @@
+#[cfg(feature = "std")]
 use std::collections::HashSet;
+#[cfg(not(feature = "std"))]
+use hashbrown::HashSet;
 
 /// Default maximum capacity for the packet hashlist.
 pub const HASHLIST_DEFAULT_CAPACITY: usize = 1_000_000;
@@ -75,7 +78,7 @@ impl PacketHashlist {
 
     /// Rotate: current becomes previous, previous is dropped.
     fn rotate(&mut self) {
-        self.previous = std::mem::take(&mut self.current);
+        self.previous = core::mem::take(&mut self.current);
     }
 }
 

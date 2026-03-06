@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use crate::blob::BlobStore;
 use crate::bundle::{self, BundleBuilder, MAX_BUNDLE_ENTRIES};
 use crate::chunker::{chunk_all, ChunkerConfig};

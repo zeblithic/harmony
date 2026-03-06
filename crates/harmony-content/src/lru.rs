@@ -1,5 +1,9 @@
+use alloc::vec::Vec;
+use core::fmt;
+#[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
-use std::fmt;
+#[cfg(not(feature = "std"))]
+use hashbrown::{HashMap, HashSet};
 
 use crate::cid::ContentId;
 

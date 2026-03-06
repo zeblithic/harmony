@@ -1,5 +1,6 @@
 //! StorageTier: sans-I/O wrapper integrating ContentStore with Zenoh patterns.
 
+use alloc::{string::{String, ToString}, vec, vec::Vec};
 use crate::blob::BlobStore;
 use crate::cache::ContentStore;
 use crate::cid::ContentId;

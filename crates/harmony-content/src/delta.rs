@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use crate::bundle::{self, CID_SIZE};
 use crate::cid::ContentId;
 use crate::error::ContentError;

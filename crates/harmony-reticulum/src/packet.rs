@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use harmony_crypto::hash;
 

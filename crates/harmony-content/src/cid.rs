@@ -1,3 +1,4 @@
+use alloc::{format, string::String};
 use crate::error::ContentError;
 
 /// Length of the truncated SHA-256 content hash in bytes.
@@ -206,16 +207,16 @@ impl ContentId {
     }
 }
 
-impl std::fmt::Display for ContentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ContentId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let cid_type = self.cid_type();
         let size = self.payload_size();
         write!(f, "{} {:?} {}B", hex_prefix(&self.hash), cid_type, size,)
     }
 }
 
-impl std::fmt::Debug for ContentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ContentId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "ContentId({}, {}B, {:?})",

@@ -4,11 +4,28 @@
 //! arbitrary-sized data over Reticulum links using chunked, windowed
 //! transfers with acknowledgement-based flow control.
 
+use alloc::{vec, vec::Vec};
 use rand_core::CryptoRngCore;
 
 use crate::context::PacketContext;
 use crate::error::ReticulumError;
 use harmony_crypto::hash;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Read exactly `buf.len()` bytes from a byte slice, advancing the position.
+/// No_std replacement for `std::io::Read::read_exact` on `&[u8]`.
+fn slice_read_exact(rd: &mut &[u8], buf: &mut [u8]) -> Result<(), ReticulumError> {
+    if rd.len() < buf.len() {
+        return Err(ReticulumError::ResourceAdvInvalid);
+    }
+    let (head, tail) = rd.split_at(buf.len());
+    buf.copy_from_slice(head);
+    *rd = tail;
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1347,8 +1364,7 @@ impl ResourceAdvertisement {
                 return Err(ReticulumError::ResourceAdvInvalid);
             }
             let mut key_buf = [0u8; 1];
-            std::io::Read::read_exact(&mut rd, &mut key_buf)
-                .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+            slice_read_exact(&mut rd, &mut key_buf)?;
             let key = key_buf[0];
 
             match key {
@@ -1374,8 +1390,7 @@ impl ResourceAdvertisement {
                         return Err(ReticulumError::ResourceAdvInvalid);
                     }
                     let mut h = [0u8; 16];
-                    std::io::Read::read_exact(&mut rd, &mut h)
-                        .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                    slice_read_exact(&mut rd, &mut h)?;
                     resource_hash = Some(h);
                 }
                 b'r' => {
@@ -1385,8 +1400,7 @@ impl ResourceAdvertisement {
                         return Err(ReticulumError::ResourceAdvInvalid);
                     }
                     let mut h = [0u8; 4];
-                    std::io::Read::read_exact(&mut rd, &mut h)
-                        .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                    slice_read_exact(&mut rd, &mut h)?;
                     random_hash = Some(h);
                 }
                 b'o' => {
@@ -1396,8 +1410,7 @@ impl ResourceAdvertisement {
                         return Err(ReticulumError::ResourceAdvInvalid);
                     }
                     let mut h = [0u8; 16];
-                    std::io::Read::read_exact(&mut rd, &mut h)
-                        .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                    slice_read_exact(&mut rd, &mut h)?;
                     original_hash = Some(h);
                 }
                 b'm' => {
@@ -1405,8 +1418,7 @@ impl ResourceAdvertisement {
                         .map_err(|_| ReticulumError::ResourceAdvInvalid)?
                         as usize;
                     let mut m = vec![0u8; bin_len];
-                    std::io::Read::read_exact(&mut rd, &mut m)
-                        .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                    slice_read_exact(&mut rd, &mut m)?;
                     hashmap = Some(m);
                 }
                 b'f' => {
@@ -1435,21 +1447,18 @@ impl ResourceAdvertisement {
                         let bin_len = match marker {
                             rmp::Marker::Bin8 => {
                                 let mut b = [0u8; 1];
-                                std::io::Read::read_exact(&mut rd, &mut b)
-                                    .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                                slice_read_exact(&mut rd, &mut b)?;
                                 b[0] as usize
                             }
                             rmp::Marker::Bin16 => {
                                 let mut b = [0u8; 2];
-                                std::io::Read::read_exact(&mut rd, &mut b)
-                                    .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                                slice_read_exact(&mut rd, &mut b)?;
                                 u16::from_be_bytes(b) as usize
                             }
                             _ => return Err(ReticulumError::ResourceAdvInvalid),
                         };
                         let mut id = vec![0u8; bin_len];
-                        std::io::Read::read_exact(&mut rd, &mut id)
-                            .map_err(|_| ReticulumError::ResourceAdvInvalid)?;
+                        slice_read_exact(&mut rd, &mut id)?;
                         request_id = Some(Some(id));
                     }
                 }

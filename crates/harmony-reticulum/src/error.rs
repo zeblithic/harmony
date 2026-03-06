@@ -1,3 +1,4 @@
+use alloc::string::String;
 use harmony_identity::IdentityError;
 
 /// Errors produced by Reticulum packet and announce operations.

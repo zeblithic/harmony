@@ -13,6 +13,7 @@
 //! Each pattern is exposed both as a [`KeFormat`] for building/parsing key
 //! expressions and as convenience builder functions.
 
+use alloc::{format, string::{String, ToString}};
 use zenoh_keyexpr::key_expr::format::KeFormat;
 use zenoh_keyexpr::key_expr::OwnedKeyExpr;
 

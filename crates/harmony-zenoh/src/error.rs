@@ -1,3 +1,5 @@
+use alloc::string::String;
+
 /// Errors produced by the Harmony-Zenoh layer.
 #[derive(Debug, thiserror::Error)]
 pub enum ZenohError {

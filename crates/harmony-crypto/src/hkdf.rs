@@ -1,3 +1,4 @@
+use alloc::{vec, vec::Vec};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroize;

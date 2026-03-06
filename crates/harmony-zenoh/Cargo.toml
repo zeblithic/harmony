@@ -7,13 +7,18 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Zenoh key expression integration for the Harmony decentralized stack"
 
+[features]
+default = ["std"]
+std = ["harmony-crypto/std", "harmony-identity/std", "zenoh-keyexpr/std", "rand_core/getrandom"]
+
 [dependencies]
-zenoh-keyexpr = { version = "1.7", default-features = false, features = ["std"] }
+zenoh-keyexpr = { version = "1.7", default-features = false }
 thiserror.workspace = true
 harmony-crypto.workspace = true
 harmony-identity.workspace = true
 rand_core.workspace = true
 zeroize.workspace = true
+hashbrown = { workspace = true }
 
 [dev-dependencies]
 rand.workspace = true

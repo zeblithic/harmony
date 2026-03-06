@@ -5,7 +5,8 @@
 //! byte: the high nibble holds even-indexed counters and the low nibble holds
 //! odd-indexed counters.
 
-use std::fmt;
+use alloc::{vec, vec::Vec};
+use core::fmt;
 
 use crate::cid::ContentId;
 
