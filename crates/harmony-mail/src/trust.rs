@@ -240,6 +240,14 @@ fn metrics_to_score(m: &TrustMetrics) -> f32 {
 /// Weighted median is used instead of weighted mean for robustness: a single
 /// malicious reporter cannot skew the aggregate even with extreme values.
 ///
+/// # Safety invariant
+///
+/// **Callers MUST verify all report signatures** (via [`TrustReport::verify`])
+/// before passing them to this function. This function trusts that
+/// `reporter_address` is authentic. Since address hashes are public (advertised
+/// in [`GatewayAnnounce`] payloads), an attacker could otherwise construct a
+/// fake report with a spoofed `reporter_address` to inject a manipulated score.
+///
 /// Returns `None` if no reports match any reporter in the weights map.
 pub fn aggregate_trust(
     reports: &[TrustReport],

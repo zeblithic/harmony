@@ -197,7 +197,16 @@ impl SmtpSession {
             SmtpCommand::Data => self.handle_data(),
             SmtpCommand::Quit => self.handle_quit(),
             SmtpCommand::Rset => self.handle_rset(),
-            SmtpCommand::Noop => vec![SmtpAction::SendResponse(250, "OK".to_string())],
+            SmtpCommand::Noop => {
+                if self.pending_rcpt.is_some() {
+                    vec![SmtpAction::SendResponse(
+                        503,
+                        "Recipient resolution pending".to_string(),
+                    )]
+                } else {
+                    vec![SmtpAction::SendResponse(250, "OK".to_string())]
+                }
+            }
             SmtpCommand::StartTls => self.handle_starttls(),
         }
     }
@@ -1127,6 +1136,28 @@ mod tests {
         // TlsCompleted should transition to GreetingSent.
         session.handle(SmtpEvent::TlsCompleted);
         assert_eq!(session.state, SmtpState::GreetingSent);
+    }
+
+    #[test]
+    fn noop_rejected_while_rcpt_pending() {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        assert!(session.pending_rcpt.is_some());
+
+        // NOOP while resolution pending should be rejected to preserve
+        // RFC 5321 pipelining response ordering.
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Noop));
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => {
+                assert_eq!(*code, 503, "NOOP should be rejected while resolution pending");
+            }
+            other => panic!("expected SendResponse(503, ...), got {other:?}"),
+        }
     }
 
     /// Drive a session to DeliveryPending state for tests.
