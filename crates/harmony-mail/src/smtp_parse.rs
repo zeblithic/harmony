@@ -85,7 +85,7 @@ fn parse_mail_from_arg(arg: &str) -> Result<String, MailError> {
         return Err(MailError::UnknownCommand("MAIL".to_string()));
     };
 
-    Ok(extract_address(after_from))
+    extract_address(after_from)
 }
 
 /// Parse the argument to `RCPT TO:`, extracting the address.
@@ -99,7 +99,7 @@ fn parse_rcpt_to_arg(arg: &str) -> Result<String, MailError> {
         return Err(MailError::UnknownCommand("RCPT".to_string()));
     };
 
-    Ok(extract_address(after_to))
+    extract_address(after_to)
 }
 
 /// Extract an email address from a string that may be wrapped in angle brackets.
@@ -107,18 +107,20 @@ fn parse_rcpt_to_arg(arg: &str) -> Result<String, MailError> {
 /// If angle brackets are present, the content between `<` and `>` is returned.
 /// Any ESMTP parameters after the closing `>` are ignored.
 /// If no brackets, the first whitespace-delimited token is returned.
-fn extract_address(s: &str) -> String {
+/// Returns an error if `<` is present without a matching `>`.
+fn extract_address(s: &str) -> Result<String, MailError> {
     let s = s.trim();
     if let Some(start) = s.find('<') {
-        if let Some(end) = s[start..].find('>') {
-            return s[start + 1..start + end].to_string();
-        }
+        return s[start..]
+            .find('>')
+            .map(|end| s[start + 1..start + end].to_string())
+            .ok_or_else(|| MailError::UnknownCommand("unclosed angle bracket".to_string()));
     }
     // No brackets — take up to first whitespace.
-    s.split_whitespace()
+    Ok(s.split_whitespace()
         .next()
         .unwrap_or("")
-        .to_string()
+        .to_string())
 }
 
 #[cfg(test)]
@@ -259,6 +261,18 @@ mod tests {
         // Same boundary issue for "TO:" prefix (3 bytes).
         let result = parse_command("RCPT £<addr>\r\n".as_bytes());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_unclosed_angle_bracket_rejected() {
+        let result = parse_command(b"MAIL FROM:<user@example.com\r\n");
+        assert!(result.is_err(), "unclosed angle bracket should be rejected");
+    }
+
+    #[test]
+    fn parse_rcpt_unclosed_angle_bracket_rejected() {
+        let result = parse_command(b"RCPT TO:<user@example.com\r\n");
+        assert!(result.is_err(), "unclosed angle bracket should be rejected");
     }
 
     #[test]

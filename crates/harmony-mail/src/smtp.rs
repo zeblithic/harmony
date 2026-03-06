@@ -413,6 +413,15 @@ impl SmtpSession {
         if self.state != SmtpState::DataReceiving {
             return vec![];
         }
+        if bytes.len() > self.config.max_message_size {
+            self.mail_from = None;
+            self.resolved_recipients.clear();
+            self.state = SmtpState::Ready;
+            return vec![SmtpAction::SendResponse(
+                552,
+                "5.3.4 Message too large".to_string(),
+            )];
+        }
         let recipients = std::mem::take(&mut self.resolved_recipients);
         self.state = SmtpState::DeliveryPending;
 
@@ -1024,6 +1033,36 @@ mod tests {
         match &actions[0] {
             SmtpAction::SendResponse(code, _msg) => assert_eq!(*code, 503),
             other => panic!("expected 503, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_message_rejected() {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "bob".to_string(),
+            identity: Some([0xBB; ADDRESS_HASH_LEN]),
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Data));
+
+        // Send a message that exceeds max_message_size (10 MB in test_config).
+        let oversized = vec![0u8; 10 * 1024 * 1024 + 1];
+        let actions = session.handle(SmtpEvent::DataComplete(oversized));
+
+        assert_eq!(session.state, SmtpState::Ready);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, msg) => {
+                assert_eq!(*code, 552);
+                assert!(msg.contains("too large"), "552 should mention too large: {msg}");
+            }
+            other => panic!("expected SendResponse(552, ...), got {other:?}"),
         }
     }
 
