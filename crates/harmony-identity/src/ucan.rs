@@ -7,10 +7,12 @@
 use alloc::vec::Vec;
 
 use harmony_crypto::hash;
+use harmony_platform::EntropySource;
 use hashbrown::{HashMap, HashSet};
 
 use crate::identity::{Identity, ADDRESS_HASH_LENGTH, SIGNATURE_LENGTH};
 use crate::IdentityError;
+use crate::PrivateIdentity;
 
 /// Maximum size of the resource field in bytes.
 pub const MAX_RESOURCE_SIZE: usize = 256;
@@ -280,7 +282,7 @@ impl UcanToken {
     }
 
     /// Return the signable portion of the token (everything except the signature).
-    fn signable_bytes(&self) -> Vec<u8> {
+    pub fn signable_bytes(&self) -> Vec<u8> {
         let bytes = self.to_bytes();
         // The signature is always the last SIGNATURE_LENGTH bytes.
         bytes[..bytes.len() - SIGNATURE_LENGTH].to_vec()
@@ -391,12 +393,56 @@ impl RevocationSet for MemoryRevocationSet {
     }
 }
 
+impl PrivateIdentity {
+    /// Issue a root UCAN token — claims direct ownership of a resource.
+    ///
+    /// Root tokens have no `proof` field. The issuer is asserting they own
+    /// the resource. Downstream verification trusts or denies this claim
+    /// based on the issuer's identity.
+    pub fn issue_root_token(
+        &self,
+        rng: &mut impl EntropySource,
+        audience: &[u8; ADDRESS_HASH_LENGTH],
+        capability: CapabilityType,
+        resource: &[u8],
+        not_before: u64,
+        expires_at: u64,
+    ) -> Result<UcanToken, UcanError> {
+        if resource.len() > MAX_RESOURCE_SIZE {
+            return Err(UcanError::ResourceTooLarge);
+        }
+
+        let mut nonce = [0u8; 16];
+        rng.fill_bytes(&mut nonce);
+
+        let mut token = UcanToken {
+            issuer: self.identity.address_hash,
+            audience: *audience,
+            capability,
+            resource: resource.to_vec(),
+            not_before,
+            expires_at,
+            nonce,
+            proof: None,
+            signature: [0u8; SIGNATURE_LENGTH],
+        };
+
+        let signable = token.signable_bytes();
+        token.signature = self.sign(&signable);
+        Ok(token)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::PrivateIdentity;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    fn test_rng() -> StdRng {
+        StdRng::seed_from_u64(42)
+    }
 
     #[test]
     fn capability_type_u8_roundtrip() {
@@ -571,5 +617,68 @@ mod tests {
 
         assert!(revocations.is_revoked(&hash_a));
         assert!(!revocations.is_revoked(&hash_b));
+    }
+
+    // ── Task 5: Root token creation tests ─────────────────────────────
+
+    #[test]
+    fn issue_root_token_signs_correctly() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        let audience_hash = [0xAA; 16];
+
+        let token = issuer
+            .issue_root_token(
+                &mut rng,
+                &audience_hash,
+                CapabilityType::Content,
+                &[0xBB; 8],
+                1000,
+                2000,
+            )
+            .unwrap();
+
+        assert_eq!(token.issuer, issuer.identity.address_hash);
+        assert_eq!(token.audience, audience_hash);
+        assert_eq!(token.capability, CapabilityType::Content);
+        assert_eq!(token.resource, alloc::vec![0xBB; 8]);
+        assert_eq!(token.not_before, 1000);
+        assert_eq!(token.expires_at, 2000);
+        assert!(token.proof.is_none());
+
+        // Verify the signature is valid
+        let signable = token.signable_bytes();
+        issuer
+            .public_identity()
+            .verify(&signable, &token.signature)
+            .unwrap();
+    }
+
+    #[test]
+    fn issue_root_token_resource_too_large() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        let result = issuer.issue_root_token(
+            &mut rng,
+            &[0u8; 16],
+            CapabilityType::Memory,
+            &[0u8; 257],
+            0,
+            0,
+        );
+        assert!(matches!(result, Err(UcanError::ResourceTooLarge)));
+    }
+
+    #[test]
+    fn issue_root_token_nonce_is_random() {
+        let mut rng = test_rng();
+        let issuer = PrivateIdentity::generate(&mut rng);
+        let t1 = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Content, &[], 0, 0)
+            .unwrap();
+        let t2 = issuer
+            .issue_root_token(&mut rng, &[0u8; 16], CapabilityType::Content, &[], 0, 0)
+            .unwrap();
+        assert_ne!(t1.nonce, t2.nonce);
     }
 }
