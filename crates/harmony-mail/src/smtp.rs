@@ -389,9 +389,9 @@ impl SmtpSession {
     }
 
     fn handle_rset(&mut self) -> Vec<SmtpAction> {
-        // Reject RSET while delivery is in flight — I/O layer must wait for
-        // DeliveryResult before accepting new commands.
-        if self.state == SmtpState::DeliveryPending {
+        // Reject RSET during data collection or delivery — these states require
+        // their respective completion events before accepting new commands.
+        if self.state == SmtpState::DeliveryPending || self.state == SmtpState::DataReceiving {
             return vec![SmtpAction::SendResponse(
                 503,
                 "Bad sequence of commands".to_string(),
@@ -497,6 +497,11 @@ impl SmtpSession {
         local_part: &str,
         identity: Option<[u8; ADDRESS_HASH_LEN]>,
     ) -> Vec<SmtpAction> {
+        // Only valid from states where RCPT TO resolution can be outstanding.
+        match self.state {
+            SmtpState::MailFromReceived | SmtpState::RcptToReceived => {}
+            _ => return vec![],
+        }
         // Verify the response matches our outstanding request.
         if self.pending_rcpt.as_deref() != Some(local_part) {
             return vec![];
@@ -1154,6 +1159,30 @@ mod tests {
         // TlsCompleted should transition to GreetingSent.
         session.handle(SmtpEvent::TlsCompleted);
         assert_eq!(session.state, SmtpState::GreetingSent);
+    }
+
+    #[test]
+    fn rset_rejected_during_data_receiving() {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "bob".to_string(),
+            identity: Some([0xBB; ADDRESS_HASH_LEN]),
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Data));
+        assert_eq!(session.state, SmtpState::DataReceiving);
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Rset));
+        assert_eq!(session.state, SmtpState::DataReceiving, "RSET should not change state during DataReceiving");
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => assert_eq!(*code, 503),
+            other => panic!("expected 503, got {other:?}"),
+        }
     }
 
     #[test]

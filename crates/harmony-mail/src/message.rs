@@ -197,6 +197,11 @@ pub struct HarmonyMessage {
 impl HarmonyMessage {
     /// Serialize the message to its binary wire format.
     ///
+    /// BCC recipients are **stripped** from the serialized output — only To and
+    /// Cc recipients appear in the wire format. This prevents BCC addresses from
+    /// leaking to non-BCC recipients. To deliver a copy to a BCC recipient,
+    /// construct a separate message with only that recipient as `To`.
+    ///
     /// # Errors
     ///
     /// Returns `MailError` if any field exceeds its size limit.
@@ -263,10 +268,15 @@ impl HarmonyMessage {
         }
         // sender_address: 16 bytes
         buf.extend_from_slice(&self.sender_address);
-        // recipient_count: 1 byte
-        buf.push(self.recipients.len() as u8);
+        // recipient_count: 1 byte (BCC recipients stripped for privacy)
+        let non_bcc: Vec<_> = self
+            .recipients
+            .iter()
+            .filter(|r| r.recipient_type != RecipientType::Bcc)
+            .collect();
+        buf.push(non_bcc.len() as u8);
         // each recipient: 16 bytes address_hash + 1 byte type
-        for r in &self.recipients {
+        for r in &non_bcc {
             buf.extend_from_slice(&r.address_hash);
             buf.push(r.recipient_type as u8);
         }
@@ -706,6 +716,40 @@ mod tests {
         assert_eq!(decoded, msg);
         assert_eq!(decoded.message_type, MailMessageType::Bounce);
         assert_eq!(decoded.body, "Recipient not found on any reachable node");
+    }
+
+    #[test]
+    fn bcc_stripped_from_wire_format() {
+        let msg = HarmonyMessage {
+            version: VERSION,
+            message_type: MailMessageType::Email,
+            flags: MessageFlags::new(false, false, false),
+            timestamp: 1_709_654_400,
+            message_id: [0x01; MESSAGE_ID_LEN],
+            in_reply_to: None,
+            sender_address: [0xAA; ADDRESS_HASH_LEN],
+            recipients: vec![
+                Recipient {
+                    address_hash: [0xBB; ADDRESS_HASH_LEN],
+                    recipient_type: RecipientType::To,
+                },
+                Recipient {
+                    address_hash: [0xCC; ADDRESS_HASH_LEN],
+                    recipient_type: RecipientType::Bcc,
+                },
+            ],
+            subject: "Secret".to_string(),
+            body: "BCC test".to_string(),
+            attachments: vec![],
+        };
+
+        let bytes = msg.to_bytes().unwrap();
+        let decoded = HarmonyMessage::from_bytes(&bytes).unwrap();
+
+        // BCC recipient should be stripped — only To recipient remains.
+        assert_eq!(decoded.recipients.len(), 1);
+        assert_eq!(decoded.recipients[0].recipient_type, RecipientType::To);
+        assert_eq!(decoded.recipients[0].address_hash, [0xBB; ADDRESS_HASH_LEN]);
     }
 
     #[test]
