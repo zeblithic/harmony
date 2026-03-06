@@ -12,7 +12,7 @@
 
 **Design doc:** `docs/plans/2026-03-06-virtio-net-driver-design.md`
 
-**Post-review corrections:** Code snippets below reflect the original plan. The implemented code includes these fixes: (1) All TX/RX buffers include the 12-byte `virtio_net_hdr` prefix (VirtIO 1.0 §5.1.6). (2) 64-bit PCI BARs read the upper 32 bits from the next BAR. (3) `DRIVER_OK` is set before queue notifications (§3.1.1 step 8). (4) Inbound packet actions are dispatched, not dropped. See the actual source for corrected versions.
+**Post-review corrections:** Code snippets below reflect the original plan. The implemented code includes these fixes: (1) All TX/RX buffers include the 12-byte `virtio_net_hdr` prefix (VirtIO 1.0 §5.1.6). (2) 64-bit PCI BARs read the upper 32 bits from the next BAR, with bounds checks. (3) `DRIVER_OK` is set before queue notifications (§3.1.1 step 8). (4) Inbound packet actions are dispatched, not dropped. (5) `VIRTIO_F_VERSION_1` (bit 32) is negotiated as required by §6. (6) DMA-shared ring memory uses volatile reads/writes. (7) 64-bit queue address writes use paired 32-bit writes per §4.1.3.1. (8) Capability list walk is capped to prevent infinite loops. See the actual source for corrected versions.
 
 ---
 
