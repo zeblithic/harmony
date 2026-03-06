@@ -3,5 +3,9 @@ extern crate alloc;
 
 pub mod entropy;
 pub mod error;
+pub mod network;
+pub mod persistence;
 
 pub use entropy::EntropySource;
+pub use network::NetworkInterface;
+pub use persistence::{MemoryPersistentState, PersistentState};
