@@ -381,6 +381,7 @@ impl SmtpSession {
             )];
         }
         self.state = SmtpState::Closed;
+        self.pending_rcpt = None;
         vec![
             SmtpAction::SendResponse(221, "Bye".to_string()),
             SmtpAction::Close,
@@ -1153,6 +1154,35 @@ mod tests {
         // TlsCompleted should transition to GreetingSent.
         session.handle(SmtpEvent::TlsCompleted);
         assert_eq!(session.state, SmtpState::GreetingSent);
+    }
+
+    #[test]
+    fn quit_clears_pending_rcpt() {
+        // QUIT during pending RCPT TO resolution must clear pending_rcpt
+        // so a late HarmonyResolved doesn't revive the closed session.
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "alice@sender.example.com".to_string(),
+        }));
+        session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "bob@harmony.example.com".to_string(),
+        }));
+        assert!(session.pending_rcpt.is_some());
+
+        session.handle(SmtpEvent::Command(SmtpCommand::Quit));
+        assert_eq!(session.state, SmtpState::Closed);
+        assert!(
+            session.pending_rcpt.is_none(),
+            "QUIT should clear pending_rcpt"
+        );
+
+        // Late resolution should be silently ignored.
+        let actions = session.handle(SmtpEvent::HarmonyResolved {
+            local_part: "bob".to_string(),
+            identity: Some([0xBB; ADDRESS_HASH_LEN]),
+        });
+        assert!(actions.is_empty(), "late resolution on closed session should be ignored");
+        assert_eq!(session.state, SmtpState::Closed, "closed session should stay closed");
     }
 
     #[test]

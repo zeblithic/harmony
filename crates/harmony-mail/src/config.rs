@@ -112,6 +112,9 @@ pub struct SpamConfig {
     pub dnsbl: Vec<String>,
     #[serde(default = "default_reject_threshold")]
     pub reject_threshold: i32,
+    /// Maximum concurrent connections allowed from a single IP address.
+    ///
+    /// Enforced by the I/O layer at TCP accept time, not through [`super::spam::score`].
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
     #[serde(default = "default_max_message_size")]
