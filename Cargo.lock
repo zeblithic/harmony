@@ -841,6 +841,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-platform"
+version = "0.1.0"
+dependencies = [
+ "hashbrown 0.15.5",
+ "rand",
+ "rand_core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harmony-reticulum"
 version = "0.1.0"
 dependencies = [
