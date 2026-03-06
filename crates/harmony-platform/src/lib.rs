@@ -7,5 +7,6 @@ pub mod network;
 pub mod persistence;
 
 pub use entropy::EntropySource;
+pub use error::PlatformError;
 pub use network::NetworkInterface;
 pub use persistence::{MemoryPersistentState, PersistentState};

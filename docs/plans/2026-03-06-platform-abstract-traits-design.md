@@ -87,7 +87,7 @@ pub trait PersistentState {
     fn delete(&mut self, key: &str) -> Result<(), PlatformError>;
 
     /// List all stored keys.
-    fn keys(&self) -> Vec<&str>;
+    fn keys(&self) -> Vec<String>;
 }
 ```
 
