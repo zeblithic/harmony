@@ -1,4 +1,7 @@
 use alloc::{sync::Arc, vec, vec::Vec};
+#[cfg(feature = "std")]
+use std::collections::HashMap;
+#[cfg(not(feature = "std"))]
 use hashbrown::HashMap;
 
 use harmony_crypto::hash::TRUNCATED_HASH_LENGTH;

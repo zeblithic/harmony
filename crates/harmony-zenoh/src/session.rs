@@ -6,6 +6,9 @@
 //! executes the returned actions.
 
 use alloc::{string::String, vec, vec::Vec};
+#[cfg(feature = "std")]
+use std::collections::HashMap;
+#[cfg(not(feature = "std"))]
 use hashbrown::HashMap;
 
 use harmony_identity::{Identity, PrivateIdentity};

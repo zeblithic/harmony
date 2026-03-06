@@ -1,5 +1,8 @@
 use alloc::vec::Vec;
 use core::fmt;
+#[cfg(feature = "std")]
+use std::collections::HashSet;
+#[cfg(not(feature = "std"))]
 use hashbrown::HashSet;
 
 use crate::blob::BlobStore;

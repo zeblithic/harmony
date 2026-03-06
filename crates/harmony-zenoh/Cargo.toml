@@ -9,7 +9,7 @@ description = "Zenoh key expression integration for the Harmony decentralized st
 
 [features]
 default = ["std"]
-std = ["harmony-crypto/std", "harmony-identity/std", "zenoh-keyexpr/std"]
+std = ["harmony-crypto/std", "harmony-identity/std", "zenoh-keyexpr/std", "rand_core/getrandom"]
 
 [dependencies]
 zenoh-keyexpr = { version = "1.7", default-features = false }
