@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# review-state.sh — Deterministic PR review state checker for zeblithic/harmony.
+# review-state.sh — Deterministic PR review state checker.
 #
-# Usage: ./scripts/review-state.sh [PR_NUMBER]
+# Usage: ./scripts/review-state.sh [--repo OWNER/REPO] [PR_NUMBER]
+#   --repo: GitHub repo (default: auto-detect from gh CLI / current directory)
 #   If no PR number given, infers from current branch via gh pr view.
+#
+# Works with any repo (harmony, harmony-os, harmony-client). When run from
+# the repo directory, auto-detects the repo. Or pass --repo explicitly.
 #
 # Checks Bugbot (cursor[bot]) and Greptile (greptile-apps[bot]) review status,
 # extracts all findings, and derives the review state machine state.
 
 set -euo pipefail
-
-REPO="zeblithic/harmony"
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -26,8 +28,36 @@ to_epoch() {
 }
 
 # ── 1. Argument parsing & PR detection ──────────────────────────────
+#
+# Usage: ./scripts/review-state.sh [--repo OWNER/REPO] [PR_NUMBER]
+#   --repo: GitHub repo in OWNER/REPO format (default: auto-detect from gh)
+#   If no PR number given, infers from current branch via gh pr view.
 
-PR_NUMBER="${1:-}"
+REPO=""
+PR_NUMBER=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo)
+      REPO="$2"
+      shift 2
+      ;;
+    *)
+      PR_NUMBER="$1"
+      shift
+      ;;
+  esac
+done
+
+# Auto-detect repo from gh CLI if not specified
+if [[ -z "$REPO" ]]; then
+  REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || echo "")
+  if [[ -z "$REPO" ]]; then
+    echo "ERROR: Could not detect repo. Use --repo OWNER/REPO or run from a git repo."
+    exit 1
+  fi
+fi
+
 if [[ -z "$PR_NUMBER" ]]; then
   PR_NUMBER=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
   if [[ -z "$PR_NUMBER" ]]; then

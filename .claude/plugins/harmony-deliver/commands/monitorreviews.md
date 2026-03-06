@@ -20,6 +20,35 @@ PR number (optional): $ARGUMENTS
 
 If no PR number is provided, infer from the current branch's associated PR.
 
+## CRITICAL: Use the Script, Not Manual API Calls
+
+**ALWAYS use `bash scripts/review-state.sh` instead of manual `gh api` calls.**
+
+The script correctly checks ALL three API endpoints where review findings can appear:
+1. `pulls/{number}/reviews` — review summaries (Bugbot posts here; Greptile posts empty bodies here)
+2. `pulls/{number}/comments` — **inline PR review comments** (Greptile posts findings HERE, not in the review body)
+3. `issues/{number}/comments` — PR-level comments (trigger comments, Greptile summary)
+
+Manual `gh api` calls checking only the `reviews` endpoint will MISS Greptile's inline findings because Greptile posts an empty review body and puts all actual findings as inline PR comments on specific lines.
+
+## Multi-Repo PRs
+
+When a bead spans multiple repos (e.g., harmony + harmony-os), check EACH repo's PR separately:
+
+```bash
+# harmony PR
+cd /Users/zeblith/work/zeblithic/harmony
+bash scripts/review-state.sh [PR_NUMBER]
+
+# harmony-os PR (use --repo flag since script lives in harmony repo)
+cd /Users/zeblith/work/zeblithic/harmony-os
+bash /Users/zeblith/work/zeblithic/harmony/scripts/review-state.sh --repo zeblithic/harmony-os [PR_NUMBER]
+
+# harmony-client PR
+cd /Users/zeblith/work/zeblithic/harmony-client
+bash /Users/zeblith/work/zeblithic/harmony/scripts/review-state.sh --repo zeblithic/harmony-client [PR_NUMBER]
+```
+
 ## Review Monitoring Workflow
 
 ### 1. Run the review-state script
