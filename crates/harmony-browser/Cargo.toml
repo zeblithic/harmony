@@ -1,0 +1,17 @@
+[package]
+name = "harmony-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Sans-I/O browser core for Harmony content-addressed networks"
+
+[dependencies]
+harmony-content = { path = "../harmony-content" }
+harmony-identity = { path = "../harmony-identity" }
+harmony-zenoh = { path = "../harmony-zenoh" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = "0.8"

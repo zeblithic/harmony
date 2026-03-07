@@ -771,6 +771,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-browser"
+version = "0.1.0"
+dependencies = [
+ "harmony-content",
+ "harmony-identity",
+ "harmony-zenoh",
+ "rand",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harmony-compute"
 version = "0.1.0"
 dependencies = [
