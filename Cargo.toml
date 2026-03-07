@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/harmony-browser",
     "crates/harmony-compute",
     "crates/harmony-content",
     "crates/harmony-crypto",
