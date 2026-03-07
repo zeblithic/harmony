@@ -40,8 +40,9 @@ fn navigate_to_subscribe_emits_subscribe() {
     )));
     assert_eq!(actions.len(), 1);
     match &actions[0] {
-        BrowserAction::Subscribe { key_expr } => {
+        BrowserAction::Subscribe { key_expr, sub_id } => {
             assert_eq!(key_expr, "harmony/presence/**");
+            assert_eq!(*sub_id, harmony_browser::BrowserSubId(1));
         }
         other => panic!("expected Subscribe, got {:?}", other),
     }

@@ -97,7 +97,7 @@ impl BrowserCore {
                 let sub_id = BrowserSubId(self.next_sub_id);
                 self.next_sub_id += 1;
                 self.subscriptions.insert(key_expr.clone(), sub_id);
-                vec![BrowserAction::Subscribe { key_expr }]
+                vec![BrowserAction::Subscribe { key_expr, sub_id }]
             }
         }
     }
