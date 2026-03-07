@@ -33,6 +33,14 @@ pub enum VineAction {
     FeedUpdated,
 }
 
+/// Build the vine announce subscription pattern for a creator address.
+///
+/// Canonical source: `harmony_zenoh::keyspace::vine_announce_sub`.
+/// Keep in sync if the pattern changes.
+fn vine_announce_pattern(addr_hex: &str) -> String {
+    format!("harmony/vines/{addr_hex}/announce/**")
+}
+
 /// Sans-I/O state machine for vine feed management.
 ///
 /// Tracks followed creators, vine items, and viewed state.
@@ -62,19 +70,24 @@ impl VineFeed {
                 }
                 let addr_hex = hex::encode(address);
                 vec![VineAction::Subscribe {
-                    key_expr: format!("harmony/vines/{addr_hex}/announce/**"),
+                    key_expr: vine_announce_pattern(&addr_hex),
                 }]
             }
             VineEvent::UnfollowCreator { address } => {
                 if !self.followed.remove(&address) {
                     return vec![];
                 }
-                // Remove all items from this creator.
+                // Purge viewed CIDs for this creator before removing items.
+                for item in self.items.values() {
+                    if item.creator == address {
+                        self.viewed.remove(&item.bundle_cid);
+                    }
+                }
                 self.items.retain(|_, item| item.creator != address);
                 let addr_hex = hex::encode(address);
                 vec![
                     VineAction::Unsubscribe {
-                        key_expr: format!("harmony/vines/{addr_hex}/announce/**"),
+                        key_expr: vine_announce_pattern(&addr_hex),
                     },
                     VineAction::FeedUpdated,
                 ]
@@ -88,7 +101,9 @@ impl VineFeed {
                 vec![VineAction::FeedUpdated]
             }
             VineEvent::MarkViewed { bundle_cid } => {
-                self.viewed.insert(bundle_cid);
+                if !self.viewed.insert(bundle_cid) {
+                    return vec![];
+                }
                 vec![VineAction::FeedUpdated]
             }
             VineEvent::MarkAllViewed => {
@@ -280,6 +295,48 @@ mod tests {
         assert_eq!(items[0].timestamp, 300);
         assert_eq!(items[1].timestamp, 200);
         assert_eq!(items[2].timestamp, 100);
+    }
+
+    #[test]
+    fn unfollow_clears_viewed_state() {
+        let mut feed = VineFeed::new();
+        let _ = feed.handle_event(VineEvent::FollowCreator {
+            address: creator_a(),
+        });
+        let cid = cid_from(1);
+        let _ = feed.handle_event(VineEvent::VineAnnounced {
+            item: make_item(creator_a(), 100, cid),
+        });
+        let _ = feed.handle_event(VineEvent::MarkViewed { bundle_cid: cid });
+        assert!(feed.new_items().is_empty());
+        // Unfollow should clear viewed state for that creator.
+        let _ = feed.handle_event(VineEvent::UnfollowCreator {
+            address: creator_a(),
+        });
+        // Re-follow and re-announce: should appear as new, not already-viewed.
+        let _ = feed.handle_event(VineEvent::FollowCreator {
+            address: creator_a(),
+        });
+        let _ = feed.handle_event(VineEvent::VineAnnounced {
+            item: make_item(creator_a(), 100, cid),
+        });
+        assert_eq!(feed.new_items().len(), 1);
+    }
+
+    #[test]
+    fn mark_viewed_duplicate_is_noop() {
+        let mut feed = VineFeed::new();
+        let _ = feed.handle_event(VineEvent::FollowCreator {
+            address: creator_a(),
+        });
+        let cid = cid_from(1);
+        let _ = feed.handle_event(VineEvent::VineAnnounced {
+            item: make_item(creator_a(), 100, cid),
+        });
+        let actions1 = feed.handle_event(VineEvent::MarkViewed { bundle_cid: cid });
+        assert_eq!(actions1.len(), 1); // FeedUpdated
+        let actions2 = feed.handle_event(VineEvent::MarkViewed { bundle_cid: cid });
+        assert!(actions2.is_empty()); // No spurious update
     }
 
     #[test]

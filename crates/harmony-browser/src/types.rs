@@ -58,6 +58,7 @@ pub enum MimeHint {
     PlainText,
     Image(ImageFormat),
     Video,
+    Compilation,
     HarmonyApp,
     Unknown([u8; 8]),
 }
@@ -71,6 +72,7 @@ impl MimeHint {
             b"img/jpg\0" => Self::Image(ImageFormat::Jpg),
             b"img/webp" => Self::Image(ImageFormat::Webp),
             b"vine/vid" => Self::Video,
+            b"vine/cmp" => Self::Compilation,
             b"app/hmy\0" => Self::HarmonyApp,
             _ => Self::Unknown(bytes),
         }
