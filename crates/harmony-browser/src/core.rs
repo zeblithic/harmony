@@ -132,8 +132,13 @@ impl BrowserCore {
             _ => MimeHint::PlainText,
         };
 
-        // Trust decision (no author attribution in MVP — defaults to Unknown)
-        let trust_level = TrustDecision::Unknown;
+        // User-approved content gets FullTrust; otherwise Unknown in MVP
+        // (no author attribution yet — trust scores require author identity)
+        let trust_level = if self.approved.contains(&cid) {
+            TrustDecision::FullTrust
+        } else {
+            TrustDecision::Unknown
+        };
 
         vec![BrowserAction::Render(ResolvedContent::Static {
             cid,

@@ -95,3 +95,26 @@ fn tampered_content_is_rejected() {
     let actions = core.handle_event(BrowserEvent::ContentFetched { cid, data });
     assert!(actions.is_empty(), "tampered content should produce no actions");
 }
+
+#[test]
+fn approved_content_renders_with_full_trust() {
+    let mut core = BrowserCore::new();
+    let data = b"gated image data";
+    let cid = ContentId::for_blob(data).unwrap();
+
+    // Approve the CID first
+    let _ = core.handle_event(BrowserEvent::ApproveContent { cid });
+
+    // Now when the content arrives, it should render with FullTrust
+    let actions = core.handle_event(BrowserEvent::ContentFetched {
+        cid,
+        data: data.to_vec(),
+    });
+    assert_eq!(actions.len(), 1);
+    match &actions[0] {
+        BrowserAction::Render(ResolvedContent::Static { trust_level, .. }) => {
+            assert_eq!(*trust_level, TrustDecision::FullTrust);
+        }
+        other => panic!("expected Render with FullTrust, got {:?}", other),
+    }
+}

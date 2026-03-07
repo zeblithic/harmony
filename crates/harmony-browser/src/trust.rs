@@ -51,6 +51,10 @@ impl TrustPolicy {
 
     pub fn set_full_trust_threshold(&mut self, threshold: u8) {
         self.full_trust_threshold = threshold;
+        // Ensure preview always requires strictly less than full trust.
+        if self.preview_threshold >= threshold {
+            self.preview_threshold = threshold.saturating_sub(1);
+        }
     }
 }
 

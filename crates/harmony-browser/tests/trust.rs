@@ -43,3 +43,13 @@ fn custom_threshold_overrides_default() {
     assert_eq!(policy.decide(Some(0b00000010)), TrustDecision::Untrusted);
     assert_eq!(policy.decide(Some(0b00000011)), TrustDecision::Preview);
 }
+
+#[test]
+fn set_full_trust_threshold_clamps_preview() {
+    let mut policy = TrustPolicy::new();
+    // Lowering full_trust below preview must clamp preview down.
+    // full_trust=1, preview clamped to 0 → identity 0 gets Preview, 1+ gets FullTrust
+    policy.set_full_trust_threshold(1);
+    assert_eq!(policy.decide(Some(0b00000000)), TrustDecision::Preview);
+    assert_eq!(policy.decide(Some(0b00000001)), TrustDecision::FullTrust);
+}
