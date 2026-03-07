@@ -13,6 +13,3 @@ harmony-identity = { path = "../harmony-identity" }
 hashbrown = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-rand = "0.8"
