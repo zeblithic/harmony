@@ -11,7 +11,9 @@ description = "Sans-I/O browser core for Harmony content-addressed networks"
 harmony-content = { path = "../harmony-content" }
 harmony-identity = { path = "../harmony-identity" }
 harmony-zenoh = { path = "../harmony-zenoh" }
+hex = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+hex = "0.4"
 rand = "0.8"

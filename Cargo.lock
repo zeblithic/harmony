@@ -777,6 +777,7 @@ dependencies = [
  "harmony-content",
  "harmony-identity",
  "harmony-zenoh",
+ "hex",
  "rand",
  "thiserror 2.0.18",
 ]

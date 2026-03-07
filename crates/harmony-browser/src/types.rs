@@ -1,3 +1,4 @@
+use crate::BrowserError;
 use harmony_content::cid::ContentId;
 
 /// What the user types into the address bar.
@@ -9,6 +10,37 @@ pub enum BrowseTarget {
     Named(String),
     /// Live subscription to a key expression.
     Subscribe(String),
+}
+
+impl BrowseTarget {
+    /// Parse user address bar input into a BrowseTarget.
+    ///
+    /// Formats:
+    /// - `hmy:<64-char hex>` -> CID lookup
+    /// - `~<key_expr>` -> live subscription (prefixed with `harmony/`)
+    /// - anything else -> named content (prefixed with `harmony/content/`)
+    pub fn parse(input: &str) -> Result<Self, BrowserError> {
+        let trimmed = input.trim();
+
+        if let Some(hex_str) = trimmed.strip_prefix("hmy:") {
+            let bytes = hex::decode(hex_str)
+                .map_err(|_| BrowserError::InvalidCidHex(hex_str.to_string()))?;
+            if bytes.len() != 32 {
+                return Err(BrowserError::InvalidCidHex(format!(
+                    "expected 32 bytes, got {}",
+                    bytes.len()
+                )));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let cid = ContentId::from_bytes(arr);
+            Ok(Self::Cid(cid))
+        } else if let Some(key_expr) = trimmed.strip_prefix('~') {
+            Ok(Self::Subscribe(format!("harmony/{key_expr}")))
+        } else {
+            Ok(Self::Named(format!("harmony/content/{trimmed}")))
+        }
+    }
 }
 
 /// Image format for rendering decisions.
