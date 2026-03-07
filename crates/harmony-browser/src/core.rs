@@ -99,14 +99,39 @@ impl BrowserCore {
     }
 
     fn handle_content_fetched(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<BrowserAction> {
-        // Content resolution will be improved in Task 7.
-        // For now, render as unknown-trust plain data.
+        use harmony_content::bundle::parse_bundle;
+        use harmony_content::cid::CidType;
+
+        // Try to interpret as a bundle with inline metadata
+        let mime = match cid.cid_type() {
+            CidType::Bundle(_) => match parse_bundle(&data) {
+                Ok(children) => children
+                    .iter()
+                    .find_map(|child| {
+                        if child.cid_type() == CidType::InlineMetadata {
+                            child
+                                .parse_inline_metadata()
+                                .ok()
+                                .map(|(_, _, _, m)| MimeHint::from_mime_bytes(m))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(MimeHint::PlainText),
+                Err(_) => MimeHint::PlainText,
+            },
+            _ => MimeHint::PlainText,
+        };
+
+        // Trust decision (no author attribution in MVP — defaults to Unknown)
+        let trust_level = TrustDecision::Unknown;
+
         vec![BrowserAction::Render(ResolvedContent::Static {
             cid,
-            mime: MimeHint::PlainText,
+            mime,
             data,
             author: None,
-            trust_level: TrustDecision::Unknown,
+            trust_level,
         })]
     }
 }
