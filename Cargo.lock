@@ -771,6 +771,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-athenaeum"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "harmony-browser"
 version = "0.1.0"
 dependencies = [
@@ -778,7 +785,6 @@ dependencies = [
  "harmony-identity",
  "hashbrown 0.15.5",
  "hex",
- "rand",
  "thiserror 2.0.18",
 ]
 
