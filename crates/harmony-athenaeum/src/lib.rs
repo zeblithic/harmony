@@ -146,4 +146,47 @@ mod tests {
         assert!(debug.contains("Blob"));
         assert!(debug.contains("4096B"));
     }
+
+    #[test]
+    fn encyclopedia_multi_blob_reassemble() {
+        // Build an Encyclopedia from 5 blobs with varied sizes
+        let mut blobs_data = Vec::new();
+        for blob_idx in 0u8..5 {
+            let size = 4096 * (blob_idx as usize + 1); // 4KB to 20KB
+            let mut data = alloc::vec![0u8; size];
+            for (i, b) in data.iter_mut().enumerate() {
+                let pos = i as u32;
+                *b = (pos ^ (pos >> 8) ^ (blob_idx as u32 * 37)) as u8;
+            }
+            blobs_data.push(data);
+        }
+        let blobs: Vec<([u8; 32], &[u8])> = blobs_data.iter()
+            .map(|d| (sha256_hash(d), d.as_slice()))
+            .collect();
+
+        let enc = Encyclopedia::build(&blobs).unwrap();
+        assert_eq!(enc.total_blobs, 5);
+
+        // Verify serialization round-trip
+        let bytes = enc.to_bytes();
+        let restored = Encyclopedia::from_bytes(&bytes).unwrap();
+        assert_eq!(enc, restored);
+    }
+
+    #[test]
+    fn encyclopedia_shared_chunks_across_blobs() {
+        // Two blobs sharing first chunk
+        let shared = alloc::vec![0x42u8; 4096];
+        let mut data1 = shared.clone();
+        data1.extend_from_slice(&alloc::vec![0xAAu8; 4096]);
+        let mut data2 = shared.clone();
+        data2.extend_from_slice(&alloc::vec![0xBBu8; 4096]);
+
+        let cid1 = sha256_hash(&data1);
+        let cid2 = sha256_hash(&data2);
+
+        let enc = Encyclopedia::build(&[(cid1, &data1), (cid2, &data2)]).unwrap();
+        // 1 shared + 2 unique = 3 unique chunks
+        assert_eq!(enc.total_unique_chunks, 3);
+    }
 }
