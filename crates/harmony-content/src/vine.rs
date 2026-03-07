@@ -33,6 +33,10 @@ impl VineDescriptor {
     }
 
     /// Deserialize from postcard-encoded bytes.
+    ///
+    /// Note: this does **not** call [`Self::validate`]. Callers should
+    /// validate the returned descriptor before trusting its contents
+    /// (e.g. title length).
     pub fn from_bytes(data: &[u8]) -> Result<Self, postcard::Error> {
         postcard::from_bytes(data)
     }

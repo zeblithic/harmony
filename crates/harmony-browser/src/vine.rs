@@ -57,7 +57,9 @@ impl VineFeed {
     pub fn handle_event(&mut self, event: VineEvent) -> Vec<VineAction> {
         match event {
             VineEvent::FollowCreator { address } => {
-                self.followed.insert(address);
+                if !self.followed.insert(address) {
+                    return vec![];
+                }
                 let addr_hex = hex::encode(address);
                 vec![VineAction::Subscribe {
                     key_expr: format!("harmony/vines/{addr_hex}/announce/**"),
@@ -283,12 +285,14 @@ mod tests {
     #[test]
     fn duplicate_follow_is_idempotent() {
         let mut feed = VineFeed::new();
-        let _ = feed.handle_event(VineEvent::FollowCreator {
+        let actions1 = feed.handle_event(VineEvent::FollowCreator {
             address: creator_a(),
         });
-        let _ = feed.handle_event(VineEvent::FollowCreator {
+        assert_eq!(actions1.len(), 1); // Subscribe emitted
+        let actions2 = feed.handle_event(VineEvent::FollowCreator {
             address: creator_a(),
         });
+        assert!(actions2.is_empty()); // No spurious Subscribe
         assert!(feed.is_followed(&creator_a()));
         // Unfollow once should fully remove.
         let actions = feed.handle_event(VineEvent::UnfollowCreator {

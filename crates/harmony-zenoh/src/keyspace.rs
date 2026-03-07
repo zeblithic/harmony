@@ -190,15 +190,17 @@ pub fn vine_announce_sub(creator_addr_hex: &str) -> Result<OwnedKeyExpr, ZenohEr
 
 /// Build a vine reaction key expression.
 ///
-/// Pattern: `harmony/vines/{target_creator_hex}/reactions/{reactor_hex}`
+/// Pattern: `harmony/vines/{target_creator_hex}/reactions/{bundle_cid_hex}/{reactor_hex}`
 pub fn vine_reaction_key(
     target_creator_hex: &str,
+    bundle_cid_hex: &str,
     reactor_hex: &str,
 ) -> Result<OwnedKeyExpr, ZenohError> {
     reject_slashes(target_creator_hex)?;
+    reject_slashes(bundle_cid_hex)?;
     reject_slashes(reactor_hex)?;
     ke(&format!(
-        "harmony/vines/{target_creator_hex}/reactions/{reactor_hex}"
+        "harmony/vines/{target_creator_hex}/reactions/{bundle_cid_hex}/{reactor_hex}"
     ))
 }
 
@@ -515,8 +517,11 @@ mod tests {
 
     #[test]
     fn vine_reaction_key_valid() {
-        let k = vine_reaction_key("creator01", "reactor02").unwrap();
-        assert_eq!(k.as_str(), "harmony/vines/creator01/reactions/reactor02");
+        let k = vine_reaction_key("creator01", "bundle99", "reactor02").unwrap();
+        assert_eq!(
+            k.as_str(),
+            "harmony/vines/creator01/reactions/bundle99/reactor02"
+        );
     }
 
     #[test]
@@ -528,8 +533,9 @@ mod tests {
     #[test]
     fn vine_keys_reject_slashes() {
         assert!(vine_announce_sub("aa/bb").is_err());
-        assert!(vine_reaction_key("cre/ator", "reactor").is_err());
-        assert!(vine_reaction_key("creator", "rea/ctor").is_err());
+        assert!(vine_reaction_key("cre/ator", "bundle", "reactor").is_err());
+        assert!(vine_reaction_key("creator", "bun/dle", "reactor").is_err());
+        assert!(vine_reaction_key("creator", "bundle", "rea/ctor").is_err());
         assert!(vine_compilation_key("cre/ator", "cid").is_err());
         assert!(vine_compilation_key("creator", "ci/d").is_err());
     }
