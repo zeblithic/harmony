@@ -48,13 +48,14 @@ hashbrown = { version = "0.15", default-features = false, features = ["default-h
 # (encode/decode on byte slices) works without any features enabled.
 rmp = { version = "0.8", default-features = false }
 hex = "0.4"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 
 # WASM runtime
 wasmi = "1"
 wasmtime = "38"
 
 # CLI and config
-serde = "1"
+serde = { version = "1", default-features = false }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 
