@@ -149,7 +149,7 @@ fn address_with_collision_resolution(
 /// Find the size exponent for a chunk: the largest `exp` where `4096 >> exp >= len`.
 ///
 /// Returns 0 for full 4KB chunks, up to 7 for 32-byte chunks.
-fn chunk_size_exponent(len: usize) -> u8 {
+pub(crate) fn chunk_size_exponent(len: usize) -> u8 {
     // Full-size chunks are the common case
     if len > 2048 {
         return 0;
