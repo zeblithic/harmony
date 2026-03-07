@@ -12,6 +12,8 @@ use alloc::vec::Vec;
 pub enum BookError {
     TooShort,
     InvalidChecksum,
+    /// Unrecognized format (bad magic, unsupported version, unknown tag).
+    BadFormat,
 }
 
 /// A single blob entry in a book.

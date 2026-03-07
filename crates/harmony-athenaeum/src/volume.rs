@@ -36,7 +36,12 @@ impl Volume {
         }
     }
 
-    /// Number of unique chunks in this subtree.
+    /// Total chunk references in this subtree.
+    ///
+    /// Counts every chunk slot across all `BookEntry` values. When blobs
+    /// share deduplicated chunks, the same `ChunkAddr` appears in multiple
+    /// entries, so this number may exceed the count of *unique* chunks.
+    /// Use [`Encyclopedia::total_unique_chunks`] for the deduplicated count.
     pub fn chunk_count(&self) -> usize {
         match self {
             Volume::Leaf { books, .. } => books
@@ -140,6 +145,15 @@ impl Volume {
 
     /// Deserialize a Volume node.
     pub fn from_bytes(data: &[u8]) -> Result<Self, BookError> {
+        let (vol, consumed) = Self::parse(data)?;
+        if consumed != data.len() {
+            return Err(BookError::BadFormat);
+        }
+        Ok(vol)
+    }
+
+    /// Internal parser that returns the Volume and byte count consumed.
+    fn parse(data: &[u8]) -> Result<(Self, usize), BookError> {
         if data.len() < 8 {
             return Err(BookError::TooShort);
         }
@@ -177,11 +191,14 @@ impl Volume {
                     books.push(book);
                     pos += book_len;
                 }
-                Ok(Volume::Leaf {
-                    partition_depth,
-                    partition_path,
-                    books,
-                })
+                Ok((
+                    Volume::Leaf {
+                        partition_depth,
+                        partition_path,
+                        books,
+                    },
+                    pos,
+                ))
             }
             1 => {
                 // Split
@@ -197,21 +214,25 @@ impl Volume {
                 if left_start + left_len > data.len() {
                     return Err(BookError::TooShort);
                 }
-                let left = Volume::from_bytes(&data[left_start..left_start + left_len])?;
+                let (left, _) = Self::parse(&data[left_start..left_start + left_len])?;
                 let right_start = left_start + left_len;
                 if right_start >= data.len() {
                     return Err(BookError::TooShort);
                 }
-                let right = Volume::from_bytes(&data[right_start..])?;
-                Ok(Volume::Split {
-                    partition_depth,
-                    partition_path,
-                    split_bit,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
+                let (right, right_consumed) = Self::parse(&data[right_start..])?;
+                let total = right_start + right_consumed;
+                Ok((
+                    Volume::Split {
+                        partition_depth,
+                        partition_path,
+                        split_bit,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                    total,
+                ))
             }
-            _ => Err(BookError::InvalidChecksum),
+            _ => Err(BookError::BadFormat),
         }
     }
 }
@@ -324,5 +345,36 @@ mod tests {
     #[test]
     fn volume_from_bytes_too_short() {
         assert!(Volume::from_bytes(&[0u8; 3]).is_err());
+    }
+
+    #[test]
+    fn volume_from_bytes_rejects_trailing_bytes() {
+        let vol = Volume::leaf(0, 0, Vec::new());
+        let mut bytes = vol.to_bytes();
+        bytes.push(0xFF); // trailing garbage
+        assert_eq!(Volume::from_bytes(&bytes), Err(BookError::BadFormat));
+    }
+
+    #[test]
+    fn split_from_bytes_rejects_trailing_bytes() {
+        let left = Volume::leaf(1, 0, Vec::new());
+        let right = Volume::leaf(1, 1, Vec::new());
+        let split = Volume::Split {
+            partition_depth: 0,
+            partition_path: 0,
+            split_bit: 22,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+        let mut bytes = split.to_bytes();
+        bytes.push(0xFF); // trailing garbage
+        assert_eq!(Volume::from_bytes(&bytes), Err(BookError::BadFormat));
+    }
+
+    #[test]
+    fn volume_from_bytes_unknown_tag() {
+        let mut data = [0u8; 10];
+        data[0] = 99; // unknown tag
+        assert_eq!(Volume::from_bytes(&data), Err(BookError::BadFormat));
     }
 }

@@ -178,6 +178,12 @@ impl Encyclopedia {
     /// Addresses ONLY the chunks whose content hashes belong to this
     /// partition. Each blob's BookEntry contains only the subset of
     /// chunk addresses that route here.
+    ///
+    /// **Cross-partition reassembly:** When the Encyclopedia splits,
+    /// a blob's chunks may span multiple leaf Volumes. Reassembling a
+    /// full blob requires gathering its BookEntries from every leaf
+    /// that references it. This is by design — each partition is
+    /// independently address-consistent.
     fn resolve_leaf(
         chunks: &[ChunkInfo],
         blobs: &[([u8; 32], &[u8])],
@@ -275,10 +281,10 @@ impl Encyclopedia {
             return Err(BookError::TooShort);
         }
         if &data[0..4] != b"ENCY" {
-            return Err(BookError::InvalidChecksum);
+            return Err(BookError::BadFormat);
         }
         if data[4] != 1 {
-            return Err(BookError::InvalidChecksum);
+            return Err(BookError::BadFormat);
         }
         let total_blobs =
             u32::from_le_bytes(data[5..9].try_into().map_err(|_| BookError::TooShort)?);
