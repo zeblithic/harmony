@@ -20,6 +20,8 @@ pub struct VineDescriptor {
     pub creator_address: [u8; 16],
     /// Unix timestamp (seconds) when the vine was created.
     pub created_at: u64,
+    /// CID of the raw video content blob.
+    pub video_cid: [u8; 32],
     /// Optional human-readable title (max 140 bytes).
     pub title: Option<String>,
     /// If this vine is a reshare, the CID hash of the original.
@@ -63,6 +65,7 @@ mod tests {
         let desc = VineDescriptor {
             creator_address: [0xAB; 16],
             created_at: 1_700_000_000,
+            video_cid: [0xCC; 32],
             title: Some(String::from("My first vine")),
             reshare_of: None,
         };
@@ -77,6 +80,7 @@ mod tests {
         let desc = VineDescriptor {
             creator_address: [0x01; 16],
             created_at: 1_700_000_001,
+            video_cid: [0xBB; 32],
             title: None,
             reshare_of: Some([0xDE; 32]),
         };
@@ -91,6 +95,7 @@ mod tests {
         let desc = VineDescriptor {
             creator_address: [0x00; 16],
             created_at: 0,
+            video_cid: [0x00; 32],
             title: Some("A".repeat(141)),
             reshare_of: None,
         };
@@ -101,6 +106,7 @@ mod tests {
         let ok_desc = VineDescriptor {
             creator_address: [0x00; 16],
             created_at: 0,
+            video_cid: [0x00; 32],
             title: Some("B".repeat(140)),
             reshare_of: None,
         };

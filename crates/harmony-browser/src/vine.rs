@@ -34,11 +34,10 @@ pub enum VineAction {
 }
 
 /// Build the vine announce subscription pattern for a creator address.
-///
-/// Canonical source: `harmony_zenoh::keyspace::vine_announce_sub`.
-/// Keep in sync if the pattern changes.
 fn vine_announce_pattern(addr_hex: &str) -> String {
-    format!("harmony/vines/{addr_hex}/announce/**")
+    harmony_zenoh::keyspace::vine_announce_sub(addr_hex)
+        .expect("vine announce sub should not fail for valid hex")
+        .to_string()
 }
 
 /// Sans-I/O state machine for vine feed management.
