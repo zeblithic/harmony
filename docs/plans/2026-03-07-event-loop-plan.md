@@ -50,6 +50,7 @@ pub enum RuntimeAction {
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
     pub address_hash: [u8; 16],
+    pub dest_hash: [u8; 16],
     pub last_seen_ms: u64,
     pub hops: u8,
     pub discovered_at_ms: u64,
@@ -464,6 +465,7 @@ pub fn handle_packet(
                 let is_new = !self.peers.contains_key(&addr);
                 self.peers.insert(addr, PeerInfo {
                     address_hash: addr,
+                    dest_hash: destination_hash,
                     last_seen_ms: now,
                     hops,
                     discovered_at_ms: if is_new { now } else {
@@ -507,7 +509,6 @@ pub fn handle_packet(
             }
             NodeAction::AnnounceNeeded { dest_hash } => {
                 // Resolve inline (can happen on inbound too).
-                let now_secs = now / 1000;
                 let announce_actions = self.node.announce(
                     &dest_hash,
                     &mut self.entropy,
@@ -644,26 +645,22 @@ fn build_data_packet(dest_hash: &DestinationHash, payload: &[u8]) -> Option<Vec<
 Then add heartbeat emission at the end of `tick()`, before the peer timeout check:
 
 ```rust
-// Emit heartbeats if interval has elapsed and we have a destination.
+// Emit heartbeats if interval has elapsed and we have peers.
 if !self.peers.is_empty()
     && now.saturating_sub(self.last_heartbeat_ms) >= self.heartbeat_interval_ms
 {
-    if let Some(ref dest_hash) = self.dest_hash {
-        let hbt = self.build_heartbeat(now);
-        // Send heartbeat to each peer's destination.
-        // For now, broadcast — peers learn our dest_hash from announces.
-        // We use route_packet which broadcasts if no path is known.
-        let peer_addrs: Vec<[u8; 16]> = self.peers.keys().copied().collect();
-        for _peer_addr in &peer_addrs {
-            if let Some(raw) = Self::build_data_packet(dest_hash, &hbt) {
-                let send_actions = self.node.route_packet(dest_hash, raw);
-                for sa in send_actions {
-                    if let NodeAction::SendOnInterface { interface_name, raw } = sa {
-                        out.push(RuntimeAction::SendOnInterface { interface_name, raw });
-                    }
+    let hbt = self.build_heartbeat(now);
+    // Route a heartbeat to each peer's destination hash so that
+    // DeliverLocally fires on the receiving node.
+    let peer_dest_hashes: Vec<[u8; 16]> =
+        self.peers.values().map(|p| p.dest_hash).collect();
+    for peer_dest in &peer_dest_hashes {
+        if let Some(raw) = Self::build_data_packet(peer_dest, &hbt) {
+            let send_actions = self.node.route_packet(peer_dest, raw);
+            for sa in send_actions {
+                if let NodeAction::SendOnInterface { interface_name, raw } = sa {
+                    out.push(RuntimeAction::SendOnInterface { interface_name, raw });
                 }
-                // One broadcast covers all peers on the same LAN.
-                break;
             }
         }
     }
@@ -671,7 +668,7 @@ if !self.peers.is_empty()
 }
 ```
 
-**Note on routing:** In the initial Ring 1 deployment, all nodes are on the same broadcast LAN. Rather than sending per-peer unicast heartbeats, we broadcast a single heartbeat packet. All peers receiving it parse the sender address and update liveness. This is correct and efficient for the QEMU virtual LAN.
+**Note on routing:** Heartbeats are addressed to each peer's destination hash (learned from their announce). This ensures `DeliverLocally` fires on the receiving node. On a broadcast LAN, the physical packets may overlap, but the Reticulum destination_hash in each packet header must match the receiver's registered destination for delivery to work.
 
 **Step 4: Run tests**
 

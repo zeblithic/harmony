@@ -39,7 +39,7 @@ read the current count to measure elapsed time. On each call to
 ```rust
 // crates/harmony-boot/src/pit.rs
 pub struct PitTimer {
-    accumulated_ms: u64,
+    accumulated_ticks: u64,
     last_count: u16,
 }
 
@@ -85,7 +85,6 @@ pub struct UnikernelRuntime<E, P> {
     tick_count: u64,
 
     // new
-    dest_name: Option<DestinationName>,
     dest_hash: Option<DestinationHash>,
     peers: BTreeMap<[u8; 16], PeerInfo>,
     heartbeat_interval_ms: u64,       // default: 5000
@@ -95,6 +94,7 @@ pub struct UnikernelRuntime<E, P> {
 
 pub struct PeerInfo {
     pub address_hash: [u8; 16],
+    pub dest_hash: [u8; 16],
     pub last_seen_ms: u64,
     pub hops: u8,
     pub discovered_at_ms: u64,
@@ -105,7 +105,7 @@ pub struct PeerInfo {
 
 - `register_announcing_destination(name, aspects, announce_interval_ms, now)`
   — Registers the node's identity as an announcing destination on the
-  `Node`. Stores `dest_name` and `dest_hash` for heartbeat routing.
+  `Node`. Stores `dest_hash` for heartbeat routing.
 
 - `tick(now) -> Vec<RuntimeAction>` — Enhanced: after calling
   `node.handle_event(TimerTick)`, internally resolves any
