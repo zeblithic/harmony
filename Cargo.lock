@@ -778,7 +778,6 @@ dependencies = [
  "harmony-identity",
  "hashbrown 0.15.5",
  "hex",
- "rand",
  "thiserror 2.0.18",
 ]
 
