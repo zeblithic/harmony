@@ -92,6 +92,7 @@ pub struct UnikernelRuntime<E, P> {
     heartbeat_interval_ms: u64,       // default: 5000
     peer_timeout_ms: u64,             // default: 15000 (3x heartbeat)
     last_heartbeat_ms: u64,
+    boot_time_ms: u64,               // set on first register_announcing_destination()
 }
 
 pub struct PeerInfo {
