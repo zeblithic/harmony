@@ -87,8 +87,7 @@ impl Volume {
     /// - tag: u8 = 0
     /// - partition_depth: u8
     /// - partition_path: u32 (LE)
-    /// - book_count: u16 (LE)
-    /// - reserved: u16
+    /// - book_count: u32 (LE)
     /// - for each book: book_len: u32 (LE), book_bytes
     ///
     /// Split format:
@@ -111,9 +110,8 @@ impl Volume {
                 buf.push(0u8); // tag
                 buf.push(*partition_depth);
                 buf.extend_from_slice(&partition_path.to_le_bytes());
-                let count = books.len() as u16;
+                let count = books.len() as u32;
                 buf.extend_from_slice(&count.to_le_bytes());
-                buf.extend_from_slice(&[0u8; 2]); // reserved
                 for book in books {
                     let book_bytes = book.to_bytes();
                     let len = book_bytes.len() as u32;
@@ -169,9 +167,8 @@ impl Volume {
                     return Err(BookError::TooShort);
                 }
                 let book_count =
-                    u16::from_le_bytes(data[6..8].try_into().map_err(|_| BookError::TooShort)?)
+                    u32::from_le_bytes(data[6..10].try_into().map_err(|_| BookError::TooShort)?)
                         as usize;
-                // skip 2 reserved bytes
                 let mut pos = 10;
                 let mut books = Vec::with_capacity(book_count);
                 for _ in 0..book_count {
@@ -214,7 +211,10 @@ impl Volume {
                 if left_start + left_len > data.len() {
                     return Err(BookError::TooShort);
                 }
-                let (left, _) = Self::parse(&data[left_start..left_start + left_len])?;
+                let (left, left_consumed) = Self::parse(&data[left_start..left_start + left_len])?;
+                if left_consumed != left_len {
+                    return Err(BookError::BadFormat);
+                }
                 let right_start = left_start + left_len;
                 if right_start >= data.len() {
                     return Err(BookError::TooShort);
