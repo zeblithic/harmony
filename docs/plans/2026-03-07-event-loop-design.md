@@ -60,11 +60,14 @@ Constructed in `kernel_main()` after serial init. Every event loop
 iteration calls `now_ms()` and passes the result to `runtime.tick(now)`
 and `runtime.handle_packet(..., now)`.
 
-### Wraparound safety
+### Counter reload safety
 
-The PIT counter wraps every ~54.9ms at full countdown. Since the spin
-loop iterates much faster than that, we always catch the rollover.
-A debug assert flags if we ever miss one.
+PIT Channel 2 in mode 0 counts down and stops at 0 (it does not
+wrap). The timer reloads the counter when it drops below 1000 ticks
+(~0.84ms), well before it reaches terminal count. The spin loop
+iterates far faster than 55ms, so the reload always fires in time.
+Up to ~1000 ticks may be lost per reload — acceptable for Ring 1's
+5s/15s protocol intervals.
 
 ## UnikernelRuntime Extensions
 
@@ -85,7 +88,6 @@ pub struct UnikernelRuntime<E, P> {
     tick_count: u64,
 
     // new
-    dest_hash: Option<DestinationHash>,
     peers: BTreeMap<[u8; 16], PeerInfo>,
     heartbeat_interval_ms: u64,       // default: 5000
     peer_timeout_ms: u64,             // default: 15000 (3x heartbeat)
@@ -105,7 +107,7 @@ pub struct PeerInfo {
 
 - `register_announcing_destination(name, aspects, announce_interval_ms, now)`
   — Registers the node's identity as an announcing destination on the
-  `Node`. Stores `dest_hash` for heartbeat routing.
+  `Node`. Returns the destination hash for logging.
 
 - `tick(now) -> Vec<RuntimeAction>` — Enhanced: after calling
   `node.handle_event(TimerTick)`, internally resolves any

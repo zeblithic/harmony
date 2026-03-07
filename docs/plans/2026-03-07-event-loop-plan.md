@@ -291,6 +291,7 @@ fn tick_emits_peer_lost_after_timeout() {
     // Manually insert a peer.
     runtime.peers.insert([0xAA; 16], PeerInfo {
         address_hash: [0xAA; 16],
+        dest_hash: [0xAA; 16],
         last_seen_ms: 0,
         hops: 1,
         discovered_at_ms: 0,
@@ -571,6 +572,7 @@ fn tick_emits_heartbeats_to_peers() {
     // Insert a fake peer.
     runtime.peers.insert([0xBB; 16], PeerInfo {
         address_hash: [0xBB; 16],
+        dest_hash: [0xBB; 16],
         last_seen_ms: 0,
         hops: 1,
         discovered_at_ms: 0,
