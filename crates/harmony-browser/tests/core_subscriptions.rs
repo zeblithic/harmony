@@ -1,9 +1,9 @@
-use harmony_browser::{BrowserAction, BrowserCore, BrowserEvent, BrowseTarget};
+use harmony_browser::{BrowserAction, BrowserCore, BrowserEvent, BrowserSubId, BrowseTarget};
 
 #[test]
 fn subscribe_tracks_active_subscription() {
     let mut core = BrowserCore::new();
-    core.handle_event(BrowserEvent::Navigate(
+    let _ = core.handle_event(BrowserEvent::Navigate(
         BrowseTarget::Subscribe("harmony/presence/**".into()),
     ));
     assert_eq!(core.active_subscriptions().len(), 1);
@@ -13,7 +13,7 @@ fn subscribe_tracks_active_subscription() {
 #[test]
 fn duplicate_subscribe_does_not_add_twice() {
     let mut core = BrowserCore::new();
-    core.handle_event(BrowserEvent::Navigate(
+    let _ = core.handle_event(BrowserEvent::Navigate(
         BrowseTarget::Subscribe("harmony/presence/**".into()),
     ));
     // Second subscribe to same key_expr should be a no-op
@@ -27,7 +27,7 @@ fn duplicate_subscribe_does_not_add_twice() {
 #[test]
 fn subscription_update_emits_deliver() {
     let mut core = BrowserCore::new();
-    core.handle_event(BrowserEvent::Navigate(
+    let _ = core.handle_event(BrowserEvent::Navigate(
         BrowseTarget::Subscribe("harmony/presence/**".into()),
     ));
 
@@ -48,4 +48,15 @@ fn subscription_update_emits_deliver() {
         }
         other => panic!("expected DeliverUpdate, got {:?}", other),
     }
+}
+
+#[test]
+fn unknown_sub_id_is_ignored() {
+    let mut core = BrowserCore::new();
+    let actions = core.handle_event(BrowserEvent::SubscriptionUpdate {
+        sub_id: BrowserSubId(999),
+        key_expr: "harmony/presence/alice".into(),
+        payload: b"online".to_vec(),
+    });
+    assert!(actions.is_empty());
 }

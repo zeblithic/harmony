@@ -19,7 +19,7 @@ fn approved_cid_is_remembered() {
     let mut core = BrowserCore::new();
     let cid = ContentId::for_blob(b"gated image").unwrap();
 
-    core.handle_event(BrowserEvent::ApproveContent { cid });
+    let _ = core.handle_event(BrowserEvent::ApproveContent { cid });
     assert!(core.is_approved(&cid));
 }
 

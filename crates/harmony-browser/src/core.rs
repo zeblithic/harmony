@@ -56,6 +56,7 @@ impl BrowserCore {
         self.subscriptions.values().copied().collect()
     }
 
+    #[must_use]
     pub fn handle_event(&mut self, event: BrowserEvent) -> Vec<BrowserAction> {
         match event {
             BrowserEvent::Navigate(target) => self.handle_navigate(target),
@@ -65,6 +66,9 @@ impl BrowserCore {
                 key_expr,
                 payload,
             } => {
+                if !self.subscriptions.values().any(|id| *id == sub_id) {
+                    return vec![];
+                }
                 vec![BrowserAction::DeliverUpdate {
                     sub_id,
                     key_expr,
@@ -101,6 +105,11 @@ impl BrowserCore {
     fn handle_content_fetched(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<BrowserAction> {
         use harmony_content::bundle::parse_bundle;
         use harmony_content::cid::CidType;
+
+        // Verify content hash matches CID (content-addressed integrity check)
+        if !cid.verify_hash(&data) {
+            return vec![];
+        }
 
         // Try to interpret as a bundle with inline metadata
         let mime = match cid.cid_type() {

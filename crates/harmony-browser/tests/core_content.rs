@@ -70,7 +70,7 @@ fn trust_update_affects_subsequent_content() {
     let author_address = [0xAA; 16];
 
     // Set trust: identity=3 (full trust)
-    core.handle_event(BrowserEvent::TrustUpdated {
+    let _ = core.handle_event(BrowserEvent::TrustUpdated {
         address: author_address,
         score: 0b00000011, // identity=3
     });
@@ -80,4 +80,18 @@ fn trust_update_affects_subsequent_content() {
         core.trust_policy().decide(core.trust_score(&author_address)),
         TrustDecision::FullTrust,
     );
+}
+
+#[test]
+fn tampered_content_is_rejected() {
+    let mut core = BrowserCore::new();
+    let (cid, mut data) = build_test_bundle(b"# Hello", *b"text/md\0");
+
+    // Tamper with the data so the hash no longer matches
+    if let Some(byte) = data.last_mut() {
+        *byte ^= 0xFF;
+    }
+
+    let actions = core.handle_event(BrowserEvent::ContentFetched { cid, data });
+    assert!(actions.is_empty(), "tampered content should produce no actions");
 }
