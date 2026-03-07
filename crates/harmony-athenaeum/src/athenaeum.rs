@@ -28,6 +28,8 @@ pub enum CollisionError {
     AllAlgorithmsCollide { chunk_index: usize },
     /// Blob exceeds `MAX_BLOB_SIZE`.
     BlobTooLarge { size: usize },
+    /// Partition depth exceeded (>230 splits — unreachable in practice).
+    MaxPartitionDepth { depth: u8 },
 }
 
 /// Error when a chunk is missing during reassembly.
@@ -317,5 +319,13 @@ mod tests {
         let data = vec![0xFFu8; 5000];
         let ath = Athenaeum::from_blob(test_cid(), &data).unwrap();
         assert_eq!(ath.blob_size, 5000);
+    }
+
+    #[test]
+    fn collision_error_max_partition_depth() {
+        let err = CollisionError::MaxPartitionDepth { depth: 42 };
+        let debug = alloc::format!("{:?}", err);
+        assert!(debug.contains("MaxPartitionDepth"));
+        assert!(debug.contains("42"));
     }
 }
