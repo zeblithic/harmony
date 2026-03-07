@@ -96,6 +96,9 @@ impl VineFeed {
                 if !self.followed.contains(&item.creator) {
                     return vec![];
                 }
+                // Evict any existing entry for the same CID (re-announcement
+                // with a different timestamp).
+                self.items.retain(|_, existing| existing.bundle_cid != item.bundle_cid);
                 let key = (item.timestamp, item.bundle_cid);
                 self.items.insert(key, item);
                 vec![VineAction::FeedUpdated]
@@ -107,10 +110,17 @@ impl VineFeed {
                 vec![VineAction::FeedUpdated]
             }
             VineEvent::MarkAllViewed => {
+                let mut changed = false;
                 for item in self.items.values() {
-                    self.viewed.insert(item.bundle_cid);
+                    if self.viewed.insert(item.bundle_cid) {
+                        changed = true;
+                    }
                 }
-                vec![VineAction::FeedUpdated]
+                if changed {
+                    vec![VineAction::FeedUpdated]
+                } else {
+                    vec![]
+                }
             }
         }
     }
@@ -336,6 +346,48 @@ mod tests {
         let actions1 = feed.handle_event(VineEvent::MarkViewed { bundle_cid: cid });
         assert_eq!(actions1.len(), 1); // FeedUpdated
         let actions2 = feed.handle_event(VineEvent::MarkViewed { bundle_cid: cid });
+        assert!(actions2.is_empty()); // No spurious update
+    }
+
+    #[test]
+    fn reannounce_same_cid_deduplicates() {
+        let mut feed = VineFeed::new();
+        let _ = feed.handle_event(VineEvent::FollowCreator {
+            address: creator_a(),
+        });
+        let cid = cid_from(1);
+        let _ = feed.handle_event(VineEvent::VineAnnounced {
+            item: make_item(creator_a(), 100, cid),
+        });
+        // Re-announce same CID with different timestamp.
+        let _ = feed.handle_event(VineEvent::VineAnnounced {
+            item: make_item(creator_a(), 200, cid),
+        });
+        // Should have exactly one entry, at the new timestamp.
+        let items = feed.archive_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].timestamp, 200);
+    }
+
+    #[test]
+    fn mark_all_viewed_empty_feed_is_noop() {
+        let mut feed = VineFeed::new();
+        let actions = feed.handle_event(VineEvent::MarkAllViewed);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn mark_all_viewed_already_viewed_is_noop() {
+        let mut feed = VineFeed::new();
+        let _ = feed.handle_event(VineEvent::FollowCreator {
+            address: creator_a(),
+        });
+        let _ = feed.handle_event(VineEvent::VineAnnounced {
+            item: make_item(creator_a(), 100, cid_from(1)),
+        });
+        let actions1 = feed.handle_event(VineEvent::MarkAllViewed);
+        assert_eq!(actions1.len(), 1); // FeedUpdated
+        let actions2 = feed.handle_event(VineEvent::MarkAllViewed);
         assert!(actions2.is_empty()); // No spurious update
     }
 
