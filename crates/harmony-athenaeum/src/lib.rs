@@ -12,11 +12,13 @@ mod addr;
 mod hash;
 mod athenaeum;
 mod book;
+mod volume;
 
 pub use addr::{ChunkAddr, Algorithm, Depth};
 pub use athenaeum::{Athenaeum, CollisionError, MissingChunkError, MAX_BLOB_SIZE};
 pub use book::{Book, BookEntry, BookError};
 pub use hash::{sha256_hash, sha224_hash};
+pub use volume::{Volume, route_chunk, MAX_PARTITION_DEPTH};
 
 #[cfg(test)]
 mod tests {
