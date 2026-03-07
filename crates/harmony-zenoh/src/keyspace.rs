@@ -162,6 +162,60 @@ pub fn node_lookup_key(node_hash: &str) -> Result<OwnedKeyExpr, ZenohError> {
     f.build().map_err(|e| ze(e.to_string()))
 }
 
+// ── Vine key expressions ─────────────────────────────────────────────
+
+/// Build a vine announcement key expression.
+///
+/// Pattern: `harmony/vines/{address_hex}/announce/{bundle_cid_hex}`
+pub fn vine_announce_key(
+    creator_addr_hex: &str,
+    bundle_cid_hex: &str,
+) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(creator_addr_hex)?;
+    reject_slashes(bundle_cid_hex)?;
+    ke(&format!(
+        "harmony/vines/{creator_addr_hex}/announce/{bundle_cid_hex}"
+    ))
+}
+
+/// Build a vine announcement subscription pattern.
+///
+/// Pattern: `harmony/vines/{address_hex}/announce/**`
+pub fn vine_announce_sub(creator_addr_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(creator_addr_hex)?;
+    ke(&format!(
+        "harmony/vines/{creator_addr_hex}/announce/**"
+    ))
+}
+
+/// Build a vine reaction key expression.
+///
+/// Pattern: `harmony/vines/{target_creator_hex}/reactions/{reactor_hex}`
+pub fn vine_reaction_key(
+    target_creator_hex: &str,
+    reactor_hex: &str,
+) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(target_creator_hex)?;
+    reject_slashes(reactor_hex)?;
+    ke(&format!(
+        "harmony/vines/{target_creator_hex}/reactions/{reactor_hex}"
+    ))
+}
+
+/// Build a vine compilation key expression.
+///
+/// Pattern: `harmony/vines/{address_hex}/compilations/{cid_hex}`
+pub fn vine_compilation_key(
+    creator_addr_hex: &str,
+    compilation_cid_hex: &str,
+) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(creator_addr_hex)?;
+    reject_slashes(compilation_cid_hex)?;
+    ke(&format!(
+        "harmony/vines/{creator_addr_hex}/compilations/{compilation_cid_hex}"
+    ))
+}
+
 // ── Parsing helpers ──────────────────────────────────────────────────
 
 /// Parse a channel message key expression, returning (server_id, channel_id).
@@ -437,5 +491,46 @@ mod tests {
         // concrete one.
         let ke = channel_msg_key("*", "general").unwrap();
         assert!(ke.as_str().contains('*'));
+    }
+
+    // ── Vine key expression tests ───────────────────────────────────
+
+    #[test]
+    fn vine_announce_key_valid() {
+        let k = vine_announce_key("aa11bb22", "cid0099").unwrap();
+        assert_eq!(k.as_str(), "harmony/vines/aa11bb22/announce/cid0099");
+    }
+
+    #[test]
+    fn vine_announce_sub_valid() {
+        let k = vine_announce_sub("aa11bb22").unwrap();
+        assert_eq!(k.as_str(), "harmony/vines/aa11bb22/announce/**");
+    }
+
+    #[test]
+    fn vine_announce_key_rejects_slash() {
+        assert!(vine_announce_key("aa/bb", "cid01").is_err());
+        assert!(vine_announce_key("aabb", "cid/01").is_err());
+    }
+
+    #[test]
+    fn vine_reaction_key_valid() {
+        let k = vine_reaction_key("creator01", "reactor02").unwrap();
+        assert_eq!(k.as_str(), "harmony/vines/creator01/reactions/reactor02");
+    }
+
+    #[test]
+    fn vine_compilation_key_valid() {
+        let k = vine_compilation_key("creator01", "compilcid").unwrap();
+        assert_eq!(k.as_str(), "harmony/vines/creator01/compilations/compilcid");
+    }
+
+    #[test]
+    fn vine_keys_reject_slashes() {
+        assert!(vine_announce_sub("aa/bb").is_err());
+        assert!(vine_reaction_key("cre/ator", "reactor").is_err());
+        assert!(vine_reaction_key("creator", "rea/ctor").is_err());
+        assert!(vine_compilation_key("cre/ator", "cid").is_err());
+        assert!(vine_compilation_key("creator", "ci/d").is_err());
     }
 }
