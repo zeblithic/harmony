@@ -204,6 +204,16 @@ pub fn vine_reaction_key(
     ))
 }
 
+/// Build a vine compilation subscription pattern.
+///
+/// Pattern: `harmony/vines/{address_hex}/compilations/**`
+pub fn vine_compilation_sub(creator_addr_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(creator_addr_hex)?;
+    ke(&format!(
+        "harmony/vines/{creator_addr_hex}/compilations/**"
+    ))
+}
+
 /// Build a vine compilation key expression.
 ///
 /// Pattern: `harmony/vines/{address_hex}/compilations/{cid_hex}`
@@ -525,6 +535,22 @@ mod tests {
     }
 
     #[test]
+    fn vine_compilation_sub_valid() {
+        let k = vine_compilation_sub("creator01").unwrap();
+        assert_eq!(k.as_str(), "harmony/vines/creator01/compilations/**");
+    }
+
+    #[test]
+    fn vine_compilation_sub_matches_key() {
+        let sub = vine_compilation_sub("creator01").unwrap();
+        let key = vine_compilation_key("creator01", "compilcid").unwrap();
+        assert!(sub.intersects(&key));
+
+        let other = vine_compilation_key("creator02", "compilcid").unwrap();
+        assert!(!sub.intersects(&other));
+    }
+
+    #[test]
     fn vine_compilation_key_valid() {
         let k = vine_compilation_key("creator01", "compilcid").unwrap();
         assert_eq!(k.as_str(), "harmony/vines/creator01/compilations/compilcid");
@@ -536,6 +562,7 @@ mod tests {
         assert!(vine_reaction_key("cre/ator", "bundle", "reactor").is_err());
         assert!(vine_reaction_key("creator", "bun/dle", "reactor").is_err());
         assert!(vine_reaction_key("creator", "bundle", "rea/ctor").is_err());
+        assert!(vine_compilation_sub("cre/ator").is_err());
         assert!(vine_compilation_key("cre/ator", "cid").is_err());
         assert!(vine_compilation_key("creator", "ci/d").is_err());
     }

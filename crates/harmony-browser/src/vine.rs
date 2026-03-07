@@ -78,6 +78,7 @@ impl VineFeed {
                     return vec![];
                 }
                 // Purge viewed CIDs for this creator before removing items.
+                let had_items = self.items.values().any(|item| item.creator == address);
                 for item in self.items.values() {
                     if item.creator == address {
                         self.viewed.remove(&item.bundle_cid);
@@ -85,12 +86,13 @@ impl VineFeed {
                 }
                 self.items.retain(|_, item| item.creator != address);
                 let addr_hex = hex::encode(address);
-                vec![
-                    VineAction::Unsubscribe {
-                        key_expr: vine_announce_pattern(&addr_hex),
-                    },
-                    VineAction::FeedUpdated,
-                ]
+                let mut actions = vec![VineAction::Unsubscribe {
+                    key_expr: vine_announce_pattern(&addr_hex),
+                }];
+                if had_items {
+                    actions.push(VineAction::FeedUpdated);
+                }
+                actions
             }
             VineEvent::VineAnnounced { item } => {
                 if !self.followed.contains(&item.creator) {
@@ -104,7 +106,11 @@ impl VineFeed {
                 vec![VineAction::FeedUpdated]
             }
             VineEvent::MarkViewed { bundle_cid } => {
-                if !self.viewed.insert(bundle_cid) {
+                let in_feed = self
+                    .items
+                    .values()
+                    .any(|item| item.bundle_cid == bundle_cid);
+                if !in_feed || !self.viewed.insert(bundle_cid) {
                     return vec![];
                 }
                 vec![VineAction::FeedUpdated]
@@ -203,10 +209,11 @@ mod tests {
         let _ = feed.handle_event(VineEvent::FollowCreator {
             address: creator_a(),
         });
+        // No items — only Unsubscribe, no FeedUpdated.
         let actions = feed.handle_event(VineEvent::UnfollowCreator {
             address: creator_a(),
         });
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 1);
         match &actions[0] {
             VineAction::Unsubscribe { key_expr } => {
                 let expected_hex = hex::encode(creator_a());
@@ -217,6 +224,22 @@ mod tests {
             }
             other => panic!("expected Unsubscribe, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn unfollow_with_items_emits_feed_updated() {
+        let mut feed = VineFeed::new();
+        let _ = feed.handle_event(VineEvent::FollowCreator {
+            address: creator_a(),
+        });
+        let _ = feed.handle_event(VineEvent::VineAnnounced {
+            item: make_item(creator_a(), 100, cid_from(1)),
+        });
+        let actions = feed.handle_event(VineEvent::UnfollowCreator {
+            address: creator_a(),
+        });
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(actions[0], VineAction::Unsubscribe { .. }));
         assert!(matches!(actions[1], VineAction::FeedUpdated));
     }
 
@@ -392,6 +415,15 @@ mod tests {
     }
 
     #[test]
+    fn mark_viewed_unknown_cid_is_noop() {
+        let mut feed = VineFeed::new();
+        let actions = feed.handle_event(VineEvent::MarkViewed {
+            bundle_cid: cid_from(99),
+        });
+        assert!(actions.is_empty());
+    }
+
+    #[test]
     fn duplicate_follow_is_idempotent() {
         let mut feed = VineFeed::new();
         let actions1 = feed.handle_event(VineEvent::FollowCreator {
@@ -408,6 +440,6 @@ mod tests {
             address: creator_a(),
         });
         assert!(!feed.is_followed(&creator_a()));
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 1); // Unsubscribe only, no items to update
     }
 }
