@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Book — portable athenaeum metadata serialization.
 
+use crate::addr::ChunkAddr;
+use crate::athenaeum::{chunk_blob, Athenaeum, CollisionError, MAX_BLOB_SIZE};
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
-use crate::addr::ChunkAddr;
-use crate::athenaeum::{Athenaeum, CollisionError, MAX_BLOB_SIZE, chunk_blob};
 
 /// Error when parsing a book from bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,10 +68,13 @@ impl Book {
             if data.len() > MAX_BLOB_SIZE {
                 return Err(CollisionError::BlobTooLarge { size: data.len() });
             }
-            let blob_size = u32::try_from(data.len())
-                .expect("blob_size exceeds u32::MAX");
+            let blob_size = u32::try_from(data.len()).expect("blob_size exceeds u32::MAX");
             let chunks = chunk_blob(data, &mut used_addrs, &mut content_cache)?;
-            entries.push(BookEntry { cid, blob_size, chunks });
+            entries.push(BookEntry {
+                cid,
+                blob_size,
+                chunks,
+            });
         }
 
         Ok(Book { entries })
@@ -82,8 +85,7 @@ impl Book {
     /// No cross-blob resolution is performed. For multi-blob books
     /// with cross-consistency guarantees, use [`Book::from_blobs`].
     pub fn from_athenaeum(ath: &Athenaeum) -> Self {
-        let blob_size = u32::try_from(ath.blob_size)
-            .expect("blob_size exceeds u32::MAX");
+        let blob_size = u32::try_from(ath.blob_size).expect("blob_size exceeds u32::MAX");
         Book {
             entries: alloc::vec![BookEntry {
                 cid: ath.cid,
@@ -98,8 +100,7 @@ impl Book {
     /// For multi-blob books with cross-consistency guarantees, use
     /// [`Book::from_blobs`] instead.
     pub fn add_athenaeum(&mut self, ath: &Athenaeum) {
-        let blob_size = u32::try_from(ath.blob_size)
-            .expect("blob_size exceeds u32::MAX");
+        let blob_size = u32::try_from(ath.blob_size).expect("blob_size exceeds u32::MAX");
         self.entries.push(BookEntry {
             cid: ath.cid,
             blob_size,
@@ -138,12 +139,16 @@ impl Book {
             pos += 32;
 
             let blob_size = u32::from_le_bytes(
-                data[pos..pos + 4].try_into().map_err(|_| BookError::TooShort)?,
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| BookError::TooShort)?,
             );
             pos += 4;
 
             let count = u16::from_le_bytes(
-                data[pos..pos + 2].try_into().map_err(|_| BookError::TooShort)?,
+                data[pos..pos + 2]
+                    .try_into()
+                    .map_err(|_| BookError::TooShort)?,
             ) as usize;
             pos += 4; // count (2) + reserved (2)
 
@@ -155,7 +160,9 @@ impl Book {
             let mut chunks = Vec::with_capacity(count);
             for _ in 0..count {
                 let raw = u32::from_le_bytes(
-                    data[pos..pos + 4].try_into().map_err(|_| BookError::TooShort)?,
+                    data[pos..pos + 4]
+                        .try_into()
+                        .map_err(|_| BookError::TooShort)?,
                 );
                 let addr = ChunkAddr(raw);
                 if !addr.verify_checksum() {
@@ -165,7 +172,11 @@ impl Book {
                 pos += 4;
             }
 
-            entries.push(BookEntry { cid, blob_size, chunks });
+            entries.push(BookEntry {
+                cid,
+                blob_size,
+                chunks,
+            });
         }
 
         Ok(Book { entries })
@@ -175,8 +186,8 @@ impl Book {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Athenaeum;
     use crate::hash::sha256_hash;
+    use crate::Athenaeum;
 
     #[test]
     fn round_trip_single_blob() {
@@ -207,7 +218,9 @@ mod tests {
 
     #[test]
     fn empty_book() {
-        let book = Book { entries: Vec::new() };
+        let book = Book {
+            entries: Vec::new(),
+        };
         let bytes = book.to_bytes();
         assert!(bytes.is_empty());
         let restored = Book::from_bytes(&bytes).unwrap();
@@ -264,13 +277,19 @@ mod tests {
         assert_eq!(book.entries.len(), 2);
 
         // Collect ALL hash_bits across both entries — no duplicates
-        let all_addrs: Vec<u32> = book.entries.iter()
+        let all_addrs: Vec<u32> = book
+            .entries
+            .iter()
             .flat_map(|e| e.chunks.iter().map(|a| a.hash_bits()))
             .collect();
         let mut deduped = all_addrs.clone();
         deduped.sort();
         deduped.dedup();
-        assert_eq!(all_addrs.len(), deduped.len(), "cross-blob collision detected");
+        assert_eq!(
+            all_addrs.len(),
+            deduped.len(),
+            "cross-blob collision detected"
+        );
     }
 
     #[test]
@@ -325,6 +344,10 @@ mod tests {
         let ath = Athenaeum::from_blob(cid, &data).unwrap();
         let book = Book::from_athenaeum(&ath);
         let bytes = book.to_bytes();
-        assert!(bytes.len() <= 4096, "single 1MB blob book = {} bytes", bytes.len());
+        assert!(
+            bytes.len() <= 4096,
+            "single 1MB blob book = {} bytes",
+            bytes.len()
+        );
     }
 }

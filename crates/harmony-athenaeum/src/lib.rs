@@ -9,18 +9,18 @@
 extern crate alloc;
 
 mod addr;
-mod hash;
 mod athenaeum;
 mod book;
-mod volume;
 mod encyclopedia;
+mod hash;
+mod volume;
 
-pub use addr::{ChunkAddr, Algorithm, Depth};
+pub use addr::{Algorithm, ChunkAddr, Depth};
 pub use athenaeum::{Athenaeum, CollisionError, MissingChunkError, MAX_BLOB_SIZE};
 pub use book::{Book, BookEntry, BookError};
-pub use hash::{sha256_hash, sha224_hash};
-pub use volume::{Volume, route_chunk, MAX_PARTITION_DEPTH};
 pub use encyclopedia::{Encyclopedia, SPLIT_THRESHOLD};
+pub use hash::{sha224_hash, sha256_hash};
+pub use volume::{route_chunk, Volume, MAX_PARTITION_DEPTH};
 
 #[cfg(test)]
 mod tests {
@@ -51,7 +51,11 @@ mod tests {
         // Serialize to book and back
         let book = Book::from_athenaeum(&ath);
         let book_bytes = book.to_bytes();
-        assert!(book_bytes.len() <= 4096, "book fits in single 4KB chunk: {} bytes", book_bytes.len());
+        assert!(
+            book_bytes.len() <= 4096,
+            "book fits in single 4KB chunk: {} bytes",
+            book_bytes.len()
+        );
 
         let restored_book = Book::from_bytes(&book_bytes).unwrap();
         assert_eq!(restored_book.entries.len(), 1);
@@ -69,9 +73,7 @@ mod tests {
         }
 
         // Reassemble and verify
-        let reassembled = ath.reassemble(|addr| {
-            store.get(&addr.0).cloned()
-        }).unwrap();
+        let reassembled = ath.reassemble(|addr| store.get(&addr.0).cloned()).unwrap();
         assert_eq!(reassembled.len(), data.len());
         assert_eq!(reassembled, data);
     }
@@ -108,9 +110,7 @@ mod tests {
         let mut padded = alloc::vec![0u8; 64];
         padded[..data.len()].copy_from_slice(data);
 
-        let reassembled = ath.reassemble(|_addr| {
-            Some(padded.clone())
-        }).unwrap();
+        let reassembled = ath.reassemble(|_addr| Some(padded.clone())).unwrap();
         assert_eq!(&reassembled, data);
     }
 
@@ -160,7 +160,8 @@ mod tests {
             }
             blobs_data.push(data);
         }
-        let blobs: Vec<([u8; 32], &[u8])> = blobs_data.iter()
+        let blobs: Vec<([u8; 32], &[u8])> = blobs_data
+            .iter()
             .map(|d| (sha256_hash(d), d.as_slice()))
             .collect();
 

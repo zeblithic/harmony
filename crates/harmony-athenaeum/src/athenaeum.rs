@@ -118,9 +118,8 @@ pub(crate) fn chunk_blob(
             continue;
         }
 
-        let addr =
-            address_with_collision_resolution(&padded, Depth::Blob, size_exp, used_addrs)
-                .ok_or(CollisionError::AllAlgorithmsCollide { chunk_index: i })?;
+        let addr = address_with_collision_resolution(&padded, Depth::Blob, size_exp, used_addrs)
+            .ok_or(CollisionError::AllAlgorithmsCollide { chunk_index: i })?;
 
         used_addrs.insert(addr.hash_bits());
         content_cache.insert(content_hash, addr);

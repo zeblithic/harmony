@@ -5,10 +5,12 @@ use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
-use crate::athenaeum::{CollisionError, chunk_blob, CHUNK_SIZE, MAX_BLOB_SIZE, chunk_size_exponent};
+use crate::athenaeum::{
+    chunk_blob, chunk_size_exponent, CollisionError, CHUNK_SIZE, MAX_BLOB_SIZE,
+};
 use crate::book::{Book, BookEntry, BookError};
 use crate::hash::sha256_hash;
-use crate::volume::{Volume, route_chunk, MAX_PARTITION_DEPTH};
+use crate::volume::{route_chunk, Volume, MAX_PARTITION_DEPTH};
 
 /// Threshold for proactive splitting.
 /// 75% of 2^21 ~ 1,572,864 unique chunks (~6GB unique data).
@@ -73,11 +75,10 @@ impl Encyclopedia {
                 let content_hash = sha256_hash(&padded);
                 hashes.push(content_hash);
 
-                unique_chunks.entry(content_hash)
-                    .or_insert(ChunkInfo {
-                        content_hash,
-                        _padded_data: padded,
-                    });
+                unique_chunks.entry(content_hash).or_insert(ChunkInfo {
+                    content_hash,
+                    _padded_data: padded,
+                });
             }
             blob_chunk_hashes.push(hashes);
         }
@@ -90,8 +91,8 @@ impl Encyclopedia {
             &chunk_list,
             blobs,
             &blob_chunk_hashes,
-            0,    // depth
-            0,    // path
+            0, // depth
+            0, // path
             PARTITION_START_BIT,
         )?;
 
@@ -141,12 +142,20 @@ impl Encyclopedia {
         }
 
         let left = Self::build_volume(
-            &left_chunks, blobs, blob_chunk_hashes,
-            depth + 1, path, bit_index + 1,
+            &left_chunks,
+            blobs,
+            blob_chunk_hashes,
+            depth + 1,
+            path,
+            bit_index + 1,
         )?;
         let right = Self::build_volume(
-            &right_chunks, blobs, blob_chunk_hashes,
-            depth + 1, path | (1u32 << depth), bit_index + 1,
+            &right_chunks,
+            blobs,
+            blob_chunk_hashes,
+            depth + 1,
+            path | (1u32 << depth),
+            bit_index + 1,
         )?;
 
         Ok(Volume::Split {
@@ -171,9 +180,7 @@ impl Encyclopedia {
         path: u32,
     ) -> Result<Volume, CollisionError> {
         // Build a set of content hashes in this partition
-        let partition_hashes: BTreeSet<[u8; 32]> = chunks.iter()
-            .map(|c| c.content_hash)
-            .collect();
+        let partition_hashes: BTreeSet<[u8; 32]> = chunks.iter().map(|c| c.content_hash).collect();
 
         // Find which blobs have chunks in this partition
         let mut relevant_blob_indices: Vec<usize> = Vec::new();
@@ -244,14 +251,16 @@ impl Encyclopedia {
         if data[4] != 1 {
             return Err(BookError::InvalidChecksum);
         }
-        let total_blobs = u32::from_le_bytes(
-            data[5..9].try_into().map_err(|_| BookError::TooShort)?
-        );
-        let total_unique_chunks = u32::from_le_bytes(
-            data[9..13].try_into().map_err(|_| BookError::TooShort)?
-        );
+        let total_blobs =
+            u32::from_le_bytes(data[5..9].try_into().map_err(|_| BookError::TooShort)?);
+        let total_unique_chunks =
+            u32::from_le_bytes(data[9..13].try_into().map_err(|_| BookError::TooShort)?);
         let root = Volume::from_bytes(&data[13..])?;
-        Ok(Encyclopedia { root, total_blobs, total_unique_chunks })
+        Ok(Encyclopedia {
+            root,
+            total_blobs,
+            total_unique_chunks,
+        })
     }
 }
 
@@ -354,7 +363,7 @@ mod tests {
         // Put a valid leaf volume: tag=0, depth=0, path=0, book_count=0, reserved=0
         data[13] = 0; // tag
         data[14] = 0; // depth
-        // rest zeros are fine for path, book_count, reserved
+                      // rest zeros are fine for path, book_count, reserved
         assert!(Encyclopedia::from_bytes(&data).is_err());
     }
 

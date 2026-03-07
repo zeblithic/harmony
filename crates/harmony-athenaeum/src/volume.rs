@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Volume — partition tree node for the Encyclopedia.
 
-use alloc::vec::Vec;
 use crate::book::{Book, BookError};
+use alloc::vec::Vec;
 
 /// Maximum partition depth (SHA-256 bits 22-252 = 230 usable bits).
 pub const MAX_PARTITION_DEPTH: u8 = 230;
@@ -39,14 +39,11 @@ impl Volume {
     /// Number of unique chunks in this subtree.
     pub fn chunk_count(&self) -> usize {
         match self {
-            Volume::Leaf { books, .. } => {
-                books.iter()
-                    .map(|b| b.entries.iter().map(|e| e.chunks.len()).sum::<usize>())
-                    .sum()
-            }
-            Volume::Split { left, right, .. } => {
-                left.chunk_count() + right.chunk_count()
-            }
+            Volume::Leaf { books, .. } => books
+                .iter()
+                .map(|b| b.entries.iter().map(|e| e.chunks.len()).sum::<usize>())
+                .sum(),
+            Volume::Split { left, right, .. } => left.chunk_count() + right.chunk_count(),
         }
     }
 
@@ -54,18 +51,19 @@ impl Volume {
     pub fn book_count(&self) -> usize {
         match self {
             Volume::Leaf { books, .. } => books.len(),
-            Volume::Split { left, right, .. } => {
-                left.book_count() + right.book_count()
-            }
+            Volume::Split { left, right, .. } => left.book_count() + right.book_count(),
         }
     }
 
     /// Partition depth of this node.
     pub fn depth(&self) -> u8 {
         match self {
-            Volume::Leaf { partition_depth, .. } | Volume::Split { partition_depth, .. } => {
-                *partition_depth
+            Volume::Leaf {
+                partition_depth, ..
             }
+            | Volume::Split {
+                partition_depth, ..
+            } => *partition_depth,
         }
     }
 
@@ -100,7 +98,11 @@ impl Volume {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         match self {
-            Volume::Leaf { partition_depth, partition_path, books } => {
+            Volume::Leaf {
+                partition_depth,
+                partition_path,
+                books,
+            } => {
                 buf.push(0u8); // tag
                 buf.push(*partition_depth);
                 buf.extend_from_slice(&partition_path.to_le_bytes());
@@ -114,7 +116,13 @@ impl Volume {
                     buf.extend_from_slice(&book_bytes);
                 }
             }
-            Volume::Split { partition_depth, partition_path, split_bit, left, right } => {
+            Volume::Split {
+                partition_depth,
+                partition_path,
+                split_bit,
+                left,
+                right,
+            } => {
                 buf.push(1u8); // tag
                 buf.push(*partition_depth);
                 buf.extend_from_slice(&partition_path.to_le_bytes());
@@ -137,9 +145,8 @@ impl Volume {
         }
         let tag = data[0];
         let partition_depth = data[1];
-        let partition_path = u32::from_le_bytes(
-            data[2..6].try_into().map_err(|_| BookError::TooShort)?
-        );
+        let partition_path =
+            u32::from_le_bytes(data[2..6].try_into().map_err(|_| BookError::TooShort)?);
 
         match tag {
             0 => {
@@ -147,9 +154,9 @@ impl Volume {
                 if data.len() < 10 {
                     return Err(BookError::TooShort);
                 }
-                let book_count = u16::from_le_bytes(
-                    data[6..8].try_into().map_err(|_| BookError::TooShort)?
-                ) as usize;
+                let book_count =
+                    u16::from_le_bytes(data[6..8].try_into().map_err(|_| BookError::TooShort)?)
+                        as usize;
                 // skip 2 reserved bytes
                 let mut pos = 10;
                 let mut books = Vec::with_capacity(book_count);
@@ -158,7 +165,9 @@ impl Volume {
                         return Err(BookError::TooShort);
                     }
                     let book_len = u32::from_le_bytes(
-                        data[pos..pos + 4].try_into().map_err(|_| BookError::TooShort)?
+                        data[pos..pos + 4]
+                            .try_into()
+                            .map_err(|_| BookError::TooShort)?,
                     ) as usize;
                     pos += 4;
                     if pos + book_len > data.len() {
@@ -168,7 +177,11 @@ impl Volume {
                     books.push(book);
                     pos += book_len;
                 }
-                Ok(Volume::Leaf { partition_depth, partition_path, books })
+                Ok(Volume::Leaf {
+                    partition_depth,
+                    partition_path,
+                    books,
+                })
             }
             1 => {
                 // Split
@@ -177,9 +190,9 @@ impl Volume {
                 }
                 let split_bit = data[6];
                 // data[7] = reserved
-                let left_len = u32::from_le_bytes(
-                    data[8..12].try_into().map_err(|_| BookError::TooShort)?
-                ) as usize;
+                let left_len =
+                    u32::from_le_bytes(data[8..12].try_into().map_err(|_| BookError::TooShort)?)
+                        as usize;
                 let left_start = 12;
                 if left_start + left_len > data.len() {
                     return Err(BookError::TooShort);
@@ -250,7 +263,9 @@ mod tests {
 
     #[test]
     fn leaf_volume_chunk_count() {
-        let book = Book { entries: Vec::new() };
+        let book = Book {
+            entries: Vec::new(),
+        };
         let vol = Volume::leaf(0, 0, alloc::vec![book]);
         assert_eq!(vol.chunk_count(), 0);
         assert_eq!(vol.book_count(), 1);
@@ -281,7 +296,9 @@ mod tests {
 
     #[test]
     fn leaf_volume_round_trip() {
-        let book = Book { entries: Vec::new() };
+        let book = Book {
+            entries: Vec::new(),
+        };
         let vol = Volume::leaf(2, 0b10, alloc::vec![book]);
         let bytes = vol.to_bytes();
         let restored = Volume::from_bytes(&bytes).unwrap();
