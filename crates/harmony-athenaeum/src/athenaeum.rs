@@ -130,7 +130,7 @@ pub(crate) fn chunk_blob(
 }
 
 /// Try all 4 algorithms to find a collision-free address.
-fn address_with_collision_resolution(
+pub(crate) fn address_with_collision_resolution(
     data: &[u8],
     depth: Depth,
     size_exp: u8,
