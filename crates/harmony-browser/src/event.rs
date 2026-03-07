@@ -15,7 +15,7 @@ pub enum ResolvedContent {
         cid: ContentId,
         mime: MimeHint,
         data: Vec<u8>,
-        author: Option<Identity>,
+        author: Option<Box<Identity>>,
         trust_level: TrustDecision,
     },
     /// Live subscription producing a stream of updates.
