@@ -17,3 +17,6 @@ pub mod vine;
 pub mod reticulum_bridge;
 pub mod storage_tier;
 pub mod zenoh_bridge;
+
+// Re-export core types for downstream convenience.
+pub use cid::{ContentFlags, ContentId};

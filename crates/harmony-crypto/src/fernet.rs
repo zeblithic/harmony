@@ -9,8 +9,8 @@
 //! - First 32 bytes: HMAC-SHA256 signing key
 //! - Last 32 bytes: AES-256 encryption key
 
-use alloc::vec::Vec;
 use aes::Aes256;
+use alloc::vec::Vec;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use rand_core::CryptoRngCore;

@@ -1,6 +1,6 @@
-use alloc::vec::Vec;
-use crate::cid::ContentId;
+use crate::cid::{ContentFlags, ContentId};
 use crate::error::ContentError;
+use alloc::vec::Vec;
 
 /// Size of a single ContentId in bytes.
 pub const CID_SIZE: usize = 32;
@@ -91,12 +91,15 @@ impl BundleBuilder {
         self
     }
 
-    /// Build the bundle, returning the raw bytes and the bundle's CID.
+    /// Build the bundle with explicit flags, returning the raw bytes and the bundle's CID.
     ///
     /// The bundle's depth is `max(child_depths) + 1`. If inline metadata
     /// was set, it is prepended as the first CID in the bundle bytes
     /// (metadata CIDs have depth 0, so they don't affect bundle depth).
-    pub fn build(&self) -> Result<(Vec<u8>, ContentId), ContentError> {
+    pub fn build_with_flags(
+        &self,
+        flags: ContentFlags,
+    ) -> Result<(Vec<u8>, ContentId), ContentError> {
         if self.children.is_empty() {
             return Err(ContentError::EmptyBundle);
         }
@@ -115,9 +118,17 @@ impl BundleBuilder {
         }
 
         // Compute bundle CID (depth based on all entries including metadata)
-        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &entries)?;
+        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &entries, flags)?;
 
         Ok((bundle_bytes, bundle_cid))
+    }
+
+    /// Build the bundle, returning the raw bytes and the bundle's CID.
+    ///
+    /// Uses default (empty) flags. See [`build_with_flags`](Self::build_with_flags)
+    /// for passing explicit flags.
+    pub fn build(&self) -> Result<(Vec<u8>, ContentId), ContentError> {
+        self.build_with_flags(ContentFlags::default())
     }
 
     /// Return the number of child CIDs (not counting metadata).
@@ -145,8 +156,8 @@ mod tests {
 
     #[test]
     fn parse_valid_bundle() {
-        let blob_a = ContentId::for_blob(b"chunk a").unwrap();
-        let blob_b = ContentId::for_blob(b"chunk b").unwrap();
+        let blob_a = ContentId::for_blob(b"chunk a", ContentFlags::default()).unwrap();
+        let blob_b = ContentId::for_blob(b"chunk b", ContentFlags::default()).unwrap();
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&blob_a.to_bytes());
@@ -176,11 +187,11 @@ mod tests {
     #[test]
     fn validate_depth_accepts_valid_sparse_tree() {
         // L4 bundle containing only L2 children — valid (sparse)
-        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
         let l1_bytes = blob.to_bytes().to_vec();
-        let l1 = ContentId::for_bundle(&l1_bytes, &[blob]).unwrap();
+        let l1 = ContentId::for_bundle(&l1_bytes, &[blob], ContentFlags::default()).unwrap();
         let l2_bytes = l1.to_bytes().to_vec();
-        let l2 = ContentId::for_bundle(&l2_bytes, &[l1]).unwrap();
+        let l2 = ContentId::for_bundle(&l2_bytes, &[l1], ContentFlags::default()).unwrap();
         assert_eq!(l2.cid_type(), CidType::Bundle(2));
 
         // L4 parent should accept L2 children
@@ -189,9 +200,9 @@ mod tests {
 
     #[test]
     fn validate_depth_rejects_equal_depth() {
-        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
         let l1_bytes = blob.to_bytes().to_vec();
-        let l1 = ContentId::for_bundle(&l1_bytes, &[blob]).unwrap();
+        let l1 = ContentId::for_bundle(&l1_bytes, &[blob], ContentFlags::default()).unwrap();
         assert_eq!(l1.cid_type(), CidType::Bundle(1));
 
         // L1 parent cannot contain L1 children (depth not strictly less)
@@ -200,11 +211,11 @@ mod tests {
 
     #[test]
     fn validate_depth_rejects_deeper_child() {
-        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
         let l1_bytes = blob.to_bytes().to_vec();
-        let l1 = ContentId::for_bundle(&l1_bytes, &[blob]).unwrap();
+        let l1 = ContentId::for_bundle(&l1_bytes, &[blob], ContentFlags::default()).unwrap();
         let l2_bytes = l1.to_bytes().to_vec();
-        let l2 = ContentId::for_bundle(&l2_bytes, &[l1]).unwrap();
+        let l2 = ContentId::for_bundle(&l2_bytes, &[l1], ContentFlags::default()).unwrap();
         assert_eq!(l2.cid_type(), CidType::Bundle(2));
 
         // L1 parent cannot contain L2 child
@@ -214,19 +225,19 @@ mod tests {
     #[test]
     fn validate_depth_accepts_mixed_children() {
         // L3 bundle containing [blob, L1, L2] — valid (mixed depths, all < 3)
-        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
         let l1_bytes = blob.to_bytes().to_vec();
-        let l1 = ContentId::for_bundle(&l1_bytes, &[blob]).unwrap();
+        let l1 = ContentId::for_bundle(&l1_bytes, &[blob], ContentFlags::default()).unwrap();
         let l2_bytes = l1.to_bytes().to_vec();
-        let l2 = ContentId::for_bundle(&l2_bytes, &[l1]).unwrap();
+        let l2 = ContentId::for_bundle(&l2_bytes, &[l1], ContentFlags::default()).unwrap();
 
         assert!(validate_bundle_depth(3, &[blob, l1, l2]).is_ok());
     }
 
     #[test]
     fn builder_basic_two_blobs() {
-        let blob_a = ContentId::for_blob(b"chunk a").unwrap();
-        let blob_b = ContentId::for_blob(b"chunk b").unwrap();
+        let blob_a = ContentId::for_blob(b"chunk a", ContentFlags::default()).unwrap();
+        let blob_b = ContentId::for_blob(b"chunk b", ContentFlags::default()).unwrap();
 
         let mut builder = BundleBuilder::new();
         builder.add(blob_a).add(blob_b);
@@ -245,7 +256,7 @@ mod tests {
 
     #[test]
     fn builder_with_metadata() {
-        let blob = ContentId::for_blob(b"data").unwrap();
+        let blob = ContentId::for_blob(b"data", ContentFlags::default()).unwrap();
         let mut builder = BundleBuilder::new();
         builder.add(blob).with_metadata(1000, 1, 0, *b"text/pln");
 
@@ -262,7 +273,7 @@ mod tests {
 
     #[test]
     fn builder_depth_cascade() {
-        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
 
         // L1 bundle
         let mut b1 = BundleBuilder::new();
@@ -278,6 +289,24 @@ mod tests {
     }
 
     #[test]
+    fn build_with_flags_encrypted_bundle() {
+        let blob_a = ContentId::for_blob(b"chunk a", ContentFlags::default()).unwrap();
+        let blob_b = ContentId::for_blob(b"chunk b", ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(blob_a).add(blob_b);
+
+        let flags = ContentFlags {
+            encrypted: true,
+            ..ContentFlags::default()
+        };
+        let (_, cid) = builder.build_with_flags(flags).unwrap();
+        assert_eq!(cid.cid_type(), CidType::Bundle(1));
+        assert_eq!(cid.flags().encrypted, true);
+        assert_eq!(cid.flags().ephemeral, false);
+    }
+
+    #[test]
     fn builder_rejects_empty() {
         let builder = BundleBuilder::new();
         assert!(matches!(builder.build(), Err(ContentError::EmptyBundle)));
@@ -286,7 +315,7 @@ mod tests {
     #[test]
     fn builder_rejects_depth_overflow() {
         // Build up to depth 7 then try to wrap
-        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
         let mut current = blob;
         for _ in 0..7 {
             let mut b = BundleBuilder::new();

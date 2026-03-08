@@ -1,4 +1,4 @@
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha224, Sha256};
 
 /// Full SHA-256 hash length in bytes.
 pub const HASH_LENGTH: usize = 32;
@@ -37,6 +37,20 @@ pub fn name_hash(data: &[u8]) -> [u8; NAME_HASH_LENGTH] {
     let mut result = [0u8; NAME_HASH_LENGTH];
     result.copy_from_slice(&full[..NAME_HASH_LENGTH]);
     result
+}
+
+/// SHA-224 hash length in bytes.
+pub const SHA224_HASH_LENGTH: usize = 28;
+
+/// Compute the SHA-224 hash of `data` (28 bytes).
+///
+/// SHA-224 uses different initialization vectors from SHA-256, making them
+/// independent hash families. Used by ContentId for power-of-choice collision
+/// resistance (the `alt_hash` flag).
+pub fn sha224_hash(data: &[u8]) -> [u8; SHA224_HASH_LENGTH] {
+    let mut hasher = Sha224::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
 #[cfg(test)]
@@ -103,5 +117,39 @@ mod tests {
         let t1 = truncated_hash(b"alice");
         let t2 = truncated_hash(b"bob");
         assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn sha224_known_vector_empty() {
+        // SHA-224("") = d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f
+        let hash = sha224_hash(b"");
+        assert_eq!(
+            hex::encode(hash),
+            "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"
+        );
+    }
+
+    #[test]
+    fn sha224_known_vector_abc() {
+        // SHA-224("abc") = 23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7
+        let hash = sha224_hash(b"abc");
+        assert_eq!(
+            hex::encode(hash),
+            "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7"
+        );
+    }
+
+    #[test]
+    fn sha224_deterministic() {
+        let h1 = sha224_hash(b"hello harmony");
+        let h2 = sha224_hash(b"hello harmony");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn sha224_differs_from_sha256() {
+        let s256 = full_hash(b"test");
+        let s224 = sha224_hash(b"test");
+        assert_ne!(&s256[..28], &s224[..]);
     }
 }

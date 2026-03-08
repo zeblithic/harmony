@@ -516,8 +516,7 @@ fn read_utf8(
             expected: end - data.len(),
         });
     }
-    let s = std::str::from_utf8(&data[*pos..end])
-        .map_err(|_| MailError::InvalidUtf8 { field })?;
+    let s = std::str::from_utf8(&data[*pos..end]).map_err(|_| MailError::InvalidUtf8 { field })?;
     *pos = end;
     Ok(s.to_owned())
 }
@@ -530,9 +529,18 @@ mod tests {
 
     #[test]
     fn message_type_roundtrip() {
-        assert_eq!(MailMessageType::from_u8(0x00).unwrap(), MailMessageType::Email);
-        assert_eq!(MailMessageType::from_u8(0x01).unwrap(), MailMessageType::Receipt);
-        assert_eq!(MailMessageType::from_u8(0x02).unwrap(), MailMessageType::Bounce);
+        assert_eq!(
+            MailMessageType::from_u8(0x00).unwrap(),
+            MailMessageType::Email
+        );
+        assert_eq!(
+            MailMessageType::from_u8(0x01).unwrap(),
+            MailMessageType::Receipt
+        );
+        assert_eq!(
+            MailMessageType::from_u8(0x02).unwrap(),
+            MailMessageType::Bounce
+        );
         assert!(MailMessageType::from_u8(0x03).is_err());
         assert!(MailMessageType::from_u8(0xFF).is_err());
     }

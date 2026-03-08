@@ -4,9 +4,9 @@
 //! The CID is prepended as a 32-byte header so the receiver can verify
 //! content integrity independently of the transport hash.
 
-use alloc::vec::Vec;
 use crate::cid::ContentId;
 use crate::error::ContentError;
+use alloc::vec::Vec;
 
 /// CID header length prepended to blob data for transport.
 const CID_HEADER_LEN: usize = 32;
@@ -40,7 +40,7 @@ pub fn unpack_from_transport(transport_data: &[u8]) -> Result<(ContentId, Vec<u8
     let blob_data = &transport_data[CID_HEADER_LEN..];
 
     // Recompute CID from the blob data and verify it matches.
-    let computed_cid = ContentId::for_blob(blob_data)?;
+    let computed_cid = ContentId::for_blob(blob_data, received_cid.flags())?;
 
     if computed_cid != received_cid {
         return Err(ContentError::ChecksumMismatch);

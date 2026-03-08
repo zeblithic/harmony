@@ -9,9 +9,12 @@
 //! The 33-byte header is passed as AAD to ChaCha20-Poly1305, cryptographically
 //! binding the routing metadata to the encrypted payload.
 
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use harmony_crypto::{aead, hkdf};
 use harmony_identity::{Identity, PrivateIdentity};
-use alloc::{string::{String, ToString}, vec::Vec};
 use rand_core::CryptoRngCore;
 use zeroize::Zeroize;
 

@@ -5,11 +5,15 @@
 //! [`Session`] (peer lifecycle) via caller-driven events — the router
 //! has no internal timers.
 
-use alloc::{string::{String, ToString}, vec, vec::Vec};
-#[cfg(feature = "std")]
-use std::collections::HashMap;
+use alloc::{
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 #[cfg(not(feature = "std"))]
 use hashbrown::HashMap;
+#[cfg(feature = "std")]
+use std::collections::HashMap;
 
 use zenoh_keyexpr::key_expr::{keyexpr, OwnedKeyExpr};
 

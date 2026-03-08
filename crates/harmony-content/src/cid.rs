@@ -1,5 +1,5 @@
-use alloc::{format, string::String};
 use crate::error::ContentError;
+use alloc::{format, string::String};
 
 /// Length of the truncated SHA-256 content hash in bytes.
 pub const CONTENT_HASH_LEN: usize = 28;
@@ -13,10 +13,44 @@ pub const TAG_BITS: u32 = 12;
 /// Bitmask for the 12-bit tag field (lower 12 bits of the last u32).
 pub const TAG_MASK: u32 = 0xFFF;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ContentFlags {
+    pub encrypted: bool,
+    pub ephemeral: bool,
+    pub alt_hash: bool,
+}
+
+impl ContentFlags {
+    pub fn to_bits(self) -> u8 {
+        let mut bits = 0u8;
+        if self.encrypted {
+            bits |= 0x80;
+        }
+        if self.ephemeral {
+            bits |= 0x40;
+        }
+        if self.alt_hash {
+            bits |= 0x20;
+        }
+        bits
+    }
+
+    pub fn from_bits(byte: u8) -> Self {
+        ContentFlags {
+            encrypted: byte & 0x80 != 0,
+            ephemeral: byte & 0x40 != 0,
+            alt_hash: byte & 0x20 != 0,
+        }
+    }
+}
+
 /// A 32-byte content identifier.
 ///
 /// Layout (big-endian):
-/// - Bytes 0--27: truncated SHA-256 content hash (224 bits)
+/// - Bytes 0--27: truncated content hash (221 effective bits after flag reservation)
+///   - Top 3 bits of byte 0 encode [`ContentFlags`]:
+///     bit 7 = encrypted, bit 6 = ephemeral, bit 5 = alt_hash
+///   - `verify_hash` masks byte 0 with `0x1F` on both sides to exclude flags
 /// - Bytes 28--31: big-endian u32 where bits \[31:12\] = payload size,
 ///   bits \[11:0\] = type tag + checksum
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,6 +63,11 @@ pub struct ContentId {
 }
 
 impl ContentId {
+    /// Extract the content flags from the top 3 bits of hash\[0\].
+    pub fn flags(&self) -> ContentFlags {
+        ContentFlags::from_bits(self.hash[0])
+    }
+
     /// Extract the payload size from the packed u32 (upper 20 bits).
     pub fn payload_size(&self) -> u32 {
         let packed = u32::from_be_bytes(self.size_and_tag);
@@ -49,15 +88,23 @@ impl ContentId {
 
     /// Verify that this CID's hash matches the hash of the given data.
     ///
-    /// Only checks the truncated SHA-256 hash, not the type tag or size,
-    /// so this works for blobs, bundles, and any other content type.
+    /// Respects the `alt_hash` flag: uses SHA-224 when set, SHA-256 otherwise.
+    /// The top 3 bits of hash\[0\] (flag bits) are masked out before comparison.
     pub fn verify_hash(&self, data: &[u8]) -> bool {
-        let full = harmony_crypto::hash::full_hash(data);
-        self.hash == full[..CONTENT_HASH_LEN]
+        let flags = self.flags();
+        let digest = if flags.alt_hash {
+            harmony_crypto::hash::sha224_hash(data)
+        } else {
+            let full = harmony_crypto::hash::full_hash(data);
+            let mut trunc = [0u8; CONTENT_HASH_LEN];
+            trunc.copy_from_slice(&full[..CONTENT_HASH_LEN]);
+            trunc
+        };
+        (self.hash[0] & 0x1F) == (digest[0] & 0x1F) && self.hash[1..] == digest[1..]
     }
 
     /// Create a CID for a raw data blob.
-    pub fn for_blob(data: &[u8]) -> Result<Self, ContentError> {
+    pub fn for_blob(data: &[u8], flags: ContentFlags) -> Result<Self, ContentError> {
         if data.len() > MAX_PAYLOAD_SIZE {
             return Err(ContentError::PayloadTooLarge {
                 size: data.len(),
@@ -65,9 +112,16 @@ impl ContentId {
             });
         }
 
-        let full = harmony_crypto::hash::full_hash(data);
-        let mut hash = [0u8; CONTENT_HASH_LEN];
-        hash.copy_from_slice(&full[..CONTENT_HASH_LEN]);
+        let mut hash = if flags.alt_hash {
+            harmony_crypto::hash::sha224_hash(data)
+        } else {
+            let full = harmony_crypto::hash::full_hash(data);
+            let mut trunc = [0u8; CONTENT_HASH_LEN];
+            trunc.copy_from_slice(&full[..CONTENT_HASH_LEN]);
+            trunc
+        };
+
+        hash[0] = (hash[0] & 0x1F) | flags.to_bits();
 
         let size = data.len() as u32;
         let cid_type = CidType::Blob;
@@ -86,7 +140,11 @@ impl ContentId {
     /// `bundle_bytes` is the raw byte payload (concatenated child CIDs).
     /// `children` is the parsed slice of child CIDs (used for depth calculation).
     /// The bundle's depth is `max(child depths) + 1`.
-    pub fn for_bundle(bundle_bytes: &[u8], children: &[ContentId]) -> Result<Self, ContentError> {
+    pub fn for_bundle(
+        bundle_bytes: &[u8],
+        children: &[ContentId],
+        flags: ContentFlags,
+    ) -> Result<Self, ContentError> {
         if bundle_bytes.len() > MAX_PAYLOAD_SIZE {
             return Err(ContentError::PayloadTooLarge {
                 size: bundle_bytes.len(),
@@ -108,9 +166,16 @@ impl ContentId {
             });
         }
 
-        let full = harmony_crypto::hash::full_hash(bundle_bytes);
-        let mut hash = [0u8; CONTENT_HASH_LEN];
-        hash.copy_from_slice(&full[..CONTENT_HASH_LEN]);
+        let mut hash = if flags.alt_hash {
+            harmony_crypto::hash::sha224_hash(bundle_bytes)
+        } else {
+            let full = harmony_crypto::hash::full_hash(bundle_bytes);
+            let mut trunc = [0u8; CONTENT_HASH_LEN];
+            trunc.copy_from_slice(&full[..CONTENT_HASH_LEN]);
+            trunc
+        };
+
+        hash[0] = (hash[0] & 0x1F) | flags.to_bits();
 
         let size = bundle_bytes.len() as u32;
         let cid_type = CidType::Bundle(bundle_depth);
@@ -680,7 +745,7 @@ mod tests {
     #[test]
     fn for_blob_basic() {
         let data = b"hello harmony content addressing";
-        let cid = ContentId::for_blob(data).unwrap();
+        let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
         assert_eq!(cid.payload_size(), data.len() as u32);
         assert_eq!(cid.cid_type(), CidType::Blob);
     }
@@ -688,15 +753,17 @@ mod tests {
     #[test]
     fn for_blob_hash_is_truncated_sha256() {
         let data = b"test data";
-        let cid = ContentId::for_blob(data).unwrap();
+        let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
         let full = harmony_crypto::hash::full_hash(data);
-        assert_eq!(&cid.hash, &full[..CONTENT_HASH_LEN]);
+        // Top 3 bits are cleared by flag masking
+        assert_eq!(cid.hash[0] & 0x1F, full[0] & 0x1F);
+        assert_eq!(&cid.hash[1..], &full[1..CONTENT_HASH_LEN]);
     }
 
     #[test]
     fn verify_hash_matches_for_blob() {
         let data = b"verify this";
-        let cid = ContentId::for_blob(data).unwrap();
+        let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
         assert!(cid.verify_hash(data));
         assert!(!cid.verify_hash(b"wrong data"));
     }
@@ -705,11 +772,12 @@ mod tests {
     fn verify_hash_matches_for_bundle() {
         // Bundle CID has a different type tag than blob, but verify_hash
         // should still pass because it only checks the hash portion.
-        let blob_a = ContentId::for_blob(b"child-a").unwrap();
-        let blob_b = ContentId::for_blob(b"child-b").unwrap();
+        let blob_a = ContentId::for_blob(b"child-a", ContentFlags::default()).unwrap();
+        let blob_b = ContentId::for_blob(b"child-b", ContentFlags::default()).unwrap();
         let children = [blob_a, blob_b];
         let bundle_bytes: Vec<u8> = children.iter().flat_map(|c| c.to_bytes()).collect();
-        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &children).unwrap();
+        let bundle_cid =
+            ContentId::for_bundle(&bundle_bytes, &children, ContentFlags::default()).unwrap();
 
         assert!(bundle_cid.verify_hash(&bundle_bytes));
         assert!(!bundle_cid.verify_hash(b"wrong data"));
@@ -721,13 +789,13 @@ mod tests {
     #[test]
     fn for_blob_rejects_oversized() {
         let data = vec![0u8; MAX_PAYLOAD_SIZE + 1];
-        let result = ContentId::for_blob(&data);
+        let result = ContentId::for_blob(&data, ContentFlags::default());
         assert!(result.is_err());
     }
 
     #[test]
     fn for_blob_empty_data() {
-        let cid = ContentId::for_blob(b"").unwrap();
+        let cid = ContentId::for_blob(b"", ContentFlags::default()).unwrap();
         assert_eq!(cid.payload_size(), 0);
         assert_eq!(cid.cid_type(), CidType::Blob);
     }
@@ -735,53 +803,53 @@ mod tests {
     #[test]
     fn for_blob_max_size() {
         let data = vec![0xFFu8; MAX_PAYLOAD_SIZE];
-        let cid = ContentId::for_blob(&data).unwrap();
+        let cid = ContentId::for_blob(&data, ContentFlags::default()).unwrap();
         assert_eq!(cid.payload_size(), MAX_PAYLOAD_SIZE as u32);
     }
 
     #[test]
     fn for_bundle_basic() {
         // Create two blob CIDs, then bundle them
-        let blob_a = ContentId::for_blob(b"chunk a").unwrap();
-        let blob_b = ContentId::for_blob(b"chunk b").unwrap();
+        let blob_a = ContentId::for_blob(b"chunk a", ContentFlags::default()).unwrap();
+        let blob_b = ContentId::for_blob(b"chunk b", ContentFlags::default()).unwrap();
         let children = [blob_a, blob_b];
         let bundle_bytes = children_to_bytes(&children);
-        let cid = ContentId::for_bundle(&bundle_bytes, &children).unwrap();
+        let cid = ContentId::for_bundle(&bundle_bytes, &children, ContentFlags::default()).unwrap();
         assert_eq!(cid.cid_type(), CidType::Bundle(1)); // one level above blobs
         assert_eq!(cid.payload_size(), bundle_bytes.len() as u32);
     }
 
     #[test]
     fn for_bundle_depth_is_max_child_plus_one() {
-        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
         let l1_children = [blob];
         let l1_bytes = children_to_bytes(&l1_children);
-        let l1 = ContentId::for_bundle(&l1_bytes, &l1_children).unwrap();
+        let l1 = ContentId::for_bundle(&l1_bytes, &l1_children, ContentFlags::default()).unwrap();
         assert_eq!(l1.cid_type(), CidType::Bundle(1));
 
         let l2_children = [l1];
         let l2_bytes = children_to_bytes(&l2_children);
-        let l2 = ContentId::for_bundle(&l2_bytes, &l2_children).unwrap();
+        let l2 = ContentId::for_bundle(&l2_bytes, &l2_children, ContentFlags::default()).unwrap();
         assert_eq!(l2.cid_type(), CidType::Bundle(2));
     }
 
     #[test]
     fn for_bundle_rejects_depth_overflow() {
         // Can't create a Bundle(8) — max is 7
-        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
         // Build up to depth 7
         let mut current = blob;
         for _ in 0..7 {
             let children = [current];
             let bytes = children_to_bytes(&children);
-            current = ContentId::for_bundle(&bytes, &children).unwrap();
+            current = ContentId::for_bundle(&bytes, &children, ContentFlags::default()).unwrap();
         }
         assert_eq!(current.cid_type(), CidType::Bundle(7));
 
         // Trying to wrap a depth-7 bundle should fail
         let children = [current];
         let bytes = children_to_bytes(&children);
-        let result = ContentId::for_bundle(&bytes, &children);
+        let result = ContentId::for_bundle(&bytes, &children, ContentFlags::default());
         assert!(result.is_err());
     }
 
@@ -792,6 +860,209 @@ mod tests {
             bytes.extend_from_slice(&cid.to_bytes());
         }
         bytes
+    }
+
+    // -----------------------------------------------------------------------
+    // ContentFlags tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn content_flags_default_is_cleartext_durable_sha256() {
+        let f = ContentFlags::default();
+        assert!(!f.encrypted);
+        assert!(!f.ephemeral);
+        assert!(!f.alt_hash);
+        assert_eq!(f.to_bits(), 0x00);
+    }
+
+    #[test]
+    fn content_flags_to_bits_round_trip() {
+        for enc in [false, true] {
+            for eph in [false, true] {
+                for alt in [false, true] {
+                    let flags = ContentFlags {
+                        encrypted: enc,
+                        ephemeral: eph,
+                        alt_hash: alt,
+                    };
+                    let bits = flags.to_bits();
+                    let restored = ContentFlags::from_bits(bits);
+                    assert_eq!(
+                        flags, restored,
+                        "round trip failed for enc={enc}, eph={eph}, alt={alt}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn content_flags_bits_are_top_3() {
+        let enc = ContentFlags {
+            encrypted: true,
+            ephemeral: false,
+            alt_hash: false,
+        };
+        assert_eq!(enc.to_bits(), 0x80);
+        let eph = ContentFlags {
+            encrypted: false,
+            ephemeral: true,
+            alt_hash: false,
+        };
+        assert_eq!(eph.to_bits(), 0x40);
+        let alt = ContentFlags {
+            encrypted: false,
+            ephemeral: false,
+            alt_hash: true,
+        };
+        assert_eq!(alt.to_bits(), 0x20);
+        let all = ContentFlags {
+            encrypted: true,
+            ephemeral: true,
+            alt_hash: true,
+        };
+        assert_eq!(all.to_bits(), 0xE0);
+    }
+
+    // -----------------------------------------------------------------------
+    // flags() accessor tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flags_accessor_reads_top_3_bits() {
+        let flags = ContentFlags {
+            encrypted: true,
+            ephemeral: true,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(b"flagged", flags).unwrap();
+        let read = cid.flags();
+        assert!(read.encrypted);
+        assert!(read.ephemeral);
+        assert!(!read.alt_hash);
+    }
+
+    #[test]
+    fn flags_accessor_no_flags() {
+        let cid = ContentId::for_blob(b"plain", ContentFlags::default()).unwrap();
+        let read = cid.flags();
+        assert!(!read.encrypted);
+        assert!(!read.ephemeral);
+        assert!(!read.alt_hash);
+    }
+
+    // -----------------------------------------------------------------------
+    // for_blob with flags tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn for_blob_with_default_flags_matches_sha256() {
+        let data = b"sha256 test";
+        let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
+        assert!(!cid.flags().alt_hash);
+        assert!(cid.verify_hash(data));
+    }
+
+    #[test]
+    fn for_blob_with_alt_hash_uses_sha224() {
+        let data = b"sha224 test";
+        let flags = ContentFlags {
+            encrypted: false,
+            ephemeral: false,
+            alt_hash: true,
+        };
+        let cid = ContentId::for_blob(data, flags).unwrap();
+        assert!(cid.flags().alt_hash);
+        assert!(cid.verify_hash(data));
+        // Verify hash bytes match SHA-224
+        let expected = harmony_crypto::hash::sha224_hash(data);
+        assert_eq!(cid.hash[0] & 0x1F, expected[0] & 0x1F);
+        assert_eq!(&cid.hash[1..], &expected[1..]);
+    }
+
+    #[test]
+    fn for_blob_same_data_different_flags_different_cid() {
+        let data = b"same data";
+        let cid_default = ContentId::for_blob(data, ContentFlags::default()).unwrap();
+        let cid_enc = ContentId::for_blob(
+            data,
+            ContentFlags {
+                encrypted: true,
+                ..ContentFlags::default()
+            },
+        )
+        .unwrap();
+        let cid_alt = ContentId::for_blob(
+            data,
+            ContentFlags {
+                alt_hash: true,
+                ..ContentFlags::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(cid_default, cid_enc);
+        assert_ne!(cid_default, cid_alt);
+        assert_ne!(cid_enc, cid_alt);
+    }
+
+    // -----------------------------------------------------------------------
+    // for_bundle with flags test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn for_bundle_with_flags() {
+        let blob = ContentId::for_blob(b"child", ContentFlags::default()).unwrap();
+        let children = [blob];
+        let bytes = children_to_bytes(&children);
+
+        let flags = ContentFlags {
+            encrypted: true,
+            ephemeral: false,
+            alt_hash: false,
+        };
+        let bundle = ContentId::for_bundle(&bytes, &children, flags).unwrap();
+        assert!(bundle.flags().encrypted);
+        assert!(!bundle.flags().ephemeral);
+        assert!(bundle.verify_hash(&bytes));
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_hash tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_hash_sha256_default() {
+        let data = b"sha256 verify";
+        let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
+        assert!(cid.verify_hash(data));
+        assert!(!cid.verify_hash(b"wrong"));
+    }
+
+    #[test]
+    fn verify_hash_sha224_alt() {
+        let data = b"sha224 verify";
+        let flags = ContentFlags {
+            encrypted: false,
+            ephemeral: false,
+            alt_hash: true,
+        };
+        let cid = ContentId::for_blob(data, flags).unwrap();
+        assert!(cid.verify_hash(data));
+        assert!(!cid.verify_hash(b"wrong"));
+    }
+
+    #[test]
+    fn verify_hash_ignores_flag_bits() {
+        // Create CID with encrypted flag, then verify hash still works
+        // (flag bits are masked out during comparison).
+        let data = b"flag bits test";
+        let flags = ContentFlags {
+            encrypted: true,
+            ephemeral: true,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(data, flags).unwrap();
+        assert!(cid.verify_hash(data));
     }
 
     // -----------------------------------------------------------------------
@@ -837,7 +1108,7 @@ mod tests {
 
     #[test]
     fn parse_inline_metadata_rejects_non_metadata_cid() {
-        let blob = ContentId::for_blob(b"not metadata").unwrap();
+        let blob = ContentId::for_blob(b"not metadata", ContentFlags::default()).unwrap();
         assert!(blob.parse_inline_metadata().is_err());
     }
 
@@ -847,13 +1118,13 @@ mod tests {
 
     #[test]
     fn checksum_verification_passes_for_valid_cid() {
-        let cid = ContentId::for_blob(b"valid data").unwrap();
+        let cid = ContentId::for_blob(b"valid data", ContentFlags::default()).unwrap();
         assert!(cid.verify_checksum().is_ok());
     }
 
     #[test]
     fn checksum_verification_fails_for_corrupted_cid() {
-        let cid = ContentId::for_blob(b"valid data").unwrap();
+        let cid = ContentId::for_blob(b"valid data", ContentFlags::default()).unwrap();
         let mut bytes = cid.to_bytes();
         bytes[0] ^= 0xFF; // corrupt the hash
         let corrupted = ContentId::from_bytes(bytes);
@@ -862,10 +1133,10 @@ mod tests {
 
     #[test]
     fn checksum_verification_passes_for_bundle() {
-        let blob = ContentId::for_blob(b"leaf").unwrap();
+        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
         let children = [blob];
         let bytes = children_to_bytes(&children);
-        let bundle = ContentId::for_bundle(&bytes, &children).unwrap();
+        let bundle = ContentId::for_bundle(&bytes, &children, ContentFlags::default()).unwrap();
         assert!(bundle.verify_checksum().is_ok());
     }
 
@@ -879,7 +1150,7 @@ mod tests {
     fn checksum_detects_type_corruption() {
         // A Blob CID with its tag bits corrupted to InlineMetadata should
         // fail checksum verification, even though both types have depth 0.
-        let blob = ContentId::for_blob(b"test").unwrap();
+        let blob = ContentId::for_blob(b"test", ContentFlags::default()).unwrap();
         let mut bytes = blob.to_bytes();
         // Corrupt the tag: overwrite bottom 12 bits with an InlineMetadata tag.
         // InlineMetadata prefix = 0xFF0 (9 bits: 1111_1111_0), with 3-bit checksum.
@@ -898,7 +1169,7 @@ mod tests {
 
     #[test]
     fn serialization_round_trip() {
-        let cid = ContentId::for_blob(b"round trip test").unwrap();
+        let cid = ContentId::for_blob(b"round trip test", ContentFlags::default()).unwrap();
         let bytes = cid.to_bytes();
         let restored = ContentId::from_bytes(bytes);
         assert_eq!(cid, restored);
@@ -906,7 +1177,7 @@ mod tests {
 
     #[test]
     fn display_shows_hex_type_and_size() {
-        let cid = ContentId::for_blob(b"display test").unwrap();
+        let cid = ContentId::for_blob(b"display test", ContentFlags::default()).unwrap();
         let s = format!("{cid}");
         assert!(s.contains("Blob"));
         assert!(s.contains("12")); // data length
@@ -916,59 +1187,171 @@ mod tests {
     // Task 8: Canonical test vectors
     // -----------------------------------------------------------------------
     // These exist so other language implementations can verify byte-identical CID output.
+    // hash[0] top 3 bits are cleared for default flags, changing the first byte
+    // of the hash compared to raw SHA-256.
 
     #[test]
     fn canonical_vector_empty_blob() {
-        let cid = ContentId::for_blob(b"").unwrap();
-        let bytes = cid.to_bytes();
-        // SHA-256("")[:28] = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b
-        assert_eq!(
-            hex::encode(&bytes[..CONTENT_HASH_LEN]),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b",
-        );
+        let cid = ContentId::for_blob(b"", ContentFlags::default()).unwrap();
+        // SHA-256("")[:28] with top 3 bits cleared: e3 & 0x1F = 0x03
+        assert_eq!(cid.hash[0], 0x03);
         assert_eq!(cid.payload_size(), 0);
         assert_eq!(cid.cid_type(), CidType::Blob);
-        // Full 32-byte canonical hex (hash + packed size/tag/checksum)
+        // Full 32-byte canonical hex (independently verifiable by other implementations)
         assert_eq!(
-            hex::encode(bytes),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b0000026d",
+            hex::encode(cid.to_bytes()),
+            "03b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b000002ca",
         );
     }
 
     #[test]
     fn canonical_vector_hello_blob() {
-        let cid = ContentId::for_blob(b"hello").unwrap();
-        let bytes = cid.to_bytes();
-        // SHA-256("hello")[:28] = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362
-        assert_eq!(
-            hex::encode(&bytes[..CONTENT_HASH_LEN]),
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362",
-        );
+        let cid = ContentId::for_blob(b"hello", ContentFlags::default()).unwrap();
+        // SHA-256("hello")[:28] with top 3 bits cleared: 2c & 0x1F = 0x0c
+        assert_eq!(cid.hash[0], 0x0c);
         assert_eq!(cid.payload_size(), 5);
         assert_eq!(cid.cid_type(), CidType::Blob);
-        // Full 32-byte canonical hex
+        // Full 32-byte canonical hex (independently verifiable by other implementations)
         assert_eq!(
-            hex::encode(bytes),
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e7304336200005156",
+            hex::encode(cid.to_bytes()),
+            "0cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e7304336200005020",
         );
     }
 
     #[test]
     fn canonical_vector_bundle_of_two_blobs() {
-        let blob_a = ContentId::for_blob(b"aaa").unwrap();
-        let blob_b = ContentId::for_blob(b"bbb").unwrap();
+        let blob_a = ContentId::for_blob(b"aaa", ContentFlags::default()).unwrap();
+        let blob_b = ContentId::for_blob(b"bbb", ContentFlags::default()).unwrap();
         let children = [blob_a, blob_b];
         let bundle_bytes = children_to_bytes(&children);
-        let bundle = ContentId::for_bundle(&bundle_bytes, &children).unwrap();
+        let bundle =
+            ContentId::for_bundle(&bundle_bytes, &children, ContentFlags::default()).unwrap();
         assert_eq!(bundle.payload_size(), 64); // 2 x 32 bytes
         assert_eq!(bundle.cid_type(), CidType::Bundle(1));
-        // The hash is SHA-256 of the 64-byte bundle payload
-        let full = harmony_crypto::hash::full_hash(&bundle_bytes);
-        assert_eq!(&bundle.hash, &full[..CONTENT_HASH_LEN]);
-        // Full 32-byte canonical hex
+        assert_eq!(bundle.hash[0] & 0xE0, 0x00);
+        assert!(bundle.verify_hash(&bundle_bytes));
+        // Full 32-byte canonical hex (independently verifiable by other implementations).
+        // Pin child CIDs so the bundle hash is fully determined:
+        assert_eq!(
+            hex::encode(blob_a.to_bytes()),
+            "1834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af00003537",
+        );
+        assert_eq!(
+            hex::encode(blob_b.to_bytes()),
+            "1e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c93558000035db",
+        );
         assert_eq!(
             hex::encode(bundle.to_bytes()),
-            "5c9f61c811d592b287972b0fa001f1d5d286b0f49c25e749b0eb83cd000409ca",
+            "05d0f2f83241a0222a2b84ac33993064e525a8b186fdf4b5784326b00004083c",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // New canonical vectors with flags
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn canonical_vector_hello_encrypted() {
+        let flags = ContentFlags {
+            encrypted: true,
+            ephemeral: false,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(b"hello", flags).unwrap();
+        // SHA-256("hello")[0] = 0x2c, cleared = 0x0c, | 0x80 = 0x8c
+        assert_eq!(cid.hash[0], 0x8c);
+        assert!(cid.flags().encrypted);
+        assert!(cid.verify_hash(b"hello"));
+    }
+
+    #[test]
+    fn canonical_vector_hello_ephemeral() {
+        let flags = ContentFlags {
+            encrypted: false,
+            ephemeral: true,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(b"hello", flags).unwrap();
+        // SHA-256("hello")[0] = 0x2c, cleared = 0x0c, | 0x40 = 0x4c
+        assert_eq!(cid.hash[0], 0x4c);
+        assert!(cid.flags().ephemeral);
+        assert!(cid.verify_hash(b"hello"));
+    }
+
+    #[test]
+    fn canonical_vector_hello_alt_hash() {
+        let flags = ContentFlags {
+            encrypted: false,
+            ephemeral: false,
+            alt_hash: true,
+        };
+        let cid = ContentId::for_blob(b"hello", flags).unwrap();
+        assert!(cid.flags().alt_hash);
+        assert!(cid.verify_hash(b"hello"));
+        // Verify it uses SHA-224, not SHA-256
+        let sha224 = harmony_crypto::hash::sha224_hash(b"hello");
+        assert_eq!(cid.hash[0] & 0x1F, sha224[0] & 0x1F);
+        assert_eq!(&cid.hash[1..], &sha224[1..]);
+        // alt_hash bit set
+        assert_eq!(cid.hash[0] & 0x20, 0x20);
+    }
+
+    #[test]
+    fn canonical_vector_hello_private_ephemeral() {
+        let flags = ContentFlags {
+            encrypted: true,
+            ephemeral: true,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(b"hello", flags).unwrap();
+        // SHA-256("hello")[0] = 0x2c, cleared = 0x0c, | 0xC0 = 0xcc
+        assert_eq!(cid.hash[0], 0xcc);
+        assert!(cid.flags().encrypted);
+        assert!(cid.flags().ephemeral);
+        assert!(cid.verify_hash(b"hello"));
+    }
+
+    #[test]
+    fn canonical_vector_hello_all_flags() {
+        let flags = ContentFlags {
+            encrypted: true,
+            ephemeral: true,
+            alt_hash: true,
+        };
+        let cid = ContentId::for_blob(b"hello", flags).unwrap();
+        assert_eq!(cid.hash[0] & 0xE0, 0xE0);
+        assert!(cid.flags().encrypted);
+        assert!(cid.flags().ephemeral);
+        assert!(cid.flags().alt_hash);
+        assert!(cid.verify_hash(b"hello"));
+    }
+
+    #[test]
+    fn cross_flag_verify_hash_rejection() {
+        // CID created with SHA-256 should fail verification if the alt_hash
+        // bit is flipped (verify would use SHA-224, producing a different digest).
+        let cid_256 = ContentId::for_blob(b"hello", ContentFlags::default()).unwrap();
+        let cid_224 = ContentId::for_blob(
+            b"hello",
+            ContentFlags {
+                alt_hash: true,
+                ..ContentFlags::default()
+            },
+        )
+        .unwrap();
+
+        // Both verify against the same data with their own algorithm.
+        assert!(cid_256.verify_hash(b"hello"));
+        assert!(cid_224.verify_hash(b"hello"));
+
+        // But they produce different CIDs (different hash bytes).
+        assert_ne!(cid_256, cid_224);
+        assert_ne!(cid_256.hash[1..], cid_224.hash[1..]);
+
+        // Manually flip alt_hash bit on the SHA-256 CID — verify must fail
+        // because the hash body is SHA-256 but verify now uses SHA-224.
+        let mut corrupted = cid_256;
+        corrupted.hash[0] |= 0x20; // set alt_hash bit
+        assert!(!corrupted.verify_hash(b"hello"));
     }
 }

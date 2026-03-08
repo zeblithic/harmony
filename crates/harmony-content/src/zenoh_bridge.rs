@@ -31,7 +31,8 @@ mod tests {
 
     #[test]
     fn cid_key_expr_matches_shard_structure() {
-        let cid = ContentId::for_blob(b"shard routing test").unwrap();
+        let cid = ContentId::for_blob(b"shard routing test", crate::cid::ContentFlags::default())
+            .unwrap();
         let key_expr = cid_to_key_expr(&cid);
         assert!(key_expr.starts_with("harmony/content/"));
 
@@ -42,7 +43,8 @@ mod tests {
 
     #[test]
     fn announce_key_format() {
-        let cid = ContentId::for_blob(b"announce test").unwrap();
+        let cid =
+            ContentId::for_blob(b"announce test", crate::cid::ContentFlags::default()).unwrap();
         let key = cid_to_announce_key_expr(&cid);
         assert!(key.starts_with("harmony/announce/"));
     }

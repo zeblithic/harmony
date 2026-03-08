@@ -13,7 +13,10 @@
 //! Each pattern is exposed both as a [`KeFormat`] for building/parsing key
 //! expressions and as convenience builder functions.
 
-use alloc::{format, string::{String, ToString}};
+use alloc::{
+    format,
+    string::{String, ToString},
+};
 use zenoh_keyexpr::key_expr::format::KeFormat;
 use zenoh_keyexpr::key_expr::OwnedKeyExpr;
 
@@ -183,9 +186,7 @@ pub fn vine_announce_key(
 /// Pattern: `harmony/vines/{address_hex}/announce/**`
 pub fn vine_announce_sub(creator_addr_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
     reject_slashes(creator_addr_hex)?;
-    ke(&format!(
-        "harmony/vines/{creator_addr_hex}/announce/**"
-    ))
+    ke(&format!("harmony/vines/{creator_addr_hex}/announce/**"))
 }
 
 /// Build a vine reaction subscription pattern.
@@ -193,9 +194,7 @@ pub fn vine_announce_sub(creator_addr_hex: &str) -> Result<OwnedKeyExpr, ZenohEr
 /// Pattern: `harmony/vines/{target_creator_hex}/reactions/**`
 pub fn vine_reaction_sub(target_creator_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
     reject_slashes(target_creator_hex)?;
-    ke(&format!(
-        "harmony/vines/{target_creator_hex}/reactions/**"
-    ))
+    ke(&format!("harmony/vines/{target_creator_hex}/reactions/**"))
 }
 
 /// Build a vine reaction key expression.
@@ -219,9 +218,7 @@ pub fn vine_reaction_key(
 /// Pattern: `harmony/vines/{address_hex}/compilations/**`
 pub fn vine_compilation_sub(creator_addr_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
     reject_slashes(creator_addr_hex)?;
-    ke(&format!(
-        "harmony/vines/{creator_addr_hex}/compilations/**"
-    ))
+    ke(&format!("harmony/vines/{creator_addr_hex}/compilations/**"))
 }
 
 /// Build a vine compilation key expression.

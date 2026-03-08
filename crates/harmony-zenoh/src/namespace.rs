@@ -129,13 +129,16 @@ pub mod content {
 
     /// Content fetch key: `harmony/content/{prefix}/{cid_hex}`
     ///
-    /// The entire `cid_hex` is lowercased to match the convention used by
-    /// `hex::encode` (always lowercase). This ensures keys are consistent
-    /// regardless of the caller's hex casing.
-    /// If `cid_hex` is empty, returns a key with no shard segment (caller error).
+    /// The shard prefix is the **second** hex character of the CID (low nibble
+    /// of byte 0).  The first hex character encodes ContentFlags (encrypted,
+    /// ephemeral, alt_hash) and would cluster all default-flagged content into
+    /// 2 of 16 shards.  The second character is pure hash bits — uniformly
+    /// distributed regardless of flag combination.
+    ///
+    /// `cid_hex` is lowercased to match `hex::encode` convention.
     pub fn fetch_key(cid_hex: &str) -> String {
         let lower = cid_hex.to_ascii_lowercase();
-        let prefix = lower.get(..1).unwrap_or("");
+        let prefix = lower.get(1..2).unwrap_or("");
         format!("{PREFIX}/{prefix}/{lower}")
     }
 
@@ -373,16 +376,18 @@ mod tests {
     }
 
     #[test]
-    fn content_fetch_key_uses_first_char_as_shard() {
+    fn content_fetch_key_uses_second_char_as_shard() {
+        // Second hex char (low nibble of byte 0) is pure hash bits,
+        // uniformly distributed regardless of ContentFlags.
         let key = content::fetch_key("abc123def456");
-        assert_eq!(key, "harmony/content/a/abc123def456");
+        assert_eq!(key, "harmony/content/b/abc123def456");
     }
 
     #[test]
     fn content_fetch_key_normalizes_to_lowercase() {
         // Uppercase hex must be fully lowercased to match hex::encode convention.
         let key = content::fetch_key("ABC123DEF456");
-        assert_eq!(key, "harmony/content/a/abc123def456");
+        assert_eq!(key, "harmony/content/b/abc123def456");
     }
 
     #[test]
@@ -565,7 +570,8 @@ mod tests {
         // A fetch key's shard prefix must fall within one of the 16 shard patterns.
         let key = content::fetch_key("abc123def456");
         let patterns = content::all_shard_patterns();
-        let shard_prefix = "harmony/content/a/";
+        // Second hex char 'b' determines the shard.
+        let shard_prefix = "harmony/content/b/";
         assert!(
             patterns
                 .iter()

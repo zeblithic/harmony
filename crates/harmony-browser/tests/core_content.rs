@@ -3,7 +3,7 @@ use harmony_browser::{
 };
 use harmony_content::blob::{BlobStore, MemoryBlobStore};
 use harmony_content::bundle::BundleBuilder;
-use harmony_content::cid::ContentId;
+use harmony_content::cid::{ContentFlags, ContentId};
 
 /// Helper: build a content bundle with inline metadata.
 fn build_test_bundle(data: &[u8], mime: [u8; 8]) -> (ContentId, Vec<u8>) {
@@ -50,7 +50,7 @@ fn content_fetched_with_no_trust_score_returns_unknown() {
 fn content_fetched_plain_blob_renders_as_plain_text() {
     let mut core = BrowserCore::new();
     let data = b"just plain bytes, not a bundle";
-    let cid = ContentId::for_blob(data).unwrap();
+    let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
 
     let actions = core.handle_event(BrowserEvent::ContentFetched {
         cid,
@@ -77,7 +77,8 @@ fn trust_update_affects_subsequent_content() {
 
     // Verify the trust_scores map is populated and policy resolves correctly
     assert_eq!(
-        core.trust_policy().decide(core.trust_score(&author_address)),
+        core.trust_policy()
+            .decide(core.trust_score(&author_address)),
         TrustDecision::FullTrust,
     );
 }
@@ -93,14 +94,17 @@ fn tampered_content_is_rejected() {
     }
 
     let actions = core.handle_event(BrowserEvent::ContentFetched { cid, data });
-    assert!(actions.is_empty(), "tampered content should produce no actions");
+    assert!(
+        actions.is_empty(),
+        "tampered content should produce no actions"
+    );
 }
 
 #[test]
 fn approved_content_renders_with_full_trust() {
     let mut core = BrowserCore::new();
     let data = b"gated image data";
-    let cid = ContentId::for_blob(data).unwrap();
+    let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
 
     // Approve the CID first
     let _ = core.handle_event(BrowserEvent::ApproveContent { cid });

@@ -1,4 +1,8 @@
-use alloc::{collections::VecDeque, string::{String, ToString}, vec::Vec};
+use alloc::{
+    collections::VecDeque,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use crate::error::ReticulumError;
 use crate::interface::{Interface, InterfaceDirection, InterfaceMode, InterfaceStats};

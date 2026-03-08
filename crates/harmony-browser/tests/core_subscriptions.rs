@@ -1,11 +1,11 @@
-use harmony_browser::{BrowserAction, BrowserCore, BrowserEvent, BrowserSubId, BrowseTarget};
+use harmony_browser::{BrowseTarget, BrowserAction, BrowserCore, BrowserEvent, BrowserSubId};
 
 #[test]
 fn subscribe_tracks_active_subscription() {
     let mut core = BrowserCore::new();
-    let _ = core.handle_event(BrowserEvent::Navigate(
-        BrowseTarget::Subscribe("harmony/presence/**".into()),
-    ));
+    let _ = core.handle_event(BrowserEvent::Navigate(BrowseTarget::Subscribe(
+        "harmony/presence/**".into(),
+    )));
     assert_eq!(core.active_subscriptions().len(), 1);
     assert!(core.active_subscriptions().contains("harmony/presence/**"));
 }
@@ -13,13 +13,13 @@ fn subscribe_tracks_active_subscription() {
 #[test]
 fn duplicate_subscribe_does_not_add_twice() {
     let mut core = BrowserCore::new();
-    let _ = core.handle_event(BrowserEvent::Navigate(
-        BrowseTarget::Subscribe("harmony/presence/**".into()),
-    ));
+    let _ = core.handle_event(BrowserEvent::Navigate(BrowseTarget::Subscribe(
+        "harmony/presence/**".into(),
+    )));
     // Second subscribe to same key_expr should be a no-op
-    let actions = core.handle_event(BrowserEvent::Navigate(
-        BrowseTarget::Subscribe("harmony/presence/**".into()),
-    ));
+    let actions = core.handle_event(BrowserEvent::Navigate(BrowseTarget::Subscribe(
+        "harmony/presence/**".into(),
+    )));
     assert_eq!(core.active_subscriptions().len(), 1);
     assert!(actions.is_empty()); // No duplicate Subscribe action emitted
 }
@@ -27,9 +27,9 @@ fn duplicate_subscribe_does_not_add_twice() {
 #[test]
 fn subscription_update_emits_deliver() {
     let mut core = BrowserCore::new();
-    let _ = core.handle_event(BrowserEvent::Navigate(
-        BrowseTarget::Subscribe("harmony/presence/**".into()),
-    ));
+    let _ = core.handle_event(BrowserEvent::Navigate(BrowseTarget::Subscribe(
+        "harmony/presence/**".into(),
+    )));
 
     let sub_id = *core.active_subscription_ids().iter().next().unwrap();
     let actions = core.handle_event(BrowserEvent::SubscriptionUpdate {
