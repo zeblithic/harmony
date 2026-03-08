@@ -47,9 +47,10 @@ impl ContentFlags {
 /// A 32-byte content identifier.
 ///
 /// Layout (big-endian):
-/// - Bytes 0--27: truncated SHA-256 content hash (224 bits)
+/// - Bytes 0--27: truncated content hash (221 effective bits after flag reservation)
 ///   - Top 3 bits of byte 0 encode [`ContentFlags`]:
 ///     bit 7 = encrypted, bit 6 = ephemeral, bit 5 = alt_hash
+///   - `verify_hash` masks byte 0 with `0x1F` on both sides to exclude flags
 /// - Bytes 28--31: big-endian u32 where bits \[31:12\] = payload size,
 ///   bits \[11:0\] = type tag + checksum
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
