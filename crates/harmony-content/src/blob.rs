@@ -9,8 +9,17 @@ use crate::error::ContentError;
 
 /// A content-addressed store for blob data.
 pub trait BlobStore {
+    /// Insert raw blob data with explicit flags, returning the blob's ContentId.
+    fn insert_with_flags(
+        &mut self,
+        data: &[u8],
+        flags: ContentFlags,
+    ) -> Result<ContentId, ContentError>;
+
     /// Insert raw blob data, returning the blob's ContentId.
-    fn insert(&mut self, data: &[u8]) -> Result<ContentId, ContentError>;
+    fn insert(&mut self, data: &[u8]) -> Result<ContentId, ContentError> {
+        self.insert_with_flags(data, ContentFlags::default())
+    }
 
     /// Store data under a pre-computed CID (used for bundles).
     fn store(&mut self, cid: ContentId, data: Vec<u8>);
@@ -50,8 +59,12 @@ impl Default for MemoryBlobStore {
 }
 
 impl BlobStore for MemoryBlobStore {
-    fn insert(&mut self, data: &[u8]) -> Result<ContentId, ContentError> {
-        let cid = ContentId::for_blob(data, ContentFlags::default())?;
+    fn insert_with_flags(
+        &mut self,
+        data: &[u8],
+        flags: ContentFlags,
+    ) -> Result<ContentId, ContentError> {
+        let cid = ContentId::for_blob(data, flags)?;
         self.data.entry(cid).or_insert_with(|| data.to_vec());
         Ok(cid)
     }
@@ -106,6 +119,21 @@ mod tests {
     fn contains_reflects_state() {
         let mut store = MemoryBlobStore::new();
         let cid = store.insert(b"exists").unwrap();
+        assert!(store.contains(&cid));
+    }
+
+    #[test]
+    fn insert_with_flags_encrypted_blob() {
+        let mut store = MemoryBlobStore::new();
+        let flags = ContentFlags {
+            encrypted: true,
+            ..ContentFlags::default()
+        };
+        let data = b"encrypted payload";
+        let cid = store.insert_with_flags(data, flags).unwrap();
+        assert_eq!(cid.cid_type(), CidType::Blob);
+        assert_eq!(cid.flags().encrypted, true);
+        assert_eq!(store.get(&cid).unwrap(), data);
         assert!(store.contains(&cid));
     }
 

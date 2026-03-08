@@ -91,12 +91,15 @@ impl BundleBuilder {
         self
     }
 
-    /// Build the bundle, returning the raw bytes and the bundle's CID.
+    /// Build the bundle with explicit flags, returning the raw bytes and the bundle's CID.
     ///
     /// The bundle's depth is `max(child_depths) + 1`. If inline metadata
     /// was set, it is prepended as the first CID in the bundle bytes
     /// (metadata CIDs have depth 0, so they don't affect bundle depth).
-    pub fn build(&self) -> Result<(Vec<u8>, ContentId), ContentError> {
+    pub fn build_with_flags(
+        &self,
+        flags: ContentFlags,
+    ) -> Result<(Vec<u8>, ContentId), ContentError> {
         if self.children.is_empty() {
             return Err(ContentError::EmptyBundle);
         }
@@ -115,9 +118,17 @@ impl BundleBuilder {
         }
 
         // Compute bundle CID (depth based on all entries including metadata)
-        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &entries, ContentFlags::default())?;
+        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &entries, flags)?;
 
         Ok((bundle_bytes, bundle_cid))
+    }
+
+    /// Build the bundle, returning the raw bytes and the bundle's CID.
+    ///
+    /// Uses default (empty) flags. See [`build_with_flags`](Self::build_with_flags)
+    /// for passing explicit flags.
+    pub fn build(&self) -> Result<(Vec<u8>, ContentId), ContentError> {
+        self.build_with_flags(ContentFlags::default())
     }
 
     /// Return the number of child CIDs (not counting metadata).
@@ -275,6 +286,24 @@ mod tests {
         b2.add(l1_cid);
         let (_, l2_cid) = b2.build().unwrap();
         assert_eq!(l2_cid.cid_type(), CidType::Bundle(2));
+    }
+
+    #[test]
+    fn build_with_flags_encrypted_bundle() {
+        let blob_a = ContentId::for_blob(b"chunk a", ContentFlags::default()).unwrap();
+        let blob_b = ContentId::for_blob(b"chunk b", ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(blob_a).add(blob_b);
+
+        let flags = ContentFlags {
+            encrypted: true,
+            ..ContentFlags::default()
+        };
+        let (_, cid) = builder.build_with_flags(flags).unwrap();
+        assert_eq!(cid.cid_type(), CidType::Bundle(1));
+        assert_eq!(cid.flags().encrypted, true);
+        assert_eq!(cid.flags().ephemeral, false);
     }
 
     #[test]

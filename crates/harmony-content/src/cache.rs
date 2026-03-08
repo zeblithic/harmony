@@ -6,7 +6,7 @@ use hashbrown::HashSet;
 use std::collections::HashSet;
 
 use crate::blob::BlobStore;
-use crate::cid::ContentId;
+use crate::cid::{ContentFlags, ContentId};
 use crate::error::ContentError;
 use crate::lru::Lru;
 use crate::sketch::CountMinSketch;
@@ -327,8 +327,12 @@ impl<S: BlobStore> ContentStore<S> {
 }
 
 impl<S: BlobStore> BlobStore for ContentStore<S> {
-    fn insert(&mut self, data: &[u8]) -> Result<ContentId, ContentError> {
-        let cid = self.store.insert(data)?;
+    fn insert_with_flags(
+        &mut self,
+        data: &[u8],
+        flags: ContentFlags,
+    ) -> Result<ContentId, ContentError> {
+        let cid = self.store.insert_with_flags(data, flags)?;
         self.admit(cid, false);
         Ok(cid)
     }
