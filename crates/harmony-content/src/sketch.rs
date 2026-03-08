@@ -175,7 +175,11 @@ mod tests {
     use super::*;
 
     fn make_cid(i: usize) -> ContentId {
-        ContentId::for_blob(format!("sketch-test-{i}").as_bytes()).unwrap()
+        ContentId::for_blob(
+            format!("sketch-test-{i}").as_bytes(),
+            crate::cid::ContentFlags::default(),
+        )
+        .unwrap()
     }
 
     #[test]

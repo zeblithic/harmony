@@ -52,9 +52,12 @@ impl NameRegistration {
         check_u16_len(namespace, "namespace")?;
         check_u16_len(domain, "domain")?;
 
-        let capacity = 2 + name_bytes.len()
-            + 2 + namespace_bytes.len()
-            + 2 + domain_bytes.len()
+        let capacity = 2
+            + name_bytes.len()
+            + 2
+            + namespace_bytes.len()
+            + 2
+            + domain_bytes.len()
             + PUBLIC_KEY_LENGTH
             + 8;
 

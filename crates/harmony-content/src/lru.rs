@@ -1,9 +1,9 @@
 use alloc::vec::Vec;
 use core::fmt;
-#[cfg(feature = "std")]
-use std::collections::{HashMap, HashSet};
 #[cfg(not(feature = "std"))]
 use hashbrown::{HashMap, HashSet};
+#[cfg(feature = "std")]
+use std::collections::{HashMap, HashSet};
 
 use crate::cid::ContentId;
 
@@ -234,7 +234,11 @@ mod tests {
     use super::*;
 
     fn make_cid(i: usize) -> ContentId {
-        ContentId::for_blob(format!("lru-test-{i}").as_bytes()).unwrap()
+        ContentId::for_blob(
+            format!("lru-test-{i}").as_bytes(),
+            crate::cid::ContentFlags::default(),
+        )
+        .unwrap()
     }
 
     #[test]

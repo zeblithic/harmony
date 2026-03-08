@@ -1,10 +1,10 @@
 use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use std::collections::HashMap;
 #[cfg(not(feature = "std"))]
 use hashbrown::HashMap;
+#[cfg(feature = "std")]
+use std::collections::HashMap;
 
-use crate::cid::ContentId;
+use crate::cid::{ContentFlags, ContentId};
 use crate::error::ContentError;
 
 /// A content-addressed store for blob data.
@@ -51,7 +51,7 @@ impl Default for MemoryBlobStore {
 
 impl BlobStore for MemoryBlobStore {
     fn insert(&mut self, data: &[u8]) -> Result<ContentId, ContentError> {
-        let cid = ContentId::for_blob(data)?;
+        let cid = ContentId::for_blob(data, ContentFlags::default())?;
         self.data.entry(cid).or_insert_with(|| data.to_vec());
         Ok(cid)
     }
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn get_unknown_returns_none() {
         let store = MemoryBlobStore::new();
-        let cid = ContentId::for_blob(b"not stored").unwrap();
+        let cid = ContentId::for_blob(b"not stored", ContentFlags::default()).unwrap();
         assert!(store.get(&cid).is_none());
         assert!(!store.contains(&cid));
     }
@@ -112,14 +112,16 @@ mod tests {
     #[test]
     fn store_raw_for_bundle_data() {
         let mut store = MemoryBlobStore::new();
-        let blob_a = ContentId::for_blob(b"aaa").unwrap();
-        let blob_b = ContentId::for_blob(b"bbb").unwrap();
+        let blob_a = ContentId::for_blob(b"aaa", ContentFlags::default()).unwrap();
+        let blob_b = ContentId::for_blob(b"bbb", ContentFlags::default()).unwrap();
 
         // Build bundle bytes manually
         let mut bundle_bytes = Vec::new();
         bundle_bytes.extend_from_slice(&blob_a.to_bytes());
         bundle_bytes.extend_from_slice(&blob_b.to_bytes());
-        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &[blob_a, blob_b]).unwrap();
+        let bundle_cid =
+            ContentId::for_bundle(&bundle_bytes, &[blob_a, blob_b], ContentFlags::default())
+                .unwrap();
 
         store.store(bundle_cid, bundle_bytes.clone());
         assert_eq!(store.get(&bundle_cid).unwrap(), bundle_bytes.as_slice());

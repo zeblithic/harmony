@@ -1,7 +1,7 @@
 //! End-to-end test: navigate -> fetch -> render with trust.
 
 use harmony_browser::{
-    BrowserAction, BrowserCore, BrowserEvent, BrowseTarget, MimeHint, ResolvedContent,
+    BrowseTarget, BrowserAction, BrowserCore, BrowserEvent, MimeHint, ResolvedContent,
     TrustDecision,
 };
 use harmony_content::blob::{BlobStore, MemoryBlobStore};

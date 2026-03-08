@@ -1,10 +1,10 @@
 use harmony_browser::{BrowserAction, BrowserCore, BrowserEvent};
-use harmony_content::cid::ContentId;
+use harmony_content::cid::{ContentFlags, ContentId};
 
 #[test]
 fn approve_content_marks_cid_and_emits_fetch() {
     let mut core = BrowserCore::new();
-    let cid = ContentId::for_blob(b"gated image data").unwrap();
+    let cid = ContentId::for_blob(b"gated image data", ContentFlags::default()).unwrap();
 
     let actions = core.handle_event(BrowserEvent::ApproveContent { cid });
     assert_eq!(actions.len(), 1);
@@ -17,7 +17,7 @@ fn approve_content_marks_cid_and_emits_fetch() {
 #[test]
 fn approved_cid_is_remembered() {
     let mut core = BrowserCore::new();
-    let cid = ContentId::for_blob(b"gated image").unwrap();
+    let cid = ContentId::for_blob(b"gated image", ContentFlags::default()).unwrap();
 
     let _ = core.handle_event(BrowserEvent::ApproveContent { cid });
     assert!(core.is_approved(&cid));
@@ -26,6 +26,6 @@ fn approved_cid_is_remembered() {
 #[test]
 fn unapproved_cid_is_not_remembered() {
     let core = BrowserCore::new();
-    let cid = ContentId::for_blob(b"nope").unwrap();
+    let cid = ContentId::for_blob(b"nope", ContentFlags::default()).unwrap();
     assert!(!core.is_approved(&cid));
 }

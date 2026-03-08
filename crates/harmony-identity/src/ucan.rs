@@ -525,7 +525,16 @@ pub fn verify_token(
     revocations: &impl RevocationSet,
     max_depth: usize,
 ) -> Result<(), UcanError> {
-    verify_token_recursive(token, now, proofs, identities, revocations, max_depth, 0, None)
+    verify_token_recursive(
+        token,
+        now,
+        proofs,
+        identities,
+        revocations,
+        max_depth,
+        0,
+        None,
+    )
 }
 
 /// Verify a revocation record's signature and issuer match.

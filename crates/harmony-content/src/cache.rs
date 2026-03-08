@@ -1,9 +1,9 @@
 use alloc::vec::Vec;
 use core::fmt;
-#[cfg(feature = "std")]
-use std::collections::HashSet;
 #[cfg(not(feature = "std"))]
 use hashbrown::HashSet;
+#[cfg(feature = "std")]
+use std::collections::HashSet;
 
 use crate::blob::BlobStore;
 use crate::cid::ContentId;
@@ -363,10 +363,22 @@ mod tests {
         assert!(dbg.contains("sketch:"), "sketch field should appear");
         assert!(dbg.contains("CountMinSketch"));
         assert!(dbg.contains("window:"), "window Lru field should appear");
-        assert!(dbg.contains("probation:"), "probation Lru field should appear");
-        assert!(dbg.contains("protected:"), "protected Lru field should appear");
-        assert!(dbg.contains("Lru"), "Lru Debug impl should be used for segments");
-        assert!(dbg.contains("pinned_count: 1, .."), "should use finish_non_exhaustive()");
+        assert!(
+            dbg.contains("probation:"),
+            "probation Lru field should appear"
+        );
+        assert!(
+            dbg.contains("protected:"),
+            "protected Lru field should appear"
+        );
+        assert!(
+            dbg.contains("Lru"),
+            "Lru Debug impl should be used for segments"
+        );
+        assert!(
+            dbg.contains("pinned_count: 1, .."),
+            "should use finish_non_exhaustive()"
+        );
     }
 
     #[test]
@@ -397,7 +409,8 @@ mod tests {
         assert!(!cs.probation.contains(&target));
 
         // Miss returns None.
-        let bogus = ContentId::for_blob(b"nonexistent").unwrap();
+        let bogus =
+            ContentId::for_blob(b"nonexistent", crate::cid::ContentFlags::default()).unwrap();
         assert_eq!(cs.get_and_record(&bogus), None);
     }
 
@@ -409,13 +422,13 @@ mod tests {
         let mut cs = ContentStore::new(store, 100);
 
         let data_a = b"via-preadmitted";
-        let cid_a = ContentId::for_blob(data_a).unwrap();
+        let cid_a = ContentId::for_blob(data_a, crate::cid::ContentFlags::default()).unwrap();
         assert!(cs.should_admit(&cid_a));
         cs.store_preadmitted(cid_a, data_a.to_vec());
         let freq_a = cs.sketch.estimate(&cid_a);
 
         let data_b = b"via-plain-store";
-        let cid_b = ContentId::for_blob(data_b).unwrap();
+        let cid_b = ContentId::for_blob(data_b, crate::cid::ContentFlags::default()).unwrap();
         cs.store(cid_b, data_b.to_vec());
         let freq_b = cs.sketch.estimate(&cid_b);
 
@@ -446,7 +459,8 @@ mod tests {
         }
 
         // Cold CID with no frequency history should be rejected.
-        let cold_cid = ContentId::for_blob(b"cold-newcomer").unwrap();
+        let cold_cid =
+            ContentId::for_blob(b"cold-newcomer", crate::cid::ContentFlags::default()).unwrap();
         assert!(!cs.should_admit(&cold_cid), "cold CID should be rejected");
 
         // But calling should_admit built some frequency. After enough calls,
@@ -468,7 +482,7 @@ mod tests {
         let mut cs = ContentStore::new(store, 10);
 
         // Store directly into backing store (bypassing admit).
-        let cid = ContentId::for_blob(b"test").unwrap();
+        let cid = ContentId::for_blob(b"test", crate::cid::ContentFlags::default()).unwrap();
         cs.store.store(cid, b"test".to_vec());
 
         // Backing store has it, but LRU segments don't.
@@ -749,7 +763,8 @@ mod tests {
 
         // Give the next candidate high frequency so it would beat non-pinned victims.
         let candidate_data = b"high-freq-candidate";
-        let candidate = ContentId::for_blob(candidate_data).unwrap();
+        let candidate =
+            ContentId::for_blob(candidate_data, crate::cid::ContentFlags::default()).unwrap();
         for _ in 0..10 {
             cs.sketch.increment(&candidate);
         }

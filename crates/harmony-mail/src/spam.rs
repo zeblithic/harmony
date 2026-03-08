@@ -196,7 +196,11 @@ mod tests {
     #[test]
     fn clean_message_passes() {
         let verdict = score(&clean_signals(), 5);
-        assert!(verdict.score <= 0, "expected score <= 0, got {}", verdict.score);
+        assert!(
+            verdict.score <= 0,
+            "expected score <= 0, got {}",
+            verdict.score
+        );
         assert_eq!(verdict.action, SpamAction::Deliver);
     }
 
@@ -207,7 +211,11 @@ mod tests {
             ..clean_signals()
         };
         let verdict = score(&signals, 5);
-        assert!(verdict.score >= 5, "expected score >= 5, got {}", verdict.score);
+        assert!(
+            verdict.score >= 5,
+            "expected score >= 5, got {}",
+            verdict.score
+        );
         assert_eq!(verdict.action, SpamAction::Reject);
     }
 
@@ -224,7 +232,11 @@ mod tests {
         };
         let verdict = score(&signals, 5);
         // Expected: 0 (base) + 1 (SPF SoftFail) + 1 (DKIM Missing) - 3 (known) - 2 (trust) = -3
-        assert!(verdict.score <= 0, "expected score <= 0, got {}", verdict.score);
+        assert!(
+            verdict.score <= 0,
+            "expected score <= 0, got {}",
+            verdict.score
+        );
         assert_eq!(verdict.action, SpamAction::Deliver);
     }
 
@@ -236,7 +248,11 @@ mod tests {
         };
         let verdict = score(&signals, 5);
         // Expected: 0 (base) + 5 (executable) = 5
-        assert!(verdict.score >= 5, "expected score >= 5, got {}", verdict.score);
+        assert!(
+            verdict.score >= 5,
+            "expected score >= 5, got {}",
+            verdict.score
+        );
         assert_eq!(verdict.action, SpamAction::Reject);
     }
 

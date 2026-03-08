@@ -106,7 +106,8 @@ impl VineFeed {
                 }
                 // Evict any existing entry for the same CID (re-announcement
                 // with a different timestamp).
-                self.items.retain(|_, existing| existing.bundle_cid != item.bundle_cid);
+                self.items
+                    .retain(|_, existing| existing.bundle_cid != item.bundle_cid);
                 let key = (item.timestamp, item.bundle_cid);
                 self.items.insert(key, item);
                 vec![VineAction::FeedUpdated]

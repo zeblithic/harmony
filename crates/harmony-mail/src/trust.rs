@@ -182,7 +182,9 @@ impl TrustReport {
         // subject_address: 16 bytes
         buf.extend_from_slice(&self.subject_address);
         // subject_domain: length-prefixed string
-        buf.extend_from_slice(&check_u16_len(&self.subject_domain, "subject_domain")?.to_be_bytes());
+        buf.extend_from_slice(
+            &check_u16_len(&self.subject_domain, "subject_domain")?.to_be_bytes(),
+        );
         buf.extend_from_slice(self.subject_domain.as_bytes());
         // period_start: 8 bytes big-endian
         buf.extend_from_slice(&self.period_start.to_be_bytes());
@@ -341,7 +343,10 @@ mod tests {
         assert!(!announce.verify(other.public_identity()));
 
         // Gateway address should match.
-        assert_eq!(announce.gateway_address, gateway.public_identity().address_hash);
+        assert_eq!(
+            announce.gateway_address,
+            gateway.public_identity().address_hash
+        );
     }
 
     #[test]
@@ -374,7 +379,10 @@ mod tests {
         assert!(!report.verify(subject.public_identity()));
 
         // Reporter address should match.
-        assert_eq!(report.reporter_address, reporter.public_identity().address_hash);
+        assert_eq!(
+            report.reporter_address,
+            reporter.public_identity().address_hash
+        );
     }
 
     #[test]
@@ -406,7 +414,10 @@ mod tests {
 
         let result = aggregate_trust(&[report], &weights).unwrap();
         assert_eq!(result.report_count, 1);
-        assert_eq!(result.gateway_address, subject.public_identity().address_hash);
+        assert_eq!(
+            result.gateway_address,
+            subject.public_identity().address_hash
+        );
 
         let expected = 0.929_f32;
         assert!(
@@ -615,8 +626,14 @@ mod tests {
 
         // Subject B's bad report should be skipped — only subject A's score counts.
         let result = aggregate_trust(&[report_a, report_b], &weights).unwrap();
-        assert_eq!(result.report_count, 1, "should only count report for first subject");
-        assert_eq!(result.gateway_address, subject_a.public_identity().address_hash);
+        assert_eq!(
+            result.report_count, 1,
+            "should only count report for first subject"
+        );
+        assert_eq!(
+            result.gateway_address,
+            subject_a.public_identity().address_hash
+        );
         assert!(
             (result.trust_score - 1.0).abs() < 1e-5,
             "should reflect only subject A's perfect score, got {}",

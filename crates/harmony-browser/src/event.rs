@@ -52,7 +52,10 @@ pub enum BrowserAction {
     /// Query a named resource via Zenoh.
     QueryNamed { key_expr: String },
     /// Subscribe to a key expression.
-    Subscribe { key_expr: String, sub_id: BrowserSubId },
+    Subscribe {
+        key_expr: String,
+        sub_id: BrowserSubId,
+    },
     /// Unsubscribe from a key expression.
     // TODO: wire up subscription removal in a future phase
     Unsubscribe { sub_id: BrowserSubId },

@@ -1,9 +1,13 @@
 //! StorageTier: sans-I/O wrapper integrating ContentStore with Zenoh patterns.
 
-use alloc::{string::{String, ToString}, vec, vec::Vec};
 use crate::blob::BlobStore;
 use crate::cache::ContentStore;
 use crate::cid::ContentId;
+use alloc::{
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use harmony_zenoh::namespace::{announce as announce_ns, content as ns};
 
 /// Configuration for storage capacity limits.
@@ -269,7 +273,7 @@ mod tests {
     fn event_and_action_types_exist() {
         let _event = StorageTierEvent::ContentQuery {
             query_id: 1,
-            cid: ContentId::for_blob(b"test").unwrap(),
+            cid: ContentId::for_blob(b"test", crate::cid::ContentFlags::default()).unwrap(),
         };
         let _action = StorageTierAction::SendReply {
             query_id: 1,
@@ -311,7 +315,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
-        let cid = ContentId::for_blob(b"not stored").unwrap();
+        let cid = ContentId::for_blob(b"not stored", crate::cid::ContentFlags::default()).unwrap();
 
         let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 99, cid });
         assert!(actions.is_empty());
@@ -328,7 +332,7 @@ mod tests {
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
 
         let data = b"stats test blob";
-        let cid = ContentId::for_blob(data).unwrap();
+        let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
         tier.handle(StorageTierEvent::PublishContent {
             cid,
             data: data.to_vec(),
@@ -356,7 +360,7 @@ mod tests {
         };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
         let data = b"explicitly published blob";
-        let cid = ContentId::for_blob(data).unwrap();
+        let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
         let actions = tier.handle(StorageTierEvent::PublishContent {
             cid,
@@ -387,7 +391,7 @@ mod tests {
         };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
         let data = b"transiting blob";
-        let cid = ContentId::for_blob(data).unwrap();
+        let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
         let actions = tier.handle(StorageTierEvent::TransitContent {
             cid,
@@ -416,7 +420,7 @@ mod tests {
         };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
         let data = b"repeated transit";
-        let cid = ContentId::for_blob(data).unwrap();
+        let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
         tier.handle(StorageTierEvent::TransitContent {
             cid,
@@ -444,7 +448,8 @@ mod tests {
         // Fill cache: 3 items → window=1, probation=2.
         for i in 0..3 {
             let data = format!("hot-{i}");
-            let cid = ContentId::for_blob(data.as_bytes()).unwrap();
+            let cid =
+                ContentId::for_blob(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap();
             tier.handle(StorageTierEvent::TransitContent {
                 cid,
                 data: data.into_bytes(),
@@ -453,7 +458,8 @@ mod tests {
         // Boost frequency of the probation items via queries.
         for i in 0..2 {
             let data = format!("hot-{i}");
-            let cid = ContentId::for_blob(data.as_bytes()).unwrap();
+            let cid =
+                ContentId::for_blob(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap();
             for _ in 0..10 {
                 tier.handle(StorageTierEvent::ContentQuery { query_id: 0, cid });
             }
@@ -463,7 +469,7 @@ mod tests {
 
         // Cold transit item with zero frequency should be rejected.
         let cold_data = b"cold-newcomer-will-lose";
-        let cold_cid = ContentId::for_blob(cold_data).unwrap();
+        let cold_cid = ContentId::for_blob(cold_data, crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::TransitContent {
             cid: cold_cid,
             data: cold_data.to_vec(),
@@ -495,11 +501,16 @@ mod tests {
         };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
 
-        let blob_a = ContentId::for_blob(b"child-a").unwrap();
-        let blob_b = ContentId::for_blob(b"child-b").unwrap();
+        let blob_a = ContentId::for_blob(b"child-a", crate::cid::ContentFlags::default()).unwrap();
+        let blob_b = ContentId::for_blob(b"child-b", crate::cid::ContentFlags::default()).unwrap();
         let children = [blob_a, blob_b];
         let bundle_bytes: Vec<u8> = children.iter().flat_map(|c| c.to_bytes()).collect();
-        let bundle_cid = ContentId::for_bundle(&bundle_bytes, &children).unwrap();
+        let bundle_cid = ContentId::for_bundle(
+            &bundle_bytes,
+            &children,
+            crate::cid::ContentFlags::default(),
+        )
+        .unwrap();
 
         let actions = tier.handle(StorageTierEvent::TransitContent {
             cid: bundle_cid,
@@ -523,7 +534,7 @@ mod tests {
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
 
         // CID for "real data" but send "tampered data"
-        let cid = ContentId::for_blob(b"real data").unwrap();
+        let cid = ContentId::for_blob(b"real data", crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::TransitContent {
             cid,
             data: b"tampered data".to_vec(),
@@ -545,7 +556,7 @@ mod tests {
         };
         let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
 
-        let cid = ContentId::for_blob(b"original").unwrap();
+        let cid = ContentId::for_blob(b"original", crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::PublishContent {
             cid,
             data: b"different".to_vec(),
@@ -570,7 +581,7 @@ mod tests {
         // Craft a CID with correct hash but wrong payload_size by mutating
         // the size bits in the last 4 bytes.
         let data = b"correct data";
-        let real_cid = ContentId::for_blob(data).unwrap();
+        let real_cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
         let mut bytes = real_cid.to_bytes();
         // Corrupt the size: set size to 999 instead of 12.
         let packed = u32::from_be_bytes(bytes[28..32].try_into().unwrap());

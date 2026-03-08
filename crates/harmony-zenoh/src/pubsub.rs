@@ -5,11 +5,16 @@
 //! It composes with [`Session`] (peer lifecycle) and [`SubscriptionTable`]
 //! (key expression matching) without owning either.
 
-use alloc::{string::{String, ToString}, sync::Arc, vec, vec::Vec};
-#[cfg(feature = "std")]
-use std::collections::HashMap;
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 #[cfg(not(feature = "std"))]
 use hashbrown::HashMap;
+#[cfg(feature = "std")]
+use std::collections::HashMap;
 
 use zenoh_keyexpr::key_expr::{keyexpr, OwnedKeyExpr};
 

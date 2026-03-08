@@ -196,7 +196,10 @@ impl WorkflowEngine {
         let saved = self.budget;
         self.budget = budget;
         // Guard restores self.budget on drop (normal return or panic).
-        let guard = BudgetGuard { engine: self, saved };
+        let guard = BudgetGuard {
+            engine: self,
+            saved,
+        };
         let result = guard.engine.tick();
         // Explicit drop triggers restore before we return.
         drop(guard);
@@ -302,7 +305,7 @@ impl WorkflowEngine {
                 workflow_id: wf_id,
                 module_hash: history.module_hash,
                 input: history.input.clone(),
-                events: Vec::new(), // Fresh event log for this execution
+                events: Vec::new(),     // Fresh event log for this execution
                 total_fuel_consumed: 0, // Reset: recovery re-executes from scratch
             },
             hint: ComputeHint::PreferLocal,
@@ -421,10 +424,10 @@ impl WorkflowEngine {
             let first = waiting[0];
             let state = self.workflows.get_mut(&first).expect("workflow must exist");
             state.status = WorkflowStatus::Executing;
-            state
-                .history
-                .events
-                .push(HistoryEvent::IoResolved { cid, data: data.clone() });
+            state.history.events.push(HistoryEvent::IoResolved {
+                cid,
+                data: data.clone(),
+            });
             let saved_session = state
                 .saved_session
                 .take()
@@ -437,10 +440,10 @@ impl WorkflowEngine {
         let defer_start = if immediate_resume { 1 } else { 0 };
         for &wf_id in &waiting[defer_start..] {
             if let Some(state) = self.workflows.get_mut(&wf_id) {
-                state
-                    .history
-                    .events
-                    .push(HistoryEvent::IoResolved { cid, data: data.clone() });
+                state.history.events.push(HistoryEvent::IoResolved {
+                    cid,
+                    data: data.clone(),
+                });
                 // NOTE: Status is set to Executing here even though the workflow
                 // won't actually resume until a future tick() picks it up from
                 // deferred_resume_queue. Callers of workflow_status() will briefly
@@ -453,9 +456,7 @@ impl WorkflowEngine {
         }
 
         if immediate_resume {
-            let result = self
-                .runtime
-                .resume_with_io(io_response, self.budget);
+            let result = self.runtime.resume_with_io(io_response, self.budget);
             self.handle_compute_result(waiting[0], result)
         } else {
             Vec::new()
@@ -524,14 +525,12 @@ impl WorkflowEngine {
                             });
                             // Resume and loop (iterative, not recursive).
                             current_result = match cached_data {
-                                Some(data) => self.runtime.resume_with_io(
-                                    IOResponse::ContentReady { data },
-                                    self.budget,
-                                ),
-                                None => self.runtime.resume_with_io(
-                                    IOResponse::ContentNotFound,
-                                    self.budget,
-                                ),
+                                Some(data) => self
+                                    .runtime
+                                    .resume_with_io(IOResponse::ContentReady { data }, self.budget),
+                                None => self
+                                    .runtime
+                                    .resume_with_io(IOResponse::ContentNotFound, self.budget),
                             };
                             continue;
                         }
@@ -1138,7 +1137,11 @@ mod tests {
                 if error.contains("does not match") || error.contains("hash mismatch")),
             "should fail validation, got: {actions:?}"
         );
-        assert_eq!(engine.workflow_count(), 0, "should not create workflow on mismatch");
+        assert_eq!(
+            engine.workflow_count(),
+            0,
+            "should not create workflow on mismatch"
+        );
     }
 
     #[test]
@@ -1173,7 +1176,11 @@ mod tests {
             matches!(&actions[0], WorkflowAction::WorkflowFailed { error, .. } if error.contains("already exists")),
             "should reject recover over existing workflow, got: {actions:?}"
         );
-        assert_eq!(engine.workflow_count(), 1, "original workflow should be untouched");
+        assert_eq!(
+            engine.workflow_count(),
+            1,
+            "original workflow should be untouched"
+        );
     }
 
     #[test]
@@ -1235,7 +1242,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(first_complete.len(), 1, "exactly one should complete immediately");
+        assert_eq!(
+            first_complete.len(),
+            1,
+            "exactly one should complete immediately"
+        );
 
         // Tick to resume the deferred workflow.
         all_actions.extend(engine.tick());
@@ -1356,10 +1367,8 @@ mod tests {
             },
         ]);
 
-        let mut engine = WorkflowEngine::new(
-            Box::new(runtime),
-            InstructionBudget { fuel: 100_000 },
-        );
+        let mut engine =
+            WorkflowEngine::new(Box::new(runtime), InstructionBudget { fuel: 100_000 });
 
         let module_b = b"module_b".to_vec();
         let module_a = b"module_a".to_vec();

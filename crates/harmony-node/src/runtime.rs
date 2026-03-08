@@ -303,7 +303,11 @@ impl<B: BlobStore> NodeRuntime<B> {
 
     /// Current starvation counters (router, storage, compute).
     pub fn starvation_counters(&self) -> (u32, u32, u32) {
-        (self.router_starved, self.storage_starved, self.compute_starved)
+        (
+            self.router_starved,
+            self.storage_starved,
+            self.compute_starved,
+        )
     }
 
     /// Calculate the effective compute fuel budget based on data-plane queue depth.
@@ -378,7 +382,10 @@ impl<B: BlobStore> NodeRuntime<B> {
                             let module_hash = harmony_crypto::hash::blake3_hash(&module);
                             for (query_id, input) in pending {
                                 let wf_id = WorkflowId::new(&module_hash, &input);
-                                self.workflow_to_query.entry(wf_id).or_default().push(query_id);
+                                self.workflow_to_query
+                                    .entry(wf_id)
+                                    .or_default()
+                                    .push(query_id);
                                 let actions = self.workflow.handle(WorkflowEvent::Submit {
                                     module: module.clone(),
                                     input,
@@ -434,9 +441,19 @@ impl<B: BlobStore> NodeRuntime<B> {
         // Determine tier order: promote starved tiers to front.
         // Default order: [0=Router, 1=Storage, 2=Compute]
         let mut order = [0u8, 1, 2];
-        let starved = [self.router_starved, self.storage_starved, self.compute_starved];
+        let starved = [
+            self.router_starved,
+            self.storage_starved,
+            self.compute_starved,
+        ];
         // Stable sort: starved tiers (>= threshold) move to front, preserving original priority order
-        order.sort_by_key(|&tier| if starved[tier as usize] >= threshold { 0 } else { 1 });
+        order.sort_by_key(|&tier| {
+            if starved[tier as usize] >= threshold {
+                0
+            } else {
+                1
+            }
+        });
 
         // Emit direct replies (error responses, module fetch requests) buffered from
         // push_event. These are cross-tier concerns and should not move with tier reordering.
@@ -458,7 +475,11 @@ impl<B: BlobStore> NodeRuntime<B> {
                             None => break,
                         }
                     }
-                    if processed > 0 { self.router_starved = 0; } else { self.router_starved = self.router_starved.saturating_add(1); }
+                    if processed > 0 {
+                        self.router_starved = 0;
+                    } else {
+                        self.router_starved = self.router_starved.saturating_add(1);
+                    }
                 }
                 1 => {
                     // Tier 2: Storage
@@ -474,18 +495,28 @@ impl<B: BlobStore> NodeRuntime<B> {
                             None => break,
                         }
                     }
-                    if processed > 0 { self.storage_starved = 0; } else { self.storage_starved = self.storage_starved.saturating_add(1); }
+                    if processed > 0 {
+                        self.storage_starved = 0;
+                    } else {
+                        self.storage_starved = self.storage_starved.saturating_add(1);
+                    }
                 }
                 2 => {
                     // Tier 3: Compute — dispatch pending workflow actions, then one slice
                     let pending = std::mem::take(&mut self.pending_workflow_actions);
                     let had_pending = !pending.is_empty();
                     self.dispatch_workflow_actions(pending, &mut actions);
-                    let effective_budget = InstructionBudget { fuel: effective_fuel };
+                    let effective_budget = InstructionBudget {
+                        fuel: effective_fuel,
+                    };
                     let workflow_actions = self.workflow.tick_with_budget(effective_budget);
                     let had_work = had_pending || !workflow_actions.is_empty();
                     self.dispatch_workflow_actions(workflow_actions, &mut actions);
-                    if had_work { self.compute_starved = 0; } else { self.compute_starved = self.compute_starved.saturating_add(1); }
+                    if had_work {
+                        self.compute_starved = 0;
+                    } else {
+                        self.compute_starved = self.compute_starved.saturating_add(1);
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -563,7 +594,10 @@ impl<B: BlobStore> NodeRuntime<B> {
                 // deduplicates but we track all query_ids so every caller gets a reply.
                 let module_hash = harmony_crypto::hash::blake3_hash(&module);
                 let wf_id = WorkflowId::new(&module_hash, &input);
-                self.workflow_to_query.entry(wf_id).or_default().push(query_id);
+                self.workflow_to_query
+                    .entry(wf_id)
+                    .or_default()
+                    .push(query_id);
                 self.workflow.handle(WorkflowEvent::Submit {
                     module,
                     input,
@@ -637,7 +671,9 @@ impl<B: BlobStore> NodeRuntime<B> {
                 WorkflowAction::FetchModule { cid } => {
                     out.push(RuntimeAction::FetchModule { cid });
                 }
-                WorkflowAction::PersistHistory { workflow_id: _workflow_id } => {
+                WorkflowAction::PersistHistory {
+                    workflow_id: _workflow_id,
+                } => {
                     // TODO: Persist history (e.g., via Zenoh PUT or write-ahead log)
                     // BEFORE compacting. compact_workflow() clears replay_cache,
                     // saved_session, and module_bytes — after compaction, crash
@@ -974,7 +1010,7 @@ mod tests {
 
     /// Helper: build a valid CID hex string for test data.
     fn cid_hex_for(data: &[u8]) -> (ContentId, String) {
-        let cid = ContentId::for_blob(data).unwrap();
+        let cid = ContentId::for_blob(data, harmony_content::cid::ContentFlags::default()).unwrap();
         let hex = hex::encode(cid.to_bytes());
         (cid, hex)
     }
@@ -1478,19 +1514,29 @@ mod tests {
 
         // Tick 1: router=1, storage=1 (processes the stats query)
         let actions = rt.tick();
-        assert!(actions.iter().any(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. })));
 
         // Verify default order: router actions appear before storage actions.
         // SendOnInterface (router) should precede SendReply (storage) if any router events produce output.
         // At minimum, starvation counters confirm storage is not yet starved.
-        assert_eq!(rt.starvation_counters().1, 0, "storage processed, counter should be 0");
+        assert_eq!(
+            rt.starvation_counters().1,
+            0,
+            "storage processed, counter should be 0"
+        );
 
         rt.tick(); // tick 2: router=1, storage=0 (starved=1)
         assert_eq!(rt.starvation_counters().1, 1);
         rt.tick(); // tick 3: router=1, storage=0 (starved=2)
         assert_eq!(rt.starvation_counters().1, 2);
         rt.tick(); // tick 4: router=1, storage=0 (starved=3 → threshold hit)
-        assert_eq!(rt.starvation_counters().1, 3, "storage should hit starvation threshold");
+        assert_eq!(
+            rt.starvation_counters().1,
+            3,
+            "storage should hit starvation threshold"
+        );
 
         // Now push both a storage event AND a router event.
         // Without promotion, default order is [Router, Storage, Compute].
@@ -1505,19 +1551,32 @@ mod tests {
         // Tick 5: storage promoted → its actions should appear before router actions in output
         let actions = rt.tick();
         assert!(
-            actions.iter().any(|a| matches!(a, RuntimeAction::SendReply { query_id: 60, .. })),
+            actions
+                .iter()
+                .any(|a| matches!(a, RuntimeAction::SendReply { query_id: 60, .. })),
             "promoted storage tier should process its event"
         );
 
         // Verify promotion resets the starvation counter
-        assert_eq!(rt.starvation_counters().1, 0, "storage counter should reset after processing");
+        assert_eq!(
+            rt.starvation_counters().1,
+            0,
+            "storage counter should reset after processing"
+        );
 
         // Verify ordering: SendReply (storage) should appear before SendOnInterface (router)
         // because storage was promoted to process first.
-        let reply_pos = actions.iter().position(|a| matches!(a, RuntimeAction::SendReply { query_id: 60, .. }));
-        let send_pos = actions.iter().position(|a| matches!(a, RuntimeAction::SendOnInterface { .. }));
+        let reply_pos = actions
+            .iter()
+            .position(|a| matches!(a, RuntimeAction::SendReply { query_id: 60, .. }));
+        let send_pos = actions
+            .iter()
+            .position(|a| matches!(a, RuntimeAction::SendOnInterface { .. }));
         if let (Some(r), Some(s)) = (reply_pos, send_pos) {
-            assert!(r < s, "promoted storage actions should appear before router actions");
+            assert!(
+                r < s,
+                "promoted storage actions should appear before router actions"
+            );
         }
     }
 

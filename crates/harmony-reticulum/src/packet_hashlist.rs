@@ -1,7 +1,7 @@
-#[cfg(feature = "std")]
-use std::collections::HashSet;
 #[cfg(not(feature = "std"))]
 use hashbrown::HashSet;
+#[cfg(feature = "std")]
+use std::collections::HashSet;
 
 /// Default maximum capacity for the packet hashlist.
 pub const HASHLIST_DEFAULT_CAPACITY: usize = 1_000_000;

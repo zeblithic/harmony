@@ -783,6 +783,7 @@ version = "0.1.0"
 dependencies = [
  "harmony-content",
  "harmony-identity",
+ "harmony-zenoh",
  "hashbrown 0.15.5",
  "hex",
  "thiserror 2.0.18",

@@ -77,9 +77,7 @@ impl TlsConfig {
             }
             TlsMode::Acme => {
                 if self.acme_email.is_none() {
-                    return Err(
-                        "tls.acme_email is required when mode = \"acme\"".to_string(),
-                    );
+                    return Err("tls.acme_email is required when mode = \"acme\"".to_string());
                 }
             }
         }
@@ -239,10 +237,7 @@ announce_interval = 3600
 
         // TLS
         assert_eq!(config.tls.mode, TlsMode::Acme);
-        assert_eq!(
-            config.tls.acme_email.as_deref(),
-            Some("admin@example.com")
-        );
+        assert_eq!(config.tls.acme_email.as_deref(), Some("admin@example.com"));
         assert_eq!(config.tls.acme_challenge, "dns-01");
         assert!(config.tls.cert.is_none());
         assert!(config.tls.key.is_none());
@@ -354,7 +349,10 @@ node_config = "/tmp/node.toml"
 "#;
 
         let result = Config::from_toml(manual_tls);
-        assert!(result.is_err(), "manual mode without cert/key should fail validation");
+        assert!(
+            result.is_err(),
+            "manual mode without cert/key should fail validation"
+        );
     }
 
     #[test]
@@ -383,7 +381,10 @@ node_config = "/tmp/node.toml"
 "#;
 
         let result = Config::from_toml(bad_mode);
-        assert!(result.is_err(), "invalid TLS mode should fail deserialization");
+        assert!(
+            result.is_err(),
+            "invalid TLS mode should fail deserialization"
+        );
     }
 
     #[test]
@@ -412,7 +413,10 @@ node_config = "/tmp/node.toml"
 "#;
 
         let result = Config::from_toml(acme_no_email);
-        assert!(result.is_err(), "acme mode without acme_email should fail validation");
+        assert!(
+            result.is_err(),
+            "acme mode without acme_email should fail validation"
+        );
     }
 
     #[test]
@@ -424,6 +428,9 @@ identity_key = "/tmp/test.key"
 "#;
 
         let result = Config::from_toml(invalid);
-        assert!(result.is_err(), "should fail when required field is missing");
+        assert!(
+            result.is_err(),
+            "should fail when required field is missing"
+        );
     }
 }

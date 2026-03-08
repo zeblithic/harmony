@@ -1,9 +1,9 @@
-use alloc::vec::Vec;
 use crate::blob::BlobStore;
 use crate::bundle::{self, BundleBuilder, MAX_BUNDLE_ENTRIES};
 use crate::chunker::{chunk_all, ChunkerConfig};
 use crate::cid::{CidType, ContentId};
 use crate::error::ContentError;
+use alloc::vec::Vec;
 
 /// Ingest raw data into the content store, returning the root CID.
 ///

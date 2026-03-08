@@ -344,10 +344,7 @@ impl SmtpSession {
         let (local_part, domain) = split_address(&address);
         self.pending_rcpt = Some(local_part.clone());
 
-        vec![SmtpAction::ResolveHarmonyAddress {
-            local_part,
-            domain,
-        }]
+        vec![SmtpAction::ResolveHarmonyAddress { local_part, domain }]
     }
 
     fn handle_data(&mut self) -> Vec<SmtpAction> {
@@ -697,10 +694,7 @@ mod tests {
 
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Rset));
 
-        assert_eq!(
-            actions[0],
-            SmtpAction::SendResponse(250, "OK".to_string())
-        );
+        assert_eq!(actions[0], SmtpAction::SendResponse(250, "OK".to_string()));
         assert_eq!(
             session.state,
             SmtpState::GreetingSent,
@@ -726,13 +720,13 @@ mod tests {
         }));
 
         assert_eq!(session.state, SmtpState::MailFromReceived);
-        assert!(actions.len() >= 2, "expected at least 2 actions, got {actions:?}");
+        assert!(
+            actions.len() >= 2,
+            "expected at least 2 actions, got {actions:?}"
+        );
 
         // First action: 250 OK
-        assert_eq!(
-            actions[0],
-            SmtpAction::SendResponse(250, "OK".to_string())
-        );
+        assert_eq!(actions[0], SmtpAction::SendResponse(250, "OK".to_string()));
 
         // Second action: CheckSpf
         match &actions[1] {
@@ -886,10 +880,7 @@ mod tests {
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Quit));
         assert_eq!(session.state, SmtpState::Closed);
         assert_eq!(actions.len(), 2);
-        assert_eq!(
-            actions[0],
-            SmtpAction::SendResponse(221, "Bye".to_string())
-        );
+        assert_eq!(actions[0], SmtpAction::SendResponse(221, "Bye".to_string()));
         assert_eq!(actions[1], SmtpAction::Close);
 
         // Test QUIT from Ready state.
@@ -897,10 +888,7 @@ mod tests {
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Quit));
         assert_eq!(session.state, SmtpState::Closed);
         assert_eq!(actions.len(), 2);
-        assert_eq!(
-            actions[0],
-            SmtpAction::SendResponse(221, "Bye".to_string())
-        );
+        assert_eq!(actions[0], SmtpAction::SendResponse(221, "Bye".to_string()));
         assert_eq!(actions[1], SmtpAction::Close);
     }
 
@@ -937,10 +925,7 @@ mod tests {
         assert_eq!(session.state, SmtpState::MailFromReceived);
         // Should only have the 250 OK — no CheckSpf action.
         assert_eq!(actions.len(), 1);
-        assert_eq!(
-            actions[0],
-            SmtpAction::SendResponse(250, "OK".to_string())
-        );
+        assert_eq!(actions[0], SmtpAction::SendResponse(250, "OK".to_string()));
     }
 
     #[test]
@@ -1036,7 +1021,10 @@ mod tests {
             identity: Some([0xAA; ADDRESS_HASH_LEN]),
         });
 
-        assert!(actions.is_empty(), "stale resolution should produce no actions");
+        assert!(
+            actions.is_empty(),
+            "stale resolution should produce no actions"
+        );
         assert_eq!(
             session.pending_rcpt,
             Some("bob".to_string()),
@@ -1101,10 +1089,7 @@ mod tests {
         // I/O layer reports success.
         let actions = session.handle(SmtpEvent::DeliveryResult { success: true });
         assert_eq!(session.state, SmtpState::Ready);
-        assert_eq!(
-            actions[0],
-            SmtpAction::SendResponse(250, "OK".to_string())
-        );
+        assert_eq!(actions[0], SmtpAction::SendResponse(250, "OK".to_string()));
     }
 
     #[test]
@@ -1191,7 +1176,10 @@ mod tests {
         match &actions[0] {
             SmtpAction::SendResponse(code, msg) => {
                 assert_eq!(*code, 552);
-                assert!(msg.contains("too large"), "552 should mention too large: {msg}");
+                assert!(
+                    msg.contains("too large"),
+                    "552 should mention too large: {msg}"
+                );
             }
             other => panic!("expected SendResponse(552, ...), got {other:?}"),
         }
@@ -1210,10 +1198,7 @@ mod tests {
 
         // Delivery result should still work after the rejected QUIT.
         let actions = session.handle(SmtpEvent::DeliveryResult { success: true });
-        assert_eq!(
-            actions[0],
-            SmtpAction::SendResponse(250, "OK".to_string())
-        );
+        assert_eq!(actions[0], SmtpAction::SendResponse(250, "OK".to_string()));
     }
 
     #[test]
@@ -1250,7 +1235,11 @@ mod tests {
         let mut session = data_receiving_session();
 
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Rset));
-        assert_eq!(session.state, SmtpState::DataReceiving, "RSET should not change state during DataReceiving");
+        assert_eq!(
+            session.state,
+            SmtpState::DataReceiving,
+            "RSET should not change state during DataReceiving"
+        );
         match &actions[0] {
             SmtpAction::SendResponse(code, _) => assert_eq!(*code, 503),
             other => panic!("expected 503, got {other:?}"),
@@ -1282,8 +1271,15 @@ mod tests {
             local_part: "bob".to_string(),
             identity: Some([0xBB; ADDRESS_HASH_LEN]),
         });
-        assert!(actions.is_empty(), "late resolution on closed session should be ignored");
-        assert_eq!(session.state, SmtpState::Closed, "closed session should stay closed");
+        assert!(
+            actions.is_empty(),
+            "late resolution on closed session should be ignored"
+        );
+        assert_eq!(
+            session.state,
+            SmtpState::Closed,
+            "closed session should stay closed"
+        );
     }
 
     #[test]
@@ -1292,7 +1288,11 @@ mod tests {
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
             domain: String::new(),
         }));
-        assert_eq!(session.state, SmtpState::GreetingSent, "state should not change");
+        assert_eq!(
+            session.state,
+            SmtpState::GreetingSent,
+            "state should not change"
+        );
         match &actions[0] {
             SmtpAction::SendResponse(code, _) => assert_eq!(*code, 501),
             other => panic!("expected 501, got {other:?}"),
@@ -1305,7 +1305,11 @@ mod tests {
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Helo {
             domain: String::new(),
         }));
-        assert_eq!(session.state, SmtpState::GreetingSent, "state should not change");
+        assert_eq!(
+            session.state,
+            SmtpState::GreetingSent,
+            "state should not change"
+        );
         match &actions[0] {
             SmtpAction::SendResponse(code, _) => assert_eq!(*code, 501),
             other => panic!("expected 501, got {other:?}"),
@@ -1361,7 +1365,10 @@ mod tests {
         assert_eq!(session.state, SmtpState::Closed);
 
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Quit));
-        assert!(actions.is_empty(), "QUIT on closed session should produce no actions");
+        assert!(
+            actions.is_empty(),
+            "QUIT on closed session should produce no actions"
+        );
         assert_eq!(session.state, SmtpState::Closed);
     }
 
@@ -1374,7 +1381,11 @@ mod tests {
         assert_eq!(session.state, SmtpState::DataReceiving);
 
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Quit));
-        assert_eq!(session.state, SmtpState::DataReceiving, "QUIT must not exit DataReceiving");
+        assert_eq!(
+            session.state,
+            SmtpState::DataReceiving,
+            "QUIT must not exit DataReceiving"
+        );
         match &actions[0] {
             SmtpAction::SendResponse(code, _) => assert_eq!(*code, 503),
             other => panic!("expected 503, got {other:?}"),
@@ -1389,7 +1400,11 @@ mod tests {
         assert_eq!(session.state, SmtpState::Closed);
 
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::Rset));
-        assert_eq!(session.state, SmtpState::Closed, "Closed is terminal — RSET must not change it");
+        assert_eq!(
+            session.state,
+            SmtpState::Closed,
+            "Closed is terminal — RSET must not change it"
+        );
         assert!(actions.is_empty(), "RSET on Closed must not emit actions");
     }
 
@@ -1433,7 +1448,9 @@ mod tests {
             identity: Some([0xBB; ADDRESS_HASH_LEN]),
         });
         session.handle(SmtpEvent::Command(SmtpCommand::Data));
-        session.handle(SmtpEvent::DataComplete(b"Subject: test\r\n\r\nbody".to_vec()));
+        session.handle(SmtpEvent::DataComplete(
+            b"Subject: test\r\n\r\nbody".to_vec(),
+        ));
         assert_eq!(session.state, SmtpState::DeliveryPending);
         session
     }

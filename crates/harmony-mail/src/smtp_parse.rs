@@ -17,8 +17,8 @@ pub fn parse_command(line: &[u8]) -> Result<SmtpCommand, MailError> {
         other => other,
     };
 
-    let text = std::str::from_utf8(line)
-        .map_err(|_| MailError::InvalidUtf8 { field: "command" })?;
+    let text =
+        std::str::from_utf8(line).map_err(|_| MailError::InvalidUtf8 { field: "command" })?;
 
     let text = text.trim();
     if text.is_empty() {
@@ -35,30 +35,22 @@ pub fn parse_command(line: &[u8]) -> Result<SmtpCommand, MailError> {
 
     match verb_upper.as_str() {
         "EHLO" => {
-            let domain = rest
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
+            let domain = rest.map(|s| s.trim().to_string()).unwrap_or_default();
             Ok(SmtpCommand::Ehlo { domain })
         }
         "HELO" => {
-            let domain = rest
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
+            let domain = rest.map(|s| s.trim().to_string()).unwrap_or_default();
             Ok(SmtpCommand::Helo { domain })
         }
         "MAIL" => {
             // Expect "FROM:<address> [params]"
-            let rest = rest.ok_or_else(|| {
-                MailError::UnknownCommand("MAIL".to_string())
-            })?;
+            let rest = rest.ok_or_else(|| MailError::UnknownCommand("MAIL".to_string()))?;
             let address = parse_mail_from_arg(rest)?;
             Ok(SmtpCommand::MailFrom { address })
         }
         "RCPT" => {
             // Expect "TO:<address>"
-            let rest = rest.ok_or_else(|| {
-                MailError::UnknownCommand("RCPT".to_string())
-            })?;
+            let rest = rest.ok_or_else(|| MailError::UnknownCommand("RCPT".to_string()))?;
             let address = parse_rcpt_to_arg(rest)?;
             Ok(SmtpCommand::RcptTo { address })
         }
@@ -79,7 +71,11 @@ fn parse_mail_from_arg(arg: &str) -> Result<String, MailError> {
     let arg = arg.trim();
     // Strip the "FROM:" prefix (case-insensitive).
     // Compare at byte level to avoid panics on multi-byte UTF-8 boundaries.
-    let after_from = if arg.as_bytes().get(..5).is_some_and(|b| b.eq_ignore_ascii_case(b"FROM:")) {
+    let after_from = if arg
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"FROM:"))
+    {
         &arg[5..]
     } else {
         return Err(MailError::UnknownCommand("MAIL".to_string()));
@@ -96,7 +92,11 @@ fn parse_rcpt_to_arg(arg: &str) -> Result<String, MailError> {
     let arg = arg.trim();
     // Strip the "TO:" prefix (case-insensitive).
     // Compare at byte level to avoid panics on multi-byte UTF-8 boundaries.
-    let after_to = if arg.as_bytes().get(..3).is_some_and(|b| b.eq_ignore_ascii_case(b"TO:")) {
+    let after_to = if arg
+        .as_bytes()
+        .get(..3)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"TO:"))
+    {
         &arg[3..]
     } else {
         return Err(MailError::UnknownCommand("RCPT".to_string()));
@@ -126,10 +126,7 @@ fn extract_address(s: &str) -> Result<String, MailError> {
             .ok_or_else(|| MailError::UnknownCommand("unclosed angle bracket".to_string()));
     }
     // No brackets — take up to first whitespace.
-    Ok(s.split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string())
+    Ok(s.split_whitespace().next().unwrap_or("").to_string())
 }
 
 #[cfg(test)]
@@ -171,8 +168,7 @@ mod tests {
 
     #[test]
     fn parse_mail_from_with_size() {
-        let cmd =
-            parse_command(b"MAIL FROM:<sender@example.com> SIZE=1024\r\n").unwrap();
+        let cmd = parse_command(b"MAIL FROM:<sender@example.com> SIZE=1024\r\n").unwrap();
         assert_eq!(
             cmd,
             SmtpCommand::MailFrom {
