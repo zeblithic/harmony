@@ -15,7 +15,7 @@ path = "src/main.rs"
 harmony-identity.workspace = true
 ed25519-dalek.workspace = true
 thiserror.workspace = true
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "std"] }
 toml.workspace = true
 clap.workspace = true
 
