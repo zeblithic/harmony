@@ -45,6 +45,10 @@ fn vine_announce_pattern(addr_hex: &str) -> String {
 ///
 /// Tracks followed creators, vine items, and viewed state.
 /// The caller feeds events and receives actions to perform.
+///
+/// **Note:** The `items` map grows without bound as announcements arrive.
+/// Callers are responsible for bounding feed size (e.g. evicting old items
+/// or limiting the number of followed creators) before it becomes a problem.
 pub struct VineFeed {
     followed: hashbrown::HashSet<[u8; 16]>,
     items: BTreeMap<(u64, [u8; 32]), VineFeedItem>,
@@ -78,9 +82,10 @@ impl VineFeed {
                     return vec![];
                 }
                 // Purge viewed CIDs for this creator before removing items.
-                let had_items = self.items.values().any(|item| item.creator == address);
+                let mut had_items = false;
                 for item in self.items.values() {
                     if item.creator == address {
+                        had_items = true;
                         self.viewed.remove(&item.bundle_cid);
                     }
                 }
