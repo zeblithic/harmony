@@ -806,6 +806,8 @@ dependencies = [
  "harmony-zenoh",
  "hashbrown 0.15.5",
  "hex",
+ "postcard",
+ "serde",
  "thiserror 2.0.18",
 ]
 

@@ -54,6 +54,19 @@ fn mime_hint_unknown_for_unrecognized() {
 }
 
 #[test]
+fn mime_hint_video() {
+    assert_eq!(MimeHint::from_mime_bytes(*b"vine/vid"), MimeHint::Video);
+}
+
+#[test]
+fn mime_hint_compilation() {
+    assert_eq!(
+        MimeHint::from_mime_bytes(*b"vine/cmp"),
+        MimeHint::Compilation
+    );
+}
+
+#[test]
 fn trust_decision_default_is_unknown() {
     assert_eq!(TrustDecision::default(), TrustDecision::Unknown);
 }
