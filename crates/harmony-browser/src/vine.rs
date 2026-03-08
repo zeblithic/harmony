@@ -145,6 +145,15 @@ impl VineFeed {
         self.items.values().rev().collect()
     }
 
+    /// Returns an iterator over all currently-followed creator addresses.
+    ///
+    /// Useful for re-issuing `Subscribe` actions after a transport reconnect,
+    /// since `FollowCreator` is idempotent and won't re-emit subscriptions
+    /// for creators already in the followed set.
+    pub fn followed_creators(&self) -> impl Iterator<Item = &[u8; 16]> {
+        self.followed.iter()
+    }
+
     /// Returns whether the given address is followed.
     pub fn is_followed(&self, address: &[u8; 16]) -> bool {
         self.followed.contains(address)
@@ -421,6 +430,25 @@ mod tests {
             bundle_cid: cid_from(99),
         });
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn followed_creators_returns_all_followed() {
+        let mut feed = VineFeed::new();
+        assert_eq!(feed.followed_creators().count(), 0);
+
+        let _ = feed.handle_event(VineEvent::FollowCreator {
+            address: creator_a(),
+        });
+        let creators: Vec<_> = feed.followed_creators().collect();
+        assert_eq!(creators.len(), 1);
+        assert!(creators.contains(&&creator_a()));
+
+        // After unfollow, should be empty again.
+        let _ = feed.handle_event(VineEvent::UnfollowCreator {
+            address: creator_a(),
+        });
+        assert_eq!(feed.followed_creators().count(), 0);
     }
 
     #[test]

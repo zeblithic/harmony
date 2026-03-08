@@ -11,6 +11,11 @@ pub const MIME_VINE_VIDEO: [u8; 8] = *b"vine/vid";
 pub const MIME_VINE_COMPILATION: [u8; 8] = *b"vine/cmp";
 
 /// Maximum allowed length for a vine title, in bytes.
+///
+/// Byte-based (not character-based) because the wire format and storage
+/// layer care about serialized size. This means multi-byte scripts (CJK,
+/// emoji) get fewer visible characters — an intentional trade-off for
+/// predictable payload sizes.
 pub const MAX_TITLE_LEN: usize = 140;
 
 /// Descriptor for a vine video, carrying creator identity and optional metadata.
