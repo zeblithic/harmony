@@ -196,3 +196,20 @@ Most architectures organize by *layer* (network, storage, compute, presentation)
 The key insight: traditional systems over-invest in Red (building) and Magenta (UX) while under-investing in Green (maintenance), Cyan (protection), and Yellow (observability). Blue (transformation) is often treated as library code rather than a core system concern. This taxonomy gives each concern equal architectural weight.
 
 The order of magnitude reduction in humanity's digital footprint that Green promises is only achievable because Yellow knows what's actually being used, Blue can deduplicate and compress intelligently, and Cyan ensures that cleanup operations can't accidentally destroy something important. No color works alone.
+
+---
+
+## Case Study: Roxy (Content Licensing)
+
+See `2026-03-08-roxy-content-licensing-design.md` for the full design. Roxy demonstrates how a single feature touches every color:
+
+| Color | Roxy role |
+|---|---|
+| **Red** | License manifest authoring, catalog publishing |
+| **Blue** | Key wrapping (ECDH + ChaCha20), CBOR serialization |
+| **Yellow** | Zenoh catalog discovery, semantic search indexing |
+| **Cyan** | UCAN access control, revocation enforcement |
+| **Green** | Cache lifecycle — immediate eviction on license expiry |
+| **Magenta** | Artist profiles, consumer UX, expiry notifications |
+| **Lyll** | Content addressing (provable hashes), creator attestation |
+| **Nakaiah** | Encrypted content storage, per-consumer key wrapping, consent |
