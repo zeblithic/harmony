@@ -1192,37 +1192,28 @@ mod tests {
     #[test]
     fn canonical_vector_empty_blob() {
         let cid = ContentId::for_blob(b"", ContentFlags::default()).unwrap();
-        let bytes = cid.to_bytes();
         // SHA-256("")[:28] with top 3 bits cleared: e3 & 0x1F = 0x03
         assert_eq!(cid.hash[0], 0x03);
         assert_eq!(cid.payload_size(), 0);
         assert_eq!(cid.cid_type(), CidType::Blob);
-        // Full 32-byte canonical hex — print for reference if this needs updating
-        let hex = hex::encode(bytes);
+        // Full 32-byte canonical hex (independently verifiable by other implementations)
         assert_eq!(
-            hex,
-            format!(
-                "03b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b{}",
-                &hex[56..] // size+tag portion
-            ),
+            hex::encode(cid.to_bytes()),
+            "03b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b000002ca",
         );
     }
 
     #[test]
     fn canonical_vector_hello_blob() {
         let cid = ContentId::for_blob(b"hello", ContentFlags::default()).unwrap();
-        let bytes = cid.to_bytes();
         // SHA-256("hello")[:28] with top 3 bits cleared: 2c & 0x1F = 0x0c
         assert_eq!(cid.hash[0], 0x0c);
         assert_eq!(cid.payload_size(), 5);
         assert_eq!(cid.cid_type(), CidType::Blob);
-        let hex = hex::encode(bytes);
+        // Full 32-byte canonical hex (independently verifiable by other implementations)
         assert_eq!(
-            hex,
-            format!(
-                "0cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362{}",
-                &hex[56..] // size+tag portion
-            ),
+            hex::encode(cid.to_bytes()),
+            "0cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e7304336200005020",
         );
     }
 
@@ -1320,5 +1311,34 @@ mod tests {
         assert!(cid.flags().ephemeral);
         assert!(cid.flags().alt_hash);
         assert!(cid.verify_hash(b"hello"));
+    }
+
+    #[test]
+    fn cross_flag_verify_hash_rejection() {
+        // CID created with SHA-256 should fail verification if the alt_hash
+        // bit is flipped (verify would use SHA-224, producing a different digest).
+        let cid_256 = ContentId::for_blob(b"hello", ContentFlags::default()).unwrap();
+        let cid_224 = ContentId::for_blob(
+            b"hello",
+            ContentFlags {
+                alt_hash: true,
+                ..ContentFlags::default()
+            },
+        )
+        .unwrap();
+
+        // Both verify against the same data with their own algorithm.
+        assert!(cid_256.verify_hash(b"hello"));
+        assert!(cid_224.verify_hash(b"hello"));
+
+        // But they produce different CIDs (different hash bytes).
+        assert_ne!(cid_256, cid_224);
+        assert_ne!(cid_256.hash[1..], cid_224.hash[1..]);
+
+        // Manually flip alt_hash bit on the SHA-256 CID — verify must fail
+        // because the hash body is SHA-256 but verify now uses SHA-224.
+        let mut corrupted = cid_256;
+        corrupted.hash[0] |= 0x20; // set alt_hash bit
+        assert!(!corrupted.verify_hash(b"hello"));
     }
 }
