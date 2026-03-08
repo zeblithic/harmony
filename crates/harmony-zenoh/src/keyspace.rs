@@ -188,6 +188,16 @@ pub fn vine_announce_sub(creator_addr_hex: &str) -> Result<OwnedKeyExpr, ZenohEr
     ))
 }
 
+/// Build a vine reaction subscription pattern.
+///
+/// Pattern: `harmony/vines/{target_creator_hex}/reactions/**`
+pub fn vine_reaction_sub(target_creator_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(target_creator_hex)?;
+    ke(&format!(
+        "harmony/vines/{target_creator_hex}/reactions/**"
+    ))
+}
+
 /// Build a vine reaction key expression.
 ///
 /// Pattern: `harmony/vines/{target_creator_hex}/reactions/{bundle_cid_hex}/{reactor_hex}`
@@ -520,9 +530,35 @@ mod tests {
     }
 
     #[test]
+    fn vine_announce_sub_matches_key() {
+        let sub = vine_announce_sub("aa11bb22").unwrap();
+        let key = vine_announce_key("aa11bb22", "cid0099").unwrap();
+        assert!(sub.intersects(&key));
+
+        let other = vine_announce_key("cc33dd44", "cid0099").unwrap();
+        assert!(!sub.intersects(&other));
+    }
+
+    #[test]
     fn vine_announce_key_rejects_slash() {
         assert!(vine_announce_key("aa/bb", "cid01").is_err());
         assert!(vine_announce_key("aabb", "cid/01").is_err());
+    }
+
+    #[test]
+    fn vine_reaction_sub_valid() {
+        let k = vine_reaction_sub("creator01").unwrap();
+        assert_eq!(k.as_str(), "harmony/vines/creator01/reactions/**");
+    }
+
+    #[test]
+    fn vine_reaction_sub_matches_key() {
+        let sub = vine_reaction_sub("creator01").unwrap();
+        let key = vine_reaction_key("creator01", "bundle99", "reactor02").unwrap();
+        assert!(sub.intersects(&key));
+
+        let other = vine_reaction_key("creator02", "bundle99", "reactor02").unwrap();
+        assert!(!sub.intersects(&other));
     }
 
     #[test]
@@ -559,6 +595,7 @@ mod tests {
     #[test]
     fn vine_keys_reject_slashes() {
         assert!(vine_announce_sub("aa/bb").is_err());
+        assert!(vine_reaction_sub("cre/ator").is_err());
         assert!(vine_reaction_key("cre/ator", "bundle", "reactor").is_err());
         assert!(vine_reaction_key("creator", "bun/dle", "reactor").is_err());
         assert!(vine_reaction_key("creator", "bundle", "rea/ctor").is_err());

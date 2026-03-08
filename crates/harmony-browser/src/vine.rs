@@ -10,6 +10,7 @@ pub struct VineFeedItem {
     pub bundle_cid: [u8; 32],
     pub video_cid: [u8; 32],
     pub creator: [u8; 16],
+    /// Unix timestamp in seconds when the vine was created.
     pub timestamp: u64,
     pub title: Option<String>,
     pub reshare_of: Option<[u8; 32]>,
