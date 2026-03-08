@@ -1227,10 +1227,22 @@ mod tests {
             ContentId::for_bundle(&bundle_bytes, &children, ContentFlags::default()).unwrap();
         assert_eq!(bundle.payload_size(), 64); // 2 x 32 bytes
         assert_eq!(bundle.cid_type(), CidType::Bundle(1));
-        // Top 3 bits cleared
         assert_eq!(bundle.hash[0] & 0xE0, 0x00);
-        // Verify hash still matches
         assert!(bundle.verify_hash(&bundle_bytes));
+        // Full 32-byte canonical hex (independently verifiable by other implementations).
+        // Pin child CIDs so the bundle hash is fully determined:
+        assert_eq!(
+            hex::encode(blob_a.to_bytes()),
+            "1834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af00003537",
+        );
+        assert_eq!(
+            hex::encode(blob_b.to_bytes()),
+            "1e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c93558000035db",
+        );
+        assert_eq!(
+            hex::encode(bundle.to_bytes()),
+            "05d0f2f83241a0222a2b84ac33993064e525a8b186fdf4b5784326b00004083c",
+        );
     }
 
     // -----------------------------------------------------------------------
