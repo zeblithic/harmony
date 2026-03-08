@@ -49,6 +49,7 @@ fn vine_announce_pattern(addr_hex: &str) -> String {
 /// **Note:** The `items` map grows without bound as announcements arrive.
 /// Callers are responsible for bounding feed size (e.g. evicting old items
 /// or limiting the number of followed creators) before it becomes a problem.
+#[derive(Debug)]
 pub struct VineFeed {
     followed: hashbrown::HashSet<[u8; 16]>,
     items: BTreeMap<(u64, [u8; 32]), VineFeedItem>,
