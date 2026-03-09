@@ -276,7 +276,7 @@ signers = ["did:key:z6MkFirst", "did:key:z6MkSecond"]
         assert_eq!(manifest.name, "supply-chain");
 
         // Capabilities parsed correctly.
-        let caps = &manifest.capabilities.declarations;
+        let caps = manifest.capabilities.declarations();
         assert_eq!(caps.len(), 8); // 2 subscribe + 1 publish + 1 fetch + 1 store + 1 infer + 1 spawn + 1 seal
         assert!(caps.contains(&CapabilityDecl::Subscribe {
             topic: "orders/**".into()

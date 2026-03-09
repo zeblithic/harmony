@@ -63,7 +63,7 @@ pub enum CapabilityDecl {
 /// The set of capabilities declared by a Kitri program.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapabilitySet {
-    pub declarations: Vec<CapabilityDecl>,
+    declarations: Vec<CapabilityDecl>,
 }
 
 impl CapabilitySet {
@@ -75,6 +75,10 @@ impl CapabilitySet {
         if !self.declarations.contains(&decl) {
             self.declarations.push(decl);
         }
+    }
+
+    pub fn declarations(&self) -> &[CapabilityDecl] {
+        &self.declarations
     }
 
     pub fn is_empty(&self) -> bool {

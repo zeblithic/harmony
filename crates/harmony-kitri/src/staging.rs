@@ -45,6 +45,14 @@ impl StagingBuffer {
         core::mem::take(&mut self.writes)
     }
 
+    /// Remove a staged write by sequence number.
+    ///
+    /// Called when an I/O operation fails — the side effect never executed,
+    /// so it must not be committed on workflow completion.
+    pub fn unstage(&mut self, seq: u64) {
+        self.writes.retain(|w| w.seq != seq);
+    }
+
     /// Discard all staged writes (workflow failed or was killed).
     pub fn discard_all(&mut self) {
         self.writes.clear();
@@ -85,6 +93,31 @@ mod tests {
         let committed = buf.commit_all();
         assert_eq!(committed.len(), 1);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn staging_buffer_unstage_by_seq() {
+        let mut buf = StagingBuffer::new();
+        buf.stage(StagedWrite {
+            seq: 0,
+            op: KitriIoOp::Publish {
+                topic: "t".into(),
+                payload: vec![1],
+            },
+        });
+        buf.stage(StagedWrite {
+            seq: 1,
+            op: KitriIoOp::Store { data: vec![2] },
+        });
+        assert_eq!(buf.len(), 2);
+
+        buf.unstage(0);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.pending()[0].seq, 1);
+
+        // Unstaging a non-existent seq is a no-op.
+        buf.unstage(99);
+        assert_eq!(buf.len(), 1);
     }
 
     #[test]

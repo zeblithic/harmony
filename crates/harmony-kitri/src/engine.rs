@@ -123,14 +123,12 @@ pub enum KitriWorkflowStatus {
 
 /// Internal state for a single workflow.
 struct WorkflowState {
-    #[allow(dead_code)]
     program: KitriProgram,
     status: KitriWorkflowStatus,
     event_log: KitriEventLog,
     staging: StagingBuffer,
     compensation: CompensationLog,
     next_seq: u64,
-    #[allow(dead_code)]
     output: Option<Vec<u8>>,
     /// Error message deferred until compensation completes.
     pending_error: Option<String>,
@@ -157,6 +155,15 @@ impl KitriEngine {
     /// Query the current status of a workflow by ID.
     pub fn status(&self, workflow_id: &[u8; 32]) -> Option<KitriWorkflowStatus> {
         self.workflows.get(workflow_id).map(|w| w.status)
+    }
+
+    /// Retrieve the output of a completed workflow.
+    ///
+    /// Returns `Some` only if the workflow has reached `Complete` status.
+    pub fn output(&self, workflow_id: &[u8; 32]) -> Option<&[u8]> {
+        self.workflows
+            .get(workflow_id)
+            .and_then(|w| w.output.as_deref())
     }
 
     /// Returns the number of tracked workflows.
@@ -204,6 +211,12 @@ impl KitriEngine {
 
         if let Some(existing) = self.workflows.get_mut(&wf_id) {
             if existing.status == KitriWorkflowStatus::Failed {
+                // Enforce retry policy: reject re-submission if max_retries exhausted.
+                let max_retries = existing.program.retry_policy.max_retries;
+                if existing.attempt >= max_retries {
+                    return vec![KitriAction::Deduplicated { workflow_id: wf_id }];
+                }
+
                 // Allow retry of failed workflows. The event log is preserved
                 // as an audit trail (not for cached-result dedup — new I/O gets
                 // new seq numbers). Append a WorkflowRestarted boundary event
@@ -315,6 +328,13 @@ impl KitriEngine {
         }
 
         state.status = KitriWorkflowStatus::Executing;
+
+        // If the I/O failed, remove the corresponding staged write.
+        // The side effect never executed, so it must not be committed
+        // on workflow completion.
+        if matches!(result, KitriIoResult::Failed { .. }) {
+            state.staging.unstage(seq);
+        }
 
         state
             .event_log
@@ -547,7 +567,7 @@ impl Default for KitriEngine {
 mod tests {
     use crate::io::{KitriIoOp, KitriIoResult};
     use crate::program::{kitri_workflow_id, KitriProgram};
-    use crate::retry::RetryPolicy;
+    use crate::retry::{BackoffStrategy, RetryPolicy};
     use crate::trust::{CapabilitySet, TrustTier};
 
     use super::*;
@@ -1320,7 +1340,7 @@ mod tests {
             topic: "foo".into(),
         }); // duplicate
 
-        assert_eq!(caps.declarations.len(), 2);
+        assert_eq!(caps.declarations().len(), 2);
     }
 
     #[test]
@@ -1526,5 +1546,187 @@ mod tests {
 
         // Only attempt 2's checkpoint is returned.
         assert_eq!(log.last_checkpoint(), Some((8, [0xBB; 32])));
+    }
+
+    #[test]
+    fn engine_failed_io_unstages_side_effect() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+
+        // Request a side-effect I/O (Publish → staged).
+        engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Publish {
+                topic: "test/out".into(),
+                payload: vec![42],
+            },
+        });
+
+        // I/O fails — the staged write should be removed.
+        engine.handle(KitriEngineEvent::IoResolved {
+            workflow_id: wf_id,
+            seq: 0,
+            result: KitriIoResult::Failed {
+                error: "timeout".into(),
+            },
+        });
+
+        // Workflow completes — should NOT emit CommitStagedWrite for the failed I/O.
+        let actions = engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![99],
+        });
+
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::CommitStagedWrite { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::Complete { .. })));
+    }
+
+    #[test]
+    fn engine_successful_io_keeps_staged_write() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+
+        // Request a side-effect I/O (Publish → staged).
+        engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Publish {
+                topic: "test/out".into(),
+                payload: vec![42],
+            },
+        });
+
+        // I/O succeeds — staged write remains.
+        engine.handle(KitriEngineEvent::IoResolved {
+            workflow_id: wf_id,
+            seq: 0,
+            result: KitriIoResult::Published,
+        });
+
+        // Workflow completes — should emit CommitStagedWrite.
+        let actions = engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![99],
+        });
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::CommitStagedWrite { .. })));
+    }
+
+    #[test]
+    fn engine_retry_policy_enforced() {
+        let mut engine = KitriEngine::new();
+        let mut program = test_program();
+        program.retry_policy = RetryPolicy {
+            max_retries: 2,
+            backoff: BackoffStrategy::Fixed { interval_ms: 100 },
+            timeout_ms: 0,
+        };
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        // First run → fail.
+        engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "transient".into(),
+        });
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Failed));
+
+        // Retry 1 (attempt=1) → accepted.
+        let actions = engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::WorkflowAccepted { .. })));
+
+        // Fail again.
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "transient again".into(),
+        });
+
+        // Retry 2 (attempt=2) → accepted (max_retries=2).
+        let actions = engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::WorkflowAccepted { .. })));
+
+        // Fail again.
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "transient yet again".into(),
+        });
+
+        // Retry 3 (attempt=3 >= max_retries=2) → rejected as deduplicated.
+        let actions = engine.handle(KitriEngineEvent::Submit { program, input });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::Deduplicated { .. })));
+    }
+
+    #[test]
+    fn engine_retry_policy_none_rejects_immediately() {
+        let mut engine = KitriEngine::new();
+        let mut program = test_program();
+        program.retry_policy = RetryPolicy::none();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "fatal".into(),
+        });
+
+        // max_retries=0 → first retry attempt rejected.
+        let actions = engine.handle(KitriEngineEvent::Submit { program, input });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::Deduplicated { .. })));
+    }
+
+    #[test]
+    fn engine_output_query() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+
+        // Output is None before completion.
+        assert_eq!(engine.output(&wf_id), None);
+
+        engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![42, 43],
+        });
+
+        // Output is available after completion.
+        assert_eq!(engine.output(&wf_id), Some(&[42, 43][..]));
     }
 }
