@@ -58,6 +58,8 @@ impl StagingBuffer {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::io::KitriIoOp;
 

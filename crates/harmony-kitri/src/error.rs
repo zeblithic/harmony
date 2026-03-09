@@ -51,6 +51,8 @@ pub type KitriResult<T> = Result<T, KitriError>;
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
 
     #[test]

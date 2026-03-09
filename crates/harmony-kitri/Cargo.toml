@@ -11,18 +11,12 @@ description = "Kitri — Harmony's native programming model for durable distribu
 default = ["std"]
 std = [
     "harmony-crypto/std",
-    "harmony-content/std",
-    "harmony-identity/std",
     "serde/std",
-    "dep:harmony-workflow",
     "dep:toml",
 ]
 
 [dependencies]
 harmony-crypto = { workspace = true, default-features = false }
-harmony-workflow = { workspace = true, optional = true }
-harmony-content = { workspace = true, default-features = false }
-harmony-identity = { workspace = true, default-features = false }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 toml = { workspace = true, optional = true }
 

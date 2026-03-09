@@ -134,10 +134,11 @@ mod parsing {
 
 #[cfg(test)]
 mod tests {
-    #![allow(unused_imports)]
+    use alloc::vec;
+
     use super::*;
-    use crate::retry::{BackoffStrategy, RetryPolicy};
-    use crate::trust::{CapabilityDecl, CapabilitySet, TrustTier};
+    use crate::retry::RetryPolicy;
+    use crate::trust::CapabilitySet;
 
     #[test]
     fn manifest_creation() {
