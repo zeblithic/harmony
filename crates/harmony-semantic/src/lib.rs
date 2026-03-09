@@ -6,7 +6,11 @@
 extern crate alloc;
 
 pub mod error;
+pub mod fingerprint;
+pub mod sidecar;
 pub mod tier;
 
 pub use error::{SemanticError, SemanticResult};
+pub use fingerprint::{model_fingerprint, ModelFingerprint};
+pub use sidecar::{SidecarHeader, SIDECAR_HEADER_SIZE, SIDECAR_V1_MAGIC, SIDECAR_V2_MAGIC};
 pub use tier::EmbeddingTier;
