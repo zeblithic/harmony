@@ -13,6 +13,8 @@ members = [
     "crates/harmony-platform",
     "crates/harmony-reticulum",
     "crates/harmony-roxy",
+    "crates/harmony-oluo",
+    "crates/harmony-semantic",
     "crates/harmony-workflow",
     "crates/harmony-zenoh",
 ]
@@ -53,6 +55,7 @@ rmp = { version = "0.8", default-features = false }
 bitflags = { version = "2", default-features = false }
 hex = "0.4"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+ciborium = { version = "0.2", default-features = false }
 
 # WASM runtime
 wasmi = "1"
@@ -75,5 +78,7 @@ harmony-kitri = { path = "crates/harmony-kitri", default-features = false }
 harmony-platform = { path = "crates/harmony-platform", default-features = false }
 harmony-reticulum = { path = "crates/harmony-reticulum", default-features = false }
 harmony-roxy = { path = "crates/harmony-roxy", default-features = false }
+harmony-oluo = { path = "crates/harmony-oluo", default-features = false }
+harmony-semantic = { path = "crates/harmony-semantic", default-features = false }
 harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }

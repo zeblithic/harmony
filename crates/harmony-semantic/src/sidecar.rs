@@ -1,0 +1,469 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+//! Sidecar blob codec — encode/decode the 288-byte HSI fixed header
+//! and the enriched v2 sidecar with CBOR metadata trailer.
+
+use crate::error::{SemanticError, SemanticResult};
+use crate::fingerprint::ModelFingerprint;
+use crate::metadata::SidecarMetadata;
+
+/// HSI v1 magic bytes: "HSI" + version 1.
+pub const SIDECAR_V1_MAGIC: [u8; 4] = [0x48, 0x53, 0x49, 0x01];
+/// HSI v2 magic bytes: "HSI" + version 2 (enriched sidecar with CBOR trailer).
+pub const SIDECAR_V2_MAGIC: [u8; 4] = [0x48, 0x53, 0x49, 0x02];
+/// Size of the fixed header (both v1 and v2).
+pub const SIDECAR_HEADER_SIZE: usize = 288;
+
+/// Decoded sidecar fixed header.
+///
+/// Contains the multi-tier binary embedding vectors for a single piece
+/// of content. Tiers are nested prefixes of the same MRL vector — Tier 1
+/// is the first 64 bits, Tier 2 is the first 128, and so on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarHeader {
+    /// Model fingerprint (SHA-256(model_id)[:4]).
+    pub fingerprint: ModelFingerprint,
+    /// CID of the content this sidecar describes (32 bytes).
+    pub target_cid: [u8; 32],
+    /// Tier 1: 64-bit binary vector (8 bytes).
+    pub tier1: [u8; 8],
+    /// Tier 2: 128-bit binary vector (16 bytes).
+    pub tier2: [u8; 16],
+    /// Tier 3: 256-bit binary vector (32 bytes).
+    pub tier3: [u8; 32],
+    /// Tier 4: 512-bit binary vector (64 bytes).
+    pub tier4: [u8; 64],
+    /// Tier 5: 1024-bit binary vector (128 bytes).
+    pub tier5: [u8; 128],
+}
+
+impl SidecarHeader {
+    /// Encode the header as a 288-byte v1 sidecar blob.
+    pub fn encode_v1(&self) -> [u8; SIDECAR_HEADER_SIZE] {
+        let mut buf = [0u8; SIDECAR_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&SIDECAR_V1_MAGIC);
+        buf[4..8].copy_from_slice(&self.fingerprint);
+        buf[8..40].copy_from_slice(&self.target_cid);
+        buf[40..48].copy_from_slice(&self.tier1);
+        buf[48..64].copy_from_slice(&self.tier2);
+        buf[64..96].copy_from_slice(&self.tier3);
+        buf[96..160].copy_from_slice(&self.tier4);
+        buf[160..288].copy_from_slice(&self.tier5);
+        buf
+    }
+
+    /// Decode a sidecar header from bytes. Accepts both v1 and v2 magic.
+    pub fn decode(data: &[u8]) -> SemanticResult<Self> {
+        if data.len() < SIDECAR_HEADER_SIZE {
+            return Err(SemanticError::TruncatedHeader {
+                expected: SIDECAR_HEADER_SIZE,
+                actual: data.len(),
+            });
+        }
+
+        let magic = &data[0..4];
+        if magic != SIDECAR_V1_MAGIC && magic != SIDECAR_V2_MAGIC {
+            return Err(SemanticError::InvalidMagic);
+        }
+
+        let mut fingerprint = [0u8; 4];
+        fingerprint.copy_from_slice(&data[4..8]);
+        let mut target_cid = [0u8; 32];
+        target_cid.copy_from_slice(&data[8..40]);
+        let mut tier1 = [0u8; 8];
+        tier1.copy_from_slice(&data[40..48]);
+        let mut tier2 = [0u8; 16];
+        tier2.copy_from_slice(&data[48..64]);
+        let mut tier3 = [0u8; 32];
+        tier3.copy_from_slice(&data[64..96]);
+        let mut tier4 = [0u8; 64];
+        tier4.copy_from_slice(&data[96..160]);
+        let mut tier5 = [0u8; 128];
+        tier5.copy_from_slice(&data[160..288]);
+
+        Ok(Self {
+            fingerprint,
+            target_cid,
+            tier1,
+            tier2,
+            tier3,
+            tier4,
+            tier5,
+        })
+    }
+
+    /// Returns `true` if the given data starts with v2 magic.
+    pub fn is_v2(data: &[u8]) -> bool {
+        data.len() >= 4 && data[0..4] == SIDECAR_V2_MAGIC
+    }
+
+    /// Extract the tier data for a given embedding tier.
+    pub fn tier_data(&self, tier: crate::tier::EmbeddingTier) -> &[u8] {
+        use crate::tier::EmbeddingTier;
+        match tier {
+            EmbeddingTier::T1 => &self.tier1,
+            EmbeddingTier::T2 => &self.tier2,
+            EmbeddingTier::T3 => &self.tier3,
+            EmbeddingTier::T4 => &self.tier4,
+            EmbeddingTier::T5 => &self.tier5,
+        }
+    }
+}
+
+/// An enriched sidecar — fixed header + CBOR metadata trailer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnrichedSidecar {
+    /// The 288-byte fixed header (embedding tiers + CID).
+    pub header: SidecarHeader,
+    /// Optional metadata decoded from the CBOR trailer.
+    pub metadata: SidecarMetadata,
+}
+
+#[cfg(feature = "std")]
+impl EnrichedSidecar {
+    /// Encode as a v2 sidecar blob: 288-byte header + 4-byte trailer length + CBOR.
+    pub fn encode(&self) -> SemanticResult<alloc::vec::Vec<u8>> {
+        use alloc::string::ToString;
+        use alloc::vec::Vec;
+
+        // Encode the fixed header with v2 magic.
+        let mut buf = Vec::new();
+        let mut header_bytes = self.header.encode_v1();
+        // Overwrite magic with v2.
+        header_bytes[0..4].copy_from_slice(&SIDECAR_V2_MAGIC);
+        buf.extend_from_slice(&header_bytes);
+
+        // CBOR-encode the metadata into a temporary buffer.
+        let mut cbor_buf: Vec<u8> = Vec::new();
+        ciborium::into_writer(&self.metadata, &mut cbor_buf).map_err(|e| {
+            SemanticError::MetadataInvalid {
+                reason: e.to_string(),
+            }
+        })?;
+
+        // Write 4-byte trailer length (u32 big-endian).
+        let trailer_len = cbor_buf.len() as u32;
+        buf.extend_from_slice(&trailer_len.to_be_bytes());
+
+        // Write CBOR bytes.
+        buf.extend_from_slice(&cbor_buf);
+
+        Ok(buf)
+    }
+
+    /// Decode an enriched sidecar from bytes.
+    ///
+    /// If the data is exactly 288 bytes (v1), the metadata will be empty.
+    /// Otherwise, the CBOR trailer is decoded from bytes 288..end.
+    pub fn decode(data: &[u8]) -> SemanticResult<Self> {
+        use alloc::string::ToString;
+
+        let header = SidecarHeader::decode(data)?;
+
+        // v1 magic → no CBOR trailer. Ignore any trailing bytes beyond the header.
+        if !SidecarHeader::is_v2(data) {
+            return Ok(Self {
+                header,
+                metadata: SidecarMetadata::default(),
+            });
+        }
+
+        // v2 magic requires a CBOR trailer after the header.
+        if data.len() == SIDECAR_HEADER_SIZE {
+            return Err(SemanticError::MetadataInvalid {
+                reason: alloc::format!(
+                    "v2 sidecar is exactly {} bytes with no CBOR trailer",
+                    SIDECAR_HEADER_SIZE
+                ),
+            });
+        }
+
+        // Need at least 4 bytes for the trailer length.
+        if data.len() < SIDECAR_HEADER_SIZE + 4 {
+            return Err(SemanticError::MetadataInvalid {
+                reason: alloc::format!(
+                    "trailer too short: {} bytes after header",
+                    data.len() - SIDECAR_HEADER_SIZE
+                ),
+            });
+        }
+
+        // Read trailer length.
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&data[SIDECAR_HEADER_SIZE..SIDECAR_HEADER_SIZE + 4]);
+        let trailer_len = u32::from_be_bytes(len_bytes) as usize;
+
+        let cbor_start = SIDECAR_HEADER_SIZE + 4;
+        let cbor_end = cbor_start.checked_add(trailer_len).ok_or_else(|| {
+            SemanticError::MetadataInvalid {
+                reason: alloc::format!(
+                    "trailer length {} overflows address space",
+                    trailer_len
+                ),
+            }
+        })?;
+
+        if data.len() < cbor_end {
+            return Err(SemanticError::MetadataInvalid {
+                reason: alloc::format!(
+                    "CBOR trailer truncated: expected {} bytes, got {}",
+                    trailer_len,
+                    data.len() - cbor_start
+                ),
+            });
+        }
+
+        let metadata: SidecarMetadata = ciborium::from_reader(&data[cbor_start..cbor_end])
+            .map_err(|e| SemanticError::MetadataInvalid {
+                reason: e.to_string(),
+            })?;
+
+        Ok(Self { header, metadata })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fingerprint::model_fingerprint;
+    use crate::tier::EmbeddingTier;
+
+    /// Build a test header with deterministic data.
+    fn test_header() -> SidecarHeader {
+        let fp = model_fingerprint("test-model-v1");
+        let mut target_cid = [0u8; 32];
+        for (i, b) in target_cid.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut tier1 = [0u8; 8];
+        tier1.fill(0xAA);
+        let mut tier2 = [0u8; 16];
+        tier2.fill(0xBB);
+        let mut tier3 = [0u8; 32];
+        tier3.fill(0xCC);
+        let mut tier4 = [0u8; 64];
+        tier4.fill(0xDD);
+        let mut tier5 = [0u8; 128];
+        tier5.fill(0xEE);
+
+        SidecarHeader {
+            fingerprint: fp,
+            target_cid,
+            tier1,
+            tier2,
+            tier3,
+            tier4,
+            tier5,
+        }
+    }
+
+    #[test]
+    fn sidecar_v1_encode_decode_roundtrip() {
+        let header = test_header();
+        let encoded = header.encode_v1();
+        assert_eq!(encoded.len(), SIDECAR_HEADER_SIZE);
+
+        let decoded = SidecarHeader::decode(&encoded).expect("decode should succeed");
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn sidecar_decode_truncated_rejects() {
+        let short = [0u8; 100];
+        let err = SidecarHeader::decode(&short).unwrap_err();
+        assert_eq!(
+            err,
+            SemanticError::TruncatedHeader {
+                expected: SIDECAR_HEADER_SIZE,
+                actual: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn sidecar_decode_bad_magic_rejects() {
+        let mut buf = [0u8; SIDECAR_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let err = SidecarHeader::decode(&buf).unwrap_err();
+        assert_eq!(err, SemanticError::InvalidMagic);
+    }
+
+    #[test]
+    fn sidecar_v2_magic_accepted() {
+        let header = test_header();
+        let mut encoded = header.encode_v1();
+        // Overwrite magic with v2
+        encoded[0..4].copy_from_slice(&SIDECAR_V2_MAGIC);
+
+        let decoded = SidecarHeader::decode(&encoded).expect("v2 magic should be accepted");
+        assert_eq!(decoded.fingerprint, header.fingerprint);
+        assert_eq!(decoded.target_cid, header.target_cid);
+        assert_eq!(decoded.tier1, header.tier1);
+        assert_eq!(decoded.tier2, header.tier2);
+        assert_eq!(decoded.tier3, header.tier3);
+        assert_eq!(decoded.tier4, header.tier4);
+        assert_eq!(decoded.tier5, header.tier5);
+    }
+
+    #[test]
+    fn sidecar_tier_data_returns_correct_slice() {
+        let header = test_header();
+        assert_eq!(header.tier_data(EmbeddingTier::T1), &header.tier1);
+        assert_eq!(header.tier_data(EmbeddingTier::T2), &header.tier2);
+        assert_eq!(header.tier_data(EmbeddingTier::T3), &header.tier3);
+        assert_eq!(header.tier_data(EmbeddingTier::T4), &header.tier4);
+        assert_eq!(header.tier_data(EmbeddingTier::T5), &header.tier5);
+    }
+
+    #[test]
+    fn privacy_tier_ordering() {
+        use crate::metadata::PrivacyTier;
+        assert!(PrivacyTier::PublicDurable < PrivacyTier::PublicEphemeral);
+        assert!(PrivacyTier::PublicEphemeral < PrivacyTier::EncryptedDurable);
+        assert!(PrivacyTier::EncryptedDurable < PrivacyTier::EncryptedEphemeral);
+    }
+
+    // v2 enriched sidecar tests require std (ciborium for CBOR).
+    #[cfg(feature = "std")]
+    mod v2_tests {
+        use super::*;
+        use crate::metadata::{PrivacyTier, SidecarMetadata};
+        use alloc::collections::BTreeMap;
+        use alloc::string::ToString;
+        use alloc::vec;
+
+        #[test]
+        fn enriched_sidecar_roundtrip() {
+            let header = test_header();
+            let mut ext = BTreeMap::new();
+            ext.insert("custom-key".to_string(), vec![1, 2, 3]);
+
+            let metadata = SidecarMetadata {
+                privacy_tier: Some(PrivacyTier::EncryptedDurable),
+                created_at: Some(1_700_000_000),
+                content_type: Some("text/plain".to_string()),
+                language: Some("en-US".to_string()),
+                geo: Some((47.6062, -122.3321)),
+                description: Some("Test content".to_string()),
+                tags: Some(vec!["test".to_string(), "example".to_string()]),
+                refs: Some(vec![[0xAB; 32]]),
+                source_device: Some("laptop-01".to_string()),
+                ext: Some(ext),
+            };
+
+            let enriched = EnrichedSidecar {
+                header: header.clone(),
+                metadata: metadata.clone(),
+            };
+
+            let encoded = enriched.encode().expect("encode should succeed");
+            assert!(encoded.len() > SIDECAR_HEADER_SIZE);
+            assert_eq!(&encoded[0..4], &SIDECAR_V2_MAGIC);
+
+            let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
+            assert_eq!(decoded.header, header);
+            assert_eq!(decoded.metadata, metadata);
+        }
+
+        #[test]
+        fn enriched_sidecar_minimal_metadata() {
+            let header = test_header();
+            let metadata = SidecarMetadata {
+                privacy_tier: Some(PrivacyTier::PublicDurable),
+                created_at: Some(1_700_000_000),
+                ..SidecarMetadata::default()
+            };
+
+            let enriched = EnrichedSidecar {
+                header: header.clone(),
+                metadata: metadata.clone(),
+            };
+
+            let encoded = enriched.encode().expect("encode should succeed");
+            let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
+            assert_eq!(decoded.header, header);
+            assert_eq!(decoded.metadata, metadata);
+        }
+
+        #[test]
+        fn enriched_sidecar_v1_compat() {
+            let header = test_header();
+            let v1_blob = header.encode_v1();
+            assert_eq!(v1_blob.len(), SIDECAR_HEADER_SIZE);
+
+            let decoded = EnrichedSidecar::decode(&v1_blob).expect("v1 decode should succeed");
+            assert_eq!(decoded.header, header);
+            assert_eq!(decoded.metadata, SidecarMetadata::default());
+        }
+
+        #[test]
+        fn enriched_sidecar_v1_with_trailing_bytes() {
+            let header = test_header();
+            let mut v1_with_extra = header.encode_v1().to_vec();
+            // Append garbage trailing bytes (e.g., from a stream read).
+            v1_with_extra.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]);
+            assert!(v1_with_extra.len() > SIDECAR_HEADER_SIZE);
+
+            // v1 magic → trailing bytes ignored, default metadata returned.
+            let decoded = EnrichedSidecar::decode(&v1_with_extra)
+                .expect("v1 with trailing bytes should succeed");
+            assert_eq!(decoded.header, header);
+            assert_eq!(decoded.metadata, SidecarMetadata::default());
+        }
+
+        #[test]
+        fn enriched_sidecar_v2_truncated_no_trailer_rejects() {
+            let header = test_header();
+            let mut v2_no_trailer = header.encode_v1();
+            // Overwrite magic with v2, but provide no CBOR trailer.
+            v2_no_trailer[0..4].copy_from_slice(&SIDECAR_V2_MAGIC);
+            assert_eq!(v2_no_trailer.len(), SIDECAR_HEADER_SIZE);
+
+            let err = EnrichedSidecar::decode(&v2_no_trailer)
+                .expect_err("v2 with no trailer should fail");
+            match err {
+                SemanticError::MetadataInvalid { reason } => {
+                    assert!(reason.contains("no CBOR trailer"), "unexpected reason: {reason}");
+                }
+                other => panic!("expected MetadataInvalid, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn metadata_with_tags_and_refs() {
+            let header = test_header();
+            let ref1 = [0x11; 32];
+            let ref2 = [0x22; 32];
+            let ref3 = [0x33; 32];
+
+            let metadata = SidecarMetadata {
+                tags: Some(vec![
+                    "alpha".to_string(),
+                    "beta".to_string(),
+                    "gamma".to_string(),
+                ]),
+                refs: Some(vec![ref1, ref2, ref3]),
+                ..SidecarMetadata::default()
+            };
+
+            let enriched = EnrichedSidecar {
+                header: header.clone(),
+                metadata: metadata.clone(),
+            };
+
+            let encoded = enriched.encode().expect("encode should succeed");
+            let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
+
+            let tags = decoded.metadata.tags.as_ref().expect("tags should exist");
+            assert_eq!(tags.len(), 3);
+            assert_eq!(tags[0], "alpha");
+            assert_eq!(tags[1], "beta");
+            assert_eq!(tags[2], "gamma");
+
+            let refs = decoded.metadata.refs.as_ref().expect("refs should exist");
+            assert_eq!(refs.len(), 3);
+            assert_eq!(refs[0], ref1);
+            assert_eq!(refs[1], ref2);
+            assert_eq!(refs[2], ref3);
+        }
+    }
+}
