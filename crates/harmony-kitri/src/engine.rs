@@ -102,6 +102,12 @@ pub enum KitriAction {
         step_id: u64,
         rollback_op: KitriIoOp,
     },
+    /// The runtime should delay this many milliseconds before starting the
+    /// next attempt. Computed from the workflow's `BackoffStrategy`.
+    RetryAfter {
+        workflow_id: [u8; 32],
+        delay_ms: u64,
+    },
 }
 
 /// Status of a Kitri workflow.
@@ -164,6 +170,13 @@ impl KitriEngine {
         self.workflows
             .get(workflow_id)
             .and_then(|w| w.output.as_deref())
+    }
+
+    /// Returns the event log for a workflow, if it exists.
+    ///
+    /// Called by the runtime to fulfill `PersistEventLog` actions.
+    pub fn event_log(&self, workflow_id: &[u8; 32]) -> Option<&KitriEventLog> {
+        self.workflows.get(workflow_id).map(|w| &w.event_log)
     }
 
     /// Remove a terminal workflow from the engine, freeing its memory.
@@ -240,6 +253,11 @@ impl KitriEngine {
                 // new seq numbers). Append a WorkflowRestarted boundary event
                 // so recovery algorithms skip the stale WorkflowFailed terminal
                 // event and understand this as a distinct execution attempt.
+                let delay_ms = existing
+                    .program
+                    .retry_policy
+                    .backoff
+                    .delay_ms(existing.attempt);
                 existing.attempt += 1;
                 let seq = existing.next_seq;
                 existing.next_seq += 1;
@@ -253,6 +271,10 @@ impl KitriEngine {
                 existing.pending_error = None;
                 return vec![
                     KitriAction::PersistEventLog { workflow_id: wf_id },
+                    KitriAction::RetryAfter {
+                        workflow_id: wf_id,
+                        delay_ms,
+                    },
                     KitriAction::WorkflowAccepted { workflow_id: wf_id },
                 ];
             }
@@ -527,11 +549,13 @@ impl KitriEngine {
             .append(crate::event::KitriEvent::CheckpointSaved { seq, state_cid });
 
         // WAL invariant: persist the event log entry (CheckpointSaved with CID)
-        // BEFORE writing checkpoint bytes to content-addressed storage. If the
-        // process crashes after PersistEventLog but before PersistCheckpoint,
-        // last_checkpoint() returns the CID and recovery can re-request the bytes.
-        // If it crashes before PersistEventLog, the checkpoint is simply lost
-        // and recovery replays from the prior checkpoint (or from scratch).
+        // BEFORE writing checkpoint bytes to content-addressed storage.
+        // Crash scenario A: crash before PersistEventLog — log has no checkpoint,
+        //   recovery replays from the prior checkpoint or from scratch (safe).
+        // Crash scenario B: crash after PersistEventLog but before PersistCheckpoint —
+        //   log records the CID but the bytes were never stored. Recovery must treat
+        //   this as a missing checkpoint and fall back to the prior checkpoint or
+        //   replay from scratch. The runtime must handle a CID-not-found gracefully.
         vec![
             KitriAction::PersistEventLog { workflow_id },
             KitriAction::PersistCheckpoint {
@@ -1521,20 +1545,25 @@ mod tests {
             error: "transient".into(),
         });
 
-        // Re-submit — must emit PersistEventLog so the WorkflowRestarted
-        // boundary is durable before the runtime proceeds.
+        // Re-submit — must emit PersistEventLog, RetryAfter, WorkflowAccepted
+        // in that order. The backoff delay must come before the runtime starts
+        // the next attempt.
         let actions = engine.handle(KitriEngineEvent::Submit { program, input });
 
         let persist_pos = actions
             .iter()
             .position(|a| matches!(a, KitriAction::PersistEventLog { .. }));
+        let retry_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::RetryAfter { .. }));
         let accepted_pos = actions
             .iter()
             .position(|a| matches!(a, KitriAction::WorkflowAccepted { .. }));
         assert!(persist_pos.is_some());
+        assert!(retry_pos.is_some());
         assert!(accepted_pos.is_some());
-        // PersistEventLog must come before WorkflowAccepted.
-        assert!(persist_pos.unwrap() < accepted_pos.unwrap());
+        assert!(persist_pos.unwrap() < retry_pos.unwrap());
+        assert!(retry_pos.unwrap() < accepted_pos.unwrap());
     }
 
     #[test]
@@ -1812,5 +1841,78 @@ mod tests {
     fn engine_evict_nonexistent_returns_false() {
         let mut engine = KitriEngine::new();
         assert!(!engine.evict(&[0xFF; 32]));
+    }
+
+    #[test]
+    fn engine_event_log_accessor() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        assert!(engine.event_log(&wf_id).is_none());
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+
+        let log = engine.event_log(&wf_id).unwrap();
+        assert!(log.is_empty());
+
+        engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Fetch { cid: [0; 32] },
+        });
+
+        let log = engine.event_log(&wf_id).unwrap();
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn engine_retry_emits_backoff_delay() {
+        let mut engine = KitriEngine::new();
+        let mut program = test_program();
+        program.retry_policy = RetryPolicy {
+            max_retries: 3,
+            backoff: BackoffStrategy::Exponential {
+                initial_ms: 100,
+                max_ms: 10_000,
+            },
+            timeout_ms: 0,
+        };
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "transient".into(),
+        });
+
+        // First retry (attempt 0 at time of delay_ms call) → 100ms.
+        let actions = engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        let delay = actions.iter().find_map(|a| match a {
+            KitriAction::RetryAfter { delay_ms, .. } => Some(*delay_ms),
+            _ => None,
+        });
+        assert_eq!(delay, Some(100));
+
+        // Fail again.
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "transient".into(),
+        });
+
+        // Second retry (attempt 1 at time of delay_ms call) → 200ms.
+        let actions = engine.handle(KitriEngineEvent::Submit { program, input });
+        let delay = actions.iter().find_map(|a| match a {
+            KitriAction::RetryAfter { delay_ms, .. } => Some(*delay_ms),
+            _ => None,
+        });
+        assert_eq!(delay, Some(200));
     }
 }

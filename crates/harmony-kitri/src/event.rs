@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use crate::io::{KitriIoOp, KitriIoResult};
 
 /// A single event in a Kitri workflow's history.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KitriEvent {
     /// An I/O operation was requested by the workflow.
     IoRequested { seq: u64, op: KitriIoOp },

@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 /// Each variant corresponds to one of the `kitri::*` SDK primitives.
 /// The runtime intercepts these, logs them in the event log, and
 /// replays cached responses on crash recovery.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KitriIoOp {
     /// Retrieve content by CID from the mesh.
     Fetch { cid: [u8; 32] },
@@ -49,7 +49,7 @@ impl KitriIoOp {
 }
 
 /// The result of a durable I/O operation, returned by the runtime.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KitriIoResult {
     /// Content retrieved by CID.
     Fetched { data: Vec<u8> },
