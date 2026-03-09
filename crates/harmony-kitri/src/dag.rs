@@ -25,6 +25,9 @@ pub struct KitriDag {
 
 impl KitriDag {
     /// Validate the DAG structure.
+    ///
+    /// Checks: non-empty, all input topics produced by a preceding step,
+    /// no duplicate output topics (which would indicate back-edges or ambiguity).
     pub fn validate(&self) -> Result<(), KitriError> {
         if self.steps.is_empty() {
             return Err(KitriError::DagInvalid {
@@ -45,7 +48,14 @@ impl KitriDag {
                 }
             }
             if let Some(ref output) = step.output_topic {
-                available_topics.insert(output.clone());
+                if !available_topics.insert(output.clone()) {
+                    return Err(KitriError::DagInvalid {
+                        reason: alloc::format!(
+                            "topic '{}' is produced by more than one step",
+                            output
+                        ),
+                    });
+                }
             }
         }
 
@@ -115,6 +125,35 @@ mod tests {
             retry_subgraph: false,
         };
         assert!(dag.validate().is_err());
+    }
+
+    #[test]
+    fn dag_duplicate_output_topic_is_invalid() {
+        let dag = KitriDag {
+            name: "cycle".into(),
+            steps: vec![
+                DagStep {
+                    workflow: "step-a".into(),
+                    input_topic: None,
+                    output_topic: Some("topic-a".into()),
+                },
+                DagStep {
+                    workflow: "step-b".into(),
+                    input_topic: Some("topic-a".into()),
+                    output_topic: Some("topic-b".into()),
+                },
+                DagStep {
+                    workflow: "step-c".into(),
+                    input_topic: Some("topic-b".into()),
+                    output_topic: Some("topic-a".into()), // back-edge
+                },
+            ],
+            retry_subgraph: false,
+        };
+        let err = dag.validate().unwrap_err();
+        assert!(
+            matches!(err, KitriError::DagInvalid { ref reason } if reason.contains("more than one step"))
+        );
     }
 
     #[test]
