@@ -330,10 +330,12 @@ impl JainEngine {
     /// and `last_accessed` for newly discovered records so they don't immediately
     /// appear maximally stale.
     ///
-    /// Handles three cases:
+    /// Handles four cases:
     /// 1. Snapshot entry exists on disk but is not tracked → add a default record
-    /// 2. Tracked record has `exists_on_disk: false` → emit RepairNeeded
-    /// 3. Tracked record is not in the snapshot at all → orphan, remove it
+    /// 2. Tracked record has `exists_on_disk: false` → emit `FetchLocalCopy`,
+    ///    set `pending_local_repair`
+    /// 3. Tracked record exists on disk → clear `pending_local_repair`
+    /// 4. Tracked record is not in the snapshot at all → orphan, remove it
     pub fn reconcile(&mut self, snapshot: &[SnapshotEntry], now: f64) -> Vec<JainAction> {
         let mut actions = Vec::new();
         let mut seen: HashSet<ContentId> = HashSet::new();
@@ -352,7 +354,10 @@ impl JainEngine {
                     record.pending_local_repair = true;
                     actions.push(JainAction::FetchLocalCopy { cid: entry.cid });
                 }
-            } else if !self.records.contains_key(&entry.cid) {
+            } else if let Some(record) = self.records.get_mut(&entry.cid) {
+                // Tracked and on disk: clear any in-progress repair flag.
+                record.pending_local_repair = false;
+            } else {
                 // Case 1: on disk but not tracked → add default record.
                 // Use Confidential as the safe default when the original
                 // sensitivity is unknown — prevents accidental leakage of
@@ -1166,6 +1171,45 @@ mod tests {
         assert!(
             !engine.records.get(&cid).unwrap().pending_local_repair,
             "re-store should clear pending_local_repair"
+        );
+    }
+
+    #[test]
+    fn reconcile_clears_pending_repair_when_back_on_disk() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"repair-then-restored");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 200,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::Downloaded,
+            sensitivity: Sensitivity::Public,
+            timestamp: 0.0,
+        });
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
+
+        // First reconcile: backing data missing → sets pending_local_repair.
+        let missing = alloc::vec![SnapshotEntry {
+            cid,
+            size_bytes: 200,
+            exists_on_disk: false,
+        }];
+        engine.reconcile(&missing, 0.0);
+        assert!(
+            engine.records.get(&cid).unwrap().pending_local_repair,
+            "reconcile should set pending_local_repair when backing is missing"
+        );
+
+        // Second reconcile: backing data restored (e.g. by operator cp) → clears flag.
+        let restored = alloc::vec![SnapshotEntry {
+            cid,
+            size_bytes: 200,
+            exists_on_disk: true,
+        }];
+        engine.reconcile(&restored, 1.0);
+        assert!(
+            !engine.records.get(&cid).unwrap().pending_local_repair,
+            "reconcile should clear pending_local_repair when backing is restored"
         );
     }
 
