@@ -11,6 +11,7 @@ extern crate alloc;
 pub mod checkpoint;
 pub mod compensation;
 pub mod dag;
+pub mod engine;
 pub mod error;
 pub mod event;
 pub mod io;
@@ -20,4 +21,6 @@ pub mod retry;
 pub mod staging;
 pub mod trust;
 
+pub use engine::{KitriAction, KitriEngine, KitriEngineEvent, KitriWorkflowStatus};
 pub use error::{KitriError, KitriResult};
+pub use program::{kitri_workflow_id, KitriProgram};
