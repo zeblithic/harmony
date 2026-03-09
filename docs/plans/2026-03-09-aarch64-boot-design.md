@@ -49,7 +49,7 @@ crates/harmony-boot-aarch64/
 
 ## Boot Sequence
 
-Ten steps after UEFI entry:
+Eleven steps after UEFI entry:
 
 1. **UEFI console** — Print "Booting Harmony aarch64..." via UEFI SimpleTextOutput. Useful if PL011 setup fails.
 2. **UEFI memory map** — Collect conventional memory regions (base + size) before losing access.
@@ -58,9 +58,10 @@ Ten steps after UEFI entry:
 5. **Identity-map RAM + MMIO** — Use `Aarch64PageTable` to map UEFI memory regions as Normal cacheable and PL011 page as Device-nGnRnE. Bump allocator for page table frames.
 6. **Enable MMU** — Configure MAIR_EL1, TCR_EL1, TTBR0_EL1, then set SCTLR_EL1.M/C/I.
 7. **ARM generic timer** — Read CNTFRQ_EL0 for frequency. Provide `now_ms()` via CNTPCT_EL0.
-8. **Heap init** — Largest usable RAM region, cap at 4 MiB, `LockedHeap::init()`.
-9. **Identity generation** — RNDR register (ARMv8.5) for entropy. Detect via ID_AA64ISAR0_EL1, panic if unavailable. Generate Ed25519/X25519 keypair.
-10. **Idle event loop** — `UnikernelRuntime::new()`, loop: `tick(now_ms)` → dispatch actions → `WFE`.
+8. **RNDR entropy check** — Detect via ID_AA64ISAR0_EL1, panic if unavailable.
+9. **Heap init** — Largest CONVENTIONAL RAM region, cap at 4 MiB, `LockedHeap::init()`.
+10. **Identity generation** — RNDR register (ARMv8.5) for entropy. Generate Ed25519/X25519 keypair.
+11. **Idle event loop** — `UnikernelRuntime::new()`, loop: `tick(now_ms)` → dispatch actions → `WFE`.
 
 ## PL011 UART Driver
 
