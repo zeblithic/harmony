@@ -1,12 +1,13 @@
 //! Sans-I/O content lifecycle engine.
 
 use alloc::vec::Vec;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use harmony_content::ContentId;
+use harmony_roxy::catalog::ContentCategory;
 
 use crate::actions::*;
 use crate::config::{FilterRuleSet, JainConfig};
-use crate::types::{ContentRecord, Sensitivity, SocialContext};
+use crate::types::{ContentOrigin, ContentRecord, Sensitivity, SocialContext};
 
 /// Sans-I/O content lifecycle engine.
 ///
@@ -275,6 +276,74 @@ impl JainEngine {
 
         actions
     }
+
+    /// Reconcile internal records against a disk snapshot.
+    ///
+    /// Handles three cases:
+    /// 1. Snapshot entry exists on disk but is not tracked → add a default record
+    /// 2. Tracked record has `exists_on_disk: false` → emit RepairNeeded
+    /// 3. Tracked record is not in the snapshot at all → orphan, remove it
+    pub fn reconcile(&mut self, snapshot: &[SnapshotEntry]) -> Vec<JainAction> {
+        let mut actions = Vec::new();
+        let mut seen: HashSet<ContentId> = HashSet::new();
+
+        for entry in snapshot {
+            seen.insert(entry.cid);
+
+            if !entry.exists_on_disk {
+                // Case 2: tracked CID whose backing data is missing
+                if self.records.contains_key(&entry.cid) {
+                    actions.push(JainAction::RepairNeeded {
+                        cid: entry.cid,
+                        current_replicas: 0,
+                        desired: self.config.min_replica_count,
+                    });
+                }
+            } else if !self.records.contains_key(&entry.cid) {
+                // Case 1: on disk but not tracked → add default record
+                let record = ContentRecord {
+                    cid: entry.cid,
+                    size_bytes: entry.size_bytes,
+                    content_type: ContentCategory::Bundle,
+                    origin: ContentOrigin::CachedInTransit,
+                    sensitivity: Sensitivity::Public,
+                    stored_at: 0.0,
+                    last_accessed: 0.0,
+                    access_count: 0,
+                    replica_count: 1,
+                    pinned: false,
+                    licensed: false,
+                };
+                self.total_storage_bytes += entry.size_bytes;
+                self.records.insert(entry.cid, record);
+            }
+        }
+
+        // Case 3: orphaned records — in engine but not in snapshot
+        let orphaned: Vec<ContentId> = self
+            .records
+            .keys()
+            .copied()
+            .filter(|cid| !seen.contains(cid))
+            .collect();
+
+        if !orphaned.is_empty() {
+            let orphan_count = orphaned.len() as u32;
+            for cid in orphaned {
+                if let Some(record) = self.records.remove(&cid) {
+                    self.total_storage_bytes =
+                        self.total_storage_bytes.saturating_sub(record.size_bytes);
+                }
+            }
+            actions.push(JainAction::HealthAlert {
+                alert: HealthAlertKind::StaleReconciliation {
+                    records_without_backing: orphan_count,
+                },
+            });
+        }
+
+        actions
+    }
 }
 
 impl Default for JainEngine {
@@ -287,9 +356,8 @@ impl Default for JainEngine {
 mod tests {
     use super::*;
     use crate::config::JainConfig;
-    use crate::types::ContentOrigin;
+    use crate::types::SocialContext;
     use harmony_content::ContentFlags;
-    use harmony_roxy::catalog::ContentCategory;
 
     fn make_cid(data: &[u8]) -> ContentId {
         ContentId::for_blob(data, ContentFlags::default()).unwrap()
@@ -821,6 +889,79 @@ mod tests {
         assert!(
             actions.is_empty(),
             "expected no actions for fresh content, got: {actions:?}"
+        );
+    }
+
+    // ── Task 12: reconcile ──
+
+    #[test]
+    fn reconcile_adds_missing_records() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"disk-only");
+        let snapshot = alloc::vec![SnapshotEntry {
+            cid,
+            size_bytes: 256,
+            exists_on_disk: true,
+        }];
+        engine.reconcile(&snapshot);
+        assert_eq!(engine.record_count(), 1);
+        assert_eq!(engine.health_report().total_bytes, 256);
+    }
+
+    #[test]
+    fn reconcile_detects_missing_backing_data() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"missing-backing");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 100,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::Downloaded,
+            sensitivity: Sensitivity::Public,
+            timestamp: 1000.0,
+        });
+        let snapshot = alloc::vec![SnapshotEntry {
+            cid,
+            size_bytes: 100,
+            exists_on_disk: false,
+        }];
+        let actions = engine.reconcile(&snapshot);
+        let has_repair = actions.iter().any(|a| matches!(a, JainAction::RepairNeeded { .. }));
+        assert!(
+            has_repair,
+            "expected RepairNeeded for missing backing data, got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_detects_orphaned_records() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"orphaned");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 100,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::Downloaded,
+            sensitivity: Sensitivity::Public,
+            timestamp: 1000.0,
+        });
+        assert_eq!(engine.record_count(), 1);
+
+        // Empty snapshot → the tracked record is orphaned
+        let snapshot: Vec<SnapshotEntry> = alloc::vec![];
+        let actions = engine.reconcile(&snapshot);
+        assert_eq!(engine.record_count(), 0);
+        let has_stale_alert = actions.iter().any(|a| {
+            matches!(
+                a,
+                JainAction::HealthAlert {
+                    alert: HealthAlertKind::StaleReconciliation { .. }
+                }
+            )
+        });
+        assert!(
+            has_stale_alert,
+            "expected StaleReconciliation alert, got: {actions:?}"
         );
     }
 }
