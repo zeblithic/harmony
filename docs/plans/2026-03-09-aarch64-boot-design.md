@@ -93,6 +93,8 @@ Minimal TX-only driver for QEMU `virt` PL011 at `0x0900_0000`.
 - SH0 = 0b11 → Inner Shareable
 - ORGN0 = 0b01 → Outer WB cacheable
 - IRGN0 = 0b01 → Inner WB cacheable
+- EPD1 = 1 → Disable TTBR1 walks (upper VA half unused)
+- IPS = runtime from ID_AA64MMFR0_EL1.PARange (3-bit mask)
 
 ### Identity Map Strategy
 
@@ -164,8 +166,8 @@ Where `esp/EFI/BOOT/BOOTAA64.EFI` is the built binary.
 [MMU] Identity mapped N pages (X MiB RAM, 1 device page)
 [MMU] Enabled: MAIR, TCR, TTBR0, SCTLR
 [Timer] ARM generic timer: freq=62500000 Hz
-[Heap] Initialized: 4194304 bytes at 0x...
 [RNDR] Hardware RNG available
+[Heap] Initialized: 4194304 bytes at 0x...
 [Identity] Generated Ed25519 address: <hex>
 [Runtime] UnikernelRuntime created, entering idle loop
 ```
