@@ -34,12 +34,13 @@ pub fn wrap_key(
 /// Returns the recovered `AeadKey` for decrypting content.
 pub fn unwrap_key(consumer: &PrivateIdentity, wrapped: &[u8]) -> Result<AeadKey, RoxyError> {
     let mut plaintext = consumer.decrypt(wrapped)?;
-    if plaintext.len() != 32 {
+    let plaintext_len = plaintext.len();
+    if plaintext_len != 32 {
         plaintext.zeroize();
         return Err(RoxyError::Crypto(
             harmony_crypto::CryptoError::InvalidKeyLength {
                 expected: 32,
-                got: plaintext.len(),
+                got: plaintext_len,
             },
         ));
     }
