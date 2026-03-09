@@ -13,6 +13,8 @@ pub struct RawSearchResult {
     pub score: f32,
     /// Merged metadata from all overlays.
     pub metadata: SidecarMetadata,
+    /// CIDs of the overlay sidecars that contributed to this result.
+    pub overlays: Vec<[u8; 32]>,
 }
 
 /// A filtered search result after Jain processing.
