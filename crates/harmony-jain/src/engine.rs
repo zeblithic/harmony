@@ -323,7 +323,10 @@ impl JainEngine {
         let mut seen: HashSet<ContentId> = HashSet::new();
 
         for entry in snapshot {
-            seen.insert(entry.cid);
+            // Deduplicate: skip CIDs already processed in this snapshot pass.
+            if !seen.insert(entry.cid) {
+                continue;
+            }
 
             if !entry.exists_on_disk {
                 // Case 2: tracked CID whose backing data is missing
@@ -335,13 +338,17 @@ impl JainEngine {
                     });
                 }
             } else if !self.records.contains_key(&entry.cid) {
-                // Case 1: on disk but not tracked → add default record
+                // Case 1: on disk but not tracked → add default record.
+                // Use Confidential as the safe default when the original
+                // sensitivity is unknown — prevents accidental leakage of
+                // content that may have been Intimate or Confidential before
+                // a crash-recovery cycle.
                 let record = ContentRecord {
                     cid: entry.cid,
                     size_bytes: entry.size_bytes,
                     content_type: ContentCategory::Bundle,
                     origin: ContentOrigin::CachedInTransit,
-                    sensitivity: Sensitivity::Public,
+                    sensitivity: Sensitivity::Confidential,
                     stored_at: now,
                     last_accessed: now,
                     access_count: 0,
@@ -940,7 +947,7 @@ mod tests {
     // ── Task 12: reconcile ──
 
     #[test]
-    fn reconcile_adds_missing_records() {
+    fn reconcile_adds_missing_records_with_confidential_default() {
         let mut engine = default_engine();
         let cid = make_cid(b"disk-only");
         let snapshot = alloc::vec![SnapshotEntry {
@@ -951,6 +958,16 @@ mod tests {
         engine.reconcile(&snapshot, 1000.0);
         assert_eq!(engine.record_count(), 1);
         assert_eq!(engine.health_report(0.0).total_bytes, 256);
+
+        // Recovered records must default to Confidential (fail-closed) —
+        // prevents accidental leakage of content whose original sensitivity
+        // is unknown after crash recovery.
+        let decision = engine.filter_result(&cid, SocialContext::Professional);
+        assert_eq!(
+            decision,
+            FilterDecision::Block,
+            "reconciled records should be Confidential and blocked in Professional context"
+        );
     }
 
     #[test]
@@ -1095,6 +1112,43 @@ mod tests {
             ..JainConfig::default()
         };
         assert!(JainEngine::new(config, FilterRuleSet::default(), 10_000).is_err());
+    }
+
+    #[test]
+    fn reconcile_deduplicates_snapshot_entries() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"dup-entry");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 100,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::Downloaded,
+            sensitivity: Sensitivity::Public,
+            timestamp: 1000.0,
+        });
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 0 });
+        // Same CID appears twice with exists_on_disk: false
+        let snapshot = alloc::vec![
+            SnapshotEntry {
+                cid,
+                size_bytes: 100,
+                exists_on_disk: false,
+            },
+            SnapshotEntry {
+                cid,
+                size_bytes: 100,
+                exists_on_disk: false,
+            },
+        ];
+        let actions = engine.reconcile(&snapshot, 1000.0);
+        let repair_count = actions
+            .iter()
+            .filter(|a| matches!(a, JainAction::RepairNeeded { .. }))
+            .count();
+        assert_eq!(
+            repair_count, 1,
+            "duplicate snapshot entries should produce exactly one RepairNeeded, got {repair_count}"
+        );
     }
 
     #[test]
