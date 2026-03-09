@@ -1011,13 +1011,15 @@ pub unsafe fn is_available() -> bool {
 
 /// Read a single 64-bit random value from the RNDR register.
 ///
-/// Retries on failure (NZCV.Z set means retry needed).
+/// Retries on failure (NZCV.Z set means retry needed), up to 1024
+/// attempts. Panics if all retries are exhausted.
 ///
 /// # Safety
 /// RNDR must be available (check with `is_available()` first).
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn read_u64() -> u64 {
-    loop {
+    const MAX_RETRIES: u32 = 1024;
+    for _ in 0..MAX_RETRIES {
         let val: u64;
         let success: u64;
         asm!(
@@ -1032,6 +1034,7 @@ pub unsafe fn read_u64() -> u64 {
         // Yield before retry
         asm!("yield");
     }
+    panic!("RNDR failed after {} retries", MAX_RETRIES);
 }
 
 /// Fill a byte buffer with hardware random data from RNDR.
@@ -1236,6 +1239,12 @@ cp target/aarch64-unknown-uefi/debug/harmony-boot-aarch64.efi \
 ```bash
 # macOS (Homebrew)
 brew install qemu   # includes AAVMF at /opt/homebrew/share/qemu/edk2-aarch64-code.fd
+
+# Ubuntu/Debian: sudo apt-get install qemu-efi-aarch64
+# -bios /usr/share/AAVMF/AAVMF_CODE.fd
+
+# Fedora/RHEL: sudo dnf install edk2-aarch64
+# -bios /usr/share/edk2/aarch64/QEMU_EFI.fd
 
 # Or download directly from https://retrage.github.io/edk2-nightly/
 ```
