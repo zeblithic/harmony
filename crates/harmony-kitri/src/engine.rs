@@ -427,7 +427,11 @@ impl KitriEngine {
                 error: error.clone(),
             });
             state.pending_error = Some(error);
-            actions.push(KitriAction::PersistEventLog { workflow_id });
+            // WAL invariant: persist CompensationStarted BEFORE dispatching
+            // any ExecuteCompensator action. If the process crashes after a
+            // compensator runs, recovery must see Compensating state in the
+            // log so it knows not to re-execute the workflow from scratch.
+            actions.insert(0, KitriAction::PersistEventLog { workflow_id });
         }
 
         actions
@@ -1264,10 +1268,16 @@ mod tests {
             error: "boom".into(),
         });
 
-        // Must emit PersistEventLog to durably record the Compensating transition.
-        assert!(actions
+        // WAL invariant: PersistEventLog must come before ExecuteCompensator.
+        let persist_pos = actions
             .iter()
-            .any(|a| matches!(a, KitriAction::PersistEventLog { .. })));
+            .position(|a| matches!(a, KitriAction::PersistEventLog { .. }));
+        let compensator_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::ExecuteCompensator { .. }));
+        assert!(persist_pos.is_some());
+        assert!(compensator_pos.is_some());
+        assert!(persist_pos.unwrap() < compensator_pos.unwrap());
     }
 
     #[test]
