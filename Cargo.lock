@@ -932,6 +932,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-oluo"
+version = "0.1.0"
+dependencies = [
+ "harmony-content",
+ "harmony-crypto",
+ "harmony-semantic",
+ "hashbrown 0.15.5",
+ "serde",
+]
+
+[[package]]
 name = "harmony-platform"
 version = "0.1.0"
 dependencies = [

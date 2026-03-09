@@ -13,6 +13,7 @@ members = [
     "crates/harmony-platform",
     "crates/harmony-reticulum",
     "crates/harmony-roxy",
+    "crates/harmony-oluo",
     "crates/harmony-semantic",
     "crates/harmony-workflow",
     "crates/harmony-zenoh",
