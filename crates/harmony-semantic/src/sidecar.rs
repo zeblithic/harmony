@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-//! Sidecar blob codec — encode/decode the 288-byte HSI fixed header.
+//! Sidecar blob codec — encode/decode the 288-byte HSI fixed header
+//! and the enriched v2 sidecar with CBOR metadata trailer.
 
 use crate::error::{SemanticError, SemanticResult};
 use crate::fingerprint::ModelFingerprint;
+use crate::metadata::SidecarMetadata;
 
 /// HSI v1 magic bytes: "HSI" + version 1.
 pub const SIDECAR_V1_MAGIC: [u8; 4] = [0x48, 0x53, 0x49, 0x01];
@@ -107,6 +109,101 @@ impl SidecarHeader {
     }
 }
 
+/// An enriched sidecar — fixed header + CBOR metadata trailer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnrichedSidecar {
+    /// The 288-byte fixed header (embedding tiers + CID).
+    pub header: SidecarHeader,
+    /// Optional metadata decoded from the CBOR trailer.
+    pub metadata: SidecarMetadata,
+}
+
+#[cfg(feature = "std")]
+impl EnrichedSidecar {
+    /// Encode as a v2 sidecar blob: 288-byte header + 4-byte trailer length + CBOR.
+    pub fn encode(&self) -> SemanticResult<alloc::vec::Vec<u8>> {
+        use alloc::string::ToString;
+        use alloc::vec::Vec;
+
+        // Encode the fixed header with v2 magic.
+        let mut buf = Vec::new();
+        let mut header_bytes = self.header.encode_v1();
+        // Overwrite magic with v2.
+        header_bytes[0..4].copy_from_slice(&SIDECAR_V2_MAGIC);
+        buf.extend_from_slice(&header_bytes);
+
+        // CBOR-encode the metadata into a temporary buffer.
+        let mut cbor_buf: Vec<u8> = Vec::new();
+        ciborium::into_writer(&self.metadata, &mut cbor_buf).map_err(|e| {
+            SemanticError::MetadataInvalid {
+                reason: e.to_string(),
+            }
+        })?;
+
+        // Write 4-byte trailer length (u32 big-endian).
+        let trailer_len = cbor_buf.len() as u32;
+        buf.extend_from_slice(&trailer_len.to_be_bytes());
+
+        // Write CBOR bytes.
+        buf.extend_from_slice(&cbor_buf);
+
+        Ok(buf)
+    }
+
+    /// Decode an enriched sidecar from bytes.
+    ///
+    /// If the data is exactly 288 bytes (v1), the metadata will be empty.
+    /// Otherwise, the CBOR trailer is decoded from bytes 288..end.
+    pub fn decode(data: &[u8]) -> SemanticResult<Self> {
+        use alloc::string::ToString;
+
+        let header = SidecarHeader::decode(data)?;
+
+        // v1 compat: 288 bytes means no trailer.
+        if data.len() == SIDECAR_HEADER_SIZE {
+            return Ok(Self {
+                header,
+                metadata: SidecarMetadata::default(),
+            });
+        }
+
+        // Need at least 4 bytes for the trailer length.
+        if data.len() < SIDECAR_HEADER_SIZE + 4 {
+            return Err(SemanticError::MetadataInvalid {
+                reason: alloc::format!(
+                    "trailer too short: {} bytes after header",
+                    data.len() - SIDECAR_HEADER_SIZE
+                ),
+            });
+        }
+
+        // Read trailer length.
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&data[SIDECAR_HEADER_SIZE..SIDECAR_HEADER_SIZE + 4]);
+        let trailer_len = u32::from_be_bytes(len_bytes) as usize;
+
+        let cbor_start = SIDECAR_HEADER_SIZE + 4;
+        let cbor_end = cbor_start + trailer_len;
+
+        if data.len() < cbor_end {
+            return Err(SemanticError::MetadataInvalid {
+                reason: alloc::format!(
+                    "CBOR trailer truncated: expected {} bytes, got {}",
+                    trailer_len,
+                    data.len() - cbor_start
+                ),
+            });
+        }
+
+        let metadata: SidecarMetadata = ciborium::from_reader(&data[cbor_start..cbor_end])
+            .map_err(|e| SemanticError::MetadataInvalid {
+                reason: e.to_string(),
+            })?;
+
+        Ok(Self { header, metadata })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +295,124 @@ mod tests {
         assert_eq!(header.tier_data(EmbeddingTier::T3), &header.tier3);
         assert_eq!(header.tier_data(EmbeddingTier::T4), &header.tier4);
         assert_eq!(header.tier_data(EmbeddingTier::T5), &header.tier5);
+    }
+
+    // ---- v2 enriched sidecar tests ----
+
+    use crate::metadata::PrivacyTier;
+    use alloc::collections::BTreeMap;
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    #[test]
+    fn enriched_sidecar_roundtrip() {
+        let header = test_header();
+        let mut ext = BTreeMap::new();
+        ext.insert("custom-key".to_string(), vec![1, 2, 3]);
+
+        let metadata = SidecarMetadata {
+            privacy_tier: Some(PrivacyTier::EncryptedDurable),
+            created_at: Some(1_700_000_000),
+            content_type: Some("text/plain".to_string()),
+            language: Some("en-US".to_string()),
+            geo: Some((47.6062, -122.3321)),
+            description: Some("Test content".to_string()),
+            tags: Some(vec!["test".to_string(), "example".to_string()]),
+            refs: Some(vec![[0xAB; 32]]),
+            source_device: Some("laptop-01".to_string()),
+            ext: Some(ext),
+        };
+
+        let enriched = EnrichedSidecar {
+            header: header.clone(),
+            metadata: metadata.clone(),
+        };
+
+        let encoded = enriched.encode().expect("encode should succeed");
+        // Must be larger than the fixed header.
+        assert!(encoded.len() > SIDECAR_HEADER_SIZE);
+        // Must start with v2 magic.
+        assert_eq!(&encoded[0..4], &SIDECAR_V2_MAGIC);
+
+        let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
+        assert_eq!(decoded.header, header);
+        assert_eq!(decoded.metadata, metadata);
+    }
+
+    #[test]
+    fn enriched_sidecar_minimal_metadata() {
+        let header = test_header();
+        let metadata = SidecarMetadata {
+            privacy_tier: Some(PrivacyTier::PublicDurable),
+            created_at: Some(1_700_000_000),
+            ..SidecarMetadata::default()
+        };
+
+        let enriched = EnrichedSidecar {
+            header: header.clone(),
+            metadata: metadata.clone(),
+        };
+
+        let encoded = enriched.encode().expect("encode should succeed");
+        let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
+        assert_eq!(decoded.header, header);
+        assert_eq!(decoded.metadata, metadata);
+    }
+
+    #[test]
+    fn enriched_sidecar_v1_compat() {
+        let header = test_header();
+        // A plain v1 blob is exactly 288 bytes.
+        let v1_blob = header.encode_v1();
+        assert_eq!(v1_blob.len(), SIDECAR_HEADER_SIZE);
+
+        let decoded = EnrichedSidecar::decode(&v1_blob).expect("v1 decode should succeed");
+        assert_eq!(decoded.header, header);
+        assert_eq!(decoded.metadata, SidecarMetadata::default());
+    }
+
+    #[test]
+    fn privacy_tier_ordering() {
+        assert!(PrivacyTier::PublicDurable < PrivacyTier::PublicEphemeral);
+        assert!(PrivacyTier::PublicEphemeral < PrivacyTier::EncryptedDurable);
+        assert!(PrivacyTier::EncryptedDurable < PrivacyTier::EncryptedEphemeral);
+    }
+
+    #[test]
+    fn metadata_with_tags_and_refs() {
+        let header = test_header();
+        let ref1 = [0x11; 32];
+        let ref2 = [0x22; 32];
+        let ref3 = [0x33; 32];
+
+        let metadata = SidecarMetadata {
+            tags: Some(vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+            ]),
+            refs: Some(vec![ref1, ref2, ref3]),
+            ..SidecarMetadata::default()
+        };
+
+        let enriched = EnrichedSidecar {
+            header: header.clone(),
+            metadata: metadata.clone(),
+        };
+
+        let encoded = enriched.encode().expect("encode should succeed");
+        let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
+
+        let tags = decoded.metadata.tags.as_ref().expect("tags should exist");
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags[0], "alpha");
+        assert_eq!(tags[1], "beta");
+        assert_eq!(tags[2], "gamma");
+
+        let refs = decoded.metadata.refs.as_ref().expect("refs should exist");
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0], ref1);
+        assert_eq!(refs[1], ref2);
+        assert_eq!(refs[2], ref3);
     }
 }
