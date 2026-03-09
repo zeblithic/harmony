@@ -848,6 +848,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-kitri"
+version = "0.1.0"
+dependencies = [
+ "harmony-crypto",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "harmony-mail"
 version = "0.1.0"
 dependencies = [
