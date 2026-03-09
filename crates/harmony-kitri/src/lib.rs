@@ -8,16 +8,16 @@
 
 extern crate alloc;
 
-pub mod error;
-pub mod io;
-pub mod event;
 pub mod checkpoint;
-pub mod manifest;
-pub mod trust;
-pub mod retry;
-pub mod program;
-pub mod dag;
-pub mod staging;
 pub mod compensation;
+pub mod dag;
+pub mod error;
+pub mod event;
+pub mod io;
+pub mod manifest;
+pub mod program;
+pub mod retry;
+pub mod staging;
+pub mod trust;
 
 pub use error::{KitriError, KitriResult};
