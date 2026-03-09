@@ -159,8 +159,17 @@ impl EnrichedSidecar {
 
         let header = SidecarHeader::decode(data)?;
 
-        // v1 compat: 288 bytes means no trailer.
+        // v1 compat: 288 bytes with v1 magic means no trailer.
+        // A v2-magic blob of exactly 288 bytes is a truncated v2 sidecar (missing trailer).
         if data.len() == SIDECAR_HEADER_SIZE {
+            if SidecarHeader::is_v2(data) {
+                return Err(SemanticError::MetadataInvalid {
+                    reason: alloc::format!(
+                        "v2 sidecar is exactly {} bytes with no CBOR trailer",
+                        SIDECAR_HEADER_SIZE
+                    ),
+                });
+            }
             return Ok(Self {
                 header,
                 metadata: SidecarMetadata::default(),
@@ -376,6 +385,24 @@ mod tests {
             let decoded = EnrichedSidecar::decode(&v1_blob).expect("v1 decode should succeed");
             assert_eq!(decoded.header, header);
             assert_eq!(decoded.metadata, SidecarMetadata::default());
+        }
+
+        #[test]
+        fn enriched_sidecar_v2_truncated_no_trailer_rejects() {
+            let header = test_header();
+            let mut v2_no_trailer = header.encode_v1();
+            // Overwrite magic with v2, but provide no CBOR trailer.
+            v2_no_trailer[0..4].copy_from_slice(&SIDECAR_V2_MAGIC);
+            assert_eq!(v2_no_trailer.len(), SIDECAR_HEADER_SIZE);
+
+            let err = EnrichedSidecar::decode(&v2_no_trailer)
+                .expect_err("v2 with no trailer should fail");
+            match err {
+                SemanticError::MetadataInvalid { reason } => {
+                    assert!(reason.contains("no CBOR trailer"), "unexpected reason: {reason}");
+                }
+                other => panic!("expected MetadataInvalid, got {other:?}"),
+            }
         }
 
         #[test]

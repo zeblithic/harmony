@@ -19,6 +19,8 @@ pub enum OluoEvent {
         header: SidecarHeader,
         metadata: SidecarMetadata,
         decision: IngestDecision,
+        /// Current wall-clock time in milliseconds (caller-provided, sans-I/O).
+        now_ms: u64,
     },
     /// Execute a search query.
     Search { query_id: u64, query: SearchQuery },
@@ -56,7 +58,6 @@ pub enum OluoAction {
 
 /// An entry in the in-memory flat index.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // ingested_at_ms reserved for clock-aware TTL calculation
 struct IndexEntry {
     /// Tier 3 binary vector (256-bit) for distance comparison.
     tier3: [u8; 32],
@@ -64,7 +65,8 @@ struct IndexEntry {
     metadata: SidecarMetadata,
     /// If Some, this is a lightweight entry with TTL (expires at this timestamp ms).
     expires_at: Option<u64>,
-    /// When this entry was ingested.
+    /// When this entry was ingested (milliseconds since epoch).
+    #[allow(dead_code)] // stored for future diagnostics and re-indexing
     ingested_at_ms: u64,
 }
 
@@ -102,7 +104,8 @@ impl OluoEngine {
                 header,
                 metadata,
                 decision,
-            } => self.handle_ingest(header, metadata, decision),
+                now_ms,
+            } => self.handle_ingest(header, metadata, decision, now_ms),
             OluoEvent::Search { query_id, query } => self.handle_search(query_id, query),
             OluoEvent::SyncReceived {
                 community_id: _,
@@ -112,6 +115,7 @@ impl OluoEngine {
                 alloc::vec![OluoAction::FetchTrieNode { cid: trie_root }]
             }
             OluoEvent::EvictExpired { now_ms } => {
+                // Evict entries at or past their expiry (strictly-greater keeps live entries).
                 self.entries.retain(|_, entry| match entry.expires_at {
                     Some(expires) => expires > now_ms,
                     None => true,
@@ -131,6 +135,7 @@ impl OluoEngine {
         header: SidecarHeader,
         metadata: SidecarMetadata,
         decision: IngestDecision,
+        now_ms: u64,
     ) -> Vec<OluoAction> {
         // Reject decision — do not index.
         if decision == IngestDecision::Reject {
@@ -144,9 +149,9 @@ impl OluoEngine {
 
         let expires_at = match &decision {
             IngestDecision::IndexFull => None,
-            // TODO: When clock support is added, compute expires_at = now_ms + ttl_secs * 1000
-            // instead of using ttl_secs * 1000 as an absolute timestamp.
-            IngestDecision::IndexLightweight { ttl_secs } => Some(ttl_secs * 1000),
+            IngestDecision::IndexLightweight { ttl_secs } => {
+                Some(now_ms.saturating_add(ttl_secs.saturating_mul(1000)))
+            }
             IngestDecision::Reject => unreachable!(),
         };
 
@@ -154,7 +159,7 @@ impl OluoEngine {
             tier3: header.tier3,
             metadata,
             expires_at,
-            ingested_at_ms: 0, // No clock available yet.
+            ingested_at_ms: now_ms,
         };
 
         self.entries.insert(header.target_cid, entry);
@@ -164,12 +169,19 @@ impl OluoEngine {
     }
 
     fn handle_search(&self, query_id: u64, query: SearchQuery) -> Vec<OluoAction> {
+        // Currently only Tier 3 (256-bit) search is supported — the flat index
+        // stores tier3 vectors. The query.tier field is used for score normalization.
+        let max_bits = query.tier.bit_count() as f32;
         let mut scored: Vec<([u8; 32], f32, &IndexEntry)> = self
             .entries
             .iter()
             .map(|(cid, entry)| {
                 let dist = hamming_distance(&query.embedding, &entry.tier3);
-                let score = dist as f32 / 256.0;
+                let score = if max_bits > 0.0 {
+                    dist as f32 / max_bits
+                } else {
+                    0.0
+                };
                 (*cid, score, entry)
             })
             .collect();
@@ -234,6 +246,7 @@ mod tests {
             header,
             metadata,
             decision,
+            now_ms: 1_700_000_000_000,
         });
 
         assert!(actions.is_empty());
@@ -252,6 +265,7 @@ mod tests {
             header,
             metadata,
             decision,
+            now_ms: 1_700_000_000_000,
         });
 
         assert!(actions.is_empty());
@@ -273,6 +287,7 @@ mod tests {
             header,
             metadata,
             decision,
+            now_ms: 1_700_000_000_000,
         });
 
         assert!(actions.is_empty());
@@ -320,6 +335,7 @@ mod tests {
                 header,
                 metadata: SidecarMetadata::default(),
                 decision: IngestDecision::IndexFull,
+                now_ms: 1_700_000_000_000,
             });
         }
 
@@ -360,6 +376,7 @@ mod tests {
     #[test]
     fn engine_evict_removes_expired() {
         let mut engine = OluoEngine::new();
+        let ingest_time: u64 = 1_700_000_000_000; // realistic timestamp (ms)
 
         // Insert a lightweight entry with TTL of 60 seconds.
         let header = test_header([0x04; 32], [0xDD; 32]);
@@ -370,16 +387,21 @@ mod tests {
             header,
             metadata,
             decision,
+            now_ms: ingest_time,
         });
         assert_eq!(engine.entry_count(), 1);
 
-        // Evict at time before expiry — should still be present.
-        // expires_at = 60 * 1000 = 60000 ms (since ingested_at_ms is 0).
-        engine.handle(OluoEvent::EvictExpired { now_ms: 59_999 });
+        // expires_at = ingest_time + 60_000 ms
+        // Evict 1ms before expiry — should still be present.
+        engine.handle(OluoEvent::EvictExpired {
+            now_ms: ingest_time + 59_999,
+        });
         assert_eq!(engine.entry_count(), 1);
 
-        // Evict at expiry time — should be removed.
-        engine.handle(OluoEvent::EvictExpired { now_ms: 60_000 });
+        // Evict at expiry time — should be removed (strictly-greater keeps live entries).
+        engine.handle(OluoEvent::EvictExpired {
+            now_ms: ingest_time + 60_000,
+        });
         assert_eq!(engine.entry_count(), 0);
     }
 }

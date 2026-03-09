@@ -78,6 +78,7 @@ harmony-kitri = { path = "crates/harmony-kitri", default-features = false }
 harmony-platform = { path = "crates/harmony-platform", default-features = false }
 harmony-reticulum = { path = "crates/harmony-reticulum", default-features = false }
 harmony-roxy = { path = "crates/harmony-roxy", default-features = false }
+harmony-oluo = { path = "crates/harmony-oluo", default-features = false }
 harmony-semantic = { path = "crates/harmony-semantic", default-features = false }
 harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
