@@ -246,3 +246,4 @@
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-09T00:52:16Z","event_type":"closed","id":246,"issue_id":"harmony-c8w","new_value":"Delivered — collection blob codec in harmony-semantic, PR pending review","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-09T00:52:17Z","event_type":"closed","id":247,"issue_id":"harmony-0oi","new_value":"Delivered — overlay merge + metadata + semantic navigation in harmony-semantic, PR pending review","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-09T10:41:09Z","event_type":"closed","id":248,"issue_id":"harmony-3eo","new_value":"Delivered — PRs pending review (harmony-os code + harmony docs)","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-09T14:37:11Z","event_type":"closed","id":249,"issue_id":"harmony-kax","new_value":"Delivered — harmony-os PR #14 + harmony PR #61","old_value":""}
