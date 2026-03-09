@@ -68,11 +68,16 @@ impl Serialize for UsageRights {
 }
 
 impl<'de> Deserialize<'de> for UsageRights {
+    /// Deserializes usage rights, silently masking off unknown bits.
+    ///
+    /// Uses `from_bits_truncate` for forward compatibility: an older node
+    /// that doesn't recognize a new right (e.g., `BROADCAST = 0b10000`)
+    /// will ignore it rather than rejecting the entire manifest. This is
+    /// safe because an old node can't exercise a right its software doesn't
+    /// implement.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bits = u8::deserialize(deserializer)?;
-        UsageRights::from_bits(bits).ok_or_else(|| {
-            serde::de::Error::custom(alloc::format!("invalid UsageRights bits: {bits:#010b}"))
-        })
+        Ok(UsageRights::from_bits_truncate(bits))
     }
 }
 
