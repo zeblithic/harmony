@@ -5,6 +5,7 @@
 #![no_std]
 extern crate alloc;
 
+pub mod collection;
 pub mod distance;
 pub mod error;
 pub mod fingerprint;
@@ -12,6 +13,7 @@ pub mod quantize;
 pub mod sidecar;
 pub mod tier;
 
+pub use collection::{CollectionBlob, CollectionEntry};
 pub use distance::{hamming_distance, hamming_distance_fast};
 pub use error::{SemanticError, SemanticResult};
 pub use fingerprint::{model_fingerprint, ModelFingerprint};
