@@ -24,6 +24,11 @@ pub enum OluoEvent {
         now_ms: u64,
     },
     /// Execute a search query.
+    ///
+    /// **Caller contract:** Search does not filter expired lightweight entries.
+    /// The caller must send `EvictExpired` at an appropriate cadence to remove
+    /// stale entries before querying. This separation keeps clock concerns out
+    /// of the query path (consistent with the sans-I/O pattern).
     Search { query_id: u64, query: SearchQuery },
     /// A community published an updated trie root.
     SyncReceived {
@@ -404,6 +409,44 @@ mod tests {
             }
             _ => panic!("expected SearchResults action"),
         }
+    }
+
+    #[test]
+    fn engine_search_includes_logically_expired_without_eviction() {
+        // Documents the caller contract: expired entries appear in search
+        // results until EvictExpired is explicitly sent.
+        let mut engine = OluoEngine::new();
+        let ingest_time: u64 = 1_700_000_000_000;
+
+        let header = test_header([0x05; 32], [0x00; 32]);
+        engine.handle(OluoEvent::Ingest {
+            header,
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexLightweight { ttl_secs: 10 },
+            now_ms: ingest_time,
+        });
+
+        // Time has passed well beyond TTL, but no EvictExpired sent.
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 7, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                // Expired entry still present — caller must evict first.
+                assert_eq!(results.len(), 1);
+            }
+            _ => panic!("expected SearchResults"),
+        }
+
+        // After eviction, the entry is gone.
+        engine.handle(OluoEvent::EvictExpired {
+            now_ms: ingest_time + 20_000,
+        });
+        assert_eq!(engine.entry_count(), 0);
     }
 
     #[test]
