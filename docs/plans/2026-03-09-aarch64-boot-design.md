@@ -104,9 +104,11 @@ Minimal TX-only driver for QEMU `virt` PL011 at `0x0900_0000`.
 ### Enable Sequence
 
 ```
-DSB ISH
+DSB ISH + ISB
+TLBI vmalle1is + DSB ISH + ISB   (invalidate stale UEFI TLB entries first)
+Read ID_AA64MMFR0_EL1.PARange → set TCR_EL1.IPS
 Write MAIR_EL1
-Write TCR_EL1
+Write TCR_EL1 (with runtime IPS)
 Write TTBR0_EL1
 ISB
 Read/modify/write SCTLR_EL1: set M, C, I

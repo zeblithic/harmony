@@ -141,6 +141,9 @@ Add to `src/pl011.rs`:
 /// Formula: BRD = clock_hz / (16 * baud)
 /// IBRD = integer part, FBRD = round(fractional * 64)
 pub fn baud_divisors(clock_hz: u32, baud: u32) -> (u16, u8) {
+    if baud == 0 {
+        return (0, 0);
+    }
     // Fixed-point: multiply by 4 to get 64ths of the divisor
     // div_x64 = (clock * 4) / baud = (clock / (16 * baud)) * 64
     let div_x64 = (clock_hz as u64 * 4) / baud as u64;
@@ -184,7 +187,7 @@ mod tests {
 
 Run from `crates/harmony-boot-aarch64/`:
 ```bash
-cargo test --target aarch64-apple-darwin -- pl011
+cargo test --target $(rustc -vV | grep host | cut -d' ' -f2) -- pl011
 ```
 
 **Important:** Unit tests run on the HOST, not the UEFI target. You need to run tests with the host target, not `aarch64-unknown-uefi`. Use `cargo test --target aarch64-apple-darwin` (macOS ARM) or just `cargo test` if you temporarily override the default target. If the default target in `.cargo/config.toml` blocks host tests, run: `cargo test --target $(rustc -vV | grep host | cut -d' ' -f2)`
@@ -630,6 +633,11 @@ unsafe fn configure_system_regs(root: PhysAddr) {
         "dsb ish",
         "isb",
 
+        // Invalidate stale UEFI TLB entries BEFORE writing translation regs
+        "tlbi vmalle1is",
+        "dsb ish",
+        "isb",
+
         // Set MAIR_EL1
         "msr mair_el1, {mair}",
 
@@ -648,11 +656,6 @@ unsafe fn configure_system_regs(root: PhysAddr) {
         "msr sctlr_el1, {tmp}",
 
         // Ensure MMU is active before next instruction
-        "isb",
-
-        // Invalidate TLBs
-        "tlbi vmalle1is",
-        "dsb ish",
         "isb",
 
         mair = in(reg) MAIR_VALUE,
@@ -837,8 +840,8 @@ pub fn freq() -> u64 {
 
 /// Read the current counter value.
 ///
-/// # Safety
-/// Timer must be initialized.
+/// Note: [`init`] should be called first; otherwise the returned count
+/// has no relationship to a known frequency.
 #[cfg(target_arch = "aarch64")]
 pub fn counter() -> u64 {
     let count: u64;
