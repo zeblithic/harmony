@@ -326,10 +326,10 @@ impl JainEngine {
 
             if !entry.exists_on_disk {
                 // Case 2: tracked CID whose backing data is missing
-                if self.records.contains_key(&entry.cid) {
+                if let Some(record) = self.records.get(&entry.cid) {
                     actions.push(JainAction::RepairNeeded {
                         cid: entry.cid,
-                        current_replicas: 0,
+                        current_replicas: record.replica_count,
                         desired: self.config.min_replica_count,
                     });
                 }
@@ -964,18 +964,26 @@ mod tests {
             sensitivity: Sensitivity::Public,
             timestamp: 1000.0,
         });
+        // Set replica count to 3 so we can verify it's reported correctly
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
         let snapshot = alloc::vec![SnapshotEntry {
             cid,
             size_bytes: 100,
             exists_on_disk: false,
         }];
         let actions = engine.reconcile(&snapshot, 1000.0);
-        let has_repair = actions
-            .iter()
-            .any(|a| matches!(a, JainAction::RepairNeeded { .. }));
-        assert!(
-            has_repair,
-            "expected RepairNeeded for missing backing data, got: {actions:?}"
+        let repair = actions.iter().find_map(|a| match a {
+            JainAction::RepairNeeded {
+                current_replicas,
+                desired,
+                ..
+            } => Some((*current_replicas, *desired)),
+            _ => None,
+        });
+        assert_eq!(
+            repair,
+            Some((3, engine.config.min_replica_count)),
+            "RepairNeeded should report actual replica count, got: {actions:?}"
         );
     }
 
