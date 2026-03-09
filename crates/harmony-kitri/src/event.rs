@@ -27,6 +27,12 @@ pub enum KitriEvent {
     WorkflowCompleted { seq: u64 },
     /// The workflow failed (possibly after compensation).
     WorkflowFailed { seq: u64, error: String },
+    /// A failed workflow was restarted (retry boundary marker).
+    ///
+    /// Recovery algorithms skip terminal events before the latest restart.
+    /// The event log is preserved as an audit trail, not for cached-result
+    /// deduplication (new I/O gets new seq numbers).
+    WorkflowRestarted { seq: u64, attempt: u32 },
 }
 
 /// The full event log for a workflow instance.

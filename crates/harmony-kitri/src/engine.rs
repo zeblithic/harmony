@@ -134,6 +134,8 @@ struct WorkflowState {
     output: Option<Vec<u8>>,
     /// Error message deferred until compensation completes.
     pending_error: Option<String>,
+    /// Current attempt number (0 = first run, incremented on each retry).
+    attempt: u32,
 }
 
 /// The Kitri engine — manages workflow lifecycle with durable execution.
@@ -202,9 +204,20 @@ impl KitriEngine {
 
         if let Some(existing) = self.workflows.get_mut(&wf_id) {
             if existing.status == KitriWorkflowStatus::Failed {
-                // Allow retry of failed workflows. Keep the event log so replay
-                // can skip I/O operations that already completed, preventing
-                // duplicate side effects.
+                // Allow retry of failed workflows. The event log is preserved
+                // as an audit trail (not for cached-result dedup — new I/O gets
+                // new seq numbers). Append a WorkflowRestarted boundary event
+                // so recovery algorithms skip the stale WorkflowFailed terminal
+                // event and understand this as a distinct execution attempt.
+                existing.attempt += 1;
+                let seq = existing.next_seq;
+                existing.next_seq += 1;
+                existing.event_log.append(
+                    crate::event::KitriEvent::WorkflowRestarted {
+                        seq,
+                        attempt: existing.attempt,
+                    },
+                );
                 existing.status = KitriWorkflowStatus::Pending;
                 existing.pending_error = None;
                 return vec![KitriAction::WorkflowAccepted { workflow_id: wf_id }];
@@ -223,6 +236,7 @@ impl KitriEngine {
                 next_seq: 0,
                 output: None,
                 pending_error: None,
+                attempt: 0,
             },
         );
 
@@ -287,6 +301,16 @@ impl KitriEngine {
             return vec![];
         }
 
+        // Validate the seq matches the outstanding I/O request. Since we only
+        // allow one outstanding I/O at a time (single WaitingForIo state), the
+        // expected seq is always next_seq - 1 (the seq assigned in handle_io_requested).
+        // Rejecting stale/corrupted seq values prevents event log corruption
+        // that would break cached_result() lookups during crash-recovery replay.
+        let expected_seq = state.next_seq - 1;
+        if seq != expected_seq {
+            return vec![];
+        }
+
         state.status = KitriWorkflowStatus::Executing;
 
         state
@@ -321,17 +345,20 @@ impl KitriEngine {
             .event_log
             .append(crate::event::KitriEvent::WorkflowCompleted { seq });
 
-        let mut actions: Vec<KitriAction> = state
-            .staging
-            .commit_all()
-            .into_iter()
-            .map(|w| KitriAction::CommitStagedWrite {
+        // Crash-safety invariant: persist the event log (WAL) BEFORE committing
+        // staged writes. If the runtime crashes after PersistEventLog but before
+        // CommitStagedWrite, recovery sees WorkflowCompleted and replays the
+        // staged writes. If it crashes before PersistEventLog, the workflow is
+        // still in-progress and can be re-executed safely.
+        let mut actions = vec![KitriAction::PersistEventLog { workflow_id }];
+
+        actions.extend(state.staging.commit_all().into_iter().map(|w| {
+            KitriAction::CommitStagedWrite {
                 workflow_id,
                 write: w,
-            })
-            .collect();
+            }
+        }));
 
-        actions.push(KitriAction::PersistEventLog { workflow_id });
         actions.push(KitriAction::Complete {
             workflow_id,
             output,
@@ -1273,5 +1300,140 @@ mod tests {
         }); // duplicate
 
         assert_eq!(caps.declarations.len(), 2);
+    }
+
+    #[test]
+    fn engine_complete_persists_event_log_before_staged_writes() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+
+        // Stage a side-effect I/O.
+        engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Publish {
+                topic: "test/out".into(),
+                payload: vec![42],
+            },
+        });
+        engine.handle(KitriEngineEvent::IoResolved {
+            workflow_id: wf_id,
+            seq: 0,
+            result: KitriIoResult::Published,
+        });
+
+        let actions = engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![99],
+        });
+
+        // Crash-safety invariant: PersistEventLog must come before CommitStagedWrite.
+        // This ensures the WAL records completion before side effects are committed.
+        let persist_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::PersistEventLog { .. }));
+        let commit_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::CommitStagedWrite { .. }));
+        let complete_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::Complete { .. }));
+        assert!(persist_pos.is_some());
+        assert!(commit_pos.is_some());
+        assert!(complete_pos.is_some());
+        assert!(persist_pos.unwrap() < commit_pos.unwrap());
+        assert!(commit_pos.unwrap() < complete_pos.unwrap());
+    }
+
+    #[test]
+    fn engine_io_resolved_rejects_wrong_seq() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+
+        // I/O request gets seq 0.
+        engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Fetch { cid: [0; 32] },
+        });
+        assert_eq!(
+            engine.status(&wf_id),
+            Some(KitriWorkflowStatus::WaitingForIo)
+        );
+
+        // Stale seq (99) should be rejected — status stays WaitingForIo.
+        let actions = engine.handle(KitriEngineEvent::IoResolved {
+            workflow_id: wf_id,
+            seq: 99,
+            result: KitriIoResult::Fetched { data: vec![1] },
+        });
+        assert!(actions.is_empty());
+        assert_eq!(
+            engine.status(&wf_id),
+            Some(KitriWorkflowStatus::WaitingForIo)
+        );
+
+        // Correct seq (0) should be accepted.
+        let actions = engine.handle(KitriEngineEvent::IoResolved {
+            workflow_id: wf_id,
+            seq: 0,
+            result: KitriIoResult::Fetched { data: vec![1] },
+        });
+        assert!(!actions.is_empty());
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Executing));
+    }
+
+    #[test]
+    fn engine_retry_appends_restart_boundary_event() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "transient".into(),
+        });
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Failed));
+
+        // Re-submit — should append WorkflowRestarted boundary event.
+        let actions = engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::WorkflowAccepted { .. })));
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Pending));
+
+        // Verify the event log contains the restart boundary.
+        let state = engine.workflows.get(&wf_id).unwrap();
+        let events = state.event_log.events();
+        assert!(events.iter().any(
+            |e| matches!(e, crate::event::KitriEvent::WorkflowRestarted { attempt: 1, .. })
+        ));
+
+        // Fail and retry again — attempt should increment.
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "transient again".into(),
+        });
+        engine.handle(KitriEngineEvent::Submit { program, input });
+
+        let state = engine.workflows.get(&wf_id).unwrap();
+        let events = state.event_log.events();
+        assert!(events.iter().any(
+            |e| matches!(e, crate::event::KitriEvent::WorkflowRestarted { attempt: 2, .. })
+        ));
     }
 }
