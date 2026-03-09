@@ -8,6 +8,12 @@
 extern crate alloc;
 
 pub mod error;
+pub mod filter;
+pub mod ingest;
+pub mod scope;
 pub mod zenoh_keys;
 
 pub use error::{OluoError, OluoResult};
+pub use filter::{FilteredSearchResult, RawSearchResult, RetrievalContext, RetrievalFilter};
+pub use ingest::{IngestDecision, IngestGate};
+pub use scope::{SearchQuery, SearchScope};
