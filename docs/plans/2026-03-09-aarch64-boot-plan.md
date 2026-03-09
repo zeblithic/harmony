@@ -1043,7 +1043,7 @@ pub unsafe fn read_u64() -> u64 {
 /// RNDR must be available.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn fill(buf: &mut [u8]) {
-    fill_from_u64(buf, || read_u64());
+    fill_from_u64(buf, || unsafe { read_u64() });
 }
 ```
 

@@ -30,7 +30,9 @@ crates/harmony-boot-aarch64/
 │   ├── main.rs              # UEFI entry, boot sequence orchestration
 │   ├── pl011.rs             # PL011 UART driver (QEMU virt @ 0x0900_0000)
 │   ├── mmu.rs               # System register setup (MAIR, TCR, SCTLR), identity map
-│   └── timer.rs             # ARM generic timer (CNTP_* registers)
+│   ├── bump_alloc.rs        # Boot-time bump frame allocator for page tables
+│   ├── timer.rs             # ARM generic timer (CNTP_* registers)
+│   └── rndr.rs              # ARMv8.5 RNDR hardware entropy
 ```
 
 **Not in workspace** — excluded like x86_64 `harmony-boot` to avoid feature unification with the bare-metal target.
