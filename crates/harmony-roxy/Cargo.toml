@@ -27,6 +27,7 @@ bitflags = { workspace = true }
 hashbrown = { workspace = true }
 hex = { workspace = true }
 rand_core = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

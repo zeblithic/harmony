@@ -59,6 +59,10 @@ pub struct ArtistProfile {
 ///
 /// Returns `"roxy/catalog/{hex_hash}/{category}/{manifest_id}"`.
 pub fn catalog_key(artist_hash: &[u8; 16], category: ContentCategory, manifest_id: &str) -> String {
+    debug_assert!(
+        !manifest_id.contains('/') && !manifest_id.contains('*'),
+        "manifest_id must not contain Zenoh metacharacters"
+    );
     alloc::format!(
         "roxy/catalog/{}/{}/{}",
         hex::encode(artist_hash),
@@ -78,6 +82,10 @@ pub fn meta_key(artist_hash: &[u8; 16]) -> String {
 ///
 /// Returns `"roxy/license/{hex_hash}/{manifest_id}"`.
 pub fn license_key(consumer_hash: &[u8; 16], manifest_id: &str) -> String {
+    debug_assert!(
+        !manifest_id.contains('/') && !manifest_id.contains('*'),
+        "manifest_id must not contain Zenoh metacharacters"
+    );
     alloc::format!(
         "roxy/license/{}/{}",
         hex::encode(consumer_hash),
@@ -89,6 +97,10 @@ pub fn license_key(consumer_hash: &[u8; 16], manifest_id: &str) -> String {
 ///
 /// Returns `"roxy/revocation/{hex_hash}/{ucan_hash}"`.
 pub fn revocation_key(artist_hash: &[u8; 16], ucan_hash: &str) -> String {
+    debug_assert!(
+        !ucan_hash.contains('/') && !ucan_hash.contains('*'),
+        "ucan_hash must not contain Zenoh metacharacters"
+    );
     alloc::format!("roxy/revocation/{}/{}", hex::encode(artist_hash), ucan_hash)
 }
 
@@ -205,5 +217,8 @@ mod tests {
         let decoded: ArtistProfile = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(profile.display_name, decoded.display_name);
         assert_eq!(profile.address_hash, decoded.address_hash);
+        assert_eq!(profile.bio, decoded.bio);
+        assert_eq!(profile.avatar_cid, decoded.avatar_cid);
+        assert_eq!(profile.manifest_cids, decoded.manifest_cids);
     }
 }

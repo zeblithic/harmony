@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use harmony_crypto::aead::AeadKey;
 use harmony_identity::{Identity, PrivateIdentity};
 use rand_core::CryptoRngCore;
+use zeroize::Zeroize;
 
 use crate::error::RoxyError;
 
@@ -32,8 +33,9 @@ pub fn wrap_key(
 ///
 /// Returns the recovered `AeadKey` for decrypting content.
 pub fn unwrap_key(consumer: &PrivateIdentity, wrapped: &[u8]) -> Result<AeadKey, RoxyError> {
-    let plaintext = consumer.decrypt(wrapped)?;
+    let mut plaintext = consumer.decrypt(wrapped)?;
     if plaintext.len() != 32 {
+        plaintext.zeroize();
         return Err(RoxyError::Crypto(
             harmony_crypto::CryptoError::InvalidKeyLength {
                 expected: 32,
@@ -43,7 +45,10 @@ pub fn unwrap_key(consumer: &PrivateIdentity, wrapped: &[u8]) -> Result<AeadKey,
     }
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&plaintext);
-    Ok(AeadKey::from_bytes(key_bytes))
+    plaintext.zeroize();
+    let key = AeadKey::from_bytes(key_bytes);
+    key_bytes.zeroize();
+    Ok(key)
 }
 
 #[cfg(test)]
