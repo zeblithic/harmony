@@ -97,11 +97,11 @@ fn merge_language(a: &Option<String>, b: &Option<String>) -> Option<String> {
             let mut seen = Vec::new();
             for tag in la.split(", ").chain(lb.split(", ")) {
                 let tag = tag.trim();
-                if !tag.is_empty() && !seen.iter().any(|s: &&str| *s == tag) {
+                if !tag.is_empty() && !seen.contains(&tag) {
                     seen.push(tag);
                 }
             }
-            Some(seen.join(", ").into())
+            Some(seen.join(", "))
         }
         (Some(l), None) | (None, Some(l)) => Some(l.clone()),
         (None, None) => None,
