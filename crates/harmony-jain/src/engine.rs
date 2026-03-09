@@ -30,6 +30,13 @@ impl JainEngine {
     /// Returns an error if the configuration is invalid (e.g. zero half-life,
     /// inverted thresholds). See [`JainConfig::validate`] for the full list of
     /// checked invariants.
+    ///
+    /// # Storage capacity
+    ///
+    /// Pass `storage_capacity_bytes = 0` to disable storage-budget enforcement.
+    /// When `0` is used, [`evaluate_ingest`](Self::evaluate_ingest) will never
+    /// reject for `StorageBudgetExceeded` and [`tick`](Self::tick) will never
+    /// emit `StorageNearFull` alerts.
     pub fn new(
         config: JainConfig,
         filter_rules: FilterRuleSet,
@@ -247,6 +254,13 @@ impl JainEngine {
     /// actions.
     ///
     /// Call periodically with the current wall-clock timestamp.
+    ///
+    /// # Idempotency
+    ///
+    /// `tick` re-evaluates every record on each call and may emit the same
+    /// `RepairNeeded` or `RecommendBurn` action across successive ticks until
+    /// the underlying condition is resolved. Callers are responsible for
+    /// deduplicating or rate-limiting these actions in their dispatch loop.
     pub fn tick(&mut self, now: f64) -> Vec<JainAction> {
         let mut actions = Vec::new();
 
