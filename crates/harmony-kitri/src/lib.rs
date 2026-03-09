@@ -21,6 +21,15 @@ pub mod retry;
 pub mod staging;
 pub mod trust;
 
+pub use checkpoint::KitriCheckpoint;
+pub use compensation::{CompensationLog, Compensator};
+pub use dag::{DagStep, KitriDag};
 pub use engine::{KitriAction, KitriEngine, KitriEngineEvent, KitriWorkflowStatus};
 pub use error::{KitriError, KitriResult};
+pub use event::KitriEventLog;
+pub use io::{KitriIoOp, KitriIoResult};
+pub use manifest::{DeployConfig, KitriManifest, RuntimeConfig, TrustConfig};
 pub use program::{kitri_workflow_id, KitriProgram};
+pub use retry::{BackoffStrategy, FailureKind, RetryPolicy};
+pub use staging::{StagedWrite, StagingBuffer};
+pub use trust::{CapabilityDecl, CapabilitySet, TrustTier};
