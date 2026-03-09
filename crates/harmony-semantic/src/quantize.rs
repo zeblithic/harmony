@@ -103,7 +103,9 @@ mod tests {
     #[test]
     fn quantize_1024_dimensions() {
         // 1024 floats → 128 bytes.
-        let input: Vec<f32> = (0..1024).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let input: Vec<f32> = (0..1024)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let binary = quantize_to_binary(&input);
         assert_eq!(binary.len(), 128);
         // Every even bit is 1, odd is 0 → each byte is 0b10101010 = 0xAA.
@@ -115,7 +117,9 @@ mod tests {
     #[test]
     fn pack_tiers_roundtrip() {
         // Create a 1024-dimension vector, pack it, then verify tiers.
-        let input: Vec<f32> = (0..1024).map(|i| if i % 3 == 0 { 1.0 } else { -0.5 }).collect();
+        let input: Vec<f32> = (0..1024)
+            .map(|i| if i % 3 == 0 { 1.0 } else { -0.5 })
+            .collect();
         let fp = [0xDE, 0xAD, 0xBE, 0xEF];
         let cid = [0x42u8; 32];
 
