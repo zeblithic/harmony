@@ -216,6 +216,65 @@ impl JainEngine {
 
         decision
     }
+
+    /// Advance the engine, computing staleness scores and emitting housekeeping
+    /// actions.
+    ///
+    /// Call periodically with the current wall-clock timestamp.
+    pub fn tick(&mut self, now: f64) -> Vec<JainAction> {
+        let mut actions = Vec::new();
+
+        // Storage health check
+        if self.storage_capacity_bytes > 0 {
+            let used_pct =
+                self.total_storage_bytes as f64 / self.storage_capacity_bytes as f64;
+            if used_pct >= self.config.storage_alert_percent {
+                actions.push(JainAction::HealthAlert {
+                    alert: HealthAlertKind::StorageNearFull {
+                        used_percent_x100: (used_pct * 10000.0) as u32,
+                    },
+                });
+            }
+        }
+
+        // Per-record scoring
+        for record in self.records.values() {
+            // Under-replicated check
+            if record.replica_count < self.config.min_replica_count {
+                actions.push(JainAction::RepairNeeded {
+                    cid: record.cid,
+                    current_replicas: record.replica_count,
+                    desired: self.config.min_replica_count,
+                });
+            }
+
+            let score = crate::scoring::staleness_score(record, &self.config, now);
+
+            if score.value() >= self.config.burn_threshold {
+                actions.push(JainAction::RecommendBurn {
+                    recommendation: CleanupRecommendation {
+                        cid: record.cid,
+                        reason: CleanupReason::Stale,
+                        staleness: score,
+                        space_recovered_bytes: record.size_bytes,
+                        confidence: score.value(),
+                    },
+                });
+            } else if score.value() >= self.config.archive_threshold {
+                actions.push(JainAction::RecommendArchive {
+                    recommendation: CleanupRecommendation {
+                        cid: record.cid,
+                        reason: CleanupReason::Stale,
+                        staleness: score,
+                        space_recovered_bytes: record.size_bytes,
+                        confidence: score.value(),
+                    },
+                });
+            }
+        }
+
+        actions
+    }
 }
 
 impl Default for JainEngine {
@@ -606,6 +665,162 @@ mod tests {
         assert_eq!(
             engine.filter_result(&cid, SocialContext::Professional),
             FilterDecision::Allow
+        );
+    }
+
+    // ── Task 11: tick ──
+
+    #[test]
+    fn tick_recommends_burn_for_very_stale_content() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"stale-burn");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 500,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::CachedInTransit,
+            sensitivity: Sensitivity::Public,
+            timestamp: 0.0,
+        });
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
+
+        let now = 10.0 * engine.config.access_decay_half_life_secs;
+        let actions = engine.tick(now);
+        let has_burn = actions.iter().any(|a| matches!(a, JainAction::RecommendBurn { .. }));
+        assert!(has_burn, "expected RecommendBurn action, got: {actions:?}");
+    }
+
+    #[test]
+    fn tick_recommends_archive_for_moderately_stale_content() {
+        let config = JainConfig {
+            archive_threshold: 0.3,
+            burn_threshold: 0.95,
+            ..JainConfig::default()
+        };
+        let mut engine = JainEngine::new(config, FilterRuleSet::default(), 10_000);
+        let cid = make_cid(b"stale-archive");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 500,
+            content_type: ContentCategory::Music,
+            origin: ContentOrigin::CachedInTransit,
+            sensitivity: Sensitivity::Public,
+            timestamp: 0.0,
+        });
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
+
+        let now = 2.0 * engine.config.access_decay_half_life_secs;
+        let actions = engine.tick(now);
+        let has_archive = actions
+            .iter()
+            .any(|a| matches!(a, JainAction::RecommendArchive { .. }));
+        assert!(
+            has_archive,
+            "expected RecommendArchive action, got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn tick_skips_pinned_content() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"pinned-old");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 500,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::CachedInTransit,
+            sensitivity: Sensitivity::Public,
+            timestamp: 0.0,
+        });
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
+        engine.handle_event(ContentEvent::Pinned { cid });
+
+        let now = 10.0 * engine.config.access_decay_half_life_secs;
+        let actions = engine.tick(now);
+        let has_cleanup = actions.iter().any(|a| {
+            matches!(
+                a,
+                JainAction::RecommendBurn { .. } | JainAction::RecommendArchive { .. }
+            )
+        });
+        assert!(
+            !has_cleanup,
+            "pinned content should not get cleanup recommendations, got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn tick_emits_repair_needed_for_under_replicated() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"under-rep");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 100,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::Downloaded,
+            sensitivity: Sensitivity::Public,
+            timestamp: 1000.0,
+        });
+
+        let actions = engine.tick(1000.0);
+        let has_repair = actions.iter().any(|a| matches!(a, JainAction::RepairNeeded { .. }));
+        assert!(
+            has_repair,
+            "expected RepairNeeded action, got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn tick_emits_storage_near_full_alert() {
+        let mut engine = JainEngine::new(JainConfig::default(), FilterRuleSet::default(), 1000);
+        let cid = make_cid(b"big-content");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 900,
+            content_type: ContentCategory::Video,
+            origin: ContentOrigin::Downloaded,
+            sensitivity: Sensitivity::Public,
+            timestamp: 1000.0,
+        });
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
+
+        let actions = engine.tick(1000.0);
+        let has_storage_alert = actions.iter().any(|a| {
+            matches!(
+                a,
+                JainAction::HealthAlert {
+                    alert: HealthAlertKind::StorageNearFull { .. }
+                }
+            )
+        });
+        assert!(
+            has_storage_alert,
+            "expected StorageNearFull alert, got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn tick_no_actions_for_fresh_content() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"fresh-content");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 100,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::SelfCreated,
+            sensitivity: Sensitivity::Public,
+            timestamp: 1000.0,
+        });
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
+        engine.handle_event(ContentEvent::Accessed {
+            cid,
+            timestamp: 1000.0,
+        });
+
+        let actions = engine.tick(1000.0);
+        assert!(
+            actions.is_empty(),
+            "expected no actions for fresh content, got: {actions:?}"
         );
     }
 }
