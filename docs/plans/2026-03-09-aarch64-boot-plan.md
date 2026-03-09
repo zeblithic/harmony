@@ -1065,13 +1065,29 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 ```rust
 // ... after MMU enable, timer init, RNDR check:
 
-// Find largest usable memory region for heap (skip the bump allocator region)
-let (heap_base, heap_size) = regions[..region_count]
-    .iter()
-    .filter(|r| r.is_usable && r.base != bump_base)
-    .map(|r| (r.base, r.pages * PAGE_SIZE))
-    .max_by_key(|(_, size)| *size)
-    .expect("no usable memory region for heap");
+// Find largest usable sub-region after carving out the bump allocator.
+// On QEMU virt, most RAM is one large CONVENTIONAL descriptor that contains
+// the bump allocator, so we must carve rather than exclude the whole region.
+let bump_end = bump_base + BUMP_REGION_SIZE;
+
+let mut best_heap: Option<(u64, u64)> = None; // (base, size)
+for r in regions[..region_count].iter().filter(|r| r.is_usable) {
+    let r_end = r.base + r.pages * PAGE_SIZE;
+    let candidates: [(u64, u64); 2] = [
+        // Sub-region before bump allocator
+        if r.base < bump_base { (r.base, core::cmp::min(r_end, bump_base) - r.base) } else { (0, 0) },
+        // Sub-region after bump allocator
+        if r_end > bump_end { let start = core::cmp::max(r.base, bump_end); (start, r_end - start) } else { (0, 0) },
+    ];
+    for (base, size) in candidates {
+        if size > 0 {
+            if best_heap.map_or(true, |(_, best_size)| size > best_size) {
+                best_heap = Some((base, size));
+            }
+        }
+    }
+}
+let (heap_base, heap_size) = best_heap.expect("no usable memory region for heap");
 
 // Cap heap at 4 MiB
 let heap_size = core::cmp::min(heap_size, 4 * 1024 * 1024);
