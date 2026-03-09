@@ -63,12 +63,15 @@ impl Default for DeployConfig {
 mod parsing {
     use super::*;
     use crate::error::KitriError;
+    use crate::trust::CapabilityDecl;
     use serde::Deserialize;
 
     #[derive(Deserialize)]
     struct RawManifest {
         package: RawPackage,
         runtime: Option<RawRuntime>,
+        capabilities: Option<RawCapabilities>,
+        trust: Option<RawTrust>,
         deploy: Option<RawDeploy>,
     }
 
@@ -82,6 +85,22 @@ mod parsing {
     struct RawRuntime {
         max_retries: Option<u32>,
         fuel_budget: Option<u64>,
+    }
+
+    #[derive(Deserialize, Default)]
+    struct RawCapabilities {
+        subscribe: Option<Vec<String>>,
+        publish: Option<Vec<String>>,
+        fetch: Option<Vec<String>>,
+        store: Option<Vec<String>>,
+        infer: Option<bool>,
+        spawn: Option<Vec<String>>,
+        seal: Option<bool>,
+    }
+
+    #[derive(Deserialize, Default)]
+    struct RawTrust {
+        signers: Option<Vec<String>>,
     }
 
     #[derive(Deserialize)]
@@ -108,6 +127,39 @@ mod parsing {
                 }
             }
 
+            let mut capabilities = CapabilitySet::new();
+            if let Some(caps) = raw.capabilities {
+                for topic in caps.subscribe.unwrap_or_default() {
+                    capabilities.add(CapabilityDecl::Subscribe { topic });
+                }
+                for topic in caps.publish.unwrap_or_default() {
+                    capabilities.add(CapabilityDecl::Publish { topic });
+                }
+                for namespace in caps.fetch.unwrap_or_default() {
+                    capabilities.add(CapabilityDecl::Fetch { namespace });
+                }
+                for namespace in caps.store.unwrap_or_default() {
+                    capabilities.add(CapabilityDecl::Store { namespace });
+                }
+                if caps.infer.unwrap_or(false) {
+                    capabilities.add(CapabilityDecl::Infer);
+                }
+                for workflow in caps.spawn.unwrap_or_default() {
+                    capabilities.add(CapabilityDecl::Spawn { workflow });
+                }
+                if caps.seal.unwrap_or(false) {
+                    capabilities.add(CapabilityDecl::Seal);
+                }
+            }
+
+            let trust = if let Some(t) = raw.trust {
+                TrustConfig {
+                    signers: t.signers.unwrap_or_default(),
+                }
+            } else {
+                TrustConfig::default()
+            };
+
             let mut deploy = DeployConfig::default();
             if let Some(dep) = raw.deploy {
                 if let Some(pn) = dep.prefer_native {
@@ -122,8 +174,8 @@ mod parsing {
                 name: raw.package.name,
                 version: raw.package.version,
                 runtime,
-                capabilities: CapabilitySet::new(),
-                trust: TrustConfig::default(),
+                capabilities,
+                trust,
                 deploy,
             })
         }
@@ -196,5 +248,73 @@ replicas = 2
         assert_eq!(manifest.runtime.fuel_budget, 2_000_000);
         assert!(!manifest.deploy.prefer_native);
         assert_eq!(manifest.deploy.replicas, 2);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn parse_kitri_toml_with_capabilities_and_trust() {
+        use crate::trust::CapabilityDecl;
+
+        let toml_str = r#"
+[package]
+name = "supply-chain"
+version = "0.2.0"
+
+[capabilities]
+subscribe = ["orders/**", "events/user/*"]
+publish = ["results/output"]
+fetch = ["content/images"]
+store = ["content/processed"]
+infer = true
+spawn = ["child-verifier"]
+seal = true
+
+[trust]
+signers = ["did:key:z6MkFirst", "did:key:z6MkSecond"]
+"#;
+        let manifest = KitriManifest::from_toml(toml_str).unwrap();
+        assert_eq!(manifest.name, "supply-chain");
+
+        // Capabilities parsed correctly.
+        let caps = &manifest.capabilities.declarations;
+        assert_eq!(caps.len(), 8); // 2 subscribe + 1 publish + 1 fetch + 1 store + 1 infer + 1 spawn + 1 seal
+        assert!(caps.contains(&CapabilityDecl::Subscribe {
+            topic: "orders/**".into()
+        }));
+        assert!(caps.contains(&CapabilityDecl::Subscribe {
+            topic: "events/user/*".into()
+        }));
+        assert!(caps.contains(&CapabilityDecl::Publish {
+            topic: "results/output".into()
+        }));
+        assert!(caps.contains(&CapabilityDecl::Fetch {
+            namespace: "content/images".into()
+        }));
+        assert!(caps.contains(&CapabilityDecl::Store {
+            namespace: "content/processed".into()
+        }));
+        assert!(caps.contains(&CapabilityDecl::Infer));
+        assert!(caps.contains(&CapabilityDecl::Spawn {
+            workflow: "child-verifier".into()
+        }));
+        assert!(caps.contains(&CapabilityDecl::Seal));
+
+        // Trust signers parsed correctly.
+        assert_eq!(manifest.trust.signers.len(), 2);
+        assert_eq!(manifest.trust.signers[0], "did:key:z6MkFirst");
+        assert_eq!(manifest.trust.signers[1], "did:key:z6MkSecond");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn parse_kitri_toml_omitted_capabilities_and_trust_default() {
+        let toml_str = r#"
+[package]
+name = "minimal"
+version = "0.1.0"
+"#;
+        let manifest = KitriManifest::from_toml(toml_str).unwrap();
+        assert!(manifest.capabilities.is_empty());
+        assert!(manifest.trust.signers.is_empty());
     }
 }

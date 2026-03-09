@@ -220,6 +220,14 @@ impl KitriEngine {
             return vec![];
         };
 
+        // Only accept I/O requests from active, non-waiting states.
+        if !matches!(
+            state.status,
+            KitriWorkflowStatus::Pending | KitriWorkflowStatus::Executing
+        ) {
+            return vec![];
+        }
+
         let seq = state.next_seq;
         state.next_seq += 1;
         state.status = KitriWorkflowStatus::WaitingForIo;
@@ -374,6 +382,16 @@ impl KitriEngine {
             return vec![];
         };
 
+        // Only checkpoint alive workflows.
+        if !matches!(
+            state.status,
+            KitriWorkflowStatus::Pending
+                | KitriWorkflowStatus::Executing
+                | KitriWorkflowStatus::WaitingForIo
+        ) {
+            return vec![];
+        }
+
         let seq = state.next_seq;
         state.next_seq += 1;
         state
@@ -392,6 +410,14 @@ impl KitriEngine {
         let Some(state) = self.workflows.get_mut(&workflow_id) else {
             return vec![];
         };
+
+        // Only register compensators during active execution.
+        if !matches!(
+            state.status,
+            KitriWorkflowStatus::Pending | KitriWorkflowStatus::Executing
+        ) {
+            return vec![];
+        }
 
         state
             .compensation
@@ -826,5 +852,132 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, KitriAction::PersistEventLog { .. })));
+    }
+
+    #[test]
+    fn engine_io_requested_rejected_for_terminal_workflow() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Fetch { cid: [0; 32] },
+        });
+        engine.handle(KitriEngineEvent::IoResolved {
+            workflow_id: wf_id,
+            seq: 0,
+            result: KitriIoResult::Fetched { data: vec![1] },
+        });
+        engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![],
+        });
+
+        // Stale IoRequested should be rejected for a Complete workflow.
+        let actions = engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Fetch { cid: [1; 32] },
+        });
+        assert!(actions.is_empty());
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Complete));
+    }
+
+    #[test]
+    fn engine_io_requested_rejected_while_waiting() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Fetch { cid: [0; 32] },
+        });
+        assert_eq!(
+            engine.status(&wf_id),
+            Some(KitriWorkflowStatus::WaitingForIo)
+        );
+
+        // Second IoRequested while already waiting should be rejected.
+        let actions = engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Fetch { cid: [1; 32] },
+        });
+        assert!(actions.is_empty());
+        assert_eq!(
+            engine.status(&wf_id),
+            Some(KitriWorkflowStatus::WaitingForIo)
+        );
+    }
+
+    #[test]
+    fn engine_checkpoint_rejected_for_terminal_workflow() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Fetch { cid: [0; 32] },
+        });
+        engine.handle(KitriEngineEvent::IoResolved {
+            workflow_id: wf_id,
+            seq: 0,
+            result: KitriIoResult::Fetched { data: vec![1] },
+        });
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "boom".into(),
+        });
+
+        // Checkpoint should be rejected for a Failed workflow.
+        let actions = engine.handle(KitriEngineEvent::CheckpointRequested {
+            workflow_id: wf_id,
+            state: vec![],
+            state_cid: [0xCC; 32],
+        });
+        assert!(actions.is_empty());
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Failed));
+    }
+
+    #[test]
+    fn engine_compensator_rejected_for_terminal_workflow() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Fetch { cid: [0; 32] },
+        });
+        engine.handle(KitriEngineEvent::IoResolved {
+            workflow_id: wf_id,
+            seq: 0,
+            result: KitriIoResult::Fetched { data: vec![1] },
+        });
+        engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![],
+        });
+
+        // Compensator registration should be rejected for a Complete workflow.
+        let actions = engine.handle(KitriEngineEvent::CompensatorRegistered {
+            workflow_id: wf_id,
+            step_id: 99,
+            rollback_op: KitriIoOp::Query {
+                topic: "undo".into(),
+                payload: vec![],
+            },
+        });
+        assert!(actions.is_empty());
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Complete));
     }
 }
