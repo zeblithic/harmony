@@ -6,10 +6,10 @@ use crate::error::JainError;
 
 /// Validate that a key expression segment contains no Zenoh metacharacters.
 fn validate_segment(s: &str) -> Result<(), JainError> {
-    if s.is_empty() || s.contains('/') || s.contains('*') {
-        Err(JainError::InvalidKeySegment)
-    } else {
+    if harmony_roxy::catalog::is_valid_key_segment(s) {
         Ok(())
+    } else {
+        Err(JainError::InvalidKeySegment)
     }
 }
 

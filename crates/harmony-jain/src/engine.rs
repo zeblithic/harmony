@@ -7,6 +7,7 @@ use hashbrown::{HashMap, HashSet};
 
 use crate::actions::*;
 use crate::config::{FilterRuleSet, JainConfig};
+use crate::error::JainError;
 use crate::types::{ContentOrigin, ContentRecord, Sensitivity, SocialContext};
 
 /// Sans-I/O content lifecycle engine.
@@ -25,18 +26,23 @@ pub struct JainEngine {
 
 impl JainEngine {
     /// Create a new engine with no tracked records.
+    ///
+    /// Returns an error if the configuration is invalid (e.g. zero half-life,
+    /// inverted thresholds). See [`JainConfig::validate`] for the full list of
+    /// checked invariants.
     pub fn new(
         config: JainConfig,
         filter_rules: FilterRuleSet,
         storage_capacity_bytes: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, JainError> {
+        config.validate()?;
+        Ok(Self {
             records: HashMap::new(),
             config,
             filter_rules,
             total_storage_bytes: 0,
             storage_capacity_bytes,
-        }
+        })
     }
 
     /// Number of content records currently tracked.
@@ -85,6 +91,14 @@ impl JainEngine {
 
     /// Process a content event, updating internal state and returning any actions
     /// for the caller to execute.
+    ///
+    /// # Storage budget
+    ///
+    /// For [`ContentEvent::Stored`], the caller **must** first obtain
+    /// [`IngestDecision::IndexAndStore`] or [`IngestDecision::StoreOnly`] from
+    /// [`evaluate_ingest`](Self::evaluate_ingest) before dispatching this event.
+    /// Skipping `evaluate_ingest` may cause `total_storage_bytes` to exceed
+    /// `storage_capacity_bytes`, corrupting storage-usage accounting.
     pub fn handle_event(&mut self, event: ContentEvent) -> Vec<JainAction> {
         match event {
             ContentEvent::Stored {
@@ -258,6 +272,13 @@ impl JainEngine {
                 });
             }
 
+            // Pinned or licensed content is exempt from cleanup — enforce
+            // directly here rather than relying solely on staleness_score
+            // returning FRESH.
+            if record.pinned || record.licensed {
+                continue;
+            }
+
             let score = crate::scoring::staleness_score(record, &self.config, now);
 
             if score.value() >= self.config.burn_threshold {
@@ -362,6 +383,7 @@ impl JainEngine {
 impl Default for JainEngine {
     fn default() -> Self {
         Self::new(JainConfig::default(), FilterRuleSet::default(), 0)
+            .expect("default JainConfig is always valid")
     }
 }
 
@@ -377,7 +399,7 @@ mod tests {
     }
 
     fn default_engine() -> JainEngine {
-        JainEngine::new(JainConfig::default(), FilterRuleSet::default(), 10_000)
+        JainEngine::new(JainConfig::default(), FilterRuleSet::default(), 10_000).unwrap()
     }
 
     // ── Task 8: Constructor, record_count, health_report ──
@@ -579,7 +601,7 @@ mod tests {
 
     #[test]
     fn evaluate_ingest_rejects_over_budget() {
-        let engine = JainEngine::new(JainConfig::default(), FilterRuleSet::default(), 50);
+        let engine = JainEngine::new(JainConfig::default(), FilterRuleSet::default(), 50).unwrap();
         let candidate = IngestCandidate {
             cid: make_cid(b"big-content"),
             size_bytes: 100,
@@ -731,7 +753,7 @@ mod tests {
             enabled: false,
             ..FilterRuleSet::default()
         };
-        let mut engine = JainEngine::new(JainConfig::default(), rules, 10_000);
+        let mut engine = JainEngine::new(JainConfig::default(), rules, 10_000).unwrap();
         let cid = make_cid(b"intimate-disabled");
         engine.handle_event(ContentEvent::Stored {
             cid,
@@ -788,7 +810,7 @@ mod tests {
             burn_threshold: 0.95,
             ..JainConfig::default()
         };
-        let mut engine = JainEngine::new(config, FilterRuleSet::default(), 10_000);
+        let mut engine = JainEngine::new(config, FilterRuleSet::default(), 10_000).unwrap();
         let cid = make_cid(b"stale-archive");
         engine.handle_event(ContentEvent::Stored {
             cid,
@@ -862,7 +884,7 @@ mod tests {
 
     #[test]
     fn tick_emits_storage_near_full_alert() {
-        let mut engine = JainEngine::new(JainConfig::default(), FilterRuleSet::default(), 1000);
+        let mut engine = JainEngine::new(JainConfig::default(), FilterRuleSet::default(), 1000).unwrap();
         let cid = make_cid(b"big-content");
         engine.handle_event(ContentEvent::Stored {
             cid,
@@ -1055,6 +1077,15 @@ mod tests {
             !has_burn,
             "reconciled record should not immediately get RecommendBurn, got: {actions:?}"
         );
+    }
+
+    #[test]
+    fn new_rejects_invalid_config() {
+        let config = JainConfig {
+            access_decay_half_life_secs: 0.0,
+            ..JainConfig::default()
+        };
+        assert!(JainEngine::new(config, FilterRuleSet::default(), 10_000).is_err());
     }
 
     #[test]

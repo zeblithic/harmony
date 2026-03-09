@@ -23,8 +23,15 @@ pub fn staleness_score(record: &ContentRecord, config: &JainConfig, now: f64) ->
     }
 
     // Time decay: exponential half-life
+    // Guard: if half-life is non-positive (should be caught by config validation),
+    // treat as if infinite half-lives have elapsed — everything is maximally stale.
+    // This prevents 0.0/0.0 = NaN when elapsed is also zero.
     let elapsed = (now - record.last_accessed).max(0.0);
-    let half_lives = elapsed / config.access_decay_half_life_secs;
+    let half_lives = if config.access_decay_half_life_secs > 0.0 {
+        elapsed / config.access_decay_half_life_secs
+    } else {
+        f64::INFINITY
+    };
     let recency = pow_f(0.5, half_lives);
 
     // Frequency factor: saturating logarithmic curve
