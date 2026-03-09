@@ -21,4 +21,7 @@ pub enum RoxyError {
 
     #[error("malformed UCAN resource bytes")]
     InvalidResource,
+
+    #[error("key expression segment contains Zenoh metacharacters")]
+    InvalidKeySegment,
 }

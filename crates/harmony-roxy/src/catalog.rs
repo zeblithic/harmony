@@ -5,6 +5,8 @@ use alloc::vec::Vec;
 use harmony_content::ContentId;
 use serde::{Deserialize, Serialize};
 
+use crate::error::RoxyError;
+
 /// Content category for organizing published content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -55,20 +57,33 @@ pub struct ArtistProfile {
     pub manifest_cids: Vec<ContentId>,
 }
 
+/// Validate that a key expression segment contains no Zenoh metacharacters.
+fn validate_segment(s: &str) -> Result<(), RoxyError> {
+    if s.contains('/') || s.contains('*') {
+        Err(RoxyError::InvalidKeySegment)
+    } else {
+        Ok(())
+    }
+}
+
 /// Build a Zenoh key expression for a specific catalog entry.
 ///
 /// Returns `"roxy/catalog/{hex_hash}/{category}/{manifest_id}"`.
-pub fn catalog_key(artist_hash: &[u8; 16], category: ContentCategory, manifest_id: &str) -> String {
-    assert!(
-        !manifest_id.contains('/') && !manifest_id.contains('*'),
-        "manifest_id must not contain Zenoh metacharacters"
-    );
-    alloc::format!(
+///
+/// Returns `Err(RoxyError::InvalidKeySegment)` if `manifest_id` contains
+/// Zenoh metacharacters (`/` or `*`).
+pub fn catalog_key(
+    artist_hash: &[u8; 16],
+    category: ContentCategory,
+    manifest_id: &str,
+) -> Result<String, RoxyError> {
+    validate_segment(manifest_id)?;
+    Ok(alloc::format!(
         "roxy/catalog/{}/{}/{}",
         hex::encode(artist_hash),
         category.as_str(),
         manifest_id
-    )
+    ))
 }
 
 /// Build a Zenoh key expression for an artist's metadata entry.
@@ -81,27 +96,31 @@ pub fn meta_key(artist_hash: &[u8; 16]) -> String {
 /// Build a Zenoh key expression for a consumer's license grant.
 ///
 /// Returns `"roxy/license/{hex_hash}/{manifest_id}"`.
-pub fn license_key(consumer_hash: &[u8; 16], manifest_id: &str) -> String {
-    assert!(
-        !manifest_id.contains('/') && !manifest_id.contains('*'),
-        "manifest_id must not contain Zenoh metacharacters"
-    );
-    alloc::format!(
+///
+/// Returns `Err(RoxyError::InvalidKeySegment)` if `manifest_id` contains
+/// Zenoh metacharacters (`/` or `*`).
+pub fn license_key(consumer_hash: &[u8; 16], manifest_id: &str) -> Result<String, RoxyError> {
+    validate_segment(manifest_id)?;
+    Ok(alloc::format!(
         "roxy/license/{}/{}",
         hex::encode(consumer_hash),
         manifest_id
-    )
+    ))
 }
 
 /// Build a Zenoh key expression for a UCAN revocation notice.
 ///
 /// Returns `"roxy/revocation/{hex_hash}/{ucan_hash}"`.
-pub fn revocation_key(artist_hash: &[u8; 16], ucan_hash: &str) -> String {
-    assert!(
-        !ucan_hash.contains('/') && !ucan_hash.contains('*'),
-        "ucan_hash must not contain Zenoh metacharacters"
-    );
-    alloc::format!("roxy/revocation/{}/{}", hex::encode(artist_hash), ucan_hash)
+///
+/// Returns `Err(RoxyError::InvalidKeySegment)` if `ucan_hash` contains
+/// Zenoh metacharacters (`/` or `*`).
+pub fn revocation_key(artist_hash: &[u8; 16], ucan_hash: &str) -> Result<String, RoxyError> {
+    validate_segment(ucan_hash)?;
+    Ok(alloc::format!(
+        "roxy/revocation/{}/{}",
+        hex::encode(artist_hash),
+        ucan_hash
+    ))
 }
 
 /// Build a Zenoh subscription pattern for an artist's content.
@@ -130,7 +149,7 @@ mod tests {
     #[test]
     fn catalog_key_for_content() {
         let artist_hash = [0xABu8; 16];
-        let key = catalog_key(&artist_hash, ContentCategory::Music, "deadbeef");
+        let key = catalog_key(&artist_hash, ContentCategory::Music, "deadbeef").unwrap();
         assert_eq!(
             key,
             "roxy/catalog/abababababababababababababababab/music/deadbeef"
@@ -147,7 +166,7 @@ mod tests {
     #[test]
     fn license_key_for_consumer() {
         let consumer_hash = [0xCDu8; 16];
-        let key = license_key(&consumer_hash, "aabbccdd");
+        let key = license_key(&consumer_hash, "aabbccdd").unwrap();
         assert_eq!(
             key,
             "roxy/license/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd/aabbccdd"
@@ -157,11 +176,20 @@ mod tests {
     #[test]
     fn revocation_key_test() {
         let artist_hash = [0xEFu8; 16];
-        let key = revocation_key(&artist_hash, "11223344");
+        let key = revocation_key(&artist_hash, "11223344").unwrap();
         assert_eq!(
             key,
             "roxy/revocation/efefefefefefefefefefefefefefefef/11223344"
         );
+    }
+
+    #[test]
+    fn key_functions_reject_metacharacters() {
+        let hash = [0xABu8; 16];
+        assert!(catalog_key(&hash, ContentCategory::Music, "a/b").is_err());
+        assert!(catalog_key(&hash, ContentCategory::Music, "a*b").is_err());
+        assert!(license_key(&hash, "a/b").is_err());
+        assert!(revocation_key(&hash, "a*b").is_err());
     }
 
     #[test]
