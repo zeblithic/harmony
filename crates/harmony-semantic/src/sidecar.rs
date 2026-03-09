@@ -373,8 +373,7 @@ mod tests {
             let v1_blob = header.encode_v1();
             assert_eq!(v1_blob.len(), SIDECAR_HEADER_SIZE);
 
-            let decoded =
-                EnrichedSidecar::decode(&v1_blob).expect("v1 decode should succeed");
+            let decoded = EnrichedSidecar::decode(&v1_blob).expect("v1 decode should succeed");
             assert_eq!(decoded.header, header);
             assert_eq!(decoded.metadata, SidecarMetadata::default());
         }
