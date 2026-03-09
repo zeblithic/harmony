@@ -43,7 +43,14 @@ impl CollectionBlob {
     ///
     /// Layout: magic[0..4] + fingerprint[4..8] + count(u32 BE)[8..12]
     /// + centroid[12..44] + N × (target_cid[0..32] + tier3[32..64]).
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Returns `CollectionOverflow` if entries exceed `MAX_COLLECTION_ENTRIES`.
+    pub fn encode(&self) -> SemanticResult<Vec<u8>> {
+        if self.entries.len() > MAX_COLLECTION_ENTRIES as usize {
+            return Err(SemanticError::CollectionOverflow {
+                count: self.entries.len() as u32,
+            });
+        }
         let entry_count = self.entries.len() as u32;
         let total = COLLECTION_HEADER_SIZE + (self.entries.len() * COLLECTION_ENTRY_SIZE);
         let mut buf = Vec::with_capacity(total);
@@ -58,7 +65,7 @@ impl CollectionBlob {
             buf.extend_from_slice(&entry.tier3);
         }
 
-        buf
+        Ok(buf)
     }
 
     /// Deserialize a collection blob from bytes.
@@ -114,8 +121,8 @@ impl CollectionBlob {
     /// Compute the majority-vote centroid of the given entries.
     ///
     /// For each of the 256 bit positions: count how many entries have that bit
-    /// set. If more than half the entries have it set, set it in the centroid.
-    /// Otherwise, clear it.
+    /// set. If strictly more than half the entries have it set, set it in the
+    /// centroid. Ties (even entry count, exactly half set) resolve to 0.
     pub fn compute_centroid(entries: &[CollectionEntry]) -> [u8; 32] {
         let mut centroid = [0u8; 32];
         let n = entries.len();
@@ -173,7 +180,7 @@ mod tests {
     #[test]
     fn collection_encode_decode_roundtrip() {
         let blob = test_collection(5);
-        let encoded = blob.encode();
+        let encoded = blob.encode().expect("encode should succeed");
         let decoded = CollectionBlob::decode(&encoded).expect("decode should succeed");
         assert_eq!(decoded.fingerprint, blob.fingerprint);
         assert_eq!(decoded.centroid, blob.centroid);
@@ -218,7 +225,7 @@ mod tests {
     #[test]
     fn collection_empty_allowed() {
         let blob = test_collection(0);
-        let encoded = blob.encode();
+        let encoded = blob.encode().expect("encode should succeed");
         assert_eq!(encoded.len(), COLLECTION_HEADER_SIZE);
         let decoded = CollectionBlob::decode(&encoded).expect("empty collection should decode");
         assert_eq!(decoded.entries.len(), 0);
