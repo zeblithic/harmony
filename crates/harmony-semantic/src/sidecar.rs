@@ -159,20 +159,21 @@ impl EnrichedSidecar {
 
         let header = SidecarHeader::decode(data)?;
 
-        // v1 compat: 288 bytes with v1 magic means no trailer.
-        // A v2-magic blob of exactly 288 bytes is a truncated v2 sidecar (missing trailer).
-        if data.len() == SIDECAR_HEADER_SIZE {
-            if SidecarHeader::is_v2(data) {
-                return Err(SemanticError::MetadataInvalid {
-                    reason: alloc::format!(
-                        "v2 sidecar is exactly {} bytes with no CBOR trailer",
-                        SIDECAR_HEADER_SIZE
-                    ),
-                });
-            }
+        // v1 magic → no CBOR trailer. Ignore any trailing bytes beyond the header.
+        if !SidecarHeader::is_v2(data) {
             return Ok(Self {
                 header,
                 metadata: SidecarMetadata::default(),
+            });
+        }
+
+        // v2 magic requires a CBOR trailer after the header.
+        if data.len() == SIDECAR_HEADER_SIZE {
+            return Err(SemanticError::MetadataInvalid {
+                reason: alloc::format!(
+                    "v2 sidecar is exactly {} bytes with no CBOR trailer",
+                    SIDECAR_HEADER_SIZE
+                ),
             });
         }
 
@@ -390,6 +391,21 @@ mod tests {
             assert_eq!(v1_blob.len(), SIDECAR_HEADER_SIZE);
 
             let decoded = EnrichedSidecar::decode(&v1_blob).expect("v1 decode should succeed");
+            assert_eq!(decoded.header, header);
+            assert_eq!(decoded.metadata, SidecarMetadata::default());
+        }
+
+        #[test]
+        fn enriched_sidecar_v1_with_trailing_bytes() {
+            let header = test_header();
+            let mut v1_with_extra = header.encode_v1().to_vec();
+            // Append garbage trailing bytes (e.g., from a stream read).
+            v1_with_extra.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]);
+            assert!(v1_with_extra.len() > SIDECAR_HEADER_SIZE);
+
+            // v1 magic → trailing bytes ignored, default metadata returned.
+            let decoded = EnrichedSidecar::decode(&v1_with_extra)
+                .expect("v1 with trailing bytes should succeed");
             assert_eq!(decoded.header, header);
             assert_eq!(decoded.metadata, SidecarMetadata::default());
         }
