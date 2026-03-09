@@ -852,6 +852,7 @@ name = "harmony-kitri"
 version = "0.1.0"
 dependencies = [
  "harmony-content",
+ "harmony-crypto",
  "harmony-identity",
  "harmony-workflow",
  "serde",
