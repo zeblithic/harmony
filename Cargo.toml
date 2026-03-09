@@ -52,6 +52,7 @@ hashbrown = { version = "0.15", default-features = false, features = ["default-h
 rmp = { version = "0.8", default-features = false }
 bitflags = { version = "2", default-features = false }
 hex = "0.4"
+libm = "0.2"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 
 # WASM runtime

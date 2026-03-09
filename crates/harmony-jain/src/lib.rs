@@ -2,6 +2,7 @@
 extern crate alloc;
 
 pub mod config;
+pub mod scoring;
 pub mod types;
 
 mod error;
