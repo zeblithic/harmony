@@ -5,8 +5,8 @@
 //! to execute (file deletion, notifications, renewal requests).
 
 use alloc::vec::Vec;
-use hashbrown::HashMap;
 use harmony_content::ContentId;
+use hashbrown::HashMap;
 
 /// Lifecycle state of a cached content entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

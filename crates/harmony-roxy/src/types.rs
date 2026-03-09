@@ -70,8 +70,9 @@ impl Serialize for UsageRights {
 impl<'de> Deserialize<'de> for UsageRights {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bits = u8::deserialize(deserializer)?;
-        UsageRights::from_bits(bits)
-            .ok_or_else(|| serde::de::Error::custom(alloc::format!("invalid UsageRights bits: {bits:#010b}")))
+        UsageRights::from_bits(bits).ok_or_else(|| {
+            serde::de::Error::custom(alloc::format!("invalid UsageRights bits: {bits:#010b}"))
+        })
     }
 }
 
