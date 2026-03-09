@@ -1,9 +1,11 @@
 //! Configuration for the content lifecycle engine.
 
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
+use crate::error::JainError;
 use crate::types::{Sensitivity, SocialContext};
 
 /// Top-level configuration for the Jain content lifecycle engine.
@@ -21,6 +23,61 @@ pub struct JainConfig {
     pub access_decay_half_life_secs: f64,
     /// Weight modifier for self-created content (reduces staleness).
     pub self_created_weight: f64,
+}
+
+impl JainConfig {
+    /// Validate configuration invariants.
+    ///
+    /// Catches misconfigurations that would cause silent misbehaviour:
+    /// - `access_decay_half_life_secs <= 0.0` → division by zero / NaN propagation
+    /// - `archive_threshold >= burn_threshold` → content skips archive stage
+    /// - thresholds outside `[0.0, 1.0]`
+    /// - `self_created_weight` outside `[0.0, 1.0]`
+    /// - `storage_alert_percent` outside `(0.0, 1.0]`
+    pub fn validate(&self) -> Result<(), JainError> {
+        if self.access_decay_half_life_secs <= 0.0
+            || !self.access_decay_half_life_secs.is_finite()
+        {
+            return Err(JainError::InvalidConfig(format!(
+                "access_decay_half_life_secs must be positive and finite, got {}",
+                self.access_decay_half_life_secs
+            )));
+        }
+        if self.archive_threshold >= self.burn_threshold {
+            return Err(JainError::InvalidConfig(format!(
+                "archive_threshold ({}) must be less than burn_threshold ({})",
+                self.archive_threshold, self.burn_threshold
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.archive_threshold) {
+            return Err(JainError::InvalidConfig(format!(
+                "archive_threshold must be in [0.0, 1.0], got {}",
+                self.archive_threshold
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.burn_threshold) {
+            return Err(JainError::InvalidConfig(format!(
+                "burn_threshold must be in [0.0, 1.0], got {}",
+                self.burn_threshold
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.self_created_weight) {
+            return Err(JainError::InvalidConfig(format!(
+                "self_created_weight must be in [0.0, 1.0], got {}",
+                self.self_created_weight
+            )));
+        }
+        if self.storage_alert_percent <= 0.0
+            || self.storage_alert_percent > 1.0
+            || !self.storage_alert_percent.is_finite()
+        {
+            return Err(JainError::InvalidConfig(format!(
+                "storage_alert_percent must be in (0.0, 1.0], got {}",
+                self.storage_alert_percent
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for JainConfig {

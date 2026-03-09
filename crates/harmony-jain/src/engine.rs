@@ -288,11 +288,15 @@ impl JainEngine {
 
     /// Reconcile internal records against a disk snapshot.
     ///
+    /// `now` is the current wall-clock timestamp, used to initialise `stored_at`
+    /// and `last_accessed` for newly discovered records so they don't immediately
+    /// appear maximally stale.
+    ///
     /// Handles three cases:
     /// 1. Snapshot entry exists on disk but is not tracked → add a default record
     /// 2. Tracked record has `exists_on_disk: false` → emit RepairNeeded
     /// 3. Tracked record is not in the snapshot at all → orphan, remove it
-    pub fn reconcile(&mut self, snapshot: &[SnapshotEntry]) -> Vec<JainAction> {
+    pub fn reconcile(&mut self, snapshot: &[SnapshotEntry], now: f64) -> Vec<JainAction> {
         let mut actions = Vec::new();
         let mut seen: HashSet<ContentId> = HashSet::new();
 
@@ -316,8 +320,8 @@ impl JainEngine {
                     content_type: ContentCategory::Bundle,
                     origin: ContentOrigin::CachedInTransit,
                     sensitivity: Sensitivity::Public,
-                    stored_at: 0.0,
-                    last_accessed: 0.0,
+                    stored_at: now,
+                    last_accessed: now,
                     access_count: 0,
                     replica_count: 1,
                     pinned: false,
@@ -921,7 +925,7 @@ mod tests {
             size_bytes: 256,
             exists_on_disk: true,
         }];
-        engine.reconcile(&snapshot);
+        engine.reconcile(&snapshot, 1000.0);
         assert_eq!(engine.record_count(), 1);
         assert_eq!(engine.health_report(0.0).total_bytes, 256);
     }
@@ -943,7 +947,7 @@ mod tests {
             size_bytes: 100,
             exists_on_disk: false,
         }];
-        let actions = engine.reconcile(&snapshot);
+        let actions = engine.reconcile(&snapshot, 1000.0);
         let has_repair = actions
             .iter()
             .any(|a| matches!(a, JainAction::RepairNeeded { .. }));
@@ -969,7 +973,7 @@ mod tests {
 
         // Empty snapshot → the tracked record is orphaned
         let snapshot: Vec<SnapshotEntry> = alloc::vec![];
-        let actions = engine.reconcile(&snapshot);
+        let actions = engine.reconcile(&snapshot, 1000.0);
         assert_eq!(engine.record_count(), 0);
         let has_stale_alert = actions.iter().any(|a| {
             matches!(
@@ -1027,5 +1031,53 @@ mod tests {
             engine.health_report(far_future).stale_count > 0,
             "stale_count should be > 0 for old content"
         );
+    }
+
+    #[test]
+    fn reconciled_records_do_not_immediately_score_stale() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"reconciled-fresh");
+        let now = 1_700_000_000.0; // realistic wall-clock timestamp
+        let snapshot = alloc::vec![SnapshotEntry {
+            cid,
+            size_bytes: 256,
+            exists_on_disk: true,
+        }];
+        engine.reconcile(&snapshot, now);
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
+
+        // Immediately after reconcile, content should not be recommended for burn
+        let actions = engine.tick(now);
+        let has_burn = actions
+            .iter()
+            .any(|a| matches!(a, JainAction::RecommendBurn { .. }));
+        assert!(
+            !has_burn,
+            "reconciled record should not immediately get RecommendBurn, got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_catches_zero_half_life() {
+        let config = JainConfig {
+            access_decay_half_life_secs: 0.0,
+            ..JainConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_catches_inverted_thresholds() {
+        let config = JainConfig {
+            archive_threshold: 0.9,
+            burn_threshold: 0.5,
+            ..JainConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_accepts_defaults() {
+        assert!(JainConfig::default().validate().is_ok());
     }
 }

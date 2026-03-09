@@ -25,7 +25,7 @@ pub fn staleness_score(record: &ContentRecord, config: &JainConfig, now: f64) ->
     // Time decay: exponential half-life
     let elapsed = (now - record.last_accessed).max(0.0);
     let half_lives = elapsed / config.access_decay_half_life_secs;
-    let recency = 0.5_f64.powf(half_lives);
+    let recency = pow_f(0.5, half_lives);
 
     // Frequency factor: saturating logarithmic curve
     let ac = record.access_count as f64;
@@ -44,6 +44,18 @@ pub fn staleness_score(record: &ContentRecord, config: &JainConfig, now: f64) ->
     // Final staleness
     let staleness = (1.0 - freshness) * (1.0 - origin_bonus);
     StalenessScore::new(staleness)
+}
+
+/// Compute base^exp using the appropriate math backend.
+#[cfg(feature = "std")]
+fn pow_f(base: f64, exp: f64) -> f64 {
+    base.powf(exp)
+}
+
+/// Compute base^exp using libm for no_std environments.
+#[cfg(not(feature = "std"))]
+fn pow_f(base: f64, exp: f64) -> f64 {
+    libm::pow(base, exp)
 }
 
 /// Compute ln(1 + x) using the appropriate math backend.
