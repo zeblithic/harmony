@@ -5,6 +5,7 @@ pub mod cache;
 pub mod catalog;
 pub mod keywrap;
 pub mod manifest;
+pub mod resource;
 pub mod types;
 
 mod error;
