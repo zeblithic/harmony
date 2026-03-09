@@ -59,7 +59,7 @@ pub struct ArtistProfile {
 
 /// Validate that a key expression segment contains no Zenoh metacharacters.
 fn validate_segment(s: &str) -> Result<(), RoxyError> {
-    if s.contains('/') || s.contains('*') {
+    if s.is_empty() || s.contains('/') || s.contains('*') {
         Err(RoxyError::InvalidKeySegment)
     } else {
         Ok(())
@@ -190,6 +190,14 @@ mod tests {
         assert!(catalog_key(&hash, ContentCategory::Music, "a*b").is_err());
         assert!(license_key(&hash, "a/b").is_err());
         assert!(revocation_key(&hash, "a*b").is_err());
+    }
+
+    #[test]
+    fn key_functions_reject_empty_segment() {
+        let hash = [0xABu8; 16];
+        assert!(catalog_key(&hash, ContentCategory::Music, "").is_err());
+        assert!(license_key(&hash, "").is_err());
+        assert!(revocation_key(&hash, "").is_err());
     }
 
     #[test]

@@ -24,8 +24,6 @@ pub struct CacheEntry {
     pub manifest_cid: ContentId,
     /// CID of the actual content blob.
     pub content_cid: ContentId,
-    /// Wrapped (encrypted) symmetric key for this consumer.
-    pub wrapped_key: Vec<u8>,
     /// UCAN `not_after` timestamp. `None` means perpetual license.
     pub ucan_not_after: Option<f64>,
     /// How many seconds before expiry to send a notice.
@@ -221,7 +219,7 @@ mod tests {
         mgr.add_entry(CacheEntry {
             manifest_cid,
             content_cid,
-            wrapped_key: alloc::vec![1, 2, 3],
+
             ucan_not_after: Some(100.0),
             expiry_notice_secs: 10,
             state: CacheState::Active,
@@ -250,7 +248,7 @@ mod tests {
         mgr.add_entry(CacheEntry {
             manifest_cid,
             content_cid,
-            wrapped_key: alloc::vec![1, 2, 3],
+
             ucan_not_after: Some(100.0),
             expiry_notice_secs: 10,
             state: CacheState::Active,
@@ -275,7 +273,7 @@ mod tests {
         mgr.add_entry(CacheEntry {
             manifest_cid,
             content_cid,
-            wrapped_key: alloc::vec![1, 2, 3],
+
             ucan_not_after: Some(100.0),
             expiry_notice_secs: 10,
             state: CacheState::Active,
@@ -297,7 +295,7 @@ mod tests {
         mgr.add_entry(CacheEntry {
             manifest_cid,
             content_cid,
-            wrapped_key: alloc::vec![1, 2, 3],
+
             ucan_not_after: Some(100.0),
             expiry_notice_secs: 10,
             state: CacheState::Active,
@@ -321,7 +319,7 @@ mod tests {
         mgr.add_entry(CacheEntry {
             manifest_cid,
             content_cid,
-            wrapped_key: alloc::vec![1, 2, 3],
+
             ucan_not_after: None, // perpetual
             expiry_notice_secs: 0,
             state: CacheState::Active,
@@ -342,7 +340,7 @@ mod tests {
         mgr.add_entry(CacheEntry {
             manifest_cid,
             content_cid,
-            wrapped_key: alloc::vec![1, 2, 3],
+
             ucan_not_after: Some(100.0),
             expiry_notice_secs: 10,
             state: CacheState::Active,
@@ -367,7 +365,7 @@ mod tests {
         mgr.add_entry(CacheEntry {
             manifest_cid,
             content_cid,
-            wrapped_key: alloc::vec![1, 2, 3],
+
             ucan_not_after: Some(100.0),
             expiry_notice_secs: 10,
             state: CacheState::Active,
@@ -393,7 +391,7 @@ mod tests {
         mgr.add_entry(CacheEntry {
             manifest_cid,
             content_cid,
-            wrapped_key: alloc::vec![1, 2, 3],
+
             ucan_not_after: Some(100.0),
             expiry_notice_secs: 10,
             state: CacheState::Active,
