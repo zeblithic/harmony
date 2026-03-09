@@ -12,6 +12,7 @@ use crate::scope::SearchQuery;
 
 /// An event submitted to the Oluo engine.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Ingest carries SidecarHeader (280 bytes); acceptable for event type
 pub enum OluoEvent {
     /// Submit a sidecar for indexing (Jain has approved).
     Ingest {
@@ -55,6 +56,7 @@ pub enum OluoAction {
 
 /// An entry in the in-memory flat index.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // ingested_at_ms reserved for clock-aware TTL calculation
 struct IndexEntry {
     /// Tier 3 binary vector (256-bit) for distance comparison.
     tier3: [u8; 32],
@@ -71,6 +73,8 @@ pub struct OluoEngine {
     /// In-memory index entries (target_cid -> entry).
     entries: hashbrown::HashMap<[u8; 32], IndexEntry>,
     /// The collection threshold — when flat entries exceed this, a trie should be built.
+    /// Reserved for future trie-building logic.
+    #[allow(dead_code)]
     collection_threshold: u32,
 }
 
@@ -140,6 +144,8 @@ impl OluoEngine {
 
         let expires_at = match &decision {
             IngestDecision::IndexFull => None,
+            // TODO: When clock support is added, compute expires_at = now_ms + ttl_secs * 1000
+            // instead of using ttl_secs * 1000 as an absolute timestamp.
             IngestDecision::IndexLightweight { ttl_secs } => Some(ttl_secs * 1000),
             IngestDecision::Reject => unreachable!(),
         };
