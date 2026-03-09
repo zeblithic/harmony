@@ -7,6 +7,7 @@
 #![no_std]
 extern crate alloc;
 
+pub mod engine;
 pub mod error;
 pub mod filter;
 pub mod ingest;
@@ -14,6 +15,7 @@ pub mod scope;
 pub mod trie;
 pub mod zenoh_keys;
 
+pub use engine::{OluoAction, OluoEngine, OluoEvent};
 pub use error::{OluoError, OluoResult};
 pub use filter::{FilteredSearchResult, RawSearchResult, RetrievalContext, RetrievalFilter};
 pub use ingest::{IngestDecision, IngestGate};
