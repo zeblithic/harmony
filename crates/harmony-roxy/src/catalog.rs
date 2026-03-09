@@ -57,12 +57,21 @@ pub struct ArtistProfile {
     pub manifest_cids: Vec<ContentId>,
 }
 
+/// Returns `true` if `s` is a valid Zenoh key expression segment (non-empty,
+/// no `/` or `*` metacharacters).
+///
+/// Shared validation logic — other crates should call this rather than
+/// duplicating the check.
+pub fn is_valid_key_segment(s: &str) -> bool {
+    !s.is_empty() && !s.contains('/') && !s.contains('*')
+}
+
 /// Validate that a key expression segment contains no Zenoh metacharacters.
 fn validate_segment(s: &str) -> Result<(), RoxyError> {
-    if s.is_empty() || s.contains('/') || s.contains('*') {
-        Err(RoxyError::InvalidKeySegment)
-    } else {
+    if is_valid_key_segment(s) {
         Ok(())
+    } else {
+        Err(RoxyError::InvalidKeySegment)
     }
 }
 

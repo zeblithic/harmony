@@ -1,0 +1,223 @@
+//! Configuration for the content lifecycle engine.
+
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
+use serde::{Deserialize, Serialize};
+
+use crate::error::JainError;
+use crate::types::{Sensitivity, SocialContext};
+
+/// Top-level configuration for the Jain content lifecycle engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JainConfig {
+    /// Staleness score above which content is archived (moved to cold storage).
+    pub archive_threshold: f64,
+    /// Staleness score above which content is burned (permanently deleted).
+    pub burn_threshold: f64,
+    /// Minimum number of replicas to maintain on the network.
+    pub min_replica_count: u8,
+    /// Storage usage percentage at which alerts are triggered.
+    pub storage_alert_percent: f64,
+    /// Half-life in seconds for access-count decay.
+    pub access_decay_half_life_secs: f64,
+    /// Weight modifier for self-created content (reduces staleness).
+    ///
+    /// Self-created content receives an origin bonus that caps its maximum
+    /// achievable staleness at `1.0 - self_created_weight`. With the default
+    /// value of `0.3`, the ceiling is `0.7`, meaning self-created content will
+    /// never reach a `burn_threshold` higher than `0.7` regardless of age or
+    /// access patterns — only `RecommendArchive` is reachable.
+    pub self_created_weight: f64,
+}
+
+impl JainConfig {
+    /// Validate configuration invariants.
+    ///
+    /// Catches misconfigurations that would cause silent misbehaviour:
+    /// - `access_decay_half_life_secs <= 0.0` → division by zero / NaN propagation
+    /// - `archive_threshold >= burn_threshold` → content skips archive stage
+    /// - thresholds outside `[0.0, 1.0]`
+    /// - `self_created_weight` outside `[0.0, 1.0]`
+    /// - `storage_alert_percent` outside `(0.0, 1.0]`
+    pub fn validate(&self) -> Result<(), JainError> {
+        if self.min_replica_count == 0 {
+            return Err(JainError::InvalidConfig(format!(
+                "min_replica_count must be at least 1, got {}",
+                self.min_replica_count
+            )));
+        }
+        if self.access_decay_half_life_secs <= 0.0
+            || !self.access_decay_half_life_secs.is_finite()
+        {
+            return Err(JainError::InvalidConfig(format!(
+                "access_decay_half_life_secs must be positive and finite, got {}",
+                self.access_decay_half_life_secs
+            )));
+        }
+        if self.archive_threshold >= self.burn_threshold {
+            return Err(JainError::InvalidConfig(format!(
+                "archive_threshold ({}) must be less than burn_threshold ({})",
+                self.archive_threshold, self.burn_threshold
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.archive_threshold) {
+            return Err(JainError::InvalidConfig(format!(
+                "archive_threshold must be in [0.0, 1.0], got {}",
+                self.archive_threshold
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.burn_threshold) {
+            return Err(JainError::InvalidConfig(format!(
+                "burn_threshold must be in [0.0, 1.0], got {}",
+                self.burn_threshold
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.self_created_weight) {
+            return Err(JainError::InvalidConfig(format!(
+                "self_created_weight must be in [0.0, 1.0], got {}",
+                self.self_created_weight
+            )));
+        }
+        if self.storage_alert_percent <= 0.0
+            || self.storage_alert_percent > 1.0
+            || !self.storage_alert_percent.is_finite()
+        {
+            return Err(JainError::InvalidConfig(format!(
+                "storage_alert_percent must be in (0.0, 1.0], got {}",
+                self.storage_alert_percent
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for JainConfig {
+    fn default() -> Self {
+        Self {
+            archive_threshold: 0.6,
+            burn_threshold: 0.85,
+            min_replica_count: 2,
+            storage_alert_percent: 0.85,
+            access_decay_half_life_secs: 30.0 * 24.0 * 3600.0, // 30 days
+            self_created_weight: 0.3,
+        }
+    }
+}
+
+/// A single filter rule controlling content sharing based on sensitivity
+/// and social context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilterRule {
+    /// Minimum sensitivity level that triggers this rule.
+    pub min_sensitivity: Sensitivity,
+    /// Maximum social context in which content at this sensitivity may be shared.
+    pub max_context: SocialContext,
+    /// Whether the user must confirm before sharing.
+    pub require_confirmation: bool,
+}
+
+/// A set of filter rules that govern content sharing decisions.
+///
+/// # Rule ordering and sensitivity coverage
+///
+/// Rules use `>= min_sensitivity` matching: a rule targeting
+/// [`Sensitivity::Private`] also applies to `Confidential` and `Intimate`
+/// content. This means a permissive rule for low-sensitivity content
+/// inadvertently governs higher-sensitivity content when no stricter rule
+/// is present. To prevent leakage, ensure every sensitivity level that
+/// needs protection has its own rule, ordered most-to-least restrictive
+/// in the `rules` vec (the engine returns the most restrictive match).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilterRuleSet {
+    /// The individual rules in this set.
+    pub rules: Vec<FilterRule>,
+    /// Whether the filter rule set is active.
+    pub enabled: bool,
+}
+
+impl Default for FilterRuleSet {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rules: vec![
+                // Intimate content: only share with companions, require confirmation.
+                FilterRule {
+                    min_sensitivity: Sensitivity::Intimate,
+                    max_context: SocialContext::Companion,
+                    require_confirmation: true,
+                },
+                // Confidential content: only share privately, no confirmation
+                // (auto-block in wider contexts).
+                FilterRule {
+                    min_sensitivity: Sensitivity::Confidential,
+                    max_context: SocialContext::Private,
+                    require_confirmation: false,
+                },
+                // Private content: share up to social context, no confirmation.
+                FilterRule {
+                    min_sensitivity: Sensitivity::Private,
+                    max_context: SocialContext::Social,
+                    require_confirmation: false,
+                },
+            ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_has_sane_thresholds() {
+        let config = JainConfig::default();
+        assert!(config.archive_threshold < config.burn_threshold);
+        assert!(config.burn_threshold <= 1.0);
+        assert!(config.min_replica_count >= 1);
+        assert!(config.storage_alert_percent > 0.0);
+        assert!(config.storage_alert_percent <= 1.0);
+        assert!(config.access_decay_half_life_secs > 0.0);
+        assert!(config.self_created_weight >= 0.0);
+        assert!(config.self_created_weight <= 1.0);
+    }
+
+    #[test]
+    fn default_filter_rules_block_intimate_in_professional() {
+        let rules = FilterRuleSet::default();
+        assert!(rules.enabled);
+        assert!(!rules.rules.is_empty());
+    }
+
+    #[test]
+    fn filter_rule_set_serialization_round_trip() {
+        let rules = FilterRuleSet::default();
+        let bytes = postcard::to_allocvec(&rules).unwrap();
+        let decoded: FilterRuleSet = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.enabled, rules.enabled);
+        assert_eq!(decoded.rules.len(), rules.rules.len());
+        for (original, restored) in rules.rules.iter().zip(decoded.rules.iter()) {
+            assert_eq!(original.min_sensitivity, restored.min_sensitivity);
+            assert_eq!(original.max_context, restored.max_context);
+            assert_eq!(original.require_confirmation, restored.require_confirmation);
+        }
+    }
+
+    #[test]
+    fn config_serialization_round_trip() {
+        let config = JainConfig::default();
+        let bytes = postcard::to_allocvec(&config).unwrap();
+        let decoded: JainConfig = postcard::from_bytes(&bytes).unwrap();
+        assert!((decoded.archive_threshold - config.archive_threshold).abs() < f64::EPSILON);
+        assert!((decoded.burn_threshold - config.burn_threshold).abs() < f64::EPSILON);
+        assert_eq!(decoded.min_replica_count, config.min_replica_count);
+        assert!(
+            (decoded.storage_alert_percent - config.storage_alert_percent).abs() < f64::EPSILON
+        );
+        assert!(
+            (decoded.access_decay_half_life_secs - config.access_decay_half_life_secs).abs()
+                < f64::EPSILON
+        );
+        assert!((decoded.self_created_weight - config.self_created_weight).abs() < f64::EPSILON);
+    }
+}

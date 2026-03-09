@@ -7,6 +7,7 @@ members = [
     "crates/harmony-content",
     "crates/harmony-crypto",
     "crates/harmony-identity",
+    "crates/harmony-jain",
     "crates/harmony-kitri",
     "crates/harmony-mail",
     "crates/harmony-node",
@@ -54,6 +55,7 @@ hashbrown = { version = "0.15", default-features = false, features = ["default-h
 rmp = { version = "0.8", default-features = false }
 bitflags = { version = "2", default-features = false }
 hex = "0.4"
+libm = "0.2"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 ciborium = { version = "0.2", default-features = false }
 
@@ -74,6 +76,7 @@ harmony-compute = { path = "crates/harmony-compute" }
 harmony-content = { path = "crates/harmony-content", default-features = false }
 harmony-crypto = { path = "crates/harmony-crypto", default-features = false }
 harmony-identity = { path = "crates/harmony-identity", default-features = false }
+harmony-jain = { path = "crates/harmony-jain", default-features = false }
 harmony-kitri = { path = "crates/harmony-kitri", default-features = false }
 harmony-platform = { path = "crates/harmony-platform", default-features = false }
 harmony-reticulum = { path = "crates/harmony-reticulum", default-features = false }
