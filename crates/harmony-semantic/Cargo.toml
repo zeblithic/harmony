@@ -11,14 +11,12 @@ description = "Harmony Semantic Index — binary vector embeddings, sidecar form
 default = ["std"]
 std = [
     "harmony-crypto/std",
-    "harmony-content/std",
     "serde/std",
     "dep:ciborium",
 ]
 
 [dependencies]
 harmony-crypto = { workspace = true, default-features = false }
-harmony-content = { workspace = true, default-features = false }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 ciborium = { workspace = true, optional = true }
 hashbrown = { workspace = true }

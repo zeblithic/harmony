@@ -63,6 +63,9 @@ impl TrieNode {
         fingerprint.copy_from_slice(&data[4..8]);
 
         let split_bit = u16::from_be_bytes([data[8], data[9]]);
+        if split_bit >= 256 {
+            return Err(OluoError::InvalidTrieNode);
+        }
 
         let mut child0 = [0u8; 32];
         child0.copy_from_slice(&data[10..42]);
@@ -88,8 +91,13 @@ impl TrieNode {
 /// `bit_position` is the overall bit index (0..N). Bit 0 is the most
 /// significant bit of byte 0, matching the convention used by
 /// `quantize_to_binary` in harmony-semantic.
+///
+/// Returns `false` if `bit_position` is out of bounds.
 pub fn get_bit(vector: &[u8], bit_position: u16) -> bool {
     let byte_index = (bit_position / 8) as usize;
+    if byte_index >= vector.len() {
+        return false;
+    }
     let bit_within_byte = 7 - (bit_position % 8);
     (vector[byte_index] >> bit_within_byte) & 1 == 1
 }
@@ -140,6 +148,22 @@ mod tests {
                 actual: 50,
             }
         );
+    }
+
+    #[test]
+    fn trie_node_decode_invalid_split_bit() {
+        let mut node = sample_node();
+        node.split_bit = 256; // out of range for 256-bit vectors
+        let encoded = node.encode();
+        let err = TrieNode::decode(&encoded).unwrap_err();
+        assert_eq!(err, OluoError::InvalidTrieNode);
+    }
+
+    #[test]
+    fn get_bit_out_of_bounds_returns_false() {
+        let vector = [0xFFu8; 4]; // 32 bits
+        assert!(!get_bit(&vector, 32)); // first out-of-bounds bit
+        assert!(!get_bit(&vector, 255)); // far out of bounds
     }
 
     #[test]

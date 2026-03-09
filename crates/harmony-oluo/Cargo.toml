@@ -12,14 +12,11 @@ default = ["std"]
 std = [
     "harmony-semantic/std",
     "harmony-crypto/std",
-    "harmony-content/std",
 ]
 
 [dependencies]
 harmony-semantic = { workspace = true, default-features = false }
 harmony-crypto = { workspace = true, default-features = false }
-harmony-content = { workspace = true, default-features = false }
 hashbrown = { workspace = true }
-serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 
 [dev-dependencies]
