@@ -166,6 +166,24 @@ impl KitriEngine {
             .and_then(|w| w.output.as_deref())
     }
 
+    /// Remove a terminal workflow from the engine, freeing its memory.
+    ///
+    /// Returns `true` if the workflow was evicted. Returns `false` if the
+    /// workflow doesn't exist or is not in a terminal state (`Complete` or
+    /// `Failed`), preventing premature removal of in-progress workflows.
+    pub fn evict(&mut self, workflow_id: &[u8; 32]) -> bool {
+        if let Some(state) = self.workflows.get(workflow_id) {
+            if matches!(
+                state.status,
+                KitriWorkflowStatus::Complete | KitriWorkflowStatus::Failed
+            ) {
+                self.workflows.remove(workflow_id);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Returns the number of tracked workflows.
     pub fn workflow_count(&self) -> usize {
         self.workflows.len()
@@ -508,13 +526,19 @@ impl KitriEngine {
             .event_log
             .append(crate::event::KitriEvent::CheckpointSaved { seq, state_cid });
 
+        // WAL invariant: persist the event log entry (CheckpointSaved with CID)
+        // BEFORE writing checkpoint bytes to content-addressed storage. If the
+        // process crashes after PersistEventLog but before PersistCheckpoint,
+        // last_checkpoint() returns the CID and recovery can re-request the bytes.
+        // If it crashes before PersistEventLog, the checkpoint is simply lost
+        // and recovery replays from the prior checkpoint (or from scratch).
         vec![
+            KitriAction::PersistEventLog { workflow_id },
             KitriAction::PersistCheckpoint {
                 workflow_id,
                 state: checkpoint_state,
                 state_cid,
             },
-            KitriAction::PersistEventLog { workflow_id },
         ]
     }
 
@@ -1317,13 +1341,16 @@ mod tests {
             state_cid,
         });
 
-        // Must emit PersistCheckpoint so the runtime stores the state bytes.
-        assert!(actions.iter().any(
-            |a| matches!(a, KitriAction::PersistCheckpoint { state_cid: cid, .. } if *cid == [0xAA; 32])
-        ));
-        assert!(actions
+        // WAL invariant: PersistEventLog must come before PersistCheckpoint.
+        let persist_log_pos = actions
             .iter()
-            .any(|a| matches!(a, KitriAction::PersistEventLog { .. })));
+            .position(|a| matches!(a, KitriAction::PersistEventLog { .. }));
+        let persist_ckpt_pos = actions.iter().position(
+            |a| matches!(a, KitriAction::PersistCheckpoint { state_cid: cid, .. } if *cid == [0xAA; 32]),
+        );
+        assert!(persist_log_pos.is_some());
+        assert!(persist_ckpt_pos.is_some());
+        assert!(persist_log_pos.unwrap() < persist_ckpt_pos.unwrap());
     }
 
     #[test]
@@ -1728,5 +1755,62 @@ mod tests {
 
         // Output is available after completion.
         assert_eq!(engine.output(&wf_id), Some(&[42, 43][..]));
+    }
+
+    #[test]
+    fn engine_evict_completed_workflow() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![42],
+        });
+        assert_eq!(engine.workflow_count(), 1);
+
+        assert!(engine.evict(&wf_id));
+        assert_eq!(engine.workflow_count(), 0);
+        assert_eq!(engine.status(&wf_id), None);
+    }
+
+    #[test]
+    fn engine_evict_failed_workflow() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "boom".into(),
+        });
+
+        assert!(engine.evict(&wf_id));
+        assert_eq!(engine.workflow_count(), 0);
+    }
+
+    #[test]
+    fn engine_evict_rejects_active_workflow() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Pending));
+
+        // Cannot evict a Pending workflow.
+        assert!(!engine.evict(&wf_id));
+        assert_eq!(engine.workflow_count(), 1);
+    }
+
+    #[test]
+    fn engine_evict_nonexistent_returns_false() {
+        let mut engine = KitriEngine::new();
+        assert!(!engine.evict(&[0xFF; 32]));
     }
 }
