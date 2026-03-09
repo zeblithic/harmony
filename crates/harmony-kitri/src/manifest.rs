@@ -21,7 +21,6 @@ pub struct KitriManifest {
 /// Runtime configuration from `[runtime]` section.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    pub max_retries: u32,
     pub retry_policy: RetryPolicy,
     pub fuel_budget: u64,
 }
@@ -29,7 +28,6 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
             retry_policy: RetryPolicy::default(),
             fuel_budget: 1_000_000,
         }
@@ -103,7 +101,7 @@ mod parsing {
             let mut runtime = RuntimeConfig::default();
             if let Some(rt) = raw.runtime {
                 if let Some(mr) = rt.max_retries {
-                    runtime.max_retries = mr;
+                    runtime.retry_policy.max_retries = mr;
                 }
                 if let Some(fb) = rt.fuel_budget {
                     runtime.fuel_budget = fb;
@@ -146,7 +144,6 @@ mod tests {
             name: "shipment-verifier".into(),
             version: "0.1.0".into(),
             runtime: RuntimeConfig {
-                max_retries: 3,
                 retry_policy: RetryPolicy::default(),
                 fuel_budget: 1_000_000,
             },
@@ -165,7 +162,7 @@ mod tests {
     #[test]
     fn runtime_config_defaults() {
         let config = RuntimeConfig::default();
-        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.retry_policy.max_retries, 3);
         assert_eq!(config.fuel_budget, 1_000_000);
     }
 
@@ -195,7 +192,7 @@ replicas = 2
         let manifest = KitriManifest::from_toml(toml_str).unwrap();
         assert_eq!(manifest.name, "test-workflow");
         assert_eq!(manifest.version, "0.1.0");
-        assert_eq!(manifest.runtime.max_retries, 5);
+        assert_eq!(manifest.runtime.retry_policy.max_retries, 5);
         assert_eq!(manifest.runtime.fuel_budget, 2_000_000);
         assert!(!manifest.deploy.prefer_native);
         assert_eq!(manifest.deploy.replicas, 2);

@@ -31,6 +31,7 @@ pub enum KitriEngineEvent {
     /// An I/O operation completed.
     IoResolved {
         workflow_id: [u8; 32],
+        seq: u64,
         result: KitriIoResult,
     },
     /// A workflow completed successfully.
@@ -55,6 +56,8 @@ pub enum KitriEngineEvent {
         step_id: u64,
         rollback_op: KitriIoOp,
     },
+    /// All compensators finished executing (saga rollback complete).
+    CompensationComplete { workflow_id: [u8; 32] },
 }
 
 /// Outbound actions emitted by the Kitri engine.
@@ -123,6 +126,8 @@ struct WorkflowState {
     next_seq: u64,
     #[allow(dead_code)]
     output: Option<Vec<u8>>,
+    /// Error message deferred until compensation completes.
+    pending_error: Option<String>,
 }
 
 /// The Kitri engine — manages workflow lifecycle with durable execution.
@@ -160,8 +165,9 @@ impl KitriEngine {
             }
             KitriEngineEvent::IoResolved {
                 workflow_id,
+                seq,
                 result,
-            } => self.handle_io_resolved(workflow_id, result),
+            } => self.handle_io_resolved(workflow_id, seq, result),
             KitriEngineEvent::WorkflowComplete {
                 workflow_id,
                 output,
@@ -179,6 +185,9 @@ impl KitriEngine {
                 step_id,
                 rollback_op,
             } => self.handle_compensator(workflow_id, step_id, rollback_op),
+            KitriEngineEvent::CompensationComplete { workflow_id } => {
+                self.handle_compensation_complete(workflow_id)
+            }
         }
     }
 
@@ -199,6 +208,7 @@ impl KitriEngine {
                 compensation: CompensationLog::new(),
                 next_seq: 0,
                 output: None,
+                pending_error: None,
             },
         );
 
@@ -243,17 +253,18 @@ impl KitriEngine {
     fn handle_io_resolved(
         &mut self,
         workflow_id: [u8; 32],
+        seq: u64,
         result: KitriIoResult,
     ) -> Vec<KitriAction> {
         let Some(state) = self.workflows.get_mut(&workflow_id) else {
             return vec![];
         };
 
-        let seq = if state.next_seq > 0 {
-            state.next_seq - 1
-        } else {
-            0
-        };
+        // Only accept resolutions when actually waiting for I/O.
+        if state.status != KitriWorkflowStatus::WaitingForIo {
+            return vec![];
+        }
+
         state.status = KitriWorkflowStatus::Executing;
 
         state
@@ -308,14 +319,32 @@ impl KitriEngine {
             })
             .collect();
 
-        state.status = if actions.is_empty() {
-            KitriWorkflowStatus::Failed
+        if actions.is_empty() {
+            // No compensators — fail immediately.
+            state.status = KitriWorkflowStatus::Failed;
+            actions.push(KitriAction::Failed { workflow_id, error });
         } else {
-            KitriWorkflowStatus::Compensating
+            // Compensators need to run first. Defer Failed until
+            // CompensationComplete arrives.
+            state.status = KitriWorkflowStatus::Compensating;
+            state.pending_error = Some(error);
+        }
+
+        actions
+    }
+
+    fn handle_compensation_complete(&mut self, workflow_id: [u8; 32]) -> Vec<KitriAction> {
+        let Some(state) = self.workflows.get_mut(&workflow_id) else {
+            return vec![];
         };
 
-        actions.push(KitriAction::Failed { workflow_id, error });
-        actions
+        if state.status != KitriWorkflowStatus::Compensating {
+            return vec![];
+        }
+
+        state.status = KitriWorkflowStatus::Failed;
+        let error = state.pending_error.take().unwrap_or_default();
+        vec![KitriAction::Failed { workflow_id, error }]
     }
 
     fn handle_checkpoint(
@@ -328,6 +357,7 @@ impl KitriEngine {
         };
 
         let seq = state.next_seq;
+        state.next_seq += 1;
         state
             .event_log
             .append(crate::event::KitriEvent::CheckpointSaved { seq, state_cid });
@@ -353,6 +383,7 @@ impl KitriEngine {
             });
 
         let seq = state.next_seq;
+        state.next_seq += 1;
         state
             .event_log
             .append(crate::event::KitriEvent::CompensatorRegistered { seq, step_id });
@@ -463,6 +494,7 @@ mod tests {
         });
         engine.handle(KitriEngineEvent::IoResolved {
             workflow_id: wf_id,
+            seq: 0,
             result: KitriIoResult::Published,
         });
 
@@ -504,6 +536,127 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, KitriAction::Failed { .. })));
+    }
+
+    #[test]
+    fn engine_failed_with_compensators_defers_failed_action() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::CompensatorRegistered {
+            workflow_id: wf_id,
+            step_id: 0,
+            rollback_op: KitriIoOp::Query {
+                topic: "undo/step0".into(),
+                payload: vec![],
+            },
+        });
+        engine.handle(KitriEngineEvent::CompensatorRegistered {
+            workflow_id: wf_id,
+            step_id: 1,
+            rollback_op: KitriIoOp::Query {
+                topic: "undo/step1".into(),
+                payload: vec![],
+            },
+        });
+
+        let actions = engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "boom".into(),
+        });
+
+        // Should be Compensating, not Failed yet.
+        assert_eq!(
+            engine.status(&wf_id),
+            Some(KitriWorkflowStatus::Compensating)
+        );
+
+        // Should emit ExecuteCompensator actions in LIFO order, but NOT Failed.
+        let comp_ids: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                KitriAction::ExecuteCompensator { step_id, .. } => Some(*step_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(comp_ids, vec![1, 0]); // LIFO
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::Failed { .. })));
+
+        // CompensationComplete transitions to Failed.
+        let actions = engine.handle(KitriEngineEvent::CompensationComplete { workflow_id: wf_id });
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Failed));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::Failed { .. })));
+    }
+
+    #[test]
+    fn engine_io_resolved_rejected_after_completion() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![],
+        });
+
+        // Stale IoResolved should be rejected — status stays Complete.
+        let actions = engine.handle(KitriEngineEvent::IoResolved {
+            workflow_id: wf_id,
+            seq: 0,
+            result: KitriIoResult::Fetched { data: vec![1] },
+        });
+        assert!(actions.is_empty());
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Complete));
+    }
+
+    #[test]
+    fn engine_checkpoint_increments_seq() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+
+        // I/O request gets seq 0.
+        let actions = engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Fetch { cid: [0; 32] },
+        });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::ExecuteIo { seq: 0, .. })));
+
+        engine.handle(KitriEngineEvent::IoResolved {
+            workflow_id: wf_id,
+            seq: 0,
+            result: KitriIoResult::Fetched { data: vec![1] },
+        });
+
+        // Checkpoint should consume seq 1.
+        engine.handle(KitriEngineEvent::CheckpointRequested {
+            workflow_id: wf_id,
+            state: vec![],
+            state_cid: [0xAA; 32],
+        });
+
+        // Next I/O request should get seq 2 (not 1).
+        let actions = engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Fetch { cid: [1; 32] },
+        });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::ExecuteIo { seq: 2, .. })));
     }
 
     #[test]
