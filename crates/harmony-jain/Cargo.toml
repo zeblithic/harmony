@@ -1,0 +1,25 @@
+[package]
+name = "harmony-jain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Sans-I/O content lifecycle engine — gatekeeper, filter, and housekeeper for the Harmony decentralized stack"
+
+[features]
+default = ["std"]
+std = [
+    "harmony-content/std",
+    "harmony-roxy/std",
+    "thiserror/std",
+]
+
+[dependencies]
+harmony-content = { workspace = true, default-features = false }
+harmony-roxy = { workspace = true, default-features = false }
+thiserror.workspace = true
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+postcard = { workspace = true }
+hashbrown = { workspace = true }
+hex = { workspace = true }
