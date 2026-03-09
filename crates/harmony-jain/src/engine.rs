@@ -330,6 +330,14 @@ impl JainEngine {
     /// and `last_accessed` for newly discovered records so they don't immediately
     /// appear maximally stale.
     ///
+    /// # Snapshot completeness requirement
+    ///
+    /// `snapshot` **must** enumerate **every** piece of content currently on disk.
+    /// Any tracked record absent from `snapshot` is treated as an orphan and
+    /// permanently removed from the engine. Passing a partial or incremental
+    /// snapshot will silently delete the corresponding records with no recovery
+    /// path — ensure the snapshot is authoritative before calling `reconcile`.
+    ///
     /// Handles four cases:
     /// 1. Snapshot entry exists on disk but is not tracked → add a default record
     /// 2. Tracked record has `exists_on_disk: false` → emit `FetchLocalCopy`,

@@ -22,6 +22,12 @@ pub struct JainConfig {
     /// Half-life in seconds for access-count decay.
     pub access_decay_half_life_secs: f64,
     /// Weight modifier for self-created content (reduces staleness).
+    ///
+    /// Self-created content receives an origin bonus that caps its maximum
+    /// achievable staleness at `1.0 - self_created_weight`. With the default
+    /// value of `0.3`, the ceiling is `0.7`, meaning self-created content will
+    /// never reach a `burn_threshold` higher than `0.7` regardless of age or
+    /// access patterns — only `RecommendArchive` is reachable.
     pub self_created_weight: f64,
 }
 
