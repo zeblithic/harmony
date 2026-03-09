@@ -523,8 +523,10 @@ const TCR_SH0_INNER: u64 = 0b11 << 12;
 const TCR_ORGN0_WB: u64 = 0b01 << 10;
 /// IRGN0 = 0b01 → Inner Write-Back, Read-Allocate, Write-Allocate.
 const TCR_IRGN0_WB: u64 = 0b01 << 8;
-/// Full TCR_EL1 value.
-const TCR_VALUE: u64 = TCR_T0SZ | TCR_TG0_4K | TCR_SH0_INNER | TCR_ORGN0_WB | TCR_IRGN0_WB;
+/// EPD1 = 1 → Disable TTBR1 walks (upper VA half unused).
+const TCR_EPD1: u64 = 1 << 23;
+/// Full TCR_EL1 value (IPS set at runtime from ID_AA64MMFR0_EL1.PARange).
+const TCR_VALUE: u64 = TCR_T0SZ | TCR_TG0_4K | TCR_SH0_INNER | TCR_ORGN0_WB | TCR_IRGN0_WB | TCR_EPD1;
 
 // ── SCTLR_EL1 bits ──────────────────────────────────────────────────
 
@@ -571,10 +573,12 @@ pub unsafe fn init_and_enable(
     // 3. Create frame allocator closure for map()
     let alloc_ptr = alloc as *mut BumpAllocator;
     let mut frame_alloc = || {
-        let frame = (*alloc_ptr).alloc_frame()?;
-        // Zero the frame before use as page table
-        core::ptr::write_bytes(frame.as_u64() as *mut u8, 0, PAGE_SIZE as usize);
-        Some(frame)
+        unsafe {
+            let frame = (*alloc_ptr).alloc_frame()?;
+            // Zero the frame before use as page table
+            core::ptr::write_bytes(frame.as_u64() as *mut u8, 0, PAGE_SIZE as usize);
+            Some(frame)
+        }
     };
 
     // 4. Map all usable memory regions as Normal cacheable (RW)
@@ -624,10 +628,21 @@ pub unsafe fn init_and_enable(
 
 /// Write MAIR_EL1, TCR_EL1, TTBR0_EL1 and enable MMU in SCTLR_EL1.
 ///
+/// TCR_EL1.IPS is read from ID_AA64MMFR0_EL1.PARange at runtime so the
+/// physical address space matches the platform.
+///
 /// # Safety
 /// Must be called at EL1 with a valid root page table.
 #[cfg(target_arch = "aarch64")]
 unsafe fn configure_system_regs(root: PhysAddr) {
+    // Read the platform's physical address range from ID_AA64MMFR0_EL1[3:0]
+    // and place it into TCR_EL1.IPS (bits [34:32]).
+    let mmfr0: u64;
+    asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0);
+    // PARange is 4 bits [3:0] but IPS is only 3 bits [34:32]. Mask to 3 bits.
+    let pa_range = mmfr0 & 0x7;
+    let tcr = TCR_VALUE | (pa_range << 32);
+
     asm!(
         // Drain pending memory operations
         "dsb ish",
@@ -641,7 +656,7 @@ unsafe fn configure_system_regs(root: PhysAddr) {
         // Set MAIR_EL1
         "msr mair_el1, {mair}",
 
-        // Set TCR_EL1
+        // Set TCR_EL1 (with runtime IPS from ID_AA64MMFR0_EL1)
         "msr tcr_el1, {tcr}",
 
         // Set TTBR0_EL1 (our page table root)
@@ -659,7 +674,7 @@ unsafe fn configure_system_regs(root: PhysAddr) {
         "isb",
 
         mair = in(reg) MAIR_VALUE,
-        tcr = in(reg) TCR_VALUE,
+        tcr = in(reg) tcr,
         ttbr = in(reg) root.as_u64(),
         sctlr_bits = in(reg) SCTLR_M | SCTLR_C | SCTLR_I,
         tmp = out(reg) _,
@@ -702,16 +717,29 @@ for desc in memory_map.entries() {
     region_count += 1;
 }
 
-// Reserve 1 MiB for bump allocator (page table frames)
-// Find first usable region >= 1 MiB
-let (bump_base, bump_size) = regions[..region_count]
-    .iter()
-    .filter(|r| r.is_usable && r.pages * 4096 >= 1024 * 1024)
-    .map(|r| (r.base, core::cmp::min(r.pages * 4096, 1024 * 1024)))
-    .next()
-    .expect("no usable memory region >= 1 MiB for bump allocator");
+// Bump allocator region size (2 MiB = ~512 frames for page tables)
+const BUMP_REGION_SIZE: u64 = 2 * 1024 * 1024;
+const BUMP_MIN_ADDR: u64 = 0x10_0000; // Skip first 1 MiB
 
-let mut bump = bump_alloc::BumpAllocator::new(bump_base, bump_size);
+// Reserve bump allocator region from the first usable region >= 1 MiB
+let mut bump_base: Option<u64> = None;
+for region in &regions[..region_count] {
+    if !region.is_usable { continue; }
+    let region_end = region.base + region.pages * PAGE_SIZE;
+    let start = if region.base >= BUMP_MIN_ADDR {
+        region.base
+    } else if region_end > BUMP_MIN_ADDR {
+        BUMP_MIN_ADDR
+    } else {
+        continue;
+    };
+    if region_end.saturating_sub(start) >= BUMP_REGION_SIZE {
+        bump_base = Some(start);
+        break;
+    }
+}
+let bump_base = bump_base.expect("no suitable region for bump allocator");
+let mut bump = bump_alloc::BumpAllocator::new(bump_base, BUMP_REGION_SIZE);
 
 // Build identity map and enable MMU
 unsafe {
@@ -818,9 +846,10 @@ Add to `src/timer.rs` (above the test module):
 
 ```rust
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Cached timer frequency (read once at boot).
-static mut TIMER_FREQ: u64 = 0;
+static TIMER_FREQ: AtomicU64 = AtomicU64::new(0);
 
 /// Read the timer frequency and cache it.
 ///
@@ -830,12 +859,12 @@ static mut TIMER_FREQ: u64 = 0;
 pub unsafe fn init() {
     let freq: u64;
     asm!("mrs {}, cntfrq_el0", out(reg) freq);
-    TIMER_FREQ = freq;
+    TIMER_FREQ.store(freq, Ordering::Relaxed);
 }
 
 /// Return the cached timer frequency in Hz.
 pub fn freq() -> u64 {
-    unsafe { TIMER_FREQ }
+    TIMER_FREQ.load(Ordering::Relaxed)
 }
 
 /// Read the current counter value.
