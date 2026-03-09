@@ -149,9 +149,17 @@ mod tests {
         let bytes = manifest.to_bytes().unwrap();
         let decoded = LicenseManifest::from_bytes(&bytes).unwrap();
         assert_eq!(manifest.creator, decoded.creator);
+        assert_eq!(manifest.content_cid, decoded.content_cid);
+        assert_eq!(manifest.manifest_version, decoded.manifest_version);
         assert_eq!(manifest.license_type, decoded.license_type);
+        assert_eq!(
+            manifest.price.as_ref().map(|p| p.amount),
+            decoded.price.as_ref().map(|p| p.amount)
+        );
+        assert_eq!(manifest.duration_secs, decoded.duration_secs);
         assert_eq!(manifest.usage_rights, decoded.usage_rights);
         assert_eq!(manifest.expiry_notice_secs, decoded.expiry_notice_secs);
+        assert_eq!(manifest.content_key_cid, decoded.content_key_cid);
     }
 
     #[test]

@@ -59,7 +59,7 @@ pub struct ArtistProfile {
 ///
 /// Returns `"roxy/catalog/{hex_hash}/{category}/{manifest_id}"`.
 pub fn catalog_key(artist_hash: &[u8; 16], category: ContentCategory, manifest_id: &str) -> String {
-    debug_assert!(
+    assert!(
         !manifest_id.contains('/') && !manifest_id.contains('*'),
         "manifest_id must not contain Zenoh metacharacters"
     );
@@ -82,7 +82,7 @@ pub fn meta_key(artist_hash: &[u8; 16]) -> String {
 ///
 /// Returns `"roxy/license/{hex_hash}/{manifest_id}"`.
 pub fn license_key(consumer_hash: &[u8; 16], manifest_id: &str) -> String {
-    debug_assert!(
+    assert!(
         !manifest_id.contains('/') && !manifest_id.contains('*'),
         "manifest_id must not contain Zenoh metacharacters"
     );
@@ -97,7 +97,7 @@ pub fn license_key(consumer_hash: &[u8; 16], manifest_id: &str) -> String {
 ///
 /// Returns `"roxy/revocation/{hex_hash}/{ucan_hash}"`.
 pub fn revocation_key(artist_hash: &[u8; 16], ucan_hash: &str) -> String {
-    debug_assert!(
+    assert!(
         !ucan_hash.contains('/') && !ucan_hash.contains('*'),
         "ucan_hash must not contain Zenoh metacharacters"
     );

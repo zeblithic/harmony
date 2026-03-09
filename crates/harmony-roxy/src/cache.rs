@@ -148,6 +148,12 @@ impl CacheManager {
                         if now >= not_after {
                             // Already past deadline (e.g., node was offline) —
                             // skip the Expiring state and evict immediately.
+                            // Still honor auto_renew so the user can re-acquire access.
+                            if entry.auto_renew {
+                                actions.push(CacheAction::RequestRenewal {
+                                    manifest_cid: *manifest_cid,
+                                });
+                            }
                             actions.push(CacheAction::WipeKey {
                                 manifest_cid: *manifest_cid,
                             });
@@ -349,6 +355,32 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert!(matches!(&actions[0], CacheAction::WipeKey { .. }));
         assert!(matches!(&actions[1], CacheAction::EvictContent { .. }));
+        assert_eq!(mgr.entry_count(), 0);
+    }
+
+    #[test]
+    fn active_entry_past_deadline_with_auto_renew_requests_renewal() {
+        let mut mgr = CacheManager::new();
+        let manifest_cid = make_cid(b"manifest");
+        let content_cid = make_cid(b"content");
+
+        mgr.add_entry(CacheEntry {
+            manifest_cid,
+            content_cid,
+            wrapped_key: alloc::vec![1, 2, 3],
+            ucan_not_after: Some(100.0),
+            expiry_notice_secs: 10,
+            state: CacheState::Active,
+            auto_renew: true,
+        });
+
+        // Node was offline, comes back past deadline. Should evict AND
+        // request renewal since auto_renew is set.
+        let actions = mgr.tick(200.0);
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(&actions[0], CacheAction::RequestRenewal { .. }));
+        assert!(matches!(&actions[1], CacheAction::WipeKey { .. }));
+        assert!(matches!(&actions[2], CacheAction::EvictContent { .. }));
         assert_eq!(mgr.entry_count(), 0);
     }
 
