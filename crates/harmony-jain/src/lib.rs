@@ -2,6 +2,7 @@
 extern crate alloc;
 
 pub mod actions;
+pub mod catalog;
 pub mod config;
 pub mod scoring;
 pub mod types;
