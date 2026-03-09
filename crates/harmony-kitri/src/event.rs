@@ -82,9 +82,21 @@ impl KitriEventLog {
         })
     }
 
-    /// Find the most recent checkpoint, if any.
+    /// Find the most recent checkpoint in the current attempt, if any.
+    ///
+    /// Only returns checkpoints saved after the last `WorkflowRestarted`
+    /// boundary. Checkpoints from prior failed attempts are stale and must
+    /// not be used for recovery — the retry should replay from scratch.
     pub fn last_checkpoint(&self) -> Option<(u64, [u8; 32])> {
-        self.events.iter().rev().find_map(|e| match e {
+        // Find the position after the last restart boundary (or 0 if none).
+        let start = self
+            .events
+            .iter()
+            .rposition(|e| matches!(e, KitriEvent::WorkflowRestarted { .. }))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        self.events[start..].iter().rev().find_map(|e| match e {
             KitriEvent::CheckpointSaved { seq, state_cid } => Some((*seq, *state_cid)),
             _ => None,
         })

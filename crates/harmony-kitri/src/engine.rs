@@ -220,7 +220,10 @@ impl KitriEngine {
                 );
                 existing.status = KitriWorkflowStatus::Pending;
                 existing.pending_error = None;
-                return vec![KitriAction::WorkflowAccepted { workflow_id: wf_id }];
+                return vec![
+                    KitriAction::PersistEventLog { workflow_id: wf_id },
+                    KitriAction::WorkflowAccepted { workflow_id: wf_id },
+                ];
             }
             return vec![KitriAction::Deduplicated { workflow_id: wf_id }];
         }
@@ -367,6 +370,14 @@ impl KitriEngine {
         actions
     }
 
+    /// Handle a workflow failure.
+    ///
+    /// Accepts failure from `Pending`, `Executing`, or `WaitingForIo`. When
+    /// failing from `WaitingForIo`, the engine does NOT emit a cancellation
+    /// action for the in-flight I/O — the runtime must drop any pending
+    /// `ExecuteIo` result for this workflow. The `handle_io_resolved` status
+    /// guard will reject stale resolutions since the workflow has moved to
+    /// `Compensating` or `Failed`.
     fn handle_failed(&mut self, workflow_id: [u8; 32], error: String) -> Vec<KitriAction> {
         let Some(state) = self.workflows.get_mut(&workflow_id) else {
             return vec![];
@@ -1435,5 +1446,75 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, crate::event::KitriEvent::WorkflowRestarted { attempt: 2, .. })
         ));
+    }
+
+    #[test]
+    fn engine_retry_emits_persist_event_log() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "transient".into(),
+        });
+
+        // Re-submit — must emit PersistEventLog so the WorkflowRestarted
+        // boundary is durable before the runtime proceeds.
+        let actions = engine.handle(KitriEngineEvent::Submit { program, input });
+
+        let persist_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::PersistEventLog { .. }));
+        let accepted_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::WorkflowAccepted { .. }));
+        assert!(persist_pos.is_some());
+        assert!(accepted_pos.is_some());
+        // PersistEventLog must come before WorkflowAccepted.
+        assert!(persist_pos.unwrap() < accepted_pos.unwrap());
+    }
+
+    #[test]
+    fn engine_last_checkpoint_ignores_prior_attempts() {
+        use crate::event::KitriEventLog;
+
+        let mut log = KitriEventLog::new([0; 32]);
+
+        // Attempt 1: checkpoint at seq 3, then failure.
+        log.append(crate::event::KitriEvent::CheckpointSaved {
+            seq: 3,
+            state_cid: [0xAA; 32],
+        });
+        log.append(crate::event::KitriEvent::WorkflowFailed {
+            seq: 5,
+            error: "boom".into(),
+        });
+
+        // Before restart, checkpoint from attempt 1 is visible.
+        assert_eq!(log.last_checkpoint(), Some((3, [0xAA; 32])));
+
+        // Restart boundary.
+        log.append(crate::event::KitriEvent::WorkflowRestarted {
+            seq: 6,
+            attempt: 1,
+        });
+
+        // After restart, attempt 1's checkpoint is stale — not returned.
+        assert_eq!(log.last_checkpoint(), None);
+
+        // Attempt 2 saves its own checkpoint.
+        log.append(crate::event::KitriEvent::CheckpointSaved {
+            seq: 8,
+            state_cid: [0xBB; 32],
+        });
+
+        // Only attempt 2's checkpoint is returned.
+        assert_eq!(log.last_checkpoint(), Some((8, [0xBB; 32])));
     }
 }
