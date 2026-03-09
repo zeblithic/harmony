@@ -848,6 +848,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-jain"
+version = "0.1.0"
+dependencies = [
+ "harmony-content",
+ "harmony-roxy",
+ "hashbrown 0.15.5",
+ "hex",
+ "libm",
+ "postcard",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harmony-mail"
 version = "0.1.0"
 dependencies = [
@@ -920,6 +934,7 @@ dependencies = [
  "rand_core",
  "serde",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
