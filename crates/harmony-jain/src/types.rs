@@ -86,7 +86,13 @@ impl StalenessScore {
     pub const STALE: Self = StalenessScore(1.0);
 
     /// Create a new staleness score, clamping to [0.0, 1.0].
+    ///
+    /// NaN is treated as maximally stale (1.0) to prevent corrupted
+    /// timestamps from hiding content from cleanup.
     pub fn new(value: f64) -> Self {
+        if value.is_nan() {
+            return Self::STALE;
+        }
         StalenessScore(value.clamp(0.0, 1.0))
     }
 
@@ -162,6 +168,16 @@ mod tests {
         assert_eq!(StalenessScore::new(-0.5).value(), 0.0);
         assert_eq!(StalenessScore::new(1.5).value(), 1.0);
         assert!((StalenessScore::new(0.42).value() - 0.42).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn staleness_score_nan_becomes_stale() {
+        let score = StalenessScore::new(f64::NAN);
+        assert!(
+            (score.value() - 1.0).abs() < f64::EPSILON,
+            "NaN should become STALE (1.0), got {}",
+            score.value()
+        );
     }
 
     #[test]

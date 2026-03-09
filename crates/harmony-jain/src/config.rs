@@ -35,6 +35,12 @@ impl JainConfig {
     /// - `self_created_weight` outside `[0.0, 1.0]`
     /// - `storage_alert_percent` outside `(0.0, 1.0]`
     pub fn validate(&self) -> Result<(), JainError> {
+        if self.min_replica_count == 0 {
+            return Err(JainError::InvalidConfig(format!(
+                "min_replica_count must be at least 1, got {}",
+                self.min_replica_count
+            )));
+        }
         if self.access_decay_half_life_secs <= 0.0
             || !self.access_decay_half_life_secs.is_finite()
         {

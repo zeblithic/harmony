@@ -128,6 +128,9 @@ pub enum JainAction {
         recommendation: CleanupRecommendation,
     },
     /// Recommend deduplicating content.
+    ///
+    /// Reserved — not yet emitted by `JainEngine`. Will be used when Oluo
+    /// (content similarity search) is integrated.
     RecommendDedup {
         /// CID to keep.
         keep: ContentId,
@@ -135,6 +138,9 @@ pub enum JainAction {
         burn: ContentId,
     },
     /// Query Oluo (network layer) for additional information.
+    ///
+    /// Reserved — not yet emitted by `JainEngine`. Will be used when the
+    /// Oluo crate is implemented and integrated.
     QueryOluo {
         /// Content identifier to query about.
         cid: ContentId,
@@ -206,6 +212,10 @@ pub enum HealthAlertKind {
         records_without_backing: u32,
     },
     /// Some content has fewer replicas than desired.
+    ///
+    /// Reserved — not yet emitted by `JainEngine`. Individual under-replicated
+    /// records emit [`JainAction::RepairNeeded`] instead. This variant is
+    /// intended for aggregate health reporting in a future version.
     ReplicaDeficit {
         /// Number of under-replicated records.
         affected_records: u32,

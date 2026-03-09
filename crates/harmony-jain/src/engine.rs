@@ -1098,6 +1098,15 @@ mod tests {
     }
 
     #[test]
+    fn config_validate_catches_zero_replica_count() {
+        let config = JainConfig {
+            min_replica_count: 0,
+            ..JainConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn config_validate_catches_zero_half_life() {
         let config = JainConfig {
             access_decay_half_life_secs: 0.0,
