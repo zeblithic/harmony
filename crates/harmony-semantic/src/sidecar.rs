@@ -297,122 +297,124 @@ mod tests {
         assert_eq!(header.tier_data(EmbeddingTier::T5), &header.tier5);
     }
 
-    // ---- v2 enriched sidecar tests ----
-
-    use crate::metadata::PrivacyTier;
-    use alloc::collections::BTreeMap;
-    use alloc::string::ToString;
-    use alloc::vec;
-
-    #[test]
-    fn enriched_sidecar_roundtrip() {
-        let header = test_header();
-        let mut ext = BTreeMap::new();
-        ext.insert("custom-key".to_string(), vec![1, 2, 3]);
-
-        let metadata = SidecarMetadata {
-            privacy_tier: Some(PrivacyTier::EncryptedDurable),
-            created_at: Some(1_700_000_000),
-            content_type: Some("text/plain".to_string()),
-            language: Some("en-US".to_string()),
-            geo: Some((47.6062, -122.3321)),
-            description: Some("Test content".to_string()),
-            tags: Some(vec!["test".to_string(), "example".to_string()]),
-            refs: Some(vec![[0xAB; 32]]),
-            source_device: Some("laptop-01".to_string()),
-            ext: Some(ext),
-        };
-
-        let enriched = EnrichedSidecar {
-            header: header.clone(),
-            metadata: metadata.clone(),
-        };
-
-        let encoded = enriched.encode().expect("encode should succeed");
-        // Must be larger than the fixed header.
-        assert!(encoded.len() > SIDECAR_HEADER_SIZE);
-        // Must start with v2 magic.
-        assert_eq!(&encoded[0..4], &SIDECAR_V2_MAGIC);
-
-        let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
-        assert_eq!(decoded.header, header);
-        assert_eq!(decoded.metadata, metadata);
-    }
-
-    #[test]
-    fn enriched_sidecar_minimal_metadata() {
-        let header = test_header();
-        let metadata = SidecarMetadata {
-            privacy_tier: Some(PrivacyTier::PublicDurable),
-            created_at: Some(1_700_000_000),
-            ..SidecarMetadata::default()
-        };
-
-        let enriched = EnrichedSidecar {
-            header: header.clone(),
-            metadata: metadata.clone(),
-        };
-
-        let encoded = enriched.encode().expect("encode should succeed");
-        let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
-        assert_eq!(decoded.header, header);
-        assert_eq!(decoded.metadata, metadata);
-    }
-
-    #[test]
-    fn enriched_sidecar_v1_compat() {
-        let header = test_header();
-        // A plain v1 blob is exactly 288 bytes.
-        let v1_blob = header.encode_v1();
-        assert_eq!(v1_blob.len(), SIDECAR_HEADER_SIZE);
-
-        let decoded = EnrichedSidecar::decode(&v1_blob).expect("v1 decode should succeed");
-        assert_eq!(decoded.header, header);
-        assert_eq!(decoded.metadata, SidecarMetadata::default());
-    }
-
     #[test]
     fn privacy_tier_ordering() {
+        use crate::metadata::PrivacyTier;
         assert!(PrivacyTier::PublicDurable < PrivacyTier::PublicEphemeral);
         assert!(PrivacyTier::PublicEphemeral < PrivacyTier::EncryptedDurable);
         assert!(PrivacyTier::EncryptedDurable < PrivacyTier::EncryptedEphemeral);
     }
 
-    #[test]
-    fn metadata_with_tags_and_refs() {
-        let header = test_header();
-        let ref1 = [0x11; 32];
-        let ref2 = [0x22; 32];
-        let ref3 = [0x33; 32];
+    // v2 enriched sidecar tests require std (ciborium for CBOR).
+    #[cfg(feature = "std")]
+    mod v2_tests {
+        use super::*;
+        use crate::metadata::{PrivacyTier, SidecarMetadata};
+        use alloc::collections::BTreeMap;
+        use alloc::string::ToString;
+        use alloc::vec;
 
-        let metadata = SidecarMetadata {
-            tags: Some(vec![
-                "alpha".to_string(),
-                "beta".to_string(),
-                "gamma".to_string(),
-            ]),
-            refs: Some(vec![ref1, ref2, ref3]),
-            ..SidecarMetadata::default()
-        };
+        #[test]
+        fn enriched_sidecar_roundtrip() {
+            let header = test_header();
+            let mut ext = BTreeMap::new();
+            ext.insert("custom-key".to_string(), vec![1, 2, 3]);
 
-        let enriched = EnrichedSidecar {
-            header: header.clone(),
-            metadata: metadata.clone(),
-        };
+            let metadata = SidecarMetadata {
+                privacy_tier: Some(PrivacyTier::EncryptedDurable),
+                created_at: Some(1_700_000_000),
+                content_type: Some("text/plain".to_string()),
+                language: Some("en-US".to_string()),
+                geo: Some((47.6062, -122.3321)),
+                description: Some("Test content".to_string()),
+                tags: Some(vec!["test".to_string(), "example".to_string()]),
+                refs: Some(vec![[0xAB; 32]]),
+                source_device: Some("laptop-01".to_string()),
+                ext: Some(ext),
+            };
 
-        let encoded = enriched.encode().expect("encode should succeed");
-        let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
+            let enriched = EnrichedSidecar {
+                header: header.clone(),
+                metadata: metadata.clone(),
+            };
 
-        let tags = decoded.metadata.tags.as_ref().expect("tags should exist");
-        assert_eq!(tags.len(), 3);
-        assert_eq!(tags[0], "alpha");
-        assert_eq!(tags[1], "beta");
-        assert_eq!(tags[2], "gamma");
+            let encoded = enriched.encode().expect("encode should succeed");
+            assert!(encoded.len() > SIDECAR_HEADER_SIZE);
+            assert_eq!(&encoded[0..4], &SIDECAR_V2_MAGIC);
 
-        let refs = decoded.metadata.refs.as_ref().expect("refs should exist");
-        assert_eq!(refs.len(), 3);
-        assert_eq!(refs[0], ref1);
-        assert_eq!(refs[1], ref2);
-        assert_eq!(refs[2], ref3);
+            let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
+            assert_eq!(decoded.header, header);
+            assert_eq!(decoded.metadata, metadata);
+        }
+
+        #[test]
+        fn enriched_sidecar_minimal_metadata() {
+            let header = test_header();
+            let metadata = SidecarMetadata {
+                privacy_tier: Some(PrivacyTier::PublicDurable),
+                created_at: Some(1_700_000_000),
+                ..SidecarMetadata::default()
+            };
+
+            let enriched = EnrichedSidecar {
+                header: header.clone(),
+                metadata: metadata.clone(),
+            };
+
+            let encoded = enriched.encode().expect("encode should succeed");
+            let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
+            assert_eq!(decoded.header, header);
+            assert_eq!(decoded.metadata, metadata);
+        }
+
+        #[test]
+        fn enriched_sidecar_v1_compat() {
+            let header = test_header();
+            let v1_blob = header.encode_v1();
+            assert_eq!(v1_blob.len(), SIDECAR_HEADER_SIZE);
+
+            let decoded =
+                EnrichedSidecar::decode(&v1_blob).expect("v1 decode should succeed");
+            assert_eq!(decoded.header, header);
+            assert_eq!(decoded.metadata, SidecarMetadata::default());
+        }
+
+        #[test]
+        fn metadata_with_tags_and_refs() {
+            let header = test_header();
+            let ref1 = [0x11; 32];
+            let ref2 = [0x22; 32];
+            let ref3 = [0x33; 32];
+
+            let metadata = SidecarMetadata {
+                tags: Some(vec![
+                    "alpha".to_string(),
+                    "beta".to_string(),
+                    "gamma".to_string(),
+                ]),
+                refs: Some(vec![ref1, ref2, ref3]),
+                ..SidecarMetadata::default()
+            };
+
+            let enriched = EnrichedSidecar {
+                header: header.clone(),
+                metadata: metadata.clone(),
+            };
+
+            let encoded = enriched.encode().expect("encode should succeed");
+            let decoded = EnrichedSidecar::decode(&encoded).expect("decode should succeed");
+
+            let tags = decoded.metadata.tags.as_ref().expect("tags should exist");
+            assert_eq!(tags.len(), 3);
+            assert_eq!(tags[0], "alpha");
+            assert_eq!(tags[1], "beta");
+            assert_eq!(tags[2], "gamma");
+
+            let refs = decoded.metadata.refs.as_ref().expect("refs should exist");
+            assert_eq!(refs.len(), 3);
+            assert_eq!(refs[0], ref1);
+            assert_eq!(refs[1], ref2);
+            assert_eq!(refs[2], ref3);
+        }
     }
 }
