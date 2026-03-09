@@ -1,0 +1,23 @@
+[package]
+name = "harmony-kitri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Kitri — Harmony's native programming model for durable distributed computation (Layer 0: types & traits)"
+
+[features]
+default = ["std"]
+std = [
+    "harmony-crypto/std",
+    "serde/std",
+    "dep:toml",
+]
+
+[dependencies]
+harmony-crypto = { workspace = true, default-features = false }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+toml = { workspace = true, optional = true }
+
+[dev-dependencies]
