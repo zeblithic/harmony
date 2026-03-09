@@ -139,8 +139,6 @@ mod tests {
             (decoded.access_decay_half_life_secs - config.access_decay_half_life_secs).abs()
                 < f64::EPSILON
         );
-        assert!(
-            (decoded.self_created_weight - config.self_created_weight).abs() < f64::EPSILON
-        );
+        assert!((decoded.self_created_weight - config.self_created_weight).abs() < f64::EPSILON);
     }
 }

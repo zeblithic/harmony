@@ -1,9 +1,9 @@
 //! Sans-I/O content lifecycle engine.
 
 use alloc::vec::Vec;
-use hashbrown::{HashMap, HashSet};
 use harmony_content::ContentId;
 use harmony_roxy::catalog::ContentCategory;
+use hashbrown::{HashMap, HashSet};
 
 use crate::actions::*;
 use crate::config::{FilterRuleSet, JainConfig};
@@ -227,8 +227,7 @@ impl JainEngine {
 
         // Storage health check
         if self.storage_capacity_bytes > 0 {
-            let used_pct =
-                self.total_storage_bytes as f64 / self.storage_capacity_bytes as f64;
+            let used_pct = self.total_storage_bytes as f64 / self.storage_capacity_bytes as f64;
             if used_pct >= self.config.storage_alert_percent {
                 actions.push(JainAction::HealthAlert {
                     alert: HealthAlertKind::StorageNearFull {
@@ -529,7 +528,10 @@ mod tests {
             origin: ContentOrigin::Downloaded,
             sensitivity: Sensitivity::Public,
         };
-        assert_eq!(engine.evaluate_ingest(&candidate), IngestDecision::IndexAndStore);
+        assert_eq!(
+            engine.evaluate_ingest(&candidate),
+            IngestDecision::IndexAndStore
+        );
     }
 
     #[test]
@@ -587,7 +589,10 @@ mod tests {
             origin: ContentOrigin::SelfCreated,
             sensitivity: Sensitivity::Confidential,
         };
-        assert_eq!(engine.evaluate_ingest(&candidate), IngestDecision::StoreOnly);
+        assert_eq!(
+            engine.evaluate_ingest(&candidate),
+            IngestDecision::StoreOnly
+        );
     }
 
     // ── Task 10: filter_result ──
@@ -754,7 +759,9 @@ mod tests {
 
         let now = 10.0 * engine.config.access_decay_half_life_secs;
         let actions = engine.tick(now);
-        let has_burn = actions.iter().any(|a| matches!(a, JainAction::RecommendBurn { .. }));
+        let has_burn = actions
+            .iter()
+            .any(|a| matches!(a, JainAction::RecommendBurn { .. }));
         assert!(has_burn, "expected RecommendBurn action, got: {actions:?}");
     }
 
@@ -831,11 +838,10 @@ mod tests {
         });
 
         let actions = engine.tick(1000.0);
-        let has_repair = actions.iter().any(|a| matches!(a, JainAction::RepairNeeded { .. }));
-        assert!(
-            has_repair,
-            "expected RepairNeeded action, got: {actions:?}"
-        );
+        let has_repair = actions
+            .iter()
+            .any(|a| matches!(a, JainAction::RepairNeeded { .. }));
+        assert!(has_repair, "expected RepairNeeded action, got: {actions:?}");
     }
 
     #[test]
@@ -926,7 +932,9 @@ mod tests {
             exists_on_disk: false,
         }];
         let actions = engine.reconcile(&snapshot);
-        let has_repair = actions.iter().any(|a| matches!(a, JainAction::RepairNeeded { .. }));
+        let has_repair = actions
+            .iter()
+            .any(|a| matches!(a, JainAction::RepairNeeded { .. }));
         assert!(
             has_repair,
             "expected RepairNeeded for missing backing data, got: {actions:?}"

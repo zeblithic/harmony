@@ -290,7 +290,10 @@ mod tests {
 
     #[test]
     fn query_hint_serialization_round_trip() {
-        for hint in [QueryHint::FindPublicEquivalent, QueryHint::FindLocalDuplicates] {
+        for hint in [
+            QueryHint::FindPublicEquivalent,
+            QueryHint::FindLocalDuplicates,
+        ] {
             let bytes = postcard::to_allocvec(&hint).unwrap();
             let decoded: QueryHint = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(hint, decoded);
