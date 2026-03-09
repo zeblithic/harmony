@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use harmony_semantic::distance::hamming_distance;
 use harmony_semantic::metadata::{PrivacyTier, SidecarMetadata};
 use harmony_semantic::sidecar::SidecarHeader;
+use harmony_semantic::tier::EmbeddingTier;
 
 use crate::filter::RawSearchResult;
 use crate::ingest::IngestDecision;
@@ -169,19 +170,22 @@ impl OluoEngine {
     }
 
     fn handle_search(&self, query_id: u64, query: SearchQuery) -> Vec<OluoAction> {
-        // Currently only Tier 3 (256-bit) search is supported — the flat index
-        // stores tier3 vectors. The query.tier field is used for score normalization.
-        let max_bits = query.tier.bit_count() as f32;
+        // Only Tier 3 (256-bit) search is supported — the flat index stores tier3 vectors.
+        // Non-T3 queries return empty results rather than producing incorrect scores.
+        if query.tier != EmbeddingTier::T3 {
+            return alloc::vec![OluoAction::SearchResults {
+                query_id,
+                results: Vec::new(),
+            }];
+        }
+
+        let max_bits = EmbeddingTier::T3.bit_count() as f32;
         let mut scored: Vec<([u8; 32], f32, &IndexEntry)> = self
             .entries
             .iter()
             .map(|(cid, entry)| {
                 let dist = hamming_distance(&query.embedding, &entry.tier3);
-                let score = if max_bits > 0.0 {
-                    dist as f32 / max_bits
-                } else {
-                    0.0
-                };
+                let score = dist as f32 / max_bits;
                 (*cid, score, entry)
             })
             .collect();
@@ -292,6 +296,35 @@ mod tests {
 
         assert!(actions.is_empty());
         assert_eq!(engine.entry_count(), 0);
+    }
+
+    #[test]
+    fn engine_search_non_t3_returns_empty() {
+        let mut engine = OluoEngine::new();
+
+        // Insert an entry so the index isn't empty.
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+        });
+
+        let query = SearchQuery {
+            embedding: [0xAA; 32],
+            tier: EmbeddingTier::T1, // non-T3 — should be rejected
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+
+        let actions = engine.handle(OluoEvent::Search { query_id: 99, query });
+        match &actions[0] {
+            OluoAction::SearchResults { query_id, results } => {
+                assert_eq!(*query_id, 99);
+                assert!(results.is_empty());
+            }
+            _ => panic!("expected SearchResults action"),
+        }
     }
 
     #[test]

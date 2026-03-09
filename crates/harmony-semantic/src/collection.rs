@@ -129,6 +129,8 @@ impl CollectionBlob {
         if n == 0 {
             return centroid;
         }
+        // Integer division: for even n, threshold is exact half.
+        // count > threshold requires a strict majority; ties resolve to 0.
         let threshold = n / 2;
 
         for (byte_idx, centroid_byte) in centroid.iter_mut().enumerate() {

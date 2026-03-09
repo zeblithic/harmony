@@ -7,6 +7,8 @@ use crate::error::{OluoError, OluoResult};
 pub const TRIE_NODE_MAGIC: [u8; 4] = [0x48, 0x53, 0x4E, 0x01];
 /// Size of an internal trie node blob.
 pub const TRIE_NODE_SIZE: usize = 106;
+/// Maximum valid `split_bit` value (exclusive). Centroid is 256-bit (T3).
+pub const TRIE_MAX_SPLIT_BIT: u16 = 256;
 
 /// An internal node in the adaptive-depth embedding trie.
 ///
@@ -63,7 +65,7 @@ impl TrieNode {
         fingerprint.copy_from_slice(&data[4..8]);
 
         let split_bit = u16::from_be_bytes([data[8], data[9]]);
-        if split_bit >= 256 {
+        if split_bit >= TRIE_MAX_SPLIT_BIT {
             return Err(OluoError::InvalidTrieNode);
         }
 
@@ -153,7 +155,7 @@ mod tests {
     #[test]
     fn trie_node_decode_invalid_split_bit() {
         let mut node = sample_node();
-        node.split_bit = 256; // out of range for 256-bit vectors
+        node.split_bit = TRIE_MAX_SPLIT_BIT; // out of range for 256-bit centroid
         let encoded = node.encode();
         let err = TrieNode::decode(&encoded).unwrap_err();
         assert_eq!(err, OluoError::InvalidTrieNode);

@@ -192,7 +192,14 @@ impl EnrichedSidecar {
         let trailer_len = u32::from_be_bytes(len_bytes) as usize;
 
         let cbor_start = SIDECAR_HEADER_SIZE + 4;
-        let cbor_end = cbor_start + trailer_len;
+        let cbor_end = cbor_start.checked_add(trailer_len).ok_or_else(|| {
+            SemanticError::MetadataInvalid {
+                reason: alloc::format!(
+                    "trailer length {} overflows address space",
+                    trailer_len
+                ),
+            }
+        })?;
 
         if data.len() < cbor_end {
             return Err(SemanticError::MetadataInvalid {
