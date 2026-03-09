@@ -90,6 +90,12 @@ pub enum KitriAction {
         workflow_id: [u8; 32],
         error: String,
     },
+    /// Checkpoint state bytes should be persisted to content-addressed storage.
+    PersistCheckpoint {
+        workflow_id: [u8; 32],
+        state: Vec<u8>,
+        state_cid: [u8; 32],
+    },
     /// A compensator should be executed (saga rollback).
     ExecuteCompensator {
         workflow_id: [u8; 32],
@@ -177,9 +183,9 @@ impl KitriEngine {
             }
             KitriEngineEvent::CheckpointRequested {
                 workflow_id,
-                state: _,
+                state,
                 state_cid,
-            } => self.handle_checkpoint(workflow_id, state_cid),
+            } => self.handle_checkpoint(workflow_id, state, state_cid),
             KitriEngineEvent::CompensatorRegistered {
                 workflow_id,
                 step_id,
@@ -295,12 +301,12 @@ impl KitriEngine {
             return vec![];
         };
 
-        // Only accept completion from active states (including Pending for zero-I/O workflows).
+        // Only accept completion from Pending (zero-I/O) or Executing (all I/O resolved).
+        // WaitingForIo is excluded: completing with unresolved I/O would commit
+        // staged writes whose side effects haven't been confirmed.
         if !matches!(
             state.status,
-            KitriWorkflowStatus::Pending
-                | KitriWorkflowStatus::Executing
-                | KitriWorkflowStatus::WaitingForIo
+            KitriWorkflowStatus::Pending | KitriWorkflowStatus::Executing
         ) {
             return vec![];
         }
@@ -308,6 +314,12 @@ impl KitriEngine {
         state.status = KitriWorkflowStatus::Complete;
         state.output = Some(output.clone());
         state.compensation.discard_all();
+
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        state
+            .event_log
+            .append(crate::event::KitriEvent::WorkflowCompleted { seq });
 
         let mut actions: Vec<KitriAction> = state
             .staging
@@ -358,13 +370,26 @@ impl KitriEngine {
         if actions.is_empty() {
             // No compensators — fail immediately.
             state.status = KitriWorkflowStatus::Failed;
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            state.event_log.append(crate::event::KitriEvent::WorkflowFailed {
+                seq,
+                error: error.clone(),
+            });
             actions.push(KitriAction::PersistEventLog { workflow_id });
             actions.push(KitriAction::Failed { workflow_id, error });
         } else {
             // Compensators need to run first. Defer Failed until
             // CompensationComplete arrives.
             state.status = KitriWorkflowStatus::Compensating;
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            state.event_log.append(crate::event::KitriEvent::CompensationStarted {
+                seq,
+                error: error.clone(),
+            });
             state.pending_error = Some(error);
+            actions.push(KitriAction::PersistEventLog { workflow_id });
         }
 
         actions
@@ -381,6 +406,14 @@ impl KitriEngine {
 
         state.status = KitriWorkflowStatus::Failed;
         let error = state.pending_error.take().unwrap_or_default();
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        state
+            .event_log
+            .append(crate::event::KitriEvent::WorkflowFailed {
+                seq,
+                error: error.clone(),
+            });
         vec![
             KitriAction::PersistEventLog { workflow_id },
             KitriAction::Failed { workflow_id, error },
@@ -390,6 +423,7 @@ impl KitriEngine {
     fn handle_checkpoint(
         &mut self,
         workflow_id: [u8; 32],
+        checkpoint_state: Vec<u8>,
         state_cid: [u8; 32],
     ) -> Vec<KitriAction> {
         let Some(state) = self.workflows.get_mut(&workflow_id) else {
@@ -412,7 +446,14 @@ impl KitriEngine {
             .event_log
             .append(crate::event::KitriEvent::CheckpointSaved { seq, state_cid });
 
-        vec![KitriAction::PersistEventLog { workflow_id }]
+        vec![
+            KitriAction::PersistCheckpoint {
+                workflow_id,
+                state: checkpoint_state,
+                state_cid,
+            },
+            KitriAction::PersistEventLog { workflow_id },
+        ]
     }
 
     fn handle_compensator(
@@ -433,18 +474,22 @@ impl KitriEngine {
             return vec![];
         }
 
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        state
+            .event_log
+            .append(crate::event::KitriEvent::CompensatorRegistered {
+                seq,
+                step_id,
+                rollback_op: rollback_op.clone(),
+            });
+
         state
             .compensation
             .register(crate::compensation::Compensator {
                 step_id,
                 rollback_op,
             });
-
-        let seq = state.next_seq;
-        state.next_seq += 1;
-        state
-            .event_log
-            .append(crate::event::KitriEvent::CompensatorRegistered { seq, step_id });
 
         vec![KitriAction::PersistEventLog { workflow_id }]
     }
@@ -1127,5 +1172,106 @@ mod tests {
             .iter()
             .any(|a| matches!(a, KitriAction::Deduplicated { .. })));
         assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Complete));
+    }
+
+    #[test]
+    fn engine_complete_rejected_while_waiting_for_io() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::IoRequested {
+            workflow_id: wf_id,
+            op: KitriIoOp::Store { data: vec![1] },
+        });
+        assert_eq!(
+            engine.status(&wf_id),
+            Some(KitriWorkflowStatus::WaitingForIo)
+        );
+
+        // Complete while waiting for I/O should be rejected — unresolved
+        // staged writes would be committed without confirmation.
+        let actions = engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![99],
+        });
+        assert!(actions.is_empty());
+        assert_eq!(
+            engine.status(&wf_id),
+            Some(KitriWorkflowStatus::WaitingForIo)
+        );
+    }
+
+    #[test]
+    fn engine_compensation_path_emits_persist_event_log() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::CompensatorRegistered {
+            workflow_id: wf_id,
+            step_id: 0,
+            rollback_op: KitriIoOp::Query {
+                topic: "undo".into(),
+                payload: vec![],
+            },
+        });
+
+        let actions = engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "boom".into(),
+        });
+
+        // Must emit PersistEventLog to durably record the Compensating transition.
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::PersistEventLog { .. })));
+    }
+
+    #[test]
+    fn engine_checkpoint_emits_persist_checkpoint() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+
+        let state_bytes = vec![10, 20, 30];
+        let state_cid = [0xAA; 32];
+        let actions = engine.handle(KitriEngineEvent::CheckpointRequested {
+            workflow_id: wf_id,
+            state: state_bytes,
+            state_cid,
+        });
+
+        // Must emit PersistCheckpoint so the runtime stores the state bytes.
+        assert!(actions.iter().any(
+            |a| matches!(a, KitriAction::PersistCheckpoint { state_cid: cid, .. } if *cid == [0xAA; 32])
+        ));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::PersistEventLog { .. })));
+    }
+
+    #[test]
+    fn engine_capability_set_deduplicates() {
+        use crate::trust::{CapabilityDecl, CapabilitySet};
+
+        let mut caps = CapabilitySet::new();
+        caps.add(CapabilityDecl::Infer);
+        caps.add(CapabilityDecl::Infer); // duplicate
+        caps.add(CapabilityDecl::Subscribe {
+            topic: "foo".into(),
+        });
+        caps.add(CapabilityDecl::Subscribe {
+            topic: "foo".into(),
+        }); // duplicate
+
+        assert_eq!(caps.declarations.len(), 2);
     }
 }

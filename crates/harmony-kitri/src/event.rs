@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Event log — the durable record of a Kitri workflow's I/O history.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::io::{KitriIoOp, KitriIoResult};
@@ -15,7 +16,17 @@ pub enum KitriEvent {
     /// An explicit checkpoint was saved.
     CheckpointSaved { seq: u64, state_cid: [u8; 32] },
     /// A compensator was registered for saga rollback.
-    CompensatorRegistered { seq: u64, step_id: u64 },
+    CompensatorRegistered {
+        seq: u64,
+        step_id: u64,
+        rollback_op: KitriIoOp,
+    },
+    /// Saga compensation was triggered (workflow entering rollback).
+    CompensationStarted { seq: u64, error: String },
+    /// The workflow completed successfully.
+    WorkflowCompleted { seq: u64 },
+    /// The workflow failed (possibly after compensation).
+    WorkflowFailed { seq: u64, error: String },
 }
 
 /// The full event log for a workflow instance.

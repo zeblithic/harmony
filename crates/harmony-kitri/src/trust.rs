@@ -72,7 +72,9 @@ impl CapabilitySet {
     }
 
     pub fn add(&mut self, decl: CapabilityDecl) {
-        self.declarations.push(decl);
+        if !self.declarations.contains(&decl) {
+            self.declarations.push(decl);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
