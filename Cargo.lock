@@ -935,11 +935,9 @@ dependencies = [
 name = "harmony-oluo"
 version = "0.1.0"
 dependencies = [
- "harmony-content",
  "harmony-crypto",
  "harmony-semantic",
  "hashbrown 0.15.5",
- "serde",
 ]
 
 [[package]]
@@ -992,7 +990,6 @@ name = "harmony-semantic"
 version = "0.1.0"
 dependencies = [
  "ciborium",
- "harmony-content",
  "harmony-crypto",
  "hashbrown 0.15.5",
  "serde",
