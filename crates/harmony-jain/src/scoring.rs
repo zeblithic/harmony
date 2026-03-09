@@ -49,13 +49,13 @@ pub fn staleness_score(record: &ContentRecord, config: &JainConfig, now: f64) ->
 /// Compute ln(1 + x) using the appropriate math backend.
 #[cfg(feature = "std")]
 fn ln_1p(x: f64) -> f64 {
-    (1.0 + x).ln()
+    x.ln_1p()
 }
 
 /// Compute ln(1 + x) using libm for no_std environments.
 #[cfg(not(feature = "std"))]
 fn ln_1p(x: f64) -> f64 {
-    libm::log(1.0 + x)
+    libm::log1p(x)
 }
 
 #[cfg(test)]

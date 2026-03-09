@@ -45,9 +45,13 @@ impl JainEngine {
     }
 
     /// Generate a health report summarizing the engine's current state.
-    pub fn health_report(&self) -> HealthReport {
+    ///
+    /// `now` is the current wall-clock timestamp, used to compute staleness
+    /// scores for the `stale_count` field.
+    pub fn health_report(&self, now: f64) -> HealthReport {
         let mut under_replicated_count = 0u32;
         let mut pinned_count = 0u32;
+        let mut stale_count = 0u32;
 
         for record in self.records.values() {
             if record.replica_count < self.config.min_replica_count {
@@ -55,6 +59,10 @@ impl JainEngine {
             }
             if record.pinned {
                 pinned_count += 1;
+            }
+            let score = crate::scoring::staleness_score(record, &self.config, now);
+            if score.value() >= self.config.archive_threshold {
+                stale_count += 1;
             }
         }
 
@@ -70,7 +78,7 @@ impl JainEngine {
             total_bytes: self.total_storage_bytes,
             storage_used_percent_x100,
             under_replicated_count,
-            stale_count: 0, // Computed by tick, not health_report
+            stale_count,
             pinned_count,
         }
     }
@@ -87,11 +95,11 @@ impl JainEngine {
                 sensitivity,
                 timestamp,
             } => {
+                // Same-CID re-arrival: ignore silently. Cross-CID dedup
+                // (different CIDs for semantically equivalent content) is
+                // handled by Oluo via QueryOluo actions, not here.
                 if self.records.contains_key(&cid) {
-                    return alloc::vec![JainAction::RecommendDedup {
-                        keep: cid,
-                        burn: cid,
-                    }];
+                    return Vec::new();
                 }
                 let record = ContentRecord {
                     cid,
@@ -166,8 +174,10 @@ impl JainEngine {
             };
         }
 
-        // 2. Storage budget check
-        if self.total_storage_bytes + candidate.size_bytes > self.storage_capacity_bytes {
+        // 2. Storage budget check (capacity of 0 means unlimited)
+        if self.storage_capacity_bytes > 0
+            && self.total_storage_bytes + candidate.size_bytes > self.storage_capacity_bytes
+        {
             return IngestDecision::Reject {
                 reason: RejectReason::StorageBudgetExceeded,
             };
@@ -377,7 +387,7 @@ mod tests {
     #[test]
     fn health_report_empty_engine() {
         let engine = default_engine();
-        let report = engine.health_report();
+        let report = engine.health_report(0.0);
         assert_eq!(report.total_records, 0);
         assert_eq!(report.total_bytes, 0);
         assert_eq!(report.storage_used_percent_x100, 0);
@@ -399,12 +409,12 @@ mod tests {
         });
         assert!(actions.is_empty());
         assert_eq!(engine.record_count(), 1);
-        let report = engine.health_report();
+        let report = engine.health_report(0.0);
         assert_eq!(report.total_bytes, 100);
     }
 
     #[test]
-    fn handle_stored_duplicate_emits_dedup() {
+    fn handle_stored_duplicate_is_ignored() {
         let mut engine = default_engine();
         let cid = make_cid(b"content-dup");
         engine.handle_event(ContentEvent::Stored {
@@ -423,9 +433,11 @@ mod tests {
             sensitivity: Sensitivity::Public,
             timestamp: 2000.0,
         });
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], JainAction::RecommendDedup { .. }));
+        // Same-CID re-arrival is silently ignored; cross-CID dedup is Oluo's job
+        assert!(actions.is_empty());
         assert_eq!(engine.record_count(), 1);
+        // Storage should not double-count
+        assert_eq!(engine.health_report(0.0).total_bytes, 50);
     }
 
     #[test]
@@ -462,7 +474,7 @@ mod tests {
         });
         engine.handle_event(ContentEvent::Deleted { cid });
         assert_eq!(engine.record_count(), 0);
-        assert_eq!(engine.health_report().total_bytes, 0);
+        assert_eq!(engine.health_report(0.0).total_bytes, 0);
     }
 
     #[test]
@@ -478,9 +490,9 @@ mod tests {
             timestamp: 1000.0,
         });
         engine.handle_event(ContentEvent::Pinned { cid });
-        assert_eq!(engine.health_report().pinned_count, 1);
+        assert_eq!(engine.health_report(0.0).pinned_count, 1);
         engine.handle_event(ContentEvent::Unpinned { cid });
-        assert_eq!(engine.health_report().pinned_count, 0);
+        assert_eq!(engine.health_report(0.0).pinned_count, 0);
     }
 
     #[test]
@@ -513,9 +525,9 @@ mod tests {
             sensitivity: Sensitivity::Public,
             timestamp: 1000.0,
         });
-        assert_eq!(engine.health_report().under_replicated_count, 1);
+        assert_eq!(engine.health_report(0.0).under_replicated_count, 1);
         engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
-        assert_eq!(engine.health_report().under_replicated_count, 0);
+        assert_eq!(engine.health_report(0.0).under_replicated_count, 0);
     }
 
     #[test]
@@ -911,7 +923,7 @@ mod tests {
         }];
         engine.reconcile(&snapshot);
         assert_eq!(engine.record_count(), 1);
-        assert_eq!(engine.health_report().total_bytes, 256);
+        assert_eq!(engine.health_report(0.0).total_bytes, 256);
     }
 
     #[test]
@@ -970,6 +982,50 @@ mod tests {
         assert!(
             has_stale_alert,
             "expected StaleReconciliation alert, got: {actions:?}"
+        );
+    }
+
+    // ── Review feedback fixes ──
+
+    #[test]
+    fn default_engine_allows_ingest() {
+        // Default engine has capacity=0, which means "unlimited"
+        let engine = JainEngine::default();
+        let candidate = IngestCandidate {
+            cid: make_cid(b"default-ingest"),
+            size_bytes: 1_000_000,
+            content_type: ContentCategory::Video,
+            origin: ContentOrigin::Downloaded,
+            sensitivity: Sensitivity::Public,
+        };
+        assert_eq!(
+            engine.evaluate_ingest(&candidate),
+            IngestDecision::IndexAndStore,
+        );
+    }
+
+    #[test]
+    fn health_report_counts_stale_records() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"stale-for-report");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 100,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::CachedInTransit,
+            sensitivity: Sensitivity::Public,
+            timestamp: 0.0,
+        });
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
+
+        // At t=0, content is fresh
+        assert_eq!(engine.health_report(0.0).stale_count, 0);
+
+        // Far in the future, content is stale
+        let far_future = 10.0 * engine.config.access_decay_half_life_secs;
+        assert!(
+            engine.health_report(far_future).stale_count > 0,
+            "stale_count should be > 0 for old content"
         );
     }
 }
