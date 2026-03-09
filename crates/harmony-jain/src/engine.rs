@@ -6,7 +6,7 @@ use harmony_content::ContentId;
 
 use crate::actions::*;
 use crate::config::{FilterRuleSet, JainConfig};
-use crate::types::{ContentRecord, Sensitivity};
+use crate::types::{ContentRecord, Sensitivity, SocialContext};
 
 /// Sans-I/O content lifecycle engine.
 ///
@@ -17,7 +17,6 @@ use crate::types::{ContentRecord, Sensitivity};
 pub struct JainEngine {
     records: HashMap<ContentId, ContentRecord>,
     pub(crate) config: JainConfig,
-    #[allow(dead_code)]
     filter_rules: FilterRuleSet,
     total_storage_bytes: u64,
     storage_capacity_bytes: u64,
@@ -180,6 +179,42 @@ impl JainEngine {
 
         // 4. Normal content
         IngestDecision::IndexAndStore
+    }
+
+    /// Evaluate whether content should be shared in a given social context.
+    ///
+    /// Iterates all filter rules and returns the most restrictive matching
+    /// decision: Block > Confirm > Allow.
+    pub fn filter_result(&self, cid: &ContentId, context: SocialContext) -> FilterDecision {
+        // Disabled filter → allow everything
+        if !self.filter_rules.enabled {
+            return FilterDecision::Allow;
+        }
+
+        // Unknown CID → allow (safe default)
+        let record = match self.records.get(cid) {
+            Some(r) => r,
+            None => return FilterDecision::Allow,
+        };
+
+        // Evaluate all rules and return the most restrictive decision.
+        // Block > Confirm > Allow.
+        let mut decision = FilterDecision::Allow;
+
+        for rule in &self.filter_rules.rules {
+            if record.sensitivity >= rule.min_sensitivity {
+                if context > rule.max_context {
+                    // Context is wider than allowed → Block
+                    return FilterDecision::Block;
+                }
+                if context == rule.max_context && rule.require_confirmation {
+                    // At the boundary with confirmation required → Confirm (upgradeable to Block)
+                    decision = FilterDecision::Confirm;
+                }
+            }
+        }
+
+        decision
     }
 }
 
@@ -426,5 +461,151 @@ mod tests {
             sensitivity: Sensitivity::Confidential,
         };
         assert_eq!(engine.evaluate_ingest(&candidate), IngestDecision::StoreOnly);
+    }
+
+    // ── Task 10: filter_result ──
+
+    #[test]
+    fn filter_allows_public_content_in_any_context() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"public-content");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 10,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::Downloaded,
+            sensitivity: Sensitivity::Public,
+            timestamp: 1000.0,
+        });
+        assert_eq!(
+            engine.filter_result(&cid, SocialContext::Professional),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn filter_blocks_intimate_in_professional() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"intimate-content");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 10,
+            content_type: ContentCategory::Image,
+            origin: ContentOrigin::SelfCreated,
+            sensitivity: Sensitivity::Intimate,
+            timestamp: 1000.0,
+        });
+        assert_eq!(
+            engine.filter_result(&cid, SocialContext::Professional),
+            FilterDecision::Block
+        );
+    }
+
+    #[test]
+    fn filter_blocks_intimate_in_social() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"intimate-social");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 10,
+            content_type: ContentCategory::Image,
+            origin: ContentOrigin::SelfCreated,
+            sensitivity: Sensitivity::Intimate,
+            timestamp: 1000.0,
+        });
+        assert_eq!(
+            engine.filter_result(&cid, SocialContext::Social),
+            FilterDecision::Block
+        );
+    }
+
+    #[test]
+    fn filter_confirms_intimate_at_companion() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"intimate-companion");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 10,
+            content_type: ContentCategory::Image,
+            origin: ContentOrigin::SelfCreated,
+            sensitivity: Sensitivity::Intimate,
+            timestamp: 1000.0,
+        });
+        assert_eq!(
+            engine.filter_result(&cid, SocialContext::Companion),
+            FilterDecision::Confirm
+        );
+    }
+
+    #[test]
+    fn filter_allows_intimate_in_private() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"intimate-private");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 10,
+            content_type: ContentCategory::Image,
+            origin: ContentOrigin::SelfCreated,
+            sensitivity: Sensitivity::Intimate,
+            timestamp: 1000.0,
+        });
+        assert_eq!(
+            engine.filter_result(&cid, SocialContext::Private),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn filter_blocks_confidential_outside_private() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"confidential-content");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 10,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::SelfCreated,
+            sensitivity: Sensitivity::Confidential,
+            timestamp: 1000.0,
+        });
+        assert_eq!(
+            engine.filter_result(&cid, SocialContext::Companion),
+            FilterDecision::Block
+        );
+        assert_eq!(
+            engine.filter_result(&cid, SocialContext::Private),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn filter_allows_everything_when_disabled() {
+        let rules = FilterRuleSet {
+            enabled: false,
+            ..FilterRuleSet::default()
+        };
+        let mut engine = JainEngine::new(JainConfig::default(), rules, 10_000);
+        let cid = make_cid(b"intimate-disabled");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 10,
+            content_type: ContentCategory::Image,
+            origin: ContentOrigin::SelfCreated,
+            sensitivity: Sensitivity::Intimate,
+            timestamp: 1000.0,
+        });
+        assert_eq!(
+            engine.filter_result(&cid, SocialContext::Professional),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn filter_allows_unknown_cid() {
+        let engine = default_engine();
+        let cid = make_cid(b"unknown-content");
+        assert_eq!(
+            engine.filter_result(&cid, SocialContext::Professional),
+            FilterDecision::Allow
+        );
     }
 }
