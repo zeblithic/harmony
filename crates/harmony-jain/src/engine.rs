@@ -129,12 +129,12 @@ impl JainEngine {
                     licensed: false,
                 };
                 self.records.insert(cid, record);
-                self.total_storage_bytes += size_bytes;
+                self.total_storage_bytes = self.total_storage_bytes.saturating_add(size_bytes);
                 Vec::new()
             }
             ContentEvent::Accessed { cid, timestamp } => {
                 if let Some(record) = self.records.get_mut(&cid) {
-                    record.last_accessed = timestamp;
+                    record.last_accessed = record.last_accessed.max(timestamp);
                     record.access_count += 1;
                 }
                 Vec::new()
@@ -190,7 +190,8 @@ impl JainEngine {
 
         // 2. Storage budget check (capacity of 0 means unlimited)
         if self.storage_capacity_bytes > 0
-            && self.total_storage_bytes + candidate.size_bytes > self.storage_capacity_bytes
+            && self.total_storage_bytes.saturating_add(candidate.size_bytes)
+                > self.storage_capacity_bytes
         {
             return IngestDecision::Reject {
                 reason: RejectReason::StorageBudgetExceeded,
@@ -348,7 +349,7 @@ impl JainEngine {
                     pinned: false,
                     licensed: false,
                 };
-                self.total_storage_bytes += entry.size_bytes;
+                self.total_storage_bytes = self.total_storage_bytes.saturating_add(entry.size_bytes);
                 self.records.insert(entry.cid, record);
             }
         }
