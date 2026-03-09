@@ -82,9 +82,8 @@ impl LicenseManifest {
     /// Sets `self.signature` to the Ed25519 signature over
     /// [`Self::signable_bytes`].
     pub fn sign(&mut self, artist: &PrivateIdentity) {
-        self.signature = [0u8; 64];
         let signable = self
-            .to_bytes()
+            .signable_bytes()
             .expect("signable serialization should not fail");
         self.signature = artist.sign(&signable);
     }

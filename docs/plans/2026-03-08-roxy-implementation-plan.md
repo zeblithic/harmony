@@ -1,7 +1,5 @@
 # Roxy Content Licensing Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Implement the `harmony-roxy` library crate — sans-I/O content licensing primitives including license manifests, per-consumer key wrapping, cache lifecycle management, and Zenoh catalog discovery patterns.
 
 **Architecture:** A new workspace member crate (`crates/harmony-roxy/`) following the established harmony pattern: `no_std` by default with `std` feature, postcard for binary serialization, inline `#[cfg(test)] mod tests`, and `thiserror` for error types. Key wrapping uses the existing `Identity::encrypt()` / `PrivateIdentity::decrypt()` ECDH APIs from harmony-identity (Fernet-based internally; a ChaCha20-native path can be added to harmony-identity later).

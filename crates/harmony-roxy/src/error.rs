@@ -21,7 +21,4 @@ pub enum RoxyError {
 
     #[error("malformed UCAN resource bytes")]
     InvalidResource,
-
-    #[error("license has expired")]
-    LicenseExpired,
 }

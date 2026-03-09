@@ -145,15 +145,27 @@ impl CacheManager {
                 CacheState::Active => {
                     let remaining = (not_after - now).max(0.0);
                     if remaining <= entry.expiry_notice_secs as f64 {
-                        entry.state = CacheState::Expiring;
-                        actions.push(CacheAction::NotifyExpiring {
-                            manifest_cid: *manifest_cid,
-                            seconds_remaining: remaining as u32,
-                        });
-                        if entry.auto_renew {
-                            actions.push(CacheAction::RequestRenewal {
+                        if now >= not_after {
+                            // Already past deadline (e.g., node was offline) —
+                            // skip the Expiring state and evict immediately.
+                            actions.push(CacheAction::WipeKey {
                                 manifest_cid: *manifest_cid,
                             });
+                            actions.push(CacheAction::EvictContent {
+                                content_cid: entry.content_cid,
+                            });
+                            to_remove.push(*manifest_cid);
+                        } else {
+                            entry.state = CacheState::Expiring;
+                            actions.push(CacheAction::NotifyExpiring {
+                                manifest_cid: *manifest_cid,
+                                seconds_remaining: remaining as u32,
+                            });
+                            if entry.auto_renew {
+                                actions.push(CacheAction::RequestRenewal {
+                                    manifest_cid: *manifest_cid,
+                                });
+                            }
                         }
                     }
                 }
@@ -313,6 +325,31 @@ mod tests {
         let actions = mgr.tick(999_999_999.0);
         assert!(actions.is_empty());
         assert_eq!(mgr.entry_count(), 1);
+    }
+
+    #[test]
+    fn active_entry_past_deadline_evicts_immediately() {
+        let mut mgr = CacheManager::new();
+        let manifest_cid = make_cid(b"manifest");
+        let content_cid = make_cid(b"content");
+
+        mgr.add_entry(CacheEntry {
+            manifest_cid,
+            content_cid,
+            wrapped_key: alloc::vec![1, 2, 3],
+            ucan_not_after: Some(100.0),
+            expiry_notice_secs: 10,
+            state: CacheState::Active,
+            auto_renew: false,
+        });
+
+        // Node was offline and comes back at t=200, well past not_after=100.
+        // Should evict in a single tick, not require two ticks.
+        let actions = mgr.tick(200.0);
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(&actions[0], CacheAction::WipeKey { .. }));
+        assert!(matches!(&actions[1], CacheAction::EvictContent { .. }));
+        assert_eq!(mgr.entry_count(), 0);
     }
 
     #[test]
