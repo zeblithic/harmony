@@ -194,7 +194,15 @@ impl KitriEngine {
     fn handle_submit(&mut self, program: KitriProgram, input: Vec<u8>) -> Vec<KitriAction> {
         let wf_id = kitri_workflow_id(&program.cid, &input);
 
-        if self.workflows.contains_key(&wf_id) {
+        if let Some(existing) = self.workflows.get_mut(&wf_id) {
+            if existing.status == KitriWorkflowStatus::Failed {
+                // Allow retry of failed workflows. Keep the event log so replay
+                // can skip I/O operations that already completed, preventing
+                // duplicate side effects.
+                existing.status = KitriWorkflowStatus::Pending;
+                existing.pending_error = None;
+                return vec![KitriAction::WorkflowAccepted { workflow_id: wf_id }];
+            }
             return vec![KitriAction::Deduplicated { workflow_id: wf_id }];
         }
 
@@ -287,10 +295,12 @@ impl KitriEngine {
             return vec![];
         };
 
-        // Only accept completion from active states.
+        // Only accept completion from active states (including Pending for zero-I/O workflows).
         if !matches!(
             state.status,
-            KitriWorkflowStatus::Executing | KitriWorkflowStatus::WaitingForIo
+            KitriWorkflowStatus::Pending
+                | KitriWorkflowStatus::Executing
+                | KitriWorkflowStatus::WaitingForIo
         ) {
             return vec![];
         }
@@ -348,6 +358,7 @@ impl KitriEngine {
         if actions.is_empty() {
             // No compensators — fail immediately.
             state.status = KitriWorkflowStatus::Failed;
+            actions.push(KitriAction::PersistEventLog { workflow_id });
             actions.push(KitriAction::Failed { workflow_id, error });
         } else {
             // Compensators need to run first. Defer Failed until
@@ -370,7 +381,10 @@ impl KitriEngine {
 
         state.status = KitriWorkflowStatus::Failed;
         let error = state.pending_error.take().unwrap_or_default();
-        vec![KitriAction::Failed { workflow_id, error }]
+        vec![
+            KitriAction::PersistEventLog { workflow_id },
+            KitriAction::Failed { workflow_id, error },
+        ]
     }
 
     fn handle_checkpoint(
@@ -978,6 +992,140 @@ mod tests {
             },
         });
         assert!(actions.is_empty());
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Complete));
+    }
+
+    #[test]
+    fn engine_zero_io_workflow_can_complete() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Pending));
+
+        // A zero-I/O workflow completes directly from Pending.
+        let actions = engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![42],
+        });
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::Complete { .. })));
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Complete));
+    }
+
+    #[test]
+    fn engine_failed_emits_persist_event_log() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+
+        let actions = engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "boom".into(),
+        });
+
+        // PersistEventLog must appear before Failed for crash safety.
+        let persist_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::PersistEventLog { .. }));
+        let failed_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::Failed { .. }));
+        assert!(persist_pos.is_some());
+        assert!(failed_pos.is_some());
+        assert!(persist_pos.unwrap() < failed_pos.unwrap());
+    }
+
+    #[test]
+    fn engine_compensation_complete_emits_persist_event_log() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit { program, input });
+        engine.handle(KitriEngineEvent::CompensatorRegistered {
+            workflow_id: wf_id,
+            step_id: 0,
+            rollback_op: KitriIoOp::Query {
+                topic: "undo".into(),
+                payload: vec![],
+            },
+        });
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "boom".into(),
+        });
+
+        let actions = engine.handle(KitriEngineEvent::CompensationComplete { workflow_id: wf_id });
+
+        // PersistEventLog must appear before Failed for crash safety.
+        let persist_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::PersistEventLog { .. }));
+        let failed_pos = actions
+            .iter()
+            .position(|a| matches!(a, KitriAction::Failed { .. }));
+        assert!(persist_pos.is_some());
+        assert!(failed_pos.is_some());
+        assert!(persist_pos.unwrap() < failed_pos.unwrap());
+    }
+
+    #[test]
+    fn engine_failed_workflow_can_be_resubmitted() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        engine.handle(KitriEngineEvent::WorkflowFailed {
+            workflow_id: wf_id,
+            error: "transient".into(),
+        });
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Failed));
+
+        // Re-submit the same (program, input) — should be accepted, not deduplicated.
+        let actions = engine.handle(KitriEngineEvent::Submit { program, input });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::WorkflowAccepted { .. })));
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Pending));
+    }
+
+    #[test]
+    fn engine_complete_workflow_stays_deduplicated() {
+        let mut engine = KitriEngine::new();
+        let program = test_program();
+        let input = vec![1, 2, 3];
+        let wf_id = kitri_workflow_id(&program.cid, &input);
+
+        engine.handle(KitriEngineEvent::Submit {
+            program: program.clone(),
+            input: input.clone(),
+        });
+        // Complete directly (zero-I/O).
+        engine.handle(KitriEngineEvent::WorkflowComplete {
+            workflow_id: wf_id,
+            output: vec![99],
+        });
+        assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Complete));
+
+        // Re-submit should be deduplicated — completed workflows are final.
+        let actions = engine.handle(KitriEngineEvent::Submit { program, input });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, KitriAction::Deduplicated { .. })));
         assert_eq!(engine.status(&wf_id), Some(KitriWorkflowStatus::Complete));
     }
 }
