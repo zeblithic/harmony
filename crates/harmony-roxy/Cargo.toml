@@ -1,0 +1,33 @@
+[package]
+name = "harmony-roxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Self-sovereign content licensing primitives for the Harmony decentralized stack"
+
+[features]
+default = ["std"]
+std = [
+    "harmony-crypto/std",
+    "harmony-identity/std",
+    "harmony-content/std",
+    "thiserror/std",
+]
+
+[dependencies]
+harmony-crypto.workspace = true
+harmony-identity.workspace = true
+harmony-content = { workspace = true, default-features = false }
+thiserror.workspace = true
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+postcard = { workspace = true }
+bitflags = { workspace = true }
+hashbrown = { workspace = true }
+hex = { workspace = true }
+rand_core = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

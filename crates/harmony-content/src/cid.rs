@@ -1,5 +1,6 @@
 use crate::error::ContentError;
 use alloc::{format, string::String};
+use serde::{Deserialize, Serialize};
 
 /// Length of the truncated SHA-256 content hash in bytes.
 pub const CONTENT_HASH_LEN: usize = 28;
@@ -269,6 +270,19 @@ impl ContentId {
         let mut size_and_tag = [0u8; 4];
         size_and_tag.copy_from_slice(&bytes[CONTENT_HASH_LEN..]);
         ContentId { hash, size_and_tag }
+    }
+}
+
+impl Serialize for ContentId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_bytes().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes: [u8; 32] = Deserialize::deserialize(deserializer)?;
+        Ok(ContentId::from_bytes(bytes))
     }
 }
 

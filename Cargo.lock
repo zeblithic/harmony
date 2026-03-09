@@ -906,6 +906,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-roxy"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "harmony-content",
+ "harmony-crypto",
+ "harmony-identity",
+ "hashbrown 0.15.5",
+ "hex",
+ "postcard",
+ "rand",
+ "rand_core",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harmony-workflow"
 version = "0.1.0"
 dependencies = [
