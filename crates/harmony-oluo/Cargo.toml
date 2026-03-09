@@ -1,0 +1,22 @@
+[package]
+name = "harmony-oluo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Oluo — Harmony's semantic search engine (adaptive-depth trie, sans-I/O)"
+
+[features]
+default = ["std"]
+std = [
+    "harmony-semantic/std",
+    "harmony-crypto/std",
+]
+
+[dependencies]
+harmony-semantic = { workspace = true, default-features = false }
+harmony-crypto = { workspace = true, default-features = false }
+hashbrown = { workspace = true }
+
+[dev-dependencies]
