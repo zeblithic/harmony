@@ -147,7 +147,11 @@ pub enum JainAction {
         /// Hint about what to look for.
         query_hint: QueryHint,
     },
-    /// Content needs more replicas.
+    /// Content needs more network replicas.
+    ///
+    /// Emitted by [`tick`](super::JainEngine::tick) when `replica_count`
+    /// drops below the configured minimum. Consumers may skip this action
+    /// when `current_replicas >= desired`.
     RepairNeeded {
         /// Content identifier.
         cid: ContentId,
@@ -155,6 +159,15 @@ pub enum JainAction {
         current_replicas: u8,
         /// Desired number of replicas.
         desired: u8,
+    },
+    /// Local backing data is missing and needs to be fetched from the network.
+    ///
+    /// Emitted by [`reconcile`](super::JainEngine::reconcile) when a tracked
+    /// record's backing file is absent on disk. Unlike `RepairNeeded`, this
+    /// signals a local storage gap regardless of network replica count.
+    FetchLocalCopy {
+        /// Content identifier whose local copy is missing.
+        cid: ContentId,
     },
     /// A health alert for the node operator.
     HealthAlert {

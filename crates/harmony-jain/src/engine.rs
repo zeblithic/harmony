@@ -116,10 +116,11 @@ impl JainEngine {
                 sensitivity,
                 timestamp,
             } => {
-                // Same-CID re-arrival: ignore silently. Cross-CID dedup
-                // (different CIDs for semantically equivalent content) is
-                // handled by Oluo via QueryOluo actions, not here.
-                if self.records.contains_key(&cid) {
+                // Same-CID re-arrival: clear pending_local_repair if set
+                // (local copy restored after reconcile detected it missing).
+                // Otherwise ignore — cross-CID dedup is handled by Oluo.
+                if let Some(existing) = self.records.get_mut(&cid) {
+                    existing.pending_local_repair = false;
                     return Vec::new();
                 }
                 let record = ContentRecord {
@@ -134,6 +135,7 @@ impl JainEngine {
                     replica_count: 1,
                     pinned: false,
                     licensed: false,
+                    pending_local_repair: false,
                 };
                 self.records.insert(cid, record);
                 self.total_storage_bytes = self.total_storage_bytes.saturating_add(size_bytes);
@@ -343,13 +345,12 @@ impl JainEngine {
             }
 
             if !entry.exists_on_disk {
-                // Case 2: tracked CID whose backing data is missing
-                if let Some(record) = self.records.get(&entry.cid) {
-                    actions.push(JainAction::RepairNeeded {
-                        cid: entry.cid,
-                        current_replicas: record.replica_count,
-                        desired: self.config.min_replica_count,
-                    });
+                // Case 2: tracked CID whose backing data is missing.
+                // Mark as pending repair so tick() won't recommend burn/archive
+                // while the fetch is in progress.
+                if let Some(record) = self.records.get_mut(&entry.cid) {
+                    record.pending_local_repair = true;
+                    actions.push(JainAction::FetchLocalCopy { cid: entry.cid });
                 }
             } else if !self.records.contains_key(&entry.cid) {
                 // Case 1: on disk but not tracked → add default record.
@@ -369,6 +370,7 @@ impl JainEngine {
                     replica_count: 1,
                     pinned: false,
                     licensed: false,
+                    pending_local_repair: false,
                 };
                 self.total_storage_bytes = self.total_storage_bytes.saturating_add(entry.size_bytes);
                 self.records.insert(entry.cid, record);
@@ -1004,18 +1006,17 @@ mod tests {
             exists_on_disk: false,
         }];
         let actions = engine.reconcile(&snapshot, 1000.0);
-        let repair = actions.iter().find_map(|a| match a {
-            JainAction::RepairNeeded {
-                current_replicas,
-                desired,
-                ..
-            } => Some((*current_replicas, *desired)),
-            _ => None,
-        });
-        assert_eq!(
-            repair,
-            Some((3, engine.config.min_replica_count)),
-            "RepairNeeded should report actual replica count, got: {actions:?}"
+        let fetch = actions
+            .iter()
+            .any(|a| matches!(a, JainAction::FetchLocalCopy { .. }));
+        assert!(
+            fetch,
+            "reconcile should emit FetchLocalCopy for missing backing data, got: {actions:?}"
+        );
+        // Record should be marked as pending repair (protected from burn).
+        assert!(
+            engine.records.get(&cid).unwrap().pending_local_repair,
+            "record should be marked pending_local_repair"
         );
     }
 
@@ -1120,6 +1121,55 @@ mod tests {
     }
 
     #[test]
+    fn pending_local_repair_prevents_burn() {
+        let mut engine = default_engine();
+        let cid = make_cid(b"repair-pending");
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 100,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::CachedInTransit,
+            sensitivity: Sensitivity::Public,
+            timestamp: 0.0,
+        });
+        engine.handle_event(ContentEvent::ReplicaChanged { cid, new_count: 3 });
+
+        // Reconcile detects missing local copy.
+        let snapshot = alloc::vec![SnapshotEntry {
+            cid,
+            size_bytes: 100,
+            exists_on_disk: false,
+        }];
+        engine.reconcile(&snapshot, 0.0);
+
+        // Far future tick — content is old, but should NOT be recommended for
+        // burn because it's pending local repair.
+        let far_future = 10.0 * engine.config.access_decay_half_life_secs;
+        let actions = engine.tick(far_future);
+        let has_burn = actions
+            .iter()
+            .any(|a| matches!(a, JainAction::RecommendBurn { .. }));
+        assert!(
+            !has_burn,
+            "content pending local repair must not get RecommendBurn, got: {actions:?}"
+        );
+
+        // Re-store clears the flag — now burn is possible.
+        engine.handle_event(ContentEvent::Stored {
+            cid,
+            size_bytes: 100,
+            content_type: ContentCategory::Text,
+            origin: ContentOrigin::CachedInTransit,
+            sensitivity: Sensitivity::Public,
+            timestamp: 0.0,
+        });
+        assert!(
+            !engine.records.get(&cid).unwrap().pending_local_repair,
+            "re-store should clear pending_local_repair"
+        );
+    }
+
+    #[test]
     fn new_rejects_invalid_config() {
         let config = JainConfig {
             access_decay_half_life_secs: 0.0,
@@ -1155,13 +1205,13 @@ mod tests {
             },
         ];
         let actions = engine.reconcile(&snapshot, 1000.0);
-        let repair_count = actions
+        let fetch_count = actions
             .iter()
-            .filter(|a| matches!(a, JainAction::RepairNeeded { .. }))
+            .filter(|a| matches!(a, JainAction::FetchLocalCopy { .. }))
             .count();
         assert_eq!(
-            repair_count, 1,
-            "duplicate snapshot entries should produce exactly one RepairNeeded, got {repair_count}"
+            fetch_count, 1,
+            "duplicate snapshot entries should produce exactly one FetchLocalCopy, got {fetch_count}"
         );
     }
 

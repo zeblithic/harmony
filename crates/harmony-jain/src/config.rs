@@ -112,6 +112,16 @@ pub struct FilterRule {
 }
 
 /// A set of filter rules that govern content sharing decisions.
+///
+/// # Rule ordering and sensitivity coverage
+///
+/// Rules use `>= min_sensitivity` matching: a rule targeting
+/// [`Sensitivity::Private`] also applies to `Confidential` and `Intimate`
+/// content. This means a permissive rule for low-sensitivity content
+/// inadvertently governs higher-sensitivity content when no stricter rule
+/// is present. To prevent leakage, ensure every sensitivity level that
+/// needs protection has its own rule, ordered most-to-least restrictive
+/// in the `rules` vec (the engine returns the most restrictive match).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterRuleSet {
     /// The individual rules in this set.

@@ -18,7 +18,11 @@ use crate::types::{ContentOrigin, ContentRecord, StalenessScore};
 /// content receives a configurable bonus that reduces its effective staleness.
 pub fn staleness_score(record: &ContentRecord, config: &JainConfig, now: f64) -> StalenessScore {
     // Hard overrides → FRESH (0.0)
-    if record.pinned || record.licensed || record.replica_count < config.min_replica_count {
+    if record.pinned
+        || record.licensed
+        || record.replica_count < config.min_replica_count
+        || record.pending_local_repair
+    {
         return StalenessScore::FRESH;
     }
 
@@ -97,6 +101,7 @@ mod tests {
             replica_count: 3,
             pinned: false,
             licensed: false,
+            pending_local_repair: false,
         }
     }
 

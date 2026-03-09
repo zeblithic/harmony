@@ -71,6 +71,13 @@ pub struct ContentRecord {
     pub pinned: bool,
     /// Whether the content has an active license.
     pub licensed: bool,
+    /// Whether the local backing data is missing and a fetch is in progress.
+    ///
+    /// Set by [`reconcile`](super::JainEngine::reconcile) when backing data
+    /// is absent. While true, `staleness_score` returns FRESH to prevent
+    /// burn/archive recommendations. Cleared when new content is stored for
+    /// this CID.
+    pub pending_local_repair: bool,
 }
 
 /// A staleness score clamped to the unit interval [0.0, 1.0].
@@ -201,6 +208,7 @@ mod tests {
             replica_count: 3,
             pinned: false,
             licensed: true,
+            pending_local_repair: false,
         };
         assert_eq!(record.cid, cid);
         assert_eq!(record.size_bytes, 11);
