@@ -9,8 +9,8 @@
 extern crate alloc;
 
 mod addr;
+mod athenaeum;
 // TODO: re-enable after migration to PageAddr
-// mod athenaeum;
 // mod book;
 // mod encyclopedia;
 mod hash;
@@ -20,8 +20,8 @@ mod hash;
 pub use addr::{
     Algorithm, PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, NULL_PAGE, PAGES_PER_BOOK, PAGE_SIZE,
 };
+pub use athenaeum::{Book, BookError};
 // TODO: re-enable after migration to PageAddr
-// pub use athenaeum::{Athenaeum, CollisionError, MissingChunkError, MAX_BLOB_SIZE};
 // pub use book::{Book, BookEntry, BookError};
 // pub use encyclopedia::{Encyclopedia, SPLIT_THRESHOLD};
 pub use hash::{sha224_hash, sha256_hash};
