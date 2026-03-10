@@ -9,6 +9,10 @@
 //! | `harmony/presence/{server_id}/{user_id}` | Online presence |
 //! | `geo/s2/{l4}/{l8}/{l12}/{l16}/{rns_hash}` | Geospatial routing |
 //! | `lookup/rns/{node_hash}` | Distributed node lookup |
+//! | `harmony/book/{cid_hex}/page/{page_addr_hex}` | Content-addressed page access |
+//! | `harmony/book/{cid_hex}/pos/{index}` | Positional page access (0-255) |
+//! | `harmony/book/{cid_hex}/toc` | Table of Contents |
+//! | `harmony/book/{cid_hex}/meta` | Book metadata |
 //!
 //! Each pattern is exposed both as a [`KeFormat`] for building/parsing key
 //! expressions and as convenience builder functions.
@@ -38,6 +42,12 @@ const GEO_S2_FMT: &str = "geo/s2/${l4:*}/${l8:*}/${l12:*}/${l16:*}/${rns_hash:*}
 
 /// Node lookup: `lookup/rns/{node_hash}`
 const NODE_LOOKUP_FMT: &str = "lookup/rns/${node_hash:*}";
+
+/// Book page (content-addressed): `harmony/book/{cid_hex}/page/{page_addr_hex}`
+const BOOK_PAGE_FMT: &str = "harmony/book/${cid_hex:*}/page/${page_addr_hex:*}";
+
+/// Book position (positional access): `harmony/book/{cid_hex}/pos/{index}`
+const BOOK_POS_FMT: &str = "harmony/book/${cid_hex:*}/pos/${index:*}";
 
 // ── Wildcard subscription patterns ───────────────────────────────────
 
@@ -235,6 +245,65 @@ pub fn vine_compilation_key(
     ))
 }
 
+// ── Book/page key expressions ─────────────────────────────────────────
+
+/// Build a book page key expression (content-addressed access).
+///
+/// Pattern: `harmony/book/{cid_hex}/page/{page_addr_hex}`
+pub fn book_page_key(cid_hex: &str, page_addr_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(cid_hex)?;
+    reject_slashes(page_addr_hex)?;
+    ke(&format!("harmony/book/{cid_hex}/page/{page_addr_hex}"))
+}
+
+/// Build a book positional key expression.
+///
+/// Pattern: `harmony/book/{cid_hex}/pos/{index}` where index is 0-255.
+pub fn book_pos_key(cid_hex: &str, index: u8) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(cid_hex)?;
+    ke(&format!("harmony/book/{cid_hex}/pos/{index}"))
+}
+
+/// Build a book table-of-contents key expression.
+///
+/// Pattern: `harmony/book/{cid_hex}/toc`
+pub fn book_toc_key(cid_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(cid_hex)?;
+    ke(&format!("harmony/book/{cid_hex}/toc"))
+}
+
+/// Build a book metadata key expression.
+///
+/// Pattern: `harmony/book/{cid_hex}/meta`
+pub fn book_meta_key(cid_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(cid_hex)?;
+    ke(&format!("harmony/book/{cid_hex}/meta"))
+}
+
+/// Subscribe to a specific page across all books ("who has this page?").
+///
+/// Pattern: `harmony/book/*/page/{page_addr_hex}`
+pub fn book_page_sub_by_addr(page_addr_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(page_addr_hex)?;
+    ke(&format!("harmony/book/*/page/{page_addr_hex}"))
+}
+
+/// Subscribe to all pages of a specific book.
+///
+/// Pattern: `harmony/book/{cid_hex}/page/*`
+pub fn book_page_sub_all(cid_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(cid_hex)?;
+    ke(&format!("harmony/book/{cid_hex}/page/*"))
+}
+
+/// Subscribe to all positional pages of a specific book ("stream book in order").
+///
+/// Pattern: `harmony/book/{cid_hex}/pos/*`
+pub fn book_pos_sub_all(cid_hex: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(cid_hex)?;
+    ke(&format!("harmony/book/{cid_hex}/pos/*"))
+}
+
 // ── Parsing helpers ──────────────────────────────────────────────────
 
 /// Parse a channel message key expression, returning (server_id, channel_id).
@@ -275,6 +344,36 @@ pub fn parse_node_lookup(ke: &keyexpr) -> Result<String, ZenohError> {
         .get("node_hash")
         .map_err(|e| ze(e.to_string()))?
         .to_string())
+}
+
+/// Parse a book page key expression, returning (cid_hex, page_addr_hex).
+pub fn parse_book_page(ke: &keyexpr) -> Result<(String, String), ZenohError> {
+    let fmt = KeFormat::new(BOOK_PAGE_FMT).map_err(|e| ze(e.to_string()))?;
+    let parsed = fmt.parse(ke).map_err(|e| ze(e.to_string()))?;
+    let cid_hex = parsed
+        .get("cid_hex")
+        .map_err(|e| ze(e.to_string()))?
+        .to_string();
+    let page_addr_hex = parsed
+        .get("page_addr_hex")
+        .map_err(|e| ze(e.to_string()))?
+        .to_string();
+    Ok((cid_hex, page_addr_hex))
+}
+
+/// Parse a book positional key expression, returning (cid_hex, index_str).
+pub fn parse_book_pos(ke: &keyexpr) -> Result<(String, String), ZenohError> {
+    let fmt = KeFormat::new(BOOK_POS_FMT).map_err(|e| ze(e.to_string()))?;
+    let parsed = fmt.parse(ke).map_err(|e| ze(e.to_string()))?;
+    let cid_hex = parsed
+        .get("cid_hex")
+        .map_err(|e| ze(e.to_string()))?
+        .to_string();
+    let index_str = parsed
+        .get("index")
+        .map_err(|e| ze(e.to_string()))?
+        .to_string();
+    Ok((cid_hex, index_str))
 }
 
 // ── Re-export the keyexpr type for consumers ─────────────────────────
@@ -599,5 +698,128 @@ mod tests {
         assert!(vine_compilation_sub("cre/ator").is_err());
         assert!(vine_compilation_key("cre/ator", "cid").is_err());
         assert!(vine_compilation_key("creator", "ci/d").is_err());
+    }
+
+    // ── Book/page builder tests ─────────────────────────────────────
+
+    #[test]
+    fn book_page_key_valid() {
+        let cid = "a".repeat(64);
+        let page = "deadbeef";
+        let k = book_page_key(&cid, page).unwrap();
+        assert_eq!(k.as_str(), format!("harmony/book/{cid}/page/{page}"));
+    }
+
+    #[test]
+    fn book_pos_key_valid() {
+        let cid = "b".repeat(64);
+        let k = book_pos_key(&cid, 42).unwrap();
+        assert_eq!(k.as_str(), format!("harmony/book/{cid}/pos/42"));
+    }
+
+    #[test]
+    fn book_toc_key_valid() {
+        let cid = "c".repeat(64);
+        let k = book_toc_key(&cid).unwrap();
+        assert_eq!(k.as_str(), format!("harmony/book/{cid}/toc"));
+    }
+
+    #[test]
+    fn book_meta_key_valid() {
+        let cid = "d".repeat(64);
+        let k = book_meta_key(&cid).unwrap();
+        assert_eq!(k.as_str(), format!("harmony/book/{cid}/meta"));
+    }
+
+    // ── Book/page wildcard subscription tests ───────────────────────
+
+    #[test]
+    fn book_page_sub_by_addr_valid() {
+        let page = "aabbccdd";
+        let sub = book_page_sub_by_addr(page).unwrap();
+        assert_eq!(sub.as_str(), format!("harmony/book/*/page/{page}"));
+
+        // Should match any book with that page address
+        let cid1 = "a".repeat(64);
+        let cid2 = "b".repeat(64);
+        let key1 = book_page_key(&cid1, page).unwrap();
+        let key2 = book_page_key(&cid2, page).unwrap();
+        assert!(sub.intersects(&key1));
+        assert!(sub.intersects(&key2));
+
+        // Should NOT match a different page address
+        let key3 = book_page_key(&cid1, "11223344").unwrap();
+        assert!(!sub.intersects(&key3));
+    }
+
+    #[test]
+    fn book_page_sub_all_valid() {
+        let cid = "e".repeat(64);
+        let sub = book_page_sub_all(&cid).unwrap();
+        assert_eq!(sub.as_str(), format!("harmony/book/{cid}/page/*"));
+
+        // Should match any page in this book
+        let key1 = book_page_key(&cid, "aabbccdd").unwrap();
+        let key2 = book_page_key(&cid, "11223344").unwrap();
+        assert!(sub.intersects(&key1));
+        assert!(sub.intersects(&key2));
+
+        // Should NOT match a different book
+        let other_cid = "f".repeat(64);
+        let key3 = book_page_key(&other_cid, "aabbccdd").unwrap();
+        assert!(!sub.intersects(&key3));
+    }
+
+    #[test]
+    fn book_pos_sub_all_valid() {
+        let cid = "a".repeat(64);
+        let sub = book_pos_sub_all(&cid).unwrap();
+        assert_eq!(sub.as_str(), format!("harmony/book/{cid}/pos/*"));
+
+        // Should match any position in this book
+        let key1 = book_pos_key(&cid, 0).unwrap();
+        let key2 = book_pos_key(&cid, 255).unwrap();
+        assert!(sub.intersects(&key1));
+        assert!(sub.intersects(&key2));
+
+        // Should NOT match a different book
+        let other_cid = "b".repeat(64);
+        let key3 = book_pos_key(&other_cid, 0).unwrap();
+        assert!(!sub.intersects(&key3));
+    }
+
+    // ── Book/page input validation tests ────────────────────────────
+
+    #[test]
+    fn book_keys_reject_slashes() {
+        assert!(book_page_key("cid/hex", "page").is_err());
+        assert!(book_page_key("cidhex", "pa/ge").is_err());
+        assert!(book_pos_key("cid/hex", 0).is_err());
+        assert!(book_toc_key("cid/hex").is_err());
+        assert!(book_meta_key("cid/hex").is_err());
+        assert!(book_page_sub_by_addr("pa/ge").is_err());
+        assert!(book_page_sub_all("cid/hex").is_err());
+        assert!(book_pos_sub_all("cid/hex").is_err());
+    }
+
+    // ── Book/page parser tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_book_page_extracts_fields() {
+        let cid = "a".repeat(64);
+        let page = "deadbeef";
+        let built = book_page_key(&cid, page).unwrap();
+        let (parsed_cid, parsed_page) = parse_book_page(&built).unwrap();
+        assert_eq!(parsed_cid, cid);
+        assert_eq!(parsed_page, page);
+    }
+
+    #[test]
+    fn parse_book_pos_extracts_fields() {
+        let cid = "b".repeat(64);
+        let built = book_pos_key(&cid, 99).unwrap();
+        let (parsed_cid, parsed_index) = parse_book_pos(&built).unwrap();
+        assert_eq!(parsed_cid, cid);
+        assert_eq!(parsed_index, "99");
     }
 }
