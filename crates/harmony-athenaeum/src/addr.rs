@@ -69,10 +69,7 @@ impl PageAddr {
     /// The 2-bit XOR-fold checksum is computed automatically.
     /// `hash_bits` must fit in 28 bits (i.e., `hash_bits <= 0x0FFF_FFFF`).
     pub fn new(hash_bits: u32, algorithm: Algorithm) -> Self {
-        debug_assert!(
-            hash_bits <= 0x0FFF_FFFF,
-            "hash_bits must fit in 28 bits"
-        );
+        debug_assert!(hash_bits <= 0x0FFF_FFFF, "hash_bits must fit in 28 bits");
         let algo = (algorithm as u32) & 0x3;
         // Pack: algo in bits 31-30, hash_bits in bits 29-2
         let upper = (algo << 30) | ((hash_bits & 0x0FFF_FFFF) << 2);
@@ -138,12 +135,7 @@ impl PageAddr {
 
 impl core::fmt::Debug for PageAddr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "PageAddr({:#010x}, {:?})",
-            self.0,
-            self.algorithm(),
-        )
+        write!(f, "PageAddr({:#010x}, {:?})", self.0, self.algorithm(),)
     }
 }
 
