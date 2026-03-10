@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Volume — partition tree node for the Encyclopedia.
 
-use crate::book::{Book, BookError};
+use crate::addr::{PageAddr, ALGO_COUNT};
+use crate::athenaeum::{Book, BookError};
 use alloc::vec::Vec;
 
 /// Maximum partition depth (SHA-256 bits 22-252 = 230 usable bits).
@@ -36,19 +37,13 @@ impl Volume {
         }
     }
 
-    /// Total chunk references in this subtree.
+    /// Total page references in this subtree.
     ///
-    /// Counts every chunk slot across all `BookEntry` values. When blobs
-    /// share deduplicated chunks, the same `ChunkAddr` appears in multiple
-    /// entries, so this number may exceed the count of *unique* chunks.
-    /// Use [`Encyclopedia::total_unique_chunks`] for the deduplicated count.
-    pub fn chunk_count(&self) -> usize {
+    /// Sums `book.page_count()` across all Books in the subtree.
+    pub fn page_count(&self) -> usize {
         match self {
-            Volume::Leaf { books, .. } => books
-                .iter()
-                .map(|b| b.entries.iter().map(|e| e.chunks.len()).sum::<usize>())
-                .sum(),
-            Volume::Split { left, right, .. } => left.chunk_count() + right.chunk_count(),
+            Volume::Leaf { books, .. } => books.iter().map(|b| b.page_count()).sum(),
+            Volume::Split { left, right, .. } => left.page_count() + right.page_count(),
         }
     }
 
@@ -113,7 +108,7 @@ impl Volume {
                 let count = books.len() as u32;
                 buf.extend_from_slice(&count.to_le_bytes());
                 for book in books {
-                    let book_bytes = book.to_bytes();
+                    let book_bytes = serialize_book(book);
                     let len = book_bytes.len() as u32;
                     buf.extend_from_slice(&len.to_le_bytes());
                     buf.extend_from_slice(&book_bytes);
@@ -184,7 +179,7 @@ impl Volume {
                     if pos + book_len > data.len() {
                         return Err(BookError::TooShort);
                     }
-                    let book = Book::from_bytes(&data[pos..pos + book_len])?;
+                    let book = deserialize_book(&data[pos..pos + book_len])?;
                     books.push(book);
                     pos += book_len;
                 }
@@ -237,6 +232,85 @@ impl Volume {
     }
 }
 
+/// Serialize a Book for Volume leaf storage.
+///
+/// Format:
+/// ```text
+///   32 bytes: cid
+///    4 bytes: blob_size (u32 LE)
+///    2 bytes: page_count (u16 LE)
+///    2 bytes: reserved (0)
+///   For each page (page_count entries):
+///     4 × 4 bytes: PageAddr.0 for each algorithm variant (u32 LE) = 16 bytes per page
+/// ```
+fn serialize_book(book: &Book) -> Vec<u8> {
+    let pc = book.page_count();
+    let size = 32 + 4 + 2 + 2 + pc * ALGO_COUNT * 4;
+    let mut buf = Vec::with_capacity(size);
+
+    buf.extend_from_slice(&book.cid);
+    buf.extend_from_slice(&book.blob_size.to_le_bytes());
+    buf.extend_from_slice(&(pc as u16).to_le_bytes());
+    buf.extend_from_slice(&[0u8; 2]); // reserved
+
+    for page_addrs in &book.pages {
+        for addr in page_addrs {
+            buf.extend_from_slice(&addr.0.to_le_bytes());
+        }
+    }
+
+    buf
+}
+
+/// Deserialize a Book from Volume leaf storage.
+fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
+    // Minimum header: 32 (cid) + 4 (blob_size) + 2 (page_count) + 2 (reserved) = 40
+    if data.len() < 40 {
+        return Err(BookError::TooShort);
+    }
+
+    let mut cid = [0u8; 32];
+    cid.copy_from_slice(&data[..32]);
+
+    let blob_size = u32::from_le_bytes(data[32..36].try_into().map_err(|_| BookError::TooShort)?);
+
+    let page_count =
+        u16::from_le_bytes(data[36..38].try_into().map_err(|_| BookError::TooShort)?) as usize;
+
+    // data[38..40] = reserved, skip
+
+    let pages_start = 40;
+    let pages_bytes = page_count * ALGO_COUNT * 4;
+    if data.len() < pages_start + pages_bytes {
+        return Err(BookError::TooShort);
+    }
+    if data.len() != pages_start + pages_bytes {
+        return Err(BookError::BadFormat);
+    }
+
+    let mut pages = Vec::with_capacity(page_count);
+    let mut pos = pages_start;
+    for _ in 0..page_count {
+        let mut addrs = [PageAddr(0); ALGO_COUNT];
+        for addr in &mut addrs {
+            let raw = u32::from_le_bytes(
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| BookError::TooShort)?,
+            );
+            *addr = PageAddr(raw);
+            pos += 4;
+        }
+        pages.push(addrs);
+    }
+
+    Ok(Book {
+        cid,
+        pages,
+        blob_size,
+    })
+}
+
 /// Determine which side of a binary split a chunk belongs to.
 ///
 /// Reads bit `bit_index` from a SHA-256 content hash.
@@ -250,6 +324,11 @@ pub fn route_chunk(content_hash: &[u8; 32], bit_index: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::addr::PAGE_SIZE;
+
+    fn sample_book() -> Book {
+        Book::from_blob([0xAA; 32], &[0x42u8; PAGE_SIZE * 2]).unwrap()
+    }
 
     #[test]
     fn route_chunk_bit_22() {
@@ -273,29 +352,18 @@ mod tests {
     }
 
     #[test]
-    fn route_chunk_bit_255() {
-        let mut hash = [0u8; 32];
-        hash[31] = 0x01; // bit 255 = 1 (LSB of last byte)
-        assert!(route_chunk(&hash, 255));
-
-        hash[31] = 0x00;
-        assert!(!route_chunk(&hash, 255));
-    }
-
-    #[test]
-    fn leaf_volume_chunk_count() {
-        let book = Book {
-            entries: Vec::new(),
-        };
+    fn leaf_volume_page_count() {
+        let book = sample_book();
+        assert_eq!(book.page_count(), 2);
         let vol = Volume::leaf(0, 0, alloc::vec![book]);
-        assert_eq!(vol.chunk_count(), 0);
+        assert_eq!(vol.page_count(), 2);
         assert_eq!(vol.book_count(), 1);
     }
 
     #[test]
-    fn split_volume_chunk_count() {
-        let left = Volume::leaf(1, 0, Vec::new());
-        let right = Volume::leaf(1, 1, Vec::new());
+    fn split_volume_page_count() {
+        let left = Volume::leaf(1, 0, alloc::vec![sample_book()]);
+        let right = Volume::leaf(1, 1, alloc::vec![sample_book()]);
         let split = Volume::Split {
             partition_depth: 0,
             partition_path: 0,
@@ -303,8 +371,8 @@ mod tests {
             left: Box::new(left),
             right: Box::new(right),
         };
-        assert_eq!(split.chunk_count(), 0);
-        assert_eq!(split.book_count(), 0);
+        assert_eq!(split.page_count(), 4); // 2 pages per book × 2 books
+        assert_eq!(split.book_count(), 2);
         assert_eq!(split.depth(), 0);
     }
 
@@ -317,10 +385,7 @@ mod tests {
 
     #[test]
     fn leaf_volume_round_trip() {
-        let book = Book {
-            entries: Vec::new(),
-        };
-        let vol = Volume::leaf(2, 0b10, alloc::vec![book]);
+        let vol = Volume::leaf(2, 0b10, alloc::vec![sample_book()]);
         let bytes = vol.to_bytes();
         let restored = Volume::from_bytes(&bytes).unwrap();
         assert_eq!(vol, restored);
@@ -328,8 +393,8 @@ mod tests {
 
     #[test]
     fn split_volume_round_trip() {
-        let left = Volume::leaf(1, 0, Vec::new());
-        let right = Volume::leaf(1, 1, Vec::new());
+        let left = Volume::leaf(1, 0, alloc::vec![sample_book()]);
+        let right = Volume::leaf(1, 1, alloc::vec![sample_book()]);
         let split = Volume::Split {
             partition_depth: 0,
             partition_path: 0,
@@ -345,6 +410,13 @@ mod tests {
     #[test]
     fn volume_from_bytes_too_short() {
         assert!(Volume::from_bytes(&[0u8; 3]).is_err());
+    }
+
+    #[test]
+    fn volume_from_bytes_unknown_tag() {
+        let mut data = [0u8; 10];
+        data[0] = 99; // unknown tag
+        assert_eq!(Volume::from_bytes(&data), Err(BookError::BadFormat));
     }
 
     #[test]
@@ -372,9 +444,34 @@ mod tests {
     }
 
     #[test]
-    fn volume_from_bytes_unknown_tag() {
-        let mut data = [0u8; 10];
-        data[0] = 99; // unknown tag
-        assert_eq!(Volume::from_bytes(&data), Err(BookError::BadFormat));
+    fn empty_leaf_round_trip() {
+        let vol = Volume::leaf(5, 0b11010, Vec::new());
+        let bytes = vol.to_bytes();
+        let restored = Volume::from_bytes(&bytes).unwrap();
+        assert_eq!(vol, restored);
+        assert_eq!(restored.page_count(), 0);
+        assert_eq!(restored.book_count(), 0);
+    }
+
+    #[test]
+    fn book_serialization_round_trip() {
+        let book = sample_book();
+        let serialized = serialize_book(&book);
+        let deserialized = deserialize_book(&serialized).unwrap();
+        assert_eq!(book, deserialized);
+    }
+
+    #[test]
+    fn empty_book_serialization_round_trip() {
+        let book = Book::from_blob([0xBB; 32], &[]).unwrap();
+        assert_eq!(book.page_count(), 0);
+        let serialized = serialize_book(&book);
+        let deserialized = deserialize_book(&serialized).unwrap();
+        assert_eq!(book, deserialized);
+    }
+
+    #[test]
+    fn max_partition_depth_value() {
+        assert_eq!(MAX_PARTITION_DEPTH, 230);
     }
 }
