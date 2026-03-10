@@ -11,7 +11,6 @@ extern crate alloc;
 mod addr;
 mod athenaeum;
 // TODO: re-enable after migration to PageAddr
-// mod book;
 // mod encyclopedia;
 mod hash;
 // TODO: re-enable after migration to PageAddr
@@ -22,8 +21,10 @@ pub use addr::{
 };
 pub use athenaeum::{Book, BookError};
 // TODO: re-enable after migration to PageAddr
-// pub use book::{Book, BookEntry, BookError};
 // pub use encyclopedia::{Encyclopedia, SPLIT_THRESHOLD};
 pub use hash::{sha224_hash, sha256_hash};
 // TODO: re-enable after migration to PageAddr
 // pub use volume::{route_chunk, Volume, MAX_PARTITION_DEPTH};
+
+/// Legacy alias for backward compatibility during transition.
+pub const MAX_BLOB_SIZE: usize = BOOK_MAX_SIZE;
