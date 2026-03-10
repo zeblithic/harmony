@@ -7,7 +7,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::addr::{Algorithm, PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, NULL_PAGE, PAGES_PER_BOOK, PAGE_SIZE};
+use crate::addr::{
+    Algorithm, PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, NULL_PAGE, PAGES_PER_BOOK, PAGE_SIZE,
+};
 
 /// Error when constructing or reassembling a Book.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +31,7 @@ pub enum BookError {
 /// Every page has all 4 algorithm variants precomputed, stored as
 /// `[PageAddr; ALGO_COUNT]` in Algorithm selector order:
 /// `[Sha256Msb, Sha256Lsb, Sha224Msb, Sha224Lsb]`.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Book {
     /// 256-bit blob identifier (content ID).
     pub cid: [u8; 32],
@@ -143,10 +145,7 @@ impl Book {
     ///
     /// Pages are fetched by index (0..page_count), concatenated, and
     /// truncated to `blob_size`. A missing page returns `MissingPage` error.
-    pub fn reassemble(
-        &self,
-        fetch: impl Fn(u8) -> Option<Vec<u8>>,
-    ) -> Result<Vec<u8>, BookError> {
+    pub fn reassemble(&self, fetch: impl Fn(u8) -> Option<Vec<u8>>) -> Result<Vec<u8>, BookError> {
         let mut result = Vec::with_capacity(self.blob_size as usize);
 
         for i in 0..self.pages.len() {
@@ -206,7 +205,12 @@ mod tests {
     fn from_blob_too_large() {
         let data = vec![0u8; BOOK_MAX_SIZE + 1];
         let err = Book::from_blob(test_cid(), &data).unwrap_err();
-        assert_eq!(err, BookError::BlobTooLarge { size: BOOK_MAX_SIZE + 1 });
+        assert_eq!(
+            err,
+            BookError::BlobTooLarge {
+                size: BOOK_MAX_SIZE + 1
+            }
+        );
     }
 
     #[test]
