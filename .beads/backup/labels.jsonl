@@ -20,6 +20,8 @@
 {"issue_id":"harmony-5s7","label":"harmony-semantic"}
 {"issue_id":"harmony-7w4","label":"harmony-os"}
 {"issue_id":"harmony-7w4","label":"ring-0"}
+{"issue_id":"harmony-8fg","label":"harmony-content"}
+{"issue_id":"harmony-8fg","label":"harmony-zenoh"}
 {"issue_id":"harmony-8xc","label":"harmony-os"}
 {"issue_id":"harmony-8xc","label":"ring-0"}
 {"issue_id":"harmony-awg6","label":"node-trinity"}
