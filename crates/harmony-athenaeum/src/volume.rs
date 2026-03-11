@@ -5,8 +5,8 @@ use crate::addr::{PageAddr, ALGO_COUNT};
 use crate::athenaeum::{Book, BookError};
 use alloc::vec::Vec;
 
-/// Maximum partition depth (SHA-256 bits 22-252 = 230 usable bits).
-pub const MAX_PARTITION_DEPTH: u8 = 230;
+/// Maximum partition depth (SHA-256 bits 28-255 = 228 usable bits).
+pub const MAX_PARTITION_DEPTH: u8 = 228;
 
 /// A partition node in the Encyclopedia tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,6 +472,6 @@ mod tests {
 
     #[test]
     fn max_partition_depth_value() {
-        assert_eq!(MAX_PARTITION_DEPTH, 230);
+        assert_eq!(MAX_PARTITION_DEPTH, 228);
     }
 }

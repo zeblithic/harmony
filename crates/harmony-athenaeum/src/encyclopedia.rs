@@ -19,7 +19,7 @@ use crate::volume::{route_chunk, Volume, MAX_PARTITION_DEPTH};
 pub const SPLIT_THRESHOLD: usize = (1 << 28) * 3 / 4;
 
 /// Starting bit index for partition routing (bits 0-27 used for addressing).
-const PARTITION_START_BIT: u8 = 22;
+const PARTITION_START_BIT: u8 = 28;
 
 /// A record of how a unique page was assigned its address.
 #[derive(Debug, Clone, PartialEq, Eq)]

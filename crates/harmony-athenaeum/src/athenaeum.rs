@@ -78,7 +78,9 @@ impl Book {
             // Verify that at least one variant is unique (non-degenerate).
             // In practice, 4 independent hashes producing identical 28-bit
             // values is astronomically unlikely, but we check anyway.
-            let all_same = variants[1..].iter().all(|v| v.0 == variants[0].0);
+            let all_same = variants[1..]
+                .iter()
+                .all(|v| v.hash_bits() == variants[0].hash_bits());
             if all_same {
                 return Err(BookError::AllAlgorithmsCollide { page_index: i });
             }
