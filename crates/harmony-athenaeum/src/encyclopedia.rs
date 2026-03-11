@@ -101,7 +101,7 @@ impl Encyclopedia {
             &blob_page_hashes,
             0, // depth
             0, // path
-            PARTITION_START_BIT,
+            PARTITION_START_BIT as u16,
         )?;
 
         Ok(Encyclopedia {
@@ -118,9 +118,9 @@ impl Encyclopedia {
         blob_page_hashes: &[Vec<[u8; 32]>],
         depth: u8,
         path: u32,
-        bit_index: u8,
+        bit_index: u16,
     ) -> Result<Volume, BookError> {
-        if (bit_index as u16) >= (PARTITION_START_BIT as u16) + (MAX_PARTITION_DEPTH as u16) {
+        if bit_index >= PARTITION_START_BIT as u16 + MAX_PARTITION_DEPTH as u16 {
             return Err(BookError::MaxPartitionDepth { depth });
         }
 
@@ -138,11 +138,12 @@ impl Encyclopedia {
             }
         }
 
-        // Split by content-hash bit
+        // Split by content-hash bit (safe cast: guard above ensures bit_index < 256)
+        let bit_index_u8 = bit_index as u8;
         let mut left_pages = Vec::new();
         let mut right_pages = Vec::new();
         for page in pages {
-            if route_chunk(&page.content_hash, bit_index) {
+            if route_chunk(&page.content_hash, bit_index_u8) {
                 right_pages.push(page.clone());
             } else {
                 left_pages.push(page.clone());
@@ -173,7 +174,7 @@ impl Encyclopedia {
         Ok(Volume::Split {
             partition_depth: depth,
             partition_path: path,
-            split_bit: bit_index,
+            split_bit: bit_index_u8,
             left: Box::new(left),
             right: Box::new(right),
         })
