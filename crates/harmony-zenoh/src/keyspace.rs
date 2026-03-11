@@ -848,4 +848,20 @@ mod tests {
         assert_eq!(parsed_cid, cid);
         assert_eq!(parsed_index, "99");
     }
+
+    #[test]
+    fn parse_book_toc_extracts_cid() {
+        let cid = "c".repeat(64);
+        let built = book_toc_key(&cid).unwrap();
+        let parsed_cid = parse_book_toc(&built).unwrap();
+        assert_eq!(parsed_cid, cid);
+    }
+
+    #[test]
+    fn parse_book_meta_extracts_cid() {
+        let cid = "d".repeat(64);
+        let built = book_meta_key(&cid).unwrap();
+        let parsed_cid = parse_book_meta(&built).unwrap();
+        assert_eq!(parsed_cid, cid);
+    }
 }

@@ -219,7 +219,9 @@ impl Encyclopedia {
                 }
             }
             if !assigned {
-                return Err(BookError::AllAlgorithmsCollide { page_index: 0 });
+                return Err(BookError::AllAlgorithmsCollide {
+                    page_index: content_to_algo.len(),
+                });
             }
         }
 

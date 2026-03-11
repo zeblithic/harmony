@@ -154,6 +154,9 @@ impl Book {
             let page_data = fetch(i as u8).ok_or(BookError::MissingPage {
                 page_index: i as u8,
             })?;
+            if page_data.len() != PAGE_SIZE {
+                return Err(BookError::BadFormat);
+            }
             result.extend_from_slice(&page_data);
         }
 
