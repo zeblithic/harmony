@@ -18,7 +18,7 @@ pub use addr::{
     Algorithm, PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, NULL_PAGE, PAGES_PER_BOOK, PAGE_SIZE,
 };
 pub use athenaeum::{Book, BookError};
-pub use encyclopedia::{Assignment, Encyclopedia, SPLIT_THRESHOLD};
+pub use encyclopedia::{Encyclopedia, SPLIT_THRESHOLD};
 pub use hash::{sha224_hash, sha256_hash};
 pub use volume::{route_chunk, Volume, MAX_PARTITION_DEPTH};
 

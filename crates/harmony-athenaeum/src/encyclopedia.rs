@@ -21,14 +21,6 @@ pub const SPLIT_THRESHOLD: usize = (1 << 28) * 3 / 4;
 /// Starting bit index for partition routing (bits 0-27 used for addressing).
 const PARTITION_START_BIT: u8 = 28;
 
-/// A record of how a unique page was assigned its address.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Assignment {
-    pub book_index: usize,
-    pub page_index: u8,
-    pub algo: u8,
-}
-
 /// A complete content-addressed mapping for a corpus of blobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Encyclopedia {
@@ -128,7 +120,7 @@ impl Encyclopedia {
         path: u32,
         bit_index: u8,
     ) -> Result<Volume, BookError> {
-        if bit_index >= PARTITION_START_BIT.saturating_add(MAX_PARTITION_DEPTH) {
+        if (bit_index as u16) >= (PARTITION_START_BIT as u16) + (MAX_PARTITION_DEPTH as u16) {
             // Exceeded maximum partition depth — address space exhausted.
             return Err(BookError::AllAlgorithmsCollide {
                 page_index: depth as usize,
