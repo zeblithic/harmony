@@ -19,31 +19,29 @@ pub fn sha224_hash(data: &[u8]) -> [u8; 28] {
     hasher.finalize().into()
 }
 
-/// Extract 21 bits from the most significant end of a digest.
-fn extract_bits_msb(digest: &[u8]) -> u32 {
-    // Take first 3 bytes (24 bits), shift right by 3 to get 21 bits
-    let b0 = digest[0] as u32;
-    let b1 = digest[1] as u32;
-    let b2 = digest[2] as u32;
-    ((b0 << 16) | (b1 << 8) | b2) >> 3
-}
-
-/// Extract 21 bits from the least significant end of a digest.
-fn extract_bits_lsb(digest: &[u8]) -> u32 {
-    let len = digest.len();
-    let b0 = digest[len - 3] as u32;
-    let b1 = digest[len - 2] as u32;
-    let b2 = digest[len - 1] as u32;
-    ((b0 << 16) | (b1 << 8) | b2) >> 3
-}
-
-/// Derive 21 hash address bits from chunk data using the specified algorithm.
+/// Derive 28 hash address bits from page data using the specified algorithm.
+///
+/// Hashes `data` with the algorithm's hash function, takes a 4-byte window
+/// from the MSB or LSB end of the digest, interprets it as a big-endian u32,
+/// and masks to the lower 28 bits.
 pub(crate) fn derive_hash_bits(data: &[u8], algorithm: Algorithm) -> u32 {
     match algorithm {
-        Algorithm::Sha256Msb => extract_bits_msb(&sha256_hash(data)),
-        Algorithm::Sha256Lsb => extract_bits_lsb(&sha256_hash(data)),
-        Algorithm::Sha224Msb => extract_bits_msb(&sha224_hash(data)),
-        Algorithm::Sha224Lsb => extract_bits_lsb(&sha224_hash(data)),
+        Algorithm::Sha256Msb => {
+            let h = sha256_hash(data);
+            u32::from_be_bytes([h[0], h[1], h[2], h[3]]) & 0x0FFF_FFFF
+        }
+        Algorithm::Sha256Lsb => {
+            let h = sha256_hash(data);
+            u32::from_be_bytes([h[28], h[29], h[30], h[31]]) & 0x0FFF_FFFF
+        }
+        Algorithm::Sha224Msb => {
+            let h = sha224_hash(data);
+            u32::from_be_bytes([h[0], h[1], h[2], h[3]]) & 0x0FFF_FFFF
+        }
+        Algorithm::Sha224Lsb => {
+            let h = sha224_hash(data);
+            u32::from_be_bytes([h[24], h[25], h[26], h[27]]) & 0x0FFF_FFFF
+        }
     }
 }
 
@@ -74,15 +72,15 @@ mod tests {
     }
 
     #[test]
-    fn hash_bits_fit_in_21_bits() {
-        for algo in [
-            Algorithm::Sha256Msb,
-            Algorithm::Sha256Lsb,
-            Algorithm::Sha224Msb,
-            Algorithm::Sha224Lsb,
-        ] {
+    fn hash_bits_fit_in_28_bits() {
+        for algo in Algorithm::ALL {
             let bits = derive_hash_bits(b"anything", algo);
-            assert!(bits <= 0x1FFFFF, "hash bits {:#x} exceed 21-bit max", bits);
+            assert!(
+                bits <= 0x0FFF_FFFF,
+                "hash bits {:#x} exceed 28-bit max for {:?}",
+                bits,
+                algo,
+            );
         }
     }
 
@@ -95,35 +93,30 @@ mod tests {
 
     #[test]
     fn full_hash_sha256_known_vector() {
-        // SHA-256("abc") = ba7816bf...
-        let hash = sha256_hash(b"abc");
-        assert_eq!(hash[0], 0xba);
-        assert_eq!(hash[1], 0x78);
+        // SHA-256("") = e3b0c442...
+        let hash = sha256_hash(b"");
+        assert_eq!(hash[0], 0xe3);
+        assert_eq!(hash[1], 0xb0);
+        assert_eq!(hash[2], 0xc4);
+        assert_eq!(hash[3], 0x42);
     }
 
     #[test]
     fn full_hash_sha224_known_vector() {
-        // SHA-224("abc") = 23097d22...
-        let hash = sha224_hash(b"abc");
-        assert_eq!(hash[0], 0x23);
-        assert_eq!(hash[1], 0x09);
+        // SHA-224("") = d14a028c...
+        let hash = sha224_hash(b"");
+        assert_eq!(hash[0], 0xd1);
+        assert_eq!(hash[1], 0x4a);
+        assert_eq!(hash[2], 0x02);
+        assert_eq!(hash[3], 0x8c);
     }
 
     #[test]
     fn all_four_algorithms_produce_values() {
-        let data = b"test chunk data for athenaeum";
-        let results: Vec<u32> = [
-            Algorithm::Sha256Msb,
-            Algorithm::Sha256Lsb,
-            Algorithm::Sha224Msb,
-            Algorithm::Sha224Lsb,
-        ]
-        .iter()
-        .map(|a| derive_hash_bits(data, *a))
-        .collect();
-        // All should produce non-zero values for this input
-        for r in &results {
-            assert!(*r > 0);
+        let data = b"test page data for athenaeum";
+        for algo in Algorithm::ALL {
+            let bits = derive_hash_bits(data, algo);
+            assert!(bits > 0, "{:?} produced zero for non-trivial data", algo);
         }
     }
 }
