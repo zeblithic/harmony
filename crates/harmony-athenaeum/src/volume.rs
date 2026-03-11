@@ -306,6 +306,9 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
                     .map_err(|_| BookError::TooShort)?,
             );
             *addr = PageAddr(raw);
+            if !addr.verify_checksum() {
+                return Err(BookError::BadFormat);
+            }
             pos += 4;
         }
         pages.push(addrs);
