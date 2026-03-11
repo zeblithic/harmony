@@ -250,10 +250,18 @@ impl Encyclopedia {
                 }
             }
 
-            // Leaf books are partial — blob_size reflects only the pages
-            // in this partition, not the full original blob.
-            let partial_size =
-                (new_pages.len() as u32 * PAGE_SIZE as u32).min(original_book.blob_size);
+            // Leaf books are partial — blob_size reflects only the content
+            // bytes in the pages routed to this partition. The last page of a
+            // blob may be shorter than PAGE_SIZE, so we must use the original
+            // page index to compute each page's true byte contribution.
+            let mut partial_size = 0u32;
+            for (page_idx, hash) in page_hashes.iter().enumerate() {
+                if partition_hashes.contains(hash) {
+                    let page_start = page_idx as u32 * PAGE_SIZE as u32;
+                    let page_end = (page_start + PAGE_SIZE as u32).min(original_book.blob_size);
+                    partial_size += page_end - page_start;
+                }
+            }
             leaf_books.push(Book {
                 cid: original_book.cid,
                 pages: new_pages,
@@ -438,6 +446,29 @@ mod tests {
         let path = Encyclopedia::route(&hash, 100);
         // path is capped at 32 bits — should not panic
         let _ = path;
+    }
+
+    #[test]
+    fn partial_last_page_blob_size() {
+        // A blob of 5000 bytes = page 0 (4096 bytes) + page 1 (904 bytes).
+        // When built into an Encyclopedia, the total blob_size across all
+        // leaf Books must sum to the original blob_size (5000), not
+        // page_count * PAGE_SIZE (8192).
+        let data = alloc::vec![0xFFu8; 5000];
+        let cid = sha256_hash(&data);
+        let enc = Encyclopedia::build(&[(cid, &data)]).unwrap();
+
+        // Walk the tree and sum blob_size across all Books.
+        fn sum_blob_sizes(vol: &Volume) -> u32 {
+            match vol {
+                Volume::Leaf { books, .. } => books.iter().map(|b| b.blob_size).sum(),
+                Volume::Split { left, right, .. } => {
+                    sum_blob_sizes(left) + sum_blob_sizes(right)
+                }
+            }
+        }
+
+        assert_eq!(sum_blob_sizes(&enc.root), 5000);
     }
 
     #[test]
