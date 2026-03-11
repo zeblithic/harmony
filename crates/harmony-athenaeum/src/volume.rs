@@ -273,12 +273,14 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
     cid.copy_from_slice(&data[..32]);
 
     let blob_size = u32::from_le_bytes(data[32..36].try_into().map_err(|_| BookError::TooShort)?);
+    if blob_size as usize > crate::addr::BOOK_MAX_SIZE {
+        return Err(BookError::BadFormat);
+    }
 
     let page_count =
         u16::from_le_bytes(data[36..38].try_into().map_err(|_| BookError::TooShort)?) as usize;
 
-    use crate::addr::PAGES_PER_BOOK;
-    if page_count > PAGES_PER_BOOK {
+    if page_count > crate::addr::PAGES_PER_BOOK {
         return Err(BookError::BadFormat);
     }
 

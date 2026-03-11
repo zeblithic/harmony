@@ -180,7 +180,9 @@ mod tests {
 
     #[test]
     fn checksum_detects_single_bit_flip() {
-        // Statistical: >50% of flips in bits 2-29 should be detected
+        // XOR-fold checksum guarantees 100% detection of single-bit flips
+        // in bits 2-29: each flip toggles exactly one pair in the fold,
+        // changing the computed checksum while stored bits remain unchanged.
         let addr = PageAddr::new(0x0123_4567, Algorithm::Sha224Lsb);
         assert!(addr.verify_checksum());
 
@@ -192,9 +194,9 @@ mod tests {
                 detected += 1;
             }
         }
-        assert!(
-            detected > total_bits / 2,
-            "checksum detected {detected}/{total_bits} single-bit flips, expected >50%"
+        assert_eq!(
+            detected, total_bits,
+            "2-bit XOR-fold checksum must detect every single-bit flip in hash bits"
         );
     }
 

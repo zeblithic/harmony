@@ -49,6 +49,12 @@ const BOOK_PAGE_FMT: &str = "harmony/book/${cid_hex:*}/page/${page_addr_hex:*}";
 /// Book position (positional access): `harmony/book/{cid_hex}/pos/{index}`
 const BOOK_POS_FMT: &str = "harmony/book/${cid_hex:*}/pos/${index:*}";
 
+/// Book table of contents: `harmony/book/{cid_hex}/toc`
+const BOOK_TOC_FMT: &str = "harmony/book/${cid_hex:*}/toc";
+
+/// Book metadata: `harmony/book/{cid_hex}/meta`
+const BOOK_META_FMT: &str = "harmony/book/${cid_hex:*}/meta";
+
 // ── Wildcard subscription patterns ───────────────────────────────────
 
 /// Subscribe to all messages on a specific server's channel.
@@ -374,6 +380,26 @@ pub fn parse_book_pos(ke: &keyexpr) -> Result<(String, String), ZenohError> {
         .map_err(|e| ze(e.to_string()))?
         .to_string();
     Ok((cid_hex, index_str))
+}
+
+/// Parse a book table-of-contents key expression, returning the cid_hex.
+pub fn parse_book_toc(ke: &keyexpr) -> Result<String, ZenohError> {
+    let fmt = KeFormat::new(BOOK_TOC_FMT).map_err(|e| ze(e.to_string()))?;
+    let parsed = fmt.parse(ke).map_err(|e| ze(e.to_string()))?;
+    Ok(parsed
+        .get("cid_hex")
+        .map_err(|e| ze(e.to_string()))?
+        .to_string())
+}
+
+/// Parse a book metadata key expression, returning the cid_hex.
+pub fn parse_book_meta(ke: &keyexpr) -> Result<String, ZenohError> {
+    let fmt = KeFormat::new(BOOK_META_FMT).map_err(|e| ze(e.to_string()))?;
+    let parsed = fmt.parse(ke).map_err(|e| ze(e.to_string()))?;
+    Ok(parsed
+        .get("cid_hex")
+        .map_err(|e| ze(e.to_string()))?
+        .to_string())
 }
 
 // ── Re-export the keyexpr type for consumers ─────────────────────────
