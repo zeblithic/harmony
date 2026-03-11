@@ -197,28 +197,33 @@ impl Encyclopedia {
         // Build a set of content hashes in this partition
         let partition_hashes: BTreeSet<[u8; 32]> = pages.iter().map(|p| p.content_hash).collect();
 
-        // Power-of-choice: assign addresses to unique pages
+        // Power-of-choice: verify collision-free addressing is possible.
+        // For each unique page, try algo 0-3 and reserve the first
+        // collision-free hash_bits. The chosen algo is already encoded
+        // in the Book's pages array (all 4 variants stored per page).
         let mut used_hash_bits = BTreeSet::new();
-        let mut content_to_algo: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+        let mut assigned_pages = BTreeSet::new();
+        let mut assigned_count = 0usize;
 
         for page_info in pages {
-            if content_to_algo.contains_key(&page_info.content_hash) {
+            if assigned_pages.contains(&page_info.content_hash) {
                 continue;
             }
 
-            let mut assigned = false;
+            let mut found = false;
             for algo_idx in 0..ALGO_COUNT {
                 let hash_bits = page_info.variants[algo_idx].hash_bits();
                 if !used_hash_bits.contains(&hash_bits) {
                     used_hash_bits.insert(hash_bits);
-                    content_to_algo.insert(page_info.content_hash, algo_idx);
-                    assigned = true;
+                    assigned_pages.insert(page_info.content_hash);
+                    assigned_count += 1;
+                    found = true;
                     break;
                 }
             }
-            if !assigned {
+            if !found {
                 return Err(BookError::AllAlgorithmsCollide {
-                    page_index: content_to_algo.len(),
+                    page_index: assigned_count,
                 });
             }
         }

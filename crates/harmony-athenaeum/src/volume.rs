@@ -284,6 +284,11 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
         return Err(BookError::BadFormat);
     }
 
+    // blob_size must be consistent with page_count
+    if blob_size as usize > page_count * crate::addr::PAGE_SIZE {
+        return Err(BookError::BadFormat);
+    }
+
     // data[38..40] = reserved, skip
 
     let pages_start = 40;
