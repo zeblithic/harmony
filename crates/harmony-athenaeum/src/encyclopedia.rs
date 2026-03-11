@@ -248,10 +248,14 @@ impl Encyclopedia {
                 }
             }
 
+            // Leaf books are partial — blob_size reflects only the pages
+            // in this partition, not the full original blob.
+            let partial_size =
+                (new_pages.len() as u32 * PAGE_SIZE as u32).min(original_book.blob_size);
             leaf_books.push(Book {
                 cid: original_book.cid,
                 pages: new_pages,
-                blob_size: original_book.blob_size,
+                blob_size: partial_size,
             });
         }
 

@@ -277,6 +277,11 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
     let page_count =
         u16::from_le_bytes(data[36..38].try_into().map_err(|_| BookError::TooShort)?) as usize;
 
+    use crate::addr::PAGES_PER_BOOK;
+    if page_count > PAGES_PER_BOOK {
+        return Err(BookError::BadFormat);
+    }
+
     // data[38..40] = reserved, skip
 
     let pages_start = 40;
