@@ -20,6 +20,8 @@ pub enum BookError {
     AllAlgorithmsCollide { page_index: usize },
     /// A required page was not available during reassembly.
     MissingPage { page_index: u8 },
+    /// Partition tree exceeded maximum depth — address space exhausted.
+    MaxPartitionDepth { depth: u8 },
     /// Serialized data has an invalid format.
     BadFormat,
     /// Serialized data is too short to be valid.
@@ -134,6 +136,11 @@ impl Book {
     ///
     /// The last page is zero-padded to a full 4KB.
     pub fn page_data_from_blob(&self, data: &[u8]) -> Vec<Vec<u8>> {
+        debug_assert_eq!(
+            data.len(),
+            self.blob_size as usize,
+            "data length does not match blob_size"
+        );
         let mut pages = Vec::new();
         for chunk in data.chunks(PAGE_SIZE) {
             let mut page_buf = vec![0u8; PAGE_SIZE];

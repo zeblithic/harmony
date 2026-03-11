@@ -121,10 +121,7 @@ impl Encyclopedia {
         bit_index: u8,
     ) -> Result<Volume, BookError> {
         if (bit_index as u16) >= (PARTITION_START_BIT as u16) + (MAX_PARTITION_DEPTH as u16) {
-            // Exceeded maximum partition depth — address space exhausted.
-            return Err(BookError::AllAlgorithmsCollide {
-                page_index: depth as usize,
-            });
+            return Err(BookError::MaxPartitionDepth { depth });
         }
 
         if pages.is_empty() {
