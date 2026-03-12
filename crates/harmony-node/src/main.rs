@@ -34,6 +34,12 @@ enum Commands {
         /// Disable announcing public ephemeral (01) content on Zenoh
         #[arg(long)]
         no_public_ephemeral_announce: bool,
+        /// Bloom filter broadcast interval in seconds
+        #[arg(long, default_value_t = 30)]
+        filter_broadcast_interval: u32,
+        /// Bloom filter broadcast mutation threshold
+        #[arg(long, default_value_t = 100)]
+        filter_mutation_threshold: u32,
     },
 }
 
@@ -146,6 +152,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             encrypted_durable_persist,
             encrypted_durable_announce,
             no_public_ephemeral_announce,
+            filter_broadcast_interval,
+            filter_mutation_threshold,
         } => {
             use crate::runtime::{NodeConfig, NodeRuntime, RuntimeAction};
             use harmony_compute::InstructionBudget;
@@ -176,13 +184,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 schedule: Default::default(),
                 content_policy,
-                filter_broadcast_config: FilterBroadcastConfig::default(),
+                filter_broadcast_config: FilterBroadcastConfig {
+                    mutation_threshold: filter_mutation_threshold,
+                    max_interval_secs: filter_broadcast_interval,
+                    expected_items: cache_capacity as u32,
+                    fp_rate: 0.001,
+                },
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 
             println!("Harmony node runtime initialized");
             println!("  Cache capacity:   {cache_capacity} items");
             println!("  Compute budget:   {compute_budget} fuel/tick");
+            println!("  Filter interval: {filter_broadcast_interval}s / {filter_mutation_threshold} mutations");
             println!("  Router queue:     {} pending", rt.router_queue_len());
             println!("  Storage queue:    {} pending", rt.storage_queue_len());
             println!("  Compute queue:    {} tracked", rt.compute_queue_len());
@@ -304,5 +318,29 @@ mod tests {
             msg.contains("--encrypted-durable-announce requires --encrypted-durable-persist"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn cli_parses_run_with_filter_config() {
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--filter-broadcast-interval",
+            "60",
+            "--filter-mutation-threshold",
+            "200",
+        ])
+        .unwrap();
+        if let Commands::Run {
+            filter_broadcast_interval,
+            filter_mutation_threshold,
+            ..
+        } = cli.command
+        {
+            assert_eq!(filter_broadcast_interval, 60);
+            assert_eq!(filter_mutation_threshold, 200);
+        } else {
+            panic!("expected Run command");
+        }
     }
 }

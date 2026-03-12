@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use harmony_compute::InstructionBudget;
 use harmony_content::blob::BlobStore;
+use harmony_content::bloom::BloomFilter;
 use harmony_content::cid::ContentId;
 use harmony_content::storage_tier::{
     ContentPolicy, FilterBroadcastConfig, StorageBudget, StorageMetrics, StorageTier,
@@ -153,6 +154,59 @@ pub enum RuntimeAction {
     Subscribe { key_expr: String },
 }
 
+/// Bloom filter received from a peer, with metadata.
+struct PeerFilter {
+    filter: BloomFilter,
+    received_tick: u64,
+    item_count: u32,
+}
+
+/// Per-peer Bloom filter table for content query routing.
+struct PeerFilterTable {
+    filters: HashMap<String, PeerFilter>,
+    staleness_ticks: u64,
+}
+
+impl PeerFilterTable {
+    fn new(staleness_ticks: u64) -> Self {
+        Self {
+            filters: HashMap::new(),
+            staleness_ticks,
+        }
+    }
+
+    fn upsert(&mut self, peer_addr: String, filter: BloomFilter, item_count: u32, tick: u64) {
+        self.filters.insert(
+            peer_addr,
+            PeerFilter {
+                filter,
+                received_tick: tick,
+                item_count,
+            },
+        );
+    }
+
+    /// Returns true if the peer should be queried (no filter, stale filter, or filter says "maybe").
+    /// Returns false only if the filter definitively says the CID is absent.
+    fn should_query(&self, peer_addr: &str, cid: &ContentId, current_tick: u64) -> bool {
+        match self.filters.get(peer_addr) {
+            None => true,
+            Some(pf) => {
+                if current_tick.saturating_sub(pf.received_tick) > self.staleness_ticks {
+                    true
+                } else {
+                    pf.filter.may_contain(cid)
+                }
+            }
+        }
+    }
+
+    fn evict_stale(&mut self, current_tick: u64) {
+        self.filters
+            .retain(|_, pf| current_tick.saturating_sub(pf.received_tick) <= self.staleness_ticks);
+    }
+}
+
 /// Sans-I/O node runtime wiring Tier 1 (Router), Tier 2 (Storage), and Tier 3 (Compute).
 ///
 /// Events are pushed via [`push_event`](Self::push_event) into internal
@@ -200,6 +254,10 @@ pub struct NodeRuntime<B: BlobStore> {
     router_starved: u32,
     storage_starved: u32,
     compute_starved: u32,
+    // Per-peer Bloom filter table for content query routing
+    peer_filters: PeerFilterTable,
+    // Monotonically increasing tick counter
+    tick_count: u64,
 }
 
 impl<B: BlobStore> NodeRuntime<B> {
@@ -279,6 +337,8 @@ impl<B: BlobStore> NodeRuntime<B> {
             router_starved: 0,
             storage_starved: 0,
             compute_starved: 0,
+            peer_filters: PeerFilterTable::new(90),
+            tick_count: 0,
         };
 
         (rt, actions)
@@ -437,6 +497,7 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// Within each tier, at most `max_per_tick` events are drained (if set).
     /// When limits are `None` (the default), all queued events are drained.
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
+        self.tick_count += 1;
         let mut actions = Vec::new();
         // Note: fuel is captured once before any tier executes. When Compute is
         // promoted via starvation, it still runs with this pre-tick fuel value —
@@ -1656,5 +1717,42 @@ mod tests {
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
+    }
+
+    // ── PeerFilterTable tests ───────────────────────────────────────
+
+    use harmony_content::cid::ContentFlags;
+
+    #[test]
+    fn peer_filter_table_skips_definite_miss() {
+        let mut table = PeerFilterTable::new(100);
+        let mut filter = BloomFilter::new(1000, 0.01);
+        let cid_in = ContentId::for_blob(b"present", ContentFlags::default()).unwrap();
+        let cid_out = ContentId::for_blob(b"absent", ContentFlags::default()).unwrap();
+        filter.insert(&cid_in);
+        table.upsert("peer-1".into(), filter, 1, 10);
+
+        assert!(table.should_query("peer-1", &cid_in, 10));
+        assert!(!table.should_query("peer-1", &cid_out, 10));
+    }
+
+    #[test]
+    fn peer_filter_table_queries_unknown_peer() {
+        let table = PeerFilterTable::new(100);
+        let cid = ContentId::for_blob(b"test", ContentFlags::default()).unwrap();
+        assert!(table.should_query("unknown", &cid, 10));
+    }
+
+    #[test]
+    fn peer_filter_table_queries_stale_filter() {
+        let mut table = PeerFilterTable::new(100);
+        let filter = BloomFilter::new(1000, 0.01);
+        table.upsert("peer-1".into(), filter, 0, 10);
+
+        let cid = ContentId::for_blob(b"test", ContentFlags::default()).unwrap();
+        // Fresh filter with no items => definite miss, should NOT query
+        assert!(!table.should_query("peer-1", &cid, 10));
+        // Stale filter (current_tick - received_tick > staleness_ticks) => should query
+        assert!(table.should_query("peer-1", &cid, 200));
     }
 }
