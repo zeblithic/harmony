@@ -216,6 +216,16 @@ impl<B: BlobStore> StorageTier<B> {
         }
     }
 
+    /// Check whether a CID's content class should be announced on Zenoh.
+    fn should_announce(&self, cid: &ContentId) -> bool {
+        match cid.content_class() {
+            ContentClass::PublicDurable => true,
+            ContentClass::PublicEphemeral => self.policy.public_ephemeral_announce,
+            ContentClass::EncryptedDurable => self.policy.encrypted_durable_announce,
+            ContentClass::EncryptedEphemeral => false,
+        }
+    }
+
     /// Check whether a CID's content class is admissible under the current policy.
     fn class_admits(&self, cid: &ContentId) -> bool {
         match cid.content_class() {
@@ -249,7 +259,12 @@ impl<B: BlobStore> StorageTier<B> {
         self.metrics.transit_stored += 1;
         // Re-announcing already-cached content is intentional: it refreshes
         // the announcement TTL so peers know the content is still available.
-        vec![self.make_announce_action(&cid)]
+        // Announce only if policy allows it for this content class.
+        if self.should_announce(&cid) {
+            vec![self.make_announce_action(&cid)]
+        } else {
+            vec![]
+        }
     }
 
     fn handle_publish(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
@@ -267,7 +282,12 @@ impl<B: BlobStore> StorageTier<B> {
         // TODO: Pin published content to guarantee long-term retention (deferred).
         self.cache.store(cid, data);
         self.metrics.publishes_stored += 1;
-        vec![self.make_announce_action(&cid)]
+        // Announce only if policy allows it for this content class.
+        if self.should_announce(&cid) {
+            vec![self.make_announce_action(&cid)]
+        } else {
+            vec![]
+        }
     }
 
     /// Verify that a CID is consistent with the given data.
@@ -754,6 +774,7 @@ mod tests {
     fn transit_admits_encrypted_durable_when_policy_on() {
         let policy = ContentPolicy {
             encrypted_durable_persist: true,
+            encrypted_durable_announce: true,
             ..ContentPolicy::default()
         };
         let mut tier = make_tier_with_policy(policy);
@@ -802,5 +823,80 @@ mod tests {
         let policy = ContentPolicy::default();
         let (tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy);
         assert_eq!(tier.metrics().queries_served, 0);
+    }
+
+    // ---- Announcement gating by content class ----
+
+    #[test]
+    fn transit_public_ephemeral_no_announce_when_policy_off() {
+        let policy = ContentPolicy {
+            public_ephemeral_announce: false,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"live stream", false, true);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        // Should store but NOT announce.
+        assert!(actions.is_empty(), "no announce when policy off");
+        assert_eq!(tier.metrics().transit_stored, 1);
+    }
+
+    #[test]
+    fn transit_public_ephemeral_announces_when_policy_on() {
+        let policy = ContentPolicy {
+            public_ephemeral_announce: true,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"live stream", false, true);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::AnnounceContent { .. }
+        ));
+    }
+
+    #[test]
+    fn transit_encrypted_durable_no_announce_when_policy_off() {
+        let policy = ContentPolicy {
+            encrypted_durable_persist: true, // must persist to reach announce check
+            encrypted_durable_announce: false,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"encrypted doc", true, false);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert!(actions.is_empty(), "stored but not announced");
+        assert_eq!(tier.metrics().transit_stored, 1);
+    }
+
+    #[test]
+    fn transit_encrypted_durable_announces_when_policy_on() {
+        let policy = ContentPolicy {
+            encrypted_durable_persist: true,
+            encrypted_durable_announce: true,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"encrypted doc", true, false);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::AnnounceContent { .. }
+        ));
+    }
+
+    #[test]
+    fn transit_public_durable_always_announces() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, data) = cid_with_class(b"valuable doc", false, false);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::AnnounceContent { .. }
+        ));
     }
 }
