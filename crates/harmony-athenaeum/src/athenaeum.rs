@@ -263,8 +263,7 @@ impl Book {
             let section_offset = algo_idx * PAGES_PER_BOOK * 4;
             // Position 0: sentinel
             let sentinel = toc_sentinel_for_algo(algo_idx as u8);
-            toc_buf[section_offset..section_offset + 4]
-                .copy_from_slice(&sentinel.to_le_bytes());
+            toc_buf[section_offset..section_offset + 4].copy_from_slice(&sentinel.to_le_bytes());
             // Positions 1..N: data page addrs
             for (i, addrs) in data_page_addrs.iter().enumerate() {
                 let entry_offset = section_offset + (i + 1) * 4;
@@ -274,8 +273,7 @@ impl Book {
             // Positions N+1..255: NULL_PAGE
             for page_idx in (data_page_addrs.len() + 1)..PAGES_PER_BOOK {
                 let entry_offset = section_offset + page_idx * 4;
-                toc_buf[entry_offset..entry_offset + 4]
-                    .copy_from_slice(&NULL_PAGE.to_le_bytes());
+                toc_buf[entry_offset..entry_offset + 4].copy_from_slice(&NULL_PAGE.to_le_bytes());
             }
         }
 
@@ -483,8 +481,7 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::addr::{
-        is_toc_sentinel, toc_sentinel_for_algo, SELF_INDEXING_MAX_DATA_SIZE,
-        SELF_INDEX_SENTINEL_00,
+        is_toc_sentinel, toc_sentinel_for_algo, SELF_INDEXING_MAX_DATA_SIZE, SELF_INDEX_SENTINEL_00,
     };
     use crate::encrypted::EncryptedBookMetadata;
 
@@ -1037,10 +1034,7 @@ mod tests {
         let data = vec![0x42u8; PAGE_SIZE * 2];
         let book = Book::from_blob_encrypted([0xDD; 32], &data, &meta).unwrap();
         assert!(book.is_encrypted());
-        assert_eq!(
-            book.book_type,
-            BookType::Encrypted { metadata_pages: 2 }
-        );
+        assert_eq!(book.book_type, BookType::Encrypted { metadata_pages: 2 });
         assert_eq!(book.data_page_count(), 2);
         // Total pages = 2 metadata + 2 data = 4
         assert_eq!(book.page_count(), 4);

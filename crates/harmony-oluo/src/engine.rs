@@ -322,7 +322,10 @@ mod tests {
             max_results: 10,
         };
 
-        let actions = engine.handle(OluoEvent::Search { query_id: 99, query });
+        let actions = engine.handle(OluoEvent::Search {
+            query_id: 99,
+            query,
+        });
         match &actions[0] {
             OluoAction::SearchResults { query_id, results } => {
                 assert_eq!(*query_id, 99);

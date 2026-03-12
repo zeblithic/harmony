@@ -113,8 +113,7 @@ mod tests {
         let (ct, x_eph_pk, key1) =
             hybrid_encapsulate(&mut OsRng, &ml_pk, &x_pk, b"context-a").unwrap();
         // Decapsulate with different context should produce different key
-        let key2 =
-            hybrid_decapsulate(&ml_sk, &ct, &x_sk, &x_eph_pk, b"context-b").unwrap();
+        let key2 = hybrid_decapsulate(&ml_sk, &ct, &x_sk, &x_eph_pk, b"context-b").unwrap();
 
         assert_ne!(key1, key2);
     }

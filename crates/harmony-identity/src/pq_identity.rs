@@ -107,8 +107,8 @@ impl PqIdentity {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, IdentityError> {
         // 1. ML-KEM encapsulate → shared secret
-        let (ct, ss) =
-            harmony_crypto::ml_kem::encapsulate(rng, &self.encryption_key).map_err(IdentityError::Crypto)?;
+        let (ct, ss) = harmony_crypto::ml_kem::encapsulate(rng, &self.encryption_key)
+            .map_err(IdentityError::Crypto)?;
 
         // 2. HKDF-SHA256 → symmetric key
         let key_bytes = harmony_crypto::hkdf::derive_key(
@@ -124,8 +124,8 @@ impl PqIdentity {
 
         // 3. ChaCha20-Poly1305 encrypt
         let nonce = harmony_crypto::aead::generate_nonce(rng);
-        let encrypted =
-            harmony_crypto::aead::encrypt(&key, &nonce, plaintext, &[]).map_err(IdentityError::Crypto)?;
+        let encrypted = harmony_crypto::aead::encrypt(&key, &nonce, plaintext, &[])
+            .map_err(IdentityError::Crypto)?;
 
         // Zeroize key material
         key.zeroize();
@@ -547,14 +547,7 @@ mod tests {
     fn pq_ucan_signature_length() {
         let issuer = PqPrivateIdentity::generate(&mut OsRng);
         let token = issuer
-            .issue_pq_root_token(
-                &mut OsRng,
-                &[0xBB; 16],
-                CapabilityType::Memory,
-                &[],
-                0,
-                0,
-            )
+            .issue_pq_root_token(&mut OsRng, &[0xBB; 16], CapabilityType::Memory, &[], 0, 0)
             .unwrap();
 
         assert_eq!(token.signature.len(), 3309); // ML-DSA-65 signature length
@@ -581,24 +574,10 @@ mod tests {
     fn pq_ucan_nonce_is_random() {
         let issuer = PqPrivateIdentity::generate(&mut OsRng);
         let t1 = issuer
-            .issue_pq_root_token(
-                &mut OsRng,
-                &[0xBB; 16],
-                CapabilityType::Content,
-                &[],
-                0,
-                0,
-            )
+            .issue_pq_root_token(&mut OsRng, &[0xBB; 16], CapabilityType::Content, &[], 0, 0)
             .unwrap();
         let t2 = issuer
-            .issue_pq_root_token(
-                &mut OsRng,
-                &[0xBB; 16],
-                CapabilityType::Content,
-                &[],
-                0,
-                0,
-            )
+            .issue_pq_root_token(&mut OsRng, &[0xBB; 16], CapabilityType::Content, &[], 0, 0)
             .unwrap();
 
         assert_ne!(t1.nonce, t2.nonce);
@@ -656,14 +635,7 @@ mod tests {
     fn pq_ucan_from_bytes_rejects_wrong_crypto_suite() {
         let issuer = PqPrivateIdentity::generate(&mut OsRng);
         let token = issuer
-            .issue_pq_root_token(
-                &mut OsRng,
-                &[0xBB; 16],
-                CapabilityType::Content,
-                &[],
-                0,
-                0,
-            )
+            .issue_pq_root_token(&mut OsRng, &[0xBB; 16], CapabilityType::Content, &[], 0, 0)
             .unwrap();
 
         let mut bytes = token.to_bytes();

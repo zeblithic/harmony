@@ -509,7 +509,8 @@ impl PqUcanToken {
         );
         let resource_len = self.resource.len() as u16;
         let proof_size = if self.proof.is_some() { 32 } else { 0 };
-        let signable_size = PQ_MIN_TOKEN_SIZE - PQ_SIGNATURE_LENGTH + self.resource.len() + proof_size;
+        let signable_size =
+            PQ_MIN_TOKEN_SIZE - PQ_SIGNATURE_LENGTH + self.resource.len() + proof_size;
 
         let mut buf = Vec::with_capacity(signable_size);
         buf.push(CryptoSuite::MlDsa65 as u8); // 0x01
