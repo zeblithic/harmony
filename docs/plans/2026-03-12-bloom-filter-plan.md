@@ -1180,7 +1180,7 @@ Pass `filter_config` to `NodeConfig`.
         let cli = Cli::try_parse_from([
             "harmony",
             "run",
-            "--filter-broadcast-interval",
+            "--filter-broadcast-ticks",
             "60",
             "--filter-mutation-threshold",
             "200",

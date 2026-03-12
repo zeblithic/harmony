@@ -22,17 +22,6 @@ Four commands plus a review monitor, each ending with a human-in-the-loop checkp
 | 3.5 | `/monitorreviews` | Check review state, report status + next action | State reported |
 | 4 | `/finishtask` | Merge PR, clean up, return to main | Main updated, ready for next cycle |
 
-## Helper Scripts (`scripts/`)
-
-These scripts handle deterministic, multi-step operations atomically:
-
-| Script | Used by | Purpose |
-|--------|---------|---------|
-| `review-state.sh [PR]` | `/monitorreviews`, `/finishtask` | Gather all review signals (paginated), derive state machine state |
-| `push-and-trigger.sh [PR]` | Re-delivery cycles | Test gate → push → trigger both reviewers → confirm state |
-| `finish-task.sh [PR]` | `/finishtask` | Check review state → merge → main → cleanup → report |
-| `survey-work.sh` | `/findtask` | Gather all beads, merges, PRs, bead details in one shot |
-
 ## Critical Rules
 
 ### Branch-First Rule

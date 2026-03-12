@@ -1,7 +1,7 @@
 ---
 description: Check the review status of a PR and determine what action is needed next
 argument-hint: [pr-number]
-allowed-tools: Bash(gh pr view:*), Bash(gh pr comments:*), Bash(gh api:*), Bash(git log:*), Bash(git branch:*), Bash(bash scripts/review-state.sh:*), Bash(cd:*), Bash(pwd:*)
+allowed-tools: Bash(gh pr view:*), Bash(gh pr comments:*), Bash(gh api:*), Bash(git log:*), Bash(git branch:*), Bash(cd:*), Bash(pwd:*)
 ---
 
 ## Context
@@ -12,78 +12,58 @@ allowed-tools: Bash(gh pr view:*), Bash(gh pr comments:*), Bash(gh api:*), Bash(
 - Current branch: !`git branch --show-current 2>/dev/null || echo "(not in repo)"`
 - Open PRs: !`cd /Users/zeblith/work/zeblithic/harmony && gh pr list --state open --limit 5 2>/dev/null || echo "(gh not available)"`
 
-**Worktree note:** The review-state script uses the GitHub API with explicit repo paths, so it works from either the main repo or a worktree. Run it from wherever you are.
-
 ## Arguments
 
 PR number (optional): $ARGUMENTS
 
 If no PR number is provided, infer from the current branch's associated PR.
 
-## CRITICAL: Use the Script, Not Manual API Calls
-
-**ALWAYS use `bash scripts/review-state.sh` instead of manual `gh api` calls.**
-
-The script correctly checks ALL three API endpoints where review findings can appear:
-1. `pulls/{number}/reviews` — review summaries (Bugbot posts here; Greptile posts empty bodies here)
-2. `pulls/{number}/comments` — **inline PR review comments** (Greptile posts findings HERE, not in the review body)
-3. `issues/{number}/comments` — PR-level comments (trigger comments, Greptile summary)
-
-Manual `gh api` calls checking only the `reviews` endpoint will MISS Greptile's inline findings because Greptile posts an empty review body and puts all actual findings as inline PR comments on specific lines.
-
-## Multi-Repo PRs
-
-When a bead spans multiple repos (e.g., harmony + harmony-os), check EACH repo's PR separately:
-
-```bash
-# harmony PR
-cd /Users/zeblith/work/zeblithic/harmony
-bash scripts/review-state.sh [PR_NUMBER]
-
-# harmony-os PR (use --repo flag since script lives in harmony repo)
-cd /Users/zeblith/work/zeblithic/harmony-os
-bash /Users/zeblith/work/zeblithic/harmony/scripts/review-state.sh --repo zeblithic/harmony-os [PR_NUMBER]
-
-# harmony-client PR
-cd /Users/zeblith/work/zeblithic/harmony-client
-bash /Users/zeblith/work/zeblithic/harmony/scripts/review-state.sh --repo zeblithic/harmony-client [PR_NUMBER]
-```
-
 ## Review Monitoring Workflow
 
-### 1. Run the review-state script
+### 1. Gather review signals
 
-The script deterministically gathers all review signals and derives the state machine state. It handles pagination and checks both API endpoints.
+Check all three endpoints where review findings appear. **You must check all three** — Greptile posts an empty review body in `reviews` and puts actual findings as inline PR comments in `pulls/{n}/comments`.
 
 ```bash
-bash scripts/review-state.sh [PR_NUMBER]
+# Latest commit on the PR
+gh pr view <number> --json headRefOid,title --jq '{title: .title, sha: .headRefOid}'
+
+# Reviews (Bugbot posts here; Greptile posts empty body here)
+gh api "repos/{owner}/{repo}/pulls/<number>/reviews?per_page=100" --paginate \
+  --jq '.[] | select(.user.login == "cursor[bot]" or .user.login == "greptile-apps[bot]") | {user: .user.login, state: .state, submitted_at: .submitted_at, body: .body[:500]}'
+
+# Inline PR review comments (Greptile findings live HERE)
+gh api "repos/{owner}/{repo}/pulls/<number>/comments?per_page=100" --paginate \
+  --jq '.[] | select(.user.login == "cursor[bot]" or .user.login == "greptile-apps[bot]") | {user: .user.login, path: .path, line: .line, created_at: .created_at, body: .body[:500]}'
+
+# Issue-level comments (trigger comments, Greptile summary)
+gh api "repos/{owner}/{repo}/issues/<number>/comments?per_page=100" --paginate \
+  --jq '.[] | select(.user.login == "cursor[bot]" or .user.login == "greptile-apps[bot]") | {user: .user.login, created_at: .created_at, body: .body[:500]}'
 ```
 
-This script outputs: trigger timestamps, reaction counts, latest responses from each bot, new comment counts, derived state, and recommended action. It also prints any new findings.
+### 2. Determine state
 
-### 2. Parse the script output
+Compare reviewer response timestamps against the latest commit timestamp:
 
-The script output contains ALL findings with full bodies from both reviewers. Parse the output to:
-- Extract the `--- STATE ---` section for the status table
-- Extract all findings from the `--- BUGBOT ---` and `--- GREPTILE ---` sections for the issue summary
-- No additional API calls needed — the script handles pagination and both endpoints (inline PR comments for Bugbot, issue comments for Greptile).
-
-**CRITICAL: Thumbs-up on trigger comments = "completed review", NOT "approved". The script extracts full finding bodies — read them to determine whether there are actionable issues.**
+- **REVIEWS_PENDING**: Reviewers haven't responded yet (or only "eyes" emoji, meaning still working)
+- **PARTIAL_REVIEWS**: One reviewer done, other still pending
+- **REVIEWS_COMPLETE_ALL_CLEAR**: Both reviewers responded, no actionable issues
+- **REVIEWS_COMPLETE_WITH_FEEDBACK**: Both reviewers responded, issues found — summarize them
+- **STALE**: Commits are newer than the latest reviewer response — results are outdated
 
 ### 3. Report
 
-Print a clean status table based on the script output:
+Print a clean status:
 
 ```
 PR:        #<number> — <title>
-Bugbot:    <pending|running|complete (N issues)|stale>
-Greptile:  <pending|running|complete (N issues)|stale>
-State:     <state from script>
-Action:    <action from script>
+Bugbot:    <pending|complete (N issues)|stale>
+Greptile:  <pending|complete (N issues)|stale>
+Action:    <what to do next>
 ```
 
-If REVIEWS_COMPLETE_WITH_FEEDBACK, summarize the specific issues from BOTH reviewers.
+If there are issues, summarize the specific findings from both reviewers.
 
-If the state is REVIEWS_PENDING or PARTIAL_REVIEWS, suggest: "While waiting for reviews, this is a good time to `/compact` if context is getting long."
+If reviews are still pending, suggest: "While waiting, this is a good time to `/compact` if context is getting long."
 
 **STOP HERE. Report the state and recommended action, then yield to the human.**

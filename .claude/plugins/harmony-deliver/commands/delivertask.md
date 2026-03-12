@@ -115,7 +115,6 @@ gh pr comment <pr-number> --body "@greptile"
 > **Waiting for reviews.** The PR is now in `REVIEWS_PENDING` state.
 > - Do NOT push or run `bd` commands — pushing cancels Bugbot.
 > - Use `/monitorreviews` to check review status.
-> - For subsequent fix cycles: `bash scripts/push-and-trigger.sh` handles push + both triggers + test gate in one command.
 > - When reviews are complete and any feedback is addressed, use `/finishtask` to merge.
 > - **Good time to `/compact`** — reviews take a few minutes, reclaim context while waiting.
 

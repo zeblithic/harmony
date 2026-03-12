@@ -278,6 +278,8 @@ pub struct NodeRuntime<B: BlobStore> {
     ticks_since_filter_broadcast: u64,
     // How many ticks between filter broadcasts
     filter_broadcast_interval_ticks: u64,
+    // Coalesces multiple BroadcastFilter actions within a single tick into one publish.
+    pending_filter_broadcast: Option<Vec<u8>>,
 }
 
 impl<B: BlobStore> NodeRuntime<B> {
@@ -370,6 +372,7 @@ impl<B: BlobStore> NodeRuntime<B> {
             node_addr: config.node_addr,
             ticks_since_filter_broadcast: 0,
             filter_broadcast_interval_ticks,
+            pending_filter_broadcast: None,
         };
 
         (rt, actions)
@@ -622,6 +625,13 @@ impl<B: BlobStore> NodeRuntime<B> {
                             None => break,
                         }
                     }
+                    // Flush coalesced filter broadcast — multiple threshold crossings
+                    // within one tick produce only one publish (the latest snapshot).
+                    if let Some(payload) = self.pending_filter_broadcast.take() {
+                        let key_expr =
+                            harmony_zenoh::namespace::filters::content_key(&self.node_addr);
+                        actions.push(RuntimeAction::Publish { key_expr, payload });
+                    }
                     if processed > 0 {
                         self.storage_starved = 0;
                     } else {
@@ -697,9 +707,9 @@ impl<B: BlobStore> NodeRuntime<B> {
                 | StorageTierAction::RemoveFromDisk { .. }
                 | StorageTierAction::DiskLookup { .. } => {}
                 StorageTierAction::BroadcastFilter { payload } => {
-                    let key_expr =
-                        harmony_zenoh::namespace::filters::content_key(&self.node_addr);
-                    out.push(RuntimeAction::Publish { key_expr, payload });
+                    // Buffer the latest filter payload — multiple threshold crossings
+                    // within one tick are coalesced into a single publish at flush time.
+                    self.pending_filter_broadcast = Some(payload);
                     // Reset timer so threshold-triggered broadcasts defer the next
                     // timer-triggered one, avoiding redundant back-to-back rebuilds.
                     self.ticks_since_filter_broadcast = 0;
@@ -1877,5 +1887,55 @@ mod tests {
         rt.tick();
 
         assert_eq!(rt.peer_filter_parse_errors(), 1);
+    }
+
+    #[test]
+    fn filter_broadcasts_coalesced_within_tick() {
+        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::cid::ContentFlags;
+
+        // mutation_threshold=2: every 2 transit events triggers a rebuild.
+        // We'll queue 6 events → would be 3 rebuilds without coalescing.
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig {
+                mutation_threshold: 2,
+                ..FilterBroadcastConfig::default()
+            },
+            node_addr: "coalesce-test".to_string(),
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Queue 6 transit events (each unique CID).
+        for i in 0..6u8 {
+            let data = [i; 16];
+            let cid = ContentId::for_blob(&data, ContentFlags::default()).unwrap();
+            let cid_hex = hex::encode(cid.to_bytes());
+            let key_expr = format!("harmony/content/transit/{cid_hex}");
+            rt.push_event(RuntimeEvent::SubscriptionMessage {
+                key_expr,
+                payload: data.to_vec(),
+            });
+        }
+
+        let actions = rt.tick();
+        // Only ONE Publish with the filter key should appear, not three.
+        let filter_publishes: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::Publish { key_expr, .. }
+                if key_expr.starts_with("harmony/filters/")))
+            .collect();
+        assert_eq!(
+            filter_publishes.len(),
+            1,
+            "expected 1 coalesced filter broadcast, got {}",
+            filter_publishes.len()
+        );
     }
 }

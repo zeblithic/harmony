@@ -1,6 +1,6 @@
 ---
 description: Survey beads and project state to determine what to work on next
-allowed-tools: Bash(bd list:*), Bash(bd show:*), Bash(bd ready:*), Bash(git log:*), Bash(git branch:*), Bash(gh pr list:*), Bash(bash scripts/survey-work.sh:*), Bash(cd:*)
+allowed-tools: Bash(bd list:*), Bash(bd show:*), Bash(bd ready:*), Bash(git log:*), Bash(git branch:*), Bash(gh pr list:*), Bash(cd:*)
 ---
 
 ## Context
@@ -17,13 +17,22 @@ Help determine the most promising next unit of work.
 
 ### 1. Survey available work
 
-Run the survey script to gather all context in one shot:
+Gather context using `bd` and git directly:
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony && bash scripts/survey-work.sh
+cd /Users/zeblith/work/zeblithic/harmony
+
+# Ready beads (unblocked)
+bd ready
+
+# Recent merges for momentum context
+git log --oneline --merges -10
+
+# Open PRs
+gh pr list --state open --limit 10
 ```
 
-This outputs: current state, recent merges, all ready beads with details, and the full bead list. Use this output to understand what's available.
+If specific beads look interesting, `bd show <id>` for details.
 
 ### 2. Assess context
 

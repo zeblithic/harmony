@@ -186,7 +186,7 @@ A peer might receive an announcement for a CID not yet in the sender's latest fi
 | `harmony-content` | `cache.rs` | `iter_admitted()` on `ContentStore` — iterates CIDs in all three LRU segments |
 | `harmony-zenoh` | `namespace.rs` | `filters` module with key patterns and builders |
 | `harmony-node` | `runtime.rs` | `PeerFilterTable`, subscribe to filter broadcasts, filter check before peer dispatch |
-| `harmony-node` | `main.rs` | CLI flags: `--filter-broadcast-interval`, `--filter-mutation-threshold` |
+| `harmony-node` | `main.rs` | CLI flags: `--filter-broadcast-ticks`, `--filter-mutation-threshold` |
 
 ## Non-Goals
 
