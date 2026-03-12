@@ -8,7 +8,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::addr::{
-    Algorithm, PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, NULL_PAGE, PAGES_PER_BOOK, PAGE_SIZE,
+    toc_sentinel_for_algo, Algorithm, PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, NULL_PAGE,
+    PAGES_PER_BOOK, PAGE_SIZE,
 };
 
 /// Error when constructing or reassembling a Book.
@@ -156,7 +157,9 @@ impl Book {
             let section_offset = algo_idx * PAGES_PER_BOOK * 4;
             for page_idx in 0..PAGES_PER_BOOK {
                 let entry_offset = section_offset + page_idx * 4;
-                let value = if page_idx < self.pages.len() {
+                let value = if self.self_indexing && page_idx == 0 {
+                    toc_sentinel_for_algo(algo_idx as u8)
+                } else if page_idx < self.pages.len() {
                     self.pages[page_idx][algo_idx].0
                 } else {
                     NULL_PAGE
@@ -211,6 +214,10 @@ impl Book {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::addr::{
+        is_toc_sentinel, toc_sentinel_for_algo, SELF_INDEX_SENTINEL_00,
+    };
 
     fn test_cid() -> [u8; 32] {
         crate::hash::sha256_hash(b"test book cid")
@@ -492,5 +499,94 @@ mod tests {
         // Second page: first 100 bytes 0xBB, rest 0x00
         assert!(page_bufs[1][..100].iter().all(|&b| b == 0xBB));
         assert!(page_bufs[1][100..].iter().all(|&b| b == 0x00));
+    }
+
+    #[test]
+    fn self_indexing_toc_has_sentinels_at_position_zero() {
+        let data = vec![0xAAu8; PAGE_SIZE * 2];
+        let raw_book = Book::from_blob(test_cid(), &data).unwrap();
+        // Manually build a self-indexing book to test toc()
+        let mut pages = Vec::with_capacity(3);
+        pages.push([PageAddr(NULL_PAGE); ALGO_COUNT]); // placeholder at page 0
+        pages.extend_from_slice(&raw_book.pages);
+        let si_book = Book {
+            cid: test_cid(),
+            pages,
+            blob_size: data.len() as u32,
+            self_indexing: true,
+        };
+        let toc = si_book.toc();
+        for algo_idx in 0..ALGO_COUNT {
+            let offset = algo_idx * PAGES_PER_BOOK * 4;
+            let value = u32::from_le_bytes([
+                toc[offset],
+                toc[offset + 1],
+                toc[offset + 2],
+                toc[offset + 3],
+            ]);
+            assert!(
+                is_toc_sentinel(value),
+                "section {algo_idx}, pos 0: expected sentinel, got {value:#010x}"
+            );
+            assert_eq!(value, toc_sentinel_for_algo(algo_idx as u8));
+        }
+    }
+
+    #[test]
+    fn self_indexing_toc_data_pages_at_correct_positions() {
+        let data = vec![0xBBu8; PAGE_SIZE * 2];
+        let raw_book = Book::from_blob(test_cid(), &data).unwrap();
+        let mut pages = Vec::with_capacity(3);
+        pages.push([PageAddr(NULL_PAGE); ALGO_COUNT]);
+        pages.extend_from_slice(&raw_book.pages);
+        let si_book = Book {
+            cid: test_cid(),
+            pages,
+            blob_size: data.len() as u32,
+            self_indexing: true,
+        };
+        let toc = si_book.toc();
+        for algo_idx in 0..ALGO_COUNT {
+            for data_page in 0..2 {
+                let toc_pos = data_page + 1;
+                let offset = algo_idx * PAGES_PER_BOOK * 4 + toc_pos * 4;
+                let value = u32::from_le_bytes([
+                    toc[offset],
+                    toc[offset + 1],
+                    toc[offset + 2],
+                    toc[offset + 3],
+                ]);
+                let expected = raw_book.pages[data_page][algo_idx].0;
+                assert_eq!(value, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn self_indexing_toc_unused_entries_are_null() {
+        let data = vec![0xCCu8; PAGE_SIZE];
+        let raw_book = Book::from_blob(test_cid(), &data).unwrap();
+        let mut pages = Vec::with_capacity(2);
+        pages.push([PageAddr(NULL_PAGE); ALGO_COUNT]);
+        pages.extend_from_slice(&raw_book.pages);
+        let si_book = Book {
+            cid: test_cid(),
+            pages,
+            blob_size: data.len() as u32,
+            self_indexing: true,
+        };
+        let toc = si_book.toc();
+        for algo_idx in 0..ALGO_COUNT {
+            for page_idx in 2..PAGES_PER_BOOK {
+                let offset = algo_idx * PAGES_PER_BOOK * 4 + page_idx * 4;
+                let value = u32::from_le_bytes([
+                    toc[offset],
+                    toc[offset + 1],
+                    toc[offset + 2],
+                    toc[offset + 3],
+                ]);
+                assert_eq!(value, NULL_PAGE);
+            }
+        }
     }
 }
