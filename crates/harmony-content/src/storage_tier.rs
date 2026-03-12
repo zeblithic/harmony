@@ -2,7 +2,7 @@
 
 use crate::blob::BlobStore;
 use crate::cache::ContentStore;
-use crate::cid::ContentId;
+use crate::cid::{ContentClass, ContentId};
 use alloc::{
     string::{String, ToString},
     vec,
@@ -216,9 +216,23 @@ impl<B: BlobStore> StorageTier<B> {
         }
     }
 
+    /// Check whether a CID's content class is admissible under the current policy.
+    fn class_admits(&self, cid: &ContentId) -> bool {
+        match cid.content_class() {
+            ContentClass::EncryptedEphemeral => false,
+            ContentClass::EncryptedDurable => self.policy.encrypted_durable_persist,
+            ContentClass::PublicDurable | ContentClass::PublicEphemeral => true,
+        }
+    }
+
     fn handle_transit(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
         // Transit comes from untrusted peers — verify CID matches data hash.
         if !Self::verify_cid(&cid, &data) {
+            self.metrics.transit_rejected += 1;
+            return vec![];
+        }
+        // Class-based admission: reject content classes forbidden by policy.
+        if !self.class_admits(&cid) {
             self.metrics.transit_rejected += 1;
             return vec![];
         }
@@ -241,6 +255,11 @@ impl<B: BlobStore> StorageTier<B> {
     fn handle_publish(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
         // Publish comes from local apps — still verify as defense-in-depth.
         if !Self::verify_cid(&cid, &data) {
+            self.metrics.publishes_rejected += 1;
+            return vec![];
+        }
+        // Class-based admission: reject content classes forbidden by policy.
+        if !self.class_admits(&cid) {
             self.metrics.publishes_rejected += 1;
             return vec![];
         }
@@ -679,6 +698,91 @@ mod tests {
             }
             other => panic!("expected DeclareSubscribers, got {other:?}"),
         }
+    }
+
+    fn make_tier_with_policy(policy: ContentPolicy) -> StorageTier<MemoryBlobStore> {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy);
+        tier
+    }
+
+    fn cid_with_class(data: &[u8], encrypted: bool, ephemeral: bool) -> (ContentId, Vec<u8>) {
+        let flags = crate::cid::ContentFlags {
+            encrypted,
+            ephemeral,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(data, flags).unwrap();
+        (cid, data.to_vec())
+    }
+
+    #[test]
+    fn transit_rejects_encrypted_ephemeral() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, data) = cid_with_class(b"secret stream", true, true);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert!(actions.is_empty());
+        assert_eq!(tier.metrics().transit_rejected, 1);
+    }
+
+    #[test]
+    fn publish_rejects_encrypted_ephemeral() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, data) = cid_with_class(b"secret stream", true, true);
+        let actions = tier.handle(StorageTierEvent::PublishContent { cid, data });
+        assert!(actions.is_empty());
+        assert_eq!(tier.metrics().publishes_rejected, 1);
+    }
+
+    #[test]
+    fn transit_rejects_encrypted_durable_when_policy_off() {
+        let policy = ContentPolicy {
+            encrypted_durable_persist: false,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"encrypted file", true, false);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert!(actions.is_empty());
+        assert_eq!(tier.metrics().transit_rejected, 1);
+    }
+
+    #[test]
+    fn transit_admits_encrypted_durable_when_policy_on() {
+        let policy = ContentPolicy {
+            encrypted_durable_persist: true,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"encrypted file", true, false);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::AnnounceContent { .. }
+        ));
+        assert_eq!(tier.metrics().transit_stored, 1);
+    }
+
+    #[test]
+    fn transit_admits_public_durable() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, data) = cid_with_class(b"public doc", false, false);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert_eq!(actions.len(), 1);
+        assert_eq!(tier.metrics().transit_stored, 1);
+    }
+
+    #[test]
+    fn transit_admits_public_ephemeral() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, data) = cid_with_class(b"live stream", false, true);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert_eq!(actions.len(), 1);
+        assert_eq!(tier.metrics().transit_stored, 1);
     }
 
     #[test]
