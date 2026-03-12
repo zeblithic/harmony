@@ -1071,25 +1071,51 @@ mod tests {
 
     #[test]
     fn content_query_miss_on_disk_emits_disk_lookup() {
-        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        // Small cache to make eviction easy.
+        let budget = StorageBudget {
+            cache_capacity: 3,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
         let (cid, data) = cid_with_class(b"durable on disk", false, false);
 
-        // Store via transit — this adds to disk_index.
+        // Store via transit — adds to cache + disk_index.
         tier.handle(StorageTierEvent::TransitContent {
             cid,
             data: data.clone(),
         });
 
-        // Verify the DiskReadComplete -> SendReply path works.
-        let actions = tier.handle(StorageTierEvent::DiskReadComplete {
-            cid,
-            query_id: 99,
-            data: data.clone(),
-        });
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
-            StorageTierAction::SendReply { query_id: 99, .. }
-        ));
+        // Flood cache to evict original CID.
+        for i in 0..10 {
+            let filler = format!("filler-{i}");
+            let (filler_cid, filler_data) = cid_with_class(filler.as_bytes(), false, false);
+            tier.handle(StorageTierEvent::TransitContent {
+                cid: filler_cid,
+                data: filler_data,
+            });
+        }
+
+        // Query original CID — should miss cache but find in disk_index → DiskLookup.
+        let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 77, cid });
+        let disk_lookups: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, StorageTierAction::DiskLookup { .. }))
+            .collect();
+        assert_eq!(
+            disk_lookups.len(),
+            1,
+            "cache miss for disk-indexed CID should emit DiskLookup, got: {actions:?}"
+        );
+        match &disk_lookups[0] {
+            StorageTierAction::DiskLookup {
+                cid: lookup_cid,
+                query_id,
+            } => {
+                assert_eq!(*lookup_cid, cid);
+                assert_eq!(*query_id, 77);
+            }
+            _ => unreachable!(),
+        }
     }
 }

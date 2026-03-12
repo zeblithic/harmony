@@ -150,6 +150,13 @@ impl<S: BlobStore> ContentStore<S> {
     /// promotion from probation to protected) should prefer this over the
     /// trait `get()`.
     pub fn get_and_record(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
+        // Only return data for CIDs tracked in W-TinyLFU segments.
+        // The backing store may still hold data for evicted CIDs
+        // (store_remove is a no-op for MemoryBlobStore), so checking
+        // admission status prevents stale hits.
+        if !self.is_admitted(cid) {
+            return None;
+        }
         let data = self.store.get(cid).map(|b| b.to_vec())?;
         self.record_access(cid);
         Some(data)
