@@ -27,6 +27,8 @@ pub struct NodeConfig {
     pub compute_budget: InstructionBudget,
     /// Per-tick scheduling strategy for the three-tier event loop.
     pub schedule: TierSchedule,
+    /// Content acceptance / announcement policy.
+    pub content_policy: ContentPolicy,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -82,6 +84,7 @@ impl Default for NodeConfig {
             },
             compute_budget: InstructionBudget { fuel: 100_000 },
             schedule: TierSchedule::default(),
+            content_policy: ContentPolicy::default(),
         }
     }
 }
@@ -212,7 +215,7 @@ impl<B: BlobStore> NodeRuntime<B> {
         let mut queryable_router = QueryableRouter::new();
 
         let (storage, storage_startup) =
-            StorageTier::new(store, config.storage_budget, ContentPolicy::default());
+            StorageTier::new(store, config.storage_budget, config.content_policy);
 
         let mut actions = Vec::new();
         let mut storage_queryable_ids = HashSet::new();
@@ -1617,5 +1620,26 @@ mod tests {
         // After tick drains them all, fuel should recover
         rt.tick();
         assert_eq!(rt.effective_fuel(), 1000);
+    }
+
+    #[test]
+    fn runtime_uses_content_policy() {
+        use harmony_content::blob::MemoryBlobStore;
+
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy {
+                encrypted_durable_persist: true,
+                encrypted_durable_announce: true,
+                public_ephemeral_announce: false,
+            },
+        };
+        let (rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        assert_eq!(rt.storage_queue_len(), 0);
     }
 }
