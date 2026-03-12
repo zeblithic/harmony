@@ -12,6 +12,18 @@ use crate::addr::{
     PAGES_PER_BOOK, PAGE_SIZE, SELF_INDEXING_MAX_DATA_SIZE,
 };
 
+/// Classifies how a Book's pages are structured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookType {
+    /// No embedded metadata. All pages are data.
+    Raw,
+    /// Page 0 is a table-of-contents (00 sentinel). Pages 1-255 are data.
+    SelfIndexing,
+    /// Pages 0..metadata_pages carry encrypted book metadata (11 sentinel).
+    /// Remaining pages are encrypted data.
+    Encrypted { metadata_pages: u8 },
+}
+
 /// Error when constructing or reassembling a Book.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BookError {
@@ -42,8 +54,8 @@ pub struct Book {
     pub pages: Vec<[PageAddr; ALGO_COUNT]>,
     /// Actual byte count of the original blob (at most 1MB).
     pub blob_size: u32,
-    /// When true, page 0 is an embedded Table of Contents.
-    pub self_indexing: bool,
+    /// How this book's pages are structured.
+    pub book_type: BookType,
 }
 
 impl Book {
@@ -63,7 +75,7 @@ impl Book {
                 cid,
                 pages: Vec::new(),
                 blob_size: 0,
-                self_indexing: false,
+                book_type: BookType::Raw,
             });
         }
 
@@ -98,7 +110,7 @@ impl Book {
             cid,
             pages,
             blob_size: data.len() as u32,
-            self_indexing: false,
+            book_type: BookType::Raw,
         })
     }
 
@@ -109,22 +121,35 @@ impl Book {
 
     /// Whether this book embeds its ToC at page 0.
     pub fn is_self_indexing(&self) -> bool {
-        self.self_indexing
+        matches!(self.book_type, BookType::SelfIndexing)
     }
 
-    /// Number of data pages (excludes the ToC page for self-indexing books).
-    pub fn data_page_count(&self) -> usize {
-        if self.self_indexing {
-            self.pages.len().saturating_sub(1)
-        } else {
-            self.pages.len()
+    /// Whether this book carries encrypted metadata pages.
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.book_type, BookType::Encrypted { .. })
+    }
+
+    /// Number of overhead (non-data) pages at the start of the book.
+    fn overhead_pages(&self) -> usize {
+        match self.book_type {
+            BookType::Raw => 0,
+            BookType::SelfIndexing => 1,
+            BookType::Encrypted { metadata_pages } => metadata_pages as usize,
         }
     }
 
-    /// Slice of data page addresses (excludes ToC for self-indexing books).
+    /// Number of data pages (excludes overhead pages).
+    pub fn data_page_count(&self) -> usize {
+        self.pages.len().saturating_sub(self.overhead_pages())
+    }
+
+    /// Slice of data page addresses (excludes overhead pages).
     pub fn data_pages(&self) -> &[[PageAddr; ALGO_COUNT]] {
-        if self.self_indexing && !self.pages.is_empty() {
-            &self.pages[1..]
+        let skip = self.overhead_pages();
+        if skip > 0 && self.pages.len() > skip {
+            &self.pages[skip..]
+        } else if skip > 0 {
+            &[]
         } else {
             &self.pages
         }
@@ -132,7 +157,7 @@ impl Book {
 
     /// Returns the ToC page bytes if this is a self-indexing book.
     pub fn toc_page(&self) -> Option<Vec<u8>> {
-        if self.self_indexing {
+        if self.is_self_indexing() {
             Some(self.toc())
         } else {
             None
@@ -157,7 +182,7 @@ impl Book {
             let section_offset = algo_idx * PAGES_PER_BOOK * 4;
             for page_idx in 0..PAGES_PER_BOOK {
                 let entry_offset = section_offset + page_idx * 4;
-                let value = if self.self_indexing && page_idx == 0 {
+                let value = if self.is_self_indexing() && page_idx == 0 {
                     toc_sentinel_for_algo(algo_idx as u8)
                 } else if page_idx < self.pages.len() {
                     self.pages[page_idx][algo_idx].0
@@ -182,7 +207,7 @@ impl Book {
             "data length does not match blob_size"
         );
         let mut pages = Vec::new();
-        if self.self_indexing {
+        if self.is_self_indexing() {
             pages.push(self.toc());
         }
         for chunk in data.chunks(PAGE_SIZE) {
@@ -270,7 +295,7 @@ impl Book {
             cid,
             pages,
             blob_size: data.len() as u32,
-            self_indexing: true,
+            book_type: BookType::SelfIndexing,
         })
     }
 
@@ -309,7 +334,7 @@ impl Book {
     pub fn reassemble(&self, fetch: impl Fn(u8) -> Option<Vec<u8>>) -> Result<Vec<u8>, BookError> {
         let mut result = Vec::with_capacity(self.blob_size as usize);
 
-        let start = if self.self_indexing { 1 } else { 0 };
+        let start = self.overhead_pages();
         for i in start..self.pages.len() {
             let page_data = fetch(i as u8).ok_or(BookError::MissingPage {
                 page_index: i as u8,
@@ -628,7 +653,7 @@ mod tests {
             cid: test_cid(),
             pages,
             blob_size: data.len() as u32,
-            self_indexing: true,
+            book_type: BookType::SelfIndexing,
         };
         let toc = si_book.toc();
         for algo_idx in 0..ALGO_COUNT {
@@ -658,7 +683,7 @@ mod tests {
             cid: test_cid(),
             pages,
             blob_size: data.len() as u32,
-            self_indexing: true,
+            book_type: BookType::SelfIndexing,
         };
         let toc = si_book.toc();
         for algo_idx in 0..ALGO_COUNT {
@@ -688,7 +713,7 @@ mod tests {
             cid: test_cid(),
             pages,
             blob_size: data.len() as u32,
-            self_indexing: true,
+            book_type: BookType::SelfIndexing,
         };
         let toc = si_book.toc();
         for algo_idx in 0..ALGO_COUNT {

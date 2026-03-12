@@ -2,7 +2,7 @@
 //! Volume — partition tree node for the Encyclopedia.
 
 use crate::addr::{PageAddr, ALGO_COUNT};
-use crate::athenaeum::{Book, BookError};
+use crate::athenaeum::{Book, BookError, BookType};
 use alloc::vec::Vec;
 
 /// Maximum partition depth (SHA-256 bits 28-255 = 228 usable bits).
@@ -239,8 +239,8 @@ impl Volume {
 ///   32 bytes: cid
 ///    4 bytes: blob_size (u32 LE)
 ///    2 bytes: page_count (u16 LE)
-///    1 byte:  flags (bit 0 = self_indexing)
-///    1 byte:  reserved (0)
+///    1 byte:  flags (bits 0-1 = book_type: 00=Raw, 01=SelfIndexing, 10=Encrypted)
+///    1 byte:  metadata_pages (for Encrypted books; 0 otherwise)
 ///   For each page (page_count entries):
 ///     4 × 4 bytes: PageAddr.0 for each algorithm variant (u32 LE) = 16 bytes per page
 /// ```
@@ -252,8 +252,16 @@ fn serialize_book(book: &Book) -> Vec<u8> {
     buf.extend_from_slice(&book.cid);
     buf.extend_from_slice(&book.blob_size.to_le_bytes());
     buf.extend_from_slice(&(pc as u16).to_le_bytes());
-    let flags: u8 = if book.self_indexing { 1 } else { 0 };
-    buf.extend_from_slice(&[flags, 0u8]); // flags + reserved
+    let flags: u8 = match book.book_type {
+        BookType::Raw => 0b00,
+        BookType::SelfIndexing => 0b01,
+        BookType::Encrypted { .. } => 0b10,
+    };
+    let metadata_byte = match book.book_type {
+        BookType::Encrypted { metadata_pages } => metadata_pages,
+        _ => 0u8,
+    };
+    buf.extend_from_slice(&[flags, metadata_byte]);
 
     for page_addrs in &book.pages {
         for addr in page_addrs {
@@ -286,18 +294,30 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
         return Err(BookError::BadFormat);
     }
 
-    let self_indexing = (data[38] & 0x01) != 0;
-    // data[39] = reserved, skip
+    let type_bits = data[38] & 0x03;
+    let book_type = match type_bits {
+        0b00 => BookType::Raw,
+        0b01 => BookType::SelfIndexing,
+        0b10 => BookType::Encrypted {
+            metadata_pages: data[39],
+        },
+        _ => return Err(BookError::BadFormat),
+    };
 
-    // Self-indexing books must have at least 1 page (the ToC).
-    if self_indexing && page_count == 0 {
+    // Compute overhead pages for validation.
+    let overhead = match book_type {
+        BookType::Raw => 0,
+        BookType::SelfIndexing => 1,
+        BookType::Encrypted { metadata_pages } => metadata_pages as usize,
+    };
+
+    // Books with overhead must have at least that many pages.
+    if overhead > 0 && page_count < overhead {
         return Err(BookError::BadFormat);
     }
 
     // blob_size must be consistent with data capacity.
-    // Self-indexing books reserve page 0 for the ToC, so data capacity
-    // is (page_count - 1) pages; raw books use all pages.
-    let data_pages = if self_indexing { page_count - 1 } else { page_count };
+    let data_pages = page_count - overhead;
     if blob_size as usize > data_pages * crate::addr::PAGE_SIZE {
         return Err(BookError::BadFormat);
     }
@@ -334,7 +354,7 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
         cid,
         pages,
         blob_size,
-        self_indexing,
+        book_type,
     })
 }
 

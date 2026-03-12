@@ -20,7 +20,7 @@ pub use addr::{
     SELF_INDEXING_MAX_DATA_SIZE, SELF_INDEX_SENTINELS, SELF_INDEX_SENTINEL_00,
     SELF_INDEX_SENTINEL_01, SELF_INDEX_SENTINEL_10, SELF_INDEX_SENTINEL_11,
 };
-pub use athenaeum::{Book, BookError};
+pub use athenaeum::{Book, BookError, BookType};
 pub use encyclopedia::{Encyclopedia, SPLIT_THRESHOLD};
 pub use hash::{sha224_hash, sha256_hash};
 pub use volume::{route_chunk, Volume, MAX_PARTITION_DEPTH};
