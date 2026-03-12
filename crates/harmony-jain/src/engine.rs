@@ -199,7 +199,9 @@ impl JainEngine {
 
         // 2. Storage budget check (capacity of 0 means unlimited)
         if self.storage_capacity_bytes > 0
-            && self.total_storage_bytes.saturating_add(candidate.size_bytes)
+            && self
+                .total_storage_bytes
+                .saturating_add(candidate.size_bytes)
                 > self.storage_capacity_bytes
         {
             return IngestDecision::Reject {
@@ -385,7 +387,8 @@ impl JainEngine {
                     licensed: false,
                     pending_local_repair: false,
                 };
-                self.total_storage_bytes = self.total_storage_bytes.saturating_add(entry.size_bytes);
+                self.total_storage_bytes =
+                    self.total_storage_bytes.saturating_add(entry.size_bytes);
                 self.records.insert(entry.cid, record);
             }
         }
@@ -921,7 +924,8 @@ mod tests {
 
     #[test]
     fn tick_emits_storage_near_full_alert() {
-        let mut engine = JainEngine::new(JainConfig::default(), FilterRuleSet::default(), 1000).unwrap();
+        let mut engine =
+            JainEngine::new(JainConfig::default(), FilterRuleSet::default(), 1000).unwrap();
         let cid = make_cid(b"big-content");
         engine.handle_event(ContentEvent::Stored {
             cid,

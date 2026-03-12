@@ -47,8 +47,7 @@ impl JainConfig {
                 self.min_replica_count
             )));
         }
-        if self.access_decay_half_life_secs <= 0.0
-            || !self.access_decay_half_life_secs.is_finite()
+        if self.access_decay_half_life_secs <= 0.0 || !self.access_decay_half_life_secs.is_finite()
         {
             return Err(JainError::InvalidConfig(format!(
                 "access_decay_half_life_secs must be positive and finite, got {}",

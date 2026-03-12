@@ -193,14 +193,15 @@ impl EnrichedSidecar {
         let trailer_len = u32::from_be_bytes(len_bytes) as usize;
 
         let cbor_start = SIDECAR_HEADER_SIZE + 4;
-        let cbor_end = cbor_start.checked_add(trailer_len).ok_or_else(|| {
-            SemanticError::MetadataInvalid {
-                reason: alloc::format!(
-                    "trailer length {} overflows address space",
-                    trailer_len
-                ),
-            }
-        })?;
+        let cbor_end =
+            cbor_start
+                .checked_add(trailer_len)
+                .ok_or_else(|| SemanticError::MetadataInvalid {
+                    reason: alloc::format!(
+                        "trailer length {} overflows address space",
+                        trailer_len
+                    ),
+                })?;
 
         if data.len() < cbor_end {
             return Err(SemanticError::MetadataInvalid {
@@ -422,7 +423,10 @@ mod tests {
                 .expect_err("v2 with no trailer should fail");
             match err {
                 SemanticError::MetadataInvalid { reason } => {
-                    assert!(reason.contains("no CBOR trailer"), "unexpected reason: {reason}");
+                    assert!(
+                        reason.contains("no CBOR trailer"),
+                        "unexpected reason: {reason}"
+                    );
                 }
                 other => panic!("expected MetadataInvalid, got {other:?}"),
             }

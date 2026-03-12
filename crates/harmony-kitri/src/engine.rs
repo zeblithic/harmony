@@ -261,12 +261,12 @@ impl KitriEngine {
                 existing.attempt += 1;
                 let seq = existing.next_seq;
                 existing.next_seq += 1;
-                existing.event_log.append(
-                    crate::event::KitriEvent::WorkflowRestarted {
+                existing
+                    .event_log
+                    .append(crate::event::KitriEvent::WorkflowRestarted {
                         seq,
                         attempt: existing.attempt,
-                    },
-                );
+                    });
                 existing.status = KitriWorkflowStatus::Pending;
                 existing.pending_error = None;
                 return vec![
@@ -470,10 +470,12 @@ impl KitriEngine {
             state.status = KitriWorkflowStatus::Failed;
             let seq = state.next_seq;
             state.next_seq += 1;
-            state.event_log.append(crate::event::KitriEvent::WorkflowFailed {
-                seq,
-                error: error.clone(),
-            });
+            state
+                .event_log
+                .append(crate::event::KitriEvent::WorkflowFailed {
+                    seq,
+                    error: error.clone(),
+                });
             actions.push(KitriAction::PersistEventLog { workflow_id });
             actions.push(KitriAction::Failed { workflow_id, error });
         } else {
@@ -482,10 +484,12 @@ impl KitriEngine {
             state.status = KitriWorkflowStatus::Compensating;
             let seq = state.next_seq;
             state.next_seq += 1;
-            state.event_log.append(crate::event::KitriEvent::CompensationStarted {
-                seq,
-                error: error.clone(),
-            });
+            state
+                .event_log
+                .append(crate::event::KitriEvent::CompensationStarted {
+                    seq,
+                    error: error.clone(),
+                });
             state.pending_error = Some(error);
             // WAL invariant: persist CompensationStarted BEFORE dispatching
             // any ExecuteCompensator action. If the process crashes after a
@@ -1511,9 +1515,10 @@ mod tests {
         // Verify the event log contains the restart boundary.
         let state = engine.workflows.get(&wf_id).unwrap();
         let events = state.event_log.events();
-        assert!(events.iter().any(
-            |e| matches!(e, crate::event::KitriEvent::WorkflowRestarted { attempt: 1, .. })
-        ));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            crate::event::KitriEvent::WorkflowRestarted { attempt: 1, .. }
+        )));
 
         // Fail and retry again — attempt should increment.
         engine.handle(KitriEngineEvent::WorkflowFailed {
@@ -1524,9 +1529,10 @@ mod tests {
 
         let state = engine.workflows.get(&wf_id).unwrap();
         let events = state.event_log.events();
-        assert!(events.iter().any(
-            |e| matches!(e, crate::event::KitriEvent::WorkflowRestarted { attempt: 2, .. })
-        ));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            crate::event::KitriEvent::WorkflowRestarted { attempt: 2, .. }
+        )));
     }
 
     #[test]
@@ -1586,10 +1592,7 @@ mod tests {
         assert_eq!(log.last_checkpoint(), Some((3, [0xAA; 32])));
 
         // Restart boundary.
-        log.append(crate::event::KitriEvent::WorkflowRestarted {
-            seq: 6,
-            attempt: 1,
-        });
+        log.append(crate::event::KitriEvent::WorkflowRestarted { seq: 6, attempt: 1 });
 
         // After restart, attempt 1's checkpoint is stale — not returned.
         assert_eq!(log.last_checkpoint(), None);

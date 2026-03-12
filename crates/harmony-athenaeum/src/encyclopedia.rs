@@ -10,7 +10,7 @@ use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use crate::addr::{PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, PAGE_SIZE};
-use crate::athenaeum::{Book, BookError};
+use crate::athenaeum::{Book, BookError, BookType};
 use crate::hash::sha256_hash;
 use crate::volume::{route_chunk, Volume, MAX_PARTITION_DEPTH};
 
@@ -269,7 +269,7 @@ impl Encyclopedia {
                 cid: original_book.cid,
                 pages: new_pages,
                 blob_size: partial_size,
-                self_indexing: false,
+                book_type: BookType::Raw,
             });
         }
 
