@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 use core::convert::TryFrom;
 
 use ml_dsa::{
-    EncodedVerifyingKey, KeyGen, MlDsa65,
     signature::{Signer, Verifier},
+    EncodedVerifyingKey, KeyGen, MlDsa65,
 };
 use rand_core::CryptoRngCore;
 use zeroize::Zeroize;
@@ -97,6 +97,14 @@ impl MlDsaSecretKey {
     fn to_signing_key(&self) -> ml_dsa::SigningKey<MlDsa65> {
         let seed_arr = ml_dsa::B32::from(self.seed);
         ml_dsa::SigningKey::<MlDsa65>::from_seed(&seed_arr)
+    }
+
+    /// Derive the corresponding public (verifying) key.
+    pub fn public_key(&self) -> MlDsaPublicKey {
+        let signing_key = self.to_signing_key();
+        MlDsaPublicKey {
+            inner: signing_key.verifying_key().clone(),
+        }
     }
 }
 

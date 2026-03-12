@@ -7,10 +7,7 @@
 
 use alloc::vec::Vec;
 
-use ml_kem::{
-    Decapsulate, KeyExport, MlKem768,
-    array::Array,
-};
+use ml_kem::{array::Array, Decapsulate, KeyExport, MlKem768};
 use rand_core::CryptoRngCore;
 use zeroize::Zeroize;
 
@@ -89,6 +86,13 @@ impl MlKemSecretKey {
         })?;
         let inner = ml_kem::DecapsulationKey::<MlKem768>::from_seed(seed);
         Ok(Self { inner })
+    }
+
+    /// Derive the corresponding public (encapsulation) key.
+    pub fn public_key(&self) -> MlKemPublicKey {
+        MlKemPublicKey {
+            inner: self.inner.encapsulation_key().clone(),
+        }
     }
 }
 
@@ -175,8 +179,8 @@ pub fn decapsulate(
     sk: &MlKemSecretKey,
     ct: &MlKemCiphertext,
 ) -> Result<MlKemSharedSecret, CryptoError> {
-    let ct_arr = Array::try_from(ct.bytes.as_slice())
-        .map_err(|_| CryptoError::MlKemDecapsulationFailed)?;
+    let ct_arr =
+        Array::try_from(ct.bytes.as_slice()).map_err(|_| CryptoError::MlKemDecapsulationFailed)?;
     let ss = sk.inner.decapsulate(&ct_arr);
     let mut ss_bytes = [0u8; SS_LENGTH];
     ss_bytes.copy_from_slice(ss.as_slice());

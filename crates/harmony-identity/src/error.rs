@@ -7,6 +7,12 @@ pub enum IdentityError {
     #[error("invalid private key length: expected 64 bytes, got {0}")]
     InvalidPrivateKeyLength(usize),
 
+    #[error("invalid PQ public key length: expected 3136 bytes, got {0}")]
+    InvalidPqPublicKeyLength(usize),
+
+    #[error("invalid PQ private key length: expected 96 bytes, got {0}")]
+    InvalidPqPrivateKeyLength(usize),
+
     #[error("invalid Ed25519 verifying key")]
     InvalidVerifyingKey,
 
