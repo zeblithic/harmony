@@ -19,6 +19,13 @@ const SEED_B: u64 = 0xBF58476D1CE4E5B9;
 /// Size of the serialization header in bytes: num_bits (4) + num_hashes (4) + item_count (4).
 const HEADER_SIZE: usize = 12;
 
+/// Maximum allowed `num_hashes` (k) in a deserialized filter.
+///
+/// Optimal k for any practical false positive rate is under 25. Capping at 100
+/// prevents CPU-intensive filters from untrusted peers (a malicious broadcast
+/// with `num_hashes = u32::MAX` would cause ~4 billion iterations in `may_contain`).
+const MAX_HASHES: u32 = 100;
+
 /// Errors that can occur when deserializing a [`BloomFilter`] from bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterError {
@@ -35,6 +42,13 @@ pub enum FilterError {
     ZeroBits,
     /// `num_hashes` in the header is zero.
     ZeroHashes,
+    /// `num_hashes` exceeds the maximum allowed value.
+    TooManyHashes {
+        /// The value found in the header.
+        got: u32,
+        /// The maximum allowed value.
+        max: u32,
+    },
 }
 
 impl fmt::Display for FilterError {
@@ -46,6 +60,9 @@ impl fmt::Display for FilterError {
             }
             FilterError::ZeroBits => write!(f, "num_bits must be non-zero"),
             FilterError::ZeroHashes => write!(f, "num_hashes must be non-zero"),
+            FilterError::TooManyHashes { got, max } => {
+                write!(f, "num_hashes {got} exceeds maximum {max}")
+            }
         }
     }
 }
@@ -102,6 +119,11 @@ impl BloomFilter {
 
         // m = -n * ln(p) / (ln2)^2
         let m = -n * libm::log(fp_rate) / ln2_sq;
+        assert!(
+            m <= u32::MAX as f64,
+            "Bloom filter requires {} bits which exceeds u32::MAX; reduce expected_items or increase fp_rate",
+            m as u64,
+        );
         let num_bits = m.ceil() as u32;
 
         // k = (m / n) * ln2
@@ -141,7 +163,7 @@ impl BloomFilter {
             let idx = bit_index(h1, h2, i, self.num_bits);
             self.set_bit(idx);
         }
-        self.item_count += 1;
+        self.item_count = self.item_count.saturating_add(1);
     }
 
     /// Test whether a content ID *may* be in the filter.
@@ -225,6 +247,12 @@ impl BloomFilter {
         }
         if num_hashes == 0 {
             return Err(FilterError::ZeroHashes);
+        }
+        if num_hashes > MAX_HASHES {
+            return Err(FilterError::TooManyHashes {
+                got: num_hashes,
+                max: MAX_HASHES,
+            });
         }
 
         let num_words = (num_bits as usize).div_ceil(64);
@@ -473,5 +501,30 @@ mod tests {
     fn estimated_count_zero_for_empty() {
         let bf = BloomFilter::new(1000, 0.01);
         assert_eq!(bf.estimated_count(), 0);
+    }
+
+    #[test]
+    fn from_bytes_rejects_excessive_num_hashes() {
+        // Craft a header with num_hashes > MAX_HASHES.
+        let mut header = Vec::new();
+        header.extend_from_slice(&64u32.to_be_bytes()); // num_bits = 64
+        header.extend_from_slice(&101u32.to_be_bytes()); // num_hashes = 101 > MAX_HASHES
+        header.extend_from_slice(&0u32.to_be_bytes()); // item_count = 0
+        header.extend_from_slice(&0u64.to_le_bytes()); // 1 word for 64 bits
+        let err = BloomFilter::from_bytes(&header).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::TooManyHashes {
+                got: 101,
+                max: super::MAX_HASHES,
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds u32::MAX")]
+    fn new_panics_on_bit_count_overflow() {
+        // 500_000_000 items at 0.001 FP rate needs ~7.2 billion bits > u32::MAX.
+        BloomFilter::new(500_000_000, 0.001);
     }
 }

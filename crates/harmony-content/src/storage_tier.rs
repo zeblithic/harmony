@@ -1672,7 +1672,7 @@ mod tests {
 
         let mut tier = make_tier_with_policy(ContentPolicy::default());
 
-        // Publish a PublicDurable item.
+        // Publish a PublicDurable item (goes through normal admission).
         let pub_data = b"public durable item";
         let (pub_cid, pub_vec) = cid_with_class(pub_data, false, false);
         tier.handle(StorageTierEvent::PublishContent {
@@ -1680,29 +1680,33 @@ mod tests {
             data: pub_vec,
         });
 
+        // Inject an EncryptedEphemeral CID directly into the cache,
+        // bypassing the class_admits gate in handle_transit/handle_publish.
+        // This exercises the class_admits check inside rebuild_filter.
+        let (ee_cid, ee_data) = cid_with_class(b"encrypted ephemeral", true, true);
+        tier.cache_mut().store_preadmitted(ee_cid, ee_data);
+
         // Trigger filter rebuild via FilterTimerTick.
         let actions = tier.handle(StorageTierEvent::FilterTimerTick);
         assert_eq!(actions.len(), 1);
 
-        // Deserialize the filter from the BroadcastFilter payload.
         let payload = match &actions[0] {
             StorageTierAction::BroadcastFilter { payload } => payload,
             other => panic!("expected BroadcastFilter, got {other:?}"),
         };
         let filter = BloomFilter::from_bytes(payload).unwrap();
 
-        // Verify the PublicDurable CID is in the filter.
+        // PublicDurable CID should be in the filter.
         assert!(
             filter.may_contain(&pub_cid),
             "PublicDurable CID should be in the filter"
         );
 
-        // Create an EncryptedEphemeral CID and verify it's NOT in the filter
-        // (even if somehow in the cache, class_admits would exclude it).
-        let (ee_cid, _) = cid_with_class(b"encrypted ephemeral", true, true);
+        // EncryptedEphemeral CID is in the cache but class_admits excludes
+        // it from the filter rebuild — this is the actual behavioral guarantee.
         assert!(
             !filter.may_contain(&ee_cid),
-            "EncryptedEphemeral CID should not be in the filter"
+            "EncryptedEphemeral CID should be excluded by class_admits"
         );
     }
 

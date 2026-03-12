@@ -164,11 +164,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err("--cache-capacity must be > 0".into());
             }
 
-            if cache_capacity > u32::MAX as usize {
+            // Bloom filter bit count = expected_items * 14.378 at fp_rate=0.001.
+            // Cap at 200M to stay well within u32::MAX bits (~2.88 billion).
+            const MAX_CACHE_CAPACITY: usize = 200_000_000;
+            if cache_capacity > MAX_CACHE_CAPACITY {
                 return Err(format!(
                     "--cache-capacity {} exceeds maximum {} for Bloom filter sizing",
-                    cache_capacity,
-                    u32::MAX
+                    cache_capacity, MAX_CACHE_CAPACITY,
                 )
                 .into());
             }
@@ -348,11 +350,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_pointer_width = "64")]
     fn cli_rejects_oversized_cache_capacity() {
-        let huge = (u32::MAX as u64 + 1).to_string();
-        let cli =
-            Cli::try_parse_from(["harmony", "run", "--cache-capacity", &huge]).unwrap();
+        // 200_000_001 exceeds MAX_CACHE_CAPACITY (200M).
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--cache-capacity",
+            "200000001",
+        ])
+        .unwrap();
         let result = run(cli);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
