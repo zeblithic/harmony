@@ -190,10 +190,19 @@ impl<S: BlobStore> ContentStore<S> {
             return true;
         }
 
-        // Compare against probation's LRU victim.
-        let freq = self.sketch.estimate(cid);
+        // Compare against probation's LRU victim, factoring in class priority.
+        let candidate_prio = cid.content_class().eviction_priority();
         match self.probation.peek_lru_excluding(&self.pinned) {
-            Some(victim) => freq > self.sketch.estimate(&victim),
+            Some(victim) => {
+                let victim_prio = victim.content_class().eviction_priority();
+                if candidate_prio < victim_prio {
+                    true // higher-value class always admitted
+                } else if candidate_prio > victim_prio {
+                    false // lower-value class always rejected
+                } else {
+                    self.sketch.estimate(cid) > self.sketch.estimate(&victim)
+                }
+            }
             None => true, // All pinned — admit by default.
         }
     }
@@ -290,24 +299,35 @@ impl<S: BlobStore> ContentStore<S> {
             return;
         }
 
-        // Find the first non-pinned victim for the frequency challenge.
+        // Find the first non-pinned victim for the admission challenge.
         let Some(victim) = self.probation.peek_lru_excluding(&self.pinned) else {
             // All probation entries are pinned — drop unpinned candidate.
             self.store_remove(&candidate);
             return;
         };
 
-        let candidate_freq = self.sketch.estimate(&candidate);
-        let victim_freq = self.sketch.estimate(&victim);
+        let candidate_prio = candidate.content_class().eviction_priority();
+        let victim_prio = victim.content_class().eviction_priority();
 
-        if candidate_freq > victim_freq {
-            // Candidate wins — evict victim, admit candidate.
+        if candidate_prio < victim_prio {
+            // Candidate is higher-value class — evict victim regardless of frequency.
             self.probation.remove(&victim);
             self.store_remove(&victim);
             self.probation.insert(candidate);
-        } else {
-            // Victim wins — drop candidate entirely.
+        } else if candidate_prio > victim_prio {
+            // Candidate is lower-value class — drop it regardless of frequency.
             self.store_remove(&candidate);
+        } else {
+            // Same class — fall back to frequency comparison.
+            let candidate_freq = self.sketch.estimate(&candidate);
+            let victim_freq = self.sketch.estimate(&victim);
+            if candidate_freq > victim_freq {
+                self.probation.remove(&victim);
+                self.store_remove(&victim);
+                self.probation.insert(candidate);
+            } else {
+                self.store_remove(&candidate);
+            }
         }
     }
 
@@ -826,6 +846,68 @@ mod tests {
 
         let cid = cs.insert(b"data").unwrap();
         assert!(!cs.pin(cid), "capacity-1 cache cannot pin anything");
+    }
+
+    #[test]
+    fn ephemeral_evicted_before_durable() {
+        // Fill cache with a mix of PublicDurable and PublicEphemeral.
+        // Under pressure, PublicEphemeral items should be evicted first.
+        //
+        // Capacity 5: window=1, protected=1, probation=3.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 5);
+
+        // Insert a PublicDurable item.
+        let durable_flags = ContentFlags {
+            encrypted: false,
+            ephemeral: false,
+            alt_hash: false,
+        };
+        let durable_cid = cs
+            .insert_with_flags(b"durable-data", durable_flags)
+            .unwrap();
+
+        // Insert a PublicEphemeral item.
+        let ephemeral_flags = ContentFlags {
+            encrypted: false,
+            ephemeral: true,
+            alt_hash: false,
+        };
+        let ephemeral_cid = cs
+            .insert_with_flags(b"ephemeral-data", ephemeral_flags)
+            .unwrap();
+
+        // Both should be in cache.
+        assert!(cs.is_admitted(&durable_cid));
+        assert!(cs.is_admitted(&ephemeral_cid));
+
+        // Give both items frequency, but ephemeral gets MORE.
+        // This proves class trumps frequency: ephemeral should still be evicted first.
+        for _ in 0..5 {
+            cs.record_access(&durable_cid);
+        }
+        for _ in 0..10 {
+            cs.record_access(&ephemeral_cid);
+        }
+
+        // Fill cache with PublicDurable pressure items to trigger eviction.
+        // These are same-class as durable_cid, so frequency decides among them.
+        // But when a PublicDurable candidate faces the PublicEphemeral victim,
+        // class priority causes the ephemeral to be evicted regardless of frequency.
+        for i in 0..10 {
+            let data = format!("pressure-{i}");
+            cs.insert(data.as_bytes()).unwrap();
+        }
+
+        // Durable should survive, ephemeral should be evicted (class priority trumps frequency).
+        assert!(
+            cs.is_admitted(&durable_cid),
+            "PublicDurable should survive eviction pressure"
+        );
+        assert!(
+            !cs.is_admitted(&ephemeral_cid),
+            "PublicEphemeral should be evicted before PublicDurable even with higher frequency"
+        );
     }
 
     #[test]

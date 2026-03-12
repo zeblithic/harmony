@@ -30,6 +30,21 @@ pub enum ContentClass {
     EncryptedEphemeral,
 }
 
+impl ContentClass {
+    /// Eviction priority: higher values are evicted first under pressure.
+    ///
+    /// PublicEphemeral (disposable-first) > EncryptedDurable > PublicDurable (most valuable).
+    /// EncryptedEphemeral never enters the cache, so its priority is irrelevant.
+    pub fn eviction_priority(self) -> u8 {
+        match self {
+            ContentClass::PublicEphemeral => 2,
+            ContentClass::EncryptedDurable => 1,
+            ContentClass::PublicDurable => 0,
+            ContentClass::EncryptedEphemeral => u8::MAX, // unreachable in cache
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct ContentFlags {
     pub encrypted: bool,
