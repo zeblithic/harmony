@@ -2,6 +2,7 @@
 extern crate alloc;
 
 pub mod blob;
+pub mod bloom;
 pub mod bundle;
 pub mod cache;
 pub mod chunker;

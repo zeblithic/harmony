@@ -19,3 +19,4 @@ harmony-zenoh.workspace = true
 hashbrown = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+libm = { workspace = true }
