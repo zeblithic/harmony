@@ -163,7 +163,6 @@ pub enum RuntimeAction {
 struct PeerFilter {
     filter: BloomFilter,
     received_tick: u64,
-    item_count: u32,
 }
 
 /// Per-peer Bloom filter table for content query routing.
@@ -191,13 +190,12 @@ impl PeerFilterTable {
         self.parse_errors
     }
 
-    fn upsert(&mut self, peer_addr: String, filter: BloomFilter, item_count: u32, tick: u64) {
+    fn upsert(&mut self, peer_addr: String, filter: BloomFilter, tick: u64) {
         self.filters.insert(
             peer_addr,
             PeerFilter {
                 filter,
                 received_tick: tick,
-                item_count,
             },
         );
     }
@@ -905,11 +903,9 @@ impl<B: BlobStore> NodeRuntime<B> {
             if peer_addr != self.node_addr {
                 match BloomFilter::from_bytes(&payload) {
                     Ok(filter) => {
-                        let item_count = filter.item_count();
                         self.peer_filters.upsert(
                             peer_addr.to_string(),
                             filter,
-                            item_count,
                             self.tick_count,
                         );
                     }
@@ -1821,7 +1817,7 @@ mod tests {
         let cid_in = ContentId::for_blob(b"present", ContentFlags::default()).unwrap();
         let cid_out = ContentId::for_blob(b"absent", ContentFlags::default()).unwrap();
         filter.insert(&cid_in);
-        table.upsert("peer-1".into(), filter, 1, 10);
+        table.upsert("peer-1".into(), filter, 10);
 
         assert!(table.should_query("peer-1", &cid_in, 10));
         assert!(!table.should_query("peer-1", &cid_out, 10));
@@ -1838,7 +1834,7 @@ mod tests {
     fn peer_filter_table_queries_stale_filter() {
         let mut table = PeerFilterTable::new(100);
         let filter = BloomFilter::new(1000, 0.01);
-        table.upsert("peer-1".into(), filter, 0, 10);
+        table.upsert("peer-1".into(), filter, 10);
 
         let cid = ContentId::for_blob(b"test", ContentFlags::default()).unwrap();
         // Fresh filter with no items => definite miss, should NOT query
