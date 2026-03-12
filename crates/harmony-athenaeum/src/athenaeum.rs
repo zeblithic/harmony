@@ -11,6 +11,7 @@ use crate::addr::{
     toc_sentinel_for_algo, Algorithm, PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, NULL_PAGE,
     PAGES_PER_BOOK, PAGE_SIZE, SELF_INDEXING_MAX_DATA_SIZE,
 };
+use crate::encrypted::{EncryptedBookMetadata, ENCRYPTED_SENTINEL};
 
 /// Classifies how a Book's pages are structured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +330,7 @@ impl Book {
     ///
     /// For self-indexing books, page 0 (ToC) is skipped — only data pages
     /// (1..page_count) are fetched. For raw books, all pages are fetched.
+    /// For encrypted books, metadata pages are skipped.
     ///
     /// Pages are concatenated and truncated to `blob_size`.
     pub fn reassemble(&self, fetch: impl Fn(u8) -> Option<Vec<u8>>) -> Result<Vec<u8>, BookError> {
@@ -348,6 +350,132 @@ impl Book {
         result.truncate(self.blob_size as usize);
         Ok(result)
     }
+
+    /// Build an encrypted Book with metadata pages followed by data pages.
+    ///
+    /// The metadata is serialized into sentinel-prefixed pages that occupy
+    /// the first N page slots. Data pages follow. The `blob_size` records
+    /// only the data portion — metadata is structural overhead.
+    pub fn from_blob_encrypted(
+        cid: [u8; 32],
+        data: &[u8],
+        metadata: &EncryptedBookMetadata,
+    ) -> Result<Self, BookError> {
+        let meta_page_count = metadata.pages_needed() as usize;
+        let max_data = (PAGES_PER_BOOK - meta_page_count) * PAGE_SIZE;
+        if data.len() > max_data {
+            return Err(BookError::BlobTooLarge { size: data.len() });
+        }
+
+        let data_page_count = if data.is_empty() {
+            0
+        } else {
+            data.len().div_ceil(PAGE_SIZE)
+        };
+        let total_pages = meta_page_count + data_page_count;
+        let mut pages = Vec::with_capacity(total_pages);
+
+        // Metadata pages: compute PageAddrs from metadata page content
+        let meta_pages = metadata.to_pages();
+        for page_buf in &meta_pages {
+            let variants = [
+                PageAddr::from_data(page_buf, Algorithm::Sha256Msb),
+                PageAddr::from_data(page_buf, Algorithm::Sha256Lsb),
+                PageAddr::from_data(page_buf, Algorithm::Sha224Msb),
+                PageAddr::from_data(page_buf, Algorithm::Sha224Lsb),
+            ];
+            pages.push(variants);
+        }
+
+        // Data pages: compute PageAddrs from data content
+        for (i, chunk) in data.chunks(PAGE_SIZE).enumerate() {
+            let mut page_buf = [0u8; PAGE_SIZE];
+            page_buf[..chunk.len()].copy_from_slice(chunk);
+
+            let variants = [
+                PageAddr::from_data(&page_buf, Algorithm::Sha256Msb),
+                PageAddr::from_data(&page_buf, Algorithm::Sha256Lsb),
+                PageAddr::from_data(&page_buf, Algorithm::Sha224Msb),
+                PageAddr::from_data(&page_buf, Algorithm::Sha224Lsb),
+            ];
+
+            let all_same = variants[1..]
+                .iter()
+                .all(|v| v.hash_bits() == variants[0].hash_bits());
+            if all_same {
+                return Err(BookError::AllAlgorithmsCollide {
+                    page_index: meta_page_count + i,
+                });
+            }
+
+            pages.push(variants);
+        }
+
+        Ok(Book {
+            cid,
+            pages,
+            blob_size: data.len() as u32,
+            book_type: BookType::Encrypted {
+                metadata_pages: metadata.pages_needed(),
+            },
+        })
+    }
+
+    /// Check if raw page data starts with the encrypted book sentinel (0xFFFFFFFC).
+    ///
+    /// This checks the first 4 bytes for the `11` sentinel value, which marks
+    /// encrypted book metadata pages.
+    pub fn is_encrypted_blob(blob: &[u8]) -> bool {
+        if blob.len() < 4 {
+            return false;
+        }
+        let first = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+        first == ENCRYPTED_SENTINEL
+    }
+
+    /// Returns the number of metadata pages (0 for non-encrypted books).
+    pub fn metadata_page_count(&self) -> usize {
+        match self.book_type {
+            BookType::Encrypted { metadata_pages } => metadata_pages as usize,
+            _ => 0,
+        }
+    }
+
+    /// Generate all page data for an encrypted book (metadata + data pages).
+    ///
+    /// Metadata pages are serialized from the provided metadata, and data
+    /// pages are split from the data blob with zero-padding on the last page.
+    pub fn page_data_from_blob_encrypted(
+        &self,
+        data: &[u8],
+        metadata: &EncryptedBookMetadata,
+    ) -> Vec<Vec<u8>> {
+        debug_assert!(
+            self.is_encrypted(),
+            "page_data_from_blob_encrypted called on non-encrypted book"
+        );
+        debug_assert_eq!(
+            data.len(),
+            self.blob_size as usize,
+            "data length does not match blob_size"
+        );
+
+        let mut pages = Vec::new();
+
+        // Metadata pages
+        for page_buf in metadata.to_pages() {
+            pages.push(page_buf.to_vec());
+        }
+
+        // Data pages
+        for chunk in data.chunks(PAGE_SIZE) {
+            let mut page_buf = vec![0u8; PAGE_SIZE];
+            page_buf[..chunk.len()].copy_from_slice(chunk);
+            pages.push(page_buf);
+        }
+
+        pages
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +486,7 @@ mod tests {
         is_toc_sentinel, toc_sentinel_for_algo, SELF_INDEXING_MAX_DATA_SIZE,
         SELF_INDEX_SENTINEL_00,
     };
+    use crate::encrypted::EncryptedBookMetadata;
 
     fn test_cid() -> [u8; 32] {
         crate::hash::sha256_hash(b"test book cid")
@@ -885,5 +1014,196 @@ mod tests {
         let mut almost = vec![0u8; PAGE_SIZE - 1];
         almost[0..4].copy_from_slice(&0x3FFF_FFFFu32.to_le_bytes());
         assert!(!Book::is_self_indexing_blob(&almost));
+    }
+
+    // --- Encrypted book tests ---
+
+    fn sample_encrypted_metadata() -> EncryptedBookMetadata {
+        EncryptedBookMetadata {
+            version: 1,
+            flags: 0,
+            encryption_algo: 0,
+            owner_public_key: vec![0xAA; 1184],
+            encapsulated_key: vec![0xBB; 1088],
+            signature: vec![0xCC; 3309],
+            expiry: None,
+            tags: None,
+        }
+    }
+
+    #[test]
+    fn from_blob_encrypted_basic() {
+        let meta = sample_encrypted_metadata();
+        let data = vec![0x42u8; PAGE_SIZE * 2];
+        let book = Book::from_blob_encrypted([0xDD; 32], &data, &meta).unwrap();
+        assert!(book.is_encrypted());
+        assert_eq!(
+            book.book_type,
+            BookType::Encrypted { metadata_pages: 2 }
+        );
+        assert_eq!(book.data_page_count(), 2);
+        // Total pages = 2 metadata + 2 data = 4
+        assert_eq!(book.page_count(), 4);
+    }
+
+    #[test]
+    fn from_blob_encrypted_preserves_cid() {
+        let meta = sample_encrypted_metadata();
+        let cid = [0xDD; 32];
+        let data = vec![0x42u8; PAGE_SIZE];
+        let book = Book::from_blob_encrypted(cid, &data, &meta).unwrap();
+        assert_eq!(book.cid, cid);
+    }
+
+    #[test]
+    fn from_blob_encrypted_blob_size_is_data_only() {
+        let meta = sample_encrypted_metadata();
+        let data = vec![0x42u8; PAGE_SIZE + 100];
+        let book = Book::from_blob_encrypted([0; 32], &data, &meta).unwrap();
+        // blob_size should record only the data, not metadata
+        assert_eq!(book.blob_size, (PAGE_SIZE + 100) as u32);
+    }
+
+    #[test]
+    fn from_blob_encrypted_empty_data() {
+        let meta = sample_encrypted_metadata();
+        let book = Book::from_blob_encrypted([0; 32], &[], &meta).unwrap();
+        assert!(book.is_encrypted());
+        assert_eq!(book.data_page_count(), 0);
+        // Only metadata pages
+        assert_eq!(book.page_count(), 2);
+        assert_eq!(book.blob_size, 0);
+    }
+
+    #[test]
+    fn from_blob_encrypted_too_large() {
+        let meta = sample_encrypted_metadata();
+        let meta_pages = meta.pages_needed() as usize; // 2
+        let max_data = (PAGES_PER_BOOK - meta_pages) * PAGE_SIZE;
+        let data = vec![0u8; max_data + 1];
+        let err = Book::from_blob_encrypted([0; 32], &data, &meta).unwrap_err();
+        assert_eq!(err, BookError::BlobTooLarge { size: max_data + 1 });
+    }
+
+    #[test]
+    fn is_encrypted_blob_detection() {
+        // A page starting with 0xFFFFFFFC (11 sentinel in LE) should be detected
+        let mut page = vec![0u8; PAGE_SIZE];
+        page[..4].copy_from_slice(&ENCRYPTED_SENTINEL.to_le_bytes());
+        assert!(Book::is_encrypted_blob(&page));
+
+        // Regular data page should not be detected
+        let data_page = vec![0x42u8; PAGE_SIZE];
+        assert!(!Book::is_encrypted_blob(&data_page));
+    }
+
+    #[test]
+    fn is_encrypted_blob_rejects_short() {
+        assert!(!Book::is_encrypted_blob(&[]));
+        assert!(!Book::is_encrypted_blob(&[0xFC, 0xFF, 0xFF]));
+    }
+
+    #[test]
+    fn encrypted_book_reassemble_skips_metadata() {
+        let meta = sample_encrypted_metadata();
+        // Use data that isn't page-aligned to test truncation
+        let data = vec![0x77u8; PAGE_SIZE + 100];
+        let book = Book::from_blob_encrypted([0xDD; 32], &data, &meta).unwrap();
+        let all_pages = book.page_data_from_blob_encrypted(&data, &meta);
+
+        // Reassemble should skip metadata pages and return original data
+        let reassembled = book
+            .reassemble(|idx| all_pages.get(idx as usize).cloned())
+            .unwrap();
+        assert_eq!(reassembled.len(), data.len());
+        assert_eq!(reassembled, data);
+    }
+
+    #[test]
+    fn encrypted_book_reassemble_empty_data() {
+        let meta = sample_encrypted_metadata();
+        let book = Book::from_blob_encrypted([0; 32], &[], &meta).unwrap();
+        let all_pages = book.page_data_from_blob_encrypted(&[], &meta);
+        let reassembled = book
+            .reassemble(|idx| all_pages.get(idx as usize).cloned())
+            .unwrap();
+        assert!(reassembled.is_empty());
+    }
+
+    #[test]
+    fn metadata_pages_accessible() {
+        let meta = sample_encrypted_metadata();
+        let data = vec![0x55u8; PAGE_SIZE * 3];
+        let book = Book::from_blob_encrypted([0xDD; 32], &data, &meta).unwrap();
+        assert_eq!(book.metadata_page_count(), 2);
+    }
+
+    #[test]
+    fn metadata_page_count_zero_for_non_encrypted() {
+        let data = vec![0xABu8; PAGE_SIZE];
+        let raw = Book::from_blob(test_cid(), &data).unwrap();
+        assert_eq!(raw.metadata_page_count(), 0);
+        let si = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        assert_eq!(si.metadata_page_count(), 0);
+    }
+
+    #[test]
+    fn encrypted_data_pages_excludes_metadata() {
+        let meta = sample_encrypted_metadata();
+        let data = vec![0x55u8; PAGE_SIZE * 3];
+        let book = Book::from_blob_encrypted([0; 32], &data, &meta).unwrap();
+        let dp = book.data_pages();
+        assert_eq!(dp.len(), 3);
+        // Data pages should have valid checksums
+        for page_addrs in dp {
+            for addr in page_addrs {
+                assert!(addr.verify_checksum());
+            }
+        }
+    }
+
+    #[test]
+    fn encrypted_page_addrs_match_page_data() {
+        let meta = sample_encrypted_metadata();
+        let data = vec![0x42u8; PAGE_SIZE * 2];
+        let book = Book::from_blob_encrypted([0; 32], &data, &meta).unwrap();
+        let all_pages = book.page_data_from_blob_encrypted(&data, &meta);
+
+        // Verify each page's address variants match the page data
+        for (i, page_data) in all_pages.iter().enumerate() {
+            for (algo_idx, algo) in Algorithm::ALL.iter().enumerate() {
+                let expected = PageAddr::from_data(page_data, *algo);
+                assert_eq!(
+                    book.pages[i][algo_idx], expected,
+                    "page {i}, algo {algo_idx}: address mismatch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encrypted_metadata_pages_start_with_sentinel() {
+        let meta = sample_encrypted_metadata();
+        let data = vec![0x42u8; PAGE_SIZE];
+        let book = Book::from_blob_encrypted([0; 32], &data, &meta).unwrap();
+        let all_pages = book.page_data_from_blob_encrypted(&data, &meta);
+
+        let meta_count = book.metadata_page_count();
+        for i in 0..meta_count {
+            let sentinel = u32::from_le_bytes([
+                all_pages[i][0],
+                all_pages[i][1],
+                all_pages[i][2],
+                all_pages[i][3],
+            ]);
+            assert_eq!(sentinel, ENCRYPTED_SENTINEL);
+        }
+    }
+
+    #[test]
+    fn raw_book_is_not_encrypted() {
+        let data = vec![0xABu8; 100];
+        let book = Book::from_blob(test_cid(), &data).unwrap();
+        assert!(!book.is_encrypted());
     }
 }
