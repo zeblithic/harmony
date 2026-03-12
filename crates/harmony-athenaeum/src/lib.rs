@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod addr;
 mod athenaeum;
+mod encrypted;
 mod encyclopedia;
 mod hash;
 mod volume;
@@ -21,6 +22,7 @@ pub use addr::{
     SELF_INDEX_SENTINEL_01, SELF_INDEX_SENTINEL_10, SELF_INDEX_SENTINEL_11,
 };
 pub use athenaeum::{Book, BookError, BookType};
+pub use encrypted::{EncryptedBookMetadata, ENCRYPTED_SENTINEL, METADATA_PAGE_PAYLOAD};
 pub use encyclopedia::{Encyclopedia, SPLIT_THRESHOLD};
 pub use hash::{sha224_hash, sha256_hash};
 pub use volume::{route_chunk, Volume, MAX_PARTITION_DEPTH};
