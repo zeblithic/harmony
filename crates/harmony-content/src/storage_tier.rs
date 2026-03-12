@@ -36,6 +36,8 @@ pub struct StorageMetrics {
     pub transit_rejected: u64,
     pub publishes_stored: u64,
     pub publishes_rejected: u64,
+    pub disk_reads_served: u64,
+    pub disk_read_failures: u64,
 }
 
 impl StorageMetrics {
@@ -52,6 +54,8 @@ impl StorageMetrics {
             transit_rejected,
             publishes_stored,
             publishes_rejected,
+            disk_reads_served,
+            disk_read_failures,
         } = self;
         let fields: &[u64] = &[
             *queries_served,
@@ -61,6 +65,8 @@ impl StorageMetrics {
             *transit_rejected,
             *publishes_stored,
             *publishes_rejected,
+            *disk_reads_served,
+            *disk_read_failures,
         ];
         let mut buf = Vec::with_capacity(fields.len() * 8);
         for &val in fields {
@@ -87,6 +93,8 @@ pub enum StorageTierEvent {
         query_id: u64,
         data: Vec<u8>,
     },
+    /// Disk read failed — runtime could not deliver the requested data.
+    DiskReadFailed { cid: ContentId, query_id: u64 },
 }
 
 /// Outbound actions returned by the storage tier for the caller to execute.
@@ -231,17 +239,29 @@ impl<B: BlobStore> StorageTier<B> {
                     cid.content_class()
                 );
                 if !Self::is_durable_class(&cid) {
+                    self.metrics.disk_read_failures += 1;
                     return vec![];
                 }
                 // Verify integrity — disk data may be corrupted (bit rot, wrong file).
                 if !Self::verify_cid(&cid, &data) {
+                    self.metrics.disk_read_failures += 1;
                     return vec![];
                 }
                 // Re-cache the data from disk.
                 self.cache.store(cid, data.clone());
+                self.metrics.queries_served += 1;
+                self.metrics.disk_reads_served += 1;
                 vec![StorageTierAction::SendReply {
                     query_id,
                     payload: data,
+                }]
+            }
+            StorageTierEvent::DiskReadFailed { query_id, .. } => {
+                self.metrics.disk_read_failures += 1;
+                // Reply with empty payload so the querier doesn't hang.
+                vec![StorageTierAction::SendReply {
+                    query_id,
+                    payload: vec![],
                 }]
             }
         }
@@ -497,7 +517,7 @@ mod tests {
         match &actions[0] {
             StorageTierAction::SendStatsReply { query_id, payload } => {
                 assert_eq!(*query_id, 77);
-                assert_eq!(payload.len(), 56);
+                assert_eq!(payload.len(), 72); // 9 u64 fields
                 let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
                 assert_eq!(queries, 1); // one ContentQuery was processed
             }
@@ -1117,6 +1137,30 @@ mod tests {
             data: b"corrupted".to_vec(),
         });
         assert!(actions.is_empty(), "corrupted disk data should be rejected");
+        assert_eq!(tier.metrics().disk_read_failures, 1);
+    }
+
+    #[test]
+    fn disk_read_failed_sends_empty_reply() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let cid = ContentId::for_blob(
+            b"missing",
+            crate::cid::ContentFlags::default(),
+        )
+        .unwrap();
+        let actions = tier.handle(StorageTierEvent::DiskReadFailed {
+            cid,
+            query_id: 42,
+        });
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::SendReply { query_id, payload } => {
+                assert_eq!(*query_id, 42);
+                assert!(payload.is_empty(), "failed disk read should send empty reply");
+            }
+            other => panic!("expected SendReply, got {other:?}"),
+        }
+        assert_eq!(tier.metrics().disk_read_failures, 1);
     }
 
     #[test]

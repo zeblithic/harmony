@@ -1132,8 +1132,8 @@ mod tests {
             .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. }));
         assert!(reply.is_some(), "stats query should produce reply");
         if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
-            // 7 metrics × 8 bytes = 56 bytes
-            assert_eq!(payload.len(), 56);
+            // 9 metrics × 8 bytes = 72 bytes
+            assert_eq!(payload.len(), 72);
             // First metric is queries_served, should be 1
             let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
             assert_eq!(queries, 1);
