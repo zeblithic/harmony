@@ -565,7 +565,14 @@ impl<B: BlobStore> NodeRuntime<B> {
                 StorageTierAction::SendStatsReply { query_id, payload } => {
                     out.push(RuntimeAction::SendReply { query_id, payload });
                 }
-                _ => {} // DeclareQueryables/DeclareSubscribers only at startup
+                // Startup-only declarations — already processed in new().
+                StorageTierAction::DeclareQueryables { .. }
+                | StorageTierAction::DeclareSubscribers { .. } => {}
+                // Disk I/O actions — sans-I/O boundary. The runtime must wire
+                // these to actual filesystem operations (not yet implemented).
+                StorageTierAction::PersistToDisk { .. }
+                | StorageTierAction::RemoveFromDisk { .. }
+                | StorageTierAction::DiskLookup { .. } => {}
             }
         }
     }

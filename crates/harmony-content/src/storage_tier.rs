@@ -220,6 +220,13 @@ impl<B: BlobStore> StorageTier<B> {
                 query_id,
                 data,
             } => {
+                // DiskReadComplete should only arrive for CIDs previously admitted
+                // and disk-indexed (durable classes). Guard against invariant violations.
+                debug_assert!(
+                    self.class_admits(&cid),
+                    "DiskReadComplete for non-admissible class: {:?}",
+                    cid.content_class()
+                );
                 // Re-cache the data from disk.
                 self.cache.store(cid, data.clone());
                 vec![StorageTierAction::SendReply {
