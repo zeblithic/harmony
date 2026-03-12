@@ -11,7 +11,7 @@ use harmony_compute::InstructionBudget;
 use harmony_content::blob::BlobStore;
 use harmony_content::cid::ContentId;
 use harmony_content::storage_tier::{
-    StorageBudget, StorageMetrics, StorageTier, StorageTierAction, StorageTierEvent,
+    ContentPolicy, StorageBudget, StorageMetrics, StorageTier, StorageTierAction, StorageTierEvent,
 };
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
@@ -211,7 +211,8 @@ impl<B: BlobStore> NodeRuntime<B> {
         let router = Node::new();
         let mut queryable_router = QueryableRouter::new();
 
-        let (storage, storage_startup) = StorageTier::new(store, config.storage_budget);
+        let (storage, storage_startup) =
+            StorageTier::new(store, config.storage_budget, ContentPolicy::default());
 
         let mut actions = Vec::new();
         let mut storage_queryable_ids = HashSet::new();

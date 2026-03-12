@@ -94,6 +94,33 @@ pub enum StorageTierAction {
     DeclareSubscribers { key_exprs: Vec<String> },
 }
 
+/// Per-class storage and publishing policy.
+///
+/// Controls how each content class is handled at the admission and
+/// announcement decision points. Classes not covered by explicit flags
+/// have hardcoded behavior:
+/// - `PublicDurable (00)`: always persist, always announce.
+/// - `EncryptedEphemeral (11)`: never reaches StorageTier (gated at runtime).
+#[derive(Debug, Clone)]
+pub struct ContentPolicy {
+    /// Whether to persist encrypted durable (10) content.
+    pub encrypted_durable_persist: bool,
+    /// Whether to announce encrypted durable (10) content on Zenoh.
+    pub encrypted_durable_announce: bool,
+    /// Whether to announce public ephemeral (01) content on Zenoh.
+    pub public_ephemeral_announce: bool,
+}
+
+impl Default for ContentPolicy {
+    fn default() -> Self {
+        Self {
+            encrypted_durable_persist: false,
+            encrypted_durable_announce: false,
+            public_ephemeral_announce: true,
+        }
+    }
+}
+
 /// Sans-I/O storage tier integrating [`ContentStore`] with Zenoh key patterns.
 ///
 /// On construction, returns startup actions (queryable and subscriber
@@ -106,12 +133,18 @@ pub struct StorageTier<B: BlobStore> {
     /// limits are enforced via [`ContentStore::pin_limit`].
     #[allow(dead_code)]
     budget: StorageBudget,
+    /// Per-class admission and announcement policy.
+    policy: ContentPolicy,
     metrics: StorageMetrics,
 }
 
 impl<B: BlobStore> StorageTier<B> {
     /// Create a new StorageTier with startup actions.
-    pub fn new(store: B, budget: StorageBudget) -> (Self, Vec<StorageTierAction>) {
+    pub fn new(
+        store: B,
+        budget: StorageBudget,
+        policy: ContentPolicy,
+    ) -> (Self, Vec<StorageTierAction>) {
         let cache = ContentStore::new(store, budget.cache_capacity);
 
         let mut queryable_keys = ns::all_shard_patterns();
@@ -131,10 +164,16 @@ impl<B: BlobStore> StorageTier<B> {
         let tier = Self {
             cache,
             budget,
+            policy,
             metrics: StorageMetrics::default(),
         };
 
         (tier, actions)
+    }
+
+    /// Read-only access to the content policy.
+    pub fn policy(&self) -> &ContentPolicy {
+        &self.policy
     }
 
     /// Read-only access to metrics.
@@ -289,7 +328,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
 
         let data = b"cached blob";
         let cid = tier.cache_mut().insert(data).unwrap();
@@ -314,7 +354,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
         let cid = ContentId::for_blob(b"not stored", crate::cid::ContentFlags::default()).unwrap();
 
         let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 99, cid });
@@ -329,7 +370,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
 
         let data = b"stats test blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
@@ -358,7 +400,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
         let data = b"explicitly published blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -389,7 +432,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
         let data = b"transiting blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -418,7 +462,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
         let data = b"repeated transit";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -443,7 +488,8 @@ mod tests {
             cache_capacity: 3,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
 
         // Fill cache: 3 items → window=1, probation=2.
         for i in 0..3 {
@@ -499,7 +545,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
 
         let blob_a = ContentId::for_blob(b"child-a", crate::cid::ContentFlags::default()).unwrap();
         let blob_b = ContentId::for_blob(b"child-b", crate::cid::ContentFlags::default()).unwrap();
@@ -531,7 +578,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
 
         // CID for "real data" but send "tampered data"
         let cid = ContentId::for_blob(b"real data", crate::cid::ContentFlags::default()).unwrap();
@@ -554,7 +602,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
 
         let cid = ContentId::for_blob(b"original", crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::PublishContent {
@@ -576,7 +625,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
 
         // Craft a CID with correct hash but wrong payload_size by mutating
         // the size bits in the last 4 bytes.
@@ -606,7 +656,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (tier, actions) = StorageTier::new(MemoryBlobStore::new(), budget);
+        let (tier, actions) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
         let _ = tier;
 
         assert_eq!(actions.len(), 2);
@@ -628,5 +679,24 @@ mod tests {
             }
             other => panic!("expected DeclareSubscribers, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn content_policy_defaults_are_conservative() {
+        let policy = ContentPolicy::default();
+        assert!(!policy.encrypted_durable_persist);
+        assert!(!policy.encrypted_durable_announce);
+        assert!(policy.public_ephemeral_announce);
+    }
+
+    #[test]
+    fn storage_tier_accepts_policy() {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let policy = ContentPolicy::default();
+        let (tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy);
+        assert_eq!(tier.metrics().queries_served, 0);
     }
 }
