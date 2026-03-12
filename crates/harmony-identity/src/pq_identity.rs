@@ -111,7 +111,7 @@ impl PqIdentity {
             .map_err(IdentityError::Crypto)?;
 
         // 2. HKDF-SHA256 → symmetric key
-        let key_bytes = harmony_crypto::hkdf::derive_key(
+        let mut key_bytes = harmony_crypto::hkdf::derive_key(
             ss.as_bytes(),
             Some(&self.address_hash),
             b"harmony-pq-encrypt-v1",
@@ -129,6 +129,7 @@ impl PqIdentity {
 
         // Zeroize key material
         key.zeroize();
+        key_bytes.zeroize();
 
         // 4. Assemble wire format: [ML-KEM ct][nonce][encrypted+tag]
         let mut result =
@@ -248,7 +249,7 @@ impl PqPrivateIdentity {
             .map_err(IdentityError::Crypto)?;
 
         // 3. HKDF-SHA256 → symmetric key
-        let key_bytes = harmony_crypto::hkdf::derive_key(
+        let mut key_bytes = harmony_crypto::hkdf::derive_key(
             ss.as_bytes(),
             Some(&self.identity.address_hash),
             b"harmony-pq-encrypt-v1",
@@ -270,6 +271,7 @@ impl PqPrivateIdentity {
 
         // Zeroize key material
         key.zeroize();
+        key_bytes.zeroize();
 
         result
     }

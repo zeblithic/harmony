@@ -40,12 +40,13 @@ pub fn hybrid_encapsulate(
     ikm[..32].copy_from_slice(x_ss.as_bytes());
     ikm[32..].copy_from_slice(ml_ss.as_bytes());
 
-    let derived = crate::hkdf::derive_key(&ikm, None, context, 32)?;
+    let mut derived = crate::hkdf::derive_key(&ikm, None, context, 32)?;
     let mut key = [0u8; 32];
     key.copy_from_slice(&derived);
 
     // Zeroize intermediate key material
     ikm.zeroize();
+    derived.zeroize();
 
     Ok((ct, x_eph_public, key))
 }
@@ -74,12 +75,13 @@ pub fn hybrid_decapsulate(
     ikm[..32].copy_from_slice(x_ss.as_bytes());
     ikm[32..].copy_from_slice(ml_ss.as_bytes());
 
-    let derived = crate::hkdf::derive_key(&ikm, None, context, 32)?;
+    let mut derived = crate::hkdf::derive_key(&ikm, None, context, 32)?;
     let mut key = [0u8; 32];
     key.copy_from_slice(&derived);
 
     // Zeroize intermediate key material
     ikm.zeroize();
+    derived.zeroize();
 
     Ok(key)
 }

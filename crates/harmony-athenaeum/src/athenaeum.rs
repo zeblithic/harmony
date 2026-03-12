@@ -1018,7 +1018,6 @@ mod tests {
     fn sample_encrypted_metadata() -> EncryptedBookMetadata {
         EncryptedBookMetadata {
             version: 1,
-            flags: 0,
             encryption_algo: 0,
             owner_public_key: vec![0xAA; 1184],
             encapsulated_key: vec![0xBB; 1088],

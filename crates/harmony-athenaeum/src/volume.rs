@@ -298,9 +298,13 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
     let book_type = match type_bits {
         0b00 => BookType::Raw,
         0b01 => BookType::SelfIndexing,
-        0b10 => BookType::Encrypted {
-            metadata_pages: data[39],
-        },
+        0b10 => {
+            let metadata_pages = data[39];
+            if metadata_pages == 0 {
+                return Err(BookError::BadFormat);
+            }
+            BookType::Encrypted { metadata_pages }
+        }
         _ => return Err(BookError::BadFormat),
     };
 

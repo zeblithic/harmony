@@ -212,7 +212,6 @@ mod tests {
         // Build encrypted book with expiry
         let meta = EncryptedBookMetadata {
             version: 1,
-            flags: 0x01, // has_expiry
             encryption_algo: 0,
             owner_public_key: vec![0xAA; 1184],
             encapsulated_key: vec![0xBB; 1088],
@@ -275,7 +274,6 @@ mod tests {
         // Build encrypted book with both expiry and tags
         let meta = EncryptedBookMetadata {
             version: 1,
-            flags: 0x03, // has_expiry + has_tags
             encryption_algo: 0,
             owner_public_key: vec![0x11; 1184],
             encapsulated_key: vec![0x22; 1088],
@@ -327,7 +325,6 @@ mod tests {
         // Encrypted books
         let meta = EncryptedBookMetadata {
             version: 1,
-            flags: 0,
             encryption_algo: 0,
             owner_public_key: vec![0xAA; 1184],
             encapsulated_key: vec![0xBB; 1088],
@@ -367,7 +364,6 @@ mod tests {
         // Test that encrypted books survive volume serialization round-trip
         let meta = EncryptedBookMetadata {
             version: 1,
-            flags: 0,
             encryption_algo: 0,
             owner_public_key: vec![0xAA; 1184],
             encapsulated_key: vec![0xBB; 1088],
@@ -405,7 +401,6 @@ mod tests {
         // Verify all three book types survive volume serialization
         let meta = EncryptedBookMetadata {
             version: 1,
-            flags: 0x01,
             encryption_algo: 0,
             owner_public_key: vec![0xAA; 1184],
             encapsulated_key: vec![0xBB; 1088],
@@ -445,7 +440,6 @@ mod tests {
 
         let meta = EncryptedBookMetadata {
             version: 1,
-            flags: 0,
             encryption_algo: 0,
             owner_public_key: vec![0xAA; 1184],
             encapsulated_key: vec![0xBB; 1088],
