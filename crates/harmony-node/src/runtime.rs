@@ -203,11 +203,11 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// must execute (queryable declarations, subscriptions).
     pub fn new(config: NodeConfig, store: B) -> (Self, Vec<RuntimeAction>) {
         assert!(
-            config.schedule.router_max_per_tick.map_or(true, |n| n > 0),
+            !matches!(config.schedule.router_max_per_tick, Some(0)),
             "router_max_per_tick must be None or > 0"
         );
         assert!(
-            config.schedule.storage_max_per_tick.map_or(true, |n| n > 0),
+            !matches!(config.schedule.storage_max_per_tick, Some(0)),
             "storage_max_per_tick must be None or > 0"
         );
 
