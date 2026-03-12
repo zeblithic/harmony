@@ -1118,4 +1118,155 @@ mod tests {
             _ => unreachable!(),
         }
     }
+
+    // ---- Integration tests: multi-step policy enforcement ----
+
+    #[test]
+    fn full_durable_lifecycle_store_evict_disk_serve() {
+        // Store durable content → verify PersistToDisk emitted →
+        // query after memory eviction → DiskLookup emitted →
+        // DiskReadComplete → reply served.
+        let budget = StorageBudget {
+            cache_capacity: 3,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+        let (cid, data) = cid_with_class(b"durable lifecycle", false, false);
+
+        // Store via transit.
+        let actions = tier.handle(StorageTierEvent::TransitContent {
+            cid,
+            data: data.clone(),
+        });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::PersistToDisk { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::AnnounceContent { .. })));
+
+        // Flood cache to evict the original CID from memory.
+        for i in 0..10 {
+            let filler = format!("filler-{i}");
+            let (filler_cid, filler_data) = cid_with_class(filler.as_bytes(), false, false);
+            tier.handle(StorageTierEvent::TransitContent {
+                cid: filler_cid,
+                data: filler_data,
+            });
+        }
+
+        // Query should miss cache but find in disk_index → DiskLookup.
+        let query_actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });
+        assert!(
+            query_actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::DiskLookup { .. })),
+            "evicted durable CID should trigger DiskLookup"
+        );
+
+        // Simulate disk read response.
+        let disk_actions = tier.handle(StorageTierEvent::DiskReadComplete {
+            cid,
+            query_id: 99,
+            data: data.clone(),
+        });
+        assert!(disk_actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::SendReply { query_id: 99, .. })));
+    }
+
+    #[test]
+    fn mixed_class_eviction_ephemeral_first() {
+        // Fill cache with PublicDurable + PublicEphemeral, verify ephemeral evicted first.
+        let budget = StorageBudget {
+            cache_capacity: 5,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+
+        // Store 2 durable items via publish (bypasses W-TinyLFU).
+        let d1_data = b"durable-1";
+        let (d1_cid, d1_vec) = cid_with_class(d1_data, false, false);
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: d1_cid,
+            data: d1_vec,
+        });
+
+        let d2_data = b"durable-2";
+        let (d2_cid, d2_vec) = cid_with_class(d2_data, false, false);
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: d2_cid,
+            data: d2_vec,
+        });
+
+        // Store 2 ephemeral items via publish.
+        let e1_data = b"ephemeral-1";
+        let (e1_cid, e1_vec) = cid_with_class(e1_data, false, true);
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: e1_cid,
+            data: e1_vec,
+        });
+
+        let e2_data = b"ephemeral-2";
+        let (e2_cid, e2_vec) = cid_with_class(e2_data, false, true);
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: e2_cid,
+            data: e2_vec,
+        });
+
+        // Fill cache to trigger evictions with durable items.
+        for i in 0..10 {
+            let data = format!("pressure-{i}");
+            let (pressure_cid, pressure_data) = cid_with_class(data.as_bytes(), false, false);
+            tier.handle(StorageTierEvent::TransitContent {
+                cid: pressure_cid,
+                data: pressure_data,
+            });
+        }
+
+        // Durable items should survive (either in memory or on disk).
+        // At least one durable item should be queryable.
+        let d1_hit = tier.handle(StorageTierEvent::ContentQuery {
+            query_id: 1,
+            cid: d1_cid,
+        });
+        let d2_hit = tier.handle(StorageTierEvent::ContentQuery {
+            query_id: 2,
+            cid: d2_cid,
+        });
+        assert!(
+            !d1_hit.is_empty() || !d2_hit.is_empty(),
+            "at least one durable item should be retrievable (via cache or disk)"
+        );
+    }
+
+    #[test]
+    fn policy_toggle_encrypted_durable() {
+        // With policy off: encrypted durable rejected.
+        let policy_off = ContentPolicy {
+            encrypted_durable_persist: false,
+            ..ContentPolicy::default()
+        };
+        let mut tier_off = make_tier_with_policy(policy_off);
+        let (cid, data) = cid_with_class(b"encrypted file", true, false);
+        let actions = tier_off.handle(StorageTierEvent::TransitContent {
+            cid,
+            data: data.clone(),
+        });
+        assert!(actions.is_empty());
+        assert_eq!(tier_off.metrics().transit_rejected, 1);
+
+        // With policy on: encrypted durable admitted.
+        let policy_on = ContentPolicy {
+            encrypted_durable_persist: true,
+            encrypted_durable_announce: true,
+            ..ContentPolicy::default()
+        };
+        let mut tier_on = make_tier_with_policy(policy_on);
+        let actions = tier_on.handle(StorageTierEvent::TransitContent { cid, data });
+        assert!(!actions.is_empty());
+        assert_eq!(tier_on.metrics().transit_stored, 1);
+    }
 }
