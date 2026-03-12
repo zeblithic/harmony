@@ -15,7 +15,10 @@ mod hash;
 mod volume;
 
 pub use addr::{
-    Algorithm, PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, NULL_PAGE, PAGES_PER_BOOK, PAGE_SIZE,
+    is_toc_sentinel, sentinel_algo, toc_sentinel_for_algo, Algorithm, PageAddr, ALGO_COUNT,
+    BOOK_MAX_SIZE, NULL_PAGE, PAGES_PER_BOOK, PAGE_SIZE, SELF_INDEXING_MAX_DATA_PAGES,
+    SELF_INDEXING_MAX_DATA_SIZE, SELF_INDEX_SENTINELS, SELF_INDEX_SENTINEL_00,
+    SELF_INDEX_SENTINEL_01, SELF_INDEX_SENTINEL_10, SELF_INDEX_SENTINEL_11,
 };
 pub use athenaeum::{Book, BookError};
 pub use encyclopedia::{Encyclopedia, SPLIT_THRESHOLD};

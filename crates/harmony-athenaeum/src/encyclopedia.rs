@@ -465,9 +465,7 @@ mod tests {
         fn sum_blob_sizes(vol: &Volume) -> u32 {
             match vol {
                 Volume::Leaf { books, .. } => books.iter().map(|b| b.blob_size).sum(),
-                Volume::Split { left, right, .. } => {
-                    sum_blob_sizes(left) + sum_blob_sizes(right)
-                }
+                Volume::Split { left, right, .. } => sum_blob_sizes(left) + sum_blob_sizes(right),
             }
         }
 
