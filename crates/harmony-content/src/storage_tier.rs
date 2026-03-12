@@ -860,6 +860,70 @@ mod tests {
     }
 
     #[test]
+    fn publish_public_ephemeral_no_announce_when_policy_off() {
+        let policy = ContentPolicy {
+            public_ephemeral_announce: false,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"live stream", false, true);
+        let actions = tier.handle(StorageTierEvent::PublishContent { cid, data });
+        // Stored but not announced.
+        assert!(actions.is_empty(), "no announce when policy off");
+        assert_eq!(tier.metrics().publishes_stored, 1);
+    }
+
+    #[test]
+    fn publish_public_ephemeral_announces_when_policy_on() {
+        let policy = ContentPolicy {
+            public_ephemeral_announce: true,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"live stream", false, true);
+        let actions = tier.handle(StorageTierEvent::PublishContent { cid, data });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::AnnounceContent { .. }
+        ));
+        assert_eq!(tier.metrics().publishes_stored, 1);
+    }
+
+    #[test]
+    fn publish_encrypted_durable_no_announce_when_policy_off() {
+        let policy = ContentPolicy {
+            encrypted_durable_persist: true,
+            encrypted_durable_announce: false,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"encrypted doc", true, false);
+        let actions = tier.handle(StorageTierEvent::PublishContent { cid, data });
+        // Stored but not announced.
+        assert!(actions.is_empty(), "no announce when policy off");
+        assert_eq!(tier.metrics().publishes_stored, 1);
+    }
+
+    #[test]
+    fn publish_encrypted_durable_announces_when_policy_on() {
+        let policy = ContentPolicy {
+            encrypted_durable_persist: true,
+            encrypted_durable_announce: true,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"encrypted doc", true, false);
+        let actions = tier.handle(StorageTierEvent::PublishContent { cid, data });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::AnnounceContent { .. }
+        ));
+        assert_eq!(tier.metrics().publishes_stored, 1);
+    }
+
+    #[test]
     fn transit_rejects_encrypted_durable_when_policy_off() {
         let policy = ContentPolicy {
             encrypted_durable_persist: false,
