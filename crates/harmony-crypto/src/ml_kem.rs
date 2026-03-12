@@ -87,7 +87,7 @@ impl MlKemSecretKey {
             expected: SK_LENGTH,
             got: bytes.len(),
         })?;
-        let inner = ml_kem::DecapsulationKey::<MlKem768>::from_seed(seed.clone());
+        let inner = ml_kem::DecapsulationKey::<MlKem768>::from_seed(seed);
         seed.zeroize();
         Ok(Self { inner })
     }
@@ -149,7 +149,7 @@ pub fn generate(rng: &mut impl CryptoRngCore) -> (MlKemPublicKey, MlKemSecretKey
     let mut seed_bytes = [0u8; SK_LENGTH];
     rng.fill_bytes(&mut seed_bytes);
     let mut seed = Array::from(seed_bytes);
-    let dk = ml_kem::DecapsulationKey::<MlKem768>::from_seed(seed.clone());
+    let dk = ml_kem::DecapsulationKey::<MlKem768>::from_seed(seed);
     let ek = dk.encapsulation_key().clone();
     seed_bytes.zeroize();
     seed.zeroize();

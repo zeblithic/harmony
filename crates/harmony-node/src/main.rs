@@ -25,6 +25,15 @@ enum Commands {
         /// WASM compute fuel budget per tick
         #[arg(long, default_value_t = 100_000)]
         compute_budget: u64,
+        /// Accept encrypted durable (10) content for storage
+        #[arg(long)]
+        encrypted_durable_persist: bool,
+        /// Announce encrypted durable (10) content on Zenoh
+        #[arg(long)]
+        encrypted_durable_announce: bool,
+        /// Disable announcing public ephemeral (01) content on Zenoh
+        #[arg(long)]
+        no_public_ephemeral_announce: bool,
     },
 }
 
@@ -134,11 +143,28 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Run {
             cache_capacity,
             compute_budget,
+            encrypted_durable_persist,
+            encrypted_durable_announce,
+            no_public_ephemeral_announce,
         } => {
             use crate::runtime::{NodeConfig, NodeRuntime, RuntimeAction};
             use harmony_compute::InstructionBudget;
             use harmony_content::blob::MemoryBlobStore;
-            use harmony_content::storage_tier::StorageBudget;
+            use harmony_content::storage_tier::{ContentPolicy, StorageBudget};
+
+            if encrypted_durable_announce && !encrypted_durable_persist {
+                return Err(
+                    "--encrypted-durable-announce requires --encrypted-durable-persist: \
+                     content rejected by class admission will never reach the announce check"
+                        .into(),
+                );
+            }
+
+            let content_policy = ContentPolicy {
+                encrypted_durable_persist,
+                encrypted_durable_announce,
+                public_ephemeral_announce: !no_public_ephemeral_announce,
+            };
 
             let config = NodeConfig {
                 storage_budget: StorageBudget {
@@ -149,6 +175,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     fuel: compute_budget,
                 },
                 schedule: Default::default(),
+                content_policy,
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 
@@ -216,5 +243,65 @@ mod tests {
         } else {
             panic!("expected Run command");
         }
+    }
+
+    #[test]
+    fn cli_parses_run_with_policy_flags() {
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--encrypted-durable-persist",
+            "--encrypted-durable-announce",
+            "--no-public-ephemeral-announce",
+        ])
+        .unwrap();
+        if let Commands::Run {
+            encrypted_durable_persist,
+            encrypted_durable_announce,
+            no_public_ephemeral_announce,
+            ..
+        } = cli.command
+        {
+            assert!(encrypted_durable_persist);
+            assert!(encrypted_durable_announce);
+            assert!(no_public_ephemeral_announce);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_policy_defaults() {
+        let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
+        if let Commands::Run {
+            encrypted_durable_persist,
+            encrypted_durable_announce,
+            no_public_ephemeral_announce,
+            ..
+        } = cli.command
+        {
+            assert!(!encrypted_durable_persist);
+            assert!(!encrypted_durable_announce);
+            assert!(!no_public_ephemeral_announce);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_rejects_announce_without_persist() {
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--encrypted-durable-announce",
+        ])
+        .unwrap();
+        let result = run(cli);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--encrypted-durable-announce requires --encrypted-durable-persist"),
+            "unexpected error: {msg}"
+        );
     }
 }

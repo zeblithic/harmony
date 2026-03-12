@@ -19,4 +19,4 @@ pub mod storage_tier;
 pub mod zenoh_bridge;
 
 // Re-export core types for downstream convenience.
-pub use cid::{ContentFlags, ContentId};
+pub use cid::{ContentClass, ContentFlags, ContentId};

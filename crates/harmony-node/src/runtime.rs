@@ -11,7 +11,7 @@ use harmony_compute::InstructionBudget;
 use harmony_content::blob::BlobStore;
 use harmony_content::cid::ContentId;
 use harmony_content::storage_tier::{
-    StorageBudget, StorageMetrics, StorageTier, StorageTierAction, StorageTierEvent,
+    ContentPolicy, StorageBudget, StorageMetrics, StorageTier, StorageTierAction, StorageTierEvent,
 };
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
@@ -27,6 +27,8 @@ pub struct NodeConfig {
     pub compute_budget: InstructionBudget,
     /// Per-tick scheduling strategy for the three-tier event loop.
     pub schedule: TierSchedule,
+    /// Content acceptance / announcement policy.
+    pub content_policy: ContentPolicy,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -82,6 +84,7 @@ impl Default for NodeConfig {
             },
             compute_budget: InstructionBudget { fuel: 100_000 },
             schedule: TierSchedule::default(),
+            content_policy: ContentPolicy::default(),
         }
     }
 }
@@ -200,18 +203,19 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// must execute (queryable declarations, subscriptions).
     pub fn new(config: NodeConfig, store: B) -> (Self, Vec<RuntimeAction>) {
         assert!(
-            config.schedule.router_max_per_tick.map_or(true, |n| n > 0),
+            !matches!(config.schedule.router_max_per_tick, Some(0)),
             "router_max_per_tick must be None or > 0"
         );
         assert!(
-            config.schedule.storage_max_per_tick.map_or(true, |n| n > 0),
+            !matches!(config.schedule.storage_max_per_tick, Some(0)),
             "storage_max_per_tick must be None or > 0"
         );
 
         let router = Node::new();
         let mut queryable_router = QueryableRouter::new();
 
-        let (storage, storage_startup) = StorageTier::new(store, config.storage_budget);
+        let (storage, storage_startup) =
+            StorageTier::new(store, config.storage_budget, config.content_policy);
 
         let mut actions = Vec::new();
         let mut storage_queryable_ids = HashSet::new();
@@ -561,7 +565,14 @@ impl<B: BlobStore> NodeRuntime<B> {
                 StorageTierAction::SendStatsReply { query_id, payload } => {
                     out.push(RuntimeAction::SendReply { query_id, payload });
                 }
-                _ => {} // DeclareQueryables/DeclareSubscribers only at startup
+                // Startup-only declarations — already processed in new().
+                StorageTierAction::DeclareQueryables { .. }
+                | StorageTierAction::DeclareSubscribers { .. } => {}
+                // Disk I/O actions — sans-I/O boundary. The runtime must wire
+                // these to actual filesystem operations (not yet implemented).
+                StorageTierAction::PersistToDisk { .. }
+                | StorageTierAction::RemoveFromDisk { .. }
+                | StorageTierAction::DiskLookup { .. } => {}
             }
         }
     }
@@ -1121,8 +1132,8 @@ mod tests {
             .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. }));
         assert!(reply.is_some(), "stats query should produce reply");
         if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
-            // 7 metrics × 8 bytes = 56 bytes
-            assert_eq!(payload.len(), 56);
+            // 9 metrics × 8 bytes = 72 bytes
+            assert_eq!(payload.len(), 72);
             // First metric is queries_served, should be 1
             let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
             assert_eq!(queries, 1);
@@ -1616,5 +1627,26 @@ mod tests {
         // After tick drains them all, fuel should recover
         rt.tick();
         assert_eq!(rt.effective_fuel(), 1000);
+    }
+
+    #[test]
+    fn runtime_uses_content_policy() {
+        use harmony_content::blob::MemoryBlobStore;
+
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy {
+                encrypted_durable_persist: true,
+                encrypted_durable_announce: true,
+                public_ephemeral_announce: false,
+            },
+        };
+        let (rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        assert_eq!(rt.storage_queue_len(), 0);
     }
 }

@@ -14,6 +14,40 @@ pub const TAG_BITS: u32 = 12;
 /// Bitmask for the 12-bit tag field (lower 12 bits of the last u32).
 pub const TAG_MASK: u32 = 0xFFF;
 
+/// Content class derived from the two leading classification bits of a CID.
+///
+/// The `(encrypted, ephemeral)` bits in `ContentFlags` (byte 0 of every CID)
+/// define four content classes with distinct storage and publishing policies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContentClass {
+    /// `(false, false)` — Valuable public information. Disk-backed, LFU-managed.
+    PublicDurable,
+    /// `(false, true)` — Disposable-first content. Memory-only, evict first.
+    PublicEphemeral,
+    /// `(true, false)` — Content with intentional relationship. Configurable per-device.
+    EncryptedDurable,
+    /// `(true, true)` — Maximum privacy. Never persists, never enters Zenoh.
+    EncryptedEphemeral,
+}
+
+impl ContentClass {
+    /// Eviction priority: higher values are evicted first under pressure.
+    ///
+    /// Two tiers: ephemeral (evict first) and durable (evict last, frequency
+    /// breaks ties). Both durable classes share priority 0 so EncryptedDurable
+    /// can compete fairly against PublicDurable on frequency — otherwise
+    /// `encrypted_durable_persist=true` would be a no-op for transit when
+    /// probation fills with PublicDurable.
+    /// EncryptedEphemeral never enters the cache, so its priority is irrelevant.
+    pub fn eviction_priority(self) -> u8 {
+        match self {
+            ContentClass::PublicEphemeral => 2,
+            ContentClass::PublicDurable | ContentClass::EncryptedDurable => 0,
+            ContentClass::EncryptedEphemeral => u8::MAX, // unreachable in cache
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct ContentFlags {
     pub encrypted: bool,
@@ -67,6 +101,17 @@ impl ContentId {
     /// Extract the content flags from the top 3 bits of hash\[0\].
     pub fn flags(&self) -> ContentFlags {
         ContentFlags::from_bits(self.hash[0])
+    }
+
+    /// Derive the content class from this CID's classification flags.
+    pub fn content_class(&self) -> ContentClass {
+        let flags = self.flags();
+        match (flags.encrypted, flags.ephemeral) {
+            (false, false) => ContentClass::PublicDurable,
+            (false, true) => ContentClass::PublicEphemeral,
+            (true, false) => ContentClass::EncryptedDurable,
+            (true, true) => ContentClass::EncryptedEphemeral,
+        }
     }
 
     /// Extract the payload size from the packed u32 (upper 20 bits).
@@ -1338,6 +1383,54 @@ mod tests {
         assert!(cid.flags().ephemeral);
         assert!(cid.flags().alt_hash);
         assert!(cid.verify_hash(b"hello"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ContentClass tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn content_class_public_durable() {
+        let flags = ContentFlags {
+            encrypted: false,
+            ephemeral: false,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(b"test", flags).unwrap();
+        assert_eq!(cid.content_class(), ContentClass::PublicDurable);
+    }
+
+    #[test]
+    fn content_class_public_ephemeral() {
+        let flags = ContentFlags {
+            encrypted: false,
+            ephemeral: true,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(b"test", flags).unwrap();
+        assert_eq!(cid.content_class(), ContentClass::PublicEphemeral);
+    }
+
+    #[test]
+    fn content_class_encrypted_durable() {
+        let flags = ContentFlags {
+            encrypted: true,
+            ephemeral: false,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(b"test", flags).unwrap();
+        assert_eq!(cid.content_class(), ContentClass::EncryptedDurable);
+    }
+
+    #[test]
+    fn content_class_encrypted_ephemeral() {
+        let flags = ContentFlags {
+            encrypted: true,
+            ephemeral: true,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(b"test", flags).unwrap();
+        assert_eq!(cid.content_class(), ContentClass::EncryptedEphemeral);
     }
 
     #[test]
