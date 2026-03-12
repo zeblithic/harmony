@@ -194,8 +194,15 @@ impl PqPrivateIdentity {
     /// `[ML-KEM-768 seed (64)][ML-DSA-65 seed (32)]`.
     pub fn to_private_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(PQ_PRIVATE_KEY_LENGTH);
-        bytes.extend_from_slice(&self.encryption_secret.as_bytes());
-        bytes.extend_from_slice(&self.signing_key.as_bytes());
+
+        let mut kem_seed = self.encryption_secret.as_bytes();
+        bytes.extend_from_slice(&kem_seed);
+        kem_seed.zeroize();
+
+        let mut dsa_seed = self.signing_key.as_bytes();
+        bytes.extend_from_slice(&dsa_seed);
+        dsa_seed.zeroize();
+
         bytes
     }
 

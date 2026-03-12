@@ -69,7 +69,10 @@ pub struct MlKemSecretKey {
 impl MlKemSecretKey {
     /// Serialize to bytes (64-byte seed form).
     pub fn as_bytes(&self) -> Vec<u8> {
-        self.inner.to_bytes().to_vec()
+        let mut arr = self.inner.to_bytes();
+        let v = arr.to_vec();
+        arr.zeroize();
+        v
     }
 
     /// Deserialize from bytes (64-byte seed form).
