@@ -155,10 +155,11 @@ impl Default for ContentPolicy {
 /// Configuration for periodic Bloom filter broadcasts.
 #[derive(Debug, Clone)]
 pub struct FilterBroadcastConfig {
-    /// Broadcast after this many cache mutations (admissions + evictions).
+    /// Broadcast after this many cache admissions.
     pub mutation_threshold: u32,
-    /// Maximum seconds between broadcasts (even if no mutations).
-    pub max_interval_secs: u32,
+    /// Maximum ticks between broadcasts (even if no mutations).
+    /// The runtime injects `FilterTimerTick` events at this interval.
+    pub max_interval_ticks: u32,
     /// Expected item count for sizing the Bloom filter (should match cache capacity).
     pub expected_items: u32,
     /// Target false positive rate.
@@ -169,7 +170,7 @@ impl Default for FilterBroadcastConfig {
     fn default() -> Self {
         Self {
             mutation_threshold: 100,
-            max_interval_secs: 30,
+            max_interval_ticks: 30,
             expected_items: 1024,
             fp_rate: 0.001,
         }
@@ -1565,7 +1566,7 @@ mod tests {
     fn filter_broadcast_config_defaults() {
         let config = FilterBroadcastConfig::default();
         assert_eq!(config.mutation_threshold, 100);
-        assert_eq!(config.max_interval_secs, 30);
+        assert_eq!(config.max_interval_ticks, 30);
         assert_eq!(config.expected_items, 1024);
         assert!((config.fp_rate - 0.001).abs() < f64::EPSILON);
     }

@@ -265,7 +265,7 @@ pub struct NodeRuntime<B: BlobStore> {
     node_addr: String,
     // Ticks since last FilterTimerTick was injected
     ticks_since_filter_broadcast: u64,
-    // How many ticks between filter broadcasts (derived from max_interval_secs)
+    // How many ticks between filter broadcasts
     filter_broadcast_interval_ticks: u64,
 }
 
@@ -285,7 +285,8 @@ impl<B: BlobStore> NodeRuntime<B> {
         let router = Node::new();
         let mut queryable_router = QueryableRouter::new();
 
-        let filter_broadcast_interval_ticks = config.filter_broadcast_config.max_interval_secs as u64;
+        // Clamp to at least 1 tick to prevent filter rebuild on every tick.
+        let filter_broadcast_interval_ticks = (config.filter_broadcast_config.max_interval_ticks as u64).max(1);
 
         let (storage, storage_startup) =
             StorageTier::new(store, config.storage_budget, config.content_policy, config.filter_broadcast_config);

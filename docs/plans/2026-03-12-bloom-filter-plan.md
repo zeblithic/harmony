@@ -723,11 +723,11 @@ Add after `ContentPolicy`:
 /// Configuration for periodic Bloom filter broadcasts.
 #[derive(Debug, Clone)]
 pub struct FilterBroadcastConfig {
-    /// Broadcast after this many cache mutations (admissions + evictions).
+    /// Broadcast after this many cache admissions.
     pub mutation_threshold: u32,
     /// Maximum seconds between broadcasts (even if no mutations).
     /// The runtime injects `FilterTimerTick` events at this interval.
-    pub max_interval_secs: u32,
+    pub max_interval_ticks: u32,
     /// Expected item count for sizing the Bloom filter (should match cache_capacity).
     pub expected_items: u32,
     /// Target false positive rate.
@@ -738,7 +738,7 @@ impl Default for FilterBroadcastConfig {
     fn default() -> Self {
         Self {
             mutation_threshold: 100,
-            max_interval_secs: 30,
+            max_interval_ticks: 30,
             expected_items: 1024,
             fp_rate: 0.001,
         }
@@ -750,7 +750,7 @@ Add `FilterTimerTick` variant to `StorageTierEvent`:
 
 ```rust
     /// Timer tick for periodic filter broadcasts. Injected by runtime at
-    /// `FilterBroadcastConfig::max_interval_secs` intervals.
+    /// `FilterBroadcastConfig::max_interval_ticks` intervals.
     FilterTimerTick,
 ```
 
@@ -790,7 +790,7 @@ Update `StorageTier::new()` to accept `FilterBroadcastConfig` and initialize the
     fn filter_broadcast_config_defaults() {
         let config = FilterBroadcastConfig::default();
         assert_eq!(config.mutation_threshold, 100);
-        assert_eq!(config.max_interval_secs, 30);
+        assert_eq!(config.max_interval_ticks, 30);
         assert_eq!(config.expected_items, 1024);
         assert!((config.fp_rate - 0.001).abs() < f64::EPSILON);
     }
@@ -1158,7 +1158,7 @@ git commit -m "feat(node): PeerFilterTable for Bloom filter query routing"
 ```rust
             let filter_config = FilterBroadcastConfig {
                 mutation_threshold: filter_mutation_threshold,
-                max_interval_secs: filter_broadcast_interval,
+                max_interval_ticks: filter_broadcast_interval,
                 expected_items: cache_capacity as u32,
                 fp_rate: 0.001,
             };

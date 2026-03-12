@@ -118,16 +118,16 @@ The `item_count` lets receivers gauge staleness — if a peer's filter claims 50
 
 ```rust
 pub struct FilterBroadcastConfig {
-    /// Broadcast after this many cache mutations (admissions + evictions).
+    /// Broadcast after this many cache admissions.
     pub mutation_threshold: u32,       // default: 100
-    /// Maximum seconds between broadcasts (even if no mutations).
-    pub max_interval_secs: u32,        // default: 30
+    /// Maximum ticks between broadcasts (even if no mutations).
+    pub max_interval_ticks: u32,       // default: 30
 }
 ```
 
-**Mutation-triggered:** StorageTier tracks a `mutations_since_broadcast` counter. On every admission or eviction, it increments. When it reaches `mutation_threshold`, StorageTier rebuilds the filter and returns a `BroadcastFilter` action.
+**Mutation-triggered:** StorageTier tracks a `mutations_since_broadcast` counter. On every admission, it increments. When it reaches `mutation_threshold`, StorageTier rebuilds the filter and returns a `BroadcastFilter` action.
 
-**Timer-triggered:** The runtime injects `FilterTimerTick` events at `max_interval_secs` intervals. StorageTier responds by rebuilding and broadcasting even if no mutations occurred (guarantees freshness ceiling).
+**Timer-triggered:** The runtime injects `FilterTimerTick` events at `max_interval_ticks` intervals. StorageTier responds by rebuilding and broadcasting even if no mutations occurred (guarantees freshness ceiling).
 
 **Rebuild process:** Iterate all CIDs via `ContentStore::iter_admitted()` (window + probation + protected segments), insert each into a fresh `BloomFilter`, serialize, emit `BroadcastFilter` action.
 
@@ -151,7 +151,7 @@ pub struct PeerFilter {
 }
 ```
 
-**Staleness expiry:** Drop filters not refreshed within `3 × max_interval_secs` (default 90 seconds). A missing filter means "query this peer anyway" — safe default, no false negatives.
+**Staleness expiry:** Drop filters not refreshed within `3 × max_interval_ticks` (default 90 ticks). A missing filter means "query this peer anyway" — safe default, no false negatives.
 
 ### Query Routing Decision
 
