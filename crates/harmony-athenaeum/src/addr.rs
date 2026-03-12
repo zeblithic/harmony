@@ -30,6 +30,57 @@ pub const ALGO_COUNT: usize = 4;
 /// field is `11`. This deliberately fails checksum validation.
 pub const NULL_PAGE: u32 = 0x00000003;
 
+/// Self-indexing sentinel for algorithm 00 (Sha256Msb).
+///
+/// All 28 data bits set to 1, checksum = inverted mode bits.
+/// Deliberately fails checksum validation.
+pub const SELF_INDEX_SENTINEL_00: u32 = 0x3FFF_FFFF;
+
+/// Self-indexing sentinel for algorithm 01 (Sha256Lsb).
+pub const SELF_INDEX_SENTINEL_01: u32 = 0x7FFF_FFFE;
+
+/// Self-indexing sentinel for algorithm 10 (Sha224Msb).
+pub const SELF_INDEX_SENTINEL_10: u32 = 0xBFFF_FFFD;
+
+/// Self-indexing sentinel for algorithm 11 (Sha224Lsb).
+pub const SELF_INDEX_SENTINEL_11: u32 = 0xFFFF_FFFC;
+
+/// All four self-indexing sentinels, indexed by algorithm selector (0-3).
+pub const SELF_INDEX_SENTINELS: [u32; ALGO_COUNT] = [
+    SELF_INDEX_SENTINEL_00,
+    SELF_INDEX_SENTINEL_01,
+    SELF_INDEX_SENTINEL_10,
+    SELF_INDEX_SENTINEL_11,
+];
+
+/// Maximum data pages in a self-indexing book (page 0 is the ToC).
+pub const SELF_INDEXING_MAX_DATA_PAGES: usize = PAGES_PER_BOOK - 1;
+
+/// Maximum data size for a self-indexing book in bytes.
+pub const SELF_INDEXING_MAX_DATA_SIZE: usize = PAGE_SIZE * SELF_INDEXING_MAX_DATA_PAGES;
+
+/// Returns `true` if `addr` is one of the 4 self-indexing ToC sentinels.
+pub fn is_toc_sentinel(addr: u32) -> bool {
+    SELF_INDEX_SENTINELS.contains(&addr)
+}
+
+/// Returns the sentinel value for the given algorithm selector (0-3).
+///
+/// # Panics
+/// Panics if `algo > 3`.
+pub fn toc_sentinel_for_algo(algo: u8) -> u32 {
+    SELF_INDEX_SENTINELS[algo as usize]
+}
+
+/// If `addr` is a self-indexing sentinel, returns the algorithm selector (0-3).
+/// Returns `None` for non-sentinel values.
+pub fn sentinel_algo(addr: u32) -> Option<u8> {
+    SELF_INDEX_SENTINELS
+        .iter()
+        .position(|&s| s == addr)
+        .map(|i| i as u8)
+}
+
 /// Hash algorithm selector for address derivation.
 ///
 /// The 2-bit algorithm field selects both the hash function and which
@@ -272,5 +323,81 @@ mod tests {
         assert_eq!(restored.hash_bits(), 100);
         assert_eq!(restored.algorithm(), Algorithm::Sha256Lsb);
         assert!(restored.verify_checksum());
+    }
+
+    #[test]
+    fn sentinel_values() {
+        assert_eq!(SELF_INDEX_SENTINEL_00, 0x3FFF_FFFF);
+        assert_eq!(SELF_INDEX_SENTINEL_01, 0x7FFF_FFFE);
+        assert_eq!(SELF_INDEX_SENTINEL_10, 0xBFFF_FFFD);
+        assert_eq!(SELF_INDEX_SENTINEL_11, 0xFFFF_FFFC);
+    }
+
+    #[test]
+    fn sentinels_fail_checksum() {
+        for &sentinel in &SELF_INDEX_SENTINELS {
+            let addr = PageAddr(sentinel);
+            assert!(
+                !addr.verify_checksum(),
+                "sentinel {:#010x} must fail checksum",
+                sentinel
+            );
+        }
+    }
+
+    #[test]
+    fn sentinels_have_all_ones_data_bits() {
+        for &sentinel in &SELF_INDEX_SENTINELS {
+            let addr = PageAddr(sentinel);
+            assert_eq!(
+                addr.hash_bits(),
+                0x0FFF_FFFF,
+                "sentinel {:#010x} must have all 28 data bits set",
+                sentinel
+            );
+        }
+    }
+
+    #[test]
+    fn is_toc_sentinel_matches_all_four() {
+        for &sentinel in &SELF_INDEX_SENTINELS {
+            assert!(
+                is_toc_sentinel(sentinel),
+                "{:#010x} should be a sentinel",
+                sentinel
+            );
+        }
+    }
+
+    #[test]
+    fn is_toc_sentinel_rejects_non_sentinels() {
+        assert!(!is_toc_sentinel(NULL_PAGE));
+        assert!(!is_toc_sentinel(0));
+        let normal = PageAddr::new(42, Algorithm::Sha256Msb);
+        assert!(!is_toc_sentinel(normal.0));
+    }
+
+    #[test]
+    fn toc_sentinel_for_algo_round_trip() {
+        assert_eq!(toc_sentinel_for_algo(0), SELF_INDEX_SENTINEL_00);
+        assert_eq!(toc_sentinel_for_algo(1), SELF_INDEX_SENTINEL_01);
+        assert_eq!(toc_sentinel_for_algo(2), SELF_INDEX_SENTINEL_10);
+        assert_eq!(toc_sentinel_for_algo(3), SELF_INDEX_SENTINEL_11);
+    }
+
+    #[test]
+    fn sentinel_algo_extracts_algorithm() {
+        assert_eq!(sentinel_algo(SELF_INDEX_SENTINEL_00), Some(0));
+        assert_eq!(sentinel_algo(SELF_INDEX_SENTINEL_01), Some(1));
+        assert_eq!(sentinel_algo(SELF_INDEX_SENTINEL_10), Some(2));
+        assert_eq!(sentinel_algo(SELF_INDEX_SENTINEL_11), Some(3));
+    }
+
+    #[test]
+    fn sentinel_algo_returns_none_for_non_sentinel() {
+        assert_eq!(sentinel_algo(NULL_PAGE), None);
+        assert_eq!(sentinel_algo(0), None);
+        let normal = PageAddr::new(42, Algorithm::Sha256Msb);
+        assert_eq!(sentinel_algo(normal.0), None);
     }
 }

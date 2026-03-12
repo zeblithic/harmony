@@ -239,7 +239,8 @@ impl Volume {
 ///   32 bytes: cid
 ///    4 bytes: blob_size (u32 LE)
 ///    2 bytes: page_count (u16 LE)
-///    2 bytes: reserved (0)
+///    1 byte:  flags (bit 0 = self_indexing)
+///    1 byte:  reserved (0)
 ///   For each page (page_count entries):
 ///     4 × 4 bytes: PageAddr.0 for each algorithm variant (u32 LE) = 16 bytes per page
 /// ```
@@ -251,7 +252,8 @@ fn serialize_book(book: &Book) -> Vec<u8> {
     buf.extend_from_slice(&book.cid);
     buf.extend_from_slice(&book.blob_size.to_le_bytes());
     buf.extend_from_slice(&(pc as u16).to_le_bytes());
-    buf.extend_from_slice(&[0u8; 2]); // reserved
+    let flags: u8 = if book.self_indexing { 1 } else { 0 };
+    buf.extend_from_slice(&[flags, 0u8]); // flags + reserved
 
     for page_addrs in &book.pages {
         for addr in page_addrs {
@@ -284,12 +286,21 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
         return Err(BookError::BadFormat);
     }
 
-    // blob_size must be consistent with page_count
-    if blob_size as usize > page_count * crate::addr::PAGE_SIZE {
+    let self_indexing = (data[38] & 0x01) != 0;
+    // data[39] = reserved, skip
+
+    // Self-indexing books must have at least 1 page (the ToC).
+    if self_indexing && page_count == 0 {
         return Err(BookError::BadFormat);
     }
 
-    // data[38..40] = reserved, skip
+    // blob_size must be consistent with data capacity.
+    // Self-indexing books reserve page 0 for the ToC, so data capacity
+    // is (page_count - 1) pages; raw books use all pages.
+    let data_pages = if self_indexing { page_count - 1 } else { page_count };
+    if blob_size as usize > data_pages * crate::addr::PAGE_SIZE {
+        return Err(BookError::BadFormat);
+    }
 
     let pages_start = 40;
     let pages_bytes = page_count * ALGO_COUNT * 4;
@@ -323,6 +334,7 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
         cid,
         pages,
         blob_size,
+        self_indexing,
     })
 }
 
@@ -483,6 +495,32 @@ mod tests {
         let serialized = serialize_book(&book);
         let deserialized = deserialize_book(&serialized).unwrap();
         assert_eq!(book, deserialized);
+    }
+
+    #[test]
+    fn self_indexing_book_serialization_round_trip() {
+        let book = Book::from_blob_self_indexing([0xCC; 32], &[0x55u8; PAGE_SIZE * 2]).unwrap();
+        assert!(book.is_self_indexing());
+        let serialized = serialize_book(&book);
+        let deserialized = deserialize_book(&serialized).unwrap();
+        assert_eq!(book, deserialized);
+        assert!(deserialized.is_self_indexing());
+    }
+
+    #[test]
+    fn self_indexing_rejects_blob_size_exceeding_data_capacity() {
+        // Build a valid self-indexing book, then tamper with blob_size
+        // to exceed the data capacity of (page_count - 1) pages.
+        let book = Book::from_blob_self_indexing([0xDD; 32], &[0x77u8; PAGE_SIZE]).unwrap();
+        assert_eq!(book.page_count(), 2); // 1 ToC + 1 data
+        let mut serialized = serialize_book(&book);
+
+        // Overwrite blob_size to page_count * PAGE_SIZE (too large by 1 page).
+        let bad_size = (book.page_count() * PAGE_SIZE) as u32;
+        serialized[32..36].copy_from_slice(&bad_size.to_le_bytes());
+
+        let err = deserialize_book(&serialized).unwrap_err();
+        assert_eq!(err, BookError::BadFormat);
     }
 
     #[test]
