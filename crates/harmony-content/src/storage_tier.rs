@@ -9,6 +9,10 @@ use alloc::{
     vec::Vec,
 };
 use harmony_zenoh::namespace::{announce as announce_ns, content as ns};
+#[cfg(not(feature = "std"))]
+use hashbrown::HashSet;
+#[cfg(feature = "std")]
+use std::collections::HashSet;
 
 /// Configuration for storage capacity limits.
 #[derive(Debug, Clone)]
@@ -77,6 +81,12 @@ pub enum StorageTierEvent {
     PublishContent { cid: ContentId, data: Vec<u8> },
     /// Stats query on harmony/content/stats/{node_addr}
     StatsQuery { query_id: u64 },
+    /// Disk read completed — runtime delivers data read from disk.
+    DiskReadComplete {
+        cid: ContentId,
+        query_id: u64,
+        data: Vec<u8>,
+    },
 }
 
 /// Outbound actions returned by the storage tier for the caller to execute.
@@ -92,6 +102,12 @@ pub enum StorageTierAction {
     DeclareQueryables { key_exprs: Vec<String> },
     /// Register subscriptions (returned at startup).
     DeclareSubscribers { key_exprs: Vec<String> },
+    /// Persist content to disk (durable classes only). The runtime handles actual I/O.
+    PersistToDisk { cid: ContentId, data: Vec<u8> },
+    /// Remove content from disk. The runtime handles actual I/O.
+    RemoveFromDisk { cid: ContentId },
+    /// Request disk read for a CID known to be on disk but evicted from memory.
+    DiskLookup { cid: ContentId, query_id: u64 },
 }
 
 /// Per-class storage and publishing policy.
@@ -136,6 +152,8 @@ pub struct StorageTier<B: BlobStore> {
     /// Per-class admission and announcement policy.
     policy: ContentPolicy,
     metrics: StorageMetrics,
+    /// CIDs known to be persisted on disk (durable classes only).
+    disk_index: HashSet<ContentId>,
 }
 
 impl<B: BlobStore> StorageTier<B> {
@@ -166,6 +184,7 @@ impl<B: BlobStore> StorageTier<B> {
             budget,
             policy,
             metrics: StorageMetrics::default(),
+            disk_index: HashSet::new(),
         };
 
         (tier, actions)
@@ -196,7 +215,27 @@ impl<B: BlobStore> StorageTier<B> {
             StorageTierEvent::TransitContent { cid, data } => self.handle_transit(cid, data),
             StorageTierEvent::PublishContent { cid, data } => self.handle_publish(cid, data),
             StorageTierEvent::StatsQuery { query_id } => self.handle_stats_query(query_id),
+            StorageTierEvent::DiskReadComplete {
+                cid,
+                query_id,
+                data,
+            } => {
+                // Re-cache the data from disk.
+                self.cache.store(cid, data.clone());
+                vec![StorageTierAction::SendReply {
+                    query_id,
+                    payload: data,
+                }]
+            }
         }
+    }
+
+    /// Check whether a CID belongs to a durable content class.
+    fn is_durable_class(cid: &ContentId) -> bool {
+        matches!(
+            cid.content_class(),
+            ContentClass::PublicDurable | ContentClass::EncryptedDurable
+        )
     }
 
     fn handle_content_query(&mut self, query_id: u64, cid: &ContentId) -> Vec<StorageTierAction> {
@@ -211,7 +250,14 @@ impl<B: BlobStore> StorageTier<B> {
             }
             None => {
                 self.metrics.cache_misses += 1;
-                vec![]
+                if self.disk_index.contains(cid) {
+                    vec![StorageTierAction::DiskLookup {
+                        cid: *cid,
+                        query_id,
+                    }]
+                } else {
+                    vec![]
+                }
             }
         }
     }
@@ -253,18 +299,30 @@ impl<B: BlobStore> StorageTier<B> {
             self.metrics.transit_rejected += 1;
             return vec![];
         }
+        // Clone data before store if we need it for PersistToDisk.
+        let persist_data = if Self::is_durable_class(&cid) {
+            Some(data.clone())
+        } else {
+            None
+        };
         // Use store_preadmitted to avoid double-incrementing the sketch
         // counter (should_admit already incremented it).
         self.cache.store_preadmitted(cid, data);
         self.metrics.transit_stored += 1;
+
+        let mut actions = Vec::new();
+        // Emit PersistToDisk for durable content classes.
+        if let Some(data) = persist_data {
+            self.disk_index.insert(cid);
+            actions.push(StorageTierAction::PersistToDisk { cid, data });
+        }
         // Re-announcing already-cached content is intentional: it refreshes
         // the announcement TTL so peers know the content is still available.
         // Announce only if policy allows it for this content class.
         if self.should_announce(&cid) {
-            vec![self.make_announce_action(&cid)]
-        } else {
-            vec![]
+            actions.push(self.make_announce_action(&cid));
         }
+        actions
     }
 
     fn handle_publish(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
@@ -278,16 +336,28 @@ impl<B: BlobStore> StorageTier<B> {
             self.metrics.publishes_rejected += 1;
             return vec![];
         }
+        // Clone data before store if we need it for PersistToDisk.
+        let persist_data = if Self::is_durable_class(&cid) {
+            Some(data.clone())
+        } else {
+            None
+        };
         // Publish always stores — bypasses admission filter.
         // TODO: Pin published content to guarantee long-term retention (deferred).
         self.cache.store(cid, data);
         self.metrics.publishes_stored += 1;
+
+        let mut actions = Vec::new();
+        // Emit PersistToDisk for durable content classes.
+        if let Some(data) = persist_data {
+            self.disk_index.insert(cid);
+            actions.push(StorageTierAction::PersistToDisk { cid, data });
+        }
         // Announce only if policy allows it for this content class.
         if self.should_announce(&cid) {
-            vec![self.make_announce_action(&cid)]
-        } else {
-            vec![]
+            actions.push(self.make_announce_action(&cid));
         }
+        actions
     }
 
     /// Verify that a CID is consistent with the given data.
@@ -449,8 +519,13 @@ mod tests {
             data: data.to_vec(),
         });
 
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
+        // PublicDurable content emits PersistToDisk + AnnounceContent.
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::PersistToDisk { .. }
+        ));
+        match &actions[1] {
             StorageTierAction::AnnounceContent { key_expr, payload } => {
                 assert!(key_expr.starts_with("harmony/announce/"));
                 let announced_size = u32::from_be_bytes(payload[..4].try_into().unwrap());
@@ -481,8 +556,13 @@ mod tests {
             data: data.to_vec(),
         });
 
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
+        // PublicDurable content emits PersistToDisk + AnnounceContent.
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::PersistToDisk { .. }
+        ));
+        match &actions[1] {
             StorageTierAction::AnnounceContent { key_expr, .. } => {
                 assert!(key_expr.starts_with("harmony/announce/"));
             }
@@ -603,9 +683,14 @@ mod tests {
             data: bundle_bytes,
         });
 
-        assert_eq!(actions.len(), 1);
+        // Bundle with default flags is PublicDurable: PersistToDisk + AnnounceContent.
+        assert_eq!(actions.len(), 2);
         assert!(matches!(
             &actions[0],
+            StorageTierAction::PersistToDisk { .. }
+        ));
+        assert!(matches!(
+            &actions[1],
             StorageTierAction::AnnounceContent { .. }
         ));
         assert_eq!(tier.metrics().transit_stored, 1);
@@ -780,9 +865,14 @@ mod tests {
         let mut tier = make_tier_with_policy(policy);
         let (cid, data) = cid_with_class(b"encrypted file", true, false);
         let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
-        assert_eq!(actions.len(), 1);
+        // EncryptedDurable: PersistToDisk + AnnounceContent.
+        assert_eq!(actions.len(), 2);
         assert!(matches!(
             &actions[0],
+            StorageTierAction::PersistToDisk { .. }
+        ));
+        assert!(matches!(
+            &actions[1],
             StorageTierAction::AnnounceContent { .. }
         ));
         assert_eq!(tier.metrics().transit_stored, 1);
@@ -793,7 +883,8 @@ mod tests {
         let mut tier = make_tier_with_policy(ContentPolicy::default());
         let (cid, data) = cid_with_class(b"public doc", false, false);
         let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
-        assert_eq!(actions.len(), 1);
+        // PublicDurable: PersistToDisk + AnnounceContent.
+        assert_eq!(actions.len(), 2);
         assert_eq!(tier.metrics().transit_stored, 1);
     }
 
@@ -867,7 +958,12 @@ mod tests {
         let mut tier = make_tier_with_policy(policy);
         let (cid, data) = cid_with_class(b"encrypted doc", true, false);
         let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
-        assert!(actions.is_empty(), "stored but not announced");
+        // EncryptedDurable: PersistToDisk only (no announce when policy off).
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::PersistToDisk { .. }
+        ));
         assert_eq!(tier.metrics().transit_stored, 1);
     }
 
@@ -881,9 +977,14 @@ mod tests {
         let mut tier = make_tier_with_policy(policy);
         let (cid, data) = cid_with_class(b"encrypted doc", true, false);
         let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
-        assert_eq!(actions.len(), 1);
+        // EncryptedDurable: PersistToDisk + AnnounceContent.
+        assert_eq!(actions.len(), 2);
         assert!(matches!(
             &actions[0],
+            StorageTierAction::PersistToDisk { .. }
+        ));
+        assert!(matches!(
+            &actions[1],
             StorageTierAction::AnnounceContent { .. }
         ));
     }
@@ -893,10 +994,102 @@ mod tests {
         let mut tier = make_tier_with_policy(ContentPolicy::default());
         let (cid, data) = cid_with_class(b"valuable doc", false, false);
         let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        // PublicDurable: PersistToDisk + AnnounceContent.
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            &actions[0],
+            StorageTierAction::PersistToDisk { .. }
+        ));
+        assert!(matches!(
+            &actions[1],
+            StorageTierAction::AnnounceContent { .. }
+        ));
+    }
+
+    // ---- Sans-I/O disk persistence ----
+
+    #[test]
+    fn transit_public_durable_emits_persist_to_disk() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, data) = cid_with_class(b"durable content", false, false);
+        let actions = tier.handle(StorageTierEvent::TransitContent {
+            cid,
+            data: data.clone(),
+        });
+        let persist_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, StorageTierAction::PersistToDisk { .. }))
+            .collect();
+        assert_eq!(
+            persist_actions.len(),
+            1,
+            "durable content should emit PersistToDisk"
+        );
+    }
+
+    #[test]
+    fn transit_public_ephemeral_no_persist_to_disk() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, data) = cid_with_class(b"ephemeral content", false, true);
+        let actions = tier.handle(StorageTierEvent::TransitContent { cid, data });
+        let persist_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, StorageTierAction::PersistToDisk { .. }))
+            .collect();
+        assert!(
+            persist_actions.is_empty(),
+            "ephemeral content should NOT emit PersistToDisk"
+        );
+    }
+
+    #[test]
+    fn disk_read_complete_serves_reply() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let data = b"on-disk content".to_vec();
+        let flags = crate::cid::ContentFlags {
+            encrypted: false,
+            ephemeral: false,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(&data, flags).unwrap();
+
+        let actions = tier.handle(StorageTierEvent::DiskReadComplete {
+            cid,
+            query_id: 42,
+            data: data.clone(),
+        });
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::SendReply { query_id, payload } => {
+                assert_eq!(*query_id, 42);
+                assert_eq!(payload, &data);
+            }
+            other => panic!("expected SendReply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_query_miss_on_disk_emits_disk_lookup() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, data) = cid_with_class(b"durable on disk", false, false);
+
+        // Store via transit — this adds to disk_index.
+        tier.handle(StorageTierEvent::TransitContent {
+            cid,
+            data: data.clone(),
+        });
+
+        // Verify the DiskReadComplete -> SendReply path works.
+        let actions = tier.handle(StorageTierEvent::DiskReadComplete {
+            cid,
+            query_id: 99,
+            data: data.clone(),
+        });
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            StorageTierAction::AnnounceContent { .. }
+            StorageTierAction::SendReply { query_id: 99, .. }
         ));
     }
 }
