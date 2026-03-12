@@ -174,6 +174,12 @@ impl<B: BlobStore> StorageTier<B> {
         budget: StorageBudget,
         policy: ContentPolicy,
     ) -> (Self, Vec<StorageTierAction>) {
+        assert!(
+            !policy.encrypted_durable_announce || policy.encrypted_durable_persist,
+            "encrypted_durable_announce requires encrypted_durable_persist — \
+             content rejected by class admission will never reach the announce check"
+        );
+
         let cache = ContentStore::new(store, budget.cache_capacity);
 
         let mut queryable_keys = ns::all_shard_patterns();
@@ -326,13 +332,13 @@ impl<B: BlobStore> StorageTier<B> {
     }
 
     fn handle_transit(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
-        // Transit comes from untrusted peers — verify CID matches data hash.
-        if !Self::verify_cid(&cid, &data) {
+        // Class-based admission first — O(1) flag check before O(data_size) hash.
+        if !self.class_admits(&cid) {
             self.metrics.transit_rejected += 1;
             return vec![];
         }
-        // Class-based admission: reject content classes forbidden by policy.
-        if !self.class_admits(&cid) {
+        // Transit comes from untrusted peers — verify CID matches data hash.
+        if !Self::verify_cid(&cid, &data) {
             self.metrics.transit_rejected += 1;
             return vec![];
         }
@@ -364,13 +370,13 @@ impl<B: BlobStore> StorageTier<B> {
     }
 
     fn handle_publish(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
-        // Publish comes from local apps — still verify as defense-in-depth.
-        if !Self::verify_cid(&cid, &data) {
+        // Class-based admission first — O(1) flag check before O(data_size) hash.
+        if !self.class_admits(&cid) {
             self.metrics.publishes_rejected += 1;
             return vec![];
         }
-        // Class-based admission: reject content classes forbidden by policy.
-        if !self.class_admits(&cid) {
+        // Publish comes from local apps — still verify as defense-in-depth.
+        if !Self::verify_cid(&cid, &data) {
             self.metrics.publishes_rejected += 1;
             return vec![];
         }
@@ -1036,6 +1042,17 @@ mod tests {
         assert!(!policy.encrypted_durable_persist);
         assert!(!policy.encrypted_durable_announce);
         assert!(policy.public_ephemeral_announce);
+    }
+
+    #[test]
+    #[should_panic(expected = "encrypted_durable_announce requires encrypted_durable_persist")]
+    fn announce_without_persist_panics() {
+        let policy = ContentPolicy {
+            encrypted_durable_persist: false,
+            encrypted_durable_announce: true,
+            ..ContentPolicy::default()
+        };
+        make_tier_with_policy(policy);
     }
 
     #[test]
