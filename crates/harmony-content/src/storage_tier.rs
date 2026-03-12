@@ -314,10 +314,14 @@ impl<B: BlobStore> StorageTier<B> {
                 // Note: queries_served was already incremented in handle_content_query
                 // when this query first arrived — only count the disk-specific metric.
                 self.metrics.disk_reads_served += 1;
-                vec![StorageTierAction::SendReply {
+                let mut actions = vec![StorageTierAction::SendReply {
                     query_id,
                     payload: data,
-                }]
+                }];
+                if self.mutations_since_broadcast >= self.filter_config.mutation_threshold {
+                    actions.push(self.rebuild_filter());
+                }
+                actions
             }
             StorageTierEvent::DiskReadFailed { query_id, .. } => {
                 self.metrics.disk_read_failures += 1;
@@ -1670,6 +1674,52 @@ mod tests {
         assert!(
             !filter.may_contain(&ee_cid),
             "EncryptedEphemeral CID should not be in the filter"
+        );
+    }
+
+    #[test]
+    fn filter_broadcast_at_disk_read_mutation_threshold() {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let filter_config = FilterBroadcastConfig {
+            mutation_threshold: 2,
+            ..FilterBroadcastConfig::default()
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            filter_config,
+        );
+
+        // First DiskReadComplete: mutation counter = 1, no broadcast.
+        let (cid1, data1) = cid_with_class(b"durable-disk-1", false, false);
+        let actions = tier.handle(StorageTierEvent::DiskReadComplete {
+            cid: cid1,
+            query_id: 1,
+            data: data1,
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
+            "1st disk read: should not emit BroadcastFilter yet"
+        );
+
+        // Second DiskReadComplete: mutation counter = 2, should trigger broadcast.
+        let (cid2, data2) = cid_with_class(b"durable-disk-2", false, false);
+        let actions = tier.handle(StorageTierEvent::DiskReadComplete {
+            cid: cid2,
+            query_id: 2,
+            data: data2,
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
+            "2nd disk read: should trigger BroadcastFilter at threshold"
         );
     }
 }

@@ -888,11 +888,7 @@ impl<B: BlobStore> NodeRuntime<B> {
             // Don't process our own filter broadcasts.
             if peer_addr != self.node_addr {
                 if let Ok(filter) = BloomFilter::from_bytes(&payload) {
-                    let item_count = if payload.len() >= 12 {
-                        u32::from_be_bytes(payload[8..12].try_into().unwrap_or([0; 4]))
-                    } else {
-                        0
-                    };
+                    let item_count = filter.item_count();
                     self.peer_filters.upsert(
                         peer_addr.to_string(),
                         filter,

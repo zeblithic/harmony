@@ -160,6 +160,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             use harmony_content::blob::MemoryBlobStore;
             use harmony_content::storage_tier::{ContentPolicy, FilterBroadcastConfig, StorageBudget};
 
+            if cache_capacity == 0 {
+                return Err("--cache-capacity must be > 0".into());
+            }
+
             if encrypted_durable_announce && !encrypted_durable_persist {
                 return Err(
                     "--encrypted-durable-announce requires --encrypted-durable-persist: \
@@ -185,7 +189,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 schedule: Default::default(),
                 content_policy,
                 filter_broadcast_config: FilterBroadcastConfig {
-                    mutation_threshold: filter_mutation_threshold,
+                    mutation_threshold: filter_mutation_threshold.max(1),
                     max_interval_ticks: filter_broadcast_ticks,
                     expected_items: cache_capacity as u32,
                     fp_rate: 0.001,
@@ -318,6 +322,18 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("--encrypted-durable-announce requires --encrypted-durable-persist"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_zero_cache_capacity() {
+        let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "0"]).unwrap();
+        let result = run(cli);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--cache-capacity must be > 0"),
             "unexpected error: {msg}"
         );
     }

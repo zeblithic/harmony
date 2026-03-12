@@ -129,6 +129,11 @@ impl BloomFilter {
         self.num_hashes
     }
 
+    /// Returns the exact number of items inserted (tracked on each `insert` call).
+    pub fn item_count(&self) -> u32 {
+        self.item_count
+    }
+
     /// Insert a content ID into the filter.
     pub fn insert(&mut self, cid: &ContentId) {
         let (h1, h2) = hash_pair(cid);
