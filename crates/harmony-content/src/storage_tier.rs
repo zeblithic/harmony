@@ -227,6 +227,10 @@ impl<B: BlobStore> StorageTier<B> {
                     "DiskReadComplete for non-admissible class: {:?}",
                     cid.content_class()
                 );
+                // Verify integrity — disk data may be corrupted (bit rot, wrong file).
+                if !Self::verify_cid(&cid, &data) {
+                    return vec![];
+                }
                 // Re-cache the data from disk.
                 self.cache.store(cid, data.clone());
                 vec![StorageTierAction::SendReply {
@@ -257,14 +261,14 @@ impl<B: BlobStore> StorageTier<B> {
             }
             None => {
                 self.metrics.cache_misses += 1;
-                if self.disk_index.contains(cid) {
-                    vec![StorageTierAction::DiskLookup {
-                        cid: *cid,
-                        query_id,
-                    }]
-                } else {
-                    vec![]
-                }
+                // Note: disk_index may contain this CID, but DiskLookup actions
+                // are not yet serviced by the runtime (disk I/O is a future bead).
+                // Emitting DiskLookup here would cause queries to hang with no reply.
+                // When disk I/O is wired, restore the disk_index check:
+                //   if self.disk_index.contains(cid) {
+                //       return vec![StorageTierAction::DiskLookup { cid: *cid, query_id }];
+                //   }
+                vec![]
             }
         }
     }
@@ -1077,8 +1081,29 @@ mod tests {
     }
 
     #[test]
-    fn content_query_miss_on_disk_emits_disk_lookup() {
-        // Small cache to make eviction easy.
+    fn disk_read_complete_rejects_corrupted_data() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let flags = crate::cid::ContentFlags {
+            encrypted: false,
+            ephemeral: false,
+            alt_hash: false,
+        };
+        let cid = ContentId::for_blob(b"original", flags).unwrap();
+
+        // DiskReadComplete with data that doesn't match the CID hash.
+        let actions = tier.handle(StorageTierEvent::DiskReadComplete {
+            cid,
+            query_id: 42,
+            data: b"corrupted".to_vec(),
+        });
+        assert!(actions.is_empty(), "corrupted disk data should be rejected");
+    }
+
+    #[test]
+    fn cache_miss_returns_empty_even_for_disk_indexed() {
+        // DiskLookup is not yet serviced by the runtime (disk I/O is a future
+        // bead). Until then, cache misses return [] to avoid hanging queries.
+        // The disk_index is populated as scaffolding for when disk I/O is wired.
         let budget = StorageBudget {
             cache_capacity: 3,
             max_pinned_bytes: 1_000_000,
@@ -1103,45 +1128,28 @@ mod tests {
             });
         }
 
-        // Query original CID — should miss cache but find in disk_index → DiskLookup.
+        // Query original CID — cache miss returns empty (no DiskLookup until
+        // runtime can service it).
         let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 77, cid });
-        let disk_lookups: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, StorageTierAction::DiskLookup { .. }))
-            .collect();
-        assert_eq!(
-            disk_lookups.len(),
-            1,
-            "cache miss for disk-indexed CID should emit DiskLookup, got: {actions:?}"
+        assert!(
+            actions.is_empty(),
+            "cache miss should return empty until disk I/O is wired, got: {actions:?}"
         );
-        match &disk_lookups[0] {
-            StorageTierAction::DiskLookup {
-                cid: lookup_cid,
-                query_id,
-            } => {
-                assert_eq!(*lookup_cid, cid);
-                assert_eq!(*query_id, 77);
-            }
-            _ => unreachable!(),
-        }
     }
 
     // ---- Integration tests: multi-step policy enforcement ----
 
     #[test]
-    fn full_durable_lifecycle_store_evict_disk_serve() {
+    fn full_durable_lifecycle_store_persist_and_disk_read() {
         // Store durable content → verify PersistToDisk emitted →
-        // query after memory eviction → DiskLookup emitted →
-        // DiskReadComplete → reply served.
-        let budget = StorageBudget {
-            cache_capacity: 3,
-            max_pinned_bytes: 1_000_000,
-        };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+        // DiskReadComplete verifies and re-caches → reply served.
+        //
+        // Note: DiskLookup emission is deferred until the runtime can
+        // service disk I/O. This test exercises PersistToDisk + DiskReadComplete.
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
         let (cid, data) = cid_with_class(b"durable lifecycle", false, false);
 
-        // Store via transit.
+        // Store via transit — should emit PersistToDisk + AnnounceContent.
         let actions = tier.handle(StorageTierEvent::TransitContent {
             cid,
             data: data.clone(),
@@ -1153,26 +1161,7 @@ mod tests {
             .iter()
             .any(|a| matches!(a, StorageTierAction::AnnounceContent { .. })));
 
-        // Flood cache to evict the original CID from memory.
-        for i in 0..10 {
-            let filler = format!("filler-{i}");
-            let (filler_cid, filler_data) = cid_with_class(filler.as_bytes(), false, false);
-            tier.handle(StorageTierEvent::TransitContent {
-                cid: filler_cid,
-                data: filler_data,
-            });
-        }
-
-        // Query should miss cache but find in disk_index → DiskLookup.
-        let query_actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });
-        assert!(
-            query_actions
-                .iter()
-                .any(|a| matches!(a, StorageTierAction::DiskLookup { .. })),
-            "evicted durable CID should trigger DiskLookup"
-        );
-
-        // Simulate disk read response.
+        // Simulate disk read response — should verify, re-cache, and reply.
         let disk_actions = tier.handle(StorageTierEvent::DiskReadComplete {
             cid,
             query_id: 99,
@@ -1181,6 +1170,12 @@ mod tests {
         assert!(disk_actions
             .iter()
             .any(|a| matches!(a, StorageTierAction::SendReply { query_id: 99, .. })));
+
+        // Content should be queryable from cache after re-caching.
+        let query_actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });
+        assert!(query_actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::SendReply { query_id: 1, .. })));
     }
 
     #[test]

@@ -197,7 +197,12 @@ impl<S: BlobStore> ContentStore<S> {
             return true;
         }
 
-        // Compare against probation's LRU victim, factoring in class priority.
+        // Compare the *transit CID's* class against probation's LRU victim.
+        // This is a pre-filter heuristic: "is this CID's class valuable enough
+        // to be worth caching?" Note: admission_challenge() performs a separate
+        // class comparison for the *window evictee* (which may be a different CID)
+        // — that's intentional, as each pipeline stage evaluates the CID actually
+        // transitioning at that point.
         let candidate_prio = cid.content_class().eviction_priority();
         match self.probation.peek_lru_excluding(&self.pinned) {
             Some(victim) => {
