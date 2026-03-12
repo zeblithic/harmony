@@ -913,6 +913,7 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror 2.0.18",
+ "x25519-dalek",
  "zeroize",
 ]
 
