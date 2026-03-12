@@ -150,7 +150,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             use crate::runtime::{NodeConfig, NodeRuntime, RuntimeAction};
             use harmony_compute::InstructionBudget;
             use harmony_content::blob::MemoryBlobStore;
-            use harmony_content::storage_tier::{ContentPolicy, StorageBudget};
+            use harmony_content::storage_tier::{ContentPolicy, FilterBroadcastConfig, StorageBudget};
 
             if encrypted_durable_announce && !encrypted_durable_persist {
                 return Err(
@@ -176,6 +176,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 schedule: Default::default(),
                 content_policy,
+                filter_broadcast_config: FilterBroadcastConfig::default(),
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 

@@ -11,7 +11,8 @@ use harmony_compute::InstructionBudget;
 use harmony_content::blob::BlobStore;
 use harmony_content::cid::ContentId;
 use harmony_content::storage_tier::{
-    ContentPolicy, StorageBudget, StorageMetrics, StorageTier, StorageTierAction, StorageTierEvent,
+    ContentPolicy, FilterBroadcastConfig, StorageBudget, StorageMetrics, StorageTier,
+    StorageTierAction, StorageTierEvent,
 };
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
@@ -29,6 +30,8 @@ pub struct NodeConfig {
     pub schedule: TierSchedule,
     /// Content acceptance / announcement policy.
     pub content_policy: ContentPolicy,
+    /// Configuration for periodic Bloom filter broadcasts.
+    pub filter_broadcast_config: FilterBroadcastConfig,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -85,6 +88,7 @@ impl Default for NodeConfig {
             compute_budget: InstructionBudget { fuel: 100_000 },
             schedule: TierSchedule::default(),
             content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig::default(),
         }
     }
 }
@@ -215,7 +219,7 @@ impl<B: BlobStore> NodeRuntime<B> {
         let mut queryable_router = QueryableRouter::new();
 
         let (storage, storage_startup) =
-            StorageTier::new(store, config.storage_budget, config.content_policy);
+            StorageTier::new(store, config.storage_budget, config.content_policy, config.filter_broadcast_config);
 
         let mut actions = Vec::new();
         let mut storage_queryable_ids = HashSet::new();
@@ -573,6 +577,9 @@ impl<B: BlobStore> NodeRuntime<B> {
                 StorageTierAction::PersistToDisk { .. }
                 | StorageTierAction::RemoveFromDisk { .. }
                 | StorageTierAction::DiskLookup { .. } => {}
+                StorageTierAction::BroadcastFilter { key_expr, payload } => {
+                    out.push(RuntimeAction::Publish { key_expr, payload });
+                }
             }
         }
     }
@@ -1645,6 +1652,7 @@ mod tests {
                 encrypted_durable_announce: true,
                 public_ephemeral_announce: false,
             },
+            filter_broadcast_config: FilterBroadcastConfig::default(),
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
