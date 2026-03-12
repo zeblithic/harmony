@@ -155,6 +155,14 @@ impl Lru {
         self.capacity
     }
 
+    /// Iterate over all CIDs in the LRU from head (most recent) to tail.
+    pub fn iter(&self) -> LruIter<'_> {
+        LruIter {
+            entries: &self.entries,
+            current: self.head,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -226,6 +234,23 @@ impl Lru {
         self.free.push(tail_idx);
         self.len -= 1;
         Some(cid)
+    }
+}
+
+/// Iterator over CIDs in an LRU segment, from head to tail.
+pub struct LruIter<'a> {
+    entries: &'a [LruEntry],
+    current: Option<usize>,
+}
+
+impl<'a> Iterator for LruIter<'a> {
+    type Item = ContentId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let idx = self.current?;
+        let entry = &self.entries[idx];
+        self.current = entry.next;
+        Some(entry.cid)
     }
 }
 
@@ -335,5 +360,24 @@ mod tests {
         assert_eq!(lru.insert(c0), Some(c0));
         assert_eq!(lru.len(), 0);
         assert!(!lru.contains(&c0));
+    }
+
+    #[test]
+    fn iter_visits_all_entries_head_to_tail() {
+        let mut lru = Lru::new(5);
+        lru.insert(make_cid(1));
+        lru.insert(make_cid(2));
+        lru.insert(make_cid(3));
+        let cids: Vec<ContentId> = lru.iter().collect();
+        assert_eq!(cids.len(), 3);
+        // Most recent first (head = last inserted).
+        assert_eq!(cids[0], make_cid(3));
+        assert_eq!(cids[2], make_cid(1));
+    }
+
+    #[test]
+    fn iter_empty_lru() {
+        let lru = Lru::new(5);
+        assert_eq!(lru.iter().count(), 0);
     }
 }
