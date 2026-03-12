@@ -276,14 +276,28 @@ impl Book {
 
     /// Detect whether a blob starts with a self-indexing ToC.
     ///
-    /// Checks the first 4 bytes: if they equal `SELF_INDEX_SENTINEL_00`
-    /// (0x3FFFFFFF as little-endian), this is a self-indexing book.
+    /// Validates all 4 sentinel values at offsets 0, 1024, 2048, 3072
+    /// (the first entry of each algorithm section). A raw book matching
+    /// all 4 sentinels by coincidence requires 128 bits of collision.
+    ///
+    /// Returns `false` for blobs smaller than a full page (4096 bytes).
     pub fn is_self_indexing_blob(blob: &[u8]) -> bool {
-        if blob.len() < 4 {
+        if blob.len() < PAGE_SIZE {
             return false;
         }
-        let first = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
-        first == crate::addr::SELF_INDEX_SENTINEL_00
+        for (algo_idx, &sentinel) in crate::addr::SELF_INDEX_SENTINELS.iter().enumerate() {
+            let offset = algo_idx * PAGES_PER_BOOK * 4;
+            let val = u32::from_le_bytes([
+                blob[offset],
+                blob[offset + 1],
+                blob[offset + 2],
+                blob[offset + 3],
+            ]);
+            if val != sentinel {
+                return false;
+            }
+        }
+        true
     }
 
     /// Reassemble the original blob by fetching pages by index.
@@ -842,5 +856,9 @@ mod tests {
     fn is_self_indexing_blob_rejects_short() {
         assert!(!Book::is_self_indexing_blob(&[0xFF, 0xFF, 0xFF]));
         assert!(!Book::is_self_indexing_blob(&[]));
+        // Less than PAGE_SIZE but starts with sentinel bytes
+        let mut almost = vec![0u8; PAGE_SIZE - 1];
+        almost[0..4].copy_from_slice(&0x3FFF_FFFFu32.to_le_bytes());
+        assert!(!Book::is_self_indexing_blob(&almost));
     }
 }
