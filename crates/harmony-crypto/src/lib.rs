@@ -6,5 +6,6 @@ pub mod error;
 pub mod fernet;
 pub mod hash;
 pub mod hkdf;
+pub mod ml_kem;
 
 pub use error::CryptoError;

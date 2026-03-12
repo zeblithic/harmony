@@ -21,4 +21,16 @@ pub enum CryptoError {
 
     #[error("HKDF output length {requested} exceeds maximum ({max})")]
     HkdfLengthExceeded { requested: usize, max: usize },
+
+    #[error("ML-KEM encapsulation failed")]
+    MlKemEncapsulationFailed,
+
+    #[error("ML-KEM decapsulation failed")]
+    MlKemDecapsulationFailed,
+
+    #[error("ML-DSA signing failed")]
+    MlDsaSignFailed,
+
+    #[error("ML-DSA signature verification failed")]
+    MlDsaVerifyFailed,
 }
