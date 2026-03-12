@@ -34,6 +34,8 @@ pub struct NodeConfig {
     /// Configuration for periodic Bloom filter broadcasts.
     pub filter_broadcast_config: FilterBroadcastConfig,
     /// This node's address (hex-encoded), used for filter broadcast keys.
+    /// Must be unique per node — set from identity address_hash at startup.
+    /// Defaults to `"local"` as a placeholder until identity is wired.
     pub node_addr: String,
 }
 
@@ -354,7 +356,7 @@ impl<B: BlobStore> NodeRuntime<B> {
             router_starved: 0,
             storage_starved: 0,
             compute_starved: 0,
-            peer_filters: PeerFilterTable::new(90),
+            peer_filters: PeerFilterTable::new(filter_broadcast_interval_ticks * 3),
             tick_count: 0,
             node_addr: config.node_addr,
             ticks_since_filter_broadcast: 0,
@@ -684,6 +686,9 @@ impl<B: BlobStore> NodeRuntime<B> {
                     let key_expr =
                         harmony_zenoh::namespace::filters::content_key(&self.node_addr);
                     out.push(RuntimeAction::Publish { key_expr, payload });
+                    // Reset timer so threshold-triggered broadcasts defer the next
+                    // timer-triggered one, avoiding redundant back-to-back rebuilds.
+                    self.ticks_since_filter_broadcast = 0;
                 }
             }
         }

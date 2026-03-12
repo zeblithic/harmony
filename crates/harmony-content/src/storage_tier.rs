@@ -310,6 +310,7 @@ impl<B: BlobStore> StorageTier<B> {
                 // genuinely hot cached items (freq 10+).
                 self.cache.warm_frequency(&cid, 5);
                 self.cache.store(cid, data.clone());
+                self.mutations_since_broadcast += 1;
                 // Note: queries_served was already incremented in handle_content_query
                 // when this query first arrived — only count the disk-specific metric.
                 self.metrics.disk_reads_served += 1;
