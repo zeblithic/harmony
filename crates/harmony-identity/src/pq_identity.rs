@@ -15,6 +15,7 @@ use harmony_crypto::hash;
 use harmony_crypto::ml_dsa::{self, MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 use harmony_crypto::ml_kem::{self, MlKemPublicKey, MlKemSecretKey};
 use rand_core::CryptoRngCore;
+use zeroize::Zeroize;
 
 use crate::IdentityError;
 
@@ -94,6 +95,47 @@ impl PqIdentity {
     pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), IdentityError> {
         let sig = MlDsaSignature::from_bytes(signature).map_err(IdentityError::Crypto)?;
         ml_dsa::verify(&self.verifying_key, message, &sig).map_err(IdentityError::Crypto)
+    }
+
+    /// Encrypt plaintext to this identity using ML-KEM-768 + ChaCha20-Poly1305.
+    ///
+    /// Wire format: `[1088B ML-KEM ciphertext][12B nonce][encrypted data + 16B tag]`
+    pub fn encrypt(
+        &self,
+        rng: &mut impl CryptoRngCore,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, IdentityError> {
+        // 1. ML-KEM encapsulate → shared secret
+        let (ct, ss) =
+            harmony_crypto::ml_kem::encapsulate(rng, &self.encryption_key).map_err(IdentityError::Crypto)?;
+
+        // 2. HKDF-SHA256 → symmetric key
+        let key_bytes = harmony_crypto::hkdf::derive_key(
+            ss.as_bytes(),
+            Some(&self.address_hash),
+            b"harmony-pq-encrypt-v1",
+            32,
+        )
+        .map_err(IdentityError::Crypto)?;
+
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&key_bytes);
+
+        // 3. ChaCha20-Poly1305 encrypt
+        let nonce = harmony_crypto::aead::generate_nonce(rng);
+        let encrypted =
+            harmony_crypto::aead::encrypt(&key, &nonce, plaintext, &[]).map_err(IdentityError::Crypto)?;
+
+        // Zeroize key material
+        key.zeroize();
+
+        // 4. Assemble wire format: [ML-KEM ct][nonce][encrypted+tag]
+        let mut result =
+            Vec::with_capacity(harmony_crypto::ml_kem::CT_LENGTH + 12 + encrypted.len());
+        result.extend_from_slice(ct.as_bytes());
+        result.extend_from_slice(&nonce);
+        result.extend_from_slice(&encrypted);
+        Ok(result)
     }
 }
 
@@ -183,6 +225,52 @@ impl PqPrivateIdentity {
     /// Access the ML-KEM-768 secret key (for encryption/decryption operations).
     pub fn encryption_secret(&self) -> &MlKemSecretKey {
         &self.encryption_secret
+    }
+
+    /// Decrypt ciphertext encrypted to this identity.
+    ///
+    /// Expects wire format: `[1088B ML-KEM ciphertext][12B nonce][encrypted data + 16B tag]`
+    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, IdentityError> {
+        let min_len = harmony_crypto::ml_kem::CT_LENGTH + 12 + 16; // ct + nonce + tag
+        if ciphertext.len() < min_len {
+            return Err(IdentityError::DecryptionFailed);
+        }
+
+        // 1. Extract ML-KEM ciphertext
+        let ct = harmony_crypto::ml_kem::MlKemCiphertext::from_bytes(
+            &ciphertext[..harmony_crypto::ml_kem::CT_LENGTH],
+        )
+        .map_err(IdentityError::Crypto)?;
+
+        // 2. Decapsulate → shared secret
+        let ss = harmony_crypto::ml_kem::decapsulate(&self.encryption_secret, &ct)
+            .map_err(IdentityError::Crypto)?;
+
+        // 3. HKDF-SHA256 → symmetric key
+        let key_bytes = harmony_crypto::hkdf::derive_key(
+            ss.as_bytes(),
+            Some(&self.identity.address_hash),
+            b"harmony-pq-encrypt-v1",
+            32,
+        )
+        .map_err(IdentityError::Crypto)?;
+
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&key_bytes);
+
+        // 4. Extract nonce and decrypt
+        let nonce_start = harmony_crypto::ml_kem::CT_LENGTH;
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&ciphertext[nonce_start..nonce_start + 12]);
+
+        let encrypted_data = &ciphertext[nonce_start + 12..];
+        let result = harmony_crypto::aead::decrypt(&key, &nonce, encrypted_data, &[])
+            .map_err(|_| IdentityError::DecryptionFailed);
+
+        // Zeroize key material
+        key.zeroize();
+
+        result
     }
 }
 
@@ -296,5 +384,41 @@ mod tests {
         let pub_bytes = priv_id.public_identity().to_public_bytes();
         let restored = PqIdentity::from_public_bytes(&pub_bytes).unwrap();
         assert_eq!(priv_id.public_identity(), &restored);
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let recipient = PqPrivateIdentity::generate(&mut OsRng);
+        let plaintext = b"secret post-quantum message";
+
+        let ciphertext = recipient
+            .public_identity()
+            .encrypt(&mut OsRng, plaintext)
+            .unwrap();
+        let decrypted = recipient.decrypt(&ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn wrong_recipient_cannot_decrypt() {
+        let recipient = PqPrivateIdentity::generate(&mut OsRng);
+        let wrong = PqPrivateIdentity::generate(&mut OsRng);
+        let ciphertext = recipient
+            .public_identity()
+            .encrypt(&mut OsRng, b"secret")
+            .unwrap();
+        // Decryption with wrong key should fail (AEAD tag verification fails)
+        assert!(wrong.decrypt(&ciphertext).is_err());
+    }
+
+    #[test]
+    fn ciphertext_format() {
+        let recipient = PqPrivateIdentity::generate(&mut OsRng);
+        let ciphertext = recipient
+            .public_identity()
+            .encrypt(&mut OsRng, b"test")
+            .unwrap();
+        // Format: [1088B ML-KEM ct][12B nonce][ciphertext + 16B tag]
+        assert!(ciphertext.len() >= harmony_crypto::ml_kem::CT_LENGTH + 12 + 16);
     }
 }
