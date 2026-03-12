@@ -90,13 +90,12 @@ When `TransitContent` or `PublishContent` arrives, classify and check policy bef
 
 ### 2. Eviction Priority
 
-Class-based tier ordering, frequency breaks ties within a tier:
+Two tiers determine eviction order, with frequency breaking ties within a tier:
 
 1. **PublicEphemeral (01)** — evicted first ("disposable first")
-2. **EncryptedDurable (10)** — evicted second
-3. **PublicDurable (00)** — evicted last (most valuable to the network)
+2. **EncryptedDurable (10) / PublicDurable (00)** — share eviction tier (priority 0); frequency breaks ties within this tier.
 
-In the W-TinyLFU admission challenge: if the candidate is higher-priority class than the victim, the victim is evicted regardless of frequency.
+Both durable classes share the same eviction priority so that `EncryptedDurable` with `encrypted_durable_persist=true` can compete fairly against `PublicDurable` via frequency rather than being permanently blocked when probation fills with `PublicDurable`.
 
 ### 3. Announcement Gating
 
@@ -131,7 +130,9 @@ StorageTierAction::RemoveFromDisk { cid }
 StorageTierEvent::DiskReadComplete { cid, data }
 ```
 
-**Durable flow:** Admitted → memory + `PersistToDisk` → evicted from memory → stays in `disk_index` → query hits disk index → runtime reads from disk → `DiskReadComplete` → re-cache + serve.
+**Durable flow (target):** Admitted → memory + `PersistToDisk` → evicted from memory → stays in `disk_index` → query hits disk index → runtime reads from disk → `DiskReadComplete` → re-cache + serve.
+
+> **Current state (this bead):** `PersistToDisk` emission and `disk_index` population are deferred until the runtime wires disk I/O. `DiskReadComplete` handling is implemented and tested, but the full round-trip requires a follow-on bead.
 
 **Ephemeral flow:** Admitted → memory only → evicted → gone.
 

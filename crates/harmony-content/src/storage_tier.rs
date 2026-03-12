@@ -230,6 +230,9 @@ impl<B: BlobStore> StorageTier<B> {
                     "DiskReadComplete for non-durable class: {:?}",
                     cid.content_class()
                 );
+                if !Self::is_durable_class(&cid) {
+                    return vec![];
+                }
                 // Verify integrity — disk data may be corrupted (bit rot, wrong file).
                 if !Self::verify_cid(&cid, &data) {
                     return vec![];
