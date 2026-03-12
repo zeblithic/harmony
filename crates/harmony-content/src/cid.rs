@@ -90,9 +90,9 @@ impl ContentId {
         let flags = self.flags();
         match (flags.encrypted, flags.ephemeral) {
             (false, false) => ContentClass::PublicDurable,
-            (false, true)  => ContentClass::PublicEphemeral,
-            (true, false)  => ContentClass::EncryptedDurable,
-            (true, true)   => ContentClass::EncryptedEphemeral,
+            (false, true) => ContentClass::PublicEphemeral,
+            (true, false) => ContentClass::EncryptedDurable,
+            (true, true) => ContentClass::EncryptedEphemeral,
         }
     }
 
@@ -1373,28 +1373,44 @@ mod tests {
 
     #[test]
     fn content_class_public_durable() {
-        let flags = ContentFlags { encrypted: false, ephemeral: false, alt_hash: false };
+        let flags = ContentFlags {
+            encrypted: false,
+            ephemeral: false,
+            alt_hash: false,
+        };
         let cid = ContentId::for_blob(b"test", flags).unwrap();
         assert_eq!(cid.content_class(), ContentClass::PublicDurable);
     }
 
     #[test]
     fn content_class_public_ephemeral() {
-        let flags = ContentFlags { encrypted: false, ephemeral: true, alt_hash: false };
+        let flags = ContentFlags {
+            encrypted: false,
+            ephemeral: true,
+            alt_hash: false,
+        };
         let cid = ContentId::for_blob(b"test", flags).unwrap();
         assert_eq!(cid.content_class(), ContentClass::PublicEphemeral);
     }
 
     #[test]
     fn content_class_encrypted_durable() {
-        let flags = ContentFlags { encrypted: true, ephemeral: false, alt_hash: false };
+        let flags = ContentFlags {
+            encrypted: true,
+            ephemeral: false,
+            alt_hash: false,
+        };
         let cid = ContentId::for_blob(b"test", flags).unwrap();
         assert_eq!(cid.content_class(), ContentClass::EncryptedDurable);
     }
 
     #[test]
     fn content_class_encrypted_ephemeral() {
-        let flags = ContentFlags { encrypted: true, ephemeral: true, alt_hash: false };
+        let flags = ContentFlags {
+            encrypted: true,
+            ephemeral: true,
+            alt_hash: false,
+        };
         let cid = ContentId::for_blob(b"test", flags).unwrap();
         assert_eq!(cid.content_class(), ContentClass::EncryptedEphemeral);
     }
