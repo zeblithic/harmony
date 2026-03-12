@@ -274,6 +274,18 @@ impl Book {
         })
     }
 
+    /// Detect whether a blob starts with a self-indexing ToC.
+    ///
+    /// Checks the first 4 bytes: if they equal `SELF_INDEX_SENTINEL_00`
+    /// (0x3FFFFFFF as little-endian), this is a self-indexing book.
+    pub fn is_self_indexing_blob(blob: &[u8]) -> bool {
+        if blob.len() < 4 {
+            return false;
+        }
+        let first = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+        first == crate::addr::SELF_INDEX_SENTINEL_00
+    }
+
     /// Reassemble the original blob by fetching pages by index.
     ///
     /// For self-indexing books, page 0 (ToC) is skipped — only data pages
@@ -806,5 +818,29 @@ mod tests {
             .reassemble(|idx| page_bufs.get(idx as usize).cloned())
             .unwrap();
         assert!(reassembled.is_empty());
+    }
+
+    #[test]
+    fn is_self_indexing_blob_detects_self_indexing() {
+        let data = vec![0xAAu8; PAGE_SIZE * 2];
+        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_blob(&data);
+        let blob: Vec<u8> = page_bufs.into_iter().flatten().collect();
+        assert!(Book::is_self_indexing_blob(&blob));
+    }
+
+    #[test]
+    fn is_self_indexing_blob_rejects_raw() {
+        let data = vec![0xBBu8; PAGE_SIZE * 2];
+        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_blob(&data);
+        let blob: Vec<u8> = page_bufs.into_iter().flatten().collect();
+        assert!(!Book::is_self_indexing_blob(&blob));
+    }
+
+    #[test]
+    fn is_self_indexing_blob_rejects_short() {
+        assert!(!Book::is_self_indexing_blob(&[0xFF, 0xFF, 0xFF]));
+        assert!(!Book::is_self_indexing_blob(&[]));
     }
 }
