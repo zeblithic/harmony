@@ -124,20 +124,22 @@ impl PqIdentity {
 
         // 3. ChaCha20-Poly1305 encrypt
         let nonce = harmony_crypto::aead::generate_nonce(rng);
-        let encrypted = harmony_crypto::aead::encrypt(&key, &nonce, plaintext, &[])
-            .map_err(IdentityError::Crypto)?;
+        let result = harmony_crypto::aead::encrypt(&key, &nonce, plaintext, &[])
+            .map_err(IdentityError::Crypto);
 
-        // Zeroize key material
+        // Zeroize key material before any return (including error path)
         key.zeroize();
         key_bytes.zeroize();
 
+        let encrypted = result?;
+
         // 4. Assemble wire format: [ML-KEM ct][nonce][encrypted+tag]
-        let mut result =
+        let mut wire =
             Vec::with_capacity(harmony_crypto::ml_kem::CT_LENGTH + 12 + encrypted.len());
-        result.extend_from_slice(ct.as_bytes());
-        result.extend_from_slice(&nonce);
-        result.extend_from_slice(&encrypted);
-        Ok(result)
+        wire.extend_from_slice(ct.as_bytes());
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(&encrypted);
+        Ok(wire)
     }
 }
 
