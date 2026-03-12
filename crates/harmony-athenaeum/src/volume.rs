@@ -323,6 +323,7 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
         cid,
         pages,
         blob_size,
+        self_indexing: false,
     })
 }
 

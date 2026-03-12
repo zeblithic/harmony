@@ -269,6 +269,7 @@ impl Encyclopedia {
                 cid: original_book.cid,
                 pages: new_pages,
                 blob_size: partial_size,
+                self_indexing: false,
             });
         }
 

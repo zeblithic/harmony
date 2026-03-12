@@ -41,6 +41,8 @@ pub struct Book {
     pub pages: Vec<[PageAddr; ALGO_COUNT]>,
     /// Actual byte count of the original blob (at most 1MB).
     pub blob_size: u32,
+    /// When true, page 0 is an embedded Table of Contents.
+    pub self_indexing: bool,
 }
 
 impl Book {
@@ -60,6 +62,7 @@ impl Book {
                 cid,
                 pages: Vec::new(),
                 blob_size: 0,
+                self_indexing: false,
             });
         }
 
@@ -94,12 +97,45 @@ impl Book {
             cid,
             pages,
             blob_size: data.len() as u32,
+            self_indexing: false,
         })
     }
 
     /// Number of pages in this book.
     pub fn page_count(&self) -> usize {
         self.pages.len()
+    }
+
+    /// Whether this book embeds its ToC at page 0.
+    pub fn is_self_indexing(&self) -> bool {
+        self.self_indexing
+    }
+
+    /// Number of data pages (excludes the ToC page for self-indexing books).
+    pub fn data_page_count(&self) -> usize {
+        if self.self_indexing {
+            self.pages.len().saturating_sub(1)
+        } else {
+            self.pages.len()
+        }
+    }
+
+    /// Slice of data page addresses (excludes ToC for self-indexing books).
+    pub fn data_pages(&self) -> &[[PageAddr; ALGO_COUNT]] {
+        if self.self_indexing && !self.pages.is_empty() {
+            &self.pages[1..]
+        } else {
+            &self.pages
+        }
+    }
+
+    /// Returns the ToC page bytes if this is a self-indexing book.
+    pub fn toc_page(&self) -> Option<Vec<u8>> {
+        if self.self_indexing {
+            Some(self.toc())
+        } else {
+            None
+        }
     }
 
     /// Generate a 4KB Table of Contents.
@@ -406,6 +442,38 @@ mod tests {
             ]);
             assert_eq!(value, NULL_PAGE, "entry {i} should be NULL_PAGE");
         }
+    }
+
+    #[test]
+    fn raw_book_is_not_self_indexing() {
+        let data = vec![0xABu8; 100];
+        let book = Book::from_blob(test_cid(), &data).unwrap();
+        assert!(!book.is_self_indexing());
+    }
+
+    #[test]
+    fn raw_book_data_page_count_equals_page_count() {
+        let data = vec![0xABu8; PAGE_SIZE * 3];
+        let book = Book::from_blob(test_cid(), &data).unwrap();
+        assert_eq!(book.data_page_count(), 3);
+        assert_eq!(book.data_page_count(), book.page_count());
+    }
+
+    #[test]
+    fn raw_book_data_pages_returns_all() {
+        let data = vec![0xABu8; PAGE_SIZE * 2];
+        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let dp = book.data_pages();
+        assert_eq!(dp.len(), 2);
+        assert_eq!(dp[0], book.pages[0]);
+        assert_eq!(dp[1], book.pages[1]);
+    }
+
+    #[test]
+    fn raw_book_toc_page_returns_none() {
+        let data = vec![0xABu8; 100];
+        let book = Book::from_blob(test_cid(), &data).unwrap();
+        assert!(book.toc_page().is_none());
     }
 
     #[test]
