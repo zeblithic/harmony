@@ -645,9 +645,12 @@ impl PqUcanToken {
 
     /// Verify the ML-DSA-65 signature on this token.
     ///
-    /// The caller provides the issuer's PQ public identity, whose verifying key
-    /// is used to check the signature over the signable bytes.
-    pub fn verify(
+    /// This checks *only* the cryptographic signature — it does **not** enforce
+    /// `not_before` / `expires_at` time bounds.  Callers must separately validate
+    /// the time window before accepting capabilities (analogous to how the
+    /// classical path's `verify_token()` wraps signature verification with
+    /// time-bound and revocation checks).
+    pub fn verify_signature(
         &self,
         verifying_key: &harmony_crypto::ml_dsa::MlDsaPublicKey,
     ) -> Result<(), UcanError> {

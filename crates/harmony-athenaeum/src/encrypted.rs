@@ -70,13 +70,26 @@ impl EncryptedBookMetadata {
     const FLAG_HAS_TAGS: u8 = 0x02;
 
     /// Serialize the metadata payload (without sentinel prefix).
+    ///
+    /// Flags are derived from the `expiry` and `tags` Option fields,
+    /// not from the stored `flags` byte, to prevent serialization
+    /// inconsistencies when fields are set independently.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
         // version (u16 LE)
         buf.extend_from_slice(&self.version.to_le_bytes());
-        // flags (u8)
-        buf.push(self.flags);
+
+        // Derive flags from Option field presence (single source of truth)
+        let mut flags: u8 = 0;
+        if self.expiry.is_some() {
+            flags |= Self::FLAG_HAS_EXPIRY;
+        }
+        if self.tags.is_some() {
+            flags |= Self::FLAG_HAS_TAGS;
+        }
+        buf.push(flags);
+
         // encryption_algo (u8)
         buf.push(self.encryption_algo);
 
@@ -92,19 +105,15 @@ impl EncryptedBookMetadata {
         buf.extend_from_slice(&(self.signature.len() as u16).to_le_bytes());
         buf.extend_from_slice(&self.signature);
 
-        // expiry (u64 LE) — if has_expiry
-        if self.flags & Self::FLAG_HAS_EXPIRY != 0 {
-            if let Some(exp) = self.expiry {
-                buf.extend_from_slice(&exp.to_le_bytes());
-            }
+        // expiry (u64 LE) — if present
+        if let Some(exp) = self.expiry {
+            buf.extend_from_slice(&exp.to_le_bytes());
         }
 
-        // tags: len (u16 LE) + data — if has_tags
-        if self.flags & Self::FLAG_HAS_TAGS != 0 {
-            if let Some(ref tags) = self.tags {
-                buf.extend_from_slice(&(tags.len() as u16).to_le_bytes());
-                buf.extend_from_slice(tags);
-            }
+        // tags: len (u16 LE) + data — if present
+        if let Some(ref tags) = self.tags {
+            buf.extend_from_slice(&(tags.len() as u16).to_le_bytes());
+            buf.extend_from_slice(tags);
         }
 
         buf
@@ -449,5 +458,43 @@ mod tests {
         let pages = meta.to_pages();
         let meta2 = EncryptedBookMetadata::from_pages(&pages).unwrap();
         assert_eq!(meta, meta2);
+    }
+
+    #[test]
+    fn flags_derived_from_options_not_stored_field() {
+        // Construct a struct with inconsistent flags vs Option fields.
+        // flags says "has_expiry" but expiry is None — previously this
+        // produced non-roundtrippable output.
+        let meta = EncryptedBookMetadata {
+            version: 1,
+            flags: 0x01, // claims has_expiry
+            encryption_algo: 0,
+            owner_public_key: vec![0xAA; 1184],
+            encapsulated_key: vec![0xBB; 1088],
+            signature: vec![0xCC; 3309],
+            expiry: None, // but no expiry present
+            tags: None,
+        };
+        // to_bytes derives flags from Options, so no expiry bytes are written
+        let bytes = meta.to_bytes();
+        let meta2 = EncryptedBookMetadata::from_bytes(&bytes).unwrap();
+        assert_eq!(meta2.expiry, None);
+        assert_eq!(meta2.flags, 0x00); // flags reflect actual state
+
+        // Reverse case: flags says no expiry but Option has one
+        let meta3 = EncryptedBookMetadata {
+            version: 1,
+            flags: 0x00, // claims no expiry
+            encryption_algo: 0,
+            owner_public_key: vec![0xAA; 1184],
+            encapsulated_key: vec![0xBB; 1088],
+            signature: vec![0xCC; 3309],
+            expiry: Some(42), // but expiry IS present
+            tags: None,
+        };
+        let bytes3 = meta3.to_bytes();
+        let meta4 = EncryptedBookMetadata::from_bytes(&bytes3).unwrap();
+        assert_eq!(meta4.expiry, Some(42));
+        assert_eq!(meta4.flags, 0x01); // flags reflect actual state
     }
 }

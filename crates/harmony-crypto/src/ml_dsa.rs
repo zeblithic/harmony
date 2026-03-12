@@ -95,8 +95,10 @@ impl MlDsaSecretKey {
 
     /// Derive the full `ml_dsa::SigningKey` from the stored seed.
     fn to_signing_key(&self) -> ml_dsa::SigningKey<MlDsa65> {
-        let seed_arr = ml_dsa::B32::from(self.seed);
-        ml_dsa::SigningKey::<MlDsa65>::from_seed(&seed_arr)
+        let mut seed_arr = ml_dsa::B32::from(self.seed);
+        let sk = ml_dsa::SigningKey::<MlDsa65>::from_seed(&seed_arr);
+        seed_arr.zeroize();
+        sk
     }
 
     /// Derive the corresponding public (verifying) key.
@@ -143,12 +145,13 @@ impl MlDsaSignature {
 pub fn generate(rng: &mut impl CryptoRngCore) -> (MlDsaPublicKey, MlDsaSecretKey) {
     let mut seed_bytes = [0u8; SK_LENGTH];
     rng.fill_bytes(&mut seed_bytes);
-    let seed_arr = ml_dsa::B32::from(seed_bytes);
+    let mut seed_arr = ml_dsa::B32::from(seed_bytes);
     let kp = MlDsa65::from_seed(&seed_arr);
     let pk = MlDsaPublicKey {
         inner: kp.verifying_key().clone(),
     };
     let sk = MlDsaSecretKey { seed: seed_bytes };
+    seed_arr.zeroize();
     seed_bytes.zeroize();
     (pk, sk)
 }

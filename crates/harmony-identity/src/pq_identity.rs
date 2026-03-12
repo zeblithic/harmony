@@ -518,7 +518,7 @@ mod tests {
 
         // Verify with issuer's public key
         assert!(token
-            .verify(&issuer.public_identity().verifying_key)
+            .verify_signature(&issuer.public_identity().verifying_key)
             .is_ok());
     }
 
@@ -539,7 +539,7 @@ mod tests {
             .unwrap();
 
         assert!(token
-            .verify(&wrong.public_identity().verifying_key)
+            .verify_signature(&wrong.public_identity().verifying_key)
             .is_err());
     }
 
@@ -627,7 +627,7 @@ mod tests {
 
         token.signature[0] ^= 0xFF;
         assert!(token
-            .verify(&issuer.public_identity().verifying_key)
+            .verify_signature(&issuer.public_identity().verifying_key)
             .is_err());
     }
 
