@@ -116,7 +116,7 @@ pub enum StorageTierAction {
 /// announcement decision points. Classes not covered by explicit flags
 /// have hardcoded behavior:
 /// - `PublicDurable (00)`: always persist, always announce.
-/// - `EncryptedEphemeral (11)`: never reaches StorageTier (gated at runtime).
+/// - `EncryptedEphemeral (11)`: always rejected by `class_admits()` — never stored or announced.
 #[derive(Debug, Clone)]
 pub struct ContentPolicy {
     /// Whether to persist encrypted durable (10) content.
@@ -324,7 +324,11 @@ impl<B: BlobStore> StorageTier<B> {
         let mut actions = Vec::new();
         // Emit PersistToDisk for durable content classes.
         if let Some(data) = persist_data {
-            self.disk_index.insert(cid);
+            // Note: disk_index insertion is deferred until the runtime can
+            // service DiskLookup actions (disk I/O is a future bead). Without
+            // a corresponding removal path, inserting here would grow the
+            // index unboundedly with no reader.
+            // self.disk_index.insert(cid);
             actions.push(StorageTierAction::PersistToDisk { cid, data });
         }
         // Re-announcing already-cached content is intentional: it refreshes
@@ -361,7 +365,7 @@ impl<B: BlobStore> StorageTier<B> {
         let mut actions = Vec::new();
         // Emit PersistToDisk for durable content classes.
         if let Some(data) = persist_data {
-            self.disk_index.insert(cid);
+            // self.disk_index.insert(cid);
             actions.push(StorageTierAction::PersistToDisk { cid, data });
         }
         // Announce only if policy allows it for this content class.
@@ -890,6 +894,62 @@ mod tests {
     }
 
     #[test]
+    fn transit_encrypted_durable_survives_public_durable_pressure() {
+        // Regression: EncryptedDurable (eviction_priority formerly 1) was
+        // permanently rejected by should_admit when probation was full of
+        // PublicDurable (priority 0), making encrypted_durable_persist=true
+        // a no-op for transit in steady state. With the fix, both durable
+        // classes share priority 0, so frequency breaks ties.
+        let budget = StorageBudget {
+            cache_capacity: 5,
+            max_pinned_bytes: 1_000_000,
+        };
+        let policy = ContentPolicy {
+            encrypted_durable_persist: true,
+            encrypted_durable_announce: true,
+            ..ContentPolicy::default()
+        };
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy);
+
+        // Fill cache with PublicDurable content.
+        for i in 0..4 {
+            let (cid, data) = cid_with_class(format!("pub-{i}").as_bytes(), false, false);
+            tier.handle(StorageTierEvent::TransitContent { cid, data });
+        }
+
+        // Transit the EncryptedDurable CID multiple times to build frequency.
+        // Previously this was pointless (class comparison short-circuited before
+        // frequency was consulted). Now frequency is consulted for same-priority
+        // classes, so repeated transits warm the sketch.
+        let (enc_cid, enc_data) = cid_with_class(b"encrypted file", true, false);
+        for _ in 0..5 {
+            tier.handle(StorageTierEvent::TransitContent {
+                cid: enc_cid,
+                data: enc_data.clone(),
+            });
+        }
+
+        let rejected_before = tier.metrics().transit_rejected;
+
+        // Final transit — with built-up frequency, should beat the probation victim.
+        let actions = tier.handle(StorageTierEvent::TransitContent {
+            cid: enc_cid,
+            data: enc_data,
+        });
+        assert_eq!(
+            tier.metrics().transit_rejected,
+            rejected_before,
+            "EncryptedDurable with high frequency should not be rejected"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::PersistToDisk { .. })),
+            "EncryptedDurable should emit PersistToDisk"
+        );
+    }
+
+    #[test]
     fn transit_admits_public_durable() {
         let mut tier = make_tier_with_policy(ContentPolicy::default());
         let (cid, data) = cid_with_class(b"public doc", false, false);
@@ -1100,10 +1160,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_miss_returns_empty_even_for_disk_indexed() {
+    fn cache_miss_returns_empty() {
         // DiskLookup is not yet serviced by the runtime (disk I/O is a future
         // bead). Until then, cache misses return [] to avoid hanging queries.
-        // The disk_index is populated as scaffolding for when disk I/O is wired.
         let budget = StorageBudget {
             cache_capacity: 3,
             max_pinned_bytes: 1_000_000,
@@ -1112,7 +1171,7 @@ mod tests {
             StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
         let (cid, data) = cid_with_class(b"durable on disk", false, false);
 
-        // Store via transit — adds to cache + disk_index.
+        // Store via transit — adds to cache.
         tier.handle(StorageTierEvent::TransitContent {
             cid,
             data: data.clone(),

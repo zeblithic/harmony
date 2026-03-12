@@ -33,13 +33,16 @@ pub enum ContentClass {
 impl ContentClass {
     /// Eviction priority: higher values are evicted first under pressure.
     ///
-    /// PublicEphemeral (disposable-first) > EncryptedDurable > PublicDurable (most valuable).
+    /// Two tiers: ephemeral (evict first) and durable (evict last, frequency
+    /// breaks ties). Both durable classes share priority 0 so EncryptedDurable
+    /// can compete fairly against PublicDurable on frequency — otherwise
+    /// `encrypted_durable_persist=true` would be a no-op for transit when
+    /// probation fills with PublicDurable.
     /// EncryptedEphemeral never enters the cache, so its priority is irrelevant.
     pub fn eviction_priority(self) -> u8 {
         match self {
             ContentClass::PublicEphemeral => 2,
-            ContentClass::EncryptedDurable => 1,
-            ContentClass::PublicDurable => 0,
+            ContentClass::PublicDurable | ContentClass::EncryptedDurable => 0,
             ContentClass::EncryptedEphemeral => u8::MAX, // unreachable in cache
         }
     }
