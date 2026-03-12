@@ -15,6 +15,9 @@ hmac = { workspace = true }
 aes = { workspace = true }
 cbc = { workspace = true }
 chacha20poly1305 = { workspace = true }
+ml-kem = { workspace = true }
+ml-dsa = { workspace = true }
+hybrid-array = { workspace = true }
 rand_core = { workspace = true }
 zeroize = { workspace = true }
 subtle = { workspace = true }
@@ -31,6 +34,7 @@ std = [
     "chacha20poly1305/getrandom",
     "subtle/std",
     "thiserror/std",
+    # ml-kem, ml-dsa, hybrid-array are no_std-clean by default; no std feature to re-enable
     # aes 0.8 is no_std-clean by default; no std feature to re-enable
 ]
 
