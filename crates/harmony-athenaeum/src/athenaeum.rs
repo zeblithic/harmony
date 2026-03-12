@@ -173,7 +173,8 @@ impl Book {
 
     /// Split the original blob into page-sized buffers (4KB each).
     ///
-    /// The last page is zero-padded to a full 4KB.
+    /// For self-indexing books, the ToC page is prepended at index 0.
+    /// The last data page is zero-padded to a full 4KB.
     pub fn page_data_from_blob(&self, data: &[u8]) -> Vec<Vec<u8>> {
         debug_assert_eq!(
             data.len(),
@@ -181,6 +182,9 @@ impl Book {
             "data length does not match blob_size"
         );
         let mut pages = Vec::new();
+        if self.self_indexing {
+            pages.push(self.toc());
+        }
         for chunk in data.chunks(PAGE_SIZE) {
             let mut page_buf = vec![0u8; PAGE_SIZE];
             page_buf[..chunk.len()].copy_from_slice(chunk);
@@ -272,12 +276,15 @@ impl Book {
 
     /// Reassemble the original blob by fetching pages by index.
     ///
-    /// Pages are fetched by index (0..page_count), concatenated, and
-    /// truncated to `blob_size`. A missing page returns `MissingPage` error.
+    /// For self-indexing books, page 0 (ToC) is skipped — only data pages
+    /// (1..page_count) are fetched. For raw books, all pages are fetched.
+    ///
+    /// Pages are concatenated and truncated to `blob_size`.
     pub fn reassemble(&self, fetch: impl Fn(u8) -> Option<Vec<u8>>) -> Result<Vec<u8>, BookError> {
         let mut result = Vec::with_capacity(self.blob_size as usize);
 
-        for i in 0..self.pages.len() {
+        let start = if self.self_indexing { 1 } else { 0 };
+        for i in start..self.pages.len() {
             let page_data = fetch(i as u8).ok_or(BookError::MissingPage {
                 page_index: i as u8,
             })?;
@@ -748,5 +755,56 @@ mod tests {
         for addr in &book.pages[0] {
             assert!(addr.verify_data(&toc));
         }
+    }
+
+    #[test]
+    fn page_data_self_indexing_includes_toc() {
+        let data = vec![0xAAu8; PAGE_SIZE + 100];
+        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_blob(&data);
+        assert_eq!(page_bufs.len(), 3); // ToC + 2 data pages
+        assert_eq!(page_bufs[0].len(), PAGE_SIZE);
+        let first_u32 = u32::from_le_bytes([
+            page_bufs[0][0],
+            page_bufs[0][1],
+            page_bufs[0][2],
+            page_bufs[0][3],
+        ]);
+        assert_eq!(first_u32, SELF_INDEX_SENTINEL_00);
+    }
+
+    #[test]
+    fn page_data_self_indexing_toc_matches_toc_method() {
+        let data = vec![0xBBu8; PAGE_SIZE * 2];
+        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_blob(&data);
+        let toc = book.toc();
+        assert_eq!(page_bufs[0], toc);
+    }
+
+    #[test]
+    fn reassemble_self_indexing_round_trip() {
+        let mut data = vec![0u8; PAGE_SIZE * 3 + 500];
+        for (i, b) in data.iter_mut().enumerate() {
+            let pos = i as u32;
+            *b = (pos ^ (pos >> 8) ^ (pos >> 16)) as u8;
+        }
+        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_blob(&data);
+        let reassembled = book
+            .reassemble(|idx| page_bufs.get(idx as usize).cloned())
+            .unwrap();
+        assert_eq!(reassembled.len(), data.len());
+        assert_eq!(reassembled, data);
+    }
+
+    #[test]
+    fn reassemble_self_indexing_empty() {
+        let book = Book::from_blob_self_indexing(test_cid(), &[]).unwrap();
+        let page_bufs = book.page_data_from_blob(&[]);
+        let reassembled = book
+            .reassemble(|idx| page_bufs.get(idx as usize).cloned())
+            .unwrap();
+        assert!(reassembled.is_empty());
     }
 }
