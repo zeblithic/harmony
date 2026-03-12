@@ -26,6 +26,15 @@ const HEADER_SIZE: usize = 12;
 /// with `num_hashes = u32::MAX` would cause ~4 billion iterations in `may_contain`).
 const MAX_HASHES: u32 = 100;
 
+/// Maximum allowed `num_bits` (m) in a deserialized filter.
+///
+/// Derived from the CLI's maximum cache capacity (200M items at fp_rate=0.001
+/// yields ~2.88 billion bits). Capping at 3 billion provides slight headroom
+/// and prevents untrusted peers from forcing large memory allocations (~375 MB
+/// at the cap). The receiver must still transmit a matching body, but
+/// defense-in-depth caps the allocation here.
+const MAX_BITS: u32 = 3_000_000_000;
+
 /// Errors that can occur when deserializing a [`BloomFilter`] from bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterError {
@@ -49,6 +58,13 @@ pub enum FilterError {
         /// The maximum allowed value.
         max: u32,
     },
+    /// `num_bits` exceeds the maximum allowed value.
+    TooManyBits {
+        /// The value found in the header.
+        got: u32,
+        /// The maximum allowed value.
+        max: u32,
+    },
 }
 
 impl fmt::Display for FilterError {
@@ -62,6 +78,9 @@ impl fmt::Display for FilterError {
             FilterError::ZeroHashes => write!(f, "num_hashes must be non-zero"),
             FilterError::TooManyHashes { got, max } => {
                 write!(f, "num_hashes {got} exceeds maximum {max}")
+            }
+            FilterError::TooManyBits { got, max } => {
+                write!(f, "num_bits {got} exceeds maximum {max}")
             }
         }
     }
@@ -244,6 +263,12 @@ impl BloomFilter {
 
         if num_bits == 0 {
             return Err(FilterError::ZeroBits);
+        }
+        if num_bits > MAX_BITS {
+            return Err(FilterError::TooManyBits {
+                got: num_bits,
+                max: MAX_BITS,
+            });
         }
         if num_hashes == 0 {
             return Err(FilterError::ZeroHashes);
@@ -517,6 +542,27 @@ mod tests {
             FilterError::TooManyHashes {
                 got: 101,
                 max: super::MAX_HASHES,
+            }
+        );
+    }
+
+    #[test]
+    fn from_bytes_rejects_excessive_num_bits() {
+        // num_bits = MAX_BITS + 1 should be rejected.
+        let num_bits = super::MAX_BITS + 1;
+        let num_words = (num_bits as usize).div_ceil(64);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&num_bits.to_be_bytes()); // num_bits
+        buf.extend_from_slice(&10u32.to_be_bytes()); // num_hashes
+        buf.extend_from_slice(&0u32.to_be_bytes()); // item_count
+        // Body: enough zero words to match num_bits.
+        buf.extend(core::iter::repeat(0u8).take(num_words * 8));
+        let err = BloomFilter::from_bytes(&buf).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::TooManyBits {
+                got: num_bits,
+                max: super::MAX_BITS,
             }
         );
     }

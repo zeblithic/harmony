@@ -298,8 +298,10 @@ impl<B: BlobStore> NodeRuntime<B> {
         let router = Node::new();
         let mut queryable_router = QueryableRouter::new();
 
-        // Clamp to at least 1 tick to prevent filter rebuild on every tick.
-        let filter_broadcast_interval_ticks = (config.filter_broadcast_config.max_interval_ticks as u64).max(1);
+        // Clamp to at least 2 ticks to prevent filter rebuild on every tick.
+        // With interval=1, the counter reaches 1 on the first increment and
+        // `1 >= 1` fires immediately — identical to interval=0.
+        let filter_broadcast_interval_ticks = (config.filter_broadcast_config.max_interval_ticks as u64).max(2);
 
         let (storage, storage_startup) =
             StorageTier::new(store, config.storage_budget, config.content_policy, config.filter_broadcast_config);
@@ -549,8 +551,14 @@ impl<B: BlobStore> NodeRuntime<B> {
         self.tick_count += 1;
 
         // Inject FilterTimerTick on configured interval.
+        // Skip if a threshold-triggered broadcast is already pending — the
+        // timer tick would cause a redundant full-cache rebuild whose payload
+        // immediately overwrites the pending one (coalescing keeps correctness
+        // but the extra iteration is wasted work).
         self.ticks_since_filter_broadcast += 1;
-        if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks {
+        if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks
+            && self.pending_filter_broadcast.is_none()
+        {
             self.ticks_since_filter_broadcast = 0;
             self.storage_queue
                 .push_back(StorageTierEvent::FilterTimerTick);
@@ -1887,6 +1895,115 @@ mod tests {
         rt.tick();
 
         assert_eq!(rt.peer_filter_parse_errors(), 1);
+    }
+
+    #[test]
+    fn filter_interval_clamped_to_at_least_two() {
+        use harmony_content::blob::MemoryBlobStore;
+
+        // max_interval_ticks=1 should be clamped to 2 so the timer doesn't
+        // fire every single tick.
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig {
+                max_interval_ticks: 1,
+                ..FilterBroadcastConfig::default()
+            },
+            node_addr: "clamp-test".to_string(),
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Tick 1: counter goes 0→1, but interval is 2 so no timer fires.
+        let actions = rt.tick();
+        let filter_publishes = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, RuntimeAction::Publish { key_expr, .. }
+                    if key_expr.starts_with("harmony/filters/"))
+            })
+            .count();
+        assert_eq!(
+            filter_publishes, 0,
+            "no filter broadcast on tick 1 (interval clamped to 2)"
+        );
+
+        // Tick 2: counter reaches 2, timer fires.
+        let actions = rt.tick();
+        let filter_publishes = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, RuntimeAction::Publish { key_expr, .. }
+                    if key_expr.starts_with("harmony/filters/"))
+            })
+            .count();
+        assert_eq!(
+            filter_publishes, 1,
+            "filter broadcast on tick 2 (interval=2 reached)"
+        );
+    }
+
+    #[test]
+    fn timer_skipped_when_threshold_broadcast_pending() {
+        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::cid::ContentFlags;
+
+        // Set mutation_threshold=2 and max_interval_ticks=2.
+        // Queue 2 transit events (crosses threshold) then call tick().
+        // The timer fires on tick 2, but should be skipped because
+        // a threshold broadcast is already pending.
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig {
+                mutation_threshold: 2,
+                max_interval_ticks: 2,
+                ..FilterBroadcastConfig::default()
+            },
+            node_addr: "skip-timer-test".to_string(),
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Tick 1: no events, no broadcast.
+        rt.tick();
+
+        // Queue 2 transit events to cross the mutation threshold.
+        for i in 0..2u8 {
+            let data = [i; 16];
+            let cid = ContentId::for_blob(&data, ContentFlags::default()).unwrap();
+            let cid_hex = hex::encode(cid.to_bytes());
+            let key_expr = format!("harmony/content/transit/{cid_hex}");
+            rt.push_event(RuntimeEvent::SubscriptionMessage {
+                key_expr,
+                payload: data.to_vec(),
+            });
+        }
+
+        // Tick 2: timer interval also fires (tick 2 >= interval 2),
+        // but should be skipped because threshold broadcast is pending.
+        let actions = rt.tick();
+        let filter_publishes: Vec<_> = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, RuntimeAction::Publish { key_expr, .. }
+                    if key_expr.starts_with("harmony/filters/"))
+            })
+            .collect();
+        assert_eq!(
+            filter_publishes.len(),
+            1,
+            "expected exactly 1 filter broadcast (timer should be skipped when threshold pending)"
+        );
     }
 
     #[test]
