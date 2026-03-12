@@ -73,7 +73,7 @@ impl BloomFilter {
 
 ### Hashing
 
-Kirschner-Mitzenmacker optimization: derive k hash indices from 2 base hashes.
+Kirsch-Mitzenmacher optimization: derive k hash indices from 2 base hashes.
 
 ```
 h_i(x) = h1(x) + i * h2(x)   mod m
@@ -204,7 +204,7 @@ A peer might receive an announcement for a CID not yet in the sender's latest fi
 - False positive rate within expected bounds (insert n items, check m random non-members)
 - Serialization round-trip (`to_bytes` / `from_bytes`)
 - `estimated_count` accuracy
-- Kirschner-Mitzenmacker hash distribution (no degenerate clustering)
+- Kirsch-Mitzenmacher hash distribution (no degenerate clustering)
 
 **Unit tests (storage_tier.rs):**
 - Mutation counter increments on admission/eviction

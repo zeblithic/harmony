@@ -4,7 +4,7 @@
 
 **Goal:** Nodes periodically broadcast Bloom filters of their cached CID set so peers can skip content queries to nodes that definitely don't have the content.
 
-**Architecture:** A `BloomFilter` data structure in `harmony-content` uses Kirschner-Mitzenmacker double-hashing over 28-byte CID hashes. `StorageTier` tracks cache mutations and emits `BroadcastFilter` actions on a hybrid timer/threshold trigger. `ContentStore` exposes `iter_admitted()` so the filter can be rebuilt from scratch each broadcast. `harmony-zenoh` gets a `filters` namespace module. `NodeRuntime` maintains a per-peer filter table and checks it before dispatching content queries.
+**Architecture:** A `BloomFilter` data structure in `harmony-content` uses Kirsch-Mitzenmacher double-hashing over 28-byte CID hashes. `StorageTier` tracks cache mutations and emits `BroadcastFilter` actions on a hybrid timer/threshold trigger. `ContentStore` exposes `iter_admitted()` so the filter can be rebuilt from scratch each broadcast. `harmony-zenoh` gets a `filters` namespace module. `NodeRuntime` maintains a per-peer filter table and checks it before dispatching content queries.
 
 **Tech Stack:** Rust, `no_std` + `alloc`, harmony-content, harmony-zenoh, harmony-node
 
@@ -35,7 +35,7 @@ use crate::cid::ContentId;
 /// Bloom filter for approximate CID set membership.
 ///
 /// Sized at construction for a target item count and false positive rate.
-/// Uses Kirschner-Mitzenmacker double hashing: k hash indices derived from
+/// Uses Kirsch-Mitzenmacher double hashing: k hash indices derived from
 /// two base hashes of the 28-byte CID hash field.
 pub struct BloomFilter {
     /// Bit array packed into u64 words.
@@ -173,7 +173,7 @@ git commit -m "feat(content): BloomFilter struct with sizing constructor"
 **Step 1: Add hashing and insert/may_contain/clear methods**
 
 ```rust
-/// Mixing constants for Kirschner-Mitzenmacker double hashing.
+/// Mixing constants for Kirsch-Mitzenmacher double hashing.
 /// Same SplitMix64 constants as sketch.rs for consistency.
 const SEED_A: u64 = 0x9E3779B97F4A7C15;
 const SEED_B: u64 = 0xBF58476D1CE4E5B9;
@@ -214,7 +214,7 @@ impl BloomFilter {
 
     /// Derive two base hashes from a CID's 28-byte hash field.
     ///
-    /// Kirschner-Mitzenmacker: k indices = h1 + i*h2, so we only need 2 hashes.
+    /// Kirsch-Mitzenmacher: k indices = h1 + i*h2, so we only need 2 hashes.
     fn hash_pair(cid: &ContentId) -> (u64, u64) {
         let hash = &cid.hash;
         let a = u64::from_le_bytes(hash[0..8].try_into().unwrap());
@@ -225,7 +225,7 @@ impl BloomFilter {
         (h1, h2)
     }
 
-    /// Compute the i-th bit index using Kirschner-Mitzenmacker scheme.
+    /// Compute the i-th bit index using Kirsch-Mitzenmacher scheme.
     fn bit_index(&self, h1: u64, h2: u64, i: u32) -> usize {
         let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
         (combined % self.num_bits as u64) as usize

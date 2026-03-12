@@ -119,7 +119,10 @@ pub enum StorageTierAction {
     /// Request disk read for a CID known to be on disk but evicted from memory.
     DiskLookup { cid: ContentId, query_id: u64 },
     /// Broadcast a Bloom filter snapshot of the cached CID set.
-    BroadcastFilter { key_expr: String, payload: Vec<u8> },
+    ///
+    /// The runtime constructs the full key expression (including node address)
+    /// since `StorageTier` is sans-I/O and has no identity context.
+    BroadcastFilter { payload: Vec<u8> },
 }
 
 /// Per-class storage and publishing policy.
@@ -332,7 +335,6 @@ impl<B: BlobStore> StorageTier<B> {
     /// a `BroadcastFilter` action. Resets the mutation counter.
     fn rebuild_filter(&mut self) -> StorageTierAction {
         use crate::bloom::BloomFilter;
-        use harmony_zenoh::namespace::filters;
 
         let mut filter = BloomFilter::new(
             self.filter_config.expected_items,
@@ -347,9 +349,7 @@ impl<B: BlobStore> StorageTier<B> {
 
         self.mutations_since_broadcast = 0;
 
-        let key_expr = filters::content_key("");
         StorageTierAction::BroadcastFilter {
-            key_expr,
             payload: filter.to_bytes(),
         }
     }
@@ -1651,7 +1651,7 @@ mod tests {
 
         // Deserialize the filter from the BroadcastFilter payload.
         let payload = match &actions[0] {
-            StorageTierAction::BroadcastFilter { payload, .. } => payload,
+            StorageTierAction::BroadcastFilter { payload } => payload,
             other => panic!("expected BroadcastFilter, got {other:?}"),
         };
         let filter = BloomFilter::from_bytes(payload).unwrap();

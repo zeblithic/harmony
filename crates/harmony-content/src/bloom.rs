@@ -2,7 +2,7 @@
 //!
 //! Nodes broadcast Bloom filters of their cached CID set so peers can
 //! skip queries for content that is definitely absent. Uses
-//! Kirschner-Mitzenmacker double hashing to derive *k* bit indices from
+//! Kirsch-Mitzenmacher double hashing to derive *k* bit indices from
 //! two base hashes extracted from the CID's truncated SHA-256.
 
 use alloc::{vec, vec::Vec};
@@ -267,7 +267,7 @@ impl BloomFilter {
     }
 }
 
-/// Extract two base hashes from a CID for Kirschner-Mitzenmacker double hashing.
+/// Extract two base hashes from a CID for Kirsch-Mitzenmacher double hashing.
 ///
 /// Reads `hash[0..8]` and `hash[8..16]` as little-endian u64 values and mixes
 /// them with SplitMix64 constants.

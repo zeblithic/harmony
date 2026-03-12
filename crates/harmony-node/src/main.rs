@@ -190,6 +190,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     expected_items: cache_capacity as u32,
                     fp_rate: 0.001,
                 },
+                // Placeholder until identity is established at startup.
+                node_addr: "local".to_string(),
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 

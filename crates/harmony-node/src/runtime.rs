@@ -33,6 +33,8 @@ pub struct NodeConfig {
     pub content_policy: ContentPolicy,
     /// Configuration for periodic Bloom filter broadcasts.
     pub filter_broadcast_config: FilterBroadcastConfig,
+    /// This node's address (hex-encoded), used for filter broadcast keys.
+    pub node_addr: String,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -90,6 +92,7 @@ impl Default for NodeConfig {
             schedule: TierSchedule::default(),
             content_policy: ContentPolicy::default(),
             filter_broadcast_config: FilterBroadcastConfig::default(),
+            node_addr: "0000".to_string(),
         }
     }
 }
@@ -258,6 +261,12 @@ pub struct NodeRuntime<B: BlobStore> {
     peer_filters: PeerFilterTable,
     // Monotonically increasing tick counter
     tick_count: u64,
+    // This node's address (hex-encoded), used for filter broadcast keys
+    node_addr: String,
+    // Ticks since last FilterTimerTick was injected
+    ticks_since_filter_broadcast: u64,
+    // How many ticks between filter broadcasts (derived from max_interval_secs)
+    filter_broadcast_interval_ticks: u64,
 }
 
 impl<B: BlobStore> NodeRuntime<B> {
@@ -275,6 +284,8 @@ impl<B: BlobStore> NodeRuntime<B> {
 
         let router = Node::new();
         let mut queryable_router = QueryableRouter::new();
+
+        let filter_broadcast_interval_ticks = config.filter_broadcast_config.max_interval_secs as u64;
 
         let (storage, storage_startup) =
             StorageTier::new(store, config.storage_budget, config.content_policy, config.filter_broadcast_config);
@@ -320,6 +331,11 @@ impl<B: BlobStore> NodeRuntime<B> {
             key_expr: harmony_zenoh::namespace::compute::ACTIVITY_SUB.to_string(),
         });
 
+        // Subscribe to peer filter broadcasts.
+        actions.push(RuntimeAction::Subscribe {
+            key_expr: harmony_zenoh::namespace::filters::CONTENT_SUB.to_string(),
+        });
+
         let rt = Self {
             router,
             queryable_router,
@@ -339,6 +355,9 @@ impl<B: BlobStore> NodeRuntime<B> {
             compute_starved: 0,
             peer_filters: PeerFilterTable::new(90),
             tick_count: 0,
+            node_addr: config.node_addr,
+            ticks_since_filter_broadcast: 0,
+            filter_broadcast_interval_ticks,
         };
 
         (rt, actions)
@@ -376,6 +395,16 @@ impl<B: BlobStore> NodeRuntime<B> {
             self.storage_starved,
             self.compute_starved,
         )
+    }
+
+    /// Check if a peer should be queried for a given CID.
+    ///
+    /// Returns `false` only if the peer's Bloom filter definitively says
+    /// the CID is absent. Returns `true` for unknown peers, stale filters,
+    /// or filter matches.
+    pub fn should_query_peer(&self, peer_addr: &str, cid: &ContentId) -> bool {
+        self.peer_filters
+            .should_query(peer_addr, cid, self.tick_count)
     }
 
     /// Calculate the effective compute fuel budget based on data-plane queue depth.
@@ -498,6 +527,18 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// When limits are `None` (the default), all queued events are drained.
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
         self.tick_count += 1;
+
+        // Inject FilterTimerTick on configured interval.
+        self.ticks_since_filter_broadcast += 1;
+        if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks {
+            self.ticks_since_filter_broadcast = 0;
+            self.storage_queue
+                .push_back(StorageTierEvent::FilterTimerTick);
+        }
+
+        // Evict stale peer filters.
+        self.peer_filters.evict_stale(self.tick_count);
+
         let mut actions = Vec::new();
         // Note: fuel is captured once before any tier executes. When Compute is
         // promoted via starvation, it still runs with this pre-tick fuel value —
@@ -638,7 +679,9 @@ impl<B: BlobStore> NodeRuntime<B> {
                 StorageTierAction::PersistToDisk { .. }
                 | StorageTierAction::RemoveFromDisk { .. }
                 | StorageTierAction::DiskLookup { .. } => {}
-                StorageTierAction::BroadcastFilter { key_expr, payload } => {
+                StorageTierAction::BroadcastFilter { payload } => {
+                    let key_expr =
+                        harmony_zenoh::namespace::filters::content_key(&self.node_addr);
                     out.push(RuntimeAction::Publish { key_expr, payload });
                 }
             }
@@ -831,6 +874,30 @@ impl<B: BlobStore> NodeRuntime<B> {
     }
 
     fn route_subscription(&mut self, key_expr: String, payload: Vec<u8>) {
+        // Check if this is a peer filter broadcast.
+        if let Some(peer_addr) = key_expr
+            .strip_prefix(harmony_zenoh::namespace::filters::CONTENT_PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            // Don't process our own filter broadcasts.
+            if peer_addr != self.node_addr {
+                if let Ok(filter) = BloomFilter::from_bytes(&payload) {
+                    let item_count = if payload.len() >= 12 {
+                        u32::from_be_bytes(payload[8..12].try_into().unwrap_or([0; 4]))
+                    } else {
+                        0
+                    };
+                    self.peer_filters.upsert(
+                        peer_addr.to_string(),
+                        filter,
+                        item_count,
+                        self.tick_count,
+                    );
+                }
+            }
+            return;
+        }
+
         if let Some(event) = self.parse_subscription_event(&key_expr, payload) {
             self.storage_queue.push_back(event);
         }
@@ -993,8 +1060,8 @@ mod tests {
 
         // 16 shard queryables + 1 stats queryable + 1 compute activity queryable = 18
         assert_eq!(queryable_count, 18);
-        // transit + publish subscriptions = 2
-        assert_eq!(subscribe_count, 2);
+        // transit + publish + filter subscriptions = 3
+        assert_eq!(subscribe_count, 3);
     }
 
     #[test]
@@ -1714,6 +1781,7 @@ mod tests {
                 public_ephemeral_announce: false,
             },
             filter_broadcast_config: FilterBroadcastConfig::default(),
+            node_addr: "test".to_string(),
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
