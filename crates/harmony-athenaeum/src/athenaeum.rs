@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use crate::addr::{
     toc_sentinel_for_algo, Algorithm, PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, NULL_PAGE,
-    PAGES_PER_BOOK, PAGE_SIZE,
+    PAGES_PER_BOOK, PAGE_SIZE, SELF_INDEXING_MAX_DATA_SIZE,
 };
 
 /// Error when constructing or reassembling a Book.
@@ -189,6 +189,87 @@ impl Book {
         pages
     }
 
+    /// Build a self-indexing Book with an embedded ToC at page 0.
+    ///
+    /// The ToC page is constructed from the data page addresses and placed
+    /// at index 0. Data pages occupy indices 1..=N. The ToC uses sentinel
+    /// values at position 0 to break the circular hash dependency.
+    ///
+    /// - Maximum data: 255 pages (1,044,480 bytes).
+    /// - Empty data produces a Book with 1 page (just the ToC).
+    pub fn from_blob_self_indexing(cid: [u8; 32], data: &[u8]) -> Result<Self, BookError> {
+        if data.len() > SELF_INDEXING_MAX_DATA_SIZE {
+            return Err(BookError::BlobTooLarge { size: data.len() });
+        }
+
+        // Step 1: Compute data page addresses
+        let mut data_page_addrs: Vec<[PageAddr; ALGO_COUNT]> = Vec::new();
+        if !data.is_empty() {
+            for (i, chunk) in data.chunks(PAGE_SIZE).enumerate() {
+                let mut page_buf = [0u8; PAGE_SIZE];
+                page_buf[..chunk.len()].copy_from_slice(chunk);
+
+                let variants = [
+                    PageAddr::from_data(&page_buf, Algorithm::Sha256Msb),
+                    PageAddr::from_data(&page_buf, Algorithm::Sha256Lsb),
+                    PageAddr::from_data(&page_buf, Algorithm::Sha224Msb),
+                    PageAddr::from_data(&page_buf, Algorithm::Sha224Lsb),
+                ];
+
+                let all_same = variants[1..]
+                    .iter()
+                    .all(|v| v.hash_bits() == variants[0].hash_bits());
+                if all_same {
+                    return Err(BookError::AllAlgorithmsCollide { page_index: i + 1 });
+                }
+
+                data_page_addrs.push(variants);
+            }
+        }
+
+        // Step 2: Build ToC page bytes
+        let mut toc_buf = [0u8; PAGE_SIZE];
+        for algo_idx in 0..ALGO_COUNT {
+            let section_offset = algo_idx * PAGES_PER_BOOK * 4;
+            // Position 0: sentinel
+            let sentinel = toc_sentinel_for_algo(algo_idx as u8);
+            toc_buf[section_offset..section_offset + 4]
+                .copy_from_slice(&sentinel.to_le_bytes());
+            // Positions 1..N: data page addrs
+            for (i, addrs) in data_page_addrs.iter().enumerate() {
+                let entry_offset = section_offset + (i + 1) * 4;
+                toc_buf[entry_offset..entry_offset + 4]
+                    .copy_from_slice(&addrs[algo_idx].0.to_le_bytes());
+            }
+            // Positions N+1..255: NULL_PAGE
+            for page_idx in (data_page_addrs.len() + 1)..PAGES_PER_BOOK {
+                let entry_offset = section_offset + page_idx * 4;
+                toc_buf[entry_offset..entry_offset + 4]
+                    .copy_from_slice(&NULL_PAGE.to_le_bytes());
+            }
+        }
+
+        // Step 3: Hash ToC page to get its content-derived address
+        let toc_addrs = [
+            PageAddr::from_data(&toc_buf, Algorithm::Sha256Msb),
+            PageAddr::from_data(&toc_buf, Algorithm::Sha256Lsb),
+            PageAddr::from_data(&toc_buf, Algorithm::Sha224Msb),
+            PageAddr::from_data(&toc_buf, Algorithm::Sha224Lsb),
+        ];
+
+        // Step 4: Assemble pages: [ToC, data_page_1, ..., data_page_N]
+        let mut pages = Vec::with_capacity(1 + data_page_addrs.len());
+        pages.push(toc_addrs);
+        pages.extend(data_page_addrs);
+
+        Ok(Book {
+            cid,
+            pages,
+            blob_size: data.len() as u32,
+            self_indexing: true,
+        })
+    }
+
     /// Reassemble the original blob by fetching pages by index.
     ///
     /// Pages are fetched by index (0..page_count), concatenated, and
@@ -216,7 +297,8 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::addr::{
-        is_toc_sentinel, toc_sentinel_for_algo, SELF_INDEX_SENTINEL_00,
+        is_toc_sentinel, toc_sentinel_for_algo, SELF_INDEXING_MAX_DATA_SIZE,
+        SELF_INDEX_SENTINEL_00,
     };
 
     fn test_cid() -> [u8; 32] {
@@ -587,6 +669,84 @@ mod tests {
                 ]);
                 assert_eq!(value, NULL_PAGE);
             }
+        }
+    }
+
+    #[test]
+    fn from_blob_self_indexing_single_page() {
+        let data = vec![0xAAu8; 100];
+        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        assert!(book.is_self_indexing());
+        assert_eq!(book.page_count(), 2); // ToC + 1 data
+        assert_eq!(book.data_page_count(), 1);
+        assert_eq!(book.blob_size, 100);
+    }
+
+    #[test]
+    fn from_blob_self_indexing_multiple_pages() {
+        let data = vec![0xBBu8; PAGE_SIZE * 3 + 100];
+        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        assert!(book.is_self_indexing());
+        assert_eq!(book.page_count(), 5); // ToC + 4 data
+        assert_eq!(book.data_page_count(), 4);
+        assert_eq!(book.blob_size, (PAGE_SIZE * 3 + 100) as u32);
+    }
+
+    #[test]
+    fn from_blob_self_indexing_max_data() {
+        let data = vec![0xCCu8; SELF_INDEXING_MAX_DATA_SIZE];
+        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        assert_eq!(book.data_page_count(), 255);
+        assert_eq!(book.page_count(), 256);
+    }
+
+    #[test]
+    fn from_blob_self_indexing_too_large() {
+        let data = vec![0u8; SELF_INDEXING_MAX_DATA_SIZE + 1];
+        let err = Book::from_blob_self_indexing(test_cid(), &data).unwrap_err();
+        assert_eq!(
+            err,
+            BookError::BlobTooLarge {
+                size: SELF_INDEXING_MAX_DATA_SIZE + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn from_blob_self_indexing_empty() {
+        let book = Book::from_blob_self_indexing(test_cid(), &[]).unwrap();
+        assert!(book.is_self_indexing());
+        assert_eq!(book.page_count(), 1); // Just ToC
+        assert_eq!(book.data_page_count(), 0);
+        assert_eq!(book.blob_size, 0);
+    }
+
+    #[test]
+    fn from_blob_self_indexing_toc_page_zero_valid() {
+        let data = vec![0xDDu8; PAGE_SIZE * 2];
+        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        for addr in &book.pages[0] {
+            assert!(addr.verify_checksum());
+            assert!(!is_toc_sentinel(addr.0));
+        }
+    }
+
+    #[test]
+    fn from_blob_self_indexing_toc_starts_with_sentinel() {
+        let data = vec![0xEEu8; PAGE_SIZE];
+        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let toc = book.toc();
+        let first_u32 = u32::from_le_bytes([toc[0], toc[1], toc[2], toc[3]]);
+        assert_eq!(first_u32, SELF_INDEX_SENTINEL_00);
+    }
+
+    #[test]
+    fn from_blob_self_indexing_toc_verifies_against_page_zero_addr() {
+        let data = vec![0xFFu8; PAGE_SIZE * 2];
+        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let toc = book.toc();
+        for addr in &book.pages[0] {
+            assert!(addr.verify_data(&toc));
         }
     }
 }
