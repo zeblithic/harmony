@@ -152,6 +152,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             use harmony_content::blob::MemoryBlobStore;
             use harmony_content::storage_tier::{ContentPolicy, StorageBudget};
 
+            if encrypted_durable_announce && !encrypted_durable_persist {
+                return Err(
+                    "--encrypted-durable-announce requires --encrypted-durable-persist: \
+                     content rejected by class admission will never reach the announce check"
+                        .into(),
+                );
+            }
+
             let content_policy = ContentPolicy {
                 encrypted_durable_persist,
                 encrypted_durable_announce,
@@ -278,5 +286,22 @@ mod tests {
         } else {
             panic!("expected Run command");
         }
+    }
+
+    #[test]
+    fn cli_rejects_announce_without_persist() {
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--encrypted-durable-announce",
+        ])
+        .unwrap();
+        let result = run(cli);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--encrypted-durable-announce requires --encrypted-durable-persist"),
+            "unexpected error: {msg}"
+        );
     }
 }
