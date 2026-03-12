@@ -202,6 +202,10 @@ impl Book {
     /// For self-indexing books, the ToC page is prepended at index 0.
     /// The last data page is zero-padded to a full 4KB.
     pub fn page_data_from_blob(&self, data: &[u8]) -> Vec<Vec<u8>> {
+        debug_assert!(
+            !self.is_encrypted(),
+            "page_data_from_blob called on encrypted book — use page_data_from_blob_encrypted"
+        );
         debug_assert_eq!(
             data.len(),
             self.blob_size as usize,
