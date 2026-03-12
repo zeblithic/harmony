@@ -17,6 +17,7 @@ use harmony_crypto::ml_kem::{self, MlKemPublicKey, MlKemSecretKey};
 use rand_core::CryptoRngCore;
 use zeroize::Zeroize;
 
+use crate::ucan::{CapabilityType, PqUcanToken, UcanError, MAX_RESOURCE_SIZE};
 use crate::IdentityError;
 
 /// Length of the address hash in bytes (same as classical identity).
@@ -272,6 +273,52 @@ impl PqPrivateIdentity {
 
         result
     }
+
+    /// Issue a post-quantum root UCAN token — claims direct ownership of a resource.
+    ///
+    /// Root tokens have no `proof` field. The issuer is asserting they own
+    /// the resource. The token is signed with ML-DSA-65.
+    ///
+    /// The `rng` parameter is used to generate the 16-byte nonce; ML-DSA-65
+    /// signing itself is deterministic from the key.
+    pub fn issue_pq_root_token(
+        &self,
+        rng: &mut impl CryptoRngCore,
+        audience: &[u8; ADDRESS_HASH_LENGTH],
+        capability: CapabilityType,
+        resource: &[u8],
+        not_before: u64,
+        expires_at: u64,
+    ) -> Result<PqUcanToken, UcanError> {
+        if resource.len() > MAX_RESOURCE_SIZE {
+            return Err(UcanError::ResourceTooLarge);
+        }
+        if expires_at != 0 && not_before > expires_at {
+            return Err(UcanError::InvalidTimeWindow);
+        }
+
+        let mut nonce = [0u8; 16];
+        rng.fill_bytes(&mut nonce);
+
+        let mut token = PqUcanToken {
+            issuer: self.identity.address_hash,
+            audience: *audience,
+            capability,
+            resource: resource.to_vec(),
+            not_before,
+            expires_at,
+            nonce,
+            proof: None,
+            signature: Vec::new(), // placeholder for signable_bytes()
+        };
+
+        let signable = token.signable_bytes();
+        let sig = ml_dsa::sign(&self.signing_key, &signable)
+            .map_err(|e| UcanError::Identity(IdentityError::Crypto(e)))?;
+        token.signature = sig.as_bytes().to_vec();
+
+        Ok(token)
+    }
 }
 
 #[cfg(test)]
@@ -420,5 +467,231 @@ mod tests {
             .unwrap();
         // Format: [1088B ML-KEM ct][12B nonce][ciphertext + 16B tag]
         assert!(ciphertext.len() >= harmony_crypto::ml_kem::CT_LENGTH + 12 + 16);
+    }
+
+    // ── PQ UCAN token tests ─────────────────────────────────────────
+
+    #[test]
+    fn pq_ucan_roundtrip() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let audience_addr = [0xBB; 16];
+        let token = issuer
+            .issue_pq_root_token(
+                &mut OsRng,
+                &audience_addr,
+                CapabilityType::Content,
+                b"cid:abc",
+                0,
+                9999999999,
+            )
+            .unwrap();
+
+        let bytes = token.to_bytes();
+        assert_eq!(bytes[0], 0x01); // crypto_suite = PQ
+
+        let token2 = PqUcanToken::from_bytes(&bytes).unwrap();
+        assert_eq!(token.issuer, token2.issuer);
+        assert_eq!(token.audience, token2.audience);
+        assert_eq!(token.capability, token2.capability);
+        assert_eq!(token.resource, token2.resource);
+        assert_eq!(token.not_before, token2.not_before);
+        assert_eq!(token.expires_at, token2.expires_at);
+        assert_eq!(token.nonce, token2.nonce);
+        assert_eq!(token.proof, token2.proof);
+        assert_eq!(token.signature, token2.signature);
+    }
+
+    #[test]
+    fn pq_ucan_verify() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let audience_addr = [0xBB; 16];
+        let token = issuer
+            .issue_pq_root_token(
+                &mut OsRng,
+                &audience_addr,
+                CapabilityType::Content,
+                b"cid:abc",
+                0,
+                9999999999,
+            )
+            .unwrap();
+
+        // Verify with issuer's public key
+        assert!(token
+            .verify(&issuer.public_identity().verifying_key)
+            .is_ok());
+    }
+
+    #[test]
+    fn pq_ucan_wrong_key_fails_verify() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let wrong = PqPrivateIdentity::generate(&mut OsRng);
+        let audience_addr = [0xBB; 16];
+        let token = issuer
+            .issue_pq_root_token(
+                &mut OsRng,
+                &audience_addr,
+                CapabilityType::Content,
+                b"cid:abc",
+                0,
+                9999999999,
+            )
+            .unwrap();
+
+        assert!(token
+            .verify(&wrong.public_identity().verifying_key)
+            .is_err());
+    }
+
+    #[test]
+    fn pq_ucan_signature_length() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let token = issuer
+            .issue_pq_root_token(
+                &mut OsRng,
+                &[0xBB; 16],
+                CapabilityType::Memory,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(token.signature.len(), 3309); // ML-DSA-65 signature length
+    }
+
+    #[test]
+    fn pq_ucan_issuer_is_address_hash() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let token = issuer
+            .issue_pq_root_token(
+                &mut OsRng,
+                &[0xBB; 16],
+                CapabilityType::Content,
+                b"test",
+                0,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(token.issuer, issuer.public_identity().address_hash);
+    }
+
+    #[test]
+    fn pq_ucan_nonce_is_random() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let t1 = issuer
+            .issue_pq_root_token(
+                &mut OsRng,
+                &[0xBB; 16],
+                CapabilityType::Content,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+        let t2 = issuer
+            .issue_pq_root_token(
+                &mut OsRng,
+                &[0xBB; 16],
+                CapabilityType::Content,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        assert_ne!(t1.nonce, t2.nonce);
+    }
+
+    #[test]
+    fn pq_ucan_resource_too_large_rejected() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let result = issuer.issue_pq_root_token(
+            &mut OsRng,
+            &[0xBB; 16],
+            CapabilityType::Memory,
+            &[0u8; 257],
+            0,
+            0,
+        );
+        assert!(matches!(result, Err(UcanError::ResourceTooLarge)));
+    }
+
+    #[test]
+    fn pq_ucan_invalid_time_window_rejected() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let result = issuer.issue_pq_root_token(
+            &mut OsRng,
+            &[0xBB; 16],
+            CapabilityType::Memory,
+            &[],
+            200,
+            100,
+        );
+        assert!(matches!(result, Err(UcanError::InvalidTimeWindow)));
+    }
+
+    #[test]
+    fn pq_ucan_tampered_signature_fails_verify() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let mut token = issuer
+            .issue_pq_root_token(
+                &mut OsRng,
+                &[0xBB; 16],
+                CapabilityType::Content,
+                b"test",
+                0,
+                0,
+            )
+            .unwrap();
+
+        token.signature[0] ^= 0xFF;
+        assert!(token
+            .verify(&issuer.public_identity().verifying_key)
+            .is_err());
+    }
+
+    #[test]
+    fn pq_ucan_from_bytes_rejects_wrong_crypto_suite() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let token = issuer
+            .issue_pq_root_token(
+                &mut OsRng,
+                &[0xBB; 16],
+                CapabilityType::Content,
+                &[],
+                0,
+                0,
+            )
+            .unwrap();
+
+        let mut bytes = token.to_bytes();
+        bytes[0] = 0x00; // Change to Ed25519 suite
+        assert!(PqUcanToken::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn pq_ucan_from_bytes_rejects_truncated() {
+        assert!(PqUcanToken::from_bytes(&[0x01; 10]).is_err());
+    }
+
+    #[test]
+    fn pq_ucan_content_hash_deterministic() {
+        let issuer = PqPrivateIdentity::generate(&mut OsRng);
+        let token = issuer
+            .issue_pq_root_token(
+                &mut OsRng,
+                &[0xBB; 16],
+                CapabilityType::Content,
+                b"test",
+                0,
+                0,
+            )
+            .unwrap();
+
+        let h1 = token.content_hash();
+        let h2 = token.content_hash();
+        assert_eq!(h1, h2);
     }
 }

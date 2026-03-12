@@ -10,8 +10,8 @@ pub use error::IdentityError;
 pub use identity::{Identity, PrivateIdentity};
 pub use pq_identity::{PqIdentity, PqPrivateIdentity};
 pub use ucan::{
-    verify_revocation, verify_token, CapabilityType, IdentityResolver, ProofResolver, Revocation,
-    RevocationSet, UcanError, UcanToken,
+    verify_revocation, verify_token, CapabilityType, CryptoSuite, IdentityResolver, PqUcanToken,
+    ProofResolver, Revocation, RevocationSet, UcanError, UcanToken,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use ucan::{MemoryIdentityStore, MemoryProofStore, MemoryRevocationSet};

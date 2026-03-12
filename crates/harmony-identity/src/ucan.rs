@@ -18,6 +18,23 @@ use crate::PrivateIdentity;
 /// Maximum size of the resource field in bytes.
 pub const MAX_RESOURCE_SIZE: usize = 256;
 
+/// ML-DSA-65 signature length (FIPS 204).
+const PQ_SIGNATURE_LENGTH: usize = harmony_crypto::ml_dsa::SIG_LENGTH; // 3309
+
+/// Identifies which cryptographic suite a serialized token uses.
+///
+/// The first byte of the wire format distinguishes classical Ed25519 tokens
+/// from post-quantum ML-DSA-65 tokens so that parsers can dispatch to the
+/// correct deserialization logic without trial-and-error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CryptoSuite {
+    /// Classical Ed25519 signatures (64-byte).
+    Ed25519 = 0x00,
+    /// Post-quantum ML-DSA-65 signatures (3,309-byte, FIPS 204).
+    MlDsa65 = 0x01,
+}
+
 /// Capability types matching the Ring 2 microkernel's resource model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -431,6 +448,213 @@ impl MemoryRevocationSet {
 impl RevocationSet for MemoryRevocationSet {
     fn is_revoked(&self, token_hash: &[u8; 32]) -> bool {
         self.revoked.contains(token_hash)
+    }
+}
+
+/// A post-quantum UCAN capability token using ML-DSA-65 signatures.
+///
+/// Wire format (big-endian):
+/// ```text
+/// [1B crypto_suite=0x01][16B issuer][16B audience][1B capability]
+/// [2B resource_len][NB resource][8B not_before][8B expires_at]
+/// [16B nonce][1B has_proof][32B proof?]
+/// [3309B ML-DSA-65 signature]
+/// ```
+///
+/// Minimum size (no resource, no proof):
+/// 1+16+16+1+2+0+8+8+16+1+0+3309 = 3378 bytes.
+#[derive(Debug, Clone)]
+pub struct PqUcanToken {
+    /// Address hash of the token issuer (signer).
+    pub issuer: [u8; ADDRESS_HASH_LENGTH],
+    /// Address hash of the token audience (recipient of the capability).
+    pub audience: [u8; ADDRESS_HASH_LENGTH],
+    /// The type of capability this token grants.
+    pub capability: CapabilityType,
+    /// Opaque resource identifier scoped by the capability type.
+    pub resource: Vec<u8>,
+    /// Unix timestamp (seconds) before which this token is not valid.
+    pub not_before: u64,
+    /// Unix timestamp (seconds) after which this token expires.
+    pub expires_at: u64,
+    /// Random nonce for uniqueness (prevents content-hash collisions).
+    pub nonce: [u8; 16],
+    /// BLAKE3 hash of the parent proof token, if this is a delegated token.
+    pub proof: Option<[u8; 32]>,
+    /// ML-DSA-65 signature over the signable portion of this token (3,309 bytes).
+    pub signature: Vec<u8>,
+}
+
+/// Minimum wire size of a serialized PQ token (no resource, no proof).
+const PQ_MIN_TOKEN_SIZE: usize = 1                   // crypto_suite
+    + ADDRESS_HASH_LENGTH                             // issuer
+    + ADDRESS_HASH_LENGTH                             // audience
+    + 1                                               // capability
+    + 2                                               // resource_len
+    + 8                                               // not_before
+    + 8                                               // expires_at
+    + 16                                              // nonce
+    + 1                                               // has_proof
+    + PQ_SIGNATURE_LENGTH; // signature
+
+impl PqUcanToken {
+    /// Return the signable portion of the token (everything except the signature).
+    ///
+    /// This is the crypto_suite prefix + all fields before the signature.
+    /// Safe to call even when `self.signature` is empty (e.g. before signing).
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        debug_assert!(
+            self.resource.len() <= u16::MAX as usize,
+            "resource exceeds u16 length limit"
+        );
+        let resource_len = self.resource.len() as u16;
+        let proof_size = if self.proof.is_some() { 32 } else { 0 };
+        let signable_size = PQ_MIN_TOKEN_SIZE - PQ_SIGNATURE_LENGTH + self.resource.len() + proof_size;
+
+        let mut buf = Vec::with_capacity(signable_size);
+        buf.push(CryptoSuite::MlDsa65 as u8); // 0x01
+        buf.extend_from_slice(&self.issuer);
+        buf.extend_from_slice(&self.audience);
+        buf.push(self.capability as u8);
+        buf.extend_from_slice(&resource_len.to_be_bytes());
+        buf.extend_from_slice(&self.resource);
+        buf.extend_from_slice(&self.not_before.to_be_bytes());
+        buf.extend_from_slice(&self.expires_at.to_be_bytes());
+        buf.extend_from_slice(&self.nonce);
+        if let Some(ref proof) = self.proof {
+            buf.push(1);
+            buf.extend_from_slice(proof);
+        } else {
+            buf.push(0);
+        }
+        buf
+    }
+
+    /// Serialize the token to its binary wire format.
+    ///
+    /// The wire format starts with `crypto_suite = 0x01` to identify this as
+    /// a post-quantum token, followed by the same field layout as the classical
+    /// `UcanToken`, but with a 3,309-byte ML-DSA-65 signature instead of 64-byte
+    /// Ed25519.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.signable_bytes();
+        buf.extend_from_slice(&self.signature);
+        buf
+    }
+
+    /// Deserialize a token from its binary wire format.
+    ///
+    /// Expects the first byte to be `0x01` (ML-DSA-65 crypto suite).
+    pub fn from_bytes(data: &[u8]) -> Result<Self, UcanError> {
+        if data.len() < PQ_MIN_TOKEN_SIZE {
+            return Err(UcanError::InvalidEncoding);
+        }
+
+        let mut pos = 0;
+
+        // Verify crypto suite byte
+        if data[pos] != CryptoSuite::MlDsa65 as u8 {
+            return Err(UcanError::InvalidEncoding);
+        }
+        pos += 1;
+
+        let mut issuer = [0u8; ADDRESS_HASH_LENGTH];
+        issuer.copy_from_slice(&data[pos..pos + ADDRESS_HASH_LENGTH]);
+        pos += ADDRESS_HASH_LENGTH;
+
+        let mut audience = [0u8; ADDRESS_HASH_LENGTH];
+        audience.copy_from_slice(&data[pos..pos + ADDRESS_HASH_LENGTH]);
+        pos += ADDRESS_HASH_LENGTH;
+
+        let capability = CapabilityType::try_from(data[pos])?;
+        pos += 1;
+
+        let resource_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+
+        if resource_len > MAX_RESOURCE_SIZE {
+            return Err(UcanError::ResourceTooLarge);
+        }
+
+        if data.len() < PQ_MIN_TOKEN_SIZE + resource_len {
+            return Err(UcanError::InvalidEncoding);
+        }
+
+        let resource = data[pos..pos + resource_len].to_vec();
+        pos += resource_len;
+
+        let not_before = u64::from_be_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| UcanError::InvalidEncoding)?,
+        );
+        pos += 8;
+
+        let expires_at = u64::from_be_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| UcanError::InvalidEncoding)?,
+        );
+        pos += 8;
+
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&data[pos..pos + 16]);
+        pos += 16;
+
+        let has_proof = data[pos];
+        pos += 1;
+
+        let proof = match has_proof {
+            0 => None,
+            1 => {
+                if data.len() < pos + 32 + PQ_SIGNATURE_LENGTH {
+                    return Err(UcanError::InvalidEncoding);
+                }
+                let mut proof_hash = [0u8; 32];
+                proof_hash.copy_from_slice(&data[pos..pos + 32]);
+                pos += 32;
+                Some(proof_hash)
+            }
+            _ => return Err(UcanError::InvalidEncoding),
+        };
+
+        if data.len() != pos + PQ_SIGNATURE_LENGTH {
+            return Err(UcanError::InvalidEncoding);
+        }
+
+        let signature = data[pos..pos + PQ_SIGNATURE_LENGTH].to_vec();
+
+        Ok(Self {
+            issuer,
+            audience,
+            capability,
+            resource,
+            not_before,
+            expires_at,
+            nonce,
+            proof,
+            signature,
+        })
+    }
+
+    /// Compute the BLAKE3 content hash of this token's wire representation.
+    pub fn content_hash(&self) -> [u8; 32] {
+        hash::blake3_hash(&self.to_bytes())
+    }
+
+    /// Verify the ML-DSA-65 signature on this token.
+    ///
+    /// The caller provides the issuer's PQ public identity, whose verifying key
+    /// is used to check the signature over the signable bytes.
+    pub fn verify(
+        &self,
+        verifying_key: &harmony_crypto::ml_dsa::MlDsaPublicKey,
+    ) -> Result<(), UcanError> {
+        let signable = self.signable_bytes();
+        let sig = harmony_crypto::ml_dsa::MlDsaSignature::from_bytes(&self.signature)
+            .map_err(|_| UcanError::SignatureInvalid)?;
+        harmony_crypto::ml_dsa::verify(verifying_key, &signable, &sig)
+            .map_err(|_| UcanError::SignatureInvalid)
     }
 }
 
