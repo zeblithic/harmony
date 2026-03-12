@@ -164,6 +164,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err("--cache-capacity must be > 0".into());
             }
 
+            if cache_capacity > u32::MAX as usize {
+                return Err(format!(
+                    "--cache-capacity {} exceeds maximum {} for Bloom filter sizing",
+                    cache_capacity,
+                    u32::MAX
+                )
+                .into());
+            }
+
             if encrypted_durable_announce && !encrypted_durable_persist {
                 return Err(
                     "--encrypted-durable-announce requires --encrypted-durable-persist: \
@@ -189,7 +198,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 schedule: Default::default(),
                 content_policy,
                 filter_broadcast_config: FilterBroadcastConfig {
-                    mutation_threshold: filter_mutation_threshold.max(1),
+                    mutation_threshold: filter_mutation_threshold,
                     max_interval_ticks: filter_broadcast_ticks,
                     expected_items: cache_capacity as u32,
                     fp_rate: 0.001,
@@ -334,6 +343,21 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("--cache-capacity must be > 0"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn cli_rejects_oversized_cache_capacity() {
+        let huge = (u32::MAX as u64 + 1).to_string();
+        let cli =
+            Cli::try_parse_from(["harmony", "run", "--cache-capacity", &huge]).unwrap();
+        let result = run(cli);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds maximum"),
             "unexpected error: {msg}"
         );
     }

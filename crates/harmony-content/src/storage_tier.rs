@@ -217,6 +217,13 @@ impl<B: BlobStore> StorageTier<B> {
              content rejected by class admission will never reach the announce check"
         );
 
+        // Clamp mutation_threshold to at least 1 — zero would trigger a
+        // filter rebuild on every single cache write.
+        let filter_config = FilterBroadcastConfig {
+            mutation_threshold: filter_config.mutation_threshold.max(1),
+            ..filter_config
+        };
+
         let cache = ContentStore::new(store, budget.cache_capacity);
 
         let mut queryable_keys = ns::all_shard_patterns();
@@ -1574,6 +1581,28 @@ mod tests {
         assert_eq!(config.max_interval_ticks, 30);
         assert_eq!(config.expected_items, 1024);
         assert!((config.fp_rate - 0.001).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn filter_broadcast_config_clamps_zero_mutation_threshold() {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let filter_config = FilterBroadcastConfig {
+            mutation_threshold: 0,
+            ..FilterBroadcastConfig::default()
+        };
+        let (tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            filter_config,
+        );
+        assert_eq!(
+            tier.filter_config().mutation_threshold, 1,
+            "mutation_threshold = 0 should be clamped to 1"
+        );
     }
 
     #[test]

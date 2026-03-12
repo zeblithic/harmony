@@ -170,6 +170,8 @@ struct PeerFilter {
 struct PeerFilterTable {
     filters: HashMap<String, PeerFilter>,
     staleness_ticks: u64,
+    /// Count of malformed filter payloads that failed deserialization.
+    parse_errors: u64,
 }
 
 impl PeerFilterTable {
@@ -177,7 +179,16 @@ impl PeerFilterTable {
         Self {
             filters: HashMap::new(),
             staleness_ticks,
+            parse_errors: 0,
         }
+    }
+
+    fn record_parse_error(&mut self) {
+        self.parse_errors += 1;
+    }
+
+    fn parse_errors(&self) -> u64 {
+        self.parse_errors
     }
 
     fn upsert(&mut self, peer_addr: String, filter: BloomFilter, item_count: u32, tick: u64) {
@@ -408,6 +419,11 @@ impl<B: BlobStore> NodeRuntime<B> {
     pub fn should_query_peer(&self, peer_addr: &str, cid: &ContentId) -> bool {
         self.peer_filters
             .should_query(peer_addr, cid, self.tick_count)
+    }
+
+    /// Number of malformed filter payloads that failed deserialization.
+    pub fn peer_filter_parse_errors(&self) -> u64 {
+        self.peer_filters.parse_errors()
     }
 
     /// Calculate the effective compute fuel budget based on data-plane queue depth.
@@ -887,14 +903,19 @@ impl<B: BlobStore> NodeRuntime<B> {
         {
             // Don't process our own filter broadcasts.
             if peer_addr != self.node_addr {
-                if let Ok(filter) = BloomFilter::from_bytes(&payload) {
-                    let item_count = filter.item_count();
-                    self.peer_filters.upsert(
-                        peer_addr.to_string(),
-                        filter,
-                        item_count,
-                        self.tick_count,
-                    );
+                match BloomFilter::from_bytes(&payload) {
+                    Ok(filter) => {
+                        let item_count = filter.item_count();
+                        self.peer_filters.upsert(
+                            peer_addr.to_string(),
+                            filter,
+                            item_count,
+                            self.tick_count,
+                        );
+                    }
+                    Err(_) => {
+                        self.peer_filters.record_parse_error();
+                    }
                 }
             }
             return;
@@ -1824,5 +1845,41 @@ mod tests {
         assert!(!table.should_query("peer-1", &cid, 10));
         // Stale filter (current_tick - received_tick > staleness_ticks) => should query
         assert!(table.should_query("peer-1", &cid, 200));
+    }
+
+    #[test]
+    fn peer_filter_table_tracks_parse_errors() {
+        let mut table = PeerFilterTable::new(100);
+        assert_eq!(table.parse_errors(), 0);
+        table.record_parse_error();
+        table.record_parse_error();
+        assert_eq!(table.parse_errors(), 2);
+    }
+
+    #[test]
+    fn route_subscription_counts_malformed_filter() {
+        use harmony_content::blob::MemoryBlobStore;
+
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig::default(),
+            node_addr: "self-node".to_string(),
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Send a malformed filter payload from a peer.
+        rt.push_event(RuntimeEvent::SubscriptionMessage {
+            key_expr: "harmony/filters/content/peer-abc".to_string(),
+            payload: vec![0xFF, 0x01], // too short to parse
+        });
+        rt.tick();
+
+        assert_eq!(rt.peer_filter_parse_errors(), 1);
     }
 }
