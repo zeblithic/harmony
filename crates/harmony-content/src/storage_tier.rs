@@ -249,7 +249,8 @@ impl<B: BlobStore> StorageTier<B> {
                 }
                 // Re-cache the data from disk.
                 self.cache.store(cid, data.clone());
-                self.metrics.queries_served += 1;
+                // Note: queries_served was already incremented in handle_content_query
+                // when this query first arrived — only count the disk-specific metric.
                 self.metrics.disk_reads_served += 1;
                 vec![StorageTierAction::SendReply {
                     query_id,
