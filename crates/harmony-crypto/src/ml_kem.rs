@@ -83,11 +83,12 @@ impl MlKemSecretKey {
                 got: bytes.len(),
             });
         }
-        let seed = Array::try_from(bytes).map_err(|_| CryptoError::InvalidKeyLength {
+        let mut seed = Array::try_from(bytes).map_err(|_| CryptoError::InvalidKeyLength {
             expected: SK_LENGTH,
             got: bytes.len(),
         })?;
-        let inner = ml_kem::DecapsulationKey::<MlKem768>::from_seed(seed);
+        let inner = ml_kem::DecapsulationKey::<MlKem768>::from_seed(seed.clone());
+        seed.zeroize();
         Ok(Self { inner })
     }
 
@@ -147,10 +148,11 @@ impl MlKemSharedSecret {
 pub fn generate(rng: &mut impl CryptoRngCore) -> (MlKemPublicKey, MlKemSecretKey) {
     let mut seed_bytes = [0u8; SK_LENGTH];
     rng.fill_bytes(&mut seed_bytes);
-    let seed = Array::from(seed_bytes);
-    let dk = ml_kem::DecapsulationKey::<MlKem768>::from_seed(seed);
+    let mut seed = Array::from(seed_bytes);
+    let dk = ml_kem::DecapsulationKey::<MlKem768>::from_seed(seed.clone());
     let ek = dk.encapsulation_key().clone();
     seed_bytes.zeroize();
+    seed.zeroize();
     (MlKemPublicKey { inner: ek }, MlKemSecretKey { inner: dk })
 }
 
