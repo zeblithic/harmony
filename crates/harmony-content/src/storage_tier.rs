@@ -259,7 +259,12 @@ impl<B: BlobStore> StorageTier<B> {
                         payload: vec![],
                     }];
                 }
-                // Re-cache the data from disk.
+                // Pre-warm frequency so the re-cached CID survives the admission
+                // challenge. Without this, a CID with decayed sketch counts would
+                // be immediately re-evicted, creating a disk-read thrashing loop.
+                // 5 increments beat cold items (freq ~1) without unfairly displacing
+                // genuinely hot cached items (freq 10+).
+                self.cache.warm_frequency(&cid, 5);
                 self.cache.store(cid, data.clone());
                 // Note: queries_served was already incremented in handle_content_query
                 // when this query first arrived — only count the disk-specific metric.
@@ -1232,6 +1237,57 @@ mod tests {
             "corrupted disk data should produce empty reply"
         );
         assert_eq!(tier.metrics().disk_read_failures, 1);
+    }
+
+    #[test]
+    fn disk_read_complete_cid_survives_moderate_pressure() {
+        // DiskReadComplete pre-warms the frequency sketch so the re-cached
+        // CID survives the admission challenge under moderate pressure,
+        // breaking the disk-read thrashing loop.
+        let budget = StorageBudget {
+            cache_capacity: 5, // window=1, protected=1, probation=3
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+
+        // Fill cache with items (each gets frequency ~1 from transit admission).
+        for i in 0..4 {
+            let (cid, data) = cid_with_class(format!("fill-{i}").as_bytes(), false, false);
+            tier.handle(StorageTierEvent::TransitContent { cid, data });
+        }
+
+        // Simulate disk read — CID re-enters cache with frequency boost.
+        let disk_data = b"disk-resident content";
+        let flags = crate::cid::ContentFlags {
+            encrypted: false,
+            ephemeral: false,
+            alt_hash: false,
+        };
+        let disk_cid = ContentId::for_blob(disk_data, flags).unwrap();
+        let actions = tier.handle(StorageTierEvent::DiskReadComplete {
+            cid: disk_cid,
+            query_id: 50,
+            data: disk_data.to_vec(),
+        });
+        assert_eq!(actions.len(), 1); // SendReply
+
+        // Push more items to create eviction pressure. The disk-read CID
+        // will be pushed out of window into the admission challenge.
+        for i in 0..3 {
+            let (cid, data) = cid_with_class(format!("pressure-{i}").as_bytes(), false, false);
+            tier.handle(StorageTierEvent::TransitContent { cid, data });
+        }
+
+        // The disk-read CID should still be queryable thanks to frequency boost.
+        let query_actions = tier.handle(StorageTierEvent::ContentQuery {
+            query_id: 51,
+            cid: disk_cid,
+        });
+        assert!(
+            !query_actions.is_empty(),
+            "disk-read CID should survive moderate pressure thanks to frequency boost"
+        );
     }
 
     #[test]

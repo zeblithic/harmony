@@ -254,6 +254,19 @@ impl<S: BlobStore> ContentStore<S> {
         }
     }
 
+    /// Pre-warm the frequency sketch for a CID about to be re-cached from disk.
+    ///
+    /// Disk-read CIDs enter the cache with no sketch history (counts decayed
+    /// during eviction). Without a boost, they lose the admission challenge
+    /// against established items and get immediately re-evicted — creating a
+    /// disk-read thrashing loop. The boost gives them credit for the disk read
+    /// that proves they're still being requested.
+    pub fn warm_frequency(&mut self, cid: &ContentId, count: u32) {
+        for _ in 0..count {
+            self.sketch.increment(cid);
+        }
+    }
+
     /// Record a CID in the cache metadata with full W-TinyLFU admission.
     ///
     /// Increments the sketch frequency counter (unless `skip_increment` is true,
@@ -472,6 +485,22 @@ mod tests {
             freq_a, freq_b,
             "preadmitted and plain store should have same frequency"
         );
+    }
+
+    #[test]
+    fn warm_frequency_boosts_sketch_count() {
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 100);
+
+        let cid = ContentId::for_blob(b"warm-me", crate::cid::ContentFlags::default()).unwrap();
+        assert_eq!(cs.sketch.estimate(&cid), 0);
+
+        cs.warm_frequency(&cid, 5);
+        assert_eq!(cs.sketch.estimate(&cid), 5);
+
+        // After store, frequency = 5 (warm) + 1 (admit) = 6.
+        cs.store(cid, b"warm-me".to_vec());
+        assert_eq!(cs.sketch.estimate(&cid), 6);
     }
 
     #[test]
