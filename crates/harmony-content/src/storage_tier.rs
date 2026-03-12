@@ -240,12 +240,18 @@ impl<B: BlobStore> StorageTier<B> {
                 );
                 if !Self::is_durable_class(&cid) {
                     self.metrics.disk_read_failures += 1;
-                    return vec![];
+                    return vec![StorageTierAction::SendReply {
+                        query_id,
+                        payload: vec![],
+                    }];
                 }
                 // Verify integrity — disk data may be corrupted (bit rot, wrong file).
                 if !Self::verify_cid(&cid, &data) {
                     self.metrics.disk_read_failures += 1;
-                    return vec![];
+                    return vec![StorageTierAction::SendReply {
+                        query_id,
+                        payload: vec![],
+                    }];
                 }
                 // Re-cache the data from disk.
                 self.cache.store(cid, data.clone());
@@ -1137,7 +1143,13 @@ mod tests {
             query_id: 42,
             data: b"corrupted".to_vec(),
         });
-        assert!(actions.is_empty(), "corrupted disk data should be rejected");
+        // Corrupted data is rejected, but we still send an empty reply
+        // so the querier doesn't hang.
+        assert_eq!(actions.len(), 1, "should send empty reply for corrupted data");
+        assert!(
+            matches!(&actions[0], StorageTierAction::SendReply { query_id: 42, payload } if payload.is_empty()),
+            "corrupted disk data should produce empty reply"
+        );
         assert_eq!(tier.metrics().disk_read_failures, 1);
     }
 
