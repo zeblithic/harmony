@@ -153,6 +153,9 @@ pub struct StorageTier<B: BlobStore> {
     policy: ContentPolicy,
     metrics: StorageMetrics,
     /// CIDs known to be persisted on disk (durable classes only).
+    /// Scaffolding for future disk I/O — insertions and lookups are
+    /// deferred until the runtime can service DiskLookup actions.
+    #[allow(dead_code)]
     disk_index: HashSet<ContentId>,
 }
 
