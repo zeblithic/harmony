@@ -173,6 +173,28 @@ pub mod announce {
     }
 }
 
+/// Content filter broadcasts.
+///
+/// Nodes periodically broadcast Bloom filters of their cached CID set.
+/// Receiving nodes check these filters before dispatching content queries,
+/// skipping peers that definitely don't have the content.
+pub mod filters {
+    use alloc::{format, string::String};
+    /// Base prefix: `harmony/filters`
+    pub const PREFIX: &str = "harmony/filters";
+
+    /// Content filter prefix: `harmony/filters/content`
+    pub const CONTENT_PREFIX: &str = "harmony/filters/content";
+
+    /// Subscribe to all content filters: `harmony/filters/content/**`
+    pub const CONTENT_SUB: &str = "harmony/filters/content/**";
+
+    /// Content filter key: `harmony/filters/content/{node_addr}`
+    pub fn content_key(node_addr: &str) -> String {
+        format!("{CONTENT_PREFIX}/{node_addr}")
+    }
+}
+
 // ── Tier 3: Compute ─────────────────────────────────────────────────
 
 /// WASM compute key expressions.
@@ -436,6 +458,21 @@ mod tests {
         assert_eq!(announce::SUB, "harmony/announce/*");
     }
 
+    // ── Tier 2: Filters ──────────────────────────────────────────
+
+    #[test]
+    fn filters_content_key() {
+        assert_eq!(
+            filters::content_key("abc123"),
+            "harmony/filters/content/abc123"
+        );
+    }
+
+    #[test]
+    fn filters_subscription_pattern() {
+        assert_eq!(filters::CONTENT_SUB, "harmony/filters/content/**");
+    }
+
     // ── Tier 3: Compute ─────────────────────────────────────────
 
     #[test]
@@ -550,6 +587,7 @@ mod tests {
             reticulum::PREFIX,
             content::PREFIX,
             announce::PREFIX,
+            filters::PREFIX,
             compute::PREFIX,
             workflow::PREFIX,
             presence::PREFIX,
