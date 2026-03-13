@@ -35,6 +35,12 @@ pub struct FlatpackIndex {
     forward: HashMap<ContentId, Vec<ContentId>>,
     /// Approximate membership filter over child CIDs in the reverse map.
     filter: CuckooFilter,
+    /// Children that were successfully inserted into the cuckoo filter.
+    /// Tracks actual filter membership so that `on_bundle_evicted` only
+    /// calls `filter.delete` for children that are genuinely present —
+    /// deleting a never-inserted child could remove an unrelated CID's
+    /// fingerprint that happens to share the same 12-bit value.
+    filter_members: HashSet<ContentId>,
     /// Number of structural mutations since the last broadcast reset.
     mutations_since_broadcast: u32,
 }
@@ -61,6 +67,7 @@ impl FlatpackIndex {
             reverse: HashMap::new(),
             forward: HashMap::new(),
             filter: CuckooFilter::new(capacity),
+            filter_members: HashSet::new(),
             mutations_since_broadcast: 0,
         }
     }
@@ -84,10 +91,12 @@ impl FlatpackIndex {
         for child in &child_cids {
             let set = self.reverse.entry(*child).or_default();
             if set.is_empty() {
-                // New child — insert into cuckoo filter. Ignore FilterFull
-                // errors; the filter is best-effort and rebuild_filter will
-                // resize and re-insert all children on the next rebuild.
-                let _ = self.filter.insert(child);
+                // New child — insert into cuckoo filter. Track success so
+                // that on_bundle_evicted only deletes confirmed members.
+                // FilterFull is tolerable; rebuild_filter will resize later.
+                if self.filter.insert(child).is_ok() {
+                    self.filter_members.insert(*child);
+                }
             }
             set.insert(bundle_cid);
         }
@@ -115,7 +124,12 @@ impl FlatpackIndex {
                 set.remove(bundle_cid);
                 if set.is_empty() {
                     self.reverse.remove(child);
-                    self.filter.delete(child);
+                    // Only delete from cuckoo filter if we successfully
+                    // inserted it — otherwise we'd remove an unrelated
+                    // CID's fingerprint that shares the same 12-bit value.
+                    if self.filter_members.remove(child) {
+                        self.filter.delete(child);
+                    }
                 }
             }
         }
@@ -168,8 +182,11 @@ impl FlatpackIndex {
         } else {
             self.filter.clear();
         }
+        self.filter_members.clear();
         for child in self.reverse.keys() {
-            let _ = self.filter.insert(child);
+            if self.filter.insert(child).is_ok() {
+                self.filter_members.insert(*child);
+            }
         }
     }
 }

@@ -211,13 +211,12 @@ pub mod filters {
 /// Nodes query `harmony/flatpack/{child_cid_hex}` to discover which
 /// bundles reference a given child CID. Peers with matching index
 /// entries respond with their bundle CID lists.
-/// Flatpack reverse-lookup query namespace.
 ///
 /// These constants define the query/response path for on-demand reverse
-/// lookups ("which bundles reference this child CID?"). The queryable
-/// handler and subscription wiring are not yet implemented — this is
-/// scaffolding for a follow-on PR that adds the request-response path.
-/// The filter broadcast path (`filters::flatpack_key`) is already wired.
+/// lookups. The queryable handler and subscription wiring are not yet
+/// implemented — this is scaffolding for a follow-on PR that adds the
+/// request-response path. The filter broadcast path
+/// (`filters::flatpack_key`) is already wired.
 pub mod flatpack {
     use alloc::{format, string::String};
     /// Base prefix: `harmony/flatpack`

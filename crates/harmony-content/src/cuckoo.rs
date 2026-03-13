@@ -224,6 +224,11 @@ impl CuckooFilter {
     }
 
     /// Try to insert a fingerprint into a bucket, returning true on success.
+    ///
+    /// Does NOT check for duplicate fingerprints — two distinct CIDs can
+    /// legitimately share the same 12-bit fingerprint (that's how false
+    /// positives arise). Callers that need set semantics (no duplicate CIDs)
+    /// must guard against re-insertion externally.
     fn try_insert_at(&mut self, bucket_idx: usize, fp: u16) -> bool {
         for slot in &mut self.buckets[bucket_idx] {
             if *slot == EMPTY {
