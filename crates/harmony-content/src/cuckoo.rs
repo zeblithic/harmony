@@ -32,14 +32,14 @@ const FINGERPRINT_MASK: u16 = 0xFFF;
 /// Empty sentinel — a fingerprint of zero means the slot is vacant.
 const EMPTY: u16 = 0;
 
-/// Maximum number of eviction kicks before declaring the filter full.
-const MAX_KICKS: usize = 500;
+/// Default maximum number of eviction kicks before declaring the filter full.
+const DEFAULT_MAX_KICKS: u32 = 500;
 
 /// Maximum number of buckets allowed (defense-in-depth for deserialization).
 ///
 /// Used by `from_bytes` (Task 3) to reject untrusted headers.
 #[allow(dead_code)]
-const MAX_BUCKETS: usize = 1_000_000;
+const MAX_BUCKETS: u32 = 1_000_000;
 
 /// Target load factor used to size the bucket array.
 const LOAD_FACTOR: f64 = 0.95;
@@ -63,16 +63,18 @@ pub enum CuckooError {
     /// `num_buckets` exceeds the maximum allowed value.
     TooManyBuckets {
         /// The value found in the header.
-        got: usize,
+        got: u32,
         /// The maximum allowed value.
-        max: usize,
+        max: u32,
     },
 }
 
 impl fmt::Display for CuckooError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CuckooError::FilterFull => write!(f, "cuckoo filter is full after {MAX_KICKS} kicks"),
+            CuckooError::FilterFull => {
+                write!(f, "cuckoo filter is full after {DEFAULT_MAX_KICKS} kicks")
+            }
             CuckooError::HeaderTruncated => write!(f, "input shorter than serialization header"),
             CuckooError::LengthMismatch { expected, got } => {
                 write!(f, "body length mismatch: expected {expected}, got {got}")
@@ -93,6 +95,10 @@ impl fmt::Display for CuckooError {
 pub struct CuckooFilter {
     /// Bucket array: each bucket is `BUCKET_SIZE` fingerprint slots.
     buckets: Vec<[u16; BUCKET_SIZE]>,
+    /// Number of buckets in the filter.
+    num_buckets: u32,
+    /// Maximum eviction kicks before declaring the filter full.
+    max_kicks: u32,
     /// Number of items currently stored.
     count: u32,
 }
@@ -100,7 +106,7 @@ pub struct CuckooFilter {
 impl fmt::Debug for CuckooFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CuckooFilter")
-            .field("num_buckets", &self.buckets.len())
+            .field("num_buckets", &self.num_buckets)
             .field("count", &self.count)
             .finish_non_exhaustive()
     }
@@ -119,12 +125,14 @@ impl CuckooFilter {
         assert!(capacity > 0, "capacity must be > 0");
 
         let slots_needed = (capacity as f64) / LOAD_FACTOR;
-        let num_buckets = (slots_needed / BUCKET_SIZE as f64).ceil() as usize;
+        let num_buckets = (slots_needed / BUCKET_SIZE as f64).ceil() as u32;
         // Ensure at least 1 bucket.
         let num_buckets = num_buckets.max(1);
 
         CuckooFilter {
-            buckets: vec![[EMPTY; BUCKET_SIZE]; num_buckets],
+            buckets: vec![[EMPTY; BUCKET_SIZE]; num_buckets as usize],
+            num_buckets,
+            max_kicks: DEFAULT_MAX_KICKS,
             count: 0,
         }
     }
@@ -132,32 +140,32 @@ impl CuckooFilter {
     /// Insert a content ID into the filter.
     ///
     /// Returns `Ok(())` on success, or `Err(CuckooError::FilterFull)` if the
-    /// item could not be placed after [`MAX_KICKS`] eviction attempts.
+    /// item could not be placed after [`DEFAULT_MAX_KICKS`] eviction attempts.
     pub fn insert(&mut self, cid: &ContentId) -> Result<(), CuckooError> {
-        let (fp, i1) = fingerprint_and_index(cid, self.buckets.len());
-        let i2 = alt_index(i1, fp, self.buckets.len());
+        let (fp, i1) = fingerprint_and_index(cid, self.num_buckets);
+        let i2 = alt_index(i1, fp, self.num_buckets);
 
         // Try the two candidate buckets first.
-        if self.try_insert_at(i1, fp) {
+        if self.try_insert_at(i1 as usize, fp) {
             self.count = self.count.saturating_add(1);
             return Ok(());
         }
-        if self.try_insert_at(i2, fp) {
+        if self.try_insert_at(i2 as usize, fp) {
             self.count = self.count.saturating_add(1);
             return Ok(());
         }
 
         // Both buckets are full — begin eviction.
-        let mut idx = if fp as usize % 2 == 0 { i1 } else { i2 };
+        let mut idx = if fp as u32 % 2 == 0 { i1 } else { i2 };
         let mut evicted_fp = fp;
 
-        for _ in 0..MAX_KICKS {
+        for _ in 0..self.max_kicks {
             // Pick a slot based on the fingerprint value for determinism.
             let slot = evicted_fp as usize % BUCKET_SIZE;
-            core::mem::swap(&mut self.buckets[idx][slot], &mut evicted_fp);
+            core::mem::swap(&mut self.buckets[idx as usize][slot], &mut evicted_fp);
 
-            idx = alt_index(idx, evicted_fp, self.buckets.len());
-            if self.try_insert_at(idx, evicted_fp) {
+            idx = alt_index(idx, evicted_fp, self.num_buckets);
+            if self.try_insert_at(idx as usize, evicted_fp) {
                 self.count = self.count.saturating_add(1);
                 return Ok(());
             }
@@ -171,10 +179,10 @@ impl CuckooFilter {
     /// Returns `true` if the item might be present (with some false positive
     /// probability), or `false` if the item is definitely absent.
     pub fn may_contain(&self, cid: &ContentId) -> bool {
-        let (fp, i1) = fingerprint_and_index(cid, self.buckets.len());
-        let i2 = alt_index(i1, fp, self.buckets.len());
+        let (fp, i1) = fingerprint_and_index(cid, self.num_buckets);
+        let i2 = alt_index(i1, fp, self.num_buckets);
 
-        self.bucket_contains(i1, fp) || self.bucket_contains(i2, fp)
+        self.bucket_contains(i1 as usize, fp) || self.bucket_contains(i2 as usize, fp)
     }
 
     /// Clear all buckets, resetting the filter to empty.
@@ -188,6 +196,11 @@ impl CuckooFilter {
     /// Returns the number of items currently stored in the filter.
     pub fn count(&self) -> u32 {
         self.count
+    }
+
+    /// Returns the number of buckets in the filter.
+    pub fn num_buckets(&self) -> u32 {
+        self.num_buckets
     }
 
     /// Try to insert a fingerprint into a bucket, returning true on success.
@@ -212,7 +225,7 @@ impl CuckooFilter {
 /// Uses the same hash byte ranges as [`super::bloom::hash_pair`]:
 /// - `hash[0..8]` mixed with `SEED_A` produces the fingerprint
 /// - `hash[8..16]` mixed with `SEED_B` produces the bucket index
-fn fingerprint_and_index(cid: &ContentId, num_buckets: usize) -> (u16, usize) {
+fn fingerprint_and_index(cid: &ContentId, num_buckets: u32) -> (u16, u32) {
     let a = u64::from_le_bytes(cid.hash[0..8].try_into().unwrap());
     let b = u64::from_le_bytes(cid.hash[8..16].try_into().unwrap());
 
@@ -220,7 +233,7 @@ fn fingerprint_and_index(cid: &ContentId, num_buckets: usize) -> (u16, usize) {
     let fp = to_nonzero_fingerprint(fp_raw);
 
     let idx_hash = b.wrapping_mul(SEED_B) ^ a;
-    let idx = (idx_hash as usize) % num_buckets;
+    let idx = (idx_hash % num_buckets as u64) as u32;
 
     (fp, idx)
 }
@@ -249,8 +262,8 @@ fn to_nonzero_fingerprint(raw: u64) -> u16 {
 ///
 /// The fingerprint is hashed before XOR to break clustering that would occur
 /// if nearby indices and similar fingerprints mapped to the same alternate.
-fn alt_index(index: usize, fp: u16, num_buckets: usize) -> usize {
-    let fp_hash = (fp as usize).wrapping_mul(SEED_A as usize);
+fn alt_index(index: u32, fp: u16, num_buckets: u32) -> u32 {
+    let fp_hash = (fp as u32).wrapping_mul(SEED_A as u32);
     (index ^ fp_hash) % num_buckets
 }
 
