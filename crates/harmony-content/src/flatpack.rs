@@ -126,9 +126,7 @@ impl FlatpackIndex {
 
     /// Returns `true` if `child_cid` is referenced by at least one bundle.
     pub fn is_referenced(&self, child_cid: &ContentId) -> bool {
-        self.reverse
-            .get(child_cid)
-            .is_some_and(|s| !s.is_empty())
+        self.reverse.get(child_cid).is_some_and(|s| !s.is_empty())
     }
 
     /// Returns the number of structural mutations since the last broadcast reset.
@@ -184,11 +182,15 @@ mod tests {
         assert!(idx.is_referenced(&child_a));
         assert!(idx.is_referenced(&child_b));
 
-        let set_a = idx.lookup(&child_a).expect("child_a should be in reverse map");
+        let set_a = idx
+            .lookup(&child_a)
+            .expect("child_a should be in reverse map");
         assert!(set_a.contains(&bundle));
         assert_eq!(set_a.len(), 1);
 
-        let set_b = idx.lookup(&child_b).expect("child_b should be in reverse map");
+        let set_b = idx
+            .lookup(&child_b)
+            .expect("child_b should be in reverse map");
         assert!(set_b.contains(&bundle));
         assert_eq!(set_b.len(), 1);
     }
@@ -224,7 +226,9 @@ mod tests {
         idx.on_bundle_evicted(&bundle_1);
 
         assert!(idx.is_referenced(&shared_child));
-        let set = idx.lookup(&shared_child).expect("shared child should survive");
+        let set = idx
+            .lookup(&shared_child)
+            .expect("shared child should survive");
         assert!(set.contains(&bundle_2));
         assert!(!set.contains(&bundle_1));
 
@@ -265,6 +269,91 @@ mod tests {
         let unknown = make_cid(999);
         // Should not panic.
         idx.on_bundle_evicted(&unknown);
+        assert_eq!(idx.mutations_since_broadcast(), 0);
+    }
+
+    // ---- Integration tests: full cycle, GC safety, rebuild, mutation counter ----
+
+    #[test]
+    fn full_cycle_admit_broadcast_deserialize_lookup() {
+        let mut idx = FlatpackIndex::new(1000);
+        let bundle = make_cid(1000);
+        let child_a = make_cid(1001);
+        let child_b = make_cid(1002);
+
+        // Admit bundle.
+        idx.on_bundle_admitted(bundle, vec![child_a, child_b]);
+
+        // Serialize cuckoo filter (simulates broadcast).
+        let bytes = idx.filter().to_bytes();
+
+        // Deserialize (simulates receiving peer).
+        let remote_filter = CuckooFilter::from_bytes(&bytes).unwrap();
+
+        // Remote filter should say "maybe" for both children.
+        assert!(remote_filter.may_contain(&child_a));
+        assert!(remote_filter.may_contain(&child_b));
+
+        // Verify count matches.
+        assert_eq!(remote_filter.count(), 2);
+    }
+
+    #[test]
+    fn gc_safety_blocks_referenced_eviction() {
+        let mut idx = FlatpackIndex::new(1000);
+        let bundle = make_cid(2000);
+        let blob = make_cid(2001);
+
+        idx.on_bundle_admitted(bundle, vec![blob]);
+
+        // Simulate GC check before evicting blob.
+        assert!(
+            idx.is_referenced(&blob),
+            "referenced blob must not be evicted"
+        );
+
+        // After bundle eviction, blob becomes unreferenced.
+        idx.on_bundle_evicted(&bundle);
+        assert!(
+            !idx.is_referenced(&blob),
+            "unreferenced blob can be evicted"
+        );
+    }
+
+    #[test]
+    fn rebuild_filter_matches_current_state() {
+        let mut idx = FlatpackIndex::new(1000);
+        let bundle = make_cid(3000);
+        let child_a = make_cid(3001);
+        let child_b = make_cid(3002);
+        let child_c = make_cid(3003);
+
+        let bundle_2 = make_cid(3004);
+        idx.on_bundle_admitted(bundle, vec![child_a, child_b]);
+        idx.on_bundle_admitted(bundle_2, vec![child_c]);
+        idx.on_bundle_evicted(&bundle_2);
+
+        // Rebuild filter from scratch.
+        idx.rebuild_filter();
+
+        // Filter should match: child_a and child_b yes, child_c no.
+        assert!(idx.filter().may_contain(&child_a));
+        assert!(idx.filter().may_contain(&child_b));
+        assert!(!idx.filter().may_contain(&child_c));
+    }
+
+    #[test]
+    fn mutation_counter_increments() {
+        let mut idx = FlatpackIndex::new(1000);
+        assert_eq!(idx.mutations_since_broadcast(), 0);
+
+        idx.on_bundle_admitted(make_cid(4000), vec![make_cid(4001)]);
+        assert_eq!(idx.mutations_since_broadcast(), 1);
+
+        idx.on_bundle_evicted(&make_cid(4000));
+        assert_eq!(idx.mutations_since_broadcast(), 2);
+
+        idx.reset_mutation_counter();
         assert_eq!(idx.mutations_since_broadcast(), 0);
     }
 }
