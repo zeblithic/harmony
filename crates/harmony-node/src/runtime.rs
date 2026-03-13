@@ -550,19 +550,10 @@ impl<B: BlobStore> NodeRuntime<B> {
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
         self.tick_count += 1;
 
-        // Inject FilterTimerTick on configured interval.
-        // Skip if a threshold-triggered broadcast is already pending — the
-        // timer tick would cause a redundant full-cache rebuild whose payload
-        // immediately overwrites the pending one (coalescing keeps correctness
-        // but the extra iteration is wasted work).
+        // Increment the filter timer counter. The actual FilterTimerTick is
+        // injected after the storage drain (inside tier 1 processing), so we
+        // can skip it when a threshold-triggered broadcast already fired.
         self.ticks_since_filter_broadcast += 1;
-        if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks
-            && self.pending_filter_broadcast.is_none()
-        {
-            self.ticks_since_filter_broadcast = 0;
-            self.storage_queue
-                .push_back(StorageTierEvent::FilterTimerTick);
-        }
 
         // Evict stale peer filters.
         self.peer_filters.evict_stale(self.tick_count);
@@ -633,6 +624,20 @@ impl<B: BlobStore> NodeRuntime<B> {
                             None => break,
                         }
                     }
+                    // Timer-triggered filter rebuild: fires only if the interval
+                    // has elapsed AND no threshold-triggered broadcast already
+                    // occurred during this tick's drain (which would have set
+                    // pending_filter_broadcast and reset ticks_since_filter_broadcast
+                    // via dispatch_storage_actions).
+                    if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks
+                        && self.pending_filter_broadcast.is_none()
+                    {
+                        self.ticks_since_filter_broadcast = 0;
+                        let timer_actions =
+                            self.storage.handle(StorageTierEvent::FilterTimerTick);
+                        self.dispatch_storage_actions(timer_actions, &mut actions);
+                    }
+
                     // Flush coalesced filter broadcast — multiple threshold crossings
                     // within one tick produce only one publish (the latest snapshot).
                     if let Some(payload) = self.pending_filter_broadcast.take() {

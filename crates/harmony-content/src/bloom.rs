@@ -548,15 +548,13 @@ mod tests {
 
     #[test]
     fn from_bytes_rejects_excessive_num_bits() {
-        // num_bits = MAX_BITS + 1 should be rejected.
+        // num_bits = MAX_BITS + 1 should be rejected at the header check.
+        // No body is needed — from_bytes returns TooManyBits before examining it.
         let num_bits = super::MAX_BITS + 1;
-        let num_words = (num_bits as usize).div_ceil(64);
         let mut buf = Vec::new();
         buf.extend_from_slice(&num_bits.to_be_bytes()); // num_bits
         buf.extend_from_slice(&10u32.to_be_bytes()); // num_hashes
         buf.extend_from_slice(&0u32.to_be_bytes()); // item_count
-        // Body: enough zero words to match num_bits.
-        buf.extend(core::iter::repeat(0u8).take(num_words * 8));
         let err = BloomFilter::from_bytes(&buf).unwrap_err();
         assert_eq!(
             err,
