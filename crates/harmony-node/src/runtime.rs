@@ -298,10 +298,12 @@ impl<B: BlobStore> NodeRuntime<B> {
         let router = Node::new();
         let mut queryable_router = QueryableRouter::new();
 
-        // Clamp to at least 2 ticks to prevent filter rebuild on every tick.
-        // With interval=1, the counter reaches 1 on the first increment and
-        // `1 >= 1` fires immediately — identical to interval=0.
-        let filter_broadcast_interval_ticks = (config.filter_broadcast_config.max_interval_ticks as u64).max(2);
+        let filter_broadcast_interval_ticks = config.filter_broadcast_config.max_interval_ticks as u64;
+        assert!(
+            filter_broadcast_interval_ticks >= 2,
+            "filter_broadcast_interval_ticks must be >= 2; \
+             with interval=1 the timer fires every tick"
+        );
 
         let (storage, storage_startup) =
             StorageTier::new(store, config.storage_budget, config.content_policy, config.filter_broadcast_config);
@@ -1903,11 +1905,10 @@ mod tests {
     }
 
     #[test]
-    fn filter_interval_clamped_to_at_least_two() {
+    #[should_panic(expected = "filter_broadcast_interval_ticks must be >= 2")]
+    fn filter_interval_rejects_less_than_two() {
         use harmony_content::blob::MemoryBlobStore;
 
-        // max_interval_ticks=1 should be clamped to 2 so the timer doesn't
-        // fire every single tick.
         let config = NodeConfig {
             storage_budget: StorageBudget {
                 cache_capacity: 100,
@@ -1920,37 +1921,9 @@ mod tests {
                 max_interval_ticks: 1,
                 ..FilterBroadcastConfig::default()
             },
-            node_addr: "clamp-test".to_string(),
+            node_addr: "reject-test".to_string(),
         };
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
-
-        // Tick 1: counter goes 0→1, but interval is 2 so no timer fires.
-        let actions = rt.tick();
-        let filter_publishes = actions
-            .iter()
-            .filter(|a| {
-                matches!(a, RuntimeAction::Publish { key_expr, .. }
-                    if key_expr.starts_with("harmony/filters/"))
-            })
-            .count();
-        assert_eq!(
-            filter_publishes, 0,
-            "no filter broadcast on tick 1 (interval clamped to 2)"
-        );
-
-        // Tick 2: counter reaches 2, timer fires.
-        let actions = rt.tick();
-        let filter_publishes = actions
-            .iter()
-            .filter(|a| {
-                matches!(a, RuntimeAction::Publish { key_expr, .. }
-                    if key_expr.starts_with("harmony/filters/"))
-            })
-            .count();
-        assert_eq!(
-            filter_publishes, 1,
-            "filter broadcast on tick 2 (interval=2 reached)"
-        );
+        let _ = NodeRuntime::new(config, MemoryBlobStore::new());
     }
 
     #[test]

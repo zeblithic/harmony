@@ -171,6 +171,11 @@ impl BloomFilter {
     }
 
     /// Returns the exact number of items inserted (tracked on each `insert` call).
+    ///
+    /// Serialized in the wire format header so receivers can gauge staleness:
+    /// a peer whose filter claims far more items than its known cache capacity
+    /// may have a stale or corrupt filter. Not yet consumed by routing logic —
+    /// will be wired when `PeerFilterTable::should_query` adds staleness checks.
     pub fn item_count(&self) -> u32 {
         self.item_count
     }

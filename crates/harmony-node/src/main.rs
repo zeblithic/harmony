@@ -175,6 +175,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
 
+            if filter_broadcast_ticks < 2 {
+                return Err(
+                    "--filter-broadcast-ticks must be >= 2: with interval=1 the timer \
+                     fires every tick (counter reaches 1 immediately after increment)"
+                        .into(),
+                );
+            }
+
             if encrypted_durable_announce && !encrypted_durable_persist {
                 return Err(
                     "--encrypted-durable-announce requires --encrypted-durable-persist: \
@@ -392,5 +400,18 @@ mod tests {
         } else {
             panic!("expected Run command");
         }
+    }
+
+    #[test]
+    fn cli_rejects_filter_broadcast_ticks_below_two() {
+        let cli =
+            Cli::try_parse_from(["harmony", "run", "--filter-broadcast-ticks", "1"]).unwrap();
+        let result = run(cli);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--filter-broadcast-ticks must be >= 2"),
+            "unexpected error: {msg}"
+        );
     }
 }
