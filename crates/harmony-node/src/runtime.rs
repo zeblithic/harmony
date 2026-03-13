@@ -231,7 +231,12 @@ impl PeerFilterTable {
     }
 
     /// Returns true if the peer should be queried for flatpack reverse-lookup entries.
-    fn should_query_flatpack(&self, peer_addr: &str, child_cid: &ContentId, current_tick: u64) -> bool {
+    fn should_query_flatpack(
+        &self,
+        peer_addr: &str,
+        child_cid: &ContentId,
+        current_tick: u64,
+    ) -> bool {
         match self.filters.get(peer_addr) {
             None => true,
             Some(pf) => {
@@ -332,15 +337,20 @@ impl<B: BlobStore> NodeRuntime<B> {
         let router = Node::new();
         let mut queryable_router = QueryableRouter::new();
 
-        let filter_broadcast_interval_ticks = config.filter_broadcast_config.max_interval_ticks as u64;
+        let filter_broadcast_interval_ticks =
+            config.filter_broadcast_config.max_interval_ticks as u64;
         assert!(
             filter_broadcast_interval_ticks >= 2,
             "filter_broadcast_interval_ticks must be >= 2; \
              with interval=1 the timer fires every tick"
         );
 
-        let (storage, storage_startup) =
-            StorageTier::new(store, config.storage_budget, config.content_policy, config.filter_broadcast_config);
+        let (storage, storage_startup) = StorageTier::new(
+            store,
+            config.storage_budget,
+            config.content_policy,
+            config.filter_broadcast_config,
+        );
 
         let mut actions = Vec::new();
         let mut storage_queryable_ids = HashSet::new();
@@ -679,8 +689,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                         && self.pending_filter_broadcast.is_none()
                     {
                         self.ticks_since_filter_broadcast = 0;
-                        let timer_actions =
-                            self.storage.handle(StorageTierEvent::FilterTimerTick);
+                        let timer_actions = self.storage.handle(StorageTierEvent::FilterTimerTick);
                         self.dispatch_storage_actions(timer_actions, &mut actions);
                     }
 
@@ -2097,8 +2106,10 @@ mod tests {
         // Only ONE Publish with the filter key should appear, not three.
         let filter_publishes: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, RuntimeAction::Publish { key_expr, .. }
-                if key_expr.starts_with("harmony/filters/")))
+            .filter(|a| {
+                matches!(a, RuntimeAction::Publish { key_expr, .. }
+                if key_expr.starts_with("harmony/filters/"))
+            })
             .collect();
         assert_eq!(
             filter_publishes.len(),
@@ -2134,8 +2145,10 @@ mod tests {
 
         let filter_publishes: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, RuntimeAction::Publish { key_expr, .. }
-                if key_expr.starts_with("harmony/filters/")))
+            .filter(|a| {
+                matches!(a, RuntimeAction::Publish { key_expr, .. }
+                if key_expr.starts_with("harmony/filters/"))
+            })
             .collect();
         assert!(
             filter_publishes.len() >= 2,

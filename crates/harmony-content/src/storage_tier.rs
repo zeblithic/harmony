@@ -592,8 +592,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         let data = b"cached blob";
         let cid = tier.cache_mut().insert(data).unwrap();
@@ -618,8 +622,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let cid = ContentId::for_blob(b"not stored", crate::cid::ContentFlags::default()).unwrap();
 
         let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 99, cid });
@@ -634,8 +642,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         let data = b"stats test blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
@@ -664,8 +676,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let data = b"explicitly published blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -697,8 +713,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let data = b"transiting blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -728,8 +748,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let data = b"repeated transit";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -754,8 +778,12 @@ mod tests {
             cache_capacity: 3,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         // Fill cache: 3 items → window=1, probation=2.
         for i in 0..3 {
@@ -811,8 +839,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         let blob_a = ContentId::for_blob(b"child-a", crate::cid::ContentFlags::default()).unwrap();
         let blob_b = ContentId::for_blob(b"child-b", crate::cid::ContentFlags::default()).unwrap();
@@ -845,8 +877,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         // CID for "real data" but send "tampered data"
         let cid = ContentId::for_blob(b"real data", crate::cid::ContentFlags::default()).unwrap();
@@ -869,8 +905,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         let cid = ContentId::for_blob(b"original", crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::PublishContent {
@@ -892,8 +932,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         // Craft a CID with correct hash but wrong payload_size by mutating
         // the size bits in the last 4 bytes.
@@ -923,8 +967,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (tier, actions) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (tier, actions) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let _ = tier;
 
         assert_eq!(actions.len(), 2);
@@ -953,8 +1001,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, policy, FilterBroadcastConfig::default());
+        let (tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            policy,
+            FilterBroadcastConfig::default(),
+        );
         tier
     }
 
@@ -1098,7 +1150,12 @@ mod tests {
             encrypted_durable_announce: true,
             ..ContentPolicy::default()
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy, FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            policy,
+            FilterBroadcastConfig::default(),
+        );
 
         // Fill cache with PublicDurable content.
         for i in 0..4 {
@@ -1183,7 +1240,12 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let policy = ContentPolicy::default();
-        let (tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy, FilterBroadcastConfig::default());
+        let (tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            policy,
+            FilterBroadcastConfig::default(),
+        );
         assert_eq!(tier.metrics().queries_served, 0);
     }
 
@@ -1347,7 +1409,11 @@ mod tests {
         });
         // Corrupted data is rejected, but we still send an empty reply
         // so the querier doesn't hang.
-        assert_eq!(actions.len(), 1, "should send empty reply for corrupted data");
+        assert_eq!(
+            actions.len(),
+            1,
+            "should send empty reply for corrupted data"
+        );
         assert!(
             matches!(&actions[0], StorageTierAction::SendReply { query_id: 42, payload } if payload.is_empty()),
             "corrupted disk data should produce empty reply"
@@ -1364,8 +1430,12 @@ mod tests {
             cache_capacity: 5, // window=1, protected=1, probation=3
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         // Fill cache with items (each gets frequency ~1 from transit admission).
         for i in 0..4 {
@@ -1409,20 +1479,16 @@ mod tests {
     #[test]
     fn disk_read_failed_sends_empty_reply() {
         let mut tier = make_tier_with_policy(ContentPolicy::default());
-        let cid = ContentId::for_blob(
-            b"missing",
-            crate::cid::ContentFlags::default(),
-        )
-        .unwrap();
-        let actions = tier.handle(StorageTierEvent::DiskReadFailed {
-            cid,
-            query_id: 42,
-        });
+        let cid = ContentId::for_blob(b"missing", crate::cid::ContentFlags::default()).unwrap();
+        let actions = tier.handle(StorageTierEvent::DiskReadFailed { cid, query_id: 42 });
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             StorageTierAction::SendReply { query_id, payload } => {
                 assert_eq!(*query_id, 42);
-                assert!(payload.is_empty(), "failed disk read should send empty reply");
+                assert!(
+                    payload.is_empty(),
+                    "failed disk read should send empty reply"
+                );
             }
             other => panic!("expected SendReply, got {other:?}"),
         }
@@ -1437,8 +1503,12 @@ mod tests {
             cache_capacity: 3,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let (cid, data) = cid_with_class(b"durable on disk", false, false);
 
         // Store via transit — adds to cache.
@@ -1510,8 +1580,12 @@ mod tests {
             cache_capacity: 5,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         // Store 2 durable items via publish (bypasses W-TinyLFU).
         let d1_data = b"durable-1";
@@ -1625,7 +1699,8 @@ mod tests {
             filter_config,
         );
         assert_eq!(
-            tier.filter_config().mutation_threshold, 1,
+            tier.filter_config().mutation_threshold,
+            1,
             "mutation_threshold = 0 should be clamped to 1"
         );
     }

@@ -134,8 +134,7 @@ impl PqIdentity {
         let encrypted = result?;
 
         // 4. Assemble wire format: [ML-KEM ct][nonce][encrypted+tag]
-        let mut wire =
-            Vec::with_capacity(harmony_crypto::ml_kem::CT_LENGTH + 12 + encrypted.len());
+        let mut wire = Vec::with_capacity(harmony_crypto::ml_kem::CT_LENGTH + 12 + encrypted.len());
         wire.extend_from_slice(ct.as_bytes());
         wire.extend_from_slice(&nonce);
         wire.extend_from_slice(&encrypted);

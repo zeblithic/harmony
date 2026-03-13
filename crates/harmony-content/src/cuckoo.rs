@@ -398,10 +398,7 @@ mod tests {
             cf.insert(&make_cid(i)).unwrap();
         }
         for i in 0..500 {
-            assert!(
-                cf.may_contain(&make_cid(i)),
-                "false negative for item {i}"
-            );
+            assert!(cf.may_contain(&make_cid(i)), "false negative for item {i}");
         }
         assert_eq!(cf.count(), 500);
     }
@@ -416,7 +413,10 @@ mod tests {
     fn debug_impl_shows_summary() {
         let cf = CuckooFilter::new(1000);
         let dbg = format!("{cf:?}");
-        assert!(dbg.contains("CuckooFilter"), "missing 'CuckooFilter': {dbg}");
+        assert!(
+            dbg.contains("CuckooFilter"),
+            "missing 'CuckooFilter': {dbg}"
+        );
         assert!(dbg.contains("num_buckets"), "missing 'num_buckets': {dbg}");
         assert!(dbg.contains("count"), "missing 'count': {dbg}");
         assert!(dbg.contains(".."), "should use finish_non_exhaustive()");

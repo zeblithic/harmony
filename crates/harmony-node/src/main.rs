@@ -158,7 +158,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             use crate::runtime::{NodeConfig, NodeRuntime, RuntimeAction};
             use harmony_compute::InstructionBudget;
             use harmony_content::blob::MemoryBlobStore;
-            use harmony_content::storage_tier::{ContentPolicy, FilterBroadcastConfig, StorageBudget};
+            use harmony_content::storage_tier::{
+                ContentPolicy, FilterBroadcastConfig, StorageBudget,
+            };
 
             if cache_capacity == 0 {
                 return Err("--cache-capacity must be > 0".into());
@@ -332,12 +334,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_announce_without_persist() {
-        let cli = Cli::try_parse_from([
-            "harmony",
-            "run",
-            "--encrypted-durable-announce",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["harmony", "run", "--encrypted-durable-announce"]).unwrap();
         let result = run(cli);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -362,20 +359,11 @@ mod tests {
     #[test]
     fn cli_rejects_oversized_cache_capacity() {
         // 200_000_001 exceeds MAX_CACHE_CAPACITY (200M).
-        let cli = Cli::try_parse_from([
-            "harmony",
-            "run",
-            "--cache-capacity",
-            "200000001",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "200000001"]).unwrap();
         let result = run(cli);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("exceeds maximum"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("exceeds maximum"), "unexpected error: {msg}");
     }
 
     #[test]
@@ -404,8 +392,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_filter_broadcast_ticks_below_two() {
-        let cli =
-            Cli::try_parse_from(["harmony", "run", "--filter-broadcast-ticks", "1"]).unwrap();
+        let cli = Cli::try_parse_from(["harmony", "run", "--filter-broadcast-ticks", "1"]).unwrap();
         let result = run(cli);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
