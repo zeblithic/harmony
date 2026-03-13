@@ -37,8 +37,7 @@ const DEFAULT_MAX_KICKS: u32 = 500;
 
 /// Maximum number of buckets allowed (defense-in-depth for deserialization).
 ///
-/// Used by `from_bytes` (Task 3) to reject untrusted headers.
-#[allow(dead_code)]
+/// Used by [`CuckooFilter::from_bytes`] to reject untrusted headers.
 const MAX_BUCKETS: u32 = 1_000_000;
 
 /// Target load factor used to size the bucket array.
@@ -217,6 +216,69 @@ impl CuckooFilter {
     /// Check whether a bucket contains a given fingerprint.
     fn bucket_contains(&self, bucket_idx: usize, fp: u16) -> bool {
         self.buckets[bucket_idx].contains(&fp)
+    }
+
+    /// Serialize the filter to a byte vector.
+    ///
+    /// Wire format: `[num_buckets: u32 BE][item_count: u32 BE][bucket data]`
+    /// where bucket data is `num_buckets * BUCKET_SIZE` fingerprints, each as
+    /// a `u16` in big-endian order.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let header_size = 8;
+        let body_size = self.num_buckets as usize * BUCKET_SIZE * 2;
+        let mut buf = Vec::with_capacity(header_size + body_size);
+        buf.extend_from_slice(&self.num_buckets.to_be_bytes());
+        buf.extend_from_slice(&self.count.to_be_bytes());
+        for bucket in &self.buckets {
+            for &fp in bucket {
+                buf.extend_from_slice(&fp.to_be_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Deserialize a filter from bytes produced by [`to_bytes`](Self::to_bytes).
+    ///
+    /// Validates that the header is present, `num_buckets` is in range, and
+    /// the body length matches the declared bucket count.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CuckooError> {
+        const HEADER_SIZE: usize = 8;
+        if bytes.len() < HEADER_SIZE {
+            return Err(CuckooError::HeaderTruncated);
+        }
+        let num_buckets = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        let count = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+        if num_buckets == 0 {
+            return Err(CuckooError::ZeroBuckets);
+        }
+        if num_buckets > MAX_BUCKETS {
+            return Err(CuckooError::TooManyBuckets {
+                got: num_buckets,
+                max: MAX_BUCKETS,
+            });
+        }
+        let expected_body = num_buckets as usize * BUCKET_SIZE * 2;
+        let got_body = bytes.len() - HEADER_SIZE;
+        if got_body != expected_body {
+            return Err(CuckooError::LengthMismatch {
+                expected: expected_body,
+                got: got_body,
+            });
+        }
+        let mut buckets = vec![[EMPTY; BUCKET_SIZE]; num_buckets as usize];
+        let mut offset = HEADER_SIZE;
+        for bucket in &mut buckets {
+            for slot in bucket.iter_mut() {
+                *slot = u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap());
+                offset += 2;
+            }
+        }
+        Ok(CuckooFilter {
+            buckets,
+            num_buckets,
+            count,
+            max_kicks: DEFAULT_MAX_KICKS,
+        })
     }
 
     /// Remove a content ID from the filter, returning `true` if it was found.
@@ -404,5 +466,101 @@ mod tests {
         cf.insert(&cid).unwrap();
         assert!(cf.may_contain(&cid));
         assert_eq!(cf.count(), 1);
+    }
+
+    #[test]
+    fn serialization_round_trip() {
+        let mut cf = CuckooFilter::new(1000);
+        for i in 0..100 {
+            cf.insert(&make_cid(i)).unwrap();
+        }
+        let bytes = cf.to_bytes();
+        let cf2 = CuckooFilter::from_bytes(&bytes).unwrap();
+        assert_eq!(cf.num_buckets(), cf2.num_buckets());
+        assert_eq!(cf.count(), cf2.count());
+        for i in 0..100 {
+            assert!(cf2.may_contain(&make_cid(i)));
+        }
+    }
+
+    #[test]
+    fn from_bytes_rejects_truncated() {
+        let err = CuckooFilter::from_bytes(&[0u8; 4]).unwrap_err();
+        assert_eq!(err, CuckooError::HeaderTruncated);
+    }
+
+    #[test]
+    fn from_bytes_rejects_zero_buckets() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let err = CuckooFilter::from_bytes(&buf).unwrap_err();
+        assert_eq!(err, CuckooError::ZeroBuckets);
+    }
+
+    #[test]
+    fn from_bytes_rejects_excessive_buckets() {
+        let too_many = super::MAX_BUCKETS + 1;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&too_many.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let err = CuckooFilter::from_bytes(&buf).unwrap_err();
+        assert_eq!(
+            err,
+            CuckooError::TooManyBuckets {
+                got: too_many,
+                max: super::MAX_BUCKETS,
+            }
+        );
+    }
+
+    #[test]
+    fn from_bytes_rejects_wrong_body_length() {
+        let mut cf = CuckooFilter::new(100);
+        cf.insert(&make_cid(0)).unwrap();
+        let mut bytes = cf.to_bytes();
+        bytes.truncate(bytes.len() - 2);
+        let err = CuckooFilter::from_bytes(&bytes).unwrap_err();
+        match err {
+            CuckooError::LengthMismatch { .. } => {}
+            other => panic!("expected LengthMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn false_positive_rate_within_bounds() {
+        // Over-provision so all 1000 items fit without hitting FilterFull.
+        let mut cf = CuckooFilter::new(2000);
+        for i in 0..1000 {
+            cf.insert(&make_cid(i)).unwrap();
+        }
+        let mut false_positives = 0;
+        for i in 10_000..20_000 {
+            if cf.may_contain(&make_cid(i)) {
+                false_positives += 1;
+            }
+        }
+        let fp_rate = false_positives as f64 / 10_000.0;
+        assert!(
+            fp_rate <= 0.005,
+            "false positive rate {fp_rate:.4} exceeds 0.5% bound"
+        );
+    }
+
+    #[test]
+    fn insert_until_full_returns_error() {
+        let mut cf = CuckooFilter::new(10);
+        let mut full_count = 0;
+        for i in 0..100 {
+            match cf.insert(&make_cid(i)) {
+                Ok(()) => full_count += 1,
+                Err(CuckooError::FilterFull) => break,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(
+            full_count >= 10,
+            "should insert at least capacity items, got {full_count}"
+        );
     }
 }
