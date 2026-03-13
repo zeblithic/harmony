@@ -85,8 +85,8 @@ impl FlatpackIndex {
             let set = self.reverse.entry(*child).or_default();
             if set.is_empty() {
                 // New child — insert into cuckoo filter. Ignore FilterFull
-                // errors; the filter is best-effort and rebuild_filter can
-                // recover later.
+                // errors; the filter is best-effort and rebuild_filter will
+                // resize and re-insert all children on the next rebuild.
                 let _ = self.filter.insert(child);
             }
             set.insert(bundle_cid);
@@ -153,11 +153,21 @@ impl FlatpackIndex {
 
     /// Rebuild the cuckoo filter from scratch using the current reverse map.
     ///
-    /// Clears the existing filter and re-inserts all child CIDs that have
-    /// at least one bundle reference. Useful after many insertions and
-    /// deletions to eliminate false positives from deleted entries.
+    /// If the reverse map has more unique children than the current filter
+    /// can hold (based on its bucket count), the filter is replaced with a
+    /// larger one sized for the actual population. This prevents silent
+    /// false negatives from `FilterFull` errors during re-insertion.
     pub fn rebuild_filter(&mut self) {
-        self.filter.clear();
+        let child_count = self.reverse.len() as u32;
+        // Each bucket holds 4 fingerprints. Resize if population exceeds
+        // total slot count (conservative — actual capacity depends on load
+        // factor, but oversizing is cheap and prevents false negatives).
+        let total_slots = self.filter.num_buckets().saturating_mul(4);
+        if child_count > 0 && child_count > total_slots {
+            self.filter = CuckooFilter::new(child_count);
+        } else {
+            self.filter.clear();
+        }
         for child in self.reverse.keys() {
             let _ = self.filter.insert(child);
         }

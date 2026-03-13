@@ -66,6 +66,11 @@ pub enum CuckooError {
         /// The maximum allowed value.
         max: u32,
     },
+    /// `num_buckets` is not a power of two (required for alt_index involution).
+    NotPowerOfTwo {
+        /// The value found in the header.
+        got: u32,
+    },
 }
 
 impl fmt::Display for CuckooError {
@@ -81,6 +86,9 @@ impl fmt::Display for CuckooError {
             CuckooError::ZeroBuckets => write!(f, "num_buckets must be non-zero"),
             CuckooError::TooManyBuckets { got, max } => {
                 write!(f, "num_buckets {got} exceeds maximum {max}")
+            }
+            CuckooError::NotPowerOfTwo { got } => {
+                write!(f, "num_buckets {got} is not a power of two")
             }
         }
     }
@@ -142,6 +150,9 @@ impl CuckooFilter {
     ///
     /// Returns `Ok(())` on success, or `Err(CuckooError::FilterFull)` if the
     /// item could not be placed after [`DEFAULT_MAX_KICKS`] eviction attempts.
+    ///
+    /// On failure the filter is unchanged — the eviction chain is rolled back
+    /// so that no previously-inserted fingerprint is lost.
     pub fn insert(&mut self, cid: &ContentId) -> Result<(), CuckooError> {
         let (fp, i1) = fingerprint_and_index(cid, self.num_buckets);
         let i2 = alt_index(i1, fp, self.num_buckets);
@@ -157,13 +168,17 @@ impl CuckooFilter {
         }
 
         // Both buckets are full — begin eviction.
+        // Track each swap so we can roll back on failure.
         let mut idx = if fp as u32 % 2 == 0 { i1 } else { i2 };
         let mut evicted_fp = fp;
+        let mut rollback: Vec<(u32, usize, u16)> = Vec::new();
 
         for _ in 0..self.max_kicks {
-            // Pick a slot based on the fingerprint value for determinism.
             let slot = evicted_fp as usize % BUCKET_SIZE;
-            core::mem::swap(&mut self.buckets[idx as usize][slot], &mut evicted_fp);
+            let original_fp = self.buckets[idx as usize][slot];
+            self.buckets[idx as usize][slot] = evicted_fp;
+            rollback.push((idx, slot, original_fp));
+            evicted_fp = original_fp;
 
             idx = alt_index(idx, evicted_fp, self.num_buckets);
             if self.try_insert_at(idx as usize, evicted_fp) {
@@ -172,6 +187,10 @@ impl CuckooFilter {
             }
         }
 
+        // Eviction failed — roll back all swaps in reverse order.
+        for (bucket_idx, slot, original_fp) in rollback.into_iter().rev() {
+            self.buckets[bucket_idx as usize][slot] = original_fp;
+        }
         Err(CuckooError::FilterFull)
     }
 
@@ -258,6 +277,9 @@ impl CuckooFilter {
                 got: num_buckets,
                 max: MAX_BUCKETS,
             });
+        }
+        if !num_buckets.is_power_of_two() {
+            return Err(CuckooError::NotPowerOfTwo { got: num_buckets });
         }
         let expected_body = num_buckets as usize * BUCKET_SIZE * 2;
         let got_body = bytes.len() - HEADER_SIZE;
@@ -501,6 +523,19 @@ mod tests {
     }
 
     #[test]
+    fn from_bytes_rejects_non_power_of_two() {
+        // 3 is valid (non-zero, within bounds) but not a power of 2.
+        let num_buckets: u32 = 3;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&num_buckets.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        // Provide correct body length for 3 buckets.
+        buf.extend_from_slice(&vec![0u8; 3 * 4 * 2]);
+        let err = CuckooFilter::from_bytes(&buf).unwrap_err();
+        assert_eq!(err, CuckooError::NotPowerOfTwo { got: 3 });
+    }
+
+    #[test]
     fn from_bytes_rejects_excessive_buckets() {
         let too_many = super::MAX_BUCKETS + 1;
         let mut buf = Vec::new();
@@ -567,6 +602,32 @@ mod tests {
             full_count >= 10,
             "should insert at least capacity items, got {full_count}"
         );
+    }
+
+    #[test]
+    fn failed_insert_does_not_corrupt_existing_items() {
+        // Fill a small filter, then attempt an insert that fails.
+        // All previously-inserted items must still be found.
+        let mut cf = CuckooFilter::new(10);
+        let mut inserted = Vec::new();
+        for i in 0..200 {
+            let cid = make_cid(i);
+            match cf.insert(&cid) {
+                Ok(()) => inserted.push(cid),
+                Err(CuckooError::FilterFull) => {
+                    // Verify rollback: every previously-inserted item is still present.
+                    for prev in &inserted {
+                        assert!(
+                            cf.may_contain(prev),
+                            "false negative after failed insert (rollback broken)"
+                        );
+                    }
+                    return;
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        // If we never hit FilterFull, that's fine — test still passes.
     }
 
     #[test]
