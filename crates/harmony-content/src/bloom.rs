@@ -228,6 +228,9 @@ impl BloomFilter {
         }
 
         let estimate = -(m / k) * libm::log(1.0 - ratio);
+        if estimate > u32::MAX as f64 {
+            return u32::MAX;
+        }
         estimate.round() as u32
     }
 
