@@ -302,10 +302,18 @@ impl CuckooFilter {
                 offset += 2;
             }
         }
+        // Recompute count from actual bucket contents rather than trusting
+        // the wire value — prevents a malicious or corrupted payload from
+        // providing a misleading count.
+        let actual_count = buckets
+            .iter()
+            .flat_map(|b| b.iter())
+            .filter(|&&slot| slot != EMPTY)
+            .count() as u32;
         Ok(CuckooFilter {
             buckets,
             num_buckets,
-            count,
+            count: actual_count,
             max_kicks: DEFAULT_MAX_KICKS,
         })
     }
