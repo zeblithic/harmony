@@ -9,6 +9,7 @@ pub mod chunker;
 pub mod cid;
 pub mod cuckoo;
 pub mod dag;
+pub mod flatpack;
 pub mod delta;
 pub mod error;
 pub mod lru;
