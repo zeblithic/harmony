@@ -74,6 +74,13 @@ impl FlatpackIndex {
     ///
     /// Increments the mutation counter.
     pub fn on_bundle_admitted(&mut self, bundle_cid: ContentId, child_cids: Vec<ContentId>) {
+        // If this bundle was already admitted (re-admission with possibly
+        // different children), clean up old entries first to prevent orphaned
+        // reverse-map references.
+        if self.forward.contains_key(&bundle_cid) {
+            self.on_bundle_evicted(&bundle_cid);
+        }
+
         for child in &child_cids {
             let set = self.reverse.entry(*child).or_default();
             if set.is_empty() {
@@ -355,5 +362,35 @@ mod tests {
 
         idx.reset_mutation_counter();
         assert_eq!(idx.mutations_since_broadcast(), 0);
+    }
+
+    #[test]
+    fn readmit_bundle_with_different_children_cleans_old_entries() {
+        let mut idx = FlatpackIndex::new(100);
+        let bundle = make_cid(5000);
+        let old_child = make_cid(5001);
+        let new_child = make_cid(5002);
+
+        // First admission with old_child.
+        idx.on_bundle_admitted(bundle, vec![old_child]);
+        assert!(idx.is_referenced(&old_child));
+
+        // Re-admit same bundle with different children.
+        idx.on_bundle_admitted(bundle, vec![new_child]);
+
+        // Old child should be cleaned up.
+        assert!(
+            !idx.is_referenced(&old_child),
+            "old child should be unreferenced after re-admission"
+        );
+        assert!(
+            idx.lookup(&old_child).is_none(),
+            "old child should have no reverse entries"
+        );
+
+        // New child should be present.
+        assert!(idx.is_referenced(&new_child));
+        let set = idx.lookup(&new_child).expect("new child should exist");
+        assert!(set.contains(&bundle));
     }
 }

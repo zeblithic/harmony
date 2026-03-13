@@ -161,10 +161,14 @@ pub enum RuntimeAction {
 }
 
 /// Filter state received from a peer, with metadata.
+///
+/// Each filter type tracks its own received tick so that staleness detection
+/// is independent — a fresh Bloom filter doesn't mask a stale Cuckoo filter.
 struct PeerFilter {
     content_filter: Option<BloomFilter>,
     flatpack_filter: Option<CuckooFilter>,
-    received_tick: u64,
+    content_received_tick: u64,
+    flatpack_received_tick: u64,
 }
 
 /// Per-peer Bloom filter table for content query routing.
@@ -196,20 +200,22 @@ impl PeerFilterTable {
         let entry = self.filters.entry(peer_addr).or_insert(PeerFilter {
             content_filter: None,
             flatpack_filter: None,
-            received_tick: tick,
+            content_received_tick: tick,
+            flatpack_received_tick: 0,
         });
         entry.content_filter = Some(filter);
-        entry.received_tick = tick;
+        entry.content_received_tick = tick;
     }
 
     fn upsert_flatpack(&mut self, peer_addr: String, filter: CuckooFilter, tick: u64) {
         let entry = self.filters.entry(peer_addr).or_insert(PeerFilter {
             content_filter: None,
             flatpack_filter: None,
-            received_tick: tick,
+            content_received_tick: 0,
+            flatpack_received_tick: tick,
         });
         entry.flatpack_filter = Some(filter);
-        entry.received_tick = tick;
+        entry.flatpack_received_tick = tick;
     }
 
     /// Returns true if the peer should be queried (no filter, stale filter, or filter says "maybe").
@@ -218,7 +224,7 @@ impl PeerFilterTable {
         match self.filters.get(peer_addr) {
             None => true,
             Some(pf) => {
-                if current_tick.saturating_sub(pf.received_tick) > self.staleness_ticks {
+                if current_tick.saturating_sub(pf.content_received_tick) > self.staleness_ticks {
                     true
                 } else {
                     match &pf.content_filter {
@@ -240,7 +246,7 @@ impl PeerFilterTable {
         match self.filters.get(peer_addr) {
             None => true,
             Some(pf) => {
-                if current_tick.saturating_sub(pf.received_tick) > self.staleness_ticks {
+                if current_tick.saturating_sub(pf.flatpack_received_tick) > self.staleness_ticks {
                     true
                 } else {
                     match &pf.flatpack_filter {
@@ -252,9 +258,15 @@ impl PeerFilterTable {
         }
     }
 
+    /// Evict peers where both filters are stale.
     fn evict_stale(&mut self, current_tick: u64) {
-        self.filters
-            .retain(|_, pf| current_tick.saturating_sub(pf.received_tick) <= self.staleness_ticks);
+        self.filters.retain(|_, pf| {
+            let content_fresh =
+                current_tick.saturating_sub(pf.content_received_tick) <= self.staleness_ticks;
+            let flatpack_fresh =
+                current_tick.saturating_sub(pf.flatpack_received_tick) <= self.staleness_ticks;
+            content_fresh || flatpack_fresh
+        });
     }
 }
 
@@ -2185,5 +2197,39 @@ mod tests {
         rt.tick();
 
         assert_eq!(rt.peer_filter_parse_errors(), 0);
+    }
+
+    #[test]
+    fn staleness_tracking_independent_per_filter_type() {
+        let mut table = PeerFilterTable::new(10);
+        let cid = ContentId::for_blob(b"staleness-test", ContentFlags::default()).unwrap();
+
+        // Insert content filter at tick 5.
+        let bf = BloomFilter::new(100, 0.01);
+        table.upsert_content("peer-a".to_string(), bf, 5);
+
+        // At tick 20 (15 ticks later, > staleness_ticks=10), content filter
+        // should be stale, so should_query returns true (fall back to querying).
+        assert!(
+            table.should_query("peer-a", &cid, 20),
+            "stale content filter should fall back to querying"
+        );
+
+        // But if we also insert a flatpack filter at tick 18...
+        let cf = CuckooFilter::new(100);
+        table.upsert_flatpack("peer-a".to_string(), cf, 18);
+
+        // Content filter should STILL be considered stale at tick 20.
+        // (With the old shared received_tick, tick 18 would mask content staleness.)
+        assert!(
+            table.should_query("peer-a", &cid, 20),
+            "content filter must be stale independently of flatpack freshness"
+        );
+
+        // Flatpack filter should be fresh at tick 20 (20-18=2 <= 10).
+        assert!(
+            !table.should_query_flatpack("peer-a", &cid, 20),
+            "fresh flatpack filter with empty cuckoo should say 'definitely no'"
+        );
     }
 }
