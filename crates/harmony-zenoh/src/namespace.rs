@@ -193,6 +193,36 @@ pub mod filters {
     pub fn content_key(node_addr: &str) -> String {
         format!("{CONTENT_PREFIX}/{node_addr}")
     }
+
+    /// Flatpack filter prefix: `harmony/filters/flatpack`
+    pub const FLATPACK_PREFIX: &str = "harmony/filters/flatpack";
+
+    /// Subscribe to all flatpack filters: `harmony/filters/flatpack/**`
+    pub const FLATPACK_SUB: &str = "harmony/filters/flatpack/**";
+
+    /// Flatpack filter key: `harmony/filters/flatpack/{node_addr}`
+    pub fn flatpack_key(node_addr: &str) -> String {
+        format!("{FLATPACK_PREFIX}/{node_addr}")
+    }
+}
+
+/// Flatpack reverse-lookup query key expressions.
+///
+/// Nodes query `harmony/flatpack/{child_cid_hex}` to discover which
+/// bundles reference a given child CID. Peers with matching index
+/// entries respond with their bundle CID lists.
+pub mod flatpack {
+    use alloc::{format, string::String};
+    /// Base prefix: `harmony/flatpack`
+    pub const PREFIX: &str = "harmony/flatpack";
+
+    /// Subscribe to all flatpack queries: `harmony/flatpack/**`
+    pub const SUB: &str = "harmony/flatpack/**";
+
+    /// Flatpack query key: `harmony/flatpack/{child_cid_hex}`
+    pub fn query_key(child_cid_hex: &str) -> String {
+        format!("{PREFIX}/{child_cid_hex}")
+    }
 }
 
 // ── Tier 3: Compute ─────────────────────────────────────────────────
@@ -473,6 +503,36 @@ mod tests {
         assert_eq!(filters::CONTENT_SUB, "harmony/filters/content/**");
     }
 
+    // ── Tier 2: Flatpack Filters ─────────────────────────────────────
+
+    #[test]
+    fn filters_flatpack_key() {
+        assert_eq!(
+            filters::flatpack_key("abc123"),
+            "harmony/filters/flatpack/abc123"
+        );
+    }
+
+    #[test]
+    fn filters_flatpack_subscription_pattern() {
+        assert_eq!(filters::FLATPACK_SUB, "harmony/filters/flatpack/**");
+    }
+
+    // ── Tier 2: Flatpack Queries ──────────────────────────────────────
+
+    #[test]
+    fn flatpack_query_key() {
+        assert_eq!(
+            flatpack::query_key("abcdef1234567890"),
+            "harmony/flatpack/abcdef1234567890"
+        );
+    }
+
+    #[test]
+    fn flatpack_subscription_pattern() {
+        assert_eq!(flatpack::SUB, "harmony/flatpack/**");
+    }
+
     // ── Tier 3: Compute ─────────────────────────────────────────
 
     #[test]
@@ -588,6 +648,7 @@ mod tests {
             content::PREFIX,
             announce::PREFIX,
             filters::PREFIX,
+            flatpack::PREFIX,
             compute::PREFIX,
             workflow::PREFIX,
             presence::PREFIX,
