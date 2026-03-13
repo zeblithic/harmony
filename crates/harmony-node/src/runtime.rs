@@ -692,14 +692,13 @@ impl<B: BlobStore> NodeRuntime<B> {
                             None => break,
                         }
                     }
-                    // Timer-triggered filter rebuild: fires only if the interval
-                    // has elapsed AND no threshold-triggered broadcast already
-                    // occurred during this tick's drain (which would have set
-                    // pending_filter_broadcast and reset ticks_since_filter_broadcast
-                    // via dispatch_storage_actions).
-                    if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks
-                        && self.pending_filter_broadcast.is_none()
-                    {
+                    // Timer-triggered filter rebuild: fires when the interval
+                    // has elapsed. Both bloom and cuckoo filters are rebuilt
+                    // together. The pending_filter_broadcast / pending_cuckoo_broadcast
+                    // buffers coalesce multiple rebuilds within a tick, so
+                    // firing alongside a threshold-triggered bloom broadcast
+                    // is harmless — the latest snapshot wins at flush time.
+                    if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks {
                         self.ticks_since_filter_broadcast = 0;
                         let timer_actions = self.storage.handle(StorageTierEvent::FilterTimerTick);
                         self.dispatch_storage_actions(timer_actions, &mut actions);
@@ -2028,8 +2027,9 @@ mod tests {
 
         // Set mutation_threshold=2 and max_interval_ticks=2.
         // Queue 2 transit events (crosses threshold) then call tick().
-        // The timer fires on tick 2, but should be skipped because
-        // a threshold broadcast is already pending.
+        // The timer also fires on tick 2, producing both bloom and cuckoo
+        // broadcasts. The bloom broadcast from threshold and timer are
+        // coalesced into one publish; the cuckoo broadcast adds a second.
         let config = NodeConfig {
             storage_budget: StorageBudget {
                 cache_capacity: 100,
@@ -2062,8 +2062,8 @@ mod tests {
             });
         }
 
-        // Tick 2: timer interval also fires (tick 2 >= interval 2),
-        // but should be skipped because threshold broadcast is pending.
+        // Tick 2: timer interval also fires (tick 2 >= interval 2).
+        // Bloom coalesces (threshold + timer → 1 publish), cuckoo adds 1.
         let actions = rt.tick();
         let filter_publishes: Vec<_> = actions
             .iter()
@@ -2074,8 +2074,8 @@ mod tests {
             .collect();
         assert_eq!(
             filter_publishes.len(),
-            1,
-            "expected exactly 1 filter broadcast (timer should be skipped when threshold pending)"
+            2,
+            "expected 2 filter broadcasts (1 coalesced bloom + 1 cuckoo)"
         );
     }
 

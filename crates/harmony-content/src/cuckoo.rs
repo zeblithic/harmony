@@ -273,7 +273,8 @@ impl CuckooFilter {
             return Err(CuckooError::HeaderTruncated);
         }
         let num_buckets = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
-        let count = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+        // Wire count is ignored — recomputed from actual bucket contents below.
+        let _wire_count = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
         if num_buckets == 0 {
             return Err(CuckooError::ZeroBuckets);
         }
