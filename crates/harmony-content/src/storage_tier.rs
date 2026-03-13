@@ -3,6 +3,7 @@
 use crate::blob::BlobStore;
 use crate::cache::ContentStore;
 use crate::cid::{ContentClass, ContentId};
+use crate::flatpack::FlatpackIndex;
 use alloc::{
     string::{String, ToString},
     vec,
@@ -123,6 +124,11 @@ pub enum StorageTierAction {
     /// The runtime constructs the full key expression (including node address)
     /// since `StorageTier` is sans-I/O and has no identity context.
     BroadcastFilter { payload: Vec<u8> },
+    /// Broadcast a cuckoo filter snapshot of the Flatpack reverse index.
+    ///
+    /// The runtime constructs the full key expression (including node address)
+    /// since `StorageTier` is sans-I/O and has no identity context.
+    BroadcastCuckooFilter { payload: Vec<u8> },
 }
 
 /// Per-class storage and publishing policy.
@@ -201,6 +207,8 @@ pub struct StorageTier<B: BlobStore> {
     filter_config: FilterBroadcastConfig,
     /// Number of cache mutations since last Bloom filter broadcast.
     mutations_since_broadcast: u32,
+    /// Flatpack reverse index (child_cid → bundle_cids).
+    flatpack: FlatpackIndex,
 }
 
 impl<B: BlobStore> StorageTier<B> {
@@ -240,6 +248,7 @@ impl<B: BlobStore> StorageTier<B> {
             },
         ];
 
+        let flatpack = FlatpackIndex::new(filter_config.expected_items);
         let tier = Self {
             cache,
             budget,
@@ -248,6 +257,7 @@ impl<B: BlobStore> StorageTier<B> {
             disk_index: HashSet::new(),
             filter_config,
             mutations_since_broadcast: 0,
+            flatpack,
         };
 
         (tier, actions)
@@ -266,6 +276,11 @@ impl<B: BlobStore> StorageTier<B> {
     /// Read-only access to the filter broadcast configuration.
     pub fn filter_config(&self) -> &FilterBroadcastConfig {
         &self.filter_config
+    }
+
+    /// Read-only access to the Flatpack reverse index.
+    pub fn flatpack(&self) -> &FlatpackIndex {
+        &self.flatpack
     }
 
     /// Mutable access to the underlying content store (crate-internal).
@@ -339,7 +354,7 @@ impl<B: BlobStore> StorageTier<B> {
                 }]
             }
             StorageTierEvent::FilterTimerTick => {
-                vec![self.rebuild_filter()]
+                vec![self.rebuild_filter(), self.rebuild_cuckoo_filter()]
             }
         }
     }
@@ -364,6 +379,16 @@ impl<B: BlobStore> StorageTier<B> {
 
         StorageTierAction::BroadcastFilter {
             payload: filter.to_bytes(),
+        }
+    }
+
+    /// Rebuild the cuckoo filter from the Flatpack reverse index and return
+    /// a `BroadcastCuckooFilter` action. Resets the Flatpack mutation counter.
+    fn rebuild_cuckoo_filter(&mut self) -> StorageTierAction {
+        self.flatpack.rebuild_filter();
+        self.flatpack.reset_mutation_counter();
+        StorageTierAction::BroadcastCuckooFilter {
+            payload: self.flatpack.filter().to_bytes(),
         }
     }
 
@@ -567,8 +592,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         let data = b"cached blob";
         let cid = tier.cache_mut().insert(data).unwrap();
@@ -593,8 +622,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let cid = ContentId::for_blob(b"not stored", crate::cid::ContentFlags::default()).unwrap();
 
         let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 99, cid });
@@ -609,8 +642,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         let data = b"stats test blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
@@ -639,8 +676,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let data = b"explicitly published blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -672,8 +713,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let data = b"transiting blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -703,8 +748,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let data = b"repeated transit";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -729,8 +778,12 @@ mod tests {
             cache_capacity: 3,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         // Fill cache: 3 items → window=1, probation=2.
         for i in 0..3 {
@@ -786,8 +839,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         let blob_a = ContentId::for_blob(b"child-a", crate::cid::ContentFlags::default()).unwrap();
         let blob_b = ContentId::for_blob(b"child-b", crate::cid::ContentFlags::default()).unwrap();
@@ -820,8 +877,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         // CID for "real data" but send "tampered data"
         let cid = ContentId::for_blob(b"real data", crate::cid::ContentFlags::default()).unwrap();
@@ -844,8 +905,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         let cid = ContentId::for_blob(b"original", crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::PublishContent {
@@ -867,8 +932,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         // Craft a CID with correct hash but wrong payload_size by mutating
         // the size bits in the last 4 bytes.
@@ -898,8 +967,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (tier, actions) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (tier, actions) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let _ = tier;
 
         assert_eq!(actions.len(), 2);
@@ -928,8 +1001,12 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, policy, FilterBroadcastConfig::default());
+        let (tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            policy,
+            FilterBroadcastConfig::default(),
+        );
         tier
     }
 
@@ -1073,7 +1150,12 @@ mod tests {
             encrypted_durable_announce: true,
             ..ContentPolicy::default()
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy, FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            policy,
+            FilterBroadcastConfig::default(),
+        );
 
         // Fill cache with PublicDurable content.
         for i in 0..4 {
@@ -1158,7 +1240,12 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let policy = ContentPolicy::default();
-        let (tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy, FilterBroadcastConfig::default());
+        let (tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            policy,
+            FilterBroadcastConfig::default(),
+        );
         assert_eq!(tier.metrics().queries_served, 0);
     }
 
@@ -1322,7 +1409,11 @@ mod tests {
         });
         // Corrupted data is rejected, but we still send an empty reply
         // so the querier doesn't hang.
-        assert_eq!(actions.len(), 1, "should send empty reply for corrupted data");
+        assert_eq!(
+            actions.len(),
+            1,
+            "should send empty reply for corrupted data"
+        );
         assert!(
             matches!(&actions[0], StorageTierAction::SendReply { query_id: 42, payload } if payload.is_empty()),
             "corrupted disk data should produce empty reply"
@@ -1339,8 +1430,12 @@ mod tests {
             cache_capacity: 5, // window=1, protected=1, probation=3
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         // Fill cache with items (each gets frequency ~1 from transit admission).
         for i in 0..4 {
@@ -1384,20 +1479,16 @@ mod tests {
     #[test]
     fn disk_read_failed_sends_empty_reply() {
         let mut tier = make_tier_with_policy(ContentPolicy::default());
-        let cid = ContentId::for_blob(
-            b"missing",
-            crate::cid::ContentFlags::default(),
-        )
-        .unwrap();
-        let actions = tier.handle(StorageTierEvent::DiskReadFailed {
-            cid,
-            query_id: 42,
-        });
+        let cid = ContentId::for_blob(b"missing", crate::cid::ContentFlags::default()).unwrap();
+        let actions = tier.handle(StorageTierEvent::DiskReadFailed { cid, query_id: 42 });
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             StorageTierAction::SendReply { query_id, payload } => {
                 assert_eq!(*query_id, 42);
-                assert!(payload.is_empty(), "failed disk read should send empty reply");
+                assert!(
+                    payload.is_empty(),
+                    "failed disk read should send empty reply"
+                );
             }
             other => panic!("expected SendReply, got {other:?}"),
         }
@@ -1412,8 +1503,12 @@ mod tests {
             cache_capacity: 3,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
         let (cid, data) = cid_with_class(b"durable on disk", false, false);
 
         // Store via transit — adds to cache.
@@ -1485,8 +1580,12 @@ mod tests {
             cache_capacity: 5,
             max_pinned_bytes: 1_000_000,
         };
-        let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
 
         // Store 2 durable items via publish (bypasses W-TinyLFU).
         let d1_data = b"durable-1";
@@ -1600,7 +1699,8 @@ mod tests {
             filter_config,
         );
         assert_eq!(
-            tier.filter_config().mutation_threshold, 1,
+            tier.filter_config().mutation_threshold,
+            1,
             "mutation_threshold = 0 should be clamped to 1"
         );
     }
@@ -1659,10 +1759,14 @@ mod tests {
     fn filter_timer_tick_triggers_broadcast() {
         let mut tier = make_tier_with_policy(ContentPolicy::default());
         let actions = tier.handle(StorageTierEvent::FilterTimerTick);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
         assert!(
             matches!(&actions[0], StorageTierAction::BroadcastFilter { .. }),
-            "FilterTimerTick should return exactly 1 BroadcastFilter action"
+            "FilterTimerTick should emit BroadcastFilter"
+        );
+        assert!(
+            matches!(&actions[1], StorageTierAction::BroadcastCuckooFilter { .. }),
+            "FilterTimerTick should emit BroadcastCuckooFilter"
         );
     }
 
@@ -1688,7 +1792,7 @@ mod tests {
 
         // Trigger filter rebuild via FilterTimerTick.
         let actions = tier.handle(StorageTierEvent::FilterTimerTick);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
 
         let payload = match &actions[0] {
             StorageTierAction::BroadcastFilter { payload } => payload,
@@ -1753,6 +1857,24 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
             "2nd disk read: should trigger BroadcastFilter at threshold"
+        );
+    }
+
+    #[test]
+    fn cuckoo_filter_broadcast_on_timer_tick() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let actions = tier.handle(StorageTierEvent::FilterTimerTick);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
+            "should emit BroadcastFilter"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::BroadcastCuckooFilter { .. })),
+            "should emit BroadcastCuckooFilter"
         );
     }
 }

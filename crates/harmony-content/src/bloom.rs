@@ -381,10 +381,7 @@ mod tests {
     fn new_sizes_correctly_for_1k_items() {
         let bf = BloomFilter::new(1_000, 0.001);
         let m = bf.num_bits();
-        assert!(
-            m >= 14_000 && m <= 15_000,
-            "expected m in 14K-15K, got {m}"
-        );
+        assert!(m >= 14_000 && m <= 15_000, "expected m in 14K-15K, got {m}");
         assert_eq!(bf.num_hashes(), 10, "expected k=10 for 0.1% FP rate");
     }
 
@@ -447,10 +444,7 @@ mod tests {
             bf.insert(&make_cid(i));
         }
         for i in 0..1000 {
-            assert!(
-                bf.may_contain(&make_cid(i)),
-                "false negative for item {i}"
-            );
+            assert!(bf.may_contain(&make_cid(i)), "false negative for item {i}");
         }
     }
 

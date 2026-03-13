@@ -11,6 +11,7 @@ use harmony_compute::InstructionBudget;
 use harmony_content::blob::BlobStore;
 use harmony_content::bloom::BloomFilter;
 use harmony_content::cid::ContentId;
+use harmony_content::cuckoo::CuckooFilter;
 use harmony_content::storage_tier::{
     ContentPolicy, FilterBroadcastConfig, StorageBudget, StorageMetrics, StorageTier,
     StorageTierAction, StorageTierEvent,
@@ -159,10 +160,15 @@ pub enum RuntimeAction {
     Subscribe { key_expr: String },
 }
 
-/// Bloom filter received from a peer, with metadata.
+/// Filter state received from a peer, with metadata.
+///
+/// Each filter type tracks its own received tick so that staleness detection
+/// is independent — a fresh Bloom filter doesn't mask a stale Cuckoo filter.
 struct PeerFilter {
-    filter: BloomFilter,
-    received_tick: u64,
+    content_filter: Option<BloomFilter>,
+    flatpack_filter: Option<CuckooFilter>,
+    content_received_tick: u64,
+    flatpack_received_tick: u64,
 }
 
 /// Per-peer Bloom filter table for content query routing.
@@ -190,14 +196,26 @@ impl PeerFilterTable {
         self.parse_errors
     }
 
-    fn upsert(&mut self, peer_addr: String, filter: BloomFilter, tick: u64) {
-        self.filters.insert(
-            peer_addr,
-            PeerFilter {
-                filter,
-                received_tick: tick,
-            },
-        );
+    fn upsert_content(&mut self, peer_addr: String, filter: BloomFilter, tick: u64) {
+        let entry = self.filters.entry(peer_addr).or_insert(PeerFilter {
+            content_filter: None,
+            flatpack_filter: None,
+            content_received_tick: tick,
+            flatpack_received_tick: 0,
+        });
+        entry.content_filter = Some(filter);
+        entry.content_received_tick = tick;
+    }
+
+    fn upsert_flatpack(&mut self, peer_addr: String, filter: CuckooFilter, tick: u64) {
+        let entry = self.filters.entry(peer_addr).or_insert(PeerFilter {
+            content_filter: None,
+            flatpack_filter: None,
+            content_received_tick: 0,
+            flatpack_received_tick: tick,
+        });
+        entry.flatpack_filter = Some(filter);
+        entry.flatpack_received_tick = tick;
     }
 
     /// Returns true if the peer should be queried (no filter, stale filter, or filter says "maybe").
@@ -206,18 +224,49 @@ impl PeerFilterTable {
         match self.filters.get(peer_addr) {
             None => true,
             Some(pf) => {
-                if current_tick.saturating_sub(pf.received_tick) > self.staleness_ticks {
+                if current_tick.saturating_sub(pf.content_received_tick) > self.staleness_ticks {
                     true
                 } else {
-                    pf.filter.may_contain(cid)
+                    match &pf.content_filter {
+                        Some(bf) => bf.may_contain(cid),
+                        None => true,
+                    }
                 }
             }
         }
     }
 
+    /// Returns true if the peer should be queried for flatpack reverse-lookup entries.
+    fn should_query_flatpack(
+        &self,
+        peer_addr: &str,
+        child_cid: &ContentId,
+        current_tick: u64,
+    ) -> bool {
+        match self.filters.get(peer_addr) {
+            None => true,
+            Some(pf) => {
+                if current_tick.saturating_sub(pf.flatpack_received_tick) > self.staleness_ticks {
+                    true
+                } else {
+                    match &pf.flatpack_filter {
+                        Some(cf) => cf.may_contain(child_cid),
+                        None => true,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Evict peers where both filters are stale.
     fn evict_stale(&mut self, current_tick: u64) {
-        self.filters
-            .retain(|_, pf| current_tick.saturating_sub(pf.received_tick) <= self.staleness_ticks);
+        self.filters.retain(|_, pf| {
+            let content_fresh =
+                current_tick.saturating_sub(pf.content_received_tick) <= self.staleness_ticks;
+            let flatpack_fresh =
+                current_tick.saturating_sub(pf.flatpack_received_tick) <= self.staleness_ticks;
+            content_fresh || flatpack_fresh
+        });
     }
 }
 
@@ -280,6 +329,8 @@ pub struct NodeRuntime<B: BlobStore> {
     filter_broadcast_interval_ticks: u64,
     // Coalesces multiple BroadcastFilter actions within a single tick into one publish.
     pending_filter_broadcast: Option<Vec<u8>>,
+    // Coalesces cuckoo filter broadcasts (flatpack reverse-index) within a single tick.
+    pending_cuckoo_broadcast: Option<Vec<u8>>,
 }
 
 impl<B: BlobStore> NodeRuntime<B> {
@@ -298,15 +349,20 @@ impl<B: BlobStore> NodeRuntime<B> {
         let router = Node::new();
         let mut queryable_router = QueryableRouter::new();
 
-        let filter_broadcast_interval_ticks = config.filter_broadcast_config.max_interval_ticks as u64;
+        let filter_broadcast_interval_ticks =
+            config.filter_broadcast_config.max_interval_ticks as u64;
         assert!(
             filter_broadcast_interval_ticks >= 2,
             "filter_broadcast_interval_ticks must be >= 2; \
              with interval=1 the timer fires every tick"
         );
 
-        let (storage, storage_startup) =
-            StorageTier::new(store, config.storage_budget, config.content_policy, config.filter_broadcast_config);
+        let (storage, storage_startup) = StorageTier::new(
+            store,
+            config.storage_budget,
+            config.content_policy,
+            config.filter_broadcast_config,
+        );
 
         let mut actions = Vec::new();
         let mut storage_queryable_ids = HashSet::new();
@@ -353,6 +409,9 @@ impl<B: BlobStore> NodeRuntime<B> {
         actions.push(RuntimeAction::Subscribe {
             key_expr: harmony_zenoh::namespace::filters::CONTENT_SUB.to_string(),
         });
+        actions.push(RuntimeAction::Subscribe {
+            key_expr: harmony_zenoh::namespace::filters::FLATPACK_SUB.to_string(),
+        });
 
         let rt = Self {
             router,
@@ -377,6 +436,7 @@ impl<B: BlobStore> NodeRuntime<B> {
             ticks_since_filter_broadcast: 0,
             filter_broadcast_interval_ticks,
             pending_filter_broadcast: None,
+            pending_cuckoo_broadcast: None,
         };
 
         (rt, actions)
@@ -424,6 +484,12 @@ impl<B: BlobStore> NodeRuntime<B> {
     pub fn should_query_peer(&self, peer_addr: &str, cid: &ContentId) -> bool {
         self.peer_filters
             .should_query(peer_addr, cid, self.tick_count)
+    }
+
+    /// Check if a peer should be queried for flatpack reverse-lookup entries.
+    pub fn should_query_peer_flatpack(&self, peer_addr: &str, child_cid: &ContentId) -> bool {
+        self.peer_filters
+            .should_query_flatpack(peer_addr, child_cid, self.tick_count)
     }
 
     /// Number of malformed filter payloads that failed deserialization.
@@ -626,17 +692,15 @@ impl<B: BlobStore> NodeRuntime<B> {
                             None => break,
                         }
                     }
-                    // Timer-triggered filter rebuild: fires only if the interval
-                    // has elapsed AND no threshold-triggered broadcast already
-                    // occurred during this tick's drain (which would have set
-                    // pending_filter_broadcast and reset ticks_since_filter_broadcast
-                    // via dispatch_storage_actions).
-                    if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks
-                        && self.pending_filter_broadcast.is_none()
-                    {
+                    // Timer-triggered filter rebuild: fires when the interval
+                    // has elapsed. Both bloom and cuckoo filters are rebuilt
+                    // together. The pending_filter_broadcast / pending_cuckoo_broadcast
+                    // buffers coalesce multiple rebuilds within a tick, so
+                    // firing alongside a threshold-triggered bloom broadcast
+                    // is harmless — the latest snapshot wins at flush time.
+                    if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks {
                         self.ticks_since_filter_broadcast = 0;
-                        let timer_actions =
-                            self.storage.handle(StorageTierEvent::FilterTimerTick);
+                        let timer_actions = self.storage.handle(StorageTierEvent::FilterTimerTick);
                         self.dispatch_storage_actions(timer_actions, &mut actions);
                     }
 
@@ -645,6 +709,11 @@ impl<B: BlobStore> NodeRuntime<B> {
                     if let Some(payload) = self.pending_filter_broadcast.take() {
                         let key_expr =
                             harmony_zenoh::namespace::filters::content_key(&self.node_addr);
+                        actions.push(RuntimeAction::Publish { key_expr, payload });
+                    }
+                    if let Some(payload) = self.pending_cuckoo_broadcast.take() {
+                        let key_expr =
+                            harmony_zenoh::namespace::filters::flatpack_key(&self.node_addr);
                         actions.push(RuntimeAction::Publish { key_expr, payload });
                     }
                     if processed > 0 {
@@ -728,6 +797,9 @@ impl<B: BlobStore> NodeRuntime<B> {
                     // Reset timer so threshold-triggered broadcasts defer the next
                     // timer-triggered one, avoiding redundant back-to-back rebuilds.
                     self.ticks_since_filter_broadcast = 0;
+                }
+                StorageTierAction::BroadcastCuckooFilter { payload } => {
+                    self.pending_cuckoo_broadcast = Some(payload);
                 }
             }
         }
@@ -919,7 +991,7 @@ impl<B: BlobStore> NodeRuntime<B> {
     }
 
     fn route_subscription(&mut self, key_expr: String, payload: Vec<u8>) {
-        // Check if this is a peer filter broadcast.
+        // Check if this is a content filter broadcast.
         if let Some(peer_addr) = key_expr
             .strip_prefix(harmony_zenoh::namespace::filters::CONTENT_PREFIX)
             .and_then(|s| s.strip_prefix('/'))
@@ -928,7 +1000,29 @@ impl<B: BlobStore> NodeRuntime<B> {
             if peer_addr != self.node_addr {
                 match BloomFilter::from_bytes(&payload) {
                     Ok(filter) => {
-                        self.peer_filters.upsert(
+                        self.peer_filters.upsert_content(
+                            peer_addr.to_string(),
+                            filter,
+                            self.tick_count,
+                        );
+                    }
+                    Err(_) => {
+                        self.peer_filters.record_parse_error();
+                    }
+                }
+            }
+            return;
+        }
+
+        // Check if this is a flatpack filter broadcast.
+        if let Some(peer_addr) = key_expr
+            .strip_prefix(harmony_zenoh::namespace::filters::FLATPACK_PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            if peer_addr != self.node_addr {
+                match CuckooFilter::from_bytes(&payload) {
+                    Ok(filter) => {
+                        self.peer_filters.upsert_flatpack(
                             peer_addr.to_string(),
                             filter,
                             self.tick_count,
@@ -1104,8 +1198,8 @@ mod tests {
 
         // 16 shard queryables + 1 stats queryable + 1 compute activity queryable = 18
         assert_eq!(queryable_count, 18);
-        // transit + publish + filter subscriptions = 3
-        assert_eq!(subscribe_count, 3);
+        // transit + publish + content filter + flatpack filter subscriptions = 4
+        assert_eq!(subscribe_count, 4);
     }
 
     #[test]
@@ -1842,7 +1936,7 @@ mod tests {
         let cid_in = ContentId::for_blob(b"present", ContentFlags::default()).unwrap();
         let cid_out = ContentId::for_blob(b"absent", ContentFlags::default()).unwrap();
         filter.insert(&cid_in);
-        table.upsert("peer-1".into(), filter, 10);
+        table.upsert_content("peer-1".into(), filter, 10);
 
         assert!(table.should_query("peer-1", &cid_in, 10));
         assert!(!table.should_query("peer-1", &cid_out, 10));
@@ -1859,7 +1953,7 @@ mod tests {
     fn peer_filter_table_queries_stale_filter() {
         let mut table = PeerFilterTable::new(100);
         let filter = BloomFilter::new(1000, 0.01);
-        table.upsert("peer-1".into(), filter, 10);
+        table.upsert_content("peer-1".into(), filter, 10);
 
         let cid = ContentId::for_blob(b"test", ContentFlags::default()).unwrap();
         // Fresh filter with no items => definite miss, should NOT query
@@ -1933,8 +2027,9 @@ mod tests {
 
         // Set mutation_threshold=2 and max_interval_ticks=2.
         // Queue 2 transit events (crosses threshold) then call tick().
-        // The timer fires on tick 2, but should be skipped because
-        // a threshold broadcast is already pending.
+        // The timer also fires on tick 2, producing both bloom and cuckoo
+        // broadcasts. The bloom broadcast from threshold and timer are
+        // coalesced into one publish; the cuckoo broadcast adds a second.
         let config = NodeConfig {
             storage_budget: StorageBudget {
                 cache_capacity: 100,
@@ -1967,8 +2062,8 @@ mod tests {
             });
         }
 
-        // Tick 2: timer interval also fires (tick 2 >= interval 2),
-        // but should be skipped because threshold broadcast is pending.
+        // Tick 2: timer interval also fires (tick 2 >= interval 2).
+        // Bloom coalesces (threshold + timer → 1 publish), cuckoo adds 1.
         let actions = rt.tick();
         let filter_publishes: Vec<_> = actions
             .iter()
@@ -1979,8 +2074,8 @@ mod tests {
             .collect();
         assert_eq!(
             filter_publishes.len(),
-            1,
-            "expected exactly 1 filter broadcast (timer should be skipped when threshold pending)"
+            2,
+            "expected 2 filter broadcasts (1 coalesced bloom + 1 cuckoo)"
         );
     }
 
@@ -2023,14 +2118,118 @@ mod tests {
         // Only ONE Publish with the filter key should appear, not three.
         let filter_publishes: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, RuntimeAction::Publish { key_expr, .. }
-                if key_expr.starts_with("harmony/filters/")))
+            .filter(|a| {
+                matches!(a, RuntimeAction::Publish { key_expr, .. }
+                if key_expr.starts_with("harmony/filters/"))
+            })
             .collect();
         assert_eq!(
             filter_publishes.len(),
             1,
             "expected 1 coalesced filter broadcast, got {}",
             filter_publishes.len()
+        );
+    }
+
+    #[test]
+    fn cuckoo_filter_broadcast_dispatched() {
+        use harmony_content::blob::MemoryBlobStore;
+
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig::default(),
+            node_addr: "cuckoo-test".to_string(),
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Tick enough times to trigger the timer (default interval is 30).
+        // The timer fires on the 30th tick.
+        for _ in 0..29 {
+            rt.tick();
+        }
+        let actions = rt.tick();
+
+        let filter_publishes: Vec<_> = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, RuntimeAction::Publish { key_expr, .. }
+                if key_expr.starts_with("harmony/filters/"))
+            })
+            .collect();
+        assert!(
+            filter_publishes.len() >= 2,
+            "expected bloom + cuckoo filter broadcasts, got {}",
+            filter_publishes.len()
+        );
+    }
+
+    #[test]
+    fn route_subscription_parses_cuckoo_filter() {
+        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::cuckoo::CuckooFilter;
+
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig::default(),
+            node_addr: "self-node".to_string(),
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        let cf = CuckooFilter::new(100);
+        let payload = cf.to_bytes();
+
+        rt.push_event(RuntimeEvent::SubscriptionMessage {
+            key_expr: "harmony/filters/flatpack/peer-xyz".to_string(),
+            payload,
+        });
+        rt.tick();
+
+        assert_eq!(rt.peer_filter_parse_errors(), 0);
+    }
+
+    #[test]
+    fn staleness_tracking_independent_per_filter_type() {
+        let mut table = PeerFilterTable::new(10);
+        let cid = ContentId::for_blob(b"staleness-test", ContentFlags::default()).unwrap();
+
+        // Insert content filter at tick 5.
+        let bf = BloomFilter::new(100, 0.01);
+        table.upsert_content("peer-a".to_string(), bf, 5);
+
+        // At tick 20 (15 ticks later, > staleness_ticks=10), content filter
+        // should be stale, so should_query returns true (fall back to querying).
+        assert!(
+            table.should_query("peer-a", &cid, 20),
+            "stale content filter should fall back to querying"
+        );
+
+        // But if we also insert a flatpack filter at tick 18...
+        let cf = CuckooFilter::new(100);
+        table.upsert_flatpack("peer-a".to_string(), cf, 18);
+
+        // Content filter should STILL be considered stale at tick 20.
+        // (With the old shared received_tick, tick 18 would mask content staleness.)
+        assert!(
+            table.should_query("peer-a", &cid, 20),
+            "content filter must be stale independently of flatpack freshness"
+        );
+
+        // Flatpack filter should be fresh at tick 20 (20-18=2 <= 10).
+        assert!(
+            !table.should_query_flatpack("peer-a", &cid, 20),
+            "fresh flatpack filter with empty cuckoo should say 'definitely no'"
         );
     }
 }

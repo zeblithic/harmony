@@ -7,9 +7,11 @@ pub mod bundle;
 pub mod cache;
 pub mod chunker;
 pub mod cid;
+pub mod cuckoo;
 pub mod dag;
 pub mod delta;
 pub mod error;
+pub mod flatpack;
 pub mod lru;
 pub mod sketch;
 
