@@ -729,6 +729,10 @@ impl<B: BlobStore> NodeRuntime<B> {
                     // timer-triggered one, avoiding redundant back-to-back rebuilds.
                     self.ticks_since_filter_broadcast = 0;
                 }
+                StorageTierAction::BroadcastCuckooFilter { .. } => {
+                    // Cuckoo filter broadcast wiring is handled in Task 7
+                    // (PeerFilterTable cuckoo slot + flatpack subscription).
+                }
             }
         }
     }

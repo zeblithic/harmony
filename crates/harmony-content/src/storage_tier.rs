@@ -3,6 +3,7 @@
 use crate::blob::BlobStore;
 use crate::cache::ContentStore;
 use crate::cid::{ContentClass, ContentId};
+use crate::flatpack::FlatpackIndex;
 use alloc::{
     string::{String, ToString},
     vec,
@@ -123,6 +124,11 @@ pub enum StorageTierAction {
     /// The runtime constructs the full key expression (including node address)
     /// since `StorageTier` is sans-I/O and has no identity context.
     BroadcastFilter { payload: Vec<u8> },
+    /// Broadcast a cuckoo filter snapshot of the Flatpack reverse index.
+    ///
+    /// The runtime constructs the full key expression (including node address)
+    /// since `StorageTier` is sans-I/O and has no identity context.
+    BroadcastCuckooFilter { payload: Vec<u8> },
 }
 
 /// Per-class storage and publishing policy.
@@ -201,6 +207,8 @@ pub struct StorageTier<B: BlobStore> {
     filter_config: FilterBroadcastConfig,
     /// Number of cache mutations since last Bloom filter broadcast.
     mutations_since_broadcast: u32,
+    /// Flatpack reverse index (child_cid → bundle_cids).
+    flatpack: FlatpackIndex,
 }
 
 impl<B: BlobStore> StorageTier<B> {
@@ -240,6 +248,7 @@ impl<B: BlobStore> StorageTier<B> {
             },
         ];
 
+        let flatpack = FlatpackIndex::new(filter_config.expected_items);
         let tier = Self {
             cache,
             budget,
@@ -248,6 +257,7 @@ impl<B: BlobStore> StorageTier<B> {
             disk_index: HashSet::new(),
             filter_config,
             mutations_since_broadcast: 0,
+            flatpack,
         };
 
         (tier, actions)
@@ -266,6 +276,11 @@ impl<B: BlobStore> StorageTier<B> {
     /// Read-only access to the filter broadcast configuration.
     pub fn filter_config(&self) -> &FilterBroadcastConfig {
         &self.filter_config
+    }
+
+    /// Read-only access to the Flatpack reverse index.
+    pub fn flatpack(&self) -> &FlatpackIndex {
+        &self.flatpack
     }
 
     /// Mutable access to the underlying content store (crate-internal).
@@ -339,7 +354,7 @@ impl<B: BlobStore> StorageTier<B> {
                 }]
             }
             StorageTierEvent::FilterTimerTick => {
-                vec![self.rebuild_filter()]
+                vec![self.rebuild_filter(), self.rebuild_cuckoo_filter()]
             }
         }
     }
@@ -364,6 +379,16 @@ impl<B: BlobStore> StorageTier<B> {
 
         StorageTierAction::BroadcastFilter {
             payload: filter.to_bytes(),
+        }
+    }
+
+    /// Rebuild the cuckoo filter from the Flatpack reverse index and return
+    /// a `BroadcastCuckooFilter` action. Resets the Flatpack mutation counter.
+    fn rebuild_cuckoo_filter(&mut self) -> StorageTierAction {
+        self.flatpack.rebuild_filter();
+        self.flatpack.reset_mutation_counter();
+        StorageTierAction::BroadcastCuckooFilter {
+            payload: self.flatpack.filter().to_bytes(),
         }
     }
 
@@ -1659,10 +1684,14 @@ mod tests {
     fn filter_timer_tick_triggers_broadcast() {
         let mut tier = make_tier_with_policy(ContentPolicy::default());
         let actions = tier.handle(StorageTierEvent::FilterTimerTick);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
         assert!(
             matches!(&actions[0], StorageTierAction::BroadcastFilter { .. }),
-            "FilterTimerTick should return exactly 1 BroadcastFilter action"
+            "FilterTimerTick should emit BroadcastFilter"
+        );
+        assert!(
+            matches!(&actions[1], StorageTierAction::BroadcastCuckooFilter { .. }),
+            "FilterTimerTick should emit BroadcastCuckooFilter"
         );
     }
 
@@ -1688,7 +1717,7 @@ mod tests {
 
         // Trigger filter rebuild via FilterTimerTick.
         let actions = tier.handle(StorageTierEvent::FilterTimerTick);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
 
         let payload = match &actions[0] {
             StorageTierAction::BroadcastFilter { payload } => payload,
@@ -1753,6 +1782,24 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
             "2nd disk read: should trigger BroadcastFilter at threshold"
+        );
+    }
+
+    #[test]
+    fn cuckoo_filter_broadcast_on_timer_tick() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let actions = tier.handle(StorageTierEvent::FilterTimerTick);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
+            "should emit BroadcastFilter"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::BroadcastCuckooFilter { .. })),
+            "should emit BroadcastCuckooFilter"
         );
     }
 }
