@@ -4,7 +4,7 @@
 //! insertion and membership queries on [`ContentId`] values.  Uses
 //! 4-entry buckets with 12-bit fingerprints, achieving higher space
 //! efficiency than a Bloom filter at comparable false positive rates
-//! while also supporting deletion (planned for a future task).
+//! while also supporting deletion.
 //!
 //! Hashing reuses the SplitMix64 constants from [`super::bloom`] so
 //! both filters derive their entropy from the same CID hash bytes.
@@ -218,6 +218,37 @@ impl CuckooFilter {
     fn bucket_contains(&self, bucket_idx: usize, fp: u16) -> bool {
         self.buckets[bucket_idx].contains(&fp)
     }
+
+    /// Remove a content ID from the filter, returning `true` if it was found.
+    ///
+    /// Computes the fingerprint and both candidate bucket indices, then
+    /// searches both buckets for a matching fingerprint. If found, the slot
+    /// is cleared and the count decremented.
+    pub fn delete(&mut self, cid: &ContentId) -> bool {
+        let (fp, i1) = fingerprint_and_index(cid, self.num_buckets);
+        let i2 = alt_index(i1, fp, self.num_buckets);
+        if self.try_delete_bucket(i1, fp) {
+            self.count = self.count.saturating_sub(1);
+            return true;
+        }
+        if self.try_delete_bucket(i2, fp) {
+            self.count = self.count.saturating_sub(1);
+            return true;
+        }
+        false
+    }
+
+    /// Try to remove a fingerprint from the given bucket, returning `true` if found.
+    fn try_delete_bucket(&mut self, idx: u32, fp: u16) -> bool {
+        let bucket = &mut self.buckets[idx as usize];
+        for slot in bucket.iter_mut() {
+            if *slot == fp {
+                *slot = EMPTY;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Derive a non-zero 12-bit fingerprint and primary bucket index from a CID.
@@ -341,5 +372,37 @@ mod tests {
         for i in 0..50 {
             assert!(!cf.may_contain(&make_cid(i)), "item {i} survived clear");
         }
+    }
+
+    #[test]
+    fn delete_removes_item() {
+        let mut cf = CuckooFilter::new(1000);
+        let cid = make_cid(42);
+        cf.insert(&cid).unwrap();
+        assert!(cf.may_contain(&cid));
+        assert_eq!(cf.count(), 1);
+        assert!(cf.delete(&cid));
+        assert!(!cf.may_contain(&cid));
+        assert_eq!(cf.count(), 0);
+    }
+
+    #[test]
+    fn delete_nonexistent_returns_false() {
+        let mut cf = CuckooFilter::new(1000);
+        let cid = make_cid(42);
+        assert!(!cf.delete(&cid));
+        assert_eq!(cf.count(), 0);
+    }
+
+    #[test]
+    fn delete_then_reinsert() {
+        let mut cf = CuckooFilter::new(1000);
+        let cid = make_cid(42);
+        cf.insert(&cid).unwrap();
+        cf.delete(&cid);
+        assert!(!cf.may_contain(&cid));
+        cf.insert(&cid).unwrap();
+        assert!(cf.may_contain(&cid));
+        assert_eq!(cf.count(), 1);
     }
 }
