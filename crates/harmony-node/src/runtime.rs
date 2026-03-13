@@ -9,9 +9,11 @@ use std::sync::Arc;
 
 use harmony_compute::InstructionBudget;
 use harmony_content::blob::BlobStore;
+use harmony_content::bloom::BloomFilter;
 use harmony_content::cid::ContentId;
 use harmony_content::storage_tier::{
-    ContentPolicy, StorageBudget, StorageMetrics, StorageTier, StorageTierAction, StorageTierEvent,
+    ContentPolicy, FilterBroadcastConfig, StorageBudget, StorageMetrics, StorageTier,
+    StorageTierAction, StorageTierEvent,
 };
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
@@ -29,6 +31,12 @@ pub struct NodeConfig {
     pub schedule: TierSchedule,
     /// Content acceptance / announcement policy.
     pub content_policy: ContentPolicy,
+    /// Configuration for periodic Bloom filter broadcasts.
+    pub filter_broadcast_config: FilterBroadcastConfig,
+    /// This node's address (hex-encoded), used for filter broadcast keys.
+    /// Must be unique per node — set from identity address_hash at startup.
+    /// Defaults to `"local"` as a placeholder until identity is wired.
+    pub node_addr: String,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -85,6 +93,8 @@ impl Default for NodeConfig {
             compute_budget: InstructionBudget { fuel: 100_000 },
             schedule: TierSchedule::default(),
             content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig::default(),
+            node_addr: "0000".to_string(),
         }
     }
 }
@@ -149,6 +159,68 @@ pub enum RuntimeAction {
     Subscribe { key_expr: String },
 }
 
+/// Bloom filter received from a peer, with metadata.
+struct PeerFilter {
+    filter: BloomFilter,
+    received_tick: u64,
+}
+
+/// Per-peer Bloom filter table for content query routing.
+struct PeerFilterTable {
+    filters: HashMap<String, PeerFilter>,
+    staleness_ticks: u64,
+    /// Count of malformed filter payloads that failed deserialization.
+    parse_errors: u64,
+}
+
+impl PeerFilterTable {
+    fn new(staleness_ticks: u64) -> Self {
+        Self {
+            filters: HashMap::new(),
+            staleness_ticks,
+            parse_errors: 0,
+        }
+    }
+
+    fn record_parse_error(&mut self) {
+        self.parse_errors += 1;
+    }
+
+    fn parse_errors(&self) -> u64 {
+        self.parse_errors
+    }
+
+    fn upsert(&mut self, peer_addr: String, filter: BloomFilter, tick: u64) {
+        self.filters.insert(
+            peer_addr,
+            PeerFilter {
+                filter,
+                received_tick: tick,
+            },
+        );
+    }
+
+    /// Returns true if the peer should be queried (no filter, stale filter, or filter says "maybe").
+    /// Returns false only if the filter definitively says the CID is absent.
+    fn should_query(&self, peer_addr: &str, cid: &ContentId, current_tick: u64) -> bool {
+        match self.filters.get(peer_addr) {
+            None => true,
+            Some(pf) => {
+                if current_tick.saturating_sub(pf.received_tick) > self.staleness_ticks {
+                    true
+                } else {
+                    pf.filter.may_contain(cid)
+                }
+            }
+        }
+    }
+
+    fn evict_stale(&mut self, current_tick: u64) {
+        self.filters
+            .retain(|_, pf| current_tick.saturating_sub(pf.received_tick) <= self.staleness_ticks);
+    }
+}
+
 /// Sans-I/O node runtime wiring Tier 1 (Router), Tier 2 (Storage), and Tier 3 (Compute).
 ///
 /// Events are pushed via [`push_event`](Self::push_event) into internal
@@ -196,6 +268,18 @@ pub struct NodeRuntime<B: BlobStore> {
     router_starved: u32,
     storage_starved: u32,
     compute_starved: u32,
+    // Per-peer Bloom filter table for content query routing
+    peer_filters: PeerFilterTable,
+    // Monotonically increasing tick counter
+    tick_count: u64,
+    // This node's address (hex-encoded), used for filter broadcast keys
+    node_addr: String,
+    // Ticks since last FilterTimerTick was injected
+    ticks_since_filter_broadcast: u64,
+    // How many ticks between filter broadcasts
+    filter_broadcast_interval_ticks: u64,
+    // Coalesces multiple BroadcastFilter actions within a single tick into one publish.
+    pending_filter_broadcast: Option<Vec<u8>>,
 }
 
 impl<B: BlobStore> NodeRuntime<B> {
@@ -214,8 +298,15 @@ impl<B: BlobStore> NodeRuntime<B> {
         let router = Node::new();
         let mut queryable_router = QueryableRouter::new();
 
+        let filter_broadcast_interval_ticks = config.filter_broadcast_config.max_interval_ticks as u64;
+        assert!(
+            filter_broadcast_interval_ticks >= 2,
+            "filter_broadcast_interval_ticks must be >= 2; \
+             with interval=1 the timer fires every tick"
+        );
+
         let (storage, storage_startup) =
-            StorageTier::new(store, config.storage_budget, config.content_policy);
+            StorageTier::new(store, config.storage_budget, config.content_policy, config.filter_broadcast_config);
 
         let mut actions = Vec::new();
         let mut storage_queryable_ids = HashSet::new();
@@ -258,6 +349,11 @@ impl<B: BlobStore> NodeRuntime<B> {
             key_expr: harmony_zenoh::namespace::compute::ACTIVITY_SUB.to_string(),
         });
 
+        // Subscribe to peer filter broadcasts.
+        actions.push(RuntimeAction::Subscribe {
+            key_expr: harmony_zenoh::namespace::filters::CONTENT_SUB.to_string(),
+        });
+
         let rt = Self {
             router,
             queryable_router,
@@ -275,6 +371,12 @@ impl<B: BlobStore> NodeRuntime<B> {
             router_starved: 0,
             storage_starved: 0,
             compute_starved: 0,
+            peer_filters: PeerFilterTable::new(filter_broadcast_interval_ticks * 3),
+            tick_count: 0,
+            node_addr: config.node_addr,
+            ticks_since_filter_broadcast: 0,
+            filter_broadcast_interval_ticks,
+            pending_filter_broadcast: None,
         };
 
         (rt, actions)
@@ -312,6 +414,21 @@ impl<B: BlobStore> NodeRuntime<B> {
             self.storage_starved,
             self.compute_starved,
         )
+    }
+
+    /// Check if a peer should be queried for a given CID.
+    ///
+    /// Returns `false` only if the peer's Bloom filter definitively says
+    /// the CID is absent. Returns `true` for unknown peers, stale filters,
+    /// or filter matches.
+    pub fn should_query_peer(&self, peer_addr: &str, cid: &ContentId) -> bool {
+        self.peer_filters
+            .should_query(peer_addr, cid, self.tick_count)
+    }
+
+    /// Number of malformed filter payloads that failed deserialization.
+    pub fn peer_filter_parse_errors(&self) -> u64 {
+        self.peer_filters.parse_errors()
     }
 
     /// Calculate the effective compute fuel budget based on data-plane queue depth.
@@ -433,6 +550,16 @@ impl<B: BlobStore> NodeRuntime<B> {
     /// Within each tier, at most `max_per_tick` events are drained (if set).
     /// When limits are `None` (the default), all queued events are drained.
     pub fn tick(&mut self) -> Vec<RuntimeAction> {
+        self.tick_count += 1;
+
+        // Increment the filter timer counter. The actual FilterTimerTick is
+        // injected after the storage drain (inside tier 1 processing), so we
+        // can skip it when a threshold-triggered broadcast already fired.
+        self.ticks_since_filter_broadcast += 1;
+
+        // Evict stale peer filters.
+        self.peer_filters.evict_stale(self.tick_count);
+
         let mut actions = Vec::new();
         // Note: fuel is captured once before any tier executes. When Compute is
         // promoted via starvation, it still runs with this pre-tick fuel value —
@@ -498,6 +625,27 @@ impl<B: BlobStore> NodeRuntime<B> {
                             }
                             None => break,
                         }
+                    }
+                    // Timer-triggered filter rebuild: fires only if the interval
+                    // has elapsed AND no threshold-triggered broadcast already
+                    // occurred during this tick's drain (which would have set
+                    // pending_filter_broadcast and reset ticks_since_filter_broadcast
+                    // via dispatch_storage_actions).
+                    if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks
+                        && self.pending_filter_broadcast.is_none()
+                    {
+                        self.ticks_since_filter_broadcast = 0;
+                        let timer_actions =
+                            self.storage.handle(StorageTierEvent::FilterTimerTick);
+                        self.dispatch_storage_actions(timer_actions, &mut actions);
+                    }
+
+                    // Flush coalesced filter broadcast — multiple threshold crossings
+                    // within one tick produce only one publish (the latest snapshot).
+                    if let Some(payload) = self.pending_filter_broadcast.take() {
+                        let key_expr =
+                            harmony_zenoh::namespace::filters::content_key(&self.node_addr);
+                        actions.push(RuntimeAction::Publish { key_expr, payload });
                     }
                     if processed > 0 {
                         self.storage_starved = 0;
@@ -573,6 +721,14 @@ impl<B: BlobStore> NodeRuntime<B> {
                 StorageTierAction::PersistToDisk { .. }
                 | StorageTierAction::RemoveFromDisk { .. }
                 | StorageTierAction::DiskLookup { .. } => {}
+                StorageTierAction::BroadcastFilter { payload } => {
+                    // Buffer the latest filter payload — multiple threshold crossings
+                    // within one tick are coalesced into a single publish at flush time.
+                    self.pending_filter_broadcast = Some(payload);
+                    // Reset timer so threshold-triggered broadcasts defer the next
+                    // timer-triggered one, avoiding redundant back-to-back rebuilds.
+                    self.ticks_since_filter_broadcast = 0;
+                }
             }
         }
     }
@@ -763,6 +919,29 @@ impl<B: BlobStore> NodeRuntime<B> {
     }
 
     fn route_subscription(&mut self, key_expr: String, payload: Vec<u8>) {
+        // Check if this is a peer filter broadcast.
+        if let Some(peer_addr) = key_expr
+            .strip_prefix(harmony_zenoh::namespace::filters::CONTENT_PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            // Don't process our own filter broadcasts.
+            if peer_addr != self.node_addr {
+                match BloomFilter::from_bytes(&payload) {
+                    Ok(filter) => {
+                        self.peer_filters.upsert(
+                            peer_addr.to_string(),
+                            filter,
+                            self.tick_count,
+                        );
+                    }
+                    Err(_) => {
+                        self.peer_filters.record_parse_error();
+                    }
+                }
+            }
+            return;
+        }
+
         if let Some(event) = self.parse_subscription_event(&key_expr, payload) {
             self.storage_queue.push_back(event);
         }
@@ -925,8 +1104,8 @@ mod tests {
 
         // 16 shard queryables + 1 stats queryable + 1 compute activity queryable = 18
         assert_eq!(queryable_count, 18);
-        // transit + publish subscriptions = 2
-        assert_eq!(subscribe_count, 2);
+        // transit + publish + filter subscriptions = 3
+        assert_eq!(subscribe_count, 3);
     }
 
     #[test]
@@ -1645,8 +1824,213 @@ mod tests {
                 encrypted_durable_announce: true,
                 public_ephemeral_announce: false,
             },
+            filter_broadcast_config: FilterBroadcastConfig::default(),
+            node_addr: "test".to_string(),
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
+    }
+
+    // ── PeerFilterTable tests ───────────────────────────────────────
+
+    use harmony_content::cid::ContentFlags;
+
+    #[test]
+    fn peer_filter_table_skips_definite_miss() {
+        let mut table = PeerFilterTable::new(100);
+        let mut filter = BloomFilter::new(1000, 0.01);
+        let cid_in = ContentId::for_blob(b"present", ContentFlags::default()).unwrap();
+        let cid_out = ContentId::for_blob(b"absent", ContentFlags::default()).unwrap();
+        filter.insert(&cid_in);
+        table.upsert("peer-1".into(), filter, 10);
+
+        assert!(table.should_query("peer-1", &cid_in, 10));
+        assert!(!table.should_query("peer-1", &cid_out, 10));
+    }
+
+    #[test]
+    fn peer_filter_table_queries_unknown_peer() {
+        let table = PeerFilterTable::new(100);
+        let cid = ContentId::for_blob(b"test", ContentFlags::default()).unwrap();
+        assert!(table.should_query("unknown", &cid, 10));
+    }
+
+    #[test]
+    fn peer_filter_table_queries_stale_filter() {
+        let mut table = PeerFilterTable::new(100);
+        let filter = BloomFilter::new(1000, 0.01);
+        table.upsert("peer-1".into(), filter, 10);
+
+        let cid = ContentId::for_blob(b"test", ContentFlags::default()).unwrap();
+        // Fresh filter with no items => definite miss, should NOT query
+        assert!(!table.should_query("peer-1", &cid, 10));
+        // Stale filter (current_tick - received_tick > staleness_ticks) => should query
+        assert!(table.should_query("peer-1", &cid, 200));
+    }
+
+    #[test]
+    fn peer_filter_table_tracks_parse_errors() {
+        let mut table = PeerFilterTable::new(100);
+        assert_eq!(table.parse_errors(), 0);
+        table.record_parse_error();
+        table.record_parse_error();
+        assert_eq!(table.parse_errors(), 2);
+    }
+
+    #[test]
+    fn route_subscription_counts_malformed_filter() {
+        use harmony_content::blob::MemoryBlobStore;
+
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig::default(),
+            node_addr: "self-node".to_string(),
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Send a malformed filter payload from a peer.
+        rt.push_event(RuntimeEvent::SubscriptionMessage {
+            key_expr: "harmony/filters/content/peer-abc".to_string(),
+            payload: vec![0xFF, 0x01], // too short to parse
+        });
+        rt.tick();
+
+        assert_eq!(rt.peer_filter_parse_errors(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "filter_broadcast_interval_ticks must be >= 2")]
+    fn filter_interval_rejects_less_than_two() {
+        use harmony_content::blob::MemoryBlobStore;
+
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig {
+                max_interval_ticks: 1,
+                ..FilterBroadcastConfig::default()
+            },
+            node_addr: "reject-test".to_string(),
+        };
+        let _ = NodeRuntime::new(config, MemoryBlobStore::new());
+    }
+
+    #[test]
+    fn timer_skipped_when_threshold_broadcast_pending() {
+        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::cid::ContentFlags;
+
+        // Set mutation_threshold=2 and max_interval_ticks=2.
+        // Queue 2 transit events (crosses threshold) then call tick().
+        // The timer fires on tick 2, but should be skipped because
+        // a threshold broadcast is already pending.
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig {
+                mutation_threshold: 2,
+                max_interval_ticks: 2,
+                ..FilterBroadcastConfig::default()
+            },
+            node_addr: "skip-timer-test".to_string(),
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Tick 1: no events, no broadcast.
+        rt.tick();
+
+        // Queue 2 transit events to cross the mutation threshold.
+        for i in 0..2u8 {
+            let data = [i; 16];
+            let cid = ContentId::for_blob(&data, ContentFlags::default()).unwrap();
+            let cid_hex = hex::encode(cid.to_bytes());
+            let key_expr = format!("harmony/content/transit/{cid_hex}");
+            rt.push_event(RuntimeEvent::SubscriptionMessage {
+                key_expr,
+                payload: data.to_vec(),
+            });
+        }
+
+        // Tick 2: timer interval also fires (tick 2 >= interval 2),
+        // but should be skipped because threshold broadcast is pending.
+        let actions = rt.tick();
+        let filter_publishes: Vec<_> = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, RuntimeAction::Publish { key_expr, .. }
+                    if key_expr.starts_with("harmony/filters/"))
+            })
+            .collect();
+        assert_eq!(
+            filter_publishes.len(),
+            1,
+            "expected exactly 1 filter broadcast (timer should be skipped when threshold pending)"
+        );
+    }
+
+    #[test]
+    fn filter_broadcasts_coalesced_within_tick() {
+        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::cid::ContentFlags;
+
+        // mutation_threshold=2: every 2 transit events triggers a rebuild.
+        // We'll queue 6 events → would be 3 rebuilds without coalescing.
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig {
+                mutation_threshold: 2,
+                ..FilterBroadcastConfig::default()
+            },
+            node_addr: "coalesce-test".to_string(),
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+
+        // Queue 6 transit events (each unique CID).
+        for i in 0..6u8 {
+            let data = [i; 16];
+            let cid = ContentId::for_blob(&data, ContentFlags::default()).unwrap();
+            let cid_hex = hex::encode(cid.to_bytes());
+            let key_expr = format!("harmony/content/transit/{cid_hex}");
+            rt.push_event(RuntimeEvent::SubscriptionMessage {
+                key_expr,
+                payload: data.to_vec(),
+            });
+        }
+
+        let actions = rt.tick();
+        // Only ONE Publish with the filter key should appear, not three.
+        let filter_publishes: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::Publish { key_expr, .. }
+                if key_expr.starts_with("harmony/filters/")))
+            .collect();
+        assert_eq!(
+            filter_publishes.len(),
+            1,
+            "expected 1 coalesced filter broadcast, got {}",
+            filter_publishes.len()
+        );
     }
 }

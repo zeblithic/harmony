@@ -34,6 +34,12 @@ enum Commands {
         /// Disable announcing public ephemeral (01) content on Zenoh
         #[arg(long)]
         no_public_ephemeral_announce: bool,
+        /// Bloom filter broadcast interval in ticks
+        #[arg(long, default_value_t = 30)]
+        filter_broadcast_ticks: u32,
+        /// Bloom filter broadcast mutation threshold
+        #[arg(long, default_value_t = 100)]
+        filter_mutation_threshold: u32,
     },
 }
 
@@ -146,11 +152,36 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             encrypted_durable_persist,
             encrypted_durable_announce,
             no_public_ephemeral_announce,
+            filter_broadcast_ticks,
+            filter_mutation_threshold,
         } => {
             use crate::runtime::{NodeConfig, NodeRuntime, RuntimeAction};
             use harmony_compute::InstructionBudget;
             use harmony_content::blob::MemoryBlobStore;
-            use harmony_content::storage_tier::{ContentPolicy, StorageBudget};
+            use harmony_content::storage_tier::{ContentPolicy, FilterBroadcastConfig, StorageBudget};
+
+            if cache_capacity == 0 {
+                return Err("--cache-capacity must be > 0".into());
+            }
+
+            // Bloom filter bit count = expected_items * 14.378 at fp_rate=0.001.
+            // Cap at 200M to stay well within u32::MAX bits (~2.88 billion).
+            const MAX_CACHE_CAPACITY: usize = 200_000_000;
+            if cache_capacity > MAX_CACHE_CAPACITY {
+                return Err(format!(
+                    "--cache-capacity {} exceeds maximum {} for Bloom filter sizing",
+                    cache_capacity, MAX_CACHE_CAPACITY,
+                )
+                .into());
+            }
+
+            if filter_broadcast_ticks < 2 {
+                return Err(
+                    "--filter-broadcast-ticks must be >= 2: with interval=1 the timer \
+                     fires every tick (counter reaches 1 immediately after increment)"
+                        .into(),
+                );
+            }
 
             if encrypted_durable_announce && !encrypted_durable_persist {
                 return Err(
@@ -176,12 +207,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 schedule: Default::default(),
                 content_policy,
+                filter_broadcast_config: FilterBroadcastConfig {
+                    mutation_threshold: filter_mutation_threshold,
+                    max_interval_ticks: filter_broadcast_ticks,
+                    expected_items: cache_capacity as u32,
+                    fp_rate: 0.001,
+                },
+                // Placeholder — replaced by hex::encode(identity.address_hash) when
+                // the async runtime and identity establishment are wired. Until then,
+                // the node prints startup info and exits (no event loop).
+                node_addr: "local".to_string(),
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 
             println!("Harmony node runtime initialized");
             println!("  Cache capacity:   {cache_capacity} items");
             println!("  Compute budget:   {compute_budget} fuel/tick");
+            println!("  Filter interval: {filter_broadcast_ticks} ticks / {filter_mutation_threshold} mutations");
             println!("  Router queue:     {} pending", rt.router_queue_len());
             println!("  Storage queue:    {} pending", rt.storage_queue_len());
             println!("  Compute queue:    {} tracked", rt.compute_queue_len());
@@ -301,6 +343,74 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("--encrypted-durable-announce requires --encrypted-durable-persist"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_zero_cache_capacity() {
+        let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "0"]).unwrap();
+        let result = run(cli);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--cache-capacity must be > 0"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_oversized_cache_capacity() {
+        // 200_000_001 exceeds MAX_CACHE_CAPACITY (200M).
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--cache-capacity",
+            "200000001",
+        ])
+        .unwrap();
+        let result = run(cli);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds maximum"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cli_parses_run_with_filter_config() {
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--filter-broadcast-ticks",
+            "60",
+            "--filter-mutation-threshold",
+            "200",
+        ])
+        .unwrap();
+        if let Commands::Run {
+            filter_broadcast_ticks,
+            filter_mutation_threshold,
+            ..
+        } = cli.command
+        {
+            assert_eq!(filter_broadcast_ticks, 60);
+            assert_eq!(filter_mutation_threshold, 200);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_rejects_filter_broadcast_ticks_below_two() {
+        let cli =
+            Cli::try_parse_from(["harmony", "run", "--filter-broadcast-ticks", "1"]).unwrap();
+        let result = run(cli);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--filter-broadcast-ticks must be >= 2"),
             "unexpected error: {msg}"
         );
     }

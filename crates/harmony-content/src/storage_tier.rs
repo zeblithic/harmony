@@ -95,6 +95,8 @@ pub enum StorageTierEvent {
     },
     /// Disk read failed — runtime could not deliver the requested data.
     DiskReadFailed { cid: ContentId, query_id: u64 },
+    /// Timer tick for periodic filter broadcasts.
+    FilterTimerTick,
 }
 
 /// Outbound actions returned by the storage tier for the caller to execute.
@@ -116,6 +118,11 @@ pub enum StorageTierAction {
     RemoveFromDisk { cid: ContentId },
     /// Request disk read for a CID known to be on disk but evicted from memory.
     DiskLookup { cid: ContentId, query_id: u64 },
+    /// Broadcast a Bloom filter snapshot of the cached CID set.
+    ///
+    /// The runtime constructs the full key expression (including node address)
+    /// since `StorageTier` is sans-I/O and has no identity context.
+    BroadcastFilter { payload: Vec<u8> },
 }
 
 /// Per-class storage and publishing policy.
@@ -145,6 +152,31 @@ impl Default for ContentPolicy {
     }
 }
 
+/// Configuration for periodic Bloom filter broadcasts.
+#[derive(Debug, Clone)]
+pub struct FilterBroadcastConfig {
+    /// Broadcast after this many cache admissions.
+    pub mutation_threshold: u32,
+    /// Maximum ticks between broadcasts (even if no mutations).
+    /// The runtime injects `FilterTimerTick` events at this interval.
+    pub max_interval_ticks: u32,
+    /// Expected item count for sizing the Bloom filter (should match cache capacity).
+    pub expected_items: u32,
+    /// Target false positive rate.
+    pub fp_rate: f64,
+}
+
+impl Default for FilterBroadcastConfig {
+    fn default() -> Self {
+        Self {
+            mutation_threshold: 100,
+            max_interval_ticks: 30,
+            expected_items: 1024,
+            fp_rate: 0.001,
+        }
+    }
+}
+
 /// Sans-I/O storage tier integrating [`ContentStore`] with Zenoh key patterns.
 ///
 /// On construction, returns startup actions (queryable and subscriber
@@ -165,6 +197,10 @@ pub struct StorageTier<B: BlobStore> {
     /// deferred until the runtime can service DiskLookup actions.
     #[allow(dead_code)]
     disk_index: HashSet<ContentId>,
+    /// Configuration for periodic Bloom filter broadcasts.
+    filter_config: FilterBroadcastConfig,
+    /// Number of cache mutations since last Bloom filter broadcast.
+    mutations_since_broadcast: u32,
 }
 
 impl<B: BlobStore> StorageTier<B> {
@@ -173,12 +209,20 @@ impl<B: BlobStore> StorageTier<B> {
         store: B,
         budget: StorageBudget,
         policy: ContentPolicy,
+        filter_config: FilterBroadcastConfig,
     ) -> (Self, Vec<StorageTierAction>) {
         assert!(
             !policy.encrypted_durable_announce || policy.encrypted_durable_persist,
             "encrypted_durable_announce requires encrypted_durable_persist — \
              content rejected by class admission will never reach the announce check"
         );
+
+        // Clamp mutation_threshold to at least 1 — zero would trigger a
+        // filter rebuild on every single cache write.
+        let filter_config = FilterBroadcastConfig {
+            mutation_threshold: filter_config.mutation_threshold.max(1),
+            ..filter_config
+        };
 
         let cache = ContentStore::new(store, budget.cache_capacity);
 
@@ -202,6 +246,8 @@ impl<B: BlobStore> StorageTier<B> {
             policy,
             metrics: StorageMetrics::default(),
             disk_index: HashSet::new(),
+            filter_config,
+            mutations_since_broadcast: 0,
         };
 
         (tier, actions)
@@ -215,6 +261,11 @@ impl<B: BlobStore> StorageTier<B> {
     /// Read-only access to metrics.
     pub fn metrics(&self) -> &StorageMetrics {
         &self.metrics
+    }
+
+    /// Read-only access to the filter broadcast configuration.
+    pub fn filter_config(&self) -> &FilterBroadcastConfig {
+        &self.filter_config
     }
 
     /// Mutable access to the underlying content store (crate-internal).
@@ -266,13 +317,18 @@ impl<B: BlobStore> StorageTier<B> {
                 // genuinely hot cached items (freq 10+).
                 self.cache.warm_frequency(&cid, 5);
                 self.cache.store(cid, data.clone());
+                self.mutations_since_broadcast = self.mutations_since_broadcast.saturating_add(1);
                 // Note: queries_served was already incremented in handle_content_query
                 // when this query first arrived — only count the disk-specific metric.
                 self.metrics.disk_reads_served += 1;
-                vec![StorageTierAction::SendReply {
+                let mut actions = vec![StorageTierAction::SendReply {
                     query_id,
                     payload: data,
-                }]
+                }];
+                if self.mutations_since_broadcast >= self.filter_config.mutation_threshold {
+                    actions.push(self.rebuild_filter());
+                }
+                actions
             }
             StorageTierEvent::DiskReadFailed { query_id, .. } => {
                 self.metrics.disk_read_failures += 1;
@@ -282,6 +338,32 @@ impl<B: BlobStore> StorageTier<B> {
                     payload: vec![],
                 }]
             }
+            StorageTierEvent::FilterTimerTick => {
+                vec![self.rebuild_filter()]
+            }
+        }
+    }
+
+    /// Rebuild the Bloom filter from the current cache state and return
+    /// a `BroadcastFilter` action. Resets the mutation counter.
+    fn rebuild_filter(&mut self) -> StorageTierAction {
+        use crate::bloom::BloomFilter;
+
+        let mut filter = BloomFilter::new(
+            self.filter_config.expected_items,
+            self.filter_config.fp_rate,
+        );
+
+        for cid in self.cache.iter_admitted() {
+            if self.class_admits(&cid) {
+                filter.insert(&cid);
+            }
+        }
+
+        self.mutations_since_broadcast = 0;
+
+        StorageTierAction::BroadcastFilter {
+            payload: filter.to_bytes(),
         }
     }
 
@@ -358,6 +440,7 @@ impl<B: BlobStore> StorageTier<B> {
         // counter (should_admit already incremented it).
         self.cache.store_preadmitted(cid, data);
         self.metrics.transit_stored += 1;
+        self.mutations_since_broadcast = self.mutations_since_broadcast.saturating_add(1);
 
         // Note: PersistToDisk is not emitted yet — the runtime doesn't
         // service disk I/O (future bead). Emitting it would clone data on
@@ -370,6 +453,9 @@ impl<B: BlobStore> StorageTier<B> {
         // Announce only if policy allows it for this content class.
         if self.should_announce(&cid) {
             actions.push(self.make_announce_action(&cid));
+        }
+        if self.mutations_since_broadcast >= self.filter_config.mutation_threshold {
+            actions.push(self.rebuild_filter());
         }
         actions
     }
@@ -389,6 +475,7 @@ impl<B: BlobStore> StorageTier<B> {
         // TODO: Pin published content to guarantee long-term retention (deferred).
         self.cache.store(cid, data);
         self.metrics.publishes_stored += 1;
+        self.mutations_since_broadcast = self.mutations_since_broadcast.saturating_add(1);
 
         // Note: PersistToDisk deferred — see handle_transit comment.
 
@@ -396,6 +483,9 @@ impl<B: BlobStore> StorageTier<B> {
         // Announce only if policy allows it for this content class.
         if self.should_announce(&cid) {
             actions.push(self.make_announce_action(&cid));
+        }
+        if self.mutations_since_broadcast >= self.filter_config.mutation_threshold {
+            actions.push(self.rebuild_filter());
         }
         actions
     }
@@ -478,7 +568,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
 
         let data = b"cached blob";
         let cid = tier.cache_mut().insert(data).unwrap();
@@ -504,7 +594,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
         let cid = ContentId::for_blob(b"not stored", crate::cid::ContentFlags::default()).unwrap();
 
         let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 99, cid });
@@ -520,7 +610,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
 
         let data = b"stats test blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
@@ -550,7 +640,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
         let data = b"explicitly published blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -583,7 +673,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
         let data = b"transiting blob";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -614,7 +704,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
         let data = b"repeated transit";
         let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
 
@@ -640,7 +730,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
 
         // Fill cache: 3 items → window=1, probation=2.
         for i in 0..3 {
@@ -697,7 +787,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
 
         let blob_a = ContentId::for_blob(b"child-a", crate::cid::ContentFlags::default()).unwrap();
         let blob_b = ContentId::for_blob(b"child-b", crate::cid::ContentFlags::default()).unwrap();
@@ -731,7 +821,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
 
         // CID for "real data" but send "tampered data"
         let cid = ContentId::for_blob(b"real data", crate::cid::ContentFlags::default()).unwrap();
@@ -755,7 +845,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
 
         let cid = ContentId::for_blob(b"original", crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::PublishContent {
@@ -778,7 +868,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
 
         // Craft a CID with correct hash but wrong payload_size by mutating
         // the size bits in the last 4 bytes.
@@ -809,7 +899,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (tier, actions) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
         let _ = tier;
 
         assert_eq!(actions.len(), 2);
@@ -838,7 +928,8 @@ mod tests {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
-        let (tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy);
+        let (tier, _) =
+            StorageTier::new(MemoryBlobStore::new(), budget, policy, FilterBroadcastConfig::default());
         tier
     }
 
@@ -982,7 +1073,7 @@ mod tests {
             encrypted_durable_announce: true,
             ..ContentPolicy::default()
         };
-        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy);
+        let (mut tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy, FilterBroadcastConfig::default());
 
         // Fill cache with PublicDurable content.
         for i in 0..4 {
@@ -1067,7 +1158,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let policy = ContentPolicy::default();
-        let (tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy);
+        let (tier, _) = StorageTier::new(MemoryBlobStore::new(), budget, policy, FilterBroadcastConfig::default());
         assert_eq!(tier.metrics().queries_served, 0);
     }
 
@@ -1249,7 +1340,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
 
         // Fill cache with items (each gets frequency ~1 from transit admission).
         for i in 0..4 {
@@ -1322,7 +1413,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
         let (cid, data) = cid_with_class(b"durable on disk", false, false);
 
         // Store via transit — adds to cache.
@@ -1395,7 +1486,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) =
-            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default());
+            StorageTier::new(MemoryBlobStore::new(), budget, ContentPolicy::default(), FilterBroadcastConfig::default());
 
         // Store 2 durable items via publish (bypasses W-TinyLFU).
         let d1_data = b"durable-1";
@@ -1479,5 +1570,189 @@ mod tests {
         let actions = tier_on.handle(StorageTierEvent::TransitContent { cid, data });
         assert!(!actions.is_empty());
         assert_eq!(tier_on.metrics().transit_stored, 1);
+    }
+
+    // ---- Bloom filter broadcast ----
+
+    #[test]
+    fn filter_broadcast_config_defaults() {
+        let config = FilterBroadcastConfig::default();
+        assert_eq!(config.mutation_threshold, 100);
+        assert_eq!(config.max_interval_ticks, 30);
+        assert_eq!(config.expected_items, 1024);
+        assert!((config.fp_rate - 0.001).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn filter_broadcast_config_clamps_zero_mutation_threshold() {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let filter_config = FilterBroadcastConfig {
+            mutation_threshold: 0,
+            ..FilterBroadcastConfig::default()
+        };
+        let (tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            filter_config,
+        );
+        assert_eq!(
+            tier.filter_config().mutation_threshold, 1,
+            "mutation_threshold = 0 should be clamped to 1"
+        );
+    }
+
+    #[test]
+    fn filter_broadcast_at_mutation_threshold() {
+        // Create a tier with low mutation threshold for testing.
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let filter_config = FilterBroadcastConfig {
+            mutation_threshold: 3,
+            ..FilterBroadcastConfig::default()
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            filter_config,
+        );
+
+        // First 2 transits: no BroadcastFilter action.
+        for i in 0..2 {
+            let data = format!("transit-{i}");
+            let cid =
+                ContentId::for_blob(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap();
+            let actions = tier.handle(StorageTierEvent::TransitContent {
+                cid,
+                data: data.into_bytes(),
+            });
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
+                "mutation {i}: should not emit BroadcastFilter yet"
+            );
+        }
+
+        // 3rd transit: should include BroadcastFilter action.
+        let data = b"transit-2";
+        let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
+        let actions = tier.handle(StorageTierEvent::TransitContent {
+            cid,
+            data: data.to_vec(),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
+            "3rd mutation should trigger BroadcastFilter"
+        );
+    }
+
+    #[test]
+    fn filter_timer_tick_triggers_broadcast() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let actions = tier.handle(StorageTierEvent::FilterTimerTick);
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], StorageTierAction::BroadcastFilter { .. }),
+            "FilterTimerTick should return exactly 1 BroadcastFilter action"
+        );
+    }
+
+    #[test]
+    fn filter_excludes_encrypted_ephemeral() {
+        use crate::bloom::BloomFilter;
+
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+
+        // Publish a PublicDurable item (goes through normal admission).
+        let pub_data = b"public durable item";
+        let (pub_cid, pub_vec) = cid_with_class(pub_data, false, false);
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: pub_cid,
+            data: pub_vec,
+        });
+
+        // Inject an EncryptedEphemeral CID directly into the cache,
+        // bypassing the class_admits gate in handle_transit/handle_publish.
+        // This exercises the class_admits check inside rebuild_filter.
+        let (ee_cid, ee_data) = cid_with_class(b"encrypted ephemeral", true, true);
+        tier.cache_mut().store_preadmitted(ee_cid, ee_data);
+
+        // Trigger filter rebuild via FilterTimerTick.
+        let actions = tier.handle(StorageTierEvent::FilterTimerTick);
+        assert_eq!(actions.len(), 1);
+
+        let payload = match &actions[0] {
+            StorageTierAction::BroadcastFilter { payload } => payload,
+            other => panic!("expected BroadcastFilter, got {other:?}"),
+        };
+        let filter = BloomFilter::from_bytes(payload).unwrap();
+
+        // PublicDurable CID should be in the filter.
+        assert!(
+            filter.may_contain(&pub_cid),
+            "PublicDurable CID should be in the filter"
+        );
+
+        // EncryptedEphemeral CID is in the cache but class_admits excludes
+        // it from the filter rebuild — this is the actual behavioral guarantee.
+        assert!(
+            !filter.may_contain(&ee_cid),
+            "EncryptedEphemeral CID should be excluded by class_admits"
+        );
+    }
+
+    #[test]
+    fn filter_broadcast_at_disk_read_mutation_threshold() {
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 1_000_000,
+        };
+        let filter_config = FilterBroadcastConfig {
+            mutation_threshold: 2,
+            ..FilterBroadcastConfig::default()
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBlobStore::new(),
+            budget,
+            ContentPolicy::default(),
+            filter_config,
+        );
+
+        // First DiskReadComplete: mutation counter = 1, no broadcast.
+        let (cid1, data1) = cid_with_class(b"durable-disk-1", false, false);
+        let actions = tier.handle(StorageTierEvent::DiskReadComplete {
+            cid: cid1,
+            query_id: 1,
+            data: data1,
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
+            "1st disk read: should not emit BroadcastFilter yet"
+        );
+
+        // Second DiskReadComplete: mutation counter = 2, should trigger broadcast.
+        let (cid2, data2) = cid_with_class(b"durable-disk-2", false, false);
+        let actions = tier.handle(StorageTierEvent::DiskReadComplete {
+            cid: cid2,
+            query_id: 2,
+            data: data2,
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
+            "2nd disk read: should trigger BroadcastFilter at threshold"
+        );
     }
 }

@@ -73,7 +73,7 @@ impl BloomFilter {
 
 ### Hashing
 
-Kirschner-Mitzenmacker optimization: derive k hash indices from 2 base hashes.
+Kirsch-Mitzenmacher optimization: derive k hash indices from 2 base hashes.
 
 ```
 h_i(x) = h1(x) + i * h2(x)   mod m
@@ -118,16 +118,16 @@ The `item_count` lets receivers gauge staleness — if a peer's filter claims 50
 
 ```rust
 pub struct FilterBroadcastConfig {
-    /// Broadcast after this many cache mutations (admissions + evictions).
+    /// Broadcast after this many cache admissions.
     pub mutation_threshold: u32,       // default: 100
-    /// Maximum seconds between broadcasts (even if no mutations).
-    pub max_interval_secs: u32,        // default: 30
+    /// Maximum ticks between broadcasts (even if no mutations).
+    pub max_interval_ticks: u32,       // default: 30
 }
 ```
 
-**Mutation-triggered:** StorageTier tracks a `mutations_since_broadcast` counter. On every admission or eviction, it increments. When it reaches `mutation_threshold`, StorageTier rebuilds the filter and returns a `BroadcastFilter` action.
+**Mutation-triggered:** StorageTier tracks a `mutations_since_broadcast` counter. On every admission, it increments. When it reaches `mutation_threshold`, StorageTier rebuilds the filter and returns a `BroadcastFilter` action.
 
-**Timer-triggered:** The runtime injects `FilterTimerTick` events at `max_interval_secs` intervals. StorageTier responds by rebuilding and broadcasting even if no mutations occurred (guarantees freshness ceiling).
+**Timer-triggered:** The runtime injects `FilterTimerTick` events at `max_interval_ticks` intervals. StorageTier responds by rebuilding and broadcasting even if no mutations occurred (guarantees freshness ceiling).
 
 **Rebuild process:** Iterate all CIDs via `ContentStore::iter_admitted()` (window + probation + protected segments), insert each into a fresh `BloomFilter`, serialize, emit `BroadcastFilter` action.
 
@@ -151,7 +151,7 @@ pub struct PeerFilter {
 }
 ```
 
-**Staleness expiry:** Drop filters not refreshed within `3 × max_interval_secs` (default 90 seconds). A missing filter means "query this peer anyway" — safe default, no false negatives.
+**Staleness expiry:** Drop filters not refreshed within `3 × max_interval_ticks` (default 90 ticks). A missing filter means "query this peer anyway" — safe default, no false negatives.
 
 ### Query Routing Decision
 
@@ -186,7 +186,7 @@ A peer might receive an announcement for a CID not yet in the sender's latest fi
 | `harmony-content` | `cache.rs` | `iter_admitted()` on `ContentStore` — iterates CIDs in all three LRU segments |
 | `harmony-zenoh` | `namespace.rs` | `filters` module with key patterns and builders |
 | `harmony-node` | `runtime.rs` | `PeerFilterTable`, subscribe to filter broadcasts, filter check before peer dispatch |
-| `harmony-node` | `main.rs` | CLI flags: `--filter-broadcast-interval`, `--filter-mutation-threshold` |
+| `harmony-node` | `main.rs` | CLI flags: `--filter-broadcast-ticks`, `--filter-mutation-threshold` |
 
 ## Non-Goals
 
@@ -204,7 +204,7 @@ A peer might receive an announcement for a CID not yet in the sender's latest fi
 - False positive rate within expected bounds (insert n items, check m random non-members)
 - Serialization round-trip (`to_bytes` / `from_bytes`)
 - `estimated_count` accuracy
-- Kirschner-Mitzenmacker hash distribution (no degenerate clustering)
+- Kirsch-Mitzenmacher hash distribution (no degenerate clustering)
 
 **Unit tests (storage_tier.rs):**
 - Mutation counter increments on admission/eviction

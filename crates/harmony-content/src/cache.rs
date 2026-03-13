@@ -162,6 +162,16 @@ impl<S: BlobStore> ContentStore<S> {
         Some(data)
     }
 
+    /// Iterate over all admitted CIDs (window + probation + protected).
+    ///
+    /// Used to rebuild Bloom filters from the current cache state.
+    pub fn iter_admitted(&self) -> impl Iterator<Item = ContentId> + '_ {
+        self.window
+            .iter()
+            .chain(self.probation.iter())
+            .chain(self.protected.iter())
+    }
+
     /// Check whether a CID is tracked in the cache's LRU segments.
     ///
     /// Unlike [`BlobStore::contains`] (which checks the backing store and may
@@ -948,6 +958,41 @@ mod tests {
         assert!(
             !cs.is_admitted(&ephemeral_cid),
             "PublicEphemeral should be evicted before PublicDurable even with higher frequency"
+        );
+    }
+
+    #[test]
+    fn iter_admitted_returns_all_tracked_cids() {
+        // Capacity 20: window=1, protected=4, probation=15.
+        let store = MemoryBlobStore::new();
+        let mut cs = ContentStore::new(store, 20);
+
+        // Insert several items — they spread across window and probation.
+        let mut inserted = Vec::new();
+        for i in 0..5 {
+            let data = format!("iter-test-{i}");
+            let cid = cs.insert(data.as_bytes()).unwrap();
+            inserted.push(cid);
+        }
+
+        // Promote the first item to protected via record_access.
+        // It should be in probation after being pushed out of window.
+        cs.record_access(&inserted[0]);
+
+        // Collect all admitted CIDs.
+        let admitted: Vec<ContentId> = cs.iter_admitted().collect();
+
+        // Every inserted CID should appear exactly once.
+        for cid in &inserted {
+            assert!(
+                admitted.contains(cid),
+                "inserted CID should appear in iter_admitted()"
+            );
+        }
+        assert_eq!(
+            admitted.len(),
+            inserted.len(),
+            "iter_admitted should return exactly the tracked CIDs"
         );
     }
 
