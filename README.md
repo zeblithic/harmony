@@ -1,2 +1,4 @@
 # harmony
-Reclaim your internet: Decentralized, self-sovereign Ed25519 IDs &amp; trust, E2EE, Durable Execution of WASM-based workflows, PubSub &amp; Query, SCION routing
+Reclaim your internet: Decentralized, self-sovereign IDs &amp; trust, E2EE, Durable WASM-based execution, PubSub &amp; Query, CAS+NDN data organization
+
+Stop handling your information like a monk, and start handling it like a librarian!
