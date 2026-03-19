@@ -11,6 +11,7 @@ use harmony_platform::EntropySource;
 #[cfg(any(test, feature = "test-utils"))]
 use hashbrown::{HashMap, HashSet};
 
+use crate::crypto_suite::CryptoSuite;
 use crate::identity::{Identity, ADDRESS_HASH_LENGTH, SIGNATURE_LENGTH};
 use crate::IdentityError;
 use crate::PrivateIdentity;
@@ -20,20 +21,6 @@ pub const MAX_RESOURCE_SIZE: usize = 256;
 
 /// ML-DSA-65 signature length (FIPS 204).
 const PQ_SIGNATURE_LENGTH: usize = harmony_crypto::ml_dsa::SIG_LENGTH; // 3309
-
-/// Identifies which cryptographic suite a serialized token uses.
-///
-/// The first byte of the wire format distinguishes classical Ed25519 tokens
-/// from post-quantum ML-DSA-65 tokens so that parsers can dispatch to the
-/// correct deserialization logic without trial-and-error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum CryptoSuite {
-    /// Classical Ed25519 signatures (64-byte).
-    Ed25519 = 0x00,
-    /// Post-quantum ML-DSA-65 signatures (3,309-byte, FIPS 204).
-    MlDsa65 = 0x01,
-}
 
 /// Capability types matching the Ring 2 microkernel's resource model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
