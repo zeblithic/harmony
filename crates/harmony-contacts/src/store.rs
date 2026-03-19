@@ -72,11 +72,13 @@ impl ContactStore {
         self.contacts.iter()
     }
 
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Result<Vec<u8>, ContactError> {
         let mut buf = Vec::new();
         buf.push(FORMAT_VERSION);
-        buf.extend_from_slice(&postcard::to_allocvec(self).expect("serialize"));
-        buf
+        let inner = postcard::to_allocvec(self)
+            .map_err(|_| ContactError::SerializeError("postcard encode failed"))?;
+        buf.extend_from_slice(&inner);
+        Ok(buf)
     }
 
     pub fn deserialize(data: &[u8]) -> Result<Self, ContactError> {
@@ -211,7 +213,7 @@ mod tests {
         store
             .add(make_contact(0xBB, false, PeeringPriority::Low))
             .unwrap();
-        let bytes = store.serialize();
+        let bytes = store.serialize().unwrap();
         let restored = ContactStore::deserialize(&bytes).unwrap();
         assert_eq!(restored.len(), 2);
         assert!(restored.contains(&[0xAA; 16]));

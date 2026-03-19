@@ -22,6 +22,7 @@ impl PeerManager {
         }
     }
 
+    #[must_use]
     pub fn on_event(&mut self, event: PeerEvent, contacts: &ContactStore) -> Vec<PeerAction> {
         let mut actions = Vec::new();
         match event {
@@ -46,14 +47,23 @@ impl PeerManager {
             }
             PeerEvent::LinkEstablished { identity_hash, now } => {
                 if let Some(peer) = self.peers.get_mut(&identity_hash) {
-                    peer.status = PeerStatus::Connected;
-                    peer.retry_count = 0;
-                    peer.last_seen = Some(now);
-                    peer.connecting_since = None;
-                    actions.push(PeerAction::UpdateLastSeen {
-                        identity_hash,
-                        timestamp: now,
-                    });
+                    match peer.status {
+                        PeerStatus::Connecting | PeerStatus::Searching => {
+                            peer.status = PeerStatus::Connected;
+                            peer.retry_count = 0;
+                            peer.last_seen = Some(now);
+                            peer.connecting_since = None;
+                            actions.push(PeerAction::UpdateLastSeen {
+                                identity_hash,
+                                timestamp: now,
+                            });
+                        }
+                        PeerStatus::Disabled => {
+                            // Race: CloseLink was emitted but link completed first.
+                            actions.push(PeerAction::CloseLink { identity_hash });
+                        }
+                        PeerStatus::Connected => {}
+                    }
                 }
             }
             PeerEvent::LinkClosed { identity_hash } => {
@@ -638,5 +648,55 @@ mod tests {
         let peer = mgr.peers.get(&[0x99; 16]).unwrap();
         assert_eq!(peer.status, PeerStatus::Searching);
         assert_eq!(peer.retry_count, 1);
+    }
+
+    #[test]
+    fn link_established_while_disabled_emits_close() {
+        let mut mgr = PeerManager::new();
+        let mut store = make_store_with_contact(0xF1, true, PeeringPriority::High);
+        mgr.on_event(
+            PeerEvent::ContactChanged {
+                identity_hash: [0xF1; 16],
+            },
+            &store,
+        );
+        mgr.on_event(
+            PeerEvent::AnnounceReceived {
+                identity_hash: [0xF1; 16],
+            },
+            &store,
+        );
+        // Disable peering while Connecting — emits CloseLink
+        store.get_mut(&[0xF1; 16]).unwrap().peering.enabled = false;
+        let actions = mgr.on_event(
+            PeerEvent::ContactChanged {
+                identity_hash: [0xF1; 16],
+            },
+            &store,
+        );
+        assert!(actions.contains(&PeerAction::CloseLink {
+            identity_hash: [0xF1; 16],
+        }));
+        assert_eq!(
+            mgr.peers.get(&[0xF1; 16]).unwrap().status,
+            PeerStatus::Disabled
+        );
+
+        // Race: link completes before CloseLink is processed
+        let actions = mgr.on_event(
+            PeerEvent::LinkEstablished {
+                identity_hash: [0xF1; 16],
+                now: 5000,
+            },
+            &store,
+        );
+        // Should re-emit CloseLink, NOT transition to Connected
+        assert!(actions.contains(&PeerAction::CloseLink {
+            identity_hash: [0xF1; 16],
+        }));
+        assert_eq!(
+            mgr.peers.get(&[0xF1; 16]).unwrap().status,
+            PeerStatus::Disabled
+        );
     }
 }
