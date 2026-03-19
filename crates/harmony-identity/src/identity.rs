@@ -27,6 +27,10 @@ pub const PRIVATE_KEY_LENGTH: usize = 64;
 /// Length of the address hash in bytes.
 pub const ADDRESS_HASH_LENGTH: usize = hash::TRUNCATED_HASH_LENGTH; // 16
 
+/// A 128-bit identity address hash: `SHA256(X25519_pub || Ed25519_pub)[:16]`.
+/// Used as the canonical key for referencing identities across Harmony.
+pub type IdentityHash = [u8; ADDRESS_HASH_LENGTH];
+
 /// Length of an Ed25519 signature in bytes.
 pub const SIGNATURE_LENGTH: usize = 64;
 
