@@ -186,7 +186,7 @@ pub enum ContactError {
     /// Contact with this identity hash already exists.
     AlreadyExists(IdentityHash),
     /// Deserialization failed.
-    DeserializeError(String),
+    DeserializeError(&'static str),
 }
 ```
 
@@ -228,7 +228,7 @@ pub enum PeerEvent {
     /// An announce for this identity appeared in the path table.
     AnnounceReceived { identity_hash: IdentityHash },
     /// A Link to this peer reached Active state.
-    LinkEstablished { identity_hash: IdentityHash },
+    LinkEstablished { identity_hash: IdentityHash, now: u64 },
     /// A Link to this peer closed (timeout, error, remote close).
     LinkClosed { identity_hash: IdentityHash },
     /// Periodic timer tick. Caller decides interval (~1s recommended).
@@ -265,6 +265,8 @@ struct PeerState {
     last_probe: Option<u64>,
     /// When we last had an active link.
     last_seen: Option<u64>,
+    /// When the current Connecting attempt started (for timeout).
+    connecting_since: Option<u64>,
     /// Consecutive failed connection attempts (drives backoff).
     retry_count: u32,
 }
