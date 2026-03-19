@@ -2,7 +2,9 @@
 extern crate alloc;
 
 pub mod event;
+pub mod manager;
 pub mod state;
 
 pub use event::{PeerAction, PeerEvent};
+pub use manager::PeerManager;
 pub use state::{PeerState, PeerStatus};
