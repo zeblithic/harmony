@@ -58,6 +58,26 @@ impl MlKemPublicKey {
     }
 }
 
+impl core::fmt::Debug for MlKemPublicKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let bytes = self.as_bytes();
+        write!(f, "MlKemPublicKey({:02x}{:02x}..)", bytes[0], bytes[1])
+    }
+}
+
+impl serde::Serialize for MlKemPublicKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.as_bytes())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MlKemPublicKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes: alloc::vec::Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+        Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
 /// ML-KEM-768 decapsulation (secret) key.
 ///
 /// The inner `DecapsulationKey` implements `ZeroizeOnDrop` when the
@@ -249,5 +269,13 @@ mod tests {
         assert_eq!(ss.as_bytes().len(), 32);
         let ss2 = decapsulate(&sk, &ct).unwrap();
         assert_eq!(ss2.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn public_key_serde_round_trip() {
+        let (pk, _sk) = generate(&mut rand::rngs::OsRng);
+        let bytes = postcard::to_allocvec(&pk).unwrap();
+        let decoded: MlKemPublicKey = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(pk.as_bytes(), decoded.as_bytes());
     }
 }

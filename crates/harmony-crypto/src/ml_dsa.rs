@@ -60,6 +60,26 @@ impl MlDsaPublicKey {
     }
 }
 
+impl core::fmt::Debug for MlDsaPublicKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let bytes = self.as_bytes();
+        write!(f, "MlDsaPublicKey({:02x}{:02x}..)", bytes[0], bytes[1])
+    }
+}
+
+impl serde::Serialize for MlDsaPublicKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.as_bytes())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MlDsaPublicKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes: alloc::vec::Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+        Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
 /// ML-DSA-65 signing (secret) key.
 ///
 /// Stores the 32-byte seed from which the full signing key is derived.
@@ -135,6 +155,25 @@ impl MlDsaSignature {
         Ok(Self {
             bytes: bytes.to_vec(),
         })
+    }
+}
+
+impl core::fmt::Debug for MlDsaSignature {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "MlDsaSignature({}B)", self.bytes.len())
+    }
+}
+
+impl serde::Serialize for MlDsaSignature {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.bytes)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MlDsaSignature {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes: alloc::vec::Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+        Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }
 
@@ -242,5 +281,22 @@ mod tests {
         let sig_bytes = sig.as_bytes();
         let sig2 = MlDsaSignature::from_bytes(sig_bytes).unwrap();
         assert_eq!(sig.as_bytes(), sig2.as_bytes());
+    }
+
+    #[test]
+    fn public_key_serde_round_trip() {
+        let (pk, _sk) = generate(&mut rand::rngs::OsRng);
+        let bytes = postcard::to_allocvec(&pk).unwrap();
+        let decoded: MlDsaPublicKey = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(pk.as_bytes(), decoded.as_bytes());
+    }
+
+    #[test]
+    fn signature_serde_round_trip() {
+        let (pk, sk) = generate(&mut rand::rngs::OsRng);
+        let sig = sign(&sk, b"test message").unwrap();
+        let bytes = postcard::to_allocvec(&sig).unwrap();
+        let decoded: MlDsaSignature = postcard::from_bytes(&bytes).unwrap();
+        assert!(verify(&pk, b"test message", &decoded).is_ok());
     }
 }

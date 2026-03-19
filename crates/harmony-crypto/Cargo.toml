@@ -24,6 +24,7 @@ rand_core = { workspace = true }
 zeroize = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 
 [features]
 default = ["std"]
@@ -37,6 +38,7 @@ std = [
     "x25519-dalek/getrandom",
     "subtle/std",
     "thiserror/std",
+    "serde/std",
     # ml-kem, ml-dsa, hybrid-array are no_std-clean by default; no std feature to re-enable
     # aes 0.8 is no_std-clean by default; no std feature to re-enable
 ]
@@ -44,3 +46,4 @@ std = [
 [dev-dependencies]
 rand = { workspace = true }
 hex = { workspace = true }
+postcard = { workspace = true }
