@@ -16,6 +16,9 @@ pub enum CryptoSuite {
     /// ML-DSA-65 signing + ML-KEM-768 encryption (NIST FIPS 203/204).
     /// Harmony-native, post-quantum secure.
     MlDsa65 = 0x01,
+    /// ML-DSA-65/ML-KEM-768 with KERI-style key rotation.
+    /// Address derived from inception event payload, not current keys.
+    MlDsa65Rotatable = 0x02,
 }
 
 impl From<CryptoSuite> for u8 {
@@ -31,6 +34,7 @@ impl TryFrom<u8> for CryptoSuite {
         match b {
             0x00 => Ok(Self::Ed25519),
             0x01 => Ok(Self::MlDsa65),
+            0x02 => Ok(Self::MlDsa65Rotatable),
             other => Err(other),
         }
     }
@@ -39,7 +43,7 @@ impl TryFrom<u8> for CryptoSuite {
 impl CryptoSuite {
     /// Returns `true` if this suite provides post-quantum security.
     pub fn is_post_quantum(self) -> bool {
-        matches!(self, Self::MlDsa65)
+        matches!(self, Self::MlDsa65 | Self::MlDsa65Rotatable)
     }
 
     /// Multicodec identifier for the signing algorithm.
@@ -48,6 +52,7 @@ impl CryptoSuite {
         match self {
             Self::Ed25519 => 0x00ed,
             Self::MlDsa65 => 0x1211,
+            Self::MlDsa65Rotatable => 0x1211,
         }
     }
 
@@ -57,6 +62,7 @@ impl CryptoSuite {
         match self {
             Self::Ed25519 => 0x00ec,
             Self::MlDsa65 => 0x120c,
+            Self::MlDsa65Rotatable => 0x120c,
         }
     }
 
@@ -80,7 +86,7 @@ impl CryptoSuite {
         }
     }
 
-    /// Construct from the UCAN wire discriminant byte (`0x00` or `0x01`).
+    /// Construct from the UCAN wire discriminant byte (`0x00`, `0x01`, or `0x02`).
     /// Returns `None` for unknown values.
     pub fn from_byte(byte: u8) -> Option<Self> {
         Self::try_from(byte).ok()
@@ -99,6 +105,53 @@ mod tests {
     #[test]
     fn ml_dsa65_is_post_quantum() {
         assert!(CryptoSuite::MlDsa65.is_post_quantum());
+    }
+
+    #[test]
+    fn ml_dsa65_rotatable_is_post_quantum() {
+        assert!(CryptoSuite::MlDsa65Rotatable.is_post_quantum());
+    }
+
+    #[test]
+    fn ml_dsa65_rotatable_from_byte() {
+        assert_eq!(
+            CryptoSuite::from_byte(0x02),
+            Some(CryptoSuite::MlDsa65Rotatable)
+        );
+    }
+
+    #[test]
+    fn ml_dsa65_rotatable_try_from() {
+        assert_eq!(
+            CryptoSuite::try_from(0x02),
+            Ok(CryptoSuite::MlDsa65Rotatable)
+        );
+    }
+
+    #[test]
+    fn ml_dsa65_rotatable_multicodec_same_as_static() {
+        assert_eq!(
+            CryptoSuite::MlDsa65Rotatable.signing_multicodec(),
+            CryptoSuite::MlDsa65.signing_multicodec()
+        );
+        assert_eq!(
+            CryptoSuite::MlDsa65Rotatable.encryption_multicodec(),
+            CryptoSuite::MlDsa65.encryption_multicodec()
+        );
+    }
+
+    #[test]
+    fn multicodec_round_trip_lossy_for_rotatable() {
+        let code = CryptoSuite::MlDsa65Rotatable.signing_multicodec();
+        assert_eq!(
+            CryptoSuite::from_signing_multicodec(code),
+            Some(CryptoSuite::MlDsa65)
+        );
+    }
+
+    #[test]
+    fn ml_dsa65_rotatable_wire_discriminant() {
+        assert_eq!(CryptoSuite::MlDsa65Rotatable as u8, 0x02);
     }
 
     #[test]
@@ -143,7 +196,10 @@ mod tests {
     fn from_byte_round_trip() {
         assert_eq!(CryptoSuite::from_byte(0x00), Some(CryptoSuite::Ed25519));
         assert_eq!(CryptoSuite::from_byte(0x01), Some(CryptoSuite::MlDsa65));
-        assert_eq!(CryptoSuite::from_byte(0x02), None);
+        assert_eq!(
+            CryptoSuite::from_byte(0x02),
+            Some(CryptoSuite::MlDsa65Rotatable)
+        );
         assert_eq!(CryptoSuite::from_byte(0xFF), None);
     }
 
@@ -151,7 +207,11 @@ mod tests {
     fn try_from_u8_round_trip() {
         assert_eq!(CryptoSuite::try_from(0x00), Ok(CryptoSuite::Ed25519));
         assert_eq!(CryptoSuite::try_from(0x01), Ok(CryptoSuite::MlDsa65));
-        assert_eq!(CryptoSuite::try_from(0x02), Err(0x02));
+        assert_eq!(
+            CryptoSuite::try_from(0x02),
+            Ok(CryptoSuite::MlDsa65Rotatable)
+        );
+        assert_eq!(CryptoSuite::try_from(0x03), Err(0x03));
     }
 
     #[test]
@@ -161,8 +221,12 @@ mod tests {
     }
 
     #[test]
-    fn serde_round_trip_both_variants() {
-        for suite in [CryptoSuite::Ed25519, CryptoSuite::MlDsa65] {
+    fn serde_round_trip_all_variants() {
+        for suite in [
+            CryptoSuite::Ed25519,
+            CryptoSuite::MlDsa65,
+            CryptoSuite::MlDsa65Rotatable,
+        ] {
             let bytes = postcard::to_allocvec(&suite).unwrap();
             let decoded: CryptoSuite = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(decoded, suite);
@@ -176,5 +240,9 @@ mod tests {
         assert_eq!(bytes, [0x00]);
         let bytes = postcard::to_allocvec(&CryptoSuite::MlDsa65).unwrap();
         assert_eq!(bytes, [0x01]);
+        assert_eq!(
+            postcard::to_allocvec(&CryptoSuite::MlDsa65Rotatable).unwrap(),
+            [0x02]
+        );
     }
 }
