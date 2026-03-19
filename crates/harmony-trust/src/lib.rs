@@ -4,7 +4,9 @@ extern crate alloc;
 pub mod edge;
 pub mod error;
 pub mod score;
+pub mod store;
 
 pub use edge::TrustEdge;
 pub use error::TrustError;
 pub use score::TrustScore;
+pub use store::TrustStore;
