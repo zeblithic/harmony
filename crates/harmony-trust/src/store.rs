@@ -38,11 +38,12 @@ impl TrustStore {
     }
 
     /// Set or update your trust score for an identity.
-    /// Only updates if `now` is strictly newer than the existing timestamp
-    /// (consistent with `receive_edge` staleness semantics).
+    /// Rejects updates with a strictly older timestamp (protects against
+    /// out-of-order sync replay). Same-timestamp updates are accepted
+    /// since local scores are direct user actions.
     pub fn set_score(&mut self, trustee: &IdentityHash, score: TrustScore, now: u64) {
         match self.local_edges.get(trustee) {
-            Some(existing) if existing.updated_at >= now => {}
+            Some(existing) if existing.updated_at > now => {}
             _ => {
                 self.local_edges.insert(
                     *trustee,
@@ -206,6 +207,15 @@ mod tests {
         store.set_score(&ALICE, score(3, 3, 3, 3), 2000);
         // Older timestamp should be rejected
         store.set_score(&ALICE, score(0, 0, 0, 0), 1000);
+        assert_eq!(store.local_score(&ALICE).unwrap(), score(3, 3, 3, 3));
+    }
+
+    #[test]
+    fn set_score_same_timestamp_accepted() {
+        let mut store = TrustStore::new(LOCAL);
+        store.set_score(&ALICE, score(1, 1, 1, 1), 1000);
+        // Same timestamp — direct user correction, should be accepted
+        store.set_score(&ALICE, score(3, 3, 3, 3), 1000);
         assert_eq!(store.local_score(&ALICE).unwrap(), score(3, 3, 3, 3));
     }
 
