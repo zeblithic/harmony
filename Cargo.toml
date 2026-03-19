@@ -4,6 +4,7 @@ members = [
     "crates/harmony-athenaeum",
     "crates/harmony-browser",
     "crates/harmony-compute",
+    "crates/harmony-contacts",
     "crates/harmony-content",
     "crates/harmony-crypto",
     "crates/harmony-identity",
@@ -81,6 +82,7 @@ clap = { version = "4", features = ["derive"] }
 # Crates that need std re-enable it via their own `std` feature.
 harmony-athenaeum = { path = "crates/harmony-athenaeum", default-features = false }
 harmony-compute = { path = "crates/harmony-compute" }
+harmony-contacts = { path = "crates/harmony-contacts", default-features = false }
 harmony-content = { path = "crates/harmony-content", default-features = false }
 harmony-crypto = { path = "crates/harmony-crypto", default-features = false }
 harmony-identity = { path = "crates/harmony-identity", default-features = false }
