@@ -46,8 +46,8 @@ impl PeerManager {
                 }
             }
             PeerEvent::LinkEstablished { identity_hash, now } => {
-                if let Some(peer) = self.peers.get_mut(&identity_hash) {
-                    match peer.status {
+                match self.peers.get_mut(&identity_hash) {
+                    Some(peer) => match peer.status {
                         PeerStatus::Connecting | PeerStatus::Searching => {
                             peer.status = PeerStatus::Connected;
                             peer.retry_count = 0;
@@ -63,6 +63,10 @@ impl PeerManager {
                             actions.push(PeerAction::CloseLink { identity_hash });
                         }
                         PeerStatus::Connected => {}
+                    },
+                    None => {
+                        // Race: contact was removed but link completed first.
+                        actions.push(PeerAction::CloseLink { identity_hash });
                     }
                 }
             }
@@ -648,6 +652,48 @@ mod tests {
         let peer = mgr.peers.get(&[0x99; 16]).unwrap();
         assert_eq!(peer.status, PeerStatus::Searching);
         assert_eq!(peer.retry_count, 1);
+    }
+
+    #[test]
+    fn link_established_after_contact_removed_emits_close() {
+        let mut mgr = PeerManager::new();
+        let store = make_store_with_contact(0xF0, true, PeeringPriority::High);
+        mgr.on_event(
+            PeerEvent::ContactChanged {
+                identity_hash: [0xF0; 16],
+            },
+            &store,
+        );
+        mgr.on_event(
+            PeerEvent::AnnounceReceived {
+                identity_hash: [0xF0; 16],
+            },
+            &store,
+        );
+        // Remove contact — emits CloseLink, removes peer entry
+        let actions = mgr.on_event(
+            PeerEvent::ContactRemoved {
+                identity_hash: [0xF0; 16],
+            },
+            &store,
+        );
+        assert!(actions.contains(&PeerAction::CloseLink {
+            identity_hash: [0xF0; 16],
+        }));
+        assert!(!mgr.peers.contains_key(&[0xF0; 16]));
+
+        // Race: link completes after removal
+        let actions = mgr.on_event(
+            PeerEvent::LinkEstablished {
+                identity_hash: [0xF0; 16],
+                now: 5000,
+            },
+            &store,
+        );
+        // Should emit CloseLink for the dangling link
+        assert!(actions.contains(&PeerAction::CloseLink {
+            identity_hash: [0xF0; 16],
+        }));
     }
 
     #[test]
