@@ -327,3 +327,5 @@
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-19T11:00:09Z","event_type":"closed","id":327,"issue_id":"harmony-bq2","new_value":"Merged in PR #69","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-19T11:00:09Z","event_type":"closed","id":328,"issue_id":"harmony-9wb","new_value":"Merged in PR #69","old_value":""}
 {"actor":"Jake Englund","comment":null,"created_at":"2026-03-19T12:43:26Z","event_type":"closed","id":329,"issue_id":"harmony-lpk","new_value":"Merged in PR #70","old_value":""}
+{"actor":"Jake Englund","comment":null,"created_at":"2026-03-19T13:22:07Z","event_type":"created","id":330,"issue_id":"harmony-tq4","new_value":"","old_value":""}
+{"actor":"Jake Englund","comment":"Added label: feature","created_at":"2026-03-19T13:22:07Z","event_type":"label_added","id":331,"issue_id":"harmony-tq4","new_value":null,"old_value":null}
