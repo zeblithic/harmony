@@ -1,0 +1,22 @@
+[package]
+name = "harmony-peers"
+description = "Sans-I/O peering lifecycle manager for the Harmony network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harmony-identity = { workspace = true }
+harmony-contacts = { workspace = true }
+hashbrown = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+    "harmony-identity/std",
+    "harmony-contacts/std",
+]
+
+[dev-dependencies]

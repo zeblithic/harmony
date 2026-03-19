@@ -1009,6 +1009,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-peers"
+version = "0.1.0"
+dependencies = [
+ "harmony-contacts",
+ "harmony-identity",
+ "hashbrown 0.15.5",
+]
+
+[[package]]
 name = "harmony-platform"
 version = "0.1.0"
 dependencies = [
