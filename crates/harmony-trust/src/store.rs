@@ -14,6 +14,10 @@ pub struct TrustStore {
     local_identity: IdentityHash,
     local_edges: HashMap<IdentityHash, LocalEdge>,
     received_edges: HashMap<IdentityHash, HashMap<IdentityHash, ReceivedEdge>>,
+    /// Tombstone timestamps for removed local edges, preserving the
+    /// staleness guard so a remove + stale re-insert cannot downgrade.
+    #[serde(default)]
+    removed_at: HashMap<IdentityHash, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +38,7 @@ impl TrustStore {
             local_identity,
             local_edges: HashMap::new(),
             received_edges: HashMap::new(),
+            removed_at: HashMap::new(),
         }
     }
 
@@ -42,22 +47,36 @@ impl TrustStore {
     /// out-of-order sync replay). Same-timestamp updates are accepted
     /// since local scores are direct user actions.
     pub fn set_score(&mut self, trustee: &IdentityHash, score: TrustScore, now: u64) {
-        match self.local_edges.get(trustee) {
-            Some(existing) if existing.updated_at > now => {}
-            _ => {
-                self.local_edges.insert(
-                    *trustee,
-                    LocalEdge {
-                        score,
-                        updated_at: now,
-                    },
-                );
-            }
+        // Check both active edge and tombstone for staleness.
+        let dominated_by_active = self
+            .local_edges
+            .get(trustee)
+            .is_some_and(|e| e.updated_at > now);
+        let dominated_by_tombstone = self
+            .removed_at
+            .get(trustee)
+            .is_some_and(|&t| t > now);
+        if dominated_by_active || dominated_by_tombstone {
+            return;
         }
+        // Clear tombstone — this insert supersedes the removal.
+        self.removed_at.remove(trustee);
+        self.local_edges.insert(
+            *trustee,
+            LocalEdge {
+                score,
+                updated_at: now,
+            },
+        );
     }
 
+    /// Remove your trust score for an identity. Returns the old score.
+    /// Records a tombstone timestamp so stale re-insertions are rejected.
     pub fn remove_score(&mut self, trustee: &IdentityHash) -> Option<TrustScore> {
-        self.local_edges.remove(trustee).map(|e| e.score)
+        self.local_edges.remove(trustee).map(|e| {
+            self.removed_at.insert(*trustee, e.updated_at);
+            e.score
+        })
     }
 
     pub fn local_score(&self, trustee: &IdentityHash) -> Option<TrustScore> {
@@ -208,6 +227,26 @@ mod tests {
         // Older timestamp should be rejected
         store.set_score(&ALICE, score(0, 0, 0, 0), 1000);
         assert_eq!(store.local_score(&ALICE).unwrap(), score(3, 3, 3, 3));
+    }
+
+    #[test]
+    fn remove_then_stale_reinsert_rejected() {
+        let mut store = TrustStore::new(LOCAL);
+        store.set_score(&ALICE, score(3, 3, 3, 3), 2000);
+        store.remove_score(&ALICE);
+        // Stale re-insert (t=500 < removed t=2000) should be rejected
+        store.set_score(&ALICE, score(0, 0, 0, 0), 500);
+        assert!(store.local_score(&ALICE).is_none());
+    }
+
+    #[test]
+    fn remove_then_newer_reinsert_accepted() {
+        let mut store = TrustStore::new(LOCAL);
+        store.set_score(&ALICE, score(1, 1, 1, 1), 1000);
+        store.remove_score(&ALICE);
+        // Newer re-insert (t=2000 > removed t=1000) should succeed
+        store.set_score(&ALICE, score(3, 3, 3, 3), 2000);
+        assert_eq!(store.local_score(&ALICE), Some(score(3, 3, 3, 3)));
     }
 
     #[test]
