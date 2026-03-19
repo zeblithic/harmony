@@ -65,12 +65,14 @@ impl core::fmt::Debug for MlKemPublicKey {
     }
 }
 
+#[cfg(feature = "serde")]
 impl serde::Serialize for MlKemPublicKey {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(&self.as_bytes())
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for MlKemPublicKey {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes: alloc::vec::Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
@@ -271,6 +273,7 @@ mod tests {
         assert_eq!(ss2.as_bytes().len(), 32);
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn public_key_serde_round_trip() {
         let (pk, _sk) = generate(&mut rand::rngs::OsRng);

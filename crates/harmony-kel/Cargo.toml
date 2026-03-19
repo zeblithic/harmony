@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-harmony-crypto = { workspace = true }
+harmony-crypto = { workspace = true, features = ["serde"] }
 harmony-identity = { workspace = true }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 postcard = { workspace = true }

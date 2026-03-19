@@ -67,12 +67,14 @@ impl core::fmt::Debug for MlDsaPublicKey {
     }
 }
 
+#[cfg(feature = "serde")]
 impl serde::Serialize for MlDsaPublicKey {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(&self.as_bytes())
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for MlDsaPublicKey {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes: alloc::vec::Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
@@ -165,12 +167,14 @@ impl core::fmt::Debug for MlDsaSignature {
     }
 }
 
+#[cfg(feature = "serde")]
 impl serde::Serialize for MlDsaSignature {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(&self.bytes)
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for MlDsaSignature {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes: alloc::vec::Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
@@ -284,6 +288,7 @@ mod tests {
         assert_eq!(sig.as_bytes(), sig2.as_bytes());
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn public_key_serde_round_trip() {
         let (pk, _sk) = generate(&mut rand::rngs::OsRng);
@@ -292,6 +297,7 @@ mod tests {
         assert_eq!(pk.as_bytes(), decoded.as_bytes());
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn signature_serde_round_trip() {
         let (pk, sk) = generate(&mut rand::rngs::OsRng);

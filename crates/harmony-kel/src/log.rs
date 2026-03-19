@@ -14,56 +14,43 @@ use crate::event::{
 
 const FORMAT_VERSION: u8 = 1;
 
-/// Serialize the unsigned inception payload from individual field values.
+/// Wire format for serializing/deserializing a `KeyEventLog`.
 ///
-/// This is needed when constructing an inception event: we must compute the
-/// payload BEFORE the struct exists so we can sign it.
-pub fn serialize_inception_payload_parts(
-    signing_key: &MlDsaPublicKey,
-    encryption_key: &MlKemPublicKey,
-    next_key_commitment: &[u8; 32],
-    created_at: u64,
-) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&signing_key.as_bytes());
-    buf.extend_from_slice(&encryption_key.as_bytes());
-    buf.extend_from_slice(next_key_commitment);
-    buf.extend_from_slice(&created_at.to_le_bytes());
-    buf
+/// Only stores `address` and `events`; cached keys/commitment are re-derived
+/// from the event chain on deserialization to prevent tampering.
+#[derive(Serialize, Deserialize)]
+struct KeyEventLogWire {
+    address: IdentityHash,
+    events: Vec<KeyEvent>,
 }
 
-/// Serialize the unsigned rotation payload from individual field values.
-pub fn serialize_rotation_payload_parts(
-    sequence: u64,
-    previous_hash: &[u8; 32],
-    signing_key: &MlDsaPublicKey,
-    encryption_key: &MlKemPublicKey,
-    next_key_commitment: &[u8; 32],
-    created_at: u64,
-) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&sequence.to_le_bytes());
-    buf.extend_from_slice(previous_hash);
-    buf.extend_from_slice(&signing_key.as_bytes());
-    buf.extend_from_slice(&encryption_key.as_bytes());
-    buf.extend_from_slice(next_key_commitment);
-    buf.extend_from_slice(&created_at.to_le_bytes());
-    buf
-}
+/// Derive cached state (current signing key, encryption key, next-key commitment)
+/// by scanning the event chain.
+///
+/// Panics if `events` is empty or `events[0]` is not an `InceptionEvent`.
+fn derive_cached_state(events: &[KeyEvent]) -> (MlDsaPublicKey, MlKemPublicKey, [u8; 32]) {
+    let mut signing_key;
+    let mut encryption_key;
+    let mut commitment;
 
-/// Serialize the unsigned interaction payload from individual field values.
-pub fn serialize_interaction_payload_parts(
-    sequence: u64,
-    previous_hash: &[u8; 32],
-    data_hash: &[u8; 32],
-    created_at: u64,
-) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&sequence.to_le_bytes());
-    buf.extend_from_slice(previous_hash);
-    buf.extend_from_slice(data_hash);
-    buf.extend_from_slice(&created_at.to_le_bytes());
-    buf
+    match &events[0] {
+        KeyEvent::Inception(e) => {
+            signing_key = e.signing_key.clone();
+            encryption_key = e.encryption_key.clone();
+            commitment = e.next_key_commitment;
+        }
+        _ => panic!("first event must be inception"),
+    }
+
+    for event in &events[1..] {
+        if let KeyEvent::Rotation(e) = event {
+            signing_key = e.signing_key.clone();
+            encryption_key = e.encryption_key.clone();
+            commitment = e.next_key_commitment;
+        }
+    }
+
+    (signing_key, encryption_key, commitment)
 }
 
 /// A KERI-inspired Key Event Log with pre-rotation and dual signatures.
@@ -73,7 +60,7 @@ pub fn serialize_interaction_payload_parts(
 /// the previous via a BLAKE3 hash of the serialized payload.
 ///
 /// Current keys and commitment are cached for O(1) access.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct KeyEventLog {
     /// The permanent 128-bit address, derived from the inception payload.
     address: IdentityHash,
@@ -237,16 +224,27 @@ impl KeyEventLog {
     }
 
     /// Serialize the log to bytes with a format version prefix.
+    ///
+    /// Only the address and events are serialized; cached keys/commitment
+    /// are re-derived on deserialization.
     pub fn serialize(&self) -> Result<Vec<u8>, KelError> {
+        let wire = KeyEventLogWire {
+            address: self.address,
+            events: self.events.clone(),
+        };
         let mut buf = Vec::new();
         buf.push(FORMAT_VERSION);
-        let inner = postcard::to_allocvec(self)
+        let inner = postcard::to_allocvec(&wire)
             .map_err(|_| KelError::SerializeError("postcard encode failed"))?;
         buf.extend_from_slice(&inner);
         Ok(buf)
     }
 
     /// Deserialize a log from bytes (expects format version prefix).
+    ///
+    /// Cached state (current signing key, encryption key, next-key commitment)
+    /// is re-derived from the event chain rather than trusted from the wire.
+    /// Validates that only `events[0]` is an inception event.
     pub fn deserialize(data: &[u8]) -> Result<Self, KelError> {
         if data.is_empty() {
             return Err(KelError::DeserializeError("empty data"));
@@ -254,14 +252,43 @@ impl KeyEventLog {
         if data[0] != FORMAT_VERSION {
             return Err(KelError::DeserializeError("unsupported format version"));
         }
-        postcard::from_bytes(&data[1..])
-            .map_err(|_| KelError::DeserializeError("postcard decode failed"))
+        let wire: KeyEventLogWire = postcard::from_bytes(&data[1..])
+            .map_err(|_| KelError::DeserializeError("postcard decode failed"))?;
+
+        if wire.events.is_empty() {
+            return Err(KelError::EmptyLog);
+        }
+
+        // Validate: events[0] must be Inception, no other event may be Inception.
+        if !matches!(wire.events[0], KeyEvent::Inception(_)) {
+            return Err(KelError::DeserializeError("first event is not inception"));
+        }
+        for event in &wire.events[1..] {
+            if matches!(event, KeyEvent::Inception(_)) {
+                return Err(KelError::DuplicateInception);
+            }
+        }
+
+        let (current_signing_key, current_encryption_key, next_key_commitment) =
+            derive_cached_state(&wire.events);
+
+        Ok(Self {
+            address: wire.address,
+            events: wire.events,
+            current_signing_key,
+            current_encryption_key,
+            next_key_commitment,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::{
+        serialize_inception_payload_parts, serialize_interaction_payload_parts,
+        serialize_rotation_payload_parts,
+    };
     use harmony_crypto::{ml_dsa, ml_kem};
     use rand::rngs::OsRng;
 
@@ -396,7 +423,9 @@ mod tests {
         let keys = gen_keyset();
         let next = gen_keyset();
 
-        // Build the same inception payload twice (ML-DSA is deterministic)
+        // Build the same inception payload twice — address is derived from
+        // the unsigned payload, not the signature, so different signatures
+        // still produce the same address.
         let inception1 = build_inception(&keys, &next);
         let inception2 = build_inception(&keys, &next);
 
