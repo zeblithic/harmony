@@ -136,7 +136,7 @@ impl TrustScore {
     pub fn association(self) -> u8 { (self.0 >> 2) & 0x03 }
     pub fn endorsement(self) -> u8 { self.0 & 0x03 }
 
-    /// Build a score from individual dimensions (each clamped to 0-3).
+    /// Build a score from individual dimensions (each masked to 2 bits).
     pub fn from_dimensions(
         identity: u8,
         compliance: u8,

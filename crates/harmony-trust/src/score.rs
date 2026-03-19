@@ -85,7 +85,7 @@ mod tests {
     }
 
     #[test]
-    fn from_dimensions_clamps_overflow() {
+    fn from_dimensions_masks_overflow() {
         let score = TrustScore::from_dimensions(0xFF, 0xFF, 0xFF, 0xFF);
         assert_eq!(score.raw(), 0xFF);
         assert_eq!(score.identity(), 3);
