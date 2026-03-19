@@ -15,6 +15,7 @@ x25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 hashbrown = { workspace = true, optional = true }
 
 [features]
@@ -26,6 +27,7 @@ std = [
     "ed25519-dalek/std",
     "x25519-dalek/getrandom",
     "thiserror/std",
+    "serde/std",
 ]
 test-utils = ["dep:hashbrown"]
 
@@ -33,3 +35,4 @@ test-utils = ["dep:hashbrown"]
 rand = { workspace = true }
 hex = { workspace = true }
 hashbrown = { workspace = true }
+postcard = { workspace = true }

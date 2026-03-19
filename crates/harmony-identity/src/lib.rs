@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
+pub mod crypto_suite;
 pub mod error;
 pub mod identity;
 pub mod pq_identity;
