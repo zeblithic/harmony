@@ -13,6 +13,8 @@
 {"created_at":"2026-03-11T20:28:19Z","created_by":"Jake Englund","depends_on_id":"harmony-wuf","issue_id":"harmony-2jx","type":"blocks"}
 {"created_at":"2026-03-05T15:51:19Z","created_by":"Jake Englund","depends_on_id":"harmony-8xc","issue_id":"harmony-2yl","type":"blocks"}
 {"created_at":"2026-03-02T19:55:40Z","created_by":"Jake Englund","depends_on_id":"harmony-7gf","issue_id":"harmony-313","type":"blocks"}
+{"created_at":"2026-03-19T13:22:20Z","created_by":"Jake Englund","depends_on_id":"harmony-dnp","issue_id":"harmony-44r","type":"blocks"}
+{"created_at":"2026-03-19T13:22:20Z","created_by":"Jake Englund","depends_on_id":"harmony-eo2","issue_id":"harmony-44r","type":"blocks"}
 {"created_at":"2026-03-05T15:51:49Z","created_by":"Jake Englund","depends_on_id":"harmony-bpo","issue_id":"harmony-44x","type":"blocks"}
 {"created_at":"2026-03-08T01:28:07Z","created_by":"Jake Englund","depends_on_id":"harmony-3eo","issue_id":"harmony-4g8","type":"blocks"}
 {"created_at":"2026-03-08T01:28:08Z","created_by":"Jake Englund","depends_on_id":"harmony-b9e","issue_id":"harmony-4g8","type":"blocks"}
@@ -48,6 +50,7 @@
 {"created_at":"2026-03-05T15:51:37Z","created_by":"Jake Englund","depends_on_id":"harmony-2yl","issue_id":"harmony-cpo","type":"blocks"}
 {"created_at":"2026-03-05T15:51:37Z","created_by":"Jake Englund","depends_on_id":"harmony-8xc","issue_id":"harmony-cpo","type":"blocks"}
 {"created_at":"2026-03-01T11:56:31Z","created_by":"Jake Englund","depends_on_id":"harmony-14z","issue_id":"harmony-d00","type":"blocks"}
+{"created_at":"2026-03-19T13:22:20Z","created_by":"Jake Englund","depends_on_id":"harmony-dnp","issue_id":"harmony-eo2","type":"blocks"}
 {"created_at":"2026-03-01T11:56:32Z","created_by":"Jake Englund","depends_on_id":"harmony-1pm","issue_id":"harmony-gi1","type":"blocks"}
 {"created_at":"2026-03-01T11:56:32Z","created_by":"Jake Englund","depends_on_id":"harmony-iii","issue_id":"harmony-gi1","type":"blocks"}
 {"created_at":"2026-03-08T01:28:07Z","created_by":"Jake Englund","depends_on_id":"harmony-3eo","issue_id":"harmony-haq","type":"blocks"}
@@ -61,4 +64,5 @@
 {"created_at":"2026-03-08T01:28:07Z","created_by":"Jake Englund","depends_on_id":"harmony-0h0","issue_id":"harmony-qv2","type":"blocks"}
 {"created_at":"2026-03-01T11:56:32Z","created_by":"Jake Englund","depends_on_id":"harmony-8wy","issue_id":"harmony-r4h","type":"blocks"}
 {"created_at":"2026-03-01T11:56:33Z","created_by":"Jake Englund","depends_on_id":"harmony-1pm","issue_id":"harmony-sup","type":"blocks"}
+{"created_at":"2026-03-19T13:22:20Z","created_by":"Jake Englund","depends_on_id":"harmony-dnp","issue_id":"harmony-tq4","type":"blocks"}
 {"created_at":"2026-03-08T01:28:06Z","created_by":"Jake Englund","depends_on_id":"harmony-0h0","issue_id":"harmony-ujq","type":"blocks"}
