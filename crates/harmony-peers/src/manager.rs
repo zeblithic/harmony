@@ -73,8 +73,12 @@ impl PeerManager {
             PeerEvent::LinkClosed { identity_hash } => {
                 if let Some(peer) = self.peers.get_mut(&identity_hash) {
                     if matches!(peer.status, PeerStatus::Connected | PeerStatus::Connecting) {
+                        // Reset last_probe so backoff starts from the failure,
+                        // not from the original probe that led to this attempt.
+                        peer.last_probe = peer.connecting_since.or(peer.last_seen);
                         peer.status = PeerStatus::Searching;
                         peer.retry_count = peer.retry_count.saturating_add(1);
+                        peer.connecting_since = None;
                     }
                 }
             }
@@ -150,6 +154,8 @@ impl PeerManager {
                             peer.status = PeerStatus::Searching;
                             peer.retry_count = peer.retry_count.saturating_add(1);
                             peer.connecting_since = None;
+                            // Start backoff from now, not from the original probe.
+                            peer.last_probe = Some(now);
                         }
                     }
                 },
@@ -652,6 +658,53 @@ mod tests {
         let peer = mgr.peers.get(&[0x99; 16]).unwrap();
         assert_eq!(peer.status, PeerStatus::Searching);
         assert_eq!(peer.retry_count, 1);
+    }
+
+    #[test]
+    fn backoff_starts_from_failure_not_original_probe() {
+        let mut mgr = PeerManager::new();
+        let store = make_store_with_contact(0xE1, true, PeeringPriority::High);
+        mgr.on_event(
+            PeerEvent::ContactChanged {
+                identity_hash: [0xE1; 16],
+            },
+            &store,
+        );
+        // Probe at t=1000
+        mgr.on_event(PeerEvent::Tick { now: 1000 }, &store);
+        // Announce arrives, enter Connecting
+        mgr.on_event(
+            PeerEvent::AnnounceReceived {
+                identity_hash: [0xE1; 16],
+            },
+            &store,
+        );
+        // Tick stamps connecting_since at t=1020
+        mgr.on_event(PeerEvent::Tick { now: 1020 }, &store);
+        // Connection fails at t=1050
+        mgr.on_event(
+            PeerEvent::LinkClosed {
+                identity_hash: [0xE1; 16],
+            },
+            &store,
+        );
+        // retry_count=1, interval = min(30*2^1, 600) = 60s
+        // Backoff should be from connecting_since (t=1020), not original probe (t=1000)
+        // So next probe should be at t=1020+60 = t=1080
+        let actions = mgr.on_event(PeerEvent::Tick { now: 1055 }, &store);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::SendPathRequest { .. })),
+            "Should NOT probe at t=1055 — backoff from t=1020 requires 60s"
+        );
+        let actions = mgr.on_event(PeerEvent::Tick { now: 1081 }, &store);
+        assert!(
+            actions.contains(&PeerAction::SendPathRequest {
+                identity_hash: [0xE1; 16]
+            }),
+            "Should probe at t=1081 — past 60s backoff from t=1020"
+        );
     }
 
     #[test]
