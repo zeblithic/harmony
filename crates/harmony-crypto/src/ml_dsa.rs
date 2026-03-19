@@ -131,6 +131,7 @@ impl MlDsaSecretKey {
 }
 
 /// ML-DSA-65 signature.
+#[derive(Clone)]
 pub struct MlDsaSignature {
     bytes: Vec<u8>,
 }
