@@ -75,7 +75,8 @@ impl PeerManager {
                     if matches!(peer.status, PeerStatus::Connected | PeerStatus::Connecting) {
                         // Reset last_probe so backoff starts from the failure,
                         // not from the original probe that led to this attempt.
-                        peer.last_probe = peer.connecting_since.or(peer.last_seen);
+                        peer.last_probe =
+                            peer.connecting_since.or(peer.last_seen).or(peer.last_probe);
                         peer.status = PeerStatus::Searching;
                         peer.retry_count = peer.retry_count.saturating_add(1);
                         peer.connecting_since = None;
