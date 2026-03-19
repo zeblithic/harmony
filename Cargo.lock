@@ -1073,6 +1073,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-trust"
+version = "0.1.0"
+dependencies = [
+ "harmony-identity",
+ "hashbrown 0.15.5",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "harmony-workflow"
 version = "0.1.0"
 dependencies = [
