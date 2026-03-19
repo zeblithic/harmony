@@ -882,6 +882,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-contacts"
+version = "0.1.0"
+dependencies = [
+ "harmony-identity",
+ "hashbrown 0.15.5",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "harmony-content"
 version = "0.1.0"
 dependencies = [
@@ -907,6 +917,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "hybrid-array 0.2.3",
+ "keccak",
  "ml-dsa",
  "ml-kem",
  "rand",
@@ -994,6 +1005,15 @@ version = "0.1.0"
 dependencies = [
  "harmony-crypto",
  "harmony-semantic",
+ "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "harmony-peers"
+version = "0.1.0"
+dependencies = [
+ "harmony-contacts",
+ "harmony-identity",
  "hashbrown 0.15.5",
 ]
 

@@ -4,6 +4,7 @@ members = [
     "crates/harmony-athenaeum",
     "crates/harmony-browser",
     "crates/harmony-compute",
+    "crates/harmony-contacts",
     "crates/harmony-content",
     "crates/harmony-crypto",
     "crates/harmony-identity",
@@ -11,6 +12,7 @@ members = [
     "crates/harmony-kitri",
     "crates/harmony-mail",
     "crates/harmony-node",
+    "crates/harmony-peers",
     "crates/harmony-platform",
     "crates/harmony-reticulum",
     "crates/harmony-roxy",
@@ -43,6 +45,9 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 ml-kem = { version = "0.3.0-rc.0", default-features = false, features = ["zeroize"] }
 ml-dsa = { version = "0.1.0-rc.7", default-features = false, features = ["rand_core", "zeroize"] }
 hybrid-array = { version = "0.2", default-features = false }
+# Pin keccak to 0.2.0-rc.2 — the stable 0.2.0 release removed KeccakP1600
+# which sha3 0.11.0-rc.8 (a transitive dep via ml-dsa) requires.
+keccak = "=0.2.0-rc.2"
 
 # Elliptic curve cryptography
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core", "fast", "zeroize", "alloc"] }
@@ -78,11 +83,13 @@ clap = { version = "4", features = ["derive"] }
 # Crates that need std re-enable it via their own `std` feature.
 harmony-athenaeum = { path = "crates/harmony-athenaeum", default-features = false }
 harmony-compute = { path = "crates/harmony-compute" }
+harmony-contacts = { path = "crates/harmony-contacts", default-features = false }
 harmony-content = { path = "crates/harmony-content", default-features = false }
 harmony-crypto = { path = "crates/harmony-crypto", default-features = false }
 harmony-identity = { path = "crates/harmony-identity", default-features = false }
 harmony-jain = { path = "crates/harmony-jain", default-features = false }
 harmony-kitri = { path = "crates/harmony-kitri", default-features = false }
+harmony-peers = { path = "crates/harmony-peers", default-features = false }
 harmony-platform = { path = "crates/harmony-platform", default-features = false }
 harmony-reticulum = { path = "crates/harmony-reticulum", default-features = false }
 harmony-roxy = { path = "crates/harmony-roxy", default-features = false }

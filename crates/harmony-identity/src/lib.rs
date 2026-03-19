@@ -7,7 +7,7 @@ pub mod pq_identity;
 pub mod ucan;
 
 pub use error::IdentityError;
-pub use identity::{Identity, PrivateIdentity};
+pub use identity::{Identity, IdentityHash, PrivateIdentity};
 pub use pq_identity::{PqIdentity, PqPrivateIdentity};
 pub use ucan::{
     verify_revocation, verify_token, CapabilityType, CryptoSuite, IdentityResolver, PqUcanToken,
