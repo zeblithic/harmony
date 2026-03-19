@@ -17,6 +17,7 @@ pub struct IdentityRef {
 }
 
 impl IdentityRef {
+    /// Create an identity reference from a known hash and crypto suite.
     pub fn new(hash: IdentityHash, suite: CryptoSuite) -> Self {
         Self { hash, suite }
     }
@@ -100,10 +101,12 @@ mod tests {
     }
 
     #[test]
-    fn serde_round_trip() {
-        let id_ref = IdentityRef::new([0xFF; 16], CryptoSuite::MlDsa65);
-        let bytes = postcard::to_allocvec(&id_ref).unwrap();
-        let decoded: IdentityRef = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, id_ref);
+    fn serde_round_trip_both_suites() {
+        for suite in [CryptoSuite::Ed25519, CryptoSuite::MlDsa65] {
+            let id_ref = IdentityRef::new([0xFF; 16], suite);
+            let bytes = postcard::to_allocvec(&id_ref).unwrap();
+            let decoded: IdentityRef = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded, id_ref);
+        }
     }
 }

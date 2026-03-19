@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 /// The cryptographic algorithm suite backing an identity.
 ///
 /// Discriminant values match the UCAN wire format (first byte of token).
+/// Serde encoding is pinned to the `#[repr(u8)]` discriminant via
+/// `TryFrom<u8>` / `Into<u8>`, ensuring wire stability even if variants
+/// are reordered or new ones are inserted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
 #[repr(u8)]
 pub enum CryptoSuite {
     /// Ed25519 signing + X25519 encryption (Reticulum-compatible).
@@ -14,11 +18,32 @@ pub enum CryptoSuite {
     MlDsa65 = 0x01,
 }
 
+impl From<CryptoSuite> for u8 {
+    fn from(s: CryptoSuite) -> u8 {
+        s as u8
+    }
+}
+
+impl TryFrom<u8> for CryptoSuite {
+    type Error = u8;
+
+    fn try_from(b: u8) -> Result<Self, u8> {
+        match b {
+            0x00 => Ok(Self::Ed25519),
+            0x01 => Ok(Self::MlDsa65),
+            other => Err(other),
+        }
+    }
+}
+
 impl CryptoSuite {
+    /// Returns `true` if this suite provides post-quantum security.
     pub fn is_post_quantum(self) -> bool {
         matches!(self, Self::MlDsa65)
     }
 
+    /// Multicodec identifier for the signing algorithm.
+    /// Ed25519 = `0x00ed`, ML-DSA-65 = `0x1211` (draft).
     pub fn signing_multicodec(self) -> u16 {
         match self {
             Self::Ed25519 => 0x00ed,
@@ -26,6 +51,8 @@ impl CryptoSuite {
         }
     }
 
+    /// Multicodec identifier for the encryption/KEM algorithm.
+    /// X25519 = `0x00ec`, ML-KEM-768 = `0x120c` (draft).
     pub fn encryption_multicodec(self) -> u16 {
         match self {
             Self::Ed25519 => 0x00ec,
@@ -33,6 +60,8 @@ impl CryptoSuite {
         }
     }
 
+    /// Construct from a signing multicodec identifier.
+    /// Returns `None` for unknown codes.
     pub fn from_signing_multicodec(code: u16) -> Option<Self> {
         match code {
             0x00ed => Some(Self::Ed25519),
@@ -41,6 +70,8 @@ impl CryptoSuite {
         }
     }
 
+    /// Construct from an encryption multicodec identifier.
+    /// Returns `None` for unknown codes.
     pub fn from_encryption_multicodec(code: u16) -> Option<Self> {
         match code {
             0x00ec => Some(Self::Ed25519),
@@ -49,12 +80,10 @@ impl CryptoSuite {
         }
     }
 
+    /// Construct from the UCAN wire discriminant byte (`0x00` or `0x01`).
+    /// Returns `None` for unknown values.
     pub fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            0x00 => Some(Self::Ed25519),
-            0x01 => Some(Self::MlDsa65),
-            _ => None,
-        }
+        Self::try_from(byte).ok()
     }
 }
 
@@ -119,16 +148,33 @@ mod tests {
     }
 
     #[test]
+    fn try_from_u8_round_trip() {
+        assert_eq!(CryptoSuite::try_from(0x00), Ok(CryptoSuite::Ed25519));
+        assert_eq!(CryptoSuite::try_from(0x01), Ok(CryptoSuite::MlDsa65));
+        assert_eq!(CryptoSuite::try_from(0x02), Err(0x02));
+    }
+
+    #[test]
     fn wire_discriminant_values() {
         assert_eq!(CryptoSuite::Ed25519 as u8, 0x00);
         assert_eq!(CryptoSuite::MlDsa65 as u8, 0x01);
     }
 
     #[test]
-    fn serde_round_trip() {
-        let suite = CryptoSuite::MlDsa65;
-        let bytes = postcard::to_allocvec(&suite).unwrap();
-        let decoded: CryptoSuite = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, suite);
+    fn serde_round_trip_both_variants() {
+        for suite in [CryptoSuite::Ed25519, CryptoSuite::MlDsa65] {
+            let bytes = postcard::to_allocvec(&suite).unwrap();
+            let decoded: CryptoSuite = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded, suite);
+        }
+    }
+
+    #[test]
+    fn serde_encodes_as_discriminant_byte() {
+        // Verify serde encoding matches repr(u8) discriminant, not variant index
+        let bytes = postcard::to_allocvec(&CryptoSuite::Ed25519).unwrap();
+        assert_eq!(bytes, [0x00]);
+        let bytes = postcard::to_allocvec(&CryptoSuite::MlDsa65).unwrap();
+        assert_eq!(bytes, [0x01]);
     }
 }
