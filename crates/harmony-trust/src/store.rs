@@ -37,14 +37,22 @@ impl TrustStore {
         }
     }
 
+    /// Set or update your trust score for an identity.
+    /// Only updates if `now` is strictly newer than the existing timestamp
+    /// (consistent with `receive_edge` staleness semantics).
     pub fn set_score(&mut self, trustee: &IdentityHash, score: TrustScore, now: u64) {
-        self.local_edges.insert(
-            *trustee,
-            LocalEdge {
-                score,
-                updated_at: now,
-            },
-        );
+        match self.local_edges.get(trustee) {
+            Some(existing) if existing.updated_at >= now => {}
+            _ => {
+                self.local_edges.insert(
+                    *trustee,
+                    LocalEdge {
+                        score,
+                        updated_at: now,
+                    },
+                );
+            }
+        }
     }
 
     pub fn remove_score(&mut self, trustee: &IdentityHash) -> Option<TrustScore> {
@@ -111,11 +119,33 @@ impl TrustStore {
         result
     }
 
+    /// The effective trust score for an identity.
+    ///
+    /// Resolution chain:
+    ///   1. Local edge (if exists) — your own subjective assessment wins.
+    ///   2. `TrustScore::UNKNOWN` (0x00).
+    ///
+    /// Received edges are intentionally NOT consulted here. They are stored
+    /// for future EigenTrust transitive computation (separate bead) and can
+    /// be queried directly via `received_score()` / `received_edges_for()`.
+    /// Until the EigenTrust algorithm is implemented, this method reflects
+    /// only your own assessments — consumers that need network-derived trust
+    /// should aggregate received edges themselves.
     pub fn effective_score(&self, trustee: &IdentityHash) -> TrustScore {
         match self.local_score(trustee) {
             Some(score) => score,
             None => TrustScore::UNKNOWN,
         }
+    }
+
+    /// Number of local trust edges.
+    pub fn len(&self) -> usize {
+        self.local_edges.len()
+    }
+
+    /// Whether the store has no local trust edges.
+    pub fn is_empty(&self) -> bool {
+        self.local_edges.is_empty()
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, TrustError> {
@@ -163,10 +193,19 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_local_score() {
+    fn overwrite_local_score_newer_wins() {
         let mut store = TrustStore::new(LOCAL);
         store.set_score(&ALICE, score(1, 1, 1, 1), 1000);
         store.set_score(&ALICE, score(3, 3, 3, 3), 2000);
+        assert_eq!(store.local_score(&ALICE).unwrap(), score(3, 3, 3, 3));
+    }
+
+    #[test]
+    fn set_score_stale_rejected() {
+        let mut store = TrustStore::new(LOCAL);
+        store.set_score(&ALICE, score(3, 3, 3, 3), 2000);
+        // Older timestamp should be rejected
+        store.set_score(&ALICE, score(0, 0, 0, 0), 1000);
         assert_eq!(store.local_score(&ALICE).unwrap(), score(3, 3, 3, 3));
     }
 
@@ -370,6 +409,18 @@ mod tests {
             TrustStore::deserialize(&[0xFF, 0x00]),
             Err(TrustError::DeserializeError(_))
         ));
+    }
+
+    #[test]
+    fn len_and_is_empty() {
+        let mut store = TrustStore::new(LOCAL);
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+        store.set_score(&ALICE, score(1, 1, 1, 1), 1000);
+        assert!(!store.is_empty());
+        assert_eq!(store.len(), 1);
+        store.set_score(&BOB, score(2, 2, 2, 2), 2000);
+        assert_eq!(store.len(), 2);
     }
 
     #[test]
