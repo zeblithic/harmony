@@ -44,6 +44,27 @@ Endorsement) follows the inclusion-exclusion paradox: groups are more
 inclusive when you first ask "who should be kept out?" before "who should
 be included?" This produces better outcomes for community health.
 
+### Identity as MSB Enables Revocation
+
+Identity occupying the most-significant bits serves a second purpose:
+key compromise revocation. If evidence emerges that a key has been
+compromised (e.g., a revocation published by a co-identity or root key),
+the Identity dimension drops to `00` — and because it's the MSB, this
+dominates the numerical score regardless of the other dimensions.
+
+A compromised key with an excellent Compliance/Association/Endorsement
+record is actually the most dangerous — it's a "wolf in sheep's clothing,"
+the first target an attacker would puppet. The good reputation makes the
+compromise MORE threatening, not less. Zeroing the MSBs reflects this:
+the score collapses even if the other dimensions remain high, because
+you can no longer be sure *who* is behind the actions.
+
+Systems that compare trust scores numerically (e.g., thresholds, sorting)
+automatically get revocation-aware behavior: a score of `0b00_11_11_11`
+(0x3F — compromised key, exemplary everything else) sorts below
+`0b01_00_00_00` (0x40 — weakly verified, nothing else). This is the
+correct ordering.
+
 ### Domain-Specific Systems Are Consumers, Not Owners
 
 harmony-mail's SMTP trust metrics, harmony-kitri's execution tiers, and
