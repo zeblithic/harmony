@@ -9,8 +9,16 @@ use crate::record::AnnounceRecord;
 /// 1. Record hasn't expired (`expires_at > now`)
 /// 2. Signature is valid for the included public key and crypto suite
 ///
-/// Address re-derivation (checking that `public_key` matches
-/// `identity_ref.hash`) is deferred to a future version.
+/// # Security
+///
+/// **V1 limitation:** This function does NOT verify that `public_key`
+/// hashes to `identity_ref.hash`. Any actor with a valid keypair can
+/// craft an announce claiming an arbitrary identity address. Callers
+/// MUST NOT rely solely on `verify_announce` to authenticate an
+/// identity — the announce proves the signer controls the included
+/// key, not that the key belongs to the claimed address. Address
+/// re-derivation requires the encryption key (not carried in the
+/// announce) and is deferred to a future version.
 pub fn verify_announce(record: &AnnounceRecord, now: u64) -> Result<(), DiscoveryError> {
     if now >= record.expires_at {
         return Err(DiscoveryError::Expired);

@@ -8,7 +8,7 @@ use crate::verify::verify_announce;
 #[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
     AnnounceReceived { record: AnnounceRecord, now: u64 },
-    QueryReceived { address: IdentityHash, query_id: u64 },
+    QueryReceived { address: IdentityHash, query_id: u64, now: u64 },
     LivelinessChange { address: IdentityHash, alive: bool },
     Tick { now: u64 },
 }
@@ -27,7 +27,6 @@ pub struct DiscoveryManager {
     local_record: Option<AnnounceRecord>,
     known_identities: HashMap<IdentityHash, AnnounceRecord>,
     online: HashSet<IdentityHash>,
-    announcing: bool,
 }
 
 impl Default for DiscoveryManager {
@@ -42,7 +41,6 @@ impl DiscoveryManager {
             local_record: None,
             known_identities: HashMap::new(),
             online: HashSet::new(),
-            announcing: false,
         }
     }
 
@@ -52,7 +50,6 @@ impl DiscoveryManager {
 
     #[must_use]
     pub fn start_announcing(&mut self) -> Vec<DiscoveryAction> {
-        self.announcing = true;
         let mut actions = Vec::new();
         if let Some(record) = self.local_record.clone() {
             actions.push(DiscoveryAction::PublishAnnounce { record });
@@ -63,7 +60,6 @@ impl DiscoveryManager {
 
     #[must_use]
     pub fn stop_announcing(&mut self) -> Vec<DiscoveryAction> {
-        self.announcing = false;
         alloc::vec![DiscoveryAction::SetLiveliness { alive: false }]
     }
 
@@ -82,8 +78,18 @@ impl DiscoveryManager {
             DiscoveryEvent::AnnounceReceived { record, now } => {
                 self.handle_announce(record, now, &mut actions);
             }
-            DiscoveryEvent::QueryReceived { address, query_id } => {
-                let record = self.known_identities.get(&address).cloned();
+            DiscoveryEvent::QueryReceived { address, query_id, now } => {
+                let record = self
+                    .known_identities
+                    .get(&address)
+                    .filter(|r| now < r.expires_at)
+                    .cloned()
+                    .or_else(|| {
+                        self.local_record
+                            .as_ref()
+                            .filter(|r| r.identity_ref.hash == address)
+                            .cloned()
+                    });
                 actions.push(DiscoveryAction::RespondToQuery { query_id, record });
             }
             DiscoveryEvent::LivelinessChange { address, alive } => {
@@ -132,6 +138,9 @@ impl DiscoveryManager {
             .collect();
         for addr in expired {
             self.known_identities.remove(&addr);
+            if self.online.remove(&addr) {
+                actions.push(DiscoveryAction::IdentityOffline { address: addr });
+            }
             actions.push(DiscoveryAction::RecordExpired { address: addr });
         }
     }
@@ -217,12 +226,12 @@ mod tests {
         let builder1 = AnnounceBuilder::new(identity_ref, pk.clone(), 1000, 3000, [0x01; 16]);
         let payload1 = builder1.signable_payload();
         let record1 = builder1.build(private.sign(&payload1).to_vec());
-        mgr.on_event(DiscoveryEvent::AnnounceReceived { record: record1, now: 1500 });
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: record1, now: 1500 });
 
         let builder2 = AnnounceBuilder::new(identity_ref, pk.clone(), 2000, 4000, [0x02; 16]);
         let payload2 = builder2.signable_payload();
         let record2 = builder2.build(private.sign(&payload2).to_vec());
-        mgr.on_event(DiscoveryEvent::AnnounceReceived { record: record2, now: 2500 });
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: record2, now: 2500 });
 
         let cached = mgr.get_record(&identity_ref.hash).unwrap();
         assert_eq!(cached.published_at, 2000);
@@ -239,7 +248,7 @@ mod tests {
         let builder1 = AnnounceBuilder::new(identity_ref, pk.clone(), 2000, 4000, [0x01; 16]);
         let payload1 = builder1.signable_payload();
         let record1 = builder1.build(private.sign(&payload1).to_vec());
-        mgr.on_event(DiscoveryEvent::AnnounceReceived { record: record1, now: 2500 });
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: record1, now: 2500 });
 
         let builder2 = AnnounceBuilder::new(identity_ref, pk.clone(), 1000, 3000, [0x02; 16]);
         let payload2 = builder2.signable_payload();
@@ -256,16 +265,16 @@ mod tests {
         let mut mgr = DiscoveryManager::new();
         let record = build_valid_record(1000, 2000);
         let addr = record.identity_ref.hash;
-        mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
 
-        let actions = mgr.on_event(DiscoveryEvent::QueryReceived { address: addr, query_id: 42 });
+        let actions = mgr.on_event(DiscoveryEvent::QueryReceived { address: addr, query_id: 42, now: 1500 });
         assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::RespondToQuery { query_id: 42, record: Some(_) })));
     }
 
     #[test]
     fn query_received_unknown_identity() {
         let mut mgr = DiscoveryManager::new();
-        let actions = mgr.on_event(DiscoveryEvent::QueryReceived { address: [0xFF; 16], query_id: 99 });
+        let actions = mgr.on_event(DiscoveryEvent::QueryReceived { address: [0xFF; 16], query_id: 99, now: 1500 });
         assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::RespondToQuery { query_id: 99, record: None })));
     }
 
@@ -283,7 +292,7 @@ mod tests {
         let mut mgr = DiscoveryManager::new();
         let record = build_valid_record(1000, 5000);
         let addr = record.identity_ref.hash;
-        mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
 
         let actions = mgr.on_event(DiscoveryEvent::LivelinessChange { address: addr, alive: true });
         assert!(mgr.is_online(&addr));
@@ -294,7 +303,7 @@ mod tests {
     fn liveliness_leave() {
         let mut mgr = DiscoveryManager::new();
         let addr = [0xAA; 16];
-        mgr.on_event(DiscoveryEvent::LivelinessChange { address: addr, alive: true });
+        let _ = mgr.on_event(DiscoveryEvent::LivelinessChange { address: addr, alive: true });
 
         let actions = mgr.on_event(DiscoveryEvent::LivelinessChange { address: addr, alive: false });
         assert!(!mgr.is_online(&addr));
@@ -306,12 +315,59 @@ mod tests {
         let mut mgr = DiscoveryManager::new();
         let record = build_valid_record(1000, 2000);
         let addr = record.identity_ref.hash;
-        mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
         assert!(mgr.get_record(&addr).is_some());
 
         let actions = mgr.on_event(DiscoveryEvent::Tick { now: 3000 });
         assert!(mgr.get_record(&addr).is_none());
         assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::RecordExpired { .. })));
+    }
+
+    #[test]
+    fn tick_evicts_online_state_for_expired_records() {
+        let mut mgr = DiscoveryManager::new();
+        let record = build_valid_record(1000, 2000);
+        let addr = record.identity_ref.hash;
+
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
+        let _ = mgr.on_event(DiscoveryEvent::LivelinessChange { address: addr, alive: true });
+        assert!(mgr.is_online(&addr));
+
+        let actions = mgr.on_event(DiscoveryEvent::Tick { now: 3000 });
+        assert!(!mgr.is_online(&addr));
+        assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::IdentityOffline { .. })));
+        assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::RecordExpired { .. })));
+    }
+
+    #[test]
+    fn query_filters_expired_records() {
+        let mut mgr = DiscoveryManager::new();
+        let record = build_valid_record(1000, 2000);
+        let addr = record.identity_ref.hash;
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
+
+        // Query after expiry but before tick
+        let actions = mgr.on_event(DiscoveryEvent::QueryReceived {
+            address: addr, query_id: 1, now: 3000,
+        });
+        assert!(actions.iter().any(|a| matches!(
+            a, DiscoveryAction::RespondToQuery { query_id: 1, record: None }
+        )));
+    }
+
+    #[test]
+    fn query_returns_local_record() {
+        let mut mgr = DiscoveryManager::new();
+        let record = build_valid_record(1000, 5000);
+        let addr = record.identity_ref.hash;
+        mgr.set_local_record(record);
+
+        let actions = mgr.on_event(DiscoveryEvent::QueryReceived {
+            address: addr, query_id: 1, now: 2000,
+        });
+        assert!(actions.iter().any(|a| matches!(
+            a, DiscoveryAction::RespondToQuery { query_id: 1, record: Some(_) }
+        )));
     }
 
     #[test]
@@ -364,6 +420,7 @@ mod tests {
         let actions = mgr.on_event(DiscoveryEvent::QueryReceived {
             address: identity_ref.hash,
             query_id: 1,
+            now: 2000,
         });
         match &actions[0] {
             DiscoveryAction::RespondToQuery {
@@ -377,15 +434,19 @@ mod tests {
         }
 
         // 4. Liveliness tracks online state
-        mgr.on_event(DiscoveryEvent::LivelinessChange {
+        let _ = mgr.on_event(DiscoveryEvent::LivelinessChange {
             address: identity_ref.hash,
             alive: true,
         });
         assert!(mgr.is_online(&identity_ref.hash));
 
-        // 5. Tick evicts after expiry
+        // 5. Tick evicts after expiry (including online state)
         let actions = mgr.on_event(DiscoveryEvent::Tick { now: 6000 });
         assert!(mgr.get_record(&identity_ref.hash).is_none());
+        assert!(!mgr.is_online(&identity_ref.hash));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DiscoveryAction::IdentityOffline { .. })));
         assert!(actions
             .iter()
             .any(|a| matches!(a, DiscoveryAction::RecordExpired { .. })));
