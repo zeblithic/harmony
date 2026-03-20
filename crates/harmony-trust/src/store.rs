@@ -52,10 +52,7 @@ impl TrustStore {
             .local_edges
             .get(trustee)
             .is_some_and(|e| e.updated_at > now);
-        let dominated_by_tombstone = self
-            .removed_at
-            .get(trustee)
-            .is_some_and(|&t| t > now);
+        let dominated_by_tombstone = self.removed_at.get(trustee).is_some_and(|&t| t > now);
         if dominated_by_active || dominated_by_tombstone {
             return;
         }
