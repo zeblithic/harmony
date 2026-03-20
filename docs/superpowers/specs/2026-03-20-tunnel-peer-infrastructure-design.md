@@ -19,7 +19,7 @@ The design follows Harmony's sans-I/O paradigm: all protocol logic lives in pure
 | Crypto | PQ-first (ML-KEM-768 + ML-DSA-65) | Ed25519 is legacy/Reticulum-compat only; new infra is PQ-native from day 0 |
 | Peer treatment | Dual-path (Reticulum control + Zenoh data) | 500B MTU fine for control plane; data plane needs native QUIC throughput |
 | Relay identity | BLAKE3(ML-DSA-65 pub)[:32] as NodeId | Stock iroh-relay, no fork needed; relay routes by opaque key hash |
-| Handshake | ML-KEM encaps + ML-DSA mutual auth → HKDF-BLAKE3 → ChaCha20-Poly1305 | Simple, PQ-native, no legacy compat needed for new protocol |
+| Handshake | ML-KEM encaps + ML-DSA mutual auth → HKDF-SHA256 → ChaCha20-Poly1305 | Simple, PQ-native, reuses existing HKDF-SHA256 impl |
 | Relay access | Open baseline + reputation bonus | Anyone can bootstrap; trust scores unlock higher limits |
 | Relay domain | `iroh.q8.fyi` | User-owned domain, dedicated to Harmony IP-bridge infrastructure |
 
@@ -31,26 +31,43 @@ Sans-I/O state machine managing authenticated, encrypted tunnels between remote 
 
 ### PQ Handshake (2 messages)
 
+**Precondition:** The initiator must already possess the responder's ML-KEM-768 public key (obtained from a prior AnnounceRecord, contact store entry, or out-of-band exchange). Both peers' ML-KEM public keys are distributed via AnnounceRecords in `harmony-discovery`, not exchanged in the handshake itself.
+
 ```
 Initiator                              Responder
     |                                      |
     |-- TunnelInit ----------------------->|
-    |   ML-KEM-768 encaps ciphertext       |
-    |   ML-DSA-65 public key               |
-    |   ML-DSA-65 signature over above     |
-    |   Nonce (32 bytes)                   |
+    |   ML-KEM-768 ciphertext              |
+    |     (encapsulated to responder's     |
+    |      ML-KEM public key)              |
+    |   Initiator ML-DSA-65 public key     |
+    |   Nonce_i (32 bytes)                 |
+    |   ML-DSA-65 signature over           |
+    |     (ciphertext || pubkey || nonce_i) |
     |                                      |
     |<-------------- TunnelAccept ---------|
-    |   ML-DSA-65 public key               |
+    |   Responder ML-DSA-65 public key     |
+    |   Nonce_r (32 bytes)                 |
     |   ML-DSA-65 signature over           |
-    |     (shared_secret || init_nonce)     |
-    |   Nonce (32 bytes)                   |
+    |     transcript_hash                  |
     |                                      |
     |== Session established ===============|
-    |   Key = HKDF-BLAKE3(shared_secret,   |
-    |         init_nonce || accept_nonce)   |
+    |   transcript_hash =                  |
+    |     BLAKE3(TunnelInit || TunnelAccept |
+    |            fields before signature)  |
+    |   Key material =                     |
+    |     HKDF-SHA256(shared_secret,       |
+    |       salt = nonce_i || nonce_r)     |
+    |   send_key = HKDF-Expand(km, "i2r") |
+    |   recv_key = HKDF-Expand(km, "r2i") |
     |   Cipher = ChaCha20-Poly1305         |
 ```
+
+**Transcript-based signing:** Both parties sign over a transcript hash (`BLAKE3` of all exchanged message fields excluding the signature itself) rather than signing over the shared secret directly. This prevents binding the signing key to the session key material in the signature, preserving forward secrecy properties.
+
+**Directional keys:** HKDF-Expand derives separate send and receive keys using directional labels (`"i2r"` for initiator-to-responder, `"r2i"` for responder-to-initiator). Each direction uses its own ChaCha20-Poly1305 key with an independent incrementing nonce counter starting at 0. This prevents nonce reuse across directions.
+
+**KDF choice:** Uses HKDF-SHA256 (RFC 5869), consistent with the existing implementation in `harmony-crypto`. The BLAKE3 hash is used only for transcript hashing, not for key derivation.
 
 The handshake is purpose-built for tunnel establishment. It does not replace the Reticulum link handshake or Zenoh session handshake — those run on top of the established tunnel for their respective protocol layers.
 
@@ -61,22 +78,26 @@ After handshake, the tunnel carries two frame types over the same encrypted sess
 - **Reticulum frames** (tag `0x01`): Raw Reticulum packets (up to 500 bytes). Fed into the `Node` state machine as `InboundPacket` events on a virtual "tunnel interface."
 - **Zenoh frames** (tag `0x02`): Zenoh protocol messages (arbitrary size, QUIC handles fragmentation). Fed into the `Session` state machine.
 
-**Frame format:**
+**Frame format (plaintext, before encryption):**
 ```
 [1 byte tag] [2 bytes length (big-endian)] [payload]
      ↑              ↑                          ↑
-  0x01/0x02    up to 65535              encrypted content
+  0x00-0x02    up to 65535                 frame data
 ```
 
-All frames are encrypted with the session's ChaCha20-Poly1305 key using an incrementing nonce counter.
+- `0x00` — Keepalive (zero-length payload)
+- `0x01` — Reticulum frame
+- `0x02` — Zenoh frame
+
+**Encryption boundary:** The entire frame (tag + length + payload) is encrypted as a single ChaCha20-Poly1305 AEAD ciphertext. The tunnel runs over QUIC (which provides transport encryption), but the application-layer encryption ensures end-to-end confidentiality even if the relay or QUIC layer is compromised. Each direction uses its own key and independent nonce counter (see Directional keys above).
 
 ### State Machine
 
 ```
-Idle → Initiating → HandshakeWait → Active → Closing → Closed
-                                       ↑         |
-                                       └─────────┘ (reconnect)
+Idle → Initiating → HandshakeWait → Active → Closing → Closed → Idle
 ```
+
+The `TunnelSession` state machine owns transport-level lifecycle only. Reconnection decisions (whether to re-initiate after `Closed`) are made by the `PeerManager` at the peer lifecycle layer, which emits a new `InitiateTunnel` action to transition the session back to `Idle → Initiating`.
 
 **Events consumed:**
 - `InboundBytes(Vec<u8>)` — raw bytes from iroh-net connection
@@ -96,9 +117,11 @@ Idle → Initiating → HandshakeWait → Active → Closing → Closed
 ### Security Properties
 
 - **Forward secrecy:** ML-KEM encapsulation generates a fresh shared secret per session. Compromise of long-term ML-DSA signing keys does not reveal past session keys.
-- **Mutual authentication:** Both peers prove possession of their ML-DSA-65 private key. The responder signs over the shared secret to prove it decapsulated correctly.
-- **Replay protection:** Nonces from both sides are mixed into the session key derivation. ChaCha20-Poly1305 nonce counter prevents replayed frames.
+- **Mutual authentication:** Both peers prove possession of their ML-DSA-65 private key via transcript signatures. The responder's ability to produce a valid transcript hash implicitly proves successful decapsulation.
+- **Replay protection:** Nonces from both sides are mixed into the session key derivation. Per-direction ChaCha20-Poly1305 nonce counters (starting at 0, incrementing) prevent replayed frames.
+- **Keepalive:** Tag `0x00` frames with zero-length payload, sent every 30 seconds. A tunnel is declared dead after 3 consecutive missed keepalives (90 seconds). The `Tick` event drives keepalive sending and timeout checking.
 - **Zeroization:** All ephemeral key material (ML-KEM shared secret, session keys) is zeroized on drop via the `zeroize` crate.
+- **AEAD associated data:** Frame encryption uses the peer's NodeId as AAD (associated authenticated data), binding each ciphertext to the intended tunnel peer and preventing cross-tunnel frame injection.
 
 ## Section 2: iroh-net Integration in `harmony-node`
 
@@ -182,8 +205,8 @@ Public rendezvous/relay for Harmony peers behind different NATs. Runs stock `iro
 | Trusted | Valid UCAN capability token | 10 | 1 MB/s | 120 |
 | Reputation | Trust score ≥ threshold | 25 | 5 MB/s | 300 |
 
-- Rate limiting via a lightweight proxy (nginx or Rust sidecar) in front of `iroh-relay`
-- Proxy extracts NodeId from connection, validates optional UCAN bearer token, maps to tier
+- Rate limiting via a QUIC-aware Rust sidecar wrapping the `iroh-relay` library (nginx cannot inspect QUIC at the application layer). Alternatively, iroh-relay also supports WebSocket transport, which could be proxied by nginx for the rate-limiting tier — but the primary path uses a custom sidecar.
+- Sidecar extracts NodeId from the QUIC connection, validates optional UCAN bearer token, maps to tier
 - Trust score lookups are best-effort/cached; unavailable → baseline tier
 - Per-NodeId tracking prevents Sybil abuse at baseline tier
 
@@ -205,25 +228,32 @@ Extend the PeerManager to handle tunnel peer connections alongside adjacent peer
 
 ### Contact Store Additions (`harmony-contacts`)
 
-`ContactAddress` enum gains a new variant:
+`ContactAddress` is a new enum to be added to `harmony-contacts` (the existing `Contact` struct currently has only `identity_hash: IdentityHash`):
 
 ```
-ContactAddress::Tunnel {
-    node_id: [u8; 32],              // BLAKE3(ML-DSA-65 pub key)
-    relay_url: Option<Url>,          // preferred relay
-    direct_addrs: Vec<SocketAddr>,   // known direct addresses
+enum ContactAddress {
+    Reticulum {
+        destination_hash: [u8; 16],     // Reticulum destination
+    },
+    Tunnel {
+        node_id: [u8; 32],              // BLAKE3(ML-DSA-65 pub key)
+        relay_url: Option<Url>,          // preferred relay (parsed/validated)
+        direct_addrs: Vec<SocketAddr>,   // known direct addresses
+    },
 }
 ```
 
-Existing `ContactAddress::Reticulum { destination_hash }` is unchanged. A contact can have **both** — tunnel for direct QUIC connectivity, Reticulum for mesh-routed fallback.
+Both variants are new. A contact can have **multiple** addresses — tunnel for direct QUIC connectivity, Reticulum for mesh-routed fallback.
+
+**Note:** `ContactAddress` uses `Url` (parsed/validated) for relay URLs, while `RoutingHint::Tunnel` (Section 5) uses `String` (wire format). Conversion happens at the boundary where discovery hints are stored into the contact store.
 
 ### PeerManager State Machine Extension
 
 Existing states remain: `Searching → Connecting → Connected → Disabled`
 
 Transport-aware behavior in the `Connecting` state:
-- Tunnel contacts: emit `InitiateTunnel(node_id, relay_url, direct_addrs)` action
-- Reticulum contacts: emit `InitiateLink(destination_hash)` action (existing)
+- Tunnel contacts: emit `PeerAction::InitiateTunnel(node_id, relay_url, direct_addrs)` — **new variant** added alongside existing `PeerAction::InitiateLink`
+- Reticulum contacts: emit `PeerAction::InitiateLink { identity_hash }` (existing, unchanged)
 - Dual-address contacts: try tunnel first (lower latency), fall back to Reticulum if tunnel fails
 
 New events consumed:
@@ -266,7 +296,7 @@ Extend `harmony-discovery` so peers can advertise their tunnel reachability via 
 
 Existing variants:
 - `RoutingHint::ReticulumDestination(destination_hash)`
-- `RoutingHint::ZenohLocator(locator)` (future)
+- `RoutingHint::Zenoh { locator }` (existing)
 
 New variant:
 ```
@@ -313,7 +343,7 @@ An AnnounceRecord can carry **multiple** routing hints — a peer might be reach
 | 1 | `harmony-tunnel` crate: PQ tunnel state machine | P1 | None | Handshake, encryption, dual-path mux, state machine |
 | 2 | iroh-net integration in `harmony-node` event loop | P1 | #1 | Endpoint setup, connection mgmt, interface registration |
 | 3 | Tunnel peer lifecycle in `harmony-peers` | P2 | #1, #2 | ContactAddress::Tunnel, PeerManager extension, quality tracking |
-| 4 | Tunnel routing hints in `harmony-discovery` | P2 | #1 | RoutingHint::Tunnel, publish/consume hints, freshness |
+| 4 | Tunnel routing hints in `harmony-discovery` | P2 | #1 | RoutingHint::Tunnel, publish/consume hints, freshness. Can be implemented in parallel with #3 (independent at code level, co-dependent at integration level). |
 | 5 | Relay server deployment at `iroh.q8.fyi` | P3 | #2 | Stock iroh-relay, rate limiting proxy, UCAN validation |
 
 ## Implementation Order
