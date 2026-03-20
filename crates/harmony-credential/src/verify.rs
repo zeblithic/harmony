@@ -15,6 +15,13 @@ use crate::status_list::StatusListResolver;
 /// The `issued_at` parameter enables KEL-backed resolvers to return
 /// the key that was active at credential issuance time.
 /// For non-rotatable identities, `issued_at` can be ignored.
+///
+/// **Important:** For `CryptoSuite::MlDsa65Rotatable` issuers, implementations
+/// MUST resolve the historical key that was active at `issued_at` by walking
+/// the issuer's Key Event Log. A static key store is only correct if the
+/// issuer has never rotated keys — after rotation, credentials signed with
+/// the previous key will return `SignatureInvalid` unless the resolver is
+/// KEL-aware.
 pub trait CredentialKeyResolver {
     fn resolve(&self, issuer: &IdentityRef, issued_at: u64) -> Option<Vec<u8>>;
 }
@@ -116,6 +123,11 @@ fn verify_signature(
 }
 
 /// In-memory key resolver for testing.
+///
+/// Ignores `issued_at` — only correct for non-rotatable identities or
+/// rotatable identities that have never rotated. Not suitable for
+/// production use with `MlDsa65Rotatable` issuers that have undergone
+/// key rotation.
 #[cfg(any(test, feature = "test-utils"))]
 pub struct MemoryKeyResolver {
     keys: hashbrown::HashMap<harmony_identity::IdentityHash, Vec<u8>>,
