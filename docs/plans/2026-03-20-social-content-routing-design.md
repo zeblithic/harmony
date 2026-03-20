@@ -75,7 +75,7 @@ When a user subscribes to a Zenoh key expression, the interest
 propagates to all connected peers:
 
 ```
-1. Alice subscribes to harmony/vine/{bob_hex}/**
+1. Alice subscribes to harmony/vines/{bob_hex}/announce/**
 2. Alice's PubSubRouter emits SendSubscriberDeclare
 3. Bob's session receives the declaration
 4. Bob registers Alice's interest in his remote_interest table
@@ -88,30 +88,27 @@ This is standard Zenoh write-side filtering. The social routing
 aspect is that Alice's subscription goes to Bob (her tunnel peer)
 rather than to a global broker. The topology IS the routing.
 
-### Multi-Hop Interest Relay
+### Multi-Hop Interest Relay (Future)
 
-Interest propagation works transitively through tunnel peer chains:
+Transitive interest propagation (Alice → Bob → Carol) is a natural
+extension but requires a relay coordinator that doesn't exist yet.
+Currently `PubSubRouter` manages a single peer-to-peer session and
+does not forward remote interests to other sessions. Multi-hop
+relay is filed as a future bead.
 
-```
-Alice → Bob → Carol
-
-1. Alice subscribes to harmony/vine/{carol_hex}/**
-2. Bob doesn't have Carol's content, but Bob is peered with Carol
-3. Bob's router forwards Alice's interest to Carol
-4. Carol publishes a vine → flows Carol → Bob → Alice
-```
-
-Each hop is a tunnel peer connection. Interest flows along trust
-edges. Content flows back along the same path.
+For now, social routing operates on direct tunnel peer connections
+only. If Alice wants Carol's content and isn't directly peered with
+Carol, Alice peers with Carol (or finds the content via CID from
+any node that has it).
 
 ### What You Subscribe To Defines Your Social Feed
 
 The key expressions you subscribe to determine what content flows
 to you through the social graph:
 
-- `harmony/vine/{friend_hex}/**` — a specific friend's posts
+- `harmony/vines/{friend_hex}/announce/**` — a specific friend's posts
 - `harmony/community/{hub_hex}/**` — a community's feed
-- `harmony/vine/**/announce` — all vine announcements (broad)
+- `harmony/vines/**/announce/**` — all vine announcements (broad)
 - `harmony/profile/*` — all profile updates
 
 The more specific your subscriptions, the more targeted your social
@@ -119,11 +116,11 @@ content flow.
 
 ## Layer 3: Content Availability
 
-Peers broadcast Bloom filters advertising what CIDs they store:
+Peers broadcast availability filters advertising what they store:
 
 ```
-harmony/filters/content/{node_addr}  — "I probably have these CIDs"
-harmony/filters/flatpack/{node_addr} — "I have these content bundles"
+harmony/filters/content/{node_addr}  — Bloom filter: "I probably have these CIDs"
+harmony/filters/flatpack/{node_addr} — Cuckoo filter: "I have these content bundles"
 ```
 
 Before issuing a Zenoh `get()` for a specific CID, a node can check
@@ -167,13 +164,6 @@ StorageTier. Alice checks Bob's Bloom filter and confirms he likely
 has it. Proves Bloom filter broadcasts from tunnel peers enable
 socially-informed content discovery.
 
-**Test 3: Multi-hop interest relay**
-
-Alice → Bob → Carol (two tunnel peer links). Alice subscribes to
-Carol's content. Interest propagates through Bob. When Carol
-publishes, content flows Carol → Bob → Alice. Proves interest
-propagation works transitively through the social graph.
-
 ### No New Crate
 
 The existing infrastructure (`harmony-zenoh`, `harmony-content`,
@@ -196,6 +186,10 @@ harmony-crypto = { path = "crates/harmony-crypto" }
 Tests compose the sans-I/O state machines directly — no live Zenoh
 runtime needed. Events are injected, actions are inspected.
 
+The workspace root currently has no `tests/` directory. The
+implementation will create `tests/social_routing.rs` and add the
+dev-dependencies to the workspace root `Cargo.toml`.
+
 ## Future Beads
 
 - **Friends-first query preference** — when multiple nodes can serve
@@ -209,6 +203,10 @@ runtime needed. Events are injected, actions are inspected.
 - **Bandwidth budgets** — per-peer limits on how much content is
   proactively shared. Prevents a single high-volume peer from
   saturating your connection.
+
+- **Multi-hop interest relay** — relay coordinator that forwards
+  remote interests across tunnel peer sessions, enabling transitive
+  interest propagation (Alice → Bob → Carol).
 
 - **Interest taxonomy** — structured interest categories beyond raw
   key expressions. "I'm interested in music" rather than subscribing
