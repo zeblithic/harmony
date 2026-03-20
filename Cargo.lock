@@ -906,6 +906,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-credential"
+version = "0.1.0"
+dependencies = [
+ "harmony-crypto",
+ "harmony-identity",
+ "hashbrown 0.15.5",
+ "postcard",
+ "rand",
+ "serde",
+]
+
+[[package]]
 name = "harmony-crypto"
 version = "0.1.0"
 dependencies = [
