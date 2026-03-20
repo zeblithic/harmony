@@ -25,6 +25,11 @@ const MAX_CLOCK_SKEW: u64 = 60;
 /// re-derivation requires the encryption key (not carried in the
 /// announce) and is deferred to a future version.
 pub fn verify_announce(record: &AnnounceRecord, now: u64) -> Result<(), DiscoveryError> {
+    // 0. Structural validity — must have a positive validity window
+    if record.published_at >= record.expires_at {
+        return Err(DiscoveryError::Expired);
+    }
+
     // 1. Expiry check
     if now >= record.expires_at {
         return Err(DiscoveryError::Expired);

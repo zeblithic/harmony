@@ -29,6 +29,7 @@ pub enum DiscoveryAction {
 /// Default maximum number of cached identity records.
 const DEFAULT_MAX_CACHE_SIZE: usize = 4096;
 
+#[derive(Debug)]
 pub struct DiscoveryManager {
     local_record: Option<AnnounceRecord>,
     known_identities: HashMap<IdentityHash, AnnounceRecord>,
@@ -147,14 +148,16 @@ impl DiscoveryManager {
             }
             DiscoveryEvent::LivelinessChange { address, alive, now } => {
                 if alive {
-                    self.online.insert(address);
-                    if let Some(record) = self
-                        .known_identities
-                        .get(&address)
-                        .filter(|r| now < r.expires_at)
-                        .cloned()
-                    {
-                        actions.push(DiscoveryAction::IdentityDiscovered { record });
+                    if self.online.insert(address) {
+                        // Newly online — emit IdentityDiscovered if we have a valid record.
+                        if let Some(record) = self
+                            .known_identities
+                            .get(&address)
+                            .filter(|r| now < r.expires_at)
+                            .cloned()
+                        {
+                            actions.push(DiscoveryAction::IdentityDiscovered { record });
+                        }
                     }
                 } else if self.online.remove(&address) {
                     actions.push(DiscoveryAction::IdentityOffline { address });
