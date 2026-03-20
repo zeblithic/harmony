@@ -101,3 +101,10 @@ harmony-semantic = { path = "crates/harmony-semantic", default-features = false 
 harmony-trust = { path = "crates/harmony-trust", default-features = false }
 harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
+
+# Optimized profile for cross-compiled deployment binaries (OpenWRT, RPi).
+# Does not affect normal `--release` builds — use `--profile release-cross`.
+[profile.release-cross]
+inherits = "release"
+strip = true
+lto = "thin"
