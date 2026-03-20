@@ -80,14 +80,20 @@ impl DiscoveryManager {
         self.online.contains(address)
     }
 
-    /// Get a cached announce record, filtered by expiry.
+    /// Get an announce record for an address, filtered by expiry.
     ///
-    /// Returns `None` if no record is cached or if the cached record
-    /// has expired (`now >= expires_at`).
+    /// Prefers `local_record` for the local identity (always
+    /// authoritative), falls back to cached remote records.
+    /// Returns `None` if no valid record exists.
     pub fn get_record(&self, address: &IdentityHash, now: u64) -> Option<&AnnounceRecord> {
-        self.known_identities
-            .get(address)
-            .filter(|r| now < r.expires_at)
+        self.local_record
+            .as_ref()
+            .filter(|r| r.identity_ref.hash == *address && now < r.expires_at)
+            .or_else(|| {
+                self.known_identities
+                    .get(address)
+                    .filter(|r| now < r.expires_at)
+            })
     }
 
     #[must_use]
@@ -167,9 +173,11 @@ impl DiscoveryManager {
             .collect();
         for addr in expired {
             self.known_identities.remove(&addr);
-            if self.online.remove(&addr) {
-                actions.push(DiscoveryAction::IdentityOffline { address: addr });
-            }
+            // NOTE: Do NOT remove from self.online here. The online set tracks
+            // Zenoh liveliness tokens, which are independent of record expiry.
+            // A peer can be alive (liveliness active) while their record has
+            // expired. When they re-announce, handle_announce will cache the
+            // new record and emit IdentityDiscovered (since they're online).
             actions.push(DiscoveryAction::RecordExpired { address: addr });
         }
     }
@@ -394,7 +402,9 @@ mod tests {
     }
 
     #[test]
-    fn tick_evicts_online_state_for_expired_records() {
+    fn tick_preserves_online_state_when_record_expires() {
+        // Liveliness tokens are independent of record expiry. A peer can
+        // be online (liveliness active) while their record has expired.
         let mut mgr = DiscoveryManager::new();
         let record = build_valid_record(1000, 2000);
         let addr = record.identity_ref.hash;
@@ -404,9 +414,10 @@ mod tests {
         assert!(mgr.is_online(&addr));
 
         let actions = mgr.on_event(DiscoveryEvent::Tick { now: 3000 });
-        assert!(!mgr.is_online(&addr));
-        assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::IdentityOffline { .. })));
+        // Record evicted, but peer stays online
+        assert!(mgr.is_online(&addr));
         assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::RecordExpired { .. })));
+        assert!(!actions.iter().any(|a| matches!(a, DiscoveryAction::IdentityOffline { .. })));
     }
 
     #[test]
@@ -566,16 +577,16 @@ mod tests {
         });
         assert!(mgr.is_online(&identity_ref.hash));
 
-        // 5. Tick evicts after expiry (including online state)
+        // 5. Tick evicts record but preserves online state (liveliness independent)
         let actions = mgr.on_event(DiscoveryEvent::Tick { now: 6000 });
         assert!(mgr.get_record(&identity_ref.hash, 6000).is_none());
-        assert!(!mgr.is_online(&identity_ref.hash));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, DiscoveryAction::IdentityOffline { .. })));
+        assert!(mgr.is_online(&identity_ref.hash)); // still online — liveliness independent
         assert!(actions
             .iter()
             .any(|a| matches!(a, DiscoveryAction::RecordExpired { .. })));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, DiscoveryAction::IdentityOffline { .. })));
     }
 
     #[test]

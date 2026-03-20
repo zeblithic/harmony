@@ -34,6 +34,7 @@ pub enum RoutingHint {
 /// Produced by `AnnounceBuilder`. Verified by `verify_announce()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnnounceRecord {
+    pub(crate) format_version: u8,
     pub identity_ref: IdentityRef,
     pub public_key: Vec<u8>,
     pub routing_hints: Vec<RoutingHint>,
@@ -47,7 +48,7 @@ impl AnnounceRecord {
     /// Reconstruct the signable payload bytes (everything except signature).
     pub(crate) fn signable_bytes(&self) -> Vec<u8> {
         let payload = SignablePayload {
-            format_version: FORMAT_VERSION,
+            format_version: self.format_version,
             identity_ref: self.identity_ref,
             public_key: self.public_key.clone(),
             routing_hints: self.routing_hints.clone(),
@@ -61,7 +62,7 @@ impl AnnounceRecord {
     /// Serialize the record to bytes with a format version prefix.
     pub fn serialize(&self) -> Result<Vec<u8>, DiscoveryError> {
         let mut buf = Vec::new();
-        buf.push(FORMAT_VERSION);
+        buf.push(self.format_version);
         let inner = postcard::to_allocvec(self)
             .map_err(|_| DiscoveryError::SerializeError("postcard encode failed"))?;
         buf.extend_from_slice(&inner);
@@ -78,8 +79,10 @@ impl AnnounceRecord {
                 "unsupported format version",
             ));
         }
-        postcard::from_bytes(&data[1..])
-            .map_err(|_| DiscoveryError::DeserializeError("postcard decode failed"))
+        let mut record: Self = postcard::from_bytes(&data[1..])
+            .map_err(|_| DiscoveryError::DeserializeError("postcard decode failed"))?;
+        record.format_version = data[0];
+        Ok(record)
     }
 }
 
@@ -154,6 +157,7 @@ impl AnnounceBuilder {
     /// Finalize with a signature to produce the `AnnounceRecord`.
     pub fn build(self, signature: Vec<u8>) -> AnnounceRecord {
         AnnounceRecord {
+            format_version: FORMAT_VERSION,
             identity_ref: self.identity_ref,
             public_key: self.public_key,
             routing_hints: self.routing_hints,
