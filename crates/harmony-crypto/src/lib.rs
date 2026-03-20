@@ -9,5 +9,7 @@ pub mod hkdf;
 pub mod hybrid_kem;
 pub mod ml_dsa;
 pub mod ml_kem;
+#[cfg(feature = "serde")]
+mod serde_helpers;
 
 pub use error::CryptoError;
