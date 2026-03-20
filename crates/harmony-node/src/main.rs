@@ -1,4 +1,5 @@
 mod compute;
+mod identity_file;
 mod runtime;
 
 use clap::{Parser, Subcommand};
