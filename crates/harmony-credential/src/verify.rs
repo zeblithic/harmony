@@ -246,7 +246,7 @@ mod tests {
         let resolver = setup_resolver(identity, &issuer_ref);
         let mut status = MemoryStatusListResolver::new();
         let mut list = StatusList::new(128);
-        list.revoke(5);
+        list.revoke(5).unwrap();
         status.insert(issuer_ref.hash, list);
 
         assert_eq!(
@@ -424,7 +424,7 @@ mod tests {
 
         // Revoke and verify again
         let mut list = StatusList::new(128);
-        list.revoke(7);
+        list.revoke(7).unwrap();
         let mut status2 = MemoryStatusListResolver::new();
         status2.insert(issuer_ref.hash, list);
 

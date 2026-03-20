@@ -39,14 +39,17 @@ impl StatusList {
         self.bits[byte_idx] & (1 << bit_idx) != 0
     }
 
-    /// Revoke the credential at `index`. No-op if out of bounds.
-    pub fn revoke(&mut self, index: u32) {
+    /// Revoke the credential at `index`.
+    ///
+    /// Returns `IndexOutOfBounds` if the index exceeds this list's capacity.
+    pub fn revoke(&mut self, index: u32) -> Result<(), crate::error::CredentialError> {
         if index >= self.capacity {
-            return;
+            return Err(crate::error::CredentialError::IndexOutOfBounds);
         }
         let byte_idx = (index / 8) as usize;
         let bit_idx = (index % 8) as u8;
         self.bits[byte_idx] |= 1 << bit_idx;
+        Ok(())
     }
 
     /// Total number of credential slots in this list.
@@ -112,7 +115,7 @@ mod tests {
     #[test]
     fn revoke_sets_bit() {
         let mut list = StatusList::new(128);
-        list.revoke(42);
+        list.revoke(42).unwrap();
         assert!(list.is_revoked(42));
         assert!(!list.is_revoked(41));
         assert!(!list.is_revoked(43));
@@ -121,8 +124,8 @@ mod tests {
     #[test]
     fn revoke_is_idempotent() {
         let mut list = StatusList::new(128);
-        list.revoke(10);
-        list.revoke(10);
+        list.revoke(10).unwrap();
+        list.revoke(10).unwrap();
         assert!(list.is_revoked(10));
     }
 
@@ -141,10 +144,10 @@ mod tests {
     #[test]
     fn boundary_indices() {
         let mut list = StatusList::new(16);
-        list.revoke(0);
-        list.revoke(7);
-        list.revoke(8);
-        list.revoke(15);
+        list.revoke(0).unwrap();
+        list.revoke(7).unwrap();
+        list.revoke(8).unwrap();
+        list.revoke(15).unwrap();
         assert!(list.is_revoked(0));
         assert!(list.is_revoked(7));
         assert!(list.is_revoked(8));
@@ -161,19 +164,24 @@ mod tests {
     }
 
     #[test]
-    fn revoke_out_of_bounds_is_noop() {
+    fn revoke_out_of_bounds_returns_error() {
         let mut list = StatusList::new(16);
-        list.revoke(16);
-        list.revoke(9999);
-        assert_eq!(list.capacity(), 16);
+        assert_eq!(
+            list.revoke(16).unwrap_err(),
+            crate::error::CredentialError::IndexOutOfBounds
+        );
+        assert_eq!(
+            list.revoke(9999).unwrap_err(),
+            crate::error::CredentialError::IndexOutOfBounds
+        );
     }
 
     #[test]
     fn serde_round_trip() {
         let mut list = StatusList::new(256);
-        list.revoke(0);
-        list.revoke(100);
-        list.revoke(255);
+        list.revoke(0).unwrap();
+        list.revoke(100).unwrap();
+        list.revoke(255).unwrap();
 
         let bytes = postcard::to_allocvec(&list).unwrap();
         let decoded: StatusList = postcard::from_bytes(&bytes).unwrap();

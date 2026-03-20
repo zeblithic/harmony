@@ -91,6 +91,11 @@ impl Credential {
 ///
 /// Sans-I/O: call `signable_payload()` to get the bytes to sign,
 /// then `build(signature)` to produce the final credential.
+///
+/// **Important:** Do not modify the builder between calling
+/// `signable_payload()` and `build()`. The signature covers the payload
+/// at the time `signable_payload()` was called; any subsequent mutation
+/// will cause signature verification to fail.
 pub struct CredentialBuilder {
     issuer: IdentityRef,
     subject: IdentityRef,
@@ -107,6 +112,11 @@ impl CredentialBuilder {
     ///
     /// `not_before` defaults to `issued_at`. `expires_at` and `nonce` are
     /// required to prevent accidental omission.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `expires_at <= issued_at` (would produce a permanently
+    /// invalid credential).
     pub fn new(
         issuer: IdentityRef,
         subject: IdentityRef,
@@ -114,6 +124,10 @@ impl CredentialBuilder {
         expires_at: u64,
         nonce: [u8; 16],
     ) -> Self {
+        assert!(
+            expires_at > issued_at,
+            "expires_at ({expires_at}) must be > issued_at ({issued_at})"
+        );
         Self {
             issuer,
             subject,
@@ -127,7 +141,16 @@ impl CredentialBuilder {
     }
 
     /// Override the `not_before` timestamp (defaults to `issued_at`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `not_before >= expires_at`.
     pub fn not_before(&mut self, not_before: u64) -> &mut Self {
+        assert!(
+            not_before < self.expires_at,
+            "not_before ({not_before}) must be < expires_at ({})",
+            self.expires_at
+        );
         self.not_before = not_before;
         self
     }
@@ -302,6 +325,26 @@ mod tests {
         assert_eq!(restored.nonce, cred.nonce);
         assert_eq!(restored.signature, cred.signature);
         assert_eq!(restored.content_hash(), cred.content_hash());
+    }
+
+    #[test]
+    #[should_panic(expected = "expires_at")]
+    fn rejects_expires_at_before_issued_at() {
+        CredentialBuilder::new(test_issuer(), test_subject(), 2000, 1000, [0x01; 16]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expires_at")]
+    fn rejects_expires_at_equal_to_issued_at() {
+        CredentialBuilder::new(test_issuer(), test_subject(), 1000, 1000, [0x01; 16]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not_before")]
+    fn rejects_not_before_after_expires_at() {
+        let mut builder =
+            CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
+        builder.not_before(2000);
     }
 
     #[test]
