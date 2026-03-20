@@ -38,7 +38,7 @@ pub enum RoutingHint {
 /// cause downstream verification failures.
 ///
 /// Verified by [`verify_announce()`](crate::verify::verify_announce).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnounceRecord {
     pub identity_ref: IdentityRef,
     pub public_key: Vec<u8>,

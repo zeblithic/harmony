@@ -149,14 +149,20 @@ impl DiscoveryManager {
             DiscoveryEvent::LivelinessChange { address, alive, now } => {
                 if alive {
                     if self.online.insert(address) {
-                        // Newly online — emit IdentityDiscovered if we have a valid record.
-                        if let Some(record) = self
-                            .known_identities
-                            .get(&address)
-                            .filter(|r| now < r.expires_at)
+                        // Prefer local_record for our own identity.
+                        let record = self
+                            .local_record
+                            .as_ref()
+                            .filter(|r| r.identity_ref.hash == address && now < r.expires_at)
                             .cloned()
-                        {
-                            actions.push(DiscoveryAction::IdentityDiscovered { record });
+                            .or_else(|| {
+                                self.known_identities
+                                    .get(&address)
+                                    .filter(|r| now < r.expires_at)
+                                    .cloned()
+                            });
+                        if let Some(r) = record {
+                            actions.push(DiscoveryAction::IdentityDiscovered { record: r });
                         }
                     }
                 } else if self.online.remove(&address) {
@@ -176,14 +182,18 @@ impl DiscoveryManager {
         now: u64,
         actions: &mut Vec<DiscoveryAction>,
     ) {
-        if verify_announce(&record, now).is_err() {
-            return;
-        }
         let addr = record.identity_ref.hash;
+
+        // Fast staleness check before expensive signature verification.
+        // Stale redeliveries are common in pub/sub — skip the crypto.
         if let Some(existing) = self.known_identities.get(&addr) {
             if record.published_at <= existing.published_at {
                 return;
             }
+        }
+
+        if verify_announce(&record, now).is_err() {
+            return;
         }
 
         // Evict oldest record before inserting if cache is full (and this
