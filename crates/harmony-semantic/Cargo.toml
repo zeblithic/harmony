@@ -9,6 +9,7 @@ description = "Harmony Semantic Index — binary vector embeddings, sidecar form
 
 [features]
 default = ["std"]
+no-neon = ["harmony-crypto/no-neon"]
 std = [
     "harmony-crypto/std",
     "serde/std",

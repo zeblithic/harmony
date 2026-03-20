@@ -9,6 +9,7 @@ description = "Self-sovereign content licensing primitives for the Harmony decen
 
 [features]
 default = ["std"]
+no-neon = ["harmony-crypto/no-neon"]
 std = [
     "harmony-crypto/std",
     "harmony-identity/std",

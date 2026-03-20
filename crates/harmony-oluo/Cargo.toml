@@ -9,6 +9,7 @@ description = "Oluo — Harmony's semantic search engine (adaptive-depth trie, s
 
 [features]
 default = ["std"]
+no-neon = ["harmony-crypto/no-neon"]
 std = [
     "harmony-semantic/std",
     "harmony-crypto/std",

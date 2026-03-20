@@ -9,6 +9,7 @@ description = "Kitri — Harmony's native programming model for durable distribu
 
 [features]
 default = ["std"]
+no-neon = ["harmony-crypto/no-neon"]
 std = [
     "harmony-crypto/std",
     "serde/std",

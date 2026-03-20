@@ -7,6 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Durable execution orchestration with event-sourced history for the Harmony decentralized stack"
 
+[features]
+no-neon = ["harmony-crypto/no-neon"]
+
 [dependencies]
 harmony-compute.workspace = true
 harmony-crypto = { workspace = true, features = ["std"] }
