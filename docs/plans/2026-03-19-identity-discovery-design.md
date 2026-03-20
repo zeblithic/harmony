@@ -59,8 +59,8 @@ All identity discovery operates under `harmony/identity/`:
 harmony/identity/{address_hex}/announce    — pub/sub announce channel
 harmony/identity/{address_hex}/resolve     — queryable endpoint
 harmony/identity/{address_hex}/alive       — liveliness token
-harmony/identity/**/announce               — subscribe to all announces
-harmony/identity/**/alive                  — subscribe to all presence
+harmony/identity/*/announce                — subscribe to all announces
+harmony/identity/*/alive                   — subscribe to all presence
 ```
 
 Where `{address_hex}` is the 32-char lowercase hex encoding of the
@@ -72,7 +72,7 @@ payload.
 ### Announce (Pub/Sub)
 
 Identities publish `AnnounceRecord` when they come online or their
-metadata changes. Subscribers matching `harmony/identity/**/announce`
+metadata changes. Subscribers matching `harmony/identity/*/announce`
 receive all announces; subscribers matching a specific address receive
 updates for that identity only.
 
@@ -176,12 +176,19 @@ options:
 2. Skip the address derivation check for now and rely on signature
    validity alone
 
-Option 2 is acceptable for V1: if the signature verifies against
-`public_key`, the announcer demonstrably controls the private key
-corresponding to that public key. The address hash is a convenient
-routing identifier but not a security boundary — the signature is.
-A future enhancement can add the encryption key for full address
-re-derivation if needed.
+Option 2 is acceptable for V1 and applies uniformly to all crypto
+suites. For Ed25519, re-derivation requires the X25519 encryption key
+(not carried). For `MlDsa65`, it requires the ML-KEM-768 encryption
+key (not carried). For `MlDsa65Rotatable`, the address is derived
+from the inception event payload — fundamentally impossible to
+re-derive from the current public key alone.
+
+If the signature verifies against `public_key`, the announcer
+demonstrably controls the private key corresponding to that public
+key. The address hash is a convenient routing identifier but not a
+security boundary — the signature is. A future enhancement can add
+the encryption key for full address re-derivation for non-rotatable
+suites if needed.
 
 ## AnnounceBuilder
 
@@ -236,7 +243,7 @@ pub struct DiscoveryManager {
 ```rust
 pub enum DiscoveryEvent {
     /// Received a published announce from the network
-    AnnounceReceived { record: AnnounceRecord },
+    AnnounceReceived { record: AnnounceRecord, now: u64 },
     /// Someone queried us for an identity's record
     QueryReceived { address: IdentityHash, query_id: u64 },
     /// Liveliness change from Zenoh
@@ -346,15 +353,23 @@ Key expression builders added to `namespace.rs` for the
 `harmony/identity/` namespace:
 
 ```rust
+/// Subscribe to all identity announces.
+pub const IDENTITY_ALL_ANNOUNCES: &str = "harmony/identity/*/announce";
+/// Subscribe to all identity presence changes.
+pub const IDENTITY_ALL_ALIVE: &str = "harmony/identity/*/alive";
+
+/// Build a key expression for a specific identity's announce channel.
 pub fn identity_announce_key(address_hex: &str) -> String { ... }
+/// Build a key expression for a specific identity's resolve endpoint.
 pub fn identity_resolve_key(address_hex: &str) -> String { ... }
+/// Build a key expression for a specific identity's liveliness token.
 pub fn identity_alive_key(address_hex: &str) -> String { ... }
-pub fn identity_all_announces() -> &'static str { ... }
-pub fn identity_all_alive() -> &'static str { ... }
 ```
 
-No logic changes — just new key expression patterns alongside the
-existing tiers.
+Wildcard patterns are `const` values (matching existing conventions
+like `reticulum::ANNOUNCE_SUB`). Per-identity key expressions are
+builder functions that take the address hex string. No logic changes
+— just new key expression patterns alongside the existing tiers.
 
 ### harmony-peers
 
@@ -393,6 +408,7 @@ harmony-discovery/
 ```toml
 [dependencies]
 ed25519-dalek = { workspace = true }
+hashbrown = { workspace = true }
 harmony-crypto = { workspace = true, features = ["serde"] }
 harmony-identity = { workspace = true }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
@@ -400,17 +416,15 @@ postcard = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
-hashbrown = { workspace = true }
 
 [features]
 default = ["std"]
 std = ["harmony-identity/std", "harmony-crypto/std", "postcard/use-std", "serde/std"]
-test-utils = ["hashbrown"]
-
-[dependencies.hashbrown]
-workspace = true
-optional = true
 ```
+
+`hashbrown` is a non-optional runtime dependency because
+`DiscoveryManager` uses `HashMap` and `HashSet` for its internal
+state.
 
 No dependency on `harmony-zenoh` — the key expression builders live
 in `harmony-zenoh` but `harmony-discovery` doesn't import them. The
