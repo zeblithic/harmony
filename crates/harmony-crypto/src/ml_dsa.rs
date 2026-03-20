@@ -77,7 +77,7 @@ impl serde::Serialize for MlDsaPublicKey {
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for MlDsaPublicKey {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes: alloc::vec::Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+        let bytes = deserializer.deserialize_byte_buf(crate::serde_helpers::BytesOrSeqVisitor)?;
         Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }
@@ -177,7 +177,7 @@ impl serde::Serialize for MlDsaSignature {
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for MlDsaSignature {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes: alloc::vec::Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+        let bytes = deserializer.deserialize_byte_buf(crate::serde_helpers::BytesOrSeqVisitor)?;
         Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }

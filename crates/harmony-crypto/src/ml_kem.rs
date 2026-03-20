@@ -75,7 +75,7 @@ impl serde::Serialize for MlKemPublicKey {
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for MlKemPublicKey {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes: alloc::vec::Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+        let bytes = deserializer.deserialize_byte_buf(crate::serde_helpers::BytesOrSeqVisitor)?;
         Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }
