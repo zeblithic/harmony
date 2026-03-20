@@ -31,7 +31,7 @@ pub enum RoutingHint {
 /// A signed announce record that advertises an identity's presence and
 /// reachability on the network.
 ///
-/// Produced by `AnnounceBuilder`. Verified by `AnnounceVerifier`.
+/// Produced by `AnnounceBuilder`. Verified by `verify_announce()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnnounceRecord {
     pub identity_ref: IdentityRef,
