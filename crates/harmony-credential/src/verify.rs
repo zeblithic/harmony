@@ -81,14 +81,14 @@ fn verify_signature(
                 .try_into()
                 .map_err(|_| CredentialError::SignatureInvalid)?;
             let identity = harmony_identity::Identity::from_public_bytes(key_bytes)
-                .map_err(|_| CredentialError::IssuerNotFound)?;
+                .map_err(|_| CredentialError::SignatureInvalid)?;
             identity
                 .verify(message, &sig)
                 .map_err(|_| CredentialError::SignatureInvalid)
         }
         CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => {
             let pk = harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(key_bytes)
-                .map_err(|_| CredentialError::IssuerNotFound)?;
+                .map_err(|_| CredentialError::SignatureInvalid)?;
             let sig = harmony_crypto::ml_dsa::MlDsaSignature::from_bytes(signature)
                 .map_err(|_| CredentialError::SignatureInvalid)?;
             harmony_crypto::ml_dsa::verify(&pk, message, &sig)
