@@ -25,7 +25,8 @@ postcard ecosystem. Key features:
 4. **Any-identity issuance** — Ed25519, ML-DSA-65, or rotatable (KEL)
    identities can all issue; `CryptoSuite` tag enables consumer policy
 
-W3C JSON-LD interop is explicitly out of scope — filed as a future bead.
+W3C JSON-LD interop is explicitly out of scope — filed as future bead
+harmony-8ws.
 
 ## Design Philosophy
 
@@ -42,8 +43,8 @@ like "only accept age claims from issuers with Identity dimension >= 2."
 Following the established Harmony pattern, all operations are pure
 functions. Signing is the caller's responsibility (builder produces
 signable payload, caller signs externally). Verification uses trait-based
-resolution for identity lookup and revocation checking. No I/O, no
-async, no runtime coupling.
+resolution for key lookup and revocation checking. No I/O, no async, no
+runtime coupling.
 
 ### Strict UCAN Separation
 
@@ -52,8 +53,8 @@ async, no runtime coupling.
 
 These are complementary systems with no overlap. A UCAN grants permission
 to act; a credential proves an attribute. They share infrastructure
-(`IdentityRef`, `IdentityResolver`, `CryptoSuite`) but have distinct
-semantics and verification flows.
+(`IdentityRef`, `CryptoSuite`) but have distinct semantics and
+verification flows.
 
 ## Claim Model
 
@@ -107,8 +108,8 @@ but not the content of undisclosed claims.
 
 ```rust
 pub struct Credential {
-    pub issuer: IdentityRef,            // who signed this (17 bytes)
-    pub subject: IdentityRef,           // who this is about (17 bytes)
+    pub issuer: IdentityRef,            // who signed this
+    pub subject: IdentityRef,           // who this is about
     pub claim_digests: Vec<[u8; 32]>,   // BLAKE3 hashes of salted claims
     pub status_list_index: Option<u32>, // revocation index (if revocable)
     pub not_before: u64,                // unix timestamp
@@ -126,7 +127,8 @@ pub struct Credential {
   algorithm to use.
 
 - **`issued_at`** — needed for rotatable issuers (KEL-backed). The
-  verifier must determine which signing key was active at issuance time.
+  verifier passes this to the key resolver so it can determine which
+  signing key was active at issuance time. See Key Resolution below.
 
 - **`status_list_index`** — `Option` because not all credentials need
   revocation. Short-lived credentials may rely solely on expiry.
@@ -137,10 +139,29 @@ pub struct Credential {
 - **`signature`** — variable-length to support Ed25519 (64 bytes) and
   ML-DSA-65 (3309 bytes). The `issuer.suite` disambiguates.
 
+### Self-Issued Credentials
+
+Credentials where `issuer == subject` are allowed with no special
+handling. This supports self-sovereign identity claims (e.g., an
+identity asserting its own metadata). Verification follows the same
+path — the signature is still checked against the issuer's key.
+
+### Content Hash
+
+```rust
+impl Credential {
+    /// BLAKE3 hash of the signable payload. Stable identifier for this
+    /// credential, usable for indexing, deduplication, and future
+    /// delegation chain references.
+    pub fn content_hash(&self) -> [u8; 32] { ... }
+}
+```
+
 ### Signable Payload
 
-Everything except `signature`, serialized with postcard. The issuer signs
-this payload; the verifier reconstructs and checks the signature.
+Everything except `signature`, serialized canonically with postcard.
+The issuer signs this payload; the verifier reconstructs and checks
+the signature.
 
 ### Serialization
 
@@ -162,6 +183,55 @@ pub struct Presentation {
 Verification checks that each disclosed claim's digest appears in
 `credential.claim_digests`. No duplicate disclosures are allowed.
 
+### Known Limitation: Presentation Replay
+
+The `Presentation` struct has no verifier binding or challenge-response
+nonce. A presentation intercepted in transit could be replayed to a
+different verifier. The credential's `nonce` is issuer-set, not
+verifier-set. This is acceptable for V1 — adding a verifier challenge
+field is a straightforward future enhancement if needed.
+
+## Key Resolution
+
+### The Problem
+
+The existing `IdentityResolver` trait in `harmony-identity` returns
+`Option<Identity>`, where `Identity` is Ed25519-only. Credential
+verification must support all three crypto suites: Ed25519, ML-DSA-65,
+and ML-DSA-65 with key rotation (KEL).
+
+### Solution: Credential-Specific Resolver Trait
+
+Rather than modifying `harmony-identity`, the credential crate defines
+its own resolver trait that returns raw public key bytes for any suite:
+
+```rust
+/// Resolve an issuer's signing public key for credential verification.
+///
+/// The `issued_at` parameter enables KEL-backed resolvers to return
+/// the signing key that was active at credential issuance time.
+/// For non-rotatable identities, `issued_at` can be ignored.
+pub trait CredentialKeyResolver {
+    fn resolve(&self, issuer: &IdentityRef, issued_at: u64) -> Option<Vec<u8>>;
+}
+```
+
+The `CryptoSuite` in `issuer` tells the verification function which
+algorithm to use. The resolver just provides the raw key bytes —
+Ed25519 (32B), ML-DSA-65 (1952B), or the historical ML-DSA-65 key
+from a KEL.
+
+**Why not modify `IdentityResolver`?** It's used by UCAN verification
+and other consumers. Changing its return type would be a breaking change
+across the workspace. The credential-specific trait is additive and
+focused.
+
+**KEL integration note:** `KeyEventLog` currently exposes only
+`current_signing_key()`. A `CredentialKeyResolver` implementation for
+KEL-backed identities would need to walk the event chain to find the
+key active at `issued_at`. This is a consumer implementation concern —
+the credential crate defines the trait, not the KEL integration.
+
 ## Bitstring Status List
 
 Each issuer manages their own revocation bitfield. A credential
@@ -182,9 +252,17 @@ impl StatusList {
 
 ### Resolution Trait
 
+Following the `RevocationSet` pattern from UCANs (which answers a
+yes/no question rather than returning borrowed data), the status list
+resolver provides a direct query interface:
+
 ```rust
+/// Check whether a credential has been revoked.
+///
+/// Returns `Some(true)` if revoked, `Some(false)` if valid,
+/// `None` if the issuer's status list could not be resolved.
 pub trait StatusListResolver {
-    fn resolve(&self, issuer: &IdentityRef) -> Option<&StatusList>;
+    fn is_revoked(&self, issuer: &IdentityRef, index: u32) -> Option<bool>;
 }
 ```
 
@@ -205,18 +283,19 @@ decentralized mesh.
 pub fn verify_credential(
     credential: &Credential,
     now: u64,
-    identities: &impl IdentityResolver,
+    keys: &impl CredentialKeyResolver,
     status_lists: &impl StatusListResolver,
 ) -> Result<(), CredentialError>
 ```
 
 **Steps, in order:**
 1. **Time bounds** — `not_before <= now < expires_at`
-2. **Issuer resolution** — look up issuer's public key via `IdentityResolver`
+2. **Issuer resolution** — look up issuer's public key via
+   `CredentialKeyResolver`, passing `credential.issued_at`
 3. **Signature verification** — reconstruct signable payload, verify
    against issuer's key using algorithm from `issuer.suite`
-4. **Revocation check** — if `status_list_index` is `Some(idx)`, resolve
-   issuer's `StatusList` and check `is_revoked(idx)`
+4. **Revocation check** — if `status_list_index` is `Some(idx)`, call
+   `status_lists.is_revoked(issuer, idx)`
 
 ### Presentation Verification
 
@@ -224,7 +303,7 @@ pub fn verify_credential(
 pub fn verify_presentation(
     presentation: &Presentation,
     now: u64,
-    identities: &impl IdentityResolver,
+    keys: &impl CredentialKeyResolver,
     status_lists: &impl StatusListResolver,
 ) -> Result<(), CredentialError>
 ```
@@ -246,10 +325,14 @@ pub enum CredentialError {
     StatusListNotFound,
     DisclosureMismatch,
     DuplicateDisclosure,
+    IndexOutOfBounds,
     SerializeError(&'static str),
     DeserializeError(&'static str),
 }
 ```
+
+Implements `Display` and `std::error::Error` (under `std` feature),
+following the pattern in `KelError` and `TrustError`.
 
 ## Issuance API
 
@@ -269,11 +352,19 @@ pub struct CredentialBuilder {
 }
 
 impl CredentialBuilder {
-    pub fn new(issuer: IdentityRef, subject: IdentityRef, issued_at: u64) -> Self { ... }
+    /// All time bounds are required at construction.
+    /// `not_before` defaults to `issued_at`; `expires_at` must be > `not_before`.
+    pub fn new(
+        issuer: IdentityRef,
+        subject: IdentityRef,
+        issued_at: u64,
+        expires_at: u64,
+        nonce: [u8; 16],
+    ) -> Self { ... }
+
+    pub fn not_before(&mut self, not_before: u64) -> &mut Self { ... }
     pub fn add_claim(&mut self, type_id: u16, value: Vec<u8>, salt: [u8; 16]) -> &mut Self { ... }
     pub fn status_list_index(&mut self, index: u32) -> &mut Self { ... }
-    pub fn time_bounds(&mut self, not_before: u64, expires_at: u64) -> &mut Self { ... }
-    pub fn nonce(&mut self, nonce: [u8; 16]) -> &mut Self { ... }
 
     /// Produce the signable payload bytes.
     pub fn signable_payload(&self) -> Vec<u8> { ... }
@@ -283,6 +374,10 @@ impl CredentialBuilder {
     pub fn build(self, signature: Vec<u8>) -> (Credential, Vec<SaltedClaim>) { ... }
 }
 ```
+
+`not_before` defaults to `issued_at` when not explicitly set.
+`expires_at` and `nonce` are required constructor parameters to prevent
+accidental omission.
 
 ## Crate Structure
 
@@ -307,7 +402,6 @@ harmony-identity = { path = "../harmony-identity", default-features = false }
 harmony-crypto = { path = "../harmony-crypto", default-features = false, features = ["serde"] }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 postcard = { workspace = true }
-hashbrown = { workspace = true }  # for test-utils HashMap
 
 [dev-dependencies]
 postcard = { workspace = true }
@@ -316,7 +410,11 @@ rand = { workspace = true }
 [features]
 default = ["std"]
 std = ["harmony-identity/std", "harmony-crypto/std", "serde/std", "postcard/use-std"]
-test-utils = ["hashbrown/serde"]
+test-utils = ["hashbrown"]
+
+[dependencies.hashbrown]
+workspace = true
+optional = true
 ```
 
 ### Re-exports (lib.rs)
@@ -327,16 +425,20 @@ pub use credential::{Credential, CredentialBuilder};
 pub use disclosure::Presentation;
 pub use error::CredentialError;
 pub use status_list::{StatusList, StatusListResolver};
-pub use verify::{verify_credential, verify_presentation};
+pub use verify::{verify_credential, verify_presentation, CredentialKeyResolver};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use status_list::MemoryStatusListResolver;
+#[cfg(any(test, feature = "test-utils"))]
+pub use verify::MemoryKeyResolver;
 ```
 
 ## Changes to Existing Crates
 
 None. This is a new additive crate. All dependencies (`IdentityRef`,
-`IdentityResolver`, `CryptoSuite`, BLAKE3, ML-DSA-65) already exist.
+`CryptoSuite`, BLAKE3, ML-DSA-65) already exist. The new
+`CredentialKeyResolver` trait replaces `IdentityResolver` usage,
+avoiding changes to `harmony-identity`.
 
 ## Testing Strategy
 
@@ -347,8 +449,10 @@ None. This is a new additive crate. All dependencies (`IdentityRef`,
 
 ### Credential tests
 - Builder produces valid credential with correct digest count
-- `signable_payload()` is deterministic (same inputs → same bytes)
+- `signable_payload()` is deterministic (same inputs -> same bytes)
+- `content_hash()` is deterministic
 - Serde round-trip preserves all fields
+- Self-issued credential (`issuer == subject`) builds and verifies
 
 ### Presentation tests
 - Disclosing all claims succeeds
@@ -365,6 +469,7 @@ None. This is a new additive crate. All dependencies (`IdentityRef`,
 - Tampered signature rejected
 - Revoked credential rejected
 - Missing status list for revocable credential rejected
+- Non-revocable credential skips status list check
 
 ### StatusList tests
 - New list has all bits unset
@@ -375,13 +480,15 @@ None. This is a new additive crate. All dependencies (`IdentityRef`,
 - Custom capacity works
 
 ### Integration tests
-- Full flow: build credential → create presentation → verify presentation
+- Full flow: build credential -> create presentation -> verify
 - Both Ed25519 and ML-DSA-65 issuer paths
 - Revocation after issuance
 
 ## Future Beads
 
-- **W3C JSON-LD bridge** — optional `std` feature for JSON-LD
-  serialization, DID-based identifiers, external VC wallet interop
-- **Credential delegation chains** — optional `proof` field referencing
-  parent credentials, chain verification, attenuation rules
+- **harmony-8ws:** W3C JSON-LD bridge — optional `std` feature for
+  JSON-LD serialization, DID-based identifiers, external VC wallet
+  interop
+- **harmony-2fs:** Credential delegation chains — optional `proof`
+  field referencing parent credentials, chain verification, attenuation
+  rules
