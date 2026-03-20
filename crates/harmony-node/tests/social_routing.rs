@@ -64,7 +64,7 @@ fn active_session_pair() -> (Session, Session) {
 /// graph topology (who you're peered with) determines who gets your
 /// publications.
 #[test]
-fn vine_interest_propagates_through_tunnel_peer() {
+fn vine_interest_filtering_on_publisher_side() {
     let (mut alice_session, _bob_session) = active_session_pair();
     let mut bob_router = PubSubRouter::new();
 
@@ -183,17 +183,18 @@ fn bloom_filter_enables_social_content_discovery() {
         _ => None,
     });
 
-    if let Some(payload) = filter_payload {
-        // Alice receives and deserializes the Bloom filter
-        let filter =
-            harmony_content::bloom::BloomFilter::from_bytes(&payload).expect("valid Bloom filter");
+    let payload = filter_payload
+        .expect("FilterTimerTick should emit BroadcastFilter after mutation_threshold=1");
 
-        // Alice checks: does Bob likely have my CID?
-        assert!(
-            filter.may_contain(&cid),
-            "Bloom filter should indicate Bob likely has the CID"
-        );
-    }
+    // Alice receives and deserializes the Bloom filter
+    let filter =
+        harmony_content::bloom::BloomFilter::from_bytes(&payload).expect("valid Bloom filter");
+
+    // Alice checks: does Bob likely have my CID?
+    assert!(
+        filter.may_contain(&cid),
+        "Bloom filter should indicate Bob likely has the CID"
+    );
 
     // Alice queries Bob for the content — should get a reply
     let query_actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });

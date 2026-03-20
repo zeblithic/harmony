@@ -146,7 +146,7 @@ Harmony as an emergent property of existing systems.
 
 ### Integration Tests
 
-Top-level workspace integration tests (`tests/social_routing.rs`)
+Integration tests in `crates/harmony-node/tests/social_routing.rs`
 that prove the composition works by exercising the sans-I/O state
 machines together:
 
