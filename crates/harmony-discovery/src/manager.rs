@@ -80,8 +80,14 @@ impl DiscoveryManager {
         self.online.contains(address)
     }
 
-    pub fn get_record(&self, address: &IdentityHash) -> Option<&AnnounceRecord> {
-        self.known_identities.get(address)
+    /// Get a cached announce record, filtered by expiry.
+    ///
+    /// Returns `None` if no record is cached or if the cached record
+    /// has expired (`now >= expires_at`).
+    pub fn get_record(&self, address: &IdentityHash, now: u64) -> Option<&AnnounceRecord> {
+        self.known_identities
+            .get(address)
+            .filter(|r| now < r.expires_at)
     }
 
     #[must_use]
@@ -216,7 +222,7 @@ mod tests {
         let record = build_valid_record(1000, 2000);
         let addr = record.identity_ref.hash;
         let actions = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: record.clone(), now: 1500 });
-        assert!(mgr.get_record(&addr).is_some());
+        assert!(mgr.get_record(&addr, 1500).is_some());
         assert!(actions.is_empty());
     }
 
@@ -241,7 +247,7 @@ mod tests {
         let record = build_invalid_record();
         let addr = record.identity_ref.hash;
         let actions = mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
-        assert!(mgr.get_record(&addr).is_none());
+        assert!(mgr.get_record(&addr, 1500).is_none());
         assert!(actions.is_empty());
     }
 
@@ -251,7 +257,7 @@ mod tests {
         let record = build_valid_record(1000, 2000);
         let addr = record.identity_ref.hash;
         let actions = mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 3000 });
-        assert!(mgr.get_record(&addr).is_none());
+        assert!(mgr.get_record(&addr, 1500).is_none());
         assert!(actions.is_empty());
     }
 
@@ -273,7 +279,7 @@ mod tests {
         let record2 = builder2.build(private.sign(&payload2).to_vec());
         let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: record2, now: 2500 });
 
-        let cached = mgr.get_record(&identity_ref.hash).unwrap();
+        let cached = mgr.get_record(&identity_ref.hash, 2500).unwrap();
         assert_eq!(cached.published_at, 2000);
     }
 
@@ -295,7 +301,7 @@ mod tests {
         let record2 = builder2.build(private.sign(&payload2).to_vec());
         let actions = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: record2, now: 2500 });
 
-        let cached = mgr.get_record(&identity_ref.hash).unwrap();
+        let cached = mgr.get_record(&identity_ref.hash, 2500).unwrap();
         assert_eq!(cached.published_at, 2000);
         assert!(actions.is_empty());
     }
@@ -371,10 +377,10 @@ mod tests {
         let record = build_valid_record(1000, 2000);
         let addr = record.identity_ref.hash;
         let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
-        assert!(mgr.get_record(&addr).is_some());
+        assert!(mgr.get_record(&addr, 1500).is_some());
 
         let actions = mgr.on_event(DiscoveryEvent::Tick { now: 3000 });
-        assert!(mgr.get_record(&addr).is_none());
+        assert!(mgr.get_record(&addr, 1500).is_none());
         assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::RecordExpired { .. })));
     }
 
@@ -484,7 +490,7 @@ mod tests {
             now: 2000,
         });
         assert!(actions.is_empty());
-        assert!(mgr.get_record(&identity_ref.hash).is_some());
+        assert!(mgr.get_record(&identity_ref.hash, 2000).is_some());
 
         // 3. Query for it
         let actions = mgr.on_event(DiscoveryEvent::QueryReceived {
@@ -513,7 +519,7 @@ mod tests {
 
         // 5. Tick evicts after expiry (including online state)
         let actions = mgr.on_event(DiscoveryEvent::Tick { now: 6000 });
-        assert!(mgr.get_record(&identity_ref.hash).is_none());
+        assert!(mgr.get_record(&identity_ref.hash, 6000).is_none());
         assert!(!mgr.is_online(&identity_ref.hash));
         assert!(actions
             .iter()
@@ -546,6 +552,6 @@ mod tests {
         });
         // Peer not online, so announce caches silently
         assert!(actions.is_empty());
-        assert!(mgr.get_record(&identity_ref.hash).is_some());
+        assert!(mgr.get_record(&identity_ref.hash, 2000).is_some());
     }
 }

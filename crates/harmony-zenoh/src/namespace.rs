@@ -377,16 +377,25 @@ pub mod identity {
     pub const ALL_ALIVE: &str = "harmony/identity/*/alive";
 
     /// Key expression for a specific identity's announce channel.
+    ///
+    /// `address_hex` must be the 32-character lowercase hex encoding of
+    /// the 16-byte `IdentityHash` (e.g. `"aa00bb11cc22dd33ee44ff5566778899"`).
     pub fn announce_key(address_hex: &str) -> String {
         format!("{PREFIX}/{address_hex}/announce")
     }
 
     /// Key expression for a specific identity's resolve endpoint.
+    ///
+    /// `address_hex` must be the 32-character lowercase hex encoding of
+    /// the 16-byte `IdentityHash`.
     pub fn resolve_key(address_hex: &str) -> String {
         format!("{PREFIX}/{address_hex}/resolve")
     }
 
     /// Key expression for a specific identity's liveliness token.
+    ///
+    /// `address_hex` must be the 32-character lowercase hex encoding of
+    /// the 16-byte `IdentityHash`.
     pub fn alive_key(address_hex: &str) -> String {
         format!("{PREFIX}/{address_hex}/alive")
     }
