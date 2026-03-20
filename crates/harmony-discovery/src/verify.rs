@@ -3,11 +3,15 @@ use harmony_identity::CryptoSuite;
 use crate::error::DiscoveryError;
 use crate::record::AnnounceRecord;
 
-/// Verify an announce record's signature and expiry.
+/// Maximum allowed clock skew for announce timestamps (60 seconds).
+const MAX_CLOCK_SKEW: u64 = 60;
+
+/// Verify an announce record's signature and time bounds.
 ///
 /// Checks:
-/// 1. Record hasn't expired (`expires_at > now`)
-/// 2. Signature is valid for the included public key and crypto suite
+/// 1. Record hasn't expired (`now < expires_at`)
+/// 2. Record isn't future-stamped (`published_at <= now + MAX_CLOCK_SKEW`)
+/// 3. Signature is valid for the included public key and crypto suite
 ///
 /// # Security
 ///
@@ -20,7 +24,14 @@ use crate::record::AnnounceRecord;
 /// re-derivation requires the encryption key (not carried in the
 /// announce) and is deferred to a future version.
 pub fn verify_announce(record: &AnnounceRecord, now: u64) -> Result<(), DiscoveryError> {
+    // 1. Expiry check
     if now >= record.expires_at {
+        return Err(DiscoveryError::Expired);
+    }
+
+    // 2. Reject future-stamped records (prevents cache poisoning via
+    //    unreachable published_at values that block legitimate updates)
+    if record.published_at > now.saturating_add(MAX_CLOCK_SKEW) {
         return Err(DiscoveryError::Expired);
     }
 
@@ -128,6 +139,52 @@ mod tests {
             verify_announce(&record, 1500).unwrap_err(),
             DiscoveryError::SignatureInvalid
         );
+    }
+
+    #[test]
+    fn future_stamped_announce_rejected() {
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let identity = private.public_identity();
+        let identity_ref = IdentityRef::from(identity);
+
+        // published_at far in the future
+        let builder = AnnounceBuilder::new(
+            identity_ref,
+            identity.verifying_key.to_bytes().to_vec(),
+            u64::MAX - 100,
+            u64::MAX - 1,
+            [0x01; 16],
+        );
+        let payload = builder.signable_payload();
+        let record = builder.build(private.sign(&payload).to_vec());
+
+        assert_eq!(
+            verify_announce(&record, 1500).unwrap_err(),
+            DiscoveryError::Expired
+        );
+    }
+
+    #[test]
+    fn slight_clock_skew_allowed() {
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let identity = private.public_identity();
+        let identity_ref = IdentityRef::from(identity);
+
+        // published_at is 30 seconds ahead (within MAX_CLOCK_SKEW of 60s)
+        let mut builder = AnnounceBuilder::new(
+            identity_ref,
+            identity.verifying_key.to_bytes().to_vec(),
+            1030,
+            2000,
+            [0x01; 16],
+        );
+        builder.add_routing_hint(RoutingHint::Reticulum {
+            destination_hash: [0xCC; 16],
+        });
+        let payload = builder.signable_payload();
+        let record = builder.build(private.sign(&payload).to_vec());
+
+        assert!(verify_announce(&record, 1000).is_ok());
     }
 
     #[test]

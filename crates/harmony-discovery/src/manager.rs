@@ -98,15 +98,16 @@ impl DiscoveryManager {
                 self.handle_announce(record, now, &mut actions);
             }
             DiscoveryEvent::QueryReceived { address, query_id, now } => {
+                // Prefer local_record for our own identity — always authoritative.
                 let record = self
-                    .known_identities
-                    .get(&address)
-                    .filter(|r| now < r.expires_at)
+                    .local_record
+                    .as_ref()
+                    .filter(|r| r.identity_ref.hash == address && now < r.expires_at)
                     .cloned()
                     .or_else(|| {
-                        self.local_record
-                            .as_ref()
-                            .filter(|r| r.identity_ref.hash == address && now < r.expires_at)
+                        self.known_identities
+                            .get(&address)
+                            .filter(|r| now < r.expires_at)
                             .cloned()
                     });
                 actions.push(DiscoveryAction::RespondToQuery { query_id, record });
@@ -122,8 +123,7 @@ impl DiscoveryManager {
                     {
                         actions.push(DiscoveryAction::IdentityDiscovered { record });
                     }
-                } else {
-                    self.online.remove(&address);
+                } else if self.online.remove(&address) {
                     actions.push(DiscoveryAction::IdentityOffline { address });
                 }
             }
@@ -372,6 +372,15 @@ mod tests {
     }
 
     #[test]
+    fn liveliness_leave_for_never_online_peer_is_silent() {
+        let mut mgr = DiscoveryManager::new();
+        let addr = [0xAA; 16];
+        // Leave without prior join — no spurious IdentityOffline
+        let actions = mgr.on_event(DiscoveryEvent::LivelinessChange { address: addr, alive: false, now: 1500 });
+        assert!(actions.is_empty());
+    }
+
+    #[test]
     fn tick_evicts_expired_records() {
         let mut mgr = DiscoveryManager::new();
         let record = build_valid_record(1000, 2000);
@@ -430,6 +439,46 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(
             a, DiscoveryAction::RespondToQuery { query_id: 1, record: None }
         )));
+    }
+
+    #[test]
+    fn query_prefers_local_record_over_cache() {
+        let mut mgr = DiscoveryManager::new();
+
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let identity = private.public_identity();
+        let identity_ref = IdentityRef::from(identity);
+        let pk = identity.verifying_key.to_bytes().to_vec();
+
+        // Cache an older record
+        let builder1 = AnnounceBuilder::new(identity_ref, pk.clone(), 1000, 5000, [0x01; 16]);
+        let payload1 = builder1.signable_payload();
+        let record1 = builder1.build(private.sign(&payload1).to_vec());
+
+        // Set local_record with a fresher version
+        let mut builder2 = AnnounceBuilder::new(identity_ref, pk.clone(), 2000, 6000, [0x02; 16]);
+        builder2.add_routing_hint(RoutingHint::Reticulum { destination_hash: [0xDD; 16] });
+        let payload2 = builder2.signable_payload();
+        let record2 = builder2.build(private.sign(&payload2).to_vec());
+
+        // Simulate: peer is online, announce cached
+        let _ = mgr.on_event(DiscoveryEvent::LivelinessChange { address: identity_ref.hash, alive: true, now: 1500 });
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: record1, now: 1500 });
+
+        // Now update local_record without re-announcing
+        mgr.set_local_record(record2);
+
+        // Query should return the fresher local_record, not the stale cache
+        let actions = mgr.on_event(DiscoveryEvent::QueryReceived {
+            address: identity_ref.hash, query_id: 1, now: 2500,
+        });
+        match &actions[0] {
+            DiscoveryAction::RespondToQuery { query_id: 1, record: Some(r) } => {
+                assert_eq!(r.published_at, 2000); // local_record's timestamp
+                assert_eq!(r.routing_hints.len(), 1); // local_record's hints
+            }
+            other => panic!("expected RespondToQuery with Some, got {:?}", other),
+        }
     }
 
     #[test]
