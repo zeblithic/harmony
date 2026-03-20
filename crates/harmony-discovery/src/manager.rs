@@ -48,8 +48,21 @@ impl DiscoveryManager {
         self.local_record = Some(record);
     }
 
+    /// Start announcing this identity on the network.
+    ///
+    /// Emits `PublishAnnounce` (if a local record has been set via
+    /// [`set_local_record`](Self::set_local_record)) and
+    /// `SetLiveliness { alive: true }`.
+    ///
+    /// Call `set_local_record` before this method. Calling without a
+    /// local record will advertise presence but serve `None` to all
+    /// resolve queries.
     #[must_use]
     pub fn start_announcing(&mut self) -> Vec<DiscoveryAction> {
+        debug_assert!(
+            self.local_record.is_some(),
+            "start_announcing called without a local record"
+        );
         let mut actions = Vec::new();
         if let Some(record) = self.local_record.clone() {
             actions.push(DiscoveryAction::PublishAnnounce { record });
@@ -87,7 +100,7 @@ impl DiscoveryManager {
                     .or_else(|| {
                         self.local_record
                             .as_ref()
-                            .filter(|r| r.identity_ref.hash == address)
+                            .filter(|r| r.identity_ref.hash == address && now < r.expires_at)
                             .cloned()
                     });
                 actions.push(DiscoveryAction::RespondToQuery { query_id, record });
@@ -347,6 +360,22 @@ mod tests {
         let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record, now: 1500 });
 
         // Query after expiry but before tick
+        let actions = mgr.on_event(DiscoveryEvent::QueryReceived {
+            address: addr, query_id: 1, now: 3000,
+        });
+        assert!(actions.iter().any(|a| matches!(
+            a, DiscoveryAction::RespondToQuery { query_id: 1, record: None }
+        )));
+    }
+
+    #[test]
+    fn query_filters_expired_local_record() {
+        let mut mgr = DiscoveryManager::new();
+        let record = build_valid_record(1000, 2000);
+        let addr = record.identity_ref.hash;
+        mgr.set_local_record(record);
+
+        // Query after local record has expired
         let actions = mgr.on_event(DiscoveryEvent::QueryReceived {
             address: addr, query_id: 1, now: 3000,
         });
