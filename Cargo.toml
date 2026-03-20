@@ -76,6 +76,10 @@ ciborium = { version = "0.2", default-features = false }
 wasmi = "1"
 wasmtime = "38"
 
+# Networking
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
+zenoh = "1"
+
 # CLI and config
 serde = { version = "1", default-features = false }
 toml = "0.8"

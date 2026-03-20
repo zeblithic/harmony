@@ -27,8 +27,8 @@ harmony-zenoh.workspace = true
 clap = { version = "4", features = ["derive"] }
 hex.workspace = true
 rand.workspace = true
-tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
-zenoh = "1"
+tokio.workspace = true
+zenoh.workspace = true
 zeroize = { workspace = true, features = ["std"] }
 
 [dev-dependencies]

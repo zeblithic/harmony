@@ -78,7 +78,9 @@ pub async fn run(
     let mut timer = time::interval(Duration::from_millis(250));
 
     // ── Reusable UDP receive buffer ───────────────────────────────────────────
-    let mut udp_buf = vec![0u8; 512];
+    // Max UDP datagram size — Reticulum MTU is 500 (default) or 1024 (medium
+    // interfaces). Use 65535 to never silently truncate.
+    let mut udp_buf = vec![0u8; 65535];
 
     // ── Monotonic query-id counter ────────────────────────────────────────────
     let mut next_query_id: u64 = 1;
@@ -100,6 +102,12 @@ pub async fn run(
                     }
                     Err(e) => {
                         eprintln!("[event_loop] UDP recv error: {e}");
+                        // Fatal socket errors should exit — transient ones continue.
+                        use std::io::ErrorKind::*;
+                        match e.kind() {
+                            WouldBlock | Interrupted => {}
+                            _ => return Err(e.into()),
+                        }
                         vec![]
                     }
                 }
@@ -286,7 +294,8 @@ async fn dispatch_action(
 
 /// Issue a Zenoh `get()` for the given key expression and return the first reply's payload.
 ///
-/// Returns `Err` if the get fails or no successful replies arrive.
+/// Times out after 30 seconds to prevent spawned tasks from accumulating
+/// indefinitely when content is unavailable on the network.
 async fn fetch_via_zenoh(
     session: &zenoh::Session,
     key_expr: &str,
@@ -296,7 +305,8 @@ async fn fetch_via_zenoh(
         .await
         .map_err(|e| format!("zenoh get error: {e}"))?;
 
-    while let Ok(reply) = replies.recv_async().await {
+    let deadline = Duration::from_secs(30);
+    while let Ok(Ok(reply)) = tokio::time::timeout(deadline, replies.recv_async()).await {
         match reply.result() {
             Ok(sample) => {
                 return Ok(sample.payload().to_bytes().to_vec());
@@ -309,5 +319,5 @@ async fn fetch_via_zenoh(
         }
     }
 
-    Err(format!("no successful reply for '{key_expr}'"))
+    Err(format!("no successful reply for '{key_expr}' (timed out after 30s)"))
 }
