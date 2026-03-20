@@ -4,7 +4,7 @@
 //! Zenoh objects that need spawning are cloned (Session is internally Arc'd).
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use harmony_content::blob::MemoryBlobStore;
 use tokio::net::UdpSocket;
@@ -74,6 +74,10 @@ pub async fn run(
         .await;
     }
 
+    // ── Monotonic epoch ─────────────────────────────────────────────────────
+    let epoch = Instant::now();
+    let now_ms = || epoch.elapsed().as_millis() as u64;
+
     // ── Timer (250 ms tick) ───────────────────────────────────────────────────
     let mut timer = time::interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -95,11 +99,7 @@ pub async fn run(
                     Ok((len, _src)) => {
                         let interface_name = "udp0".to_string();
                         let raw = udp_buf[..len].to_vec();
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        vec![RuntimeEvent::InboundPacket { interface_name, raw, now }]
+                        vec![RuntimeEvent::InboundPacket { interface_name, raw, now: now_ms() }]
                     }
                     Err(e) => {
                         eprintln!("[event_loop] UDP recv error: {e}");
@@ -116,14 +116,13 @@ pub async fn run(
 
             // Arm 2: 250 ms timer tick
             _ = timer.tick() => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                vec![RuntimeEvent::TimerTick { now }]
+                vec![RuntimeEvent::TimerTick { now: now_ms() }]
             }
 
             // Arm 3: Zenoh bridge event
+            // Note: the None arm is currently unreachable because zenoh_tx lives
+            // alongside this loop. It exists for defense-in-depth — if we later
+            // restructure ownership so the channel can close, this path is ready.
             maybe = zenoh_rx.recv() => {
                 match maybe {
                     None => {
@@ -187,11 +186,14 @@ async fn dispatch_action(
             }
         }
 
-        // ── Tier 2: Zenoh publish ─────────────────────────────────────────────
+        // ── Tier 2: Zenoh publish (spawned to avoid blocking select loop) ────
         RuntimeAction::Publish { key_expr, payload } => {
-            if let Err(e) = session.put(&key_expr, payload).await {
-                eprintln!("[event_loop] Zenoh put error on '{key_expr}': {e}");
-            }
+            let session = session.clone();
+            tokio::spawn(async move {
+                if let Err(e) = session.put(&key_expr, payload).await {
+                    eprintln!("[event_loop] Zenoh put error on '{key_expr}': {e}");
+                }
+            });
         }
 
         // ── Tier 2: Reply to query — stub for v1 ─────────────────────────────

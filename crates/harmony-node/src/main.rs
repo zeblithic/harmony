@@ -207,6 +207,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
+            let listen_addr: std::net::SocketAddr = listen_address
+                .parse()
+                .map_err(|e| format!("Invalid --listen-address: {e}"))?;
+
             // Load or generate node identity (after validation so bad flags exit fast).
             let id_path = crate::identity_file::resolve_path(identity_file.as_deref())?;
             let identity = crate::identity_file::load_or_generate(&id_path)?;
@@ -239,9 +243,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 node_addr,
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
-
-            let listen_addr: std::net::SocketAddr = listen_address.parse()
-                .map_err(|e| format!("Invalid --listen-address: {e}"))?;
 
             eprintln!("Harmony node starting...");
             eprintln!("  Cache capacity:   {cache_capacity} items");
@@ -394,6 +395,45 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("--filter-broadcast-ticks must be >= 2"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cli_parses_listen_address() {
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--listen-address",
+            "127.0.0.1:9999",
+        ])
+        .unwrap();
+        if let Commands::Run { listen_address, .. } = cli.command {
+            assert_eq!(listen_address, "127.0.0.1:9999");
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_listen_address_default() {
+        let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
+        if let Commands::Run { listen_address, .. } = cli.command {
+            assert_eq!(listen_address, "0.0.0.0:4242");
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_rejects_invalid_listen_address() {
+        let cli =
+            Cli::try_parse_from(["harmony", "run", "--listen-address", "not-an-addr"]).unwrap();
+        let result = run(cli).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Invalid --listen-address"),
             "unexpected error: {msg}"
         );
     }
