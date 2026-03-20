@@ -401,6 +401,46 @@ pub mod identity {
     }
 }
 
+/// Endorsement record key expressions.
+///
+/// Endorsements are published at `harmony/endorsement/{endorser_hex}/{endorsee_hex}`.
+/// Both `address_hex` parameters must be the 32-character lowercase hex encoding
+/// of the 16-byte `IdentityHash`.
+pub mod endorsement {
+    use alloc::{format, string::String};
+
+    pub const PREFIX: &str = "harmony/endorsement";
+
+    /// All endorsements by a specific endorser.
+    ///
+    /// `endorser_hex` must be the 32-character lowercase hex encoding
+    /// of the 16-byte `IdentityHash`.
+    pub fn by_endorser(endorser_hex: &str) -> String {
+        format!("{PREFIX}/{endorser_hex}/*")
+    }
+
+    /// All endorsements of a specific endorsee (query-only pattern).
+    ///
+    /// This pattern uses `*` in a non-terminal position, which works
+    /// for Zenoh `session.get()` queries but may not be registerable
+    /// as a subscriber in Zenoh 1.x. For subscription use cases,
+    /// subscribe to all endorsements and filter at the application layer.
+    ///
+    /// `endorsee_hex` must be the 32-character lowercase hex encoding
+    /// of the 16-byte `IdentityHash`.
+    pub fn of_endorsee(endorsee_hex: &str) -> String {
+        format!("{PREFIX}/*/{endorsee_hex}")
+    }
+
+    /// Key expression for a specific endorsement.
+    ///
+    /// Both parameters must be the 32-character lowercase hex encoding
+    /// of the 16-byte `IdentityHash`.
+    pub fn key(endorser_hex: &str, endorsee_hex: &str) -> String {
+        format!("{PREFIX}/{endorser_hex}/{endorsee_hex}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,6 +761,38 @@ mod tests {
         assert_eq!(identity::ALL_ALIVE, "harmony/identity/*/alive");
     }
 
+    // ── Endorsement ──
+
+    #[test]
+    fn endorsement_key_format() {
+        let key = endorsement::key(
+            "aa00bb11cc22dd33ee44ff5566778899",
+            "1122334455667788aabbccddeeff0011",
+        );
+        assert_eq!(
+            key,
+            "harmony/endorsement/aa00bb11cc22dd33ee44ff5566778899/1122334455667788aabbccddeeff0011"
+        );
+    }
+
+    #[test]
+    fn endorsement_by_endorser_format() {
+        let pattern = endorsement::by_endorser("aa00bb11cc22dd33ee44ff5566778899");
+        assert_eq!(
+            pattern,
+            "harmony/endorsement/aa00bb11cc22dd33ee44ff5566778899/*"
+        );
+    }
+
+    #[test]
+    fn endorsement_of_endorsee_format() {
+        let pattern = endorsement::of_endorsee("aa00bb11cc22dd33ee44ff5566778899");
+        assert_eq!(
+            pattern,
+            "harmony/endorsement/*/aa00bb11cc22dd33ee44ff5566778899"
+        );
+    }
+
     // ── Cross-tier consistency ───────────────────────────────────
 
     #[test]
@@ -738,6 +810,7 @@ mod tests {
             messages::PREFIX,
             profile::PREFIX,
             identity::PREFIX,
+            endorsement::PREFIX,
         ];
         for prefix in prefixes {
             assert!(
