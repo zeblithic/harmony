@@ -65,15 +65,15 @@ fn active_session_pair() -> (Session, Session) {
 /// publications.
 #[test]
 fn vine_interest_filtering_on_publisher_side() {
-    let (mut alice_session, _bob_session) = active_session_pair();
+    let (_alice_session, mut bob_session) = active_session_pair();
     let mut bob_router = PubSubRouter::new();
 
     // Bob declares a publisher on his vine announce key expression.
-    // The key expression uses the actual Harmony namespace convention.
+    // Uses bob_session (Bob is local, Alice is remote).
     let (pub_id, pub_actions) = bob_router
         .declare_publisher(
             "harmony/vines/aa00bb11cc22dd33ee44ff5566778899/announce/post1".into(),
-            &mut alice_session,
+            &mut bob_session,
         )
         .unwrap();
     assert!(
@@ -83,7 +83,7 @@ fn vine_interest_filtering_on_publisher_side() {
 
     // Without interest: publish is silently dropped (write-side filtering)
     let actions = bob_router
-        .publish(pub_id, b"vine content".to_vec(), &alice_session)
+        .publish(pub_id, b"vine content".to_vec(), &bob_session)
         .unwrap();
     assert!(
         actions.is_empty(),
@@ -91,19 +91,19 @@ fn vine_interest_filtering_on_publisher_side() {
     );
 
     // Alice declares interest in Bob's vine announces (simulating
-    // the SubscriberDeclared event arriving from Alice's session)
+    // the SubscriberDeclared event arriving from Alice via the tunnel)
     bob_router
         .handle_event(
             PubSubEvent::SubscriberDeclared {
                 key_expr: "harmony/vines/aa00bb11cc22dd33ee44ff5566778899/announce/**".into(),
             },
-            &alice_session,
+            &bob_session,
         )
         .unwrap();
 
     // Now publish should emit SendMessage — Alice wants this content
     let actions = bob_router
-        .publish(pub_id, b"vine content".to_vec(), &alice_session)
+        .publish(pub_id, b"vine content".to_vec(), &bob_session)
         .unwrap();
     assert_eq!(actions.len(), 1);
     assert!(

@@ -76,13 +76,13 @@ The handshake is purpose-built for tunnel establishment. It does not replace the
 After handshake, the tunnel carries two frame types over the same encrypted session:
 
 - **Reticulum frames** (tag `0x01`): Raw Reticulum packets (up to 500 bytes). Fed into the `Node` state machine as `InboundPacket` events on a virtual "tunnel interface."
-- **Zenoh frames** (tag `0x02`): Zenoh protocol messages (arbitrary size, QUIC handles fragmentation). Fed into the `Session` state machine.
+- **Zenoh frames** (tag `0x02`): Zenoh protocol messages (up to 4 GiB per frame; QUIC handles transport fragmentation). Fed into the `Session` state machine.
 
 **Frame format (plaintext, before encryption):**
 ```
-[1 byte tag] [2 bytes length (big-endian)] [payload]
+[1 byte tag] [4 bytes length (big-endian)] [payload]
      ↑              ↑                          ↑
-  0x00-0x02    up to 65535                 frame data
+  0x00-0x02    up to 2^32-1                frame data
 ```
 
 - `0x00` — Keepalive (zero-length payload)
