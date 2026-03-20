@@ -157,9 +157,11 @@ Announce verification differs from credential verification: the public
 key is in the record itself, not resolved externally. The verifier:
 
 1. Checks `expires_at > now` (not expired)
-2. Re-derives the address hash from `public_key` and compares with
-   `identity_ref.hash` (prevents spoofing)
-3. Verifies the signature using `public_key` and `identity_ref.suite`
+2. Verifies the signature using `public_key` and `identity_ref.suite`
+
+A future V2 step would re-derive the address hash from `public_key`
+and compare with `identity_ref.hash` (prevents spoofing). This is
+deferred in V1 — see "Address Derivation Check" below.
 
 No external key resolver needed. This makes announces self-contained
 and verifiable by any node without prior state.
