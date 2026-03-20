@@ -61,30 +61,54 @@ pub fn save(path: &Path, identity: &NodeIdentity) -> Result<(), String> {
         }
     }
     let pq_bytes = Zeroizing::new(identity.pq.to_private_bytes());
-    let ed_bytes = identity.ed25519.to_private_bytes();
+    let ed_bytes = Zeroizing::new(identity.ed25519.to_private_bytes().to_vec());
     let mut buf = Zeroizing::new(Vec::with_capacity(FILE_LEN));
     buf.push(VERSION);
     buf.extend_from_slice(&pq_bytes);
     buf.extend_from_slice(&ed_bytes);
 
+    // Atomic write: create tmp with restricted permissions from the start
+    // (no world-readable window), fsync, rename into place.
     let tmp_path = path.with_extension("key.tmp");
-    std::fs::write(&tmp_path, &*buf)
-        .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
-    #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("Failed to set permissions on {}: {e}", tmp_path.display()))?;
+        #[cfg(unix)]
+        let f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
+        };
+        #[cfg(not(unix))]
+        let f = {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
+        };
+        use std::io::Write;
+        (&f).write_all(&*buf)
+            .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("Failed to fsync {}: {e}", tmp_path.display()))?;
     }
-    let f = std::fs::File::open(&tmp_path)
-        .map_err(|e| format!("Failed to open {}: {e}", tmp_path.display()))?;
-    f.sync_all()
-        .map_err(|e| format!("Failed to fsync {}: {e}", tmp_path.display()))?;
     std::fs::rename(&tmp_path, path)
         .map_err(|e| format!("Failed to rename {} → {}: {e}", tmp_path.display(), path.display()))?;
     Ok(())
 }
 
+/// Load identities from a key file, or generate and save new ones if the
+/// file does not exist.
+///
+/// Note: there is a minor TOCTOU race between `exists()` and `load()`/`save()`.
+/// If two processes race on first-run, one wins the rename and the other
+/// loads the winner's identity on its next start. This is benign — the
+/// atomic rename ensures the file is never corrupt.
 pub fn load_or_generate(path: &Path) -> Result<NodeIdentity, String> {
     if path.exists() {
         return load(path);
