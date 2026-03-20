@@ -17,7 +17,7 @@ All Harmony-related repos to check out:
 * [zeblithic/harmony-vine](https://github.com/zeblithic/harmony-vine)
   * Did you know 6 seconds of 720p video is just under 1MB? Vine is back thanks to Harmony, free forever!
 * [zeblithic/harmony-stq8](https://github.com/zeblithic/harmony-stq8)
-  * 'OJUKEVI 'IJEKOVU! I'm a linguistics nerd. STQ8 is my implementation of a speech-based human-computer interface that's extremely energy-efficient through a restricted high-constrast phonetic structure (4 consonants, 4 vowels, 8 phonemes, 16 possible syllables but only 8 needed for perfect, 256 CVCV "words", also allows for a fifth consonant & vowel to provide a C/V-agnostic "express lane"). Also uses a Hangul-inspired grapheme system. 'OJUKEVI 'IJEKOVU becomes `AO>= <XVI AI>X <OV=` arranged as:
+  * 'OJUKEVI 'IJEKOVU! I'm a linguistics nerd. STQ8 is my implementation of a speech-based human-computer interface that's extremely energy-efficient through a restricted high-constrast phonetic structure (4 consonants, 4 vowels, 8 phonemes, 16 possible syllables but only 8 needed for high-confidence (the phrase I started with!), 256 CVCV "words", also allows for a fifth consonant & vowel to provide a C/V-agnostic "express lane"). Also uses a Hangul-inspired grapheme system. 'OJUKEVI 'IJEKOVU becomes `AO>= <XVI AI>X <OV=` arranged as:
 ```
 A> <V 
 O= XI 
