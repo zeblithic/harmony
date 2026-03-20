@@ -4,20 +4,17 @@
 # (OpenWRT routers, Raspberry Pi, ARM servers).
 #
 # Uses rust-lld (bundled with Rust) so no external C cross-compiler
-# is needed. BLAKE3 NEON assembly is disabled (pure Rust fallback)
-# because the cc crate can't find aarch64-linux-musl-gcc on macOS.
+# is needed. BLAKE3 NEON assembly must be disabled at build time
+# because the cc crate requires aarch64-linux-musl-gcc for NEON
+# intrinsics. Pass CARGO_FEATURE_NO_NEON=1 in the environment:
+#
+#   CARGO_FEATURE_NO_NEON=1 cargo build -p harmony-node \
+#     --target aarch64-unknown-linux-musl --profile release-cross
+#
 # This trades ~3x BLAKE3 throughput for zero cross-compile deps.
-# If a musl cross-toolchain is available, remove CARGO_FEATURE_NO_NEON
-# and set CC_aarch64_unknown_linux_musl instead.
+# If a musl cross-toolchain is available, set CC_aarch64_unknown_linux_musl
+# instead and omit the CARGO_FEATURE_NO_NEON override to get NEON.
 
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = ["-C", "link-self-contained=yes"]
-
-[env]
-# Disable BLAKE3 NEON assembly for aarch64 cross-compilation.
-# blake3's build.rs reads this as a Cargo feature flag, skipping the
-# cc crate's attempt to compile NEON intrinsics via a C cross-compiler.
-# This is set globally because Cargo's [env] has no per-target support,
-# but it only affects the NEON codepath — harmless on x86_64 (uses SSE/AVX).
-CARGO_FEATURE_NO_NEON = "1"
