@@ -27,7 +27,7 @@ const MAX_CLOCK_SKEW: u64 = 60;
 pub fn verify_announce(record: &AnnounceRecord, now: u64) -> Result<(), DiscoveryError> {
     // 0. Structural validity — must have a positive validity window
     if record.published_at >= record.expires_at {
-        return Err(DiscoveryError::Expired);
+        return Err(DiscoveryError::InvalidRecord);
     }
 
     // 1. Expiry check

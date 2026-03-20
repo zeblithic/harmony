@@ -186,6 +186,13 @@ impl DiscoveryManager {
 
         // Fast staleness check before expensive signature verification.
         // Stale redeliveries are common in pub/sub — skip the crypto.
+        //
+        // SECURITY(V1): When a record is evicted (expiry or cache pressure)
+        // while the peer remains online, this slot is empty and the next
+        // arriving announce bypasses this guard. Until address→key binding
+        // is implemented, any actor with a valid keypair can inject routing
+        // hints for the evicted identity while its liveliness token is
+        // still active. See crate-level Security docs.
         if let Some(existing) = self.known_identities.get(&addr) {
             if record.published_at <= existing.published_at {
                 return;

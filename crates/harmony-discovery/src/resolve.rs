@@ -12,6 +12,12 @@ use crate::record::AnnounceRecord;
 /// to avoid returning stale data that the caller would reject via
 /// `verify_announce`.
 ///
+/// **Important:** Implementations that persist records MUST store the
+/// serialized bytes (from [`AnnounceRecord::serialize`]) and
+/// reconstruct via [`AnnounceRecord::deserialize`]. Passing
+/// deserialized structs across format version boundaries will cause
+/// signature verification failures.
+///
 /// The `DiscoveryManager` does not call this directly — the caller
 /// (runtime integration layer) falls back to offline resolution
 /// when a query yields no cached result.

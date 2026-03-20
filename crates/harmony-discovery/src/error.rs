@@ -3,6 +3,7 @@
 pub enum DiscoveryError {
     Expired,
     FutureTimestamp,
+    InvalidRecord,
     SignatureInvalid,
     /// V2: will be returned when public_key→IdentityHash re-derivation
     /// check is implemented. Currently unused — see `verify_announce` docs.
@@ -17,6 +18,7 @@ impl core::fmt::Display for DiscoveryError {
         match self {
             Self::Expired => write!(f, "announce record expired"),
             Self::FutureTimestamp => write!(f, "announce published_at is too far in the future"),
+            Self::InvalidRecord => write!(f, "announce record structurally invalid"),
             Self::SignatureInvalid => write!(f, "invalid announce signature"),
             Self::AddressMismatch => write!(f, "public key does not match identity address"),
             Self::SerializeError(msg) => write!(f, "serialize error: {msg}"),

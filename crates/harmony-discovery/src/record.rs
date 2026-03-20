@@ -54,6 +54,12 @@ pub struct AnnounceRecord {
 
 impl AnnounceRecord {
     /// Reconstruct the signable payload bytes (everything except signature).
+    ///
+    /// Uses the compile-time `FORMAT_VERSION` constant. This assumes all
+    /// `AnnounceRecord` instances in this process were created under the
+    /// same version. Records from persistent storage MUST go through
+    /// [`AnnounceRecord::deserialize`] (which gates on FORMAT_VERSION)
+    /// rather than being passed as deserialized structs.
     pub(crate) fn signable_bytes(&self) -> Vec<u8> {
         let payload = SignablePayload {
             format_version: FORMAT_VERSION,
