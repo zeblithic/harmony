@@ -15,14 +15,27 @@ pub enum DiscoveryEvent {
 
 #[derive(Debug, Clone)]
 pub enum DiscoveryAction {
+    /// Publish this node's signed announce record to the network.
     PublishAnnounce { record: AnnounceRecord },
+    /// Reply to a resolve query. `record` is `None` if no valid
+    /// cached record exists for the requested address.
     RespondToQuery { query_id: u64, record: Option<AnnounceRecord> },
+    /// Enable or disable the Zenoh liveliness token for this identity.
+    /// Idempotent — registering an already-active token is a no-op.
     SetLiveliness { alive: bool },
+    /// A valid record is available for an online peer. Fires on initial
+    /// discovery **and** on each subsequent record refresh while the
+    /// peer is online — callers requiring "first seen" semantics must
+    /// deduplicate on `record.identity_ref.hash`.
     IdentityDiscovered { record: AnnounceRecord },
+    /// The peer's liveliness token has been withdrawn; they are no
+    /// longer reachable.
     IdentityOffline { address: IdentityHash },
     /// A record's `expires_at` has passed; evicted by `Tick`.
     RecordExpired { address: IdentityHash },
-    /// A valid record was dropped because the cache was full.
+    /// A valid record was dropped because the cache was full. The peer
+    /// remains in the online set if their liveliness token is active;
+    /// their next re-announce will emit `IdentityDiscovered` again.
     CacheEvicted { address: IdentityHash },
 }
 
