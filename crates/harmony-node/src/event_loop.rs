@@ -101,13 +101,18 @@ pub async fn run(
                 .expect("failed to register SIGTERM handler");
             tokio::select! {
                 _ = sigterm.recv() => eprintln!("[event_loop] SIGTERM received — shutting down"),
-                _ = tokio::signal::ctrl_c() => eprintln!("[event_loop] Ctrl+C received — shutting down"),
+                result = tokio::signal::ctrl_c() => match result {
+                    Ok(()) => eprintln!("[event_loop] Ctrl+C received — shutting down"),
+                    Err(e) => eprintln!("[event_loop] SIGINT handler failed: {e} — shutting down"),
+                },
             }
         }
         #[cfg(not(unix))]
         {
-            tokio::signal::ctrl_c().await.ok();
-            eprintln!("[event_loop] Ctrl+C received — shutting down");
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => eprintln!("[event_loop] Ctrl+C received — shutting down"),
+                Err(e) => eprintln!("[event_loop] SIGINT handler failed: {e} — shutting down"),
+            }
         }
     };
     tokio::pin!(shutdown);
