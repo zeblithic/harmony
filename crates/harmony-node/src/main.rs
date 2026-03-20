@@ -203,6 +203,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let identity = crate::identity_file::load_or_generate(&id_path)?;
             let node_addr = hex::encode(identity.ed25519.public_identity().address_hash);
             eprintln!("Identity: {node_addr} ({})", id_path.display());
+            drop(identity); // key material no longer needed; zeroize-on-drop fires now
 
             let content_policy = ContentPolicy {
                 encrypted_durable_persist,
