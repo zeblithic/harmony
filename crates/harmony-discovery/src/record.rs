@@ -62,6 +62,13 @@ impl AnnounceRecord {
     }
 
     /// Serialize the record to bytes with a format version prefix.
+    ///
+    /// The version byte is a hard gate: records serialized under one
+    /// version cannot be deserialized by a binary compiled with a
+    /// different `FORMAT_VERSION`. During rolling upgrades, nodes on
+    /// the old version will reject new-version records and vice versa.
+    /// This is intentional — a version bump signals a struct layout
+    /// change that requires coordinated deployment.
     pub fn serialize(&self) -> Result<Vec<u8>, DiscoveryError> {
         let mut buf = Vec::new();
         buf.push(FORMAT_VERSION);

@@ -23,10 +23,14 @@ pub enum DiscoveryAction {
     RecordExpired { address: IdentityHash },
 }
 
+/// Default maximum number of cached identity records.
+const DEFAULT_MAX_CACHE_SIZE: usize = 4096;
+
 pub struct DiscoveryManager {
     local_record: Option<AnnounceRecord>,
     known_identities: HashMap<IdentityHash, AnnounceRecord>,
     online: HashSet<IdentityHash>,
+    max_cache_size: usize,
 }
 
 impl Default for DiscoveryManager {
@@ -37,10 +41,19 @@ impl Default for DiscoveryManager {
 
 impl DiscoveryManager {
     pub fn new() -> Self {
+        Self::with_cache_size(DEFAULT_MAX_CACHE_SIZE)
+    }
+
+    /// Create a manager with a custom cache size limit.
+    ///
+    /// When the cache reaches this limit, the oldest record (by
+    /// `published_at`) is evicted to make room for new entries.
+    pub fn with_cache_size(max_cache_size: usize) -> Self {
         Self {
             local_record: None,
             known_identities: HashMap::new(),
             online: HashSet::new(),
+            max_cache_size,
         }
     }
 
@@ -57,6 +70,11 @@ impl DiscoveryManager {
     /// Call `set_local_record` before this method. Calling without a
     /// local record will advertise presence but serve `None` to all
     /// resolve queries.
+    ///
+    /// Safe to call multiple times — emitted actions are idempotent
+    /// (Zenoh liveliness re-registration is a no-op), though callers
+    /// that queue `PublishAnnounce` for transmission will send a
+    /// redundant announce.
     #[must_use]
     pub fn start_announcing(&mut self) -> Vec<DiscoveryAction> {
         debug_assert!(
@@ -71,6 +89,7 @@ impl DiscoveryManager {
         actions
     }
 
+    /// Stop announcing. Safe to call multiple times.
     #[must_use]
     pub fn stop_announcing(&mut self) -> Vec<DiscoveryAction> {
         alloc::vec![DiscoveryAction::SetLiveliness { alive: false }]
@@ -156,6 +175,20 @@ impl DiscoveryManager {
             }
         }
         self.known_identities.insert(addr, record.clone());
+
+        // Evict oldest record if cache is full
+        if self.known_identities.len() > self.max_cache_size {
+            if let Some((&oldest_addr, _)) = self
+                .known_identities
+                .iter()
+                .filter(|(&a, _)| a != addr) // don't evict the one we just inserted
+                .min_by_key(|(_, r)| r.published_at)
+            {
+                self.known_identities.remove(&oldest_addr);
+                actions.push(DiscoveryAction::RecordExpired { address: oldest_addr });
+            }
+        }
+
         // Only emit IdentityDiscovered if the peer is already online;
         // otherwise LivelinessChange will emit it when the token arrives.
         // This prevents double-emission in the normal announce→liveliness flow.
@@ -377,6 +410,25 @@ mod tests {
         let actions = mgr.on_event(DiscoveryEvent::LivelinessChange { address: addr, alive: false, now: 1500 });
         assert!(!mgr.is_online(&addr));
         assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::IdentityOffline { .. })));
+    }
+
+    #[test]
+    fn cache_evicts_oldest_when_full() {
+        let mut mgr = DiscoveryManager::with_cache_size(2);
+
+        let r1 = build_valid_record(1000, 5000);
+        let addr1 = r1.identity_ref.hash;
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: r1, now: 1500 });
+
+        let r2 = build_valid_record(2000, 5000);
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: r2, now: 2500 });
+
+        // Cache is full (2 entries). Adding a third evicts the oldest (r1).
+        let r3 = build_valid_record(3000, 6000);
+        let actions = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: r3, now: 3500 });
+
+        assert!(mgr.get_record(&addr1, 3500).is_none()); // r1 evicted
+        assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::RecordExpired { .. })));
     }
 
     #[test]

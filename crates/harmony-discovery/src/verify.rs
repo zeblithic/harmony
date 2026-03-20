@@ -65,6 +65,11 @@ fn verify_signature(
                 .verify(message, &sig)
                 .map_err(|_| DiscoveryError::SignatureInvalid)
         }
+        // TODO(v2): MlDsa65Rotatable needs rotation-aware verification —
+        // the current key may differ from the one used to derive
+        // identity_ref.hash. A rotation certificate or KEL chain walk
+        // will be required to prove the new public_key was authorised
+        // by the inception key.
         CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => {
             let pk = harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(key_bytes)
                 .map_err(|_| DiscoveryError::SignatureInvalid)?;
