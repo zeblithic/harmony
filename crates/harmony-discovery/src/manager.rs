@@ -51,7 +51,12 @@ impl DiscoveryManager {
     ///
     /// When the cache reaches this limit, the oldest record (by
     /// `published_at`) is evicted to make room for new entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_cache_size` is 0.
     pub fn with_cache_size(max_cache_size: usize) -> Self {
+        assert!(max_cache_size > 0, "max_cache_size must be at least 1");
         Self {
             local_record: None,
             known_identities: HashMap::new(),
@@ -177,20 +182,29 @@ impl DiscoveryManager {
                 return;
             }
         }
-        self.known_identities.insert(addr, record.clone());
 
-        // Evict oldest record if cache is full
-        if self.known_identities.len() > self.max_cache_size {
-            if let Some((&oldest_addr, _)) = self
+        // Evict oldest record before inserting if cache is full (and this
+        // is a new address, not an update to an existing entry).
+        if !self.known_identities.contains_key(&addr)
+            && self.known_identities.len() >= self.max_cache_size
+        {
+            if let Some((&oldest_addr, oldest_rec)) = self
                 .known_identities
                 .iter()
-                .filter(|(&a, _)| a != addr) // don't evict the one we just inserted
                 .min_by_key(|(_, r)| r.published_at)
             {
-                self.known_identities.remove(&oldest_addr);
-                actions.push(DiscoveryAction::CacheEvicted { address: oldest_addr });
+                if oldest_rec.published_at < record.published_at {
+                    let evicted = oldest_addr;
+                    self.known_identities.remove(&evicted);
+                    actions.push(DiscoveryAction::CacheEvicted { address: evicted });
+                } else {
+                    // New entry is older than everything cached — reject it.
+                    return;
+                }
             }
         }
+
+        self.known_identities.insert(addr, record.clone());
 
         // Only emit IdentityDiscovered if the peer is already online;
         // otherwise LivelinessChange will emit it when the token arrives.
@@ -432,6 +446,31 @@ mod tests {
 
         assert!(mgr.get_record(&addr1, 3500).is_none()); // r1 evicted
         assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::CacheEvicted { .. })));
+    }
+
+    #[test]
+    fn cache_rejects_older_than_all_cached() {
+        let mut mgr = DiscoveryManager::with_cache_size(2);
+
+        let r1 = build_valid_record(2000, 5000);
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: r1, now: 2500 });
+
+        let r2 = build_valid_record(3000, 6000);
+        let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: r2, now: 3500 });
+
+        // Cache full. New record is older than everything cached — rejected.
+        let r3 = build_valid_record(1000, 5000);
+        let addr3 = r3.identity_ref.hash;
+        let actions = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: r3, now: 3500 });
+
+        assert!(mgr.get_record(&addr3, 3500).is_none()); // not inserted
+        assert!(actions.is_empty()); // no eviction, no discovery
+    }
+
+    #[test]
+    #[should_panic(expected = "max_cache_size")]
+    fn zero_cache_size_panics() {
+        DiscoveryManager::with_cache_size(0);
     }
 
     #[test]
