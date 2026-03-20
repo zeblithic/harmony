@@ -9,6 +9,7 @@ description = "Content-addressed storage primitives for the Harmony decentralize
 
 [features]
 default = ["std"]
+no-neon = ["harmony-crypto/no-neon"]
 std = ["harmony-crypto/std", "harmony-zenoh/std", "thiserror/std"]
 
 [dependencies]
