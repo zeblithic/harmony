@@ -909,6 +909,7 @@ dependencies = [
 name = "harmony-credential"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "harmony-crypto",
  "harmony-identity",
  "hashbrown 0.15.5",
