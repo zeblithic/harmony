@@ -32,7 +32,7 @@ pub fn verify_announce(record: &AnnounceRecord, now: u64) -> Result<(), Discover
     // 2. Reject future-stamped records (prevents cache poisoning via
     //    unreachable published_at values that block legitimate updates)
     if record.published_at > now.saturating_add(MAX_CLOCK_SKEW) {
-        return Err(DiscoveryError::Expired);
+        return Err(DiscoveryError::FutureTimestamp);
     }
 
     let payload = record.signable_bytes();
@@ -160,7 +160,7 @@ mod tests {
 
         assert_eq!(
             verify_announce(&record, 1500).unwrap_err(),
-            DiscoveryError::Expired
+            DiscoveryError::FutureTimestamp
         );
     }
 

@@ -34,6 +34,7 @@ pub enum RoutingHint {
 /// Produced by `AnnounceBuilder`. Verified by `verify_announce()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnnounceRecord {
+    #[serde(skip)]
     pub(crate) format_version: u8,
     pub identity_ref: IdentityRef,
     pub public_key: Vec<u8>,
