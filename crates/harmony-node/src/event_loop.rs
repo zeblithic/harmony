@@ -165,6 +165,11 @@ pub async fn run(
 
         // Only tick on timer — counters (tick_count, ticks_since_filter_broadcast,
         // peer filter eviction) must advance at wall-clock rate, not event rate.
+        // Events queue up between ticks (max ~250ms). At worst case 1 Gbps with
+        // 500-byte Reticulum frames, ~62K events queue per tick (~31 MB) — bounded
+        // by the timer interval and acceptable for 1-2 GB RAM routers.
+        // A drain-without-counter-increment API would allow bounded queues under
+        // flood conditions, but requires changing NodeRuntime's interface — deferred.
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
@@ -245,6 +250,9 @@ async fn dispatch_action(
         }
 
         // ── Setup: Declare queryable ──────────────────────────────────────────
+        // Awaited inline — these only fire during startup (before the loop).
+        // Dynamic runtime declarations are not yet wired; when they are,
+        // spawning these to avoid blocking the select loop is warranted.
         RuntimeAction::DeclareQueryable { key_expr } => {
             let is_compute = key_expr.starts_with("harmony/compute/");
             let tx = zenoh_tx.clone();
