@@ -53,17 +53,19 @@ Follows the `~/.reticulum/` convention from the Python Reticulum reference imple
 3. **If file does not exist:**
    - Generate PQ identity (`PqPrivateIdentity::generate`)
    - Generate Ed25519 identity (`PrivateIdentity::generate`)
-   - Create parent directory with `mkdir -p`, mode `0o700`
-   - Write file with mode `0o600`
+   - Create parent directory with `create_dir_all`, mode `0o700` (no-op if exists)
+   - Atomic write: write to `<path>.tmp`, fsync, rename to `<path>` — prevents data loss on crash
+   - Set file mode `0o600`
    - Zeroize the raw byte buffer after writing
    - Log: `Identity generated: <hex address> (saved to <path>)`
-4. **If file is corrupt** (wrong version, wrong length, deserialization error):
+4. **If file is corrupt** (wrong version, wrong length, 0 bytes, deserialization error):
    - Error and exit — never silently regenerate over an existing file
+   - A 0-byte file is corrupt, not "missing" — the user must delete it explicitly to regenerate
    - Message: `Error: corrupt identity file at <path>: <reason>`
 
 ### `harmony identity new`
 
-Unchanged — still prints keys to stdout. Not wired to the key file. A `--save` flag is YAGNI for now.
+Unchanged — still prints Ed25519 keys to stdout. Note: `harmony identity new` generates only Ed25519, while `harmony run` generates both PQ and Ed25519. This asymmetry is intentional — the identity subcommands predate PQ and will be extended in a follow-up.
 
 ### `harmony identity show`
 
@@ -121,11 +123,13 @@ All errors exit with non-zero status. No fallback to ephemeral identity — if t
 
 ## Zeroization
 
-- Raw byte buffer from `fs::read()` is zeroized after deserialization
-- Raw byte buffer for `fs::write()` is zeroized after writing
-- Both identity types implement `Zeroize` and `ZeroizeOnDrop` via derive
+- Read/write buffers use `Zeroizing<Vec<u8>>` wrapper from the `zeroize` crate — automatically zeroized on drop, even on early return or panic
+- Intermediate `Vec<u8>` from `PqPrivateIdentity::to_private_bytes()` is also wrapped in `Zeroizing`
+- `PrivateIdentity` derives `Zeroize`/`ZeroizeOnDrop`; `PqPrivateIdentity` relies on component-level drop impls for its internal key material
 
-Uses `zeroize` crate (already a workspace dependency).
+`zeroize` must be added as a direct dependency of `harmony-node` (already a workspace dep).
+
+**Platform note:** File permission handling (`0o700`, `0o600`) uses `std::os::unix::fs::PermissionsExt` — Unix only. This is fine for the target platforms (Linux/OpenWRT, macOS dev). Permission checks are gated with `#[cfg(unix)]`.
 
 ## Testing
 
