@@ -6,12 +6,16 @@ pub mod credential;
 pub mod disclosure;
 pub mod error;
 pub mod status_list;
+pub mod verify;
 
 pub use claim::{Claim, SaltedClaim};
 pub use credential::{Credential, CredentialBuilder};
 pub use disclosure::Presentation;
 pub use error::CredentialError;
 pub use status_list::{StatusList, StatusListResolver};
+pub use verify::{verify_credential, verify_presentation, CredentialKeyResolver};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use status_list::MemoryStatusListResolver;
+#[cfg(any(test, feature = "test-utils"))]
+pub use verify::MemoryKeyResolver;

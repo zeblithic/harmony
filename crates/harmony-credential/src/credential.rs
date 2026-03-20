@@ -201,13 +201,8 @@ mod tests {
 
     #[test]
     fn builder_produces_correct_digest_count() {
-        let mut builder = CredentialBuilder::new(
-            test_issuer(),
-            test_subject(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
         builder.add_claim(1, alloc::vec![0xAA], [0x11; 16]);
         builder.add_claim(2, alloc::vec![0xBB], [0x22; 16]);
 
@@ -227,13 +222,8 @@ mod tests {
 
     #[test]
     fn signable_payload_is_deterministic() {
-        let mut builder = CredentialBuilder::new(
-            test_issuer(),
-            test_subject(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
         builder.add_claim(1, alloc::vec![0xAA], [0x11; 16]);
 
         let p1 = builder.signable_payload();
@@ -243,13 +233,8 @@ mod tests {
 
     #[test]
     fn content_hash_is_deterministic() {
-        let mut builder = CredentialBuilder::new(
-            test_issuer(),
-            test_subject(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
         builder.add_claim(1, alloc::vec![0xAA], [0x11; 16]);
 
         let payload = builder.signable_payload();
@@ -259,13 +244,7 @@ mod tests {
 
     #[test]
     fn not_before_defaults_to_issued_at() {
-        let builder = CredentialBuilder::new(
-            test_issuer(),
-            test_subject(),
-            500,
-            2000,
-            [0x01; 16],
-        );
+        let builder = CredentialBuilder::new(test_issuer(), test_subject(), 500, 2000, [0x01; 16]);
         let payload = builder.signable_payload();
         let (cred, _) = builder.build(payload);
         assert_eq!(cred.not_before, 500);
@@ -273,13 +252,8 @@ mod tests {
 
     #[test]
     fn not_before_can_be_overridden() {
-        let mut builder = CredentialBuilder::new(
-            test_issuer(),
-            test_subject(),
-            500,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            CredentialBuilder::new(test_issuer(), test_subject(), 500, 2000, [0x01; 16]);
         builder.not_before(700);
         let payload = builder.signable_payload();
         let (cred, _) = builder.build(payload);
@@ -288,13 +262,8 @@ mod tests {
 
     #[test]
     fn status_list_index_set() {
-        let mut builder = CredentialBuilder::new(
-            test_issuer(),
-            test_subject(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
         builder.status_list_index(42);
         let payload = builder.signable_payload();
         let (cred, _) = builder.build(payload);
@@ -312,13 +281,8 @@ mod tests {
 
     #[test]
     fn serde_round_trip() {
-        let mut builder = CredentialBuilder::new(
-            test_issuer(),
-            test_subject(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
         builder.add_claim(1, alloc::vec![0xAA], [0x11; 16]);
         builder.status_list_index(5);
 
@@ -348,7 +312,9 @@ mod tests {
         ));
         assert!(matches!(
             Credential::deserialize(&[0xFF]),
-            Err(CredentialError::DeserializeError("unsupported format version"))
+            Err(CredentialError::DeserializeError(
+                "unsupported format version"
+            ))
         ));
     }
 }

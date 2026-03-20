@@ -20,7 +20,7 @@ pub struct StatusList {
 impl StatusList {
     /// Create a new status list with the given capacity (number of credential slots).
     pub fn new(capacity: u32) -> Self {
-        let byte_len = ((capacity + 7) / 8) as usize;
+        let byte_len = capacity.div_ceil(8) as usize;
         Self {
             bits: vec![0u8; byte_len],
             capacity,
@@ -91,7 +91,9 @@ impl MemoryStatusListResolver {
 #[cfg(any(test, feature = "test-utils"))]
 impl StatusListResolver for MemoryStatusListResolver {
     fn is_revoked(&self, issuer: &IdentityRef, index: u32) -> Option<bool> {
-        self.lists.get(&issuer.hash).map(|list| list.is_revoked(index))
+        self.lists
+            .get(&issuer.hash)
+            .map(|list| list.is_revoked(index))
     }
 }
 
