@@ -24,8 +24,8 @@ struct SignablePayload {
 pub enum RoutingHint {
     /// Reticulum destination hash (16 bytes).
     Reticulum { destination_hash: [u8; 16] },
-    /// Zenoh locator (e.g. `tcp/192.168.1.1:7447`).
-    Zenoh { locator: Vec<u8> },
+    /// Zenoh locator (e.g. `"tcp/192.168.1.1:7447"`).
+    Zenoh { locator: alloc::string::String },
 }
 
 /// A signed announce record that advertises an identity's presence and
@@ -34,13 +34,14 @@ pub enum RoutingHint {
 /// Produced by `AnnounceBuilder`. Verified by `verify_announce()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnnounceRecord {
-    #[serde(skip)]
-    pub(crate) format_version: u8,
     pub identity_ref: IdentityRef,
     pub public_key: Vec<u8>,
     pub routing_hints: Vec<RoutingHint>,
     pub published_at: u64,
     pub expires_at: u64,
+    /// Random bytes for replay protection. Must be cryptographically
+    /// random and unique per announce — especially when `published_at`
+    /// has not advanced since the last announcement.
     pub nonce: [u8; 16],
     pub signature: Vec<u8>,
 }
@@ -49,7 +50,7 @@ impl AnnounceRecord {
     /// Reconstruct the signable payload bytes (everything except signature).
     pub(crate) fn signable_bytes(&self) -> Vec<u8> {
         let payload = SignablePayload {
-            format_version: self.format_version,
+            format_version: FORMAT_VERSION,
             identity_ref: self.identity_ref,
             public_key: self.public_key.clone(),
             routing_hints: self.routing_hints.clone(),
@@ -63,7 +64,7 @@ impl AnnounceRecord {
     /// Serialize the record to bytes with a format version prefix.
     pub fn serialize(&self) -> Result<Vec<u8>, DiscoveryError> {
         let mut buf = Vec::new();
-        buf.push(self.format_version);
+        buf.push(FORMAT_VERSION);
         let inner = postcard::to_allocvec(self)
             .map_err(|_| DiscoveryError::SerializeError("postcard encode failed"))?;
         buf.extend_from_slice(&inner);
@@ -80,10 +81,8 @@ impl AnnounceRecord {
                 "unsupported format version",
             ));
         }
-        let mut record: Self = postcard::from_bytes(&data[1..])
-            .map_err(|_| DiscoveryError::DeserializeError("postcard decode failed"))?;
-        record.format_version = data[0];
-        Ok(record)
+        postcard::from_bytes(&data[1..])
+            .map_err(|_| DiscoveryError::DeserializeError("postcard decode failed"))
     }
 }
 
@@ -107,6 +106,11 @@ pub struct AnnounceBuilder {
 
 impl AnnounceBuilder {
     /// Create a new builder.
+    ///
+    /// All timestamps (`published_at`, `expires_at`) are Unix epoch
+    /// seconds. `nonce` must be 16 cryptographically random bytes,
+    /// unique per announce — especially when `published_at` has not
+    /// advanced since the last announcement.
     ///
     /// # Panics
     ///
@@ -158,7 +162,6 @@ impl AnnounceBuilder {
     /// Finalize with a signature to produce the `AnnounceRecord`.
     pub fn build(self, signature: Vec<u8>) -> AnnounceRecord {
         AnnounceRecord {
-            format_version: FORMAT_VERSION,
             identity_ref: self.identity_ref,
             public_key: self.public_key,
             routing_hints: self.routing_hints,
@@ -246,7 +249,7 @@ mod tests {
             destination_hash: [0xAA; 16],
         });
         builder.add_routing_hint(RoutingHint::Zenoh {
-            locator: alloc::vec![b't', b'c', b'p'],
+            locator: alloc::string::String::from("tcp/127.0.0.1:7447"),
         });
         let record = builder.build(alloc::vec![]);
         assert_eq!(record.routing_hints.len(), 2);

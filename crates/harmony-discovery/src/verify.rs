@@ -3,7 +3,8 @@ use harmony_identity::CryptoSuite;
 use crate::error::DiscoveryError;
 use crate::record::AnnounceRecord;
 
-/// Maximum allowed clock skew for announce timestamps (60 seconds).
+/// Maximum allowed clock skew for announce timestamps.
+/// All timestamps in this crate are Unix epoch seconds.
 const MAX_CLOCK_SKEW: u64 = 60;
 
 /// Verify an announce record's signature and time bounds.

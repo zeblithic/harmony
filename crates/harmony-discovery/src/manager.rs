@@ -537,7 +537,7 @@ mod tests {
                 destination_hash: [0xAA; 16],
             })
             .add_routing_hint(RoutingHint::Zenoh {
-                locator: alloc::vec![0xBB; 4],
+                locator: alloc::string::String::from("tcp/10.0.0.1:7447"),
             });
 
         let payload = builder.signable_payload();
