@@ -1,0 +1,23 @@
+# Cross-compilation targets for Harmony node deployment.
+#
+# aarch64-unknown-linux-musl: Static musl binaries for Linux aarch64
+# (OpenWRT routers, Raspberry Pi, ARM servers).
+#
+# Uses rust-lld (bundled with Rust) so no external C cross-compiler
+# is needed. BLAKE3 NEON assembly is disabled (pure Rust fallback)
+# because the cc crate can't find aarch64-linux-musl-gcc on macOS.
+# This trades ~3x BLAKE3 throughput for zero cross-compile deps.
+# If a musl cross-toolchain is available, remove CARGO_FEATURE_NO_NEON
+# and set CC_aarch64_unknown_linux_musl instead.
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+[env]
+# Disable BLAKE3 NEON assembly for aarch64 cross-compilation.
+# blake3's build.rs reads this as a Cargo feature flag, skipping the
+# cc crate's attempt to compile NEON intrinsics via a C cross-compiler.
+# This is set globally because Cargo's [env] has no per-target support,
+# but it only affects the NEON codepath — harmless on x86_64 (uses SSE/AVX).
+CARGO_FEATURE_NO_NEON = "1"

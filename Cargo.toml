@@ -101,3 +101,7 @@ harmony-semantic = { path = "crates/harmony-semantic", default-features = false 
 harmony-trust = { path = "crates/harmony-trust", default-features = false }
 harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
+
+[profile.release]
+strip = true
+lto = "thin"
