@@ -56,14 +56,25 @@ pub fn verify_credential(
     Ok(())
 }
 
-/// Verify a presentation: credential verification + disclosure integrity.
+/// Verify a presentation: credential verification + subject identity +
+/// disclosure integrity.
+///
+/// When `expected_subject` is `Some`, the credential's subject must match
+/// the given identity. This prevents replay of intercepted presentations
+/// by a different party.
 pub fn verify_presentation(
     presentation: &Presentation,
     now: u64,
+    expected_subject: Option<&IdentityRef>,
     keys: &impl CredentialKeyResolver,
     status_lists: &impl StatusListResolver,
 ) -> Result<(), CredentialError> {
     verify_credential(&presentation.credential, now, keys, status_lists)?;
+    if let Some(subject) = expected_subject {
+        if &presentation.credential.subject != subject {
+            return Err(CredentialError::SubjectMismatch);
+        }
+    }
     presentation.verify_disclosures()?;
     Ok(())
 }
@@ -302,7 +313,39 @@ mod tests {
             credential: cred,
             disclosed_claims: claims,
         };
-        assert!(verify_presentation(&presentation, 1500, &resolver, &status).is_ok());
+        assert!(verify_presentation(&presentation, 1500, None, &resolver, &status).is_ok());
+    }
+
+    #[test]
+    fn valid_presentation_with_expected_subject() {
+        let (private, cred, claims, issuer_ref) = build_signed_credential();
+        let resolver = setup_resolver(private.public_identity(), &issuer_ref);
+        let status = empty_status();
+        let subject = cred.subject;
+        let presentation = Presentation {
+            credential: cred,
+            disclosed_claims: claims,
+        };
+        assert!(
+            verify_presentation(&presentation, 1500, Some(&subject), &resolver, &status).is_ok()
+        );
+    }
+
+    #[test]
+    fn wrong_subject_rejected() {
+        let (private, cred, claims, issuer_ref) = build_signed_credential();
+        let resolver = setup_resolver(private.public_identity(), &issuer_ref);
+        let status = empty_status();
+        let wrong_subject = IdentityRef::new([0xCC; 16], CryptoSuite::Ed25519);
+        let presentation = Presentation {
+            credential: cred,
+            disclosed_claims: claims,
+        };
+        assert_eq!(
+            verify_presentation(&presentation, 1500, Some(&wrong_subject), &resolver, &status)
+                .unwrap_err(),
+            CredentialError::SubjectMismatch
+        );
     }
 
     #[test]
@@ -316,7 +359,7 @@ mod tests {
             disclosed_claims: vec![claims[0].clone()],
         };
         assert_eq!(
-            verify_presentation(&presentation, 1500, &resolver, &status).unwrap_err(),
+            verify_presentation(&presentation, 1500, None, &resolver, &status).unwrap_err(),
             CredentialError::DisclosureMismatch
         );
     }
@@ -357,7 +400,7 @@ mod tests {
                     credential: cred,
                     disclosed_claims: claims,
                 };
-                assert!(verify_presentation(&presentation, 1500, &resolver, &status).is_ok());
+                assert!(verify_presentation(&presentation, 1500, None, &resolver, &status).is_ok());
             })
             .expect("failed to spawn thread")
             .join()
@@ -396,7 +439,7 @@ mod tests {
         let mut status = MemoryStatusListResolver::new();
         status.insert(issuer_ref.hash, StatusList::new(128));
 
-        assert!(verify_presentation(&presentation, 2000, &resolver, &status).is_ok());
+        assert!(verify_presentation(&presentation, 2000, None, &resolver, &status).is_ok());
     }
 
     #[test]

@@ -29,14 +29,15 @@ impl StatusList {
 
     /// Check whether the credential at `index` has been revoked.
     ///
-    /// Returns `false` for out-of-bounds indices (treat unknown as valid).
-    pub fn is_revoked(&self, index: u32) -> bool {
+    /// Returns `None` for out-of-bounds indices so the verifier fails
+    /// closed rather than treating un-representable indices as valid.
+    pub fn is_revoked(&self, index: u32) -> Option<bool> {
         if index >= self.capacity {
-            return false;
+            return None;
         }
         let byte_idx = (index / 8) as usize;
         let bit_idx = (index % 8) as u8;
-        self.bits[byte_idx] & (1 << bit_idx) != 0
+        Some(self.bits[byte_idx] & (1 << bit_idx) != 0)
     }
 
     /// Revoke the credential at `index`.
@@ -96,7 +97,7 @@ impl StatusListResolver for MemoryStatusListResolver {
     fn is_revoked(&self, issuer: &IdentityRef, index: u32) -> Option<bool> {
         self.lists
             .get(&issuer.hash)
-            .map(|list| list.is_revoked(index))
+            .and_then(|list| list.is_revoked(index))
     }
 }
 
@@ -108,7 +109,7 @@ mod tests {
     fn new_list_all_valid() {
         let list = StatusList::new(128);
         for i in 0..128 {
-            assert!(!list.is_revoked(i));
+            assert_eq!(list.is_revoked(i), Some(false));
         }
     }
 
@@ -116,9 +117,9 @@ mod tests {
     fn revoke_sets_bit() {
         let mut list = StatusList::new(128);
         list.revoke(42).unwrap();
-        assert!(list.is_revoked(42));
-        assert!(!list.is_revoked(41));
-        assert!(!list.is_revoked(43));
+        assert_eq!(list.is_revoked(42), Some(true));
+        assert_eq!(list.is_revoked(41), Some(false));
+        assert_eq!(list.is_revoked(43), Some(false));
     }
 
     #[test]
@@ -126,7 +127,7 @@ mod tests {
         let mut list = StatusList::new(128);
         list.revoke(10).unwrap();
         list.revoke(10).unwrap();
-        assert!(list.is_revoked(10));
+        assert_eq!(list.is_revoked(10), Some(true));
     }
 
     #[test]
@@ -148,19 +149,19 @@ mod tests {
         list.revoke(7).unwrap();
         list.revoke(8).unwrap();
         list.revoke(15).unwrap();
-        assert!(list.is_revoked(0));
-        assert!(list.is_revoked(7));
-        assert!(list.is_revoked(8));
-        assert!(list.is_revoked(15));
-        assert!(!list.is_revoked(1));
-        assert!(!list.is_revoked(9));
+        assert_eq!(list.is_revoked(0), Some(true));
+        assert_eq!(list.is_revoked(7), Some(true));
+        assert_eq!(list.is_revoked(8), Some(true));
+        assert_eq!(list.is_revoked(15), Some(true));
+        assert_eq!(list.is_revoked(1), Some(false));
+        assert_eq!(list.is_revoked(9), Some(false));
     }
 
     #[test]
-    fn out_of_bounds_is_valid() {
+    fn out_of_bounds_returns_none() {
         let list = StatusList::new(16);
-        assert!(!list.is_revoked(16));
-        assert!(!list.is_revoked(9999));
+        assert_eq!(list.is_revoked(16), None);
+        assert_eq!(list.is_revoked(9999), None);
     }
 
     #[test]
@@ -185,10 +186,10 @@ mod tests {
 
         let bytes = postcard::to_allocvec(&list).unwrap();
         let decoded: StatusList = postcard::from_bytes(&bytes).unwrap();
-        assert!(decoded.is_revoked(0));
-        assert!(decoded.is_revoked(100));
-        assert!(decoded.is_revoked(255));
-        assert!(!decoded.is_revoked(1));
+        assert_eq!(decoded.is_revoked(0), Some(true));
+        assert_eq!(decoded.is_revoked(100), Some(true));
+        assert_eq!(decoded.is_revoked(255), Some(true));
+        assert_eq!(decoded.is_revoked(1), Some(false));
         assert_eq!(decoded.capacity(), 256);
     }
 }
