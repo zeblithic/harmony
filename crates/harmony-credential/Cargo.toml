@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ed25519-dalek = { workspace = true }
 harmony-crypto = { workspace = true, features = ["serde"] }
 harmony-identity = { workspace = true }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }

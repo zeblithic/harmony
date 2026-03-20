@@ -206,10 +206,14 @@ Rather than modifying `harmony-identity`, the credential crate defines
 its own resolver trait that returns raw public key bytes for any suite:
 
 ```rust
-/// Resolve an issuer's signing public key for credential verification.
+/// Resolve an issuer's verifying public key for credential verification.
+///
+/// Returns the raw public key bytes used for signature verification:
+/// - Ed25519: 32-byte verifying key
+/// - ML-DSA-65: 1952-byte signing public key
 ///
 /// The `issued_at` parameter enables KEL-backed resolvers to return
-/// the signing key that was active at credential issuance time.
+/// the key that was active at credential issuance time.
 /// For non-rotatable identities, `issued_at` can be ignored.
 pub trait CredentialKeyResolver {
     fn resolve(&self, issuer: &IdentityRef, issued_at: u64) -> Option<Vec<u8>>;
@@ -217,7 +221,7 @@ pub trait CredentialKeyResolver {
 ```
 
 The `CryptoSuite` in `issuer` tells the verification function which
-algorithm to use. The resolver just provides the raw key bytes —
+algorithm to use. The resolver provides the raw verifying key bytes —
 Ed25519 (32B), ML-DSA-65 (1952B), or the historical ML-DSA-65 key
 from a KEL.
 

@@ -6,10 +6,14 @@ use crate::disclosure::Presentation;
 use crate::error::CredentialError;
 use crate::status_list::StatusListResolver;
 
-/// Resolve an issuer's signing public key for credential verification.
+/// Resolve an issuer's verifying public key for credential verification.
+///
+/// Returns the raw public key bytes used for signature verification:
+/// - Ed25519: 32-byte verifying key
+/// - ML-DSA-65: 1952-byte signing public key
 ///
 /// The `issued_at` parameter enables KEL-backed resolvers to return
-/// the signing key that was active at credential issuance time.
+/// the key that was active at credential issuance time.
 /// For non-rotatable identities, `issued_at` can be ignored.
 pub trait CredentialKeyResolver {
     fn resolve(&self, issuer: &IdentityRef, issued_at: u64) -> Option<Vec<u8>>;
@@ -88,12 +92,15 @@ fn verify_signature(
 ) -> Result<(), CredentialError> {
     match suite {
         CryptoSuite::Ed25519 => {
-            let sig: [u8; 64] = signature
+            use ed25519_dalek::Verifier;
+            let key_array: [u8; 32] = key_bytes
                 .try_into()
                 .map_err(|_| CredentialError::SignatureInvalid)?;
-            let identity = harmony_identity::Identity::from_public_bytes(key_bytes)
+            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key_array)
                 .map_err(|_| CredentialError::SignatureInvalid)?;
-            identity
+            let sig = ed25519_dalek::Signature::from_slice(signature)
+                .map_err(|_| CredentialError::SignatureInvalid)?;
+            verifying_key
                 .verify(message, &sig)
                 .map_err(|_| CredentialError::SignatureInvalid)
         }
@@ -172,7 +179,7 @@ mod tests {
         issuer_ref: &IdentityRef,
     ) -> MemoryKeyResolver {
         let mut resolver = MemoryKeyResolver::new();
-        resolver.insert(issuer_ref.hash, identity.to_public_bytes().to_vec());
+        resolver.insert(issuer_ref.hash, identity.verifying_key.to_bytes().to_vec());
         resolver
     }
 
@@ -435,7 +442,7 @@ mod tests {
 
         // 3. Verify
         let mut resolver = MemoryKeyResolver::new();
-        resolver.insert(issuer_ref.hash, identity.to_public_bytes().to_vec());
+        resolver.insert(issuer_ref.hash, identity.verifying_key.to_bytes().to_vec());
         let mut status = MemoryStatusListResolver::new();
         status.insert(issuer_ref.hash, StatusList::new(128));
 
@@ -458,7 +465,7 @@ mod tests {
         let (cred, _) = builder.build(signature.to_vec());
 
         let mut resolver = MemoryKeyResolver::new();
-        resolver.insert(issuer_ref.hash, identity.to_public_bytes().to_vec());
+        resolver.insert(issuer_ref.hash, identity.verifying_key.to_bytes().to_vec());
 
         // Valid before revocation
         let mut status = MemoryStatusListResolver::new();

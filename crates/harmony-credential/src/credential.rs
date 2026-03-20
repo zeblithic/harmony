@@ -12,6 +12,7 @@ const FORMAT_VERSION: u8 = 1;
 /// Everything except the signature.
 #[derive(Serialize, Deserialize)]
 struct SignablePayload {
+    format_version: u8,
     issuer: IdentityRef,
     subject: IdentityRef,
     claim_digests: Vec<[u8; 32]>,
@@ -50,6 +51,7 @@ impl Credential {
     /// Reconstruct the signable payload bytes (everything except signature).
     pub(crate) fn signable_bytes(&self) -> Vec<u8> {
         let payload = SignablePayload {
+            format_version: FORMAT_VERSION,
             issuer: self.issuer,
             subject: self.subject,
             claim_digests: self.claim_digests.clone(),
@@ -176,6 +178,7 @@ impl CredentialBuilder {
     pub fn signable_payload(&self) -> Vec<u8> {
         let digests: Vec<[u8; 32]> = self.claims.iter().map(|c| c.digest()).collect();
         let payload = SignablePayload {
+            format_version: FORMAT_VERSION,
             issuer: self.issuer,
             subject: self.subject,
             claim_digests: digests,
