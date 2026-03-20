@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Durable execution orchestration with event-sourced history for the Harmony decentralized stack"
 
 [features]
+default = []
 no-neon = ["harmony-crypto/no-neon"]
 
 [dependencies]
