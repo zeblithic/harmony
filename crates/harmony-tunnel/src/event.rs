@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 #[derive(Debug)]
 pub enum TunnelEvent {
     /// Raw bytes received from the transport (iroh-net connection).
-    InboundBytes { data: Vec<u8> },
+    InboundBytes { data: Vec<u8>, now_ms: u64 },
     /// Send a Reticulum packet through this tunnel.
     SendReticulum { packet: Vec<u8> },
     /// Send a Zenoh message through this tunnel.

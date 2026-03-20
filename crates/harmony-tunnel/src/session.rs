@@ -185,7 +185,10 @@ impl TunnelSession {
     /// Process a single event and return resulting actions.
     pub fn handle_event(&mut self, event: TunnelEvent) -> Result<Vec<TunnelAction>, TunnelError> {
         match event {
-            TunnelEvent::InboundBytes { data } => self.handle_inbound(data),
+            TunnelEvent::InboundBytes { data, now_ms } => {
+                self.last_received_ms = now_ms;
+                self.handle_inbound(data)
+            }
             TunnelEvent::SendReticulum { packet } => self.handle_send(FrameTag::Reticulum, packet),
             TunnelEvent::SendZenoh { message } => self.handle_send(FrameTag::Zenoh, message),
             TunnelEvent::Tick { now_ms } => self.handle_tick(now_ms),
@@ -382,7 +385,7 @@ mod tests {
 
         // Initiator processes TunnelAccept
         let actions = initiator
-            .handle_event(TunnelEvent::InboundBytes { data: accept_bytes })
+            .handle_event(TunnelEvent::InboundBytes { data: accept_bytes, now_ms: 0 })
             .unwrap();
 
         assert_eq!(initiator.state(), TunnelState::Active);
@@ -417,7 +420,7 @@ mod tests {
             .unwrap();
 
         initiator
-            .handle_event(TunnelEvent::InboundBytes { data: accept_bytes })
+            .handle_event(TunnelEvent::InboundBytes { data: accept_bytes, now_ms: 0 })
             .unwrap();
 
         // Initiator sends Reticulum packet to responder
@@ -433,7 +436,7 @@ mod tests {
         };
 
         let actions = responder
-            .handle_event(TunnelEvent::InboundBytes { data: encrypted })
+            .handle_event(TunnelEvent::InboundBytes { data: encrypted, now_ms: 0 })
             .unwrap();
 
         assert!(matches!(
@@ -454,7 +457,7 @@ mod tests {
         };
 
         let actions = initiator
-            .handle_event(TunnelEvent::InboundBytes { data: encrypted })
+            .handle_event(TunnelEvent::InboundBytes { data: encrypted, now_ms: 0 })
             .unwrap();
 
         assert!(matches!(
@@ -493,7 +496,7 @@ mod tests {
             .unwrap();
 
         initiator
-            .handle_event(TunnelEvent::InboundBytes { data: accept_bytes })
+            .handle_event(TunnelEvent::InboundBytes { data: accept_bytes, now_ms: 0 })
             .unwrap();
 
         assert_eq!(initiator.state(), TunnelState::Active);
@@ -541,6 +544,7 @@ mod tests {
         // Initiator must reject — pubkey doesn't match expected responder
         let result = initiator.handle_event(TunnelEvent::InboundBytes {
             data: impersonator_accept_bytes,
+            now_ms: 0,
         });
         assert!(
             result.is_err(),
@@ -639,6 +643,57 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
             "Close must emit TunnelAction::Closed"
+        );
+    }
+
+    // ── Task 8: Timestamp Tracking ────────────────────────────────────────────
+
+    #[test]
+    fn inbound_data_resets_keepalive_timer() {
+        let (mut initiator, mut responder, _iid, _rid) = complete_handshake();
+
+        // Artificially set last_received_ms as if we last heard from peer at t=1000
+        initiator.last_received_ms = 1000;
+
+        // Responder sends a packet
+        let send_actions = responder
+            .handle_event(TunnelEvent::SendReticulum {
+                packet: b"ping".to_vec(),
+            })
+            .unwrap();
+        let encrypted = match &send_actions[0] {
+            TunnelAction::OutboundBytes { data } => data.clone(),
+            _ => panic!("expected OutboundBytes"),
+        };
+
+        // Initiator receives it at now_ms=50_000 — resets last_received_ms to 50_000
+        initiator
+            .handle_event(TunnelEvent::InboundBytes { data: encrypted, now_ms: 50_000 })
+            .unwrap();
+        assert_eq!(initiator.last_received_ms, 50_000);
+
+        // Tick at 50000 + 89999 = 139999: 89999ms < DEAD_TIMEOUT_MS (90000) — NO timeout
+        let actions = initiator
+            .handle_event(TunnelEvent::Tick { now_ms: 139_999 })
+            .unwrap();
+        assert_ne!(
+            initiator.state(),
+            TunnelState::Closed,
+            "should not timeout at 139999ms"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
+            "must not be closed at 139999ms"
+        );
+
+        // Tick at 50000 + 90001 = 140001: 90001ms >= DEAD_TIMEOUT_MS — timeout
+        let actions = initiator
+            .handle_event(TunnelEvent::Tick { now_ms: 140_001 })
+            .unwrap();
+        assert_eq!(initiator.state(), TunnelState::Closed);
+        assert!(
+            actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
+            "must timeout at 140001ms"
         );
     }
 
