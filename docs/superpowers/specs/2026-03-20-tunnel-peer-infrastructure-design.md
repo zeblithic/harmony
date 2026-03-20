@@ -94,10 +94,10 @@ After handshake, the tunnel carries two frame types over the same encrypted sess
 ### State Machine
 
 ```
-Idle → Initiating → HandshakeWait → Active → Closing → Closed → Idle
+Idle → Initiating → Active → Closed
 ```
 
-The `TunnelSession` state machine owns transport-level lifecycle only. Reconnection decisions (whether to re-initiate after `Closed`) are made by the `PeerManager` at the peer lifecycle layer, which emits a new `InitiateTunnel` action to transition the session back to `Idle → Initiating`.
+The `TunnelSession` state machine owns transport-level lifecycle only. There is no `Closing` state — close is immediate (no graceful-close handshake needed since QUIC handles transport-level teardown). Reconnection decisions (whether to re-initiate after `Closed`) are made by the `PeerManager` at the peer lifecycle layer, which creates a new `TunnelSession` starting at `Idle`.
 
 **Events consumed:**
 - `InboundBytes(Vec<u8>)` — raw bytes from iroh-net connection

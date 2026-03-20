@@ -1605,7 +1605,7 @@ Add to `session.rs` tests:
 
         // Initiator should reject — wrong responder identity
         let result = initiator.handle_event(
-            TunnelEvent::InboundBytes { data: accept_bytes, now_ms: 0 },
+            TunnelEvent::InboundBytes { data: accept_bytes },
         );
         assert!(result.is_err());
     }
