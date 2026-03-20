@@ -91,38 +91,46 @@ pub async fn run(
     let mut next_query_id: u64 = 1;
 
     // ── Select loop ──────────────────────────────────────────────────────────
+    //
+    // Events from UDP and Zenoh are buffered via push_event(). tick() is
+    // called ONLY when the 250ms timer fires — this ensures tick_count,
+    // ticks_since_filter_broadcast, and PeerFilterTable eviction all
+    // advance at wall-clock rate, not at event rate. Under high traffic,
+    // events queue up and are drained on the next tick.
     loop {
-        let runtime_events: Vec<RuntimeEvent> = tokio::select! {
-            // Arm 1: UDP packet received
+        let mut should_tick = false;
+
+        tokio::select! {
+            // Arm 1: UDP packet received — buffer only, tick on timer.
             result = udp.recv_from(&mut udp_buf) => {
                 match result {
                     Ok((len, _src)) => {
-                        let interface_name = "udp0".to_string();
-                        let raw = udp_buf[..len].to_vec();
-                        vec![RuntimeEvent::InboundPacket { interface_name, raw, now: now_ms() }]
+                        runtime.push_event(RuntimeEvent::InboundPacket {
+                            interface_name: "udp0".to_string(),
+                            raw: udp_buf[..len].to_vec(),
+                            now: now_ms(),
+                        });
                     }
                     Err(e) => {
                         eprintln!("[event_loop] UDP recv error: {e}");
-                        // Fatal socket errors should exit — transient ones continue.
                         use std::io::ErrorKind::*;
                         match e.kind() {
                             WouldBlock | Interrupted => {}
                             _ => return Err(e.into()),
                         }
-                        vec![]
                     }
                 }
             }
 
-            // Arm 2: 250 ms timer tick
+            // Arm 2: 250 ms timer tick — push TimerTick AND trigger tick().
             _ = timer.tick() => {
-                vec![RuntimeEvent::TimerTick { now: now_ms() }]
+                runtime.push_event(RuntimeEvent::TimerTick { now: now_ms() });
+                should_tick = true;
             }
 
-            // Arm 3: Zenoh bridge event
+            // Arm 3: Zenoh bridge event — buffer only, tick on timer.
             // Note: the None arm is currently unreachable because zenoh_tx lives
-            // alongside this loop. It exists for defense-in-depth — if we later
-            // restructure ownership so the channel can close, this path is ready.
+            // alongside this loop. It exists for defense-in-depth.
             maybe = zenoh_rx.recv() => {
                 match maybe {
                     None => {
@@ -133,37 +141,35 @@ pub async fn run(
                         ZenohEvent::Query { key_expr, payload } => {
                             let query_id = next_query_id;
                             next_query_id += 1;
-                            vec![RuntimeEvent::QueryReceived { query_id, key_expr, payload }]
+                            runtime.push_event(RuntimeEvent::QueryReceived { query_id, key_expr, payload });
                         }
                         ZenohEvent::ComputeQuery { key_expr, payload } => {
                             let query_id = next_query_id;
                             next_query_id += 1;
-                            vec![RuntimeEvent::ComputeQuery { query_id, key_expr, payload }]
+                            runtime.push_event(RuntimeEvent::ComputeQuery { query_id, key_expr, payload });
                         }
                         ZenohEvent::Subscription { key_expr, payload } => {
-                            vec![RuntimeEvent::SubscriptionMessage { key_expr, payload }]
+                            runtime.push_event(RuntimeEvent::SubscriptionMessage { key_expr, payload });
                         }
                         ZenohEvent::FetchResponse { cid, is_module, result } => {
                             if is_module {
-                                vec![RuntimeEvent::ModuleFetchResponse { cid, result }]
+                                runtime.push_event(RuntimeEvent::ModuleFetchResponse { cid, result });
                             } else {
-                                vec![RuntimeEvent::ContentFetchResponse { cid, result }]
+                                runtime.push_event(RuntimeEvent::ContentFetchResponse { cid, result });
                             }
                         }
                     }
                 }
             }
-        };
-
-        // Push all events from this select arm into the runtime.
-        for event in runtime_events {
-            runtime.push_event(event);
         }
 
-        // Run one runtime tick and dispatch resulting actions.
-        let actions = runtime.tick();
-        for action in actions {
-            dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr).await;
+        // Only tick on timer — counters (tick_count, ticks_since_filter_broadcast,
+        // peer filter eviction) must advance at wall-clock rate, not event rate.
+        if should_tick {
+            let actions = runtime.tick();
+            for action in actions {
+                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr).await;
+            }
         }
     }
 
@@ -180,6 +186,9 @@ async fn dispatch_action(
 ) {
     match action {
         // ── Tier 1: UDP broadcast ─────────────────────────────────────────────
+        // Awaited inline (not spawned) because tokio::net::UdpSocket is not
+        // Clone. For Reticulum's small MTU (≤1024 bytes), send_to is
+        // effectively non-blocking on a UDP socket with default buffer sizes.
         RuntimeAction::SendOnInterface { raw, .. } => {
             if let Err(e) = udp.send_to(&raw, broadcast_addr).await {
                 eprintln!("[event_loop] UDP send error: {e}");
@@ -219,6 +228,9 @@ async fn dispatch_action(
         }
 
         // ── Tier 3: Fetch WASM module via Zenoh get() ────────────────────────
+        // Modules are CID-addressed blobs stored in the content namespace —
+        // same key scheme as FetchContent. Only the response routing differs
+        // (ModuleFetchResponse vs ContentFetchResponse).
         RuntimeAction::FetchModule { cid } => {
             let cid_hex = hex::encode(cid);
             let key_expr = harmony_zenoh::namespace::content::fetch_key(&cid_hex);
