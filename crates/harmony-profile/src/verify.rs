@@ -36,11 +36,17 @@ pub fn verify_profile(
 }
 
 /// Verify an endorsement record's signature and time bounds.
+///
+/// Rejects self-endorsements (`endorser == endorsee`) as structurally
+/// invalid, even if the record was constructed bypassing the builder.
 pub fn verify_endorsement(
     record: &EndorsementRecord,
     now: u64,
     keys: &impl ProfileKeyResolver,
 ) -> Result<(), ProfileError> {
+    if record.endorser.hash == record.endorsee.hash {
+        return Err(ProfileError::InvalidRecord);
+    }
     check_time_bounds(record.published_at, record.expires_at, now)?;
 
     let key_bytes = keys
@@ -102,6 +108,13 @@ fn verify_signature(
 #[cfg(any(test, feature = "test-utils"))]
 pub struct MemoryKeyResolver {
     keys: hashbrown::HashMap<harmony_identity::IdentityHash, Vec<u8>>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Default for MemoryKeyResolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -324,6 +337,31 @@ mod tests {
         let resolver = setup_resolver(identity, &id_ref);
         assert_eq!(
             verify_profile(&record, 1500, &resolver).unwrap_err(),
+            ProfileError::InvalidRecord
+        );
+    }
+
+    #[test]
+    fn self_endorsement_rejected() {
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let identity = private.public_identity();
+        let id_ref = IdentityRef::from(identity);
+
+        // Bypass builder to construct self-endorsement directly
+        let record = EndorsementRecord {
+            endorser: id_ref,
+            endorsee: id_ref, // same identity
+            type_id: 42,
+            reason: None,
+            published_at: 1000,
+            expires_at: 2000,
+            nonce: [0x01; 16],
+            signature: alloc::vec![0xDE, 0xAD],
+        };
+
+        let resolver = setup_resolver(identity, &id_ref);
+        assert_eq!(
+            verify_endorsement(&record, 1500, &resolver).unwrap_err(),
             ProfileError::InvalidRecord
         );
     }

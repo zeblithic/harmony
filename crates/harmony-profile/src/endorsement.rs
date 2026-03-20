@@ -48,6 +48,10 @@ pub struct EndorsementRecord {
 }
 
 impl EndorsementRecord {
+    /// Reconstruct the signable payload bytes (everything except signature).
+    ///
+    /// Uses the compile-time `FORMAT_VERSION` constant. Records from
+    /// persistent storage MUST go through [`EndorsementRecord::deserialize`].
     pub(crate) fn signable_bytes(&self) -> Vec<u8> {
         let payload = SignablePayload {
             format_version: FORMAT_VERSION,
@@ -99,7 +103,7 @@ pub struct EndorsementBuilder {
 impl EndorsementBuilder {
     /// # Panics
     ///
-    /// Panics if `expires_at <= published_at`.
+    /// Panics if `expires_at <= published_at` or if `endorser == endorsee`.
     pub fn new(
         endorser: IdentityRef,
         endorsee: IdentityRef,
@@ -111,6 +115,10 @@ impl EndorsementBuilder {
         assert!(
             expires_at > published_at,
             "expires_at ({expires_at}) must be > published_at ({published_at})"
+        );
+        assert_ne!(
+            endorser.hash, endorsee.hash,
+            "endorser and endorsee must be different identities"
         );
         Self {
             endorser,
@@ -218,6 +226,13 @@ mod tests {
     #[should_panic(expected = "expires_at")]
     fn rejects_expires_at_equal_to_published_at() {
         EndorsementBuilder::new(test_endorser(), test_endorsee(), 42, 1000, 1000, [0x01; 16]);
+    }
+
+    #[test]
+    #[should_panic(expected = "endorser and endorsee must be different")]
+    fn rejects_self_endorsement() {
+        let id = test_endorser();
+        EndorsementBuilder::new(id, id, 42, 1000, 2000, [0x01; 16]);
     }
 
     #[test]

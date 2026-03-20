@@ -419,7 +419,12 @@ pub mod endorsement {
         format!("{PREFIX}/{endorser_hex}/*")
     }
 
-    /// All endorsements of a specific endorsee.
+    /// All endorsements of a specific endorsee (query-only pattern).
+    ///
+    /// This pattern uses `*` in a non-terminal position, which works
+    /// for Zenoh `session.get()` queries but may not be registerable
+    /// as a subscriber in Zenoh 1.x. For subscription use cases,
+    /// subscribe to all endorsements and filter at the application layer.
     ///
     /// `endorsee_hex` must be the 32-character lowercase hex encoding
     /// of the 16-byte `IdentityHash`.
