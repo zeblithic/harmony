@@ -27,3 +27,7 @@ harmony-zenoh.workspace = true
 clap = { version = "4", features = ["derive"] }
 hex.workspace = true
 rand.workspace = true
+zeroize = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"
