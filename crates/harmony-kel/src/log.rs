@@ -16,41 +16,11 @@ const FORMAT_VERSION: u8 = 1;
 
 /// Wire format for serializing/deserializing a `KeyEventLog`.
 ///
-/// Only stores `address` and `events`; cached keys/commitment are re-derived
-/// from the event chain on deserialization to prevent tampering.
+/// Only stores events; the address and cached keys/commitment are re-derived
+/// by replaying the event chain through the validated path on deserialization.
 #[derive(Serialize, Deserialize)]
 struct KeyEventLogWire {
-    address: IdentityHash,
     events: Vec<KeyEvent>,
-}
-
-/// Derive cached state (current signing key, encryption key, next-key commitment)
-/// by scanning the event chain.
-///
-/// Panics if `events` is empty or `events[0]` is not an `InceptionEvent`.
-fn derive_cached_state(events: &[KeyEvent]) -> (MlDsaPublicKey, MlKemPublicKey, [u8; 32]) {
-    let mut signing_key;
-    let mut encryption_key;
-    let mut commitment;
-
-    match &events[0] {
-        KeyEvent::Inception(e) => {
-            signing_key = e.signing_key.clone();
-            encryption_key = e.encryption_key.clone();
-            commitment = e.next_key_commitment;
-        }
-        _ => panic!("first event must be inception"),
-    }
-
-    for event in &events[1..] {
-        if let KeyEvent::Rotation(e) = event {
-            signing_key = e.signing_key.clone();
-            encryption_key = e.encryption_key.clone();
-            commitment = e.next_key_commitment;
-        }
-    }
-
-    (signing_key, encryption_key, commitment)
 }
 
 /// A KERI-inspired Key Event Log with pre-rotation and dual signatures.
@@ -229,7 +199,6 @@ impl KeyEventLog {
     /// are re-derived on deserialization.
     pub fn serialize(&self) -> Result<Vec<u8>, KelError> {
         let wire = KeyEventLogWire {
-            address: self.address,
             events: self.events.clone(),
         };
         let mut buf = Vec::new();
@@ -242,9 +211,13 @@ impl KeyEventLog {
 
     /// Deserialize a log from bytes (expects format version prefix).
     ///
-    /// Cached state (current signing key, encryption key, next-key commitment)
-    /// is re-derived from the event chain rather than trusted from the wire.
-    /// Validates that only `events[0]` is an inception event.
+    /// Replays the entire event chain through the validated path
+    /// (`from_inception` + `apply_rotation`/`apply_interaction`), which:
+    /// - Re-derives the address from the inception payload
+    /// - Verifies every signature cryptographically
+    /// - Validates hash chain continuity
+    /// - Checks sequence number monotonicity
+    /// - Verifies pre-rotation commitments on rotations
     pub fn deserialize(data: &[u8]) -> Result<Self, KelError> {
         if data.is_empty() {
             return Err(KelError::DeserializeError("empty data"));
@@ -259,26 +232,27 @@ impl KeyEventLog {
             return Err(KelError::EmptyLog);
         }
 
-        // Validate: events[0] must be Inception, no other event may be Inception.
-        if !matches!(wire.events[0], KeyEvent::Inception(_)) {
-            return Err(KelError::DeserializeError("first event is not inception"));
-        }
-        for event in &wire.events[1..] {
-            if matches!(event, KeyEvent::Inception(_)) {
-                return Err(KelError::DuplicateInception);
+        // Replay the entire event chain through the validated path.
+        // This re-derives the address from the inception payload and
+        // cryptographically verifies every event in the chain.
+        let mut events = wire.events.into_iter();
+
+        let inception = match events.next().unwrap() {
+            KeyEvent::Inception(e) => e,
+            _ => return Err(KelError::DeserializeError("first event is not inception")),
+        };
+
+        let mut log = Self::from_inception(inception)?;
+
+        for event in events {
+            match event {
+                KeyEvent::Inception(_) => return Err(KelError::DuplicateInception),
+                KeyEvent::Rotation(e) => log.apply_rotation(e)?,
+                KeyEvent::Interaction(e) => log.apply_interaction(e)?,
             }
         }
 
-        let (current_signing_key, current_encryption_key, next_key_commitment) =
-            derive_cached_state(&wire.events);
-
-        Ok(Self {
-            address: wire.address,
-            events: wire.events,
-            current_signing_key,
-            current_encryption_key,
-            next_key_commitment,
-        })
+        Ok(log)
     }
 }
 
@@ -899,5 +873,100 @@ mod tests {
             KeyEventLog::deserialize(&[FORMAT_VERSION, 0xFF, 0xFF, 0xFF]),
             Err(KelError::DeserializeError("postcard decode failed"))
         ));
+    }
+
+    // ---- Test 21: deserialize_validates_inception_signature ----
+    #[test]
+    fn deserialize_validates_inception_signature() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let keys0 = gen_keyset();
+                let keys1 = gen_keyset();
+                let mut inception = build_inception(&keys0, &keys1);
+                // Tamper with created_at after signing (invalidates signature)
+                inception.created_at = 9999;
+
+                let wire = KeyEventLogWire {
+                    events: alloc::vec![KeyEvent::Inception(inception)],
+                };
+                let mut buf = alloc::vec![FORMAT_VERSION];
+                buf.extend_from_slice(&postcard::to_allocvec(&wire).unwrap());
+
+                let result = KeyEventLog::deserialize(&buf);
+                assert_eq!(result.unwrap_err(), KelError::InvalidInceptionSignature);
+            })
+            .expect("failed to spawn thread")
+            .join()
+            .expect("thread panicked");
+    }
+
+    // ---- Test 22: deserialize_validates_hash_chain ----
+    #[test]
+    fn deserialize_validates_hash_chain() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let keys0 = gen_keyset();
+                let keys1 = gen_keyset();
+                let keys2 = gen_keyset();
+
+                let inception = build_inception(&keys0, &keys1);
+                let log = KeyEventLog::from_inception(inception.clone()).unwrap();
+
+                let mut rotation = build_rotation(&log, &keys0, &keys1, &keys2);
+                rotation.previous_hash = [0xAA; 32]; // tamper hash chain
+
+                let wire = KeyEventLogWire {
+                    events: alloc::vec![
+                        KeyEvent::Inception(inception),
+                        KeyEvent::Rotation(rotation),
+                    ],
+                };
+                let mut buf = alloc::vec![FORMAT_VERSION];
+                buf.extend_from_slice(&postcard::to_allocvec(&wire).unwrap());
+
+                let result = KeyEventLog::deserialize(&buf);
+                assert_eq!(result.unwrap_err(), KelError::HashChainBroken);
+            })
+            .expect("failed to spawn thread")
+            .join()
+            .expect("thread panicked");
+    }
+
+    // ---- Test 23: deserialize_validates_rotation_signatures ----
+    #[test]
+    fn deserialize_validates_rotation_signatures() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let keys0 = gen_keyset();
+                let keys1 = gen_keyset();
+                let keys2 = gen_keyset();
+
+                let inception = build_inception(&keys0, &keys1);
+                let log = KeyEventLog::from_inception(inception.clone()).unwrap();
+
+                let mut rotation = build_rotation(&log, &keys0, &keys1, &keys2);
+                // Tamper with created_at (invalidates both signatures)
+                rotation.created_at = 9999;
+
+                let wire = KeyEventLogWire {
+                    events: alloc::vec![
+                        KeyEvent::Inception(inception),
+                        KeyEvent::Rotation(rotation),
+                    ],
+                };
+                let mut buf = alloc::vec![FORMAT_VERSION];
+                buf.extend_from_slice(&postcard::to_allocvec(&wire).unwrap());
+
+                let result = KeyEventLog::deserialize(&buf);
+                // Hash chain is verified first, but previous_hash is still valid
+                // so this will fail on the old_signature check
+                assert_eq!(result.unwrap_err(), KelError::InvalidSignature);
+            })
+            .expect("failed to spawn thread")
+            .join()
+            .expect("thread panicked");
     }
 }
