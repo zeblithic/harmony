@@ -79,7 +79,7 @@ wasmi = "1"
 wasmtime = "38"
 
 # Networking
-tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
 zenoh = "1"
 
 # CLI and config

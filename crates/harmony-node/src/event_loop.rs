@@ -90,6 +90,41 @@ pub async fn run(
     // ── Monotonic query-id counter ────────────────────────────────────────────
     let mut next_query_id: u64 = 1;
 
+    // ── Shutdown signal ───────────────────────────────────────────────────────
+    // Register SIGTERM outside the async block so registration failures
+    // propagate via ? instead of panicking inside the event loop.
+    #[cfg(unix)]
+    let mut sigterm = {
+        use tokio::signal::unix::{signal, SignalKind};
+        signal(SignalKind::terminate())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to register SIGTERM handler: {e}").into()
+            })?
+    };
+
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                // Some(_) pattern: if recv() returns None (stream exhausted),
+                // the arm is disabled rather than triggering a spurious shutdown.
+                Some(_) = sigterm.recv() => eprintln!("[event_loop] SIGTERM received — shutting down"),
+                result = tokio::signal::ctrl_c() => match result {
+                    Ok(()) => eprintln!("[event_loop] Ctrl+C received — shutting down"),
+                    Err(e) => eprintln!("[event_loop] SIGINT handler failed: {e} — shutting down"),
+                },
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => eprintln!("[event_loop] Ctrl+C received — shutting down"),
+                Err(e) => eprintln!("[event_loop] SIGINT handler failed: {e} — shutting down"),
+            }
+        }
+    };
+    tokio::pin!(shutdown);
+
     // ── Select loop ──────────────────────────────────────────────────────────
     //
     // Events from UDP and Zenoh are buffered via push_event(). tick() is
@@ -160,6 +195,11 @@ pub async fn run(
                         }
                     }
                 }
+            }
+
+            // Arm 4: Graceful shutdown (SIGTERM from procd, Ctrl+C).
+            _ = &mut shutdown => {
+                break;
             }
         }
 
