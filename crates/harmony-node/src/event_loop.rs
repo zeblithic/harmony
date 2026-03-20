@@ -91,16 +91,24 @@ pub async fn run(
     let mut next_query_id: u64 = 1;
 
     // ── Shutdown signal ───────────────────────────────────────────────────────
-    // Listens for SIGTERM (procd stop) and SIGINT (Ctrl+C). The future
-    // resolves on the first signal received.
+    // Register SIGTERM outside the async block so registration failures
+    // propagate via ? instead of panicking inside the event loop.
+    #[cfg(unix)]
+    let mut sigterm = {
+        use tokio::signal::unix::{signal, SignalKind};
+        signal(SignalKind::terminate())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to register SIGTERM handler: {e}").into()
+            })?
+    };
+
     let shutdown = async {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
             tokio::select! {
-                _ = sigterm.recv() => eprintln!("[event_loop] SIGTERM received — shutting down"),
+                // Some(_) pattern: if recv() returns None (stream exhausted),
+                // the arm is disabled rather than triggering a spurious shutdown.
+                Some(_) = sigterm.recv() => eprintln!("[event_loop] SIGTERM received — shutting down"),
                 result = tokio::signal::ctrl_c() => match result {
                     Ok(()) => eprintln!("[event_loop] Ctrl+C received — shutting down"),
                     Err(e) => eprintln!("[event_loop] SIGINT handler failed: {e} — shutting down"),
