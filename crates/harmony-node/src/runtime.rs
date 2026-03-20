@@ -680,6 +680,12 @@ impl<B: BlobStore> NodeRuntime<B> {
                 }
                 1 => {
                     // Tier 2: Storage
+                    // Snapshot the timer state BEFORE processing events — a
+                    // threshold-triggered BroadcastFilter resets the counter,
+                    // but should not suppress the timer if it was due to fire.
+                    let timer_due = self.ticks_since_filter_broadcast
+                        >= self.filter_broadcast_interval_ticks;
+
                     let limit = self.schedule.storage_max_per_tick.unwrap_or(usize::MAX);
                     let mut processed = 0;
                     while processed < limit {
@@ -698,7 +704,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                     // buffers coalesce multiple rebuilds within a tick, so
                     // firing alongside a threshold-triggered bloom broadcast
                     // is harmless — the latest snapshot wins at flush time.
-                    if self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks {
+                    if timer_due {
                         self.ticks_since_filter_broadcast = 0;
                         let timer_actions = self.storage.handle(StorageTierEvent::FilterTimerTick);
                         self.dispatch_storage_actions(timer_actions, &mut actions);
