@@ -29,6 +29,9 @@ serde = { workspace = true, optional = true, default-features = false, features 
 [features]
 default = ["std"]
 serde = ["dep:serde"]
+# Disable BLAKE3 NEON assembly — use pure Rust fallback. Required for
+# cross-compilation from non-aarch64 hosts without a C cross-compiler.
+no-neon = ["blake3/no_neon"]
 std = [
     "rand_core/getrandom",
     "sha2/std",
