@@ -78,7 +78,10 @@ enum IdentityAction {
     },
 }
 
-#[tokio::main]
+// NodeRuntime is !Send — all tasks run on a single thread. Making the
+// flavor explicit prevents silent behavior change if rt-multi-thread
+// is ever added to the tokio feature set.
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {

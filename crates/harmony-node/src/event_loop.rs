@@ -76,6 +76,7 @@ pub async fn run(
 
     // ── Timer (250 ms tick) ───────────────────────────────────────────────────
     let mut timer = time::interval(Duration::from_millis(250));
+    timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     // ── Reusable UDP receive buffer ───────────────────────────────────────────
     // Max UDP datagram size — Reticulum MTU is 500 (default) or 1024 (medium
@@ -91,8 +92,8 @@ pub async fn run(
             // Arm 1: UDP packet received
             result = udp.recv_from(&mut udp_buf) => {
                 match result {
-                    Ok((len, src)) => {
-                        let interface_name = src.to_string();
+                    Ok((len, _src)) => {
+                        let interface_name = "udp0".to_string();
                         let raw = udp_buf[..len].to_vec();
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -203,11 +204,8 @@ async fn dispatch_action(
 
         // ── Tier 3: Fetch content via Zenoh get() ─────────────────────────────
         RuntimeAction::FetchContent { cid } => {
-            let key_expr = format!(
-                "harmony/content/{}/{}",
-                hex::encode(&cid[..1]),
-                hex::encode(cid)
-            );
+            let cid_hex = hex::encode(cid);
+            let key_expr = harmony_zenoh::namespace::content::fetch_key(&cid_hex);
             let tx = zenoh_tx.clone();
             let session = session.clone();
             tokio::spawn(async move {
@@ -220,11 +218,8 @@ async fn dispatch_action(
 
         // ── Tier 3: Fetch WASM module via Zenoh get() ────────────────────────
         RuntimeAction::FetchModule { cid } => {
-            let key_expr = format!(
-                "harmony/content/{}/{}",
-                hex::encode(&cid[..1]),
-                hex::encode(cid)
-            );
+            let cid_hex = hex::encode(cid);
+            let key_expr = harmony_zenoh::namespace::content::fetch_key(&cid_hex);
             let tx = zenoh_tx.clone();
             let session = session.clone();
             tokio::spawn(async move {
@@ -294,8 +289,9 @@ async fn dispatch_action(
 
 /// Issue a Zenoh `get()` for the given key expression and return the first reply's payload.
 ///
-/// Times out after 30 seconds to prevent spawned tasks from accumulating
-/// indefinitely when content is unavailable on the network.
+/// The entire fetch (including all reply iterations) is bounded by a 30-second
+/// wall-clock deadline. This prevents spawned tasks from accumulating
+/// indefinitely — even if a peer sends repeated error replies.
 async fn fetch_via_zenoh(
     session: &zenoh::Session,
     key_expr: &str,
@@ -306,18 +302,20 @@ async fn fetch_via_zenoh(
         .map_err(|e| format!("zenoh get error: {e}"))?;
 
     let deadline = Duration::from_secs(30);
-    while let Ok(Ok(reply)) = tokio::time::timeout(deadline, replies.recv_async()).await {
-        match reply.result() {
-            Ok(sample) => {
-                return Ok(sample.payload().to_bytes().to_vec());
-            }
-            Err(err) => {
-                let msg = err.payload().to_bytes().to_vec();
-                let msg = String::from_utf8_lossy(&msg).into_owned();
-                eprintln!("[event_loop] get reply error: {msg}");
+    tokio::time::timeout(deadline, async {
+        while let Ok(reply) = replies.recv_async().await {
+            match reply.result() {
+                Ok(sample) => {
+                    return Ok(sample.payload().to_bytes().to_vec());
+                }
+                Err(err) => {
+                    let msg = String::from_utf8_lossy(&err.payload().to_bytes()).into_owned();
+                    eprintln!("[event_loop] get reply error: {msg}");
+                }
             }
         }
-    }
-
-    Err(format!("no successful reply for '{key_expr}' (timed out after 30s)"))
+        Err(format!("no successful reply for '{key_expr}'"))
+    })
+    .await
+    .unwrap_or_else(|_| Err(format!("no successful reply for '{key_expr}' (timed out after 30s)")))
 }
