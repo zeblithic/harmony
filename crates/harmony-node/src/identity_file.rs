@@ -51,7 +51,7 @@ pub fn load(path: &Path) -> Result<NodeIdentity, String> {
 }
 
 pub fn save(path: &Path, identity: &NodeIdentity) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
         #[cfg(unix)]
@@ -76,6 +76,17 @@ pub fn save(path: &Path, identity: &NodeIdentity) -> Result<(), String> {
         name.push(".tmp");
         path.with_file_name(name)
     };
+
+    // Drop guard: remove tmp file on any error path so orphaned key material
+    // doesn't persist on disk after a failed write/fsync/rename.
+    struct TmpGuard<'a>(&'a Path);
+    impl Drop for TmpGuard<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let guard = TmpGuard(&tmp_path);
+
     {
         #[cfg(unix)]
         let f = {
@@ -105,6 +116,8 @@ pub fn save(path: &Path, identity: &NodeIdentity) -> Result<(), String> {
     }
     std::fs::rename(&tmp_path, path)
         .map_err(|e| format!("Failed to rename {} → {}: {e}", tmp_path.display(), path.display()))?;
+    // Rename succeeded — disarm the guard (file is now at `path`, not `tmp_path`).
+    std::mem::forget(guard);
     Ok(())
 }
 
