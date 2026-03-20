@@ -14,7 +14,7 @@ const MAX_CLOCK_SKEW: u64 = 60;
 ///
 /// Returns the raw verifying key bytes:
 /// - Ed25519: 32-byte verifying key
-/// - ML-DSA-65: 1952-byte signing public key
+/// - ML-DSA-65: 1952-byte verifying public key
 pub trait ProfileKeyResolver {
     fn resolve(&self, identity: &IdentityRef) -> Option<Vec<u8>>;
 }
@@ -57,6 +57,8 @@ pub fn verify_endorsement(
     verify_signature(record.endorser.suite, &key_bytes, &payload, &record.signature)
 }
 
+/// Validity window is half-open: `[published_at, expires_at)`.
+/// A record is expired at the instant `now == expires_at`.
 fn check_time_bounds(published_at: u64, expires_at: u64, now: u64) -> Result<(), ProfileError> {
     if published_at >= expires_at {
         return Err(ProfileError::InvalidRecord);

@@ -7,10 +7,14 @@ use crate::error::ProfileError;
 
 const FORMAT_VERSION: u8 = 1;
 
+/// Domain separator for endorsement record signatures.
+const RECORD_TYPE: u8 = 0x02;
+
 /// Internal struct for the signable portion of an endorsement record.
 #[derive(Serialize, Deserialize)]
 struct SignablePayload {
     format_version: u8,
+    record_type: u8,
     endorser: IdentityRef,
     endorsee: IdentityRef,
     type_id: u32,
@@ -55,6 +59,7 @@ impl EndorsementRecord {
     pub(crate) fn signable_bytes(&self) -> Vec<u8> {
         let payload = SignablePayload {
             format_version: FORMAT_VERSION,
+            record_type: RECORD_TYPE,
             endorser: self.endorser,
             endorsee: self.endorsee,
             type_id: self.type_id,
@@ -136,9 +141,15 @@ impl EndorsementBuilder {
         self
     }
 
+    /// Produce the signable payload bytes.
+    ///
+    /// Call this **after** all optional fields are set. Mutating the
+    /// builder after this point will produce a record whose fields no
+    /// longer match the signed payload, causing `SignatureInvalid`.
     pub fn signable_payload(&self) -> Vec<u8> {
         let payload = SignablePayload {
             format_version: FORMAT_VERSION,
+            record_type: RECORD_TYPE,
             endorser: self.endorser,
             endorsee: self.endorsee,
             type_id: self.type_id,

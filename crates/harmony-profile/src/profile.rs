@@ -7,10 +7,14 @@ use crate::error::ProfileError;
 
 const FORMAT_VERSION: u8 = 1;
 
+/// Domain separator for profile record signatures.
+const RECORD_TYPE: u8 = 0x01;
+
 /// Internal struct for the signable portion of a profile record.
 #[derive(Serialize, Deserialize)]
 struct SignablePayload {
     format_version: u8,
+    record_type: u8,
     identity_ref: IdentityRef,
     display_name: Option<String>,
     status_text: Option<String>,
@@ -51,6 +55,7 @@ impl ProfileRecord {
     pub(crate) fn signable_bytes(&self) -> Vec<u8> {
         let payload = SignablePayload {
             format_version: FORMAT_VERSION,
+            record_type: RECORD_TYPE,
             identity_ref: self.identity_ref,
             display_name: self.display_name.clone(),
             status_text: self.status_text.clone(),
@@ -147,9 +152,14 @@ impl ProfileBuilder {
     }
 
     /// Produce the signable payload bytes.
+    ///
+    /// Call this **after** all optional fields are set. Mutating the
+    /// builder after this point will produce a record whose fields no
+    /// longer match the signed payload, causing `SignatureInvalid`.
     pub fn signable_payload(&self) -> Vec<u8> {
         let payload = SignablePayload {
             format_version: FORMAT_VERSION,
+            record_type: RECORD_TYPE,
             identity_ref: self.identity_ref,
             display_name: self.display_name.clone(),
             status_text: self.status_text.clone(),
