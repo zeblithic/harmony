@@ -3,6 +3,9 @@
 pub enum DiscoveryError {
     Expired,
     SignatureInvalid,
+    /// V2: will be returned when public_key→IdentityHash re-derivation
+    /// check is implemented. Currently unused — see `verify_announce` docs.
+    #[allow(dead_code)]
     AddressMismatch,
     SerializeError(&'static str),
     DeserializeError(&'static str),

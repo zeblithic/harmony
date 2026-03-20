@@ -370,6 +370,9 @@ pub mod identity {
     /// Subscribe to all identity announces.
     pub const ALL_ANNOUNCES: &str = "harmony/identity/*/announce";
 
+    /// Register a queryable for all identity resolve requests.
+    pub const ALL_RESOLVES: &str = "harmony/identity/*/resolve";
+
     /// Subscribe to all identity presence changes.
     pub const ALL_ALIVE: &str = "harmony/identity/*/alive";
 
@@ -705,6 +708,7 @@ mod tests {
     #[test]
     fn identity_wildcard_constants() {
         assert_eq!(identity::ALL_ANNOUNCES, "harmony/identity/*/announce");
+        assert_eq!(identity::ALL_RESOLVES, "harmony/identity/*/resolve");
         assert_eq!(identity::ALL_ALIVE, "harmony/identity/*/alive");
     }
 
