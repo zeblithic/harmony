@@ -2,5 +2,7 @@
 extern crate alloc;
 
 pub mod error;
+pub mod record;
 
 pub use error::DiscoveryError;
+pub use record::{AnnounceBuilder, AnnounceRecord, RoutingHint};
