@@ -3,6 +3,11 @@ extern crate alloc;
 
 pub mod claim;
 pub mod error;
+pub mod status_list;
 
 pub use claim::{Claim, SaltedClaim};
 pub use error::CredentialError;
+pub use status_list::{StatusList, StatusListResolver};
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use status_list::MemoryStatusListResolver;
