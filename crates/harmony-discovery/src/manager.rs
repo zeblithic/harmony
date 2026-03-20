@@ -30,6 +30,12 @@ pub struct DiscoveryManager {
     announcing: bool,
 }
 
+impl Default for DiscoveryManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiscoveryManager {
     pub fn new() -> Self {
         Self {
@@ -320,5 +326,95 @@ mod tests {
 
         let actions = mgr.stop_announcing();
         assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::SetLiveliness { alive: false })));
+    }
+
+    #[test]
+    fn full_flow_announce_cache_query() {
+        let mut mgr = DiscoveryManager::new();
+
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let identity = private.public_identity();
+        let identity_ref = IdentityRef::from(identity);
+        let pk = identity.verifying_key.to_bytes().to_vec();
+
+        let mut builder =
+            AnnounceBuilder::new(identity_ref, pk, 1000, 5000, [0x10; 16]);
+        builder
+            .add_routing_hint(RoutingHint::Reticulum {
+                destination_hash: [0xAA; 16],
+            })
+            .add_routing_hint(RoutingHint::Zenoh {
+                locator: alloc::vec![0xBB; 4],
+            });
+
+        let payload = builder.signable_payload();
+        let signature = private.sign(&payload);
+        let record = builder.build(signature.to_vec());
+
+        // 2. Receive the announce
+        let actions = mgr.on_event(DiscoveryEvent::AnnounceReceived {
+            record: record.clone(),
+            now: 2000,
+        });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DiscoveryAction::IdentityDiscovered { .. })));
+
+        // 3. Query for it
+        let actions = mgr.on_event(DiscoveryEvent::QueryReceived {
+            address: identity_ref.hash,
+            query_id: 1,
+        });
+        match &actions[0] {
+            DiscoveryAction::RespondToQuery {
+                query_id: 1,
+                record: Some(r),
+            } => {
+                assert_eq!(r.identity_ref, identity_ref);
+                assert_eq!(r.routing_hints.len(), 2);
+            }
+            other => panic!("expected RespondToQuery, got {:?}", other),
+        }
+
+        // 4. Liveliness tracks online state
+        mgr.on_event(DiscoveryEvent::LivelinessChange {
+            address: identity_ref.hash,
+            alive: true,
+        });
+        assert!(mgr.is_online(&identity_ref.hash));
+
+        // 5. Tick evicts after expiry
+        let actions = mgr.on_event(DiscoveryEvent::Tick { now: 6000 });
+        assert!(mgr.get_record(&identity_ref.hash).is_none());
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DiscoveryAction::RecordExpired { .. })));
+    }
+
+    #[test]
+    fn announce_serde_round_trip_through_manager() {
+        let mut mgr = DiscoveryManager::new();
+
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let identity = private.public_identity();
+        let identity_ref = IdentityRef::from(identity);
+        let pk = identity.verifying_key.to_bytes().to_vec();
+
+        let builder = AnnounceBuilder::new(identity_ref, pk, 1000, 5000, [0x20; 16]);
+        let payload = builder.signable_payload();
+        let record = builder.build(private.sign(&payload).to_vec());
+
+        // Serialize, deserialize, then feed to manager
+        let bytes = record.serialize().unwrap();
+        let restored = AnnounceRecord::deserialize(&bytes).unwrap();
+
+        let actions = mgr.on_event(DiscoveryEvent::AnnounceReceived {
+            record: restored,
+            now: 2000,
+        });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, DiscoveryAction::IdentityDiscovered { .. })));
+        assert!(mgr.get_record(&identity_ref.hash).is_some());
     }
 }
