@@ -65,7 +65,7 @@ After `tick()` returns actions, each is dispatched:
 
 | Action | Dispatch |
 |--------|----------|
-| `SendOnInterface` | `udp_socket.send_to(&raw, peer_addr)` |
+| `SendOnInterface` | UDP broadcast to subnet broadcast address (see below) |
 | `SendReply` | Look up pending query by `query_id`, call `query.reply()` |
 | `Publish` | `zenoh_session.put(key_expr, payload)` |
 | `DeclareQueryable` | `zenoh_session.declare_queryable(key_expr)` with callback → mpsc |
@@ -73,18 +73,46 @@ After `tick()` returns actions, each is dispatched:
 | `FetchContent` | `tokio::spawn` a Zenoh `get()`, send result back as `ContentFetchResponse` via mpsc |
 | `FetchModule` | `tokio::spawn` a Zenoh `get()`, send result back as `ModuleFetchResponse` via mpsc |
 
+### UDP Send Strategy
+
+`RuntimeAction::SendOnInterface` provides `interface_name` and `raw` bytes but **no destination address**. This matches Reticulum's design for broadcast-capable media (LoRa, serial, local networks).
+
+For UDP, the event loop uses a **broadcast + known-peers** hybrid:
+
+1. **Broadcast:** Send to the subnet broadcast address (`255.255.255.255:4242`) using `SO_BROADCAST`. This ensures new nodes on the LAN discover each other via Reticulum announces.
+2. **Peer tracking:** Maintain a `HashSet<SocketAddr>` of peer addresses learned from `recv_from()`. On `SendOnInterface`, also unicast to each known peer. This handles cases where broadcast is filtered (cross-subnet, cloud, WAN peers added via future `--peer` flags).
+
+For v1, broadcast-only is sufficient. Peer tracking is an incremental improvement.
+
 ### Pending Queries
 
-`SendReply` references a `query_id` that must map back to the original Zenoh `Query` object (needed to call `query.reply()`). The event loop maintains a `HashMap<u64, zenoh::query::Query>` populated when `QueryReceived` events are created, drained when `SendReply` actions are dispatched.
+`SendReply` references a `query_id` that must map back to the original Zenoh `Query` object (needed to call `query.reply()`). The event loop maintains a `HashMap<u64, zenoh::query::Query>` populated when `QueryReceived` events are created, drained when `SendReply` actions are dispatched. Query IDs are assigned by a monotonic `u64` counter in the event loop, incremented for each incoming query/compute query.
+
+Zenoh queryable callbacks inspect the key expression prefix to route to the correct `RuntimeEvent` variant:
+- `harmony/compute/` prefix → `ComputeQuery`
+- All other queryables → `QueryReceived`
 
 ### Startup Sequence
 
 1. Load identity from key file (already done — `identity_file::load_or_generate`)
-2. Bind `tokio::net::UdpSocket` on `--listen-address` (default `0.0.0.0:4242`)
+2. Bind `tokio::net::UdpSocket` on `--listen-address` (default `0.0.0.0:4242`), enable `SO_BROADCAST`
 3. Open Zenoh session (`zenoh::open(zenoh::Config::default())`)
 4. Construct `NodeRuntime::new(config, store)` → get `(runtime, startup_actions)`
-5. Execute startup actions: declare 18 queryables + 4 subscribers, store handles
-6. Enter `select!` loop
+5. Register the UDP interface: `runtime.push_event(RuntimeEvent::InboundPacket { interface_name: "udp0", raw: vec![], now: 0 })` — **Note:** The Reticulum `Node` inside `NodeRuntime` auto-registers interfaces on first packet. Alternatively, we can add a dedicated registration method to `NodeRuntime`. For v1, the first real packet triggers registration.
+6. Execute startup actions: declare 18 queryables + 4 subscribers. **Store the returned handles** (Zenoh drops subscriptions/queryables when handles are dropped). The handles vector lives alongside the `select!` loop.
+7. Enter `select!` loop
+
+### Concurrency Constraints
+
+**`NodeRuntime` is `!Send`** — it contains `Box<dyn Any>` (saved WASM sessions) and `Box<dyn ComputeRuntime>`, neither of which is `Send`. The entire `select!` loop and `NodeRuntime` must live on a single task. Never move the runtime into a `tokio::spawn` task. The `FetchContent`/`FetchModule` spawned tasks communicate back via mpsc — they don't capture the runtime.
+
+### Zenoh Channel Sizing
+
+The mpsc channel from Zenoh callbacks uses `mpsc::channel(1024)` — bounded with generous buffer. If the channel fills (extreme traffic spike), the Zenoh callback blocks briefly, providing natural backpressure. An unbounded channel risks OOM under sustained load.
+
+### Zenoh Crate Version
+
+Use `zenoh = "1"` (the 1.x stable API). The 0.x API had significantly different callback semantics. Zenoh 1.x uses `Handler` callbacks and `FifoChannel` receivers.
 
 ### Zenoh Session Configuration
 
