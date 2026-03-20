@@ -70,12 +70,16 @@ fn vine_interest_filtering_on_publisher_side() {
 
     // Bob declares a publisher on his vine announce key expression.
     // The key expression uses the actual Harmony namespace convention.
-    let (pub_id, _) = bob_router
+    let (pub_id, pub_actions) = bob_router
         .declare_publisher(
             "harmony/vines/aa00bb11cc22dd33ee44ff5566778899/announce/post1".into(),
             &mut alice_session,
         )
         .unwrap();
+    assert!(
+        !pub_actions.is_empty(),
+        "declare_publisher should emit resource declaration actions"
+    );
 
     // Without interest: publish is silently dropped (write-side filtering)
     let actions = bob_router
