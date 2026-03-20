@@ -9,6 +9,7 @@ description = "WASM compute engine with cooperative yielding for the Harmony dec
 
 [features]
 default = []
+no-neon = ["harmony-crypto/no-neon"]
 wasmtime = ["dep:wasmtime"]
 
 [dependencies]

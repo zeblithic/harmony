@@ -9,6 +9,8 @@ rust-version.workspace = true
 [features]
 default = []
 wasmtime = ["harmony-compute/wasmtime"]
+# Disable BLAKE3 NEON assembly for cross-compilation without a C cross-compiler.
+no-neon = ["harmony-crypto/no-neon"]
 
 [[bin]]
 name = "harmony"

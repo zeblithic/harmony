@@ -20,6 +20,7 @@ hashbrown = { workspace = true }
 
 [features]
 default = ["std"]
+no-neon = ["harmony-crypto/no-neon"]
 std = [
     "harmony-crypto/std",
     "harmony-identity/std",
