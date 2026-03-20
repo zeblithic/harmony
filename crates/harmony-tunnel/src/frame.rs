@@ -31,8 +31,8 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
-/// Frame header size: 1 byte tag + 2 bytes length.
-const FRAME_HEADER_LEN: usize = 3;
+/// Frame header size: 1 byte tag + 4 bytes length.
+const FRAME_HEADER_LEN: usize = 5;
 
 impl Frame {
     /// Create a keepalive frame.
@@ -45,7 +45,7 @@ impl Frame {
 
     /// Encode the frame to wire format (tag + big-endian length + payload).
     pub fn encode(&self) -> Vec<u8> {
-        let len = self.payload.len() as u16;
+        let len = self.payload.len() as u32;
         let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + self.payload.len());
         buf.push(self.tag as u8);
         buf.extend_from_slice(&len.to_be_bytes());
@@ -63,7 +63,7 @@ impl Frame {
         }
 
         let tag = FrameTag::from_byte(data[0])?;
-        let len = u16::from_be_bytes([data[1], data[2]]) as usize;
+        let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
 
         if data.len() < FRAME_HEADER_LEN + len {
             return Err(TunnelError::FrameTooShort {
@@ -137,7 +137,7 @@ mod tests {
         };
 
         let bytes = frame.encode();
-        assert_eq!(bytes.len(), 1 + 2 + 4); // tag + length + payload
+        assert_eq!(bytes.len(), 1 + 4 + 4); // tag + length + payload
 
         let decoded = Frame::decode(&bytes).unwrap();
         assert_eq!(decoded.tag, FrameTag::Reticulum);
@@ -148,9 +148,9 @@ mod tests {
     fn keepalive_frame_has_empty_payload() {
         let frame = Frame::keepalive();
         let bytes = frame.encode();
-        assert_eq!(bytes.len(), 3); // tag + length(0)
+        assert_eq!(bytes.len(), 5); // tag + length(0)
         assert_eq!(bytes[0], 0x00);
-        assert_eq!(&bytes[1..3], &[0x00, 0x00]);
+        assert_eq!(&bytes[1..5], &[0x00, 0x00, 0x00, 0x00]);
     }
 
     #[test]

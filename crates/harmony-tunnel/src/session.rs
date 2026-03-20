@@ -19,7 +19,6 @@ const DEAD_TIMEOUT_MS: u64 = KEEPALIVE_INTERVAL_MS * 3;
 /// Tunnel session states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelState {
-    Idle,
     Initiating,
     Active,
     Closed,
@@ -87,6 +86,7 @@ impl TunnelSession {
         rng: &mut impl CryptoRngCore,
         local_identity: &PqPrivateIdentity,
         remote_identity: &PqIdentity,
+        now_ms: u64,
     ) -> Result<(Self, Vec<TunnelAction>), TunnelError> {
         let local_pub = local_identity.public_identity();
         let local_dsa_pk = &local_pub.verifying_key;
@@ -111,8 +111,8 @@ impl TunnelSession {
             recv_nonce: 0,
             remote_node_id,
             local_node_id,
-            last_received_ms: 0,
-            last_sent_ms: 0,
+            last_received_ms: now_ms,
+            last_sent_ms: now_ms,
             pending_init: Some(init_msg),
             pending_shared_secret: Some(shared_secret.as_bytes().to_vec()),
             init_nonce,
@@ -133,6 +133,7 @@ impl TunnelSession {
         rng: &mut impl CryptoRngCore,
         local_identity: &PqPrivateIdentity,
         init_bytes: &[u8],
+        now_ms: u64,
     ) -> Result<(Self, Vec<TunnelAction>), TunnelError> {
         let init_msg = TunnelInit::from_bytes(init_bytes)?;
 
@@ -163,8 +164,8 @@ impl TunnelSession {
             recv_nonce: 0,
             remote_node_id,
             local_node_id,
-            last_received_ms: 0,
-            last_sent_ms: 0,
+            last_received_ms: now_ms,
+            last_sent_ms: now_ms,
             pending_init: None,
             pending_shared_secret: None,
             init_nonce: [0u8; 32],
@@ -189,8 +190,14 @@ impl TunnelSession {
                 self.last_received_ms = now_ms;
                 self.handle_inbound(data)
             }
-            TunnelEvent::SendReticulum { packet } => self.handle_send(FrameTag::Reticulum, packet),
-            TunnelEvent::SendZenoh { message } => self.handle_send(FrameTag::Zenoh, message),
+            TunnelEvent::SendReticulum { packet, now_ms } => {
+                self.last_sent_ms = now_ms;
+                self.handle_send(FrameTag::Reticulum, packet)
+            }
+            TunnelEvent::SendZenoh { message, now_ms } => {
+                self.last_sent_ms = now_ms;
+                self.handle_send(FrameTag::Zenoh, message)
+            }
             TunnelEvent::Tick { now_ms } => self.handle_tick(now_ms),
             TunnelEvent::Close => self.handle_close(),
         }
@@ -290,9 +297,7 @@ impl TunnelSession {
         let mut actions = Vec::new();
 
         // Check for dead peer
-        if self.last_received_ms > 0
-            && now_ms.saturating_sub(self.last_received_ms) >= DEAD_TIMEOUT_MS
-        {
+        if now_ms.saturating_sub(self.last_received_ms) >= DEAD_TIMEOUT_MS {
             self.state = TunnelState::Closed;
             actions.push(TunnelAction::Error {
                 reason: "keepalive timeout".to_string(),
@@ -346,7 +351,7 @@ mod tests {
         let responder_pub = responder_id.public_identity();
 
         let (session, actions) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub).unwrap();
+            TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0).unwrap();
 
         assert_eq!(session.state(), TunnelState::Initiating);
         assert_eq!(actions.len(), 1);
@@ -360,7 +365,7 @@ mod tests {
 
         // Initiator sends TunnelInit
         let (mut initiator, init_actions) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub).unwrap();
+            TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0).unwrap();
 
         // Extract the TunnelInit bytes
         let init_bytes = match &init_actions[0] {
@@ -370,7 +375,7 @@ mod tests {
 
         // Responder processes TunnelInit and creates TunnelAccept
         let (responder, accept_actions) =
-            TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes).unwrap();
+            TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes, 0).unwrap();
 
         assert_eq!(responder.state(), TunnelState::Active);
 
@@ -401,7 +406,7 @@ mod tests {
 
         // Complete handshake
         let (mut initiator, init_actions) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, &responder_pub).unwrap();
+            TunnelSession::new_initiator(&mut OsRng, &initiator_id, &responder_pub, 0).unwrap();
 
         let init_bytes = match &init_actions[0] {
             TunnelAction::OutboundBytes { data } => data.clone(),
@@ -409,7 +414,7 @@ mod tests {
         };
 
         let (mut responder, accept_actions) =
-            TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes).unwrap();
+            TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes, 0).unwrap();
 
         let accept_bytes = accept_actions
             .iter()
@@ -427,6 +432,7 @@ mod tests {
         let actions = initiator
             .handle_event(TunnelEvent::SendReticulum {
                 packet: b"hello-reticulum".to_vec(),
+                now_ms: 0,
             })
             .unwrap();
 
@@ -448,6 +454,7 @@ mod tests {
         let actions = responder
             .handle_event(TunnelEvent::SendZenoh {
                 message: b"hello-zenoh".to_vec(),
+                now_ms: 0,
             })
             .unwrap();
 
@@ -477,7 +484,7 @@ mod tests {
         let responder_pub = responder_id.public_identity().clone();
 
         let (mut initiator, init_actions) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, &responder_pub).unwrap();
+            TunnelSession::new_initiator(&mut OsRng, &initiator_id, &responder_pub, 0).unwrap();
 
         let init_bytes = match &init_actions[0] {
             TunnelAction::OutboundBytes { data } => data.clone(),
@@ -485,7 +492,7 @@ mod tests {
         };
 
         let (mut responder, accept_actions) =
-            TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes).unwrap();
+            TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes, 0).unwrap();
 
         let accept_bytes = accept_actions
             .iter()
@@ -510,7 +517,7 @@ mod tests {
     #[test]
     fn truncated_tunnel_init_rejected() {
         let (_initiator_id, responder_id) = create_test_identities();
-        let result = TunnelSession::new_responder(&mut OsRng, &responder_id, &[0u8; 100]);
+        let result = TunnelSession::new_responder(&mut OsRng, &responder_id, &[0u8; 100], 0);
         assert!(result.is_err(), "expected error for truncated/garbage init");
     }
 
@@ -521,7 +528,7 @@ mod tests {
 
         // Initiator expects `responder_id` to respond
         let (mut initiator, init_actions) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, &responder_pub).unwrap();
+            TunnelSession::new_initiator(&mut OsRng, &initiator_id, &responder_pub, 0).unwrap();
 
         let init_bytes = match &init_actions[0] {
             TunnelAction::OutboundBytes { data } => data.clone(),
@@ -531,7 +538,7 @@ mod tests {
         // Impersonator intercepts and replies with its own identity
         let impersonator_id = harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
         let (_impersonator_session, accept_actions) =
-            TunnelSession::new_responder(&mut OsRng, &impersonator_id, &init_bytes).unwrap();
+            TunnelSession::new_responder(&mut OsRng, &impersonator_id, &init_bytes, 0).unwrap();
 
         let impersonator_accept_bytes = accept_actions
             .iter()
@@ -558,11 +565,12 @@ mod tests {
         let responder_pub = responder_id.public_identity();
 
         let (mut initiator, _) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub).unwrap();
+            TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0).unwrap();
 
         // State is Initiating — sending data must fail
         let result = initiator.handle_event(TunnelEvent::SendReticulum {
             packet: b"early".to_vec(),
+            now_ms: 0,
         });
         assert!(
             result.is_err(),
@@ -577,8 +585,7 @@ mod tests {
     fn keepalive_sent_after_interval() {
         let (mut initiator, _responder, _iid, _rid) = complete_handshake();
 
-        // Force last_sent_ms = 0 so elapsed time is measured from t=0
-        initiator.last_sent_ms = 0;
+        // Session created with now_ms=0, so last_sent_ms=0
 
         // Tick at t=0: 0ms elapsed, no keepalive
         let actions = initiator
@@ -598,9 +605,6 @@ mod tests {
             "tick at 15s should not send keepalive"
         );
 
-        // Reset last_sent_ms to 0 for clean measurement
-        initiator.last_sent_ms = 0;
-
         // Tick at t=30001: 30001ms >= KEEPALIVE_INTERVAL_MS (30000) → keepalive sent
         let actions = initiator
             .handle_event(TunnelEvent::Tick { now_ms: 30_001 })
@@ -617,12 +621,10 @@ mod tests {
     fn dead_peer_timeout() {
         let (mut initiator, _responder, _iid, _rid) = complete_handshake();
 
-        // Simulate having received data at t=1000ms
-        initiator.last_received_ms = 1000;
-
-        // Tick at t=91001: 91001 - 1000 = 90001 >= DEAD_TIMEOUT_MS (90000)
+        // Session created with now_ms=0, so last_received_ms=0
+        // Tick at t=90001: 90001 - 0 = 90001 >= DEAD_TIMEOUT_MS (90000)
         let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 91_001 })
+            .handle_event(TunnelEvent::Tick { now_ms: 90_001 })
             .unwrap();
 
         assert_eq!(initiator.state(), TunnelState::Closed);
@@ -659,6 +661,7 @@ mod tests {
         let send_actions = responder
             .handle_event(TunnelEvent::SendReticulum {
                 packet: b"ping".to_vec(),
+                now_ms: 0,
             })
             .unwrap();
         let encrypted = match &send_actions[0] {

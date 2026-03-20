@@ -6,9 +6,9 @@ pub enum TunnelEvent {
     /// Raw bytes received from the transport (iroh-net connection).
     InboundBytes { data: Vec<u8>, now_ms: u64 },
     /// Send a Reticulum packet through this tunnel.
-    SendReticulum { packet: Vec<u8> },
+    SendReticulum { packet: Vec<u8>, now_ms: u64 },
     /// Send a Zenoh message through this tunnel.
-    SendZenoh { message: Vec<u8> },
+    SendZenoh { message: Vec<u8>, now_ms: u64 },
     /// Periodic timer tick for keepalive management.
     Tick { now_ms: u64 },
     /// Request graceful tunnel shutdown.
