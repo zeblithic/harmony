@@ -1,0 +1,28 @@
+[package]
+name = "harmony-discovery"
+description = "Zenoh-native identity discovery with signed announce records and presence tracking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+hashbrown = { workspace = true }
+harmony-crypto = { workspace = true, features = ["serde"] }
+harmony-identity = { workspace = true }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+postcard = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+    "harmony-crypto/std",
+    "harmony-identity/std",
+    "postcard/use-std",
+    "serde/std",
+]

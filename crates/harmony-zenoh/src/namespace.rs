@@ -361,6 +361,46 @@ pub mod profile {
     }
 }
 
+/// Identity announce and resolve key expressions.
+pub mod identity {
+    use alloc::{format, string::String};
+
+    pub const PREFIX: &str = "harmony/identity";
+
+    /// Subscribe to all identity announces.
+    pub const ALL_ANNOUNCES: &str = "harmony/identity/*/announce";
+
+    /// Register a queryable for all identity resolve requests.
+    pub const ALL_RESOLVES: &str = "harmony/identity/*/resolve";
+
+    /// Subscribe to all identity presence changes.
+    pub const ALL_ALIVE: &str = "harmony/identity/*/alive";
+
+    /// Key expression for a specific identity's announce channel.
+    ///
+    /// `address_hex` must be the 32-character lowercase hex encoding of
+    /// the 16-byte `IdentityHash` (e.g. `"aa00bb11cc22dd33ee44ff5566778899"`).
+    pub fn announce_key(address_hex: &str) -> String {
+        format!("{PREFIX}/{address_hex}/announce")
+    }
+
+    /// Key expression for a specific identity's resolve endpoint.
+    ///
+    /// `address_hex` must be the 32-character lowercase hex encoding of
+    /// the 16-byte `IdentityHash`.
+    pub fn resolve_key(address_hex: &str) -> String {
+        format!("{PREFIX}/{address_hex}/resolve")
+    }
+
+    /// Key expression for a specific identity's liveliness token.
+    ///
+    /// `address_hex` must be the 32-character lowercase hex encoding of
+    /// the 16-byte `IdentityHash`.
+    pub fn alive_key(address_hex: &str) -> String {
+        format!("{PREFIX}/{address_hex}/alive")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,6 +685,42 @@ mod tests {
         assert_eq!(profile::SUB, "harmony/profile/*");
     }
 
+    // ── Identity ────────────────────────────────────────────────
+
+    #[test]
+    fn identity_announce_key_format() {
+        let key = identity::announce_key("aa00bb11cc22dd33ee44ff5566778899");
+        assert_eq!(
+            key,
+            "harmony/identity/aa00bb11cc22dd33ee44ff5566778899/announce"
+        );
+    }
+
+    #[test]
+    fn identity_resolve_key_format() {
+        let key = identity::resolve_key("aa00bb11cc22dd33ee44ff5566778899");
+        assert_eq!(
+            key,
+            "harmony/identity/aa00bb11cc22dd33ee44ff5566778899/resolve"
+        );
+    }
+
+    #[test]
+    fn identity_alive_key_format() {
+        let key = identity::alive_key("aa00bb11cc22dd33ee44ff5566778899");
+        assert_eq!(
+            key,
+            "harmony/identity/aa00bb11cc22dd33ee44ff5566778899/alive"
+        );
+    }
+
+    #[test]
+    fn identity_wildcard_constants() {
+        assert_eq!(identity::ALL_ANNOUNCES, "harmony/identity/*/announce");
+        assert_eq!(identity::ALL_RESOLVES, "harmony/identity/*/resolve");
+        assert_eq!(identity::ALL_ALIVE, "harmony/identity/*/alive");
+    }
+
     // ── Cross-tier consistency ───────────────────────────────────
 
     #[test]
@@ -661,6 +737,7 @@ mod tests {
             community::PREFIX,
             messages::PREFIX,
             profile::PREFIX,
+            identity::PREFIX,
         ];
         for prefix in prefixes {
             assert!(

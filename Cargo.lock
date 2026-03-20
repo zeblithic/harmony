@@ -945,6 +945,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-discovery"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "harmony-crypto",
+ "harmony-identity",
+ "hashbrown 0.15.5",
+ "postcard",
+ "rand",
+ "serde",
+]
+
+[[package]]
 name = "harmony-identity"
 version = "0.1.0"
 dependencies = [
