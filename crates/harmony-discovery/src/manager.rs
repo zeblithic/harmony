@@ -20,7 +20,10 @@ pub enum DiscoveryAction {
     SetLiveliness { alive: bool },
     IdentityDiscovered { record: AnnounceRecord },
     IdentityOffline { address: IdentityHash },
+    /// A record's `expires_at` has passed; evicted by `Tick`.
     RecordExpired { address: IdentityHash },
+    /// A valid record was dropped because the cache was full.
+    CacheEvicted { address: IdentityHash },
 }
 
 /// Default maximum number of cached identity records.
@@ -185,7 +188,7 @@ impl DiscoveryManager {
                 .min_by_key(|(_, r)| r.published_at)
             {
                 self.known_identities.remove(&oldest_addr);
-                actions.push(DiscoveryAction::RecordExpired { address: oldest_addr });
+                actions.push(DiscoveryAction::CacheEvicted { address: oldest_addr });
             }
         }
 
@@ -428,7 +431,7 @@ mod tests {
         let actions = mgr.on_event(DiscoveryEvent::AnnounceReceived { record: r3, now: 3500 });
 
         assert!(mgr.get_record(&addr1, 3500).is_none()); // r1 evicted
-        assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::RecordExpired { .. })));
+        assert!(actions.iter().any(|a| matches!(a, DiscoveryAction::CacheEvicted { .. })));
     }
 
     #[test]
