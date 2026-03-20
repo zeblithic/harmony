@@ -41,6 +41,9 @@ enum Commands {
         /// Bloom filter broadcast mutation threshold
         #[arg(long, default_value_t = 100)]
         filter_mutation_threshold: u32,
+        /// Path to the identity key file
+        #[arg(long, value_name = "PATH")]
+        identity_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -155,6 +158,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             no_public_ephemeral_announce,
             filter_broadcast_ticks,
             filter_mutation_threshold,
+            identity_file,
         } => {
             use crate::runtime::{NodeConfig, NodeRuntime, RuntimeAction};
             use harmony_compute::InstructionBudget;
@@ -194,6 +198,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
+            // Load or generate node identity (after validation so bad flags exit fast).
+            let id_path = crate::identity_file::resolve_path(identity_file.as_deref())?;
+            let identity = crate::identity_file::load_or_generate(&id_path)?;
+            let node_addr = hex::encode(identity.ed25519.public_identity().address_hash);
+            eprintln!("Identity: {node_addr} ({})", id_path.display());
+
             let content_policy = ContentPolicy {
                 encrypted_durable_persist,
                 encrypted_durable_announce,
@@ -216,10 +226,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     expected_items: cache_capacity as u32,
                     fp_rate: 0.001,
                 },
-                // Placeholder — replaced by hex::encode(identity.address_hash) when
-                // the async runtime and identity establishment are wired. Until then,
-                // the node prints startup info and exits (no event loop).
-                node_addr: "local".to_string(),
+                node_addr,
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 
