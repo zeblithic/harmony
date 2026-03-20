@@ -45,6 +45,9 @@ enum Commands {
         /// Path to the identity key file
         #[arg(long, value_name = "PATH")]
         identity_file: Option<std::path::PathBuf>,
+        /// UDP listen address for Reticulum mesh packets
+        #[arg(long, default_value = "0.0.0.0:4242")]
+        listen_address: String,
     },
 }
 
@@ -75,9 +78,10 @@ enum IdentityAction {
     },
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
-    if let Err(e) = run(cli) {
+    if let Err(e) = run(cli).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
@@ -99,7 +103,7 @@ fn decode_hex_key(
     Ok(bytes)
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Identity { action } => match action {
             IdentityAction::New => {
@@ -160,8 +164,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             filter_broadcast_ticks,
             filter_mutation_threshold,
             identity_file,
+            listen_address,
         } => {
-            use crate::runtime::{NodeConfig, NodeRuntime, RuntimeAction};
+            use crate::runtime::{NodeConfig, NodeRuntime};
             use harmony_compute::InstructionBudget;
             use harmony_content::blob::MemoryBlobStore;
             use harmony_content::storage_tier::{
@@ -232,37 +237,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 
-            println!("Harmony node runtime initialized");
-            println!("  Cache capacity:   {cache_capacity} items");
-            println!("  Compute budget:   {compute_budget} fuel/tick");
-            println!("  Filter interval: {filter_broadcast_ticks} ticks / {filter_mutation_threshold} mutations");
-            println!("  Router queue:     {} pending", rt.router_queue_len());
-            println!("  Storage queue:    {} pending", rt.storage_queue_len());
-            println!("  Compute queue:    {} tracked", rt.compute_queue_len());
-            println!("\nStartup actions:");
-            for action in &startup_actions {
-                match action {
-                    RuntimeAction::DeclareQueryable { key_expr } => {
-                        println!("  queryable: {key_expr}");
-                    }
-                    RuntimeAction::Subscribe { key_expr } => {
-                        println!("  subscribe: {key_expr}");
-                    }
-                    _ => {}
-                }
-            }
-            println!(
-                "\n{} queryables, {} subscriptions declared",
-                startup_actions
-                    .iter()
-                    .filter(|a| matches!(a, RuntimeAction::DeclareQueryable { .. }))
-                    .count(),
-                startup_actions
-                    .iter()
-                    .filter(|a| matches!(a, RuntimeAction::Subscribe { .. }))
-                    .count(),
-            );
-            println!("\nNode ready. (Event loop requires async runtime — not yet wired.)");
+            let listen_addr: std::net::SocketAddr = listen_address.parse()
+                .map_err(|e| format!("Invalid --listen-address: {e}"))?;
+
+            eprintln!("Harmony node starting...");
+            eprintln!("  Cache capacity:   {cache_capacity} items");
+            eprintln!("  Compute budget:   {compute_budget} fuel/tick");
+
+            crate::event_loop::run(rt, startup_actions, listen_addr).await
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
         }
     }
@@ -342,10 +325,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cli_rejects_announce_without_persist() {
+    #[tokio::test]
+    async fn cli_rejects_announce_without_persist() {
         let cli = Cli::try_parse_from(["harmony", "run", "--encrypted-durable-announce"]).unwrap();
-        let result = run(cli);
+        let result = run(cli).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -354,10 +337,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cli_rejects_zero_cache_capacity() {
+    #[tokio::test]
+    async fn cli_rejects_zero_cache_capacity() {
         let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "0"]).unwrap();
-        let result = run(cli);
+        let result = run(cli).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -366,11 +349,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cli_rejects_oversized_cache_capacity() {
+    #[tokio::test]
+    async fn cli_rejects_oversized_cache_capacity() {
         // 200_000_001 exceeds MAX_CACHE_CAPACITY (200M).
         let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "200000001"]).unwrap();
-        let result = run(cli);
+        let result = run(cli).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("exceeds maximum"), "unexpected error: {msg}");
@@ -400,10 +383,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cli_rejects_filter_broadcast_ticks_below_two() {
+    #[tokio::test]
+    async fn cli_rejects_filter_broadcast_ticks_below_two() {
         let cli = Cli::try_parse_from(["harmony", "run", "--filter-broadcast-ticks", "1"]).unwrap();
-        let result = run(cli);
+        let result = run(cli).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
