@@ -61,15 +61,21 @@ pub fn save(path: &Path, identity: &NodeIdentity) -> Result<(), String> {
         }
     }
     let pq_bytes = Zeroizing::new(identity.pq.to_private_bytes());
-    let ed_bytes = Zeroizing::new(identity.ed25519.to_private_bytes().to_vec());
+    let ed_bytes = Zeroizing::new(identity.ed25519.to_private_bytes());
     let mut buf = Zeroizing::new(Vec::with_capacity(FILE_LEN));
     buf.push(VERSION);
     buf.extend_from_slice(&pq_bytes);
-    buf.extend_from_slice(&ed_bytes);
+    buf.extend_from_slice(ed_bytes.as_slice());
 
     // Atomic write: create tmp with restricted permissions from the start
     // (no world-readable window), fsync, rename into place.
-    let tmp_path = path.with_extension("key.tmp");
+    // Derive tmp path as <filename>.tmp to avoid collisions when paths
+    // differ only in extension (with_extension would map both to the same tmp).
+    let tmp_path = {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".tmp");
+        path.with_file_name(name)
+    };
     {
         #[cfg(unix)]
         let f = {
@@ -231,6 +237,15 @@ mod tests {
         assert_eq!(FILE_LEN, 161);
         assert_eq!(1 + PQ_KEY_LEN + ED25519_KEY_LEN, 161);
     }
+
+    // Note: PqPrivateIdentity::from_private_bytes and PrivateIdentity::from_private_bytes
+    // accept any byte sequence of the correct length — they validate length only, not
+    // content (seeds are arbitrary byte arrays, not structured data). This means there
+    // are no "corrupt bytes" that pass the length check but fail deserialization.
+    // The corruption error branches exist for defense-in-depth if the underlying
+    // crypto libraries add stricter validation in the future. The version and length
+    // checks above cover the realistic corruption scenarios (truncated writes, wrong
+    // file type, etc.).
 
     #[cfg(unix)]
     #[test]
