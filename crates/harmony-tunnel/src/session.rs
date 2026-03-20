@@ -567,4 +567,79 @@ mod tests {
         assert_eq!(initiator.state(), TunnelState::Initiating);
     }
 
+    // ── Task 7: Keepalive and Timeout Tests ──────────────────────────────────
+
+    #[test]
+    fn keepalive_sent_after_interval() {
+        let (mut initiator, _responder, _iid, _rid) = complete_handshake();
+
+        // Force last_sent_ms = 0 so elapsed time is measured from t=0
+        initiator.last_sent_ms = 0;
+
+        // Tick at t=0: 0ms elapsed, no keepalive
+        let actions = initiator
+            .handle_event(TunnelEvent::Tick { now_ms: 0 })
+            .unwrap();
+        assert!(
+            actions.is_empty(),
+            "tick at t=0 with last_sent=0 should NOT send keepalive (0ms elapsed)"
+        );
+
+        // Tick at t=15000: only 15s elapsed → no keepalive
+        let actions = initiator
+            .handle_event(TunnelEvent::Tick { now_ms: 15_000 })
+            .unwrap();
+        assert!(
+            actions.is_empty(),
+            "tick at 15s should not send keepalive"
+        );
+
+        // Reset last_sent_ms to 0 for clean measurement
+        initiator.last_sent_ms = 0;
+
+        // Tick at t=30001: 30001ms >= KEEPALIVE_INTERVAL_MS (30000) → keepalive sent
+        let actions = initiator
+            .handle_event(TunnelEvent::Tick { now_ms: 30_001 })
+            .unwrap();
+        assert_eq!(actions.len(), 1, "tick at 30001ms must emit exactly one keepalive");
+        assert!(
+            matches!(&actions[0], TunnelAction::OutboundBytes { .. }),
+            "keepalive must be OutboundBytes"
+        );
+        assert_eq!(initiator.last_sent_ms, 30_001);
+    }
+
+    #[test]
+    fn dead_peer_timeout() {
+        let (mut initiator, _responder, _iid, _rid) = complete_handshake();
+
+        // Simulate having received data at t=1000ms
+        initiator.last_received_ms = 1000;
+
+        // Tick at t=91001: 91001 - 1000 = 90001 >= DEAD_TIMEOUT_MS (90000)
+        let actions = initiator
+            .handle_event(TunnelEvent::Tick { now_ms: 91_001 })
+            .unwrap();
+
+        assert_eq!(initiator.state(), TunnelState::Closed);
+        assert!(
+            actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
+            "dead peer timeout must emit Closed"
+        );
+    }
+
+    #[test]
+    fn close_transitions_to_closed() {
+        let (mut initiator, _responder, _iid, _rid) = complete_handshake();
+        assert_eq!(initiator.state(), TunnelState::Active);
+
+        let actions = initiator.handle_event(TunnelEvent::Close).unwrap();
+
+        assert_eq!(initiator.state(), TunnelState::Closed);
+        assert!(
+            actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
+            "Close must emit TunnelAction::Closed"
+        );
+    }
+
 }
