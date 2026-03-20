@@ -31,4 +31,4 @@ IX O=
   * Low-effort, but Harmony would benefit from a whole new hardware design inspired by things like Efficient Computing's "Fabric"-based CPUs. RISC-V target because open-source and also to drive adoption/support via Europe. 
 * [zeblithic/harmony-openwrt](https://github.com/zeblithic/harmony-openwrt)
   * Even your router participates like a full client/server/node/cache in the network!
-* You can also check out all my Harmony-related Gemini research reports [here] on my personal GDrive (https://drive.google.com/drive/folders/1Nd7pkSB1RzHrWdTS1Xykr6puTKdS8XGu)
+* You can also check out all my Harmony-related Gemini research reports [here](https://drive.google.com/drive/folders/1Nd7pkSB1RzHrWdTS1Xykr6puTKdS8XGu) on my personal GDrive
