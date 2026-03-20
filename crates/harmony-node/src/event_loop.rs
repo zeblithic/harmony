@@ -90,6 +90,28 @@ pub async fn run(
     // ── Monotonic query-id counter ────────────────────────────────────────────
     let mut next_query_id: u64 = 1;
 
+    // ── Shutdown signal ───────────────────────────────────────────────────────
+    // Listens for SIGTERM (procd stop) and SIGINT (Ctrl+C). The future
+    // resolves on the first signal received.
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = sigterm.recv() => eprintln!("[event_loop] SIGTERM received — shutting down"),
+                _ = tokio::signal::ctrl_c() => eprintln!("[event_loop] Ctrl+C received — shutting down"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+            eprintln!("[event_loop] Ctrl+C received — shutting down");
+        }
+    };
+    tokio::pin!(shutdown);
+
     // ── Select loop ──────────────────────────────────────────────────────────
     //
     // Events from UDP and Zenoh are buffered via push_event(). tick() is
@@ -160,6 +182,11 @@ pub async fn run(
                         }
                     }
                 }
+            }
+
+            // Arm 4: Graceful shutdown (SIGTERM from procd, Ctrl+C).
+            _ = &mut shutdown => {
+                break;
             }
         }
 
