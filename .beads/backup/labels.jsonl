@@ -21,11 +21,16 @@
 {"issue_id":"harmony-4oz","label":"client-ux"}
 {"issue_id":"harmony-4oz","label":"task"}
 {"issue_id":"harmony-5s7","label":"harmony-semantic"}
+{"issue_id":"harmony-641","label":"feature"}
+{"issue_id":"harmony-641","label":"task"}
 {"issue_id":"harmony-6aw","label":"harmony-os"}
 {"issue_id":"harmony-6aw","label":"ring-3"}
 {"issue_id":"harmony-6cr","label":"feature"}
+{"issue_id":"harmony-7cu","label":"refactor"}
 {"issue_id":"harmony-7w4","label":"harmony-os"}
 {"issue_id":"harmony-7w4","label":"ring-0"}
+{"issue_id":"harmony-84h","label":"infra"}
+{"issue_id":"harmony-84h","label":"task"}
 {"issue_id":"harmony-8fg","label":"harmony-content"}
 {"issue_id":"harmony-8fg","label":"harmony-zenoh"}
 {"issue_id":"harmony-8xc","label":"harmony-os"}
@@ -46,6 +51,8 @@
 {"issue_id":"harmony-cpo","label":"harmony-os"}
 {"issue_id":"harmony-cpo","label":"ring-1"}
 {"issue_id":"harmony-d63","label":"task"}
+{"issue_id":"harmony-dgb","label":"feature"}
+{"issue_id":"harmony-dgb","label":"task"}
 {"issue_id":"harmony-dmn","label":"harmony-client"}
 {"issue_id":"harmony-dnp","label":"feature"}
 {"issue_id":"harmony-duq","label":"harmony-os"}
@@ -54,6 +61,8 @@
 {"issue_id":"harmony-e67","label":"harmony-semantic"}
 {"issue_id":"harmony-eo2","label":"feature"}
 {"issue_id":"harmony-g2ud","label":"client-ux"}
+{"issue_id":"harmony-h6k","label":"feature"}
+{"issue_id":"harmony-h6k","label":"task"}
 {"issue_id":"harmony-haq","label":"harmony-os"}
 {"issue_id":"harmony-haq","label":"ring-1"}
 {"issue_id":"harmony-hmf7","label":"node-trinity"}
@@ -62,6 +71,8 @@
 {"issue_id":"harmony-k5ed","label":"node-trinity"}
 {"issue_id":"harmony-kax","label":"harmony-os"}
 {"issue_id":"harmony-kax","label":"ring-3"}
+{"issue_id":"harmony-lbv","label":"feature"}
+{"issue_id":"harmony-lbv","label":"task"}
 {"issue_id":"harmony-lpk","label":"feature"}
 {"issue_id":"harmony-m6dp","label":"client-ux"}
 {"issue_id":"harmony-ms6","label":"harmony-os"}
