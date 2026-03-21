@@ -280,7 +280,11 @@ pub async fn run(
                     },
                     Some(Err(_)) => {
                         tracing::warn!("mDNS channel disconnected — discovery disabled");
-                        mdns_state = None;
+                        if let Some((daemon, _)) = mdns_state.take() {
+                            if let Err(e) = daemon.shutdown() {
+                                tracing::warn!(err = %e, "mDNS shutdown error");
+                            }
+                        }
                     }
                     None => unreachable!("pending future cannot resolve to None"),
                 }
