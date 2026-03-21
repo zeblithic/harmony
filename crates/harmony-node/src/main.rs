@@ -88,7 +88,10 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|e| {
+                    eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
+                    tracing_subscriber::EnvFilter::new("info")
+                }),
         )
         .with_target(false)
         .with_writer(std::io::stderr)
