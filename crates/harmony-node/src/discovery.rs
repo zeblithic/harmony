@@ -17,13 +17,19 @@ pub struct PeerInfo {
 ///
 /// Keyed by `SocketAddr` (IP + port) in the primary map; a reverse index
 /// maps each Reticulum address to all socket addresses that announced it.
-/// Self-announcements are silently dropped.
+/// Self-announcements are silently dropped. Capped at `MAX_PEERS` to bound
+/// send amplification from mDNS flooding.
 pub struct PeerTable {
     pub(crate) peers: HashMap<SocketAddr, PeerInfo>,
     pub(crate) addr_to_sockets: HashMap<[u8; 16], HashSet<SocketAddr>>,
     our_addr: [u8; 16],
     stale_timeout: Duration,
 }
+
+/// Maximum number of tracked peers. Prevents O(N) send amplification if a
+/// malicious actor floods mDNS with fake service advertisements. 128 is far
+/// more than any realistic LAN mesh; real deployments are 5-30 nodes.
+const MAX_PEERS: usize = 128;
 
 impl PeerTable {
     pub fn new(our_addr: [u8; 16], stale_timeout: Duration) -> Self {
@@ -46,8 +52,13 @@ impl PeerTable {
         if reticulum_addr == self.our_addr {
             return false;
         }
-        let now = Instant::now();
         let is_new = !self.peers.contains_key(&addr);
+        // Reject new peers beyond the cap to bound send amplification.
+        // Existing peers (upsert) are always allowed through.
+        if is_new && self.peers.len() >= MAX_PEERS {
+            return false;
+        }
+        let now = Instant::now();
         let old_reticulum_addr = self.peers.get(&addr).map(|p| p.reticulum_addr);
         self.peers
             .entry(addr)
@@ -458,6 +469,35 @@ mod tests {
             t.addr_to_sockets.get(&ra).is_none(),
             "addr_to_sockets must be empty after all sockets for a reticulum addr evict"
         );
+    }
+
+    #[test]
+    fn max_peers_cap_rejects_new_peers() {
+        let our = [0xFF; 16]; // won't collide with generated addrs
+        let mut t = PeerTable::new(our, Duration::from_secs(60));
+        // Fill to MAX_PEERS
+        for i in 0..super::MAX_PEERS {
+            let sa = make_addr(5000 + i as u16);
+            let mut ra = [0u8; 16];
+            // Ensure ra != our_addr by setting byte 2 to a non-0xFF value
+            ra[0] = (i >> 8) as u8;
+            ra[1] = (i & 0xFF) as u8;
+            ra[2] = 0x01;
+            assert!(t.add_peer(sa, ra, 1), "peer {i} should be accepted");
+        }
+        assert_eq!(t.peer_count(), super::MAX_PEERS);
+
+        // Next new peer should be rejected
+        let extra = make_addr(9000);
+        assert!(!t.add_peer(extra, make_reticulum_addr(200), 1));
+        assert_eq!(t.peer_count(), super::MAX_PEERS);
+
+        // But upsert of existing peer still works
+        let existing = make_addr(5000);
+        let mut ra0 = [0u8; 16];
+        ra0[2] = 0x01;
+        assert!(!t.add_peer(existing, ra0, 2)); // returns false (not new), but updates
+        assert_eq!(t.peers.get(&existing).unwrap().proto_version, 2);
     }
 
     // ── parse_instance_addr tests ────────────────────────────────────────────

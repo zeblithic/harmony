@@ -166,6 +166,8 @@ pub async fn run(
             result = udp.recv_from(&mut udp_buf) => {
                 match result {
                     Ok((len, src)) => {
+                        // Invariant: src port matches the peer's mDNS-announced listen port
+                        // because each node sends from its bound --listen-address socket.
                         peer_table.mark_seen(&src);
                         runtime.push_event(RuntimeEvent::InboundPacket {
                             interface_name: "udp0".to_string(),
