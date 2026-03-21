@@ -95,8 +95,11 @@ async fn main() {
         )
         .with_target(false)
         .with_ansi(false)
+        .without_time()
         .with_writer(std::io::stderr)
         .init();
+    // Tip: use RUST_LOG=harmony=debug for harmony-only debug output.
+    // Plain RUST_LOG=debug includes Zenoh's verbose internal traces.
 
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {
