@@ -850,14 +850,15 @@ impl<B: BookStore> NodeRuntime<B> {
                     });
                 }
                 NodeAction::AnnounceReceived {
-                    destination_hash, ..
+                    validated_announce, ..
                 } => {
                     // Feed announce into PeerManager so it can trigger
                     // link/tunnel initiation for known contacts.
+                    // Use identity.address_hash (the raw identity hash), NOT
+                    // destination_hash (which is SHA256(name_hash || address_hash)[:16]).
+                    let identity_hash = validated_announce.identity.address_hash;
                     let peer_actions = self.peer_manager.on_event(
-                        PeerEvent::AnnounceReceived {
-                            identity_hash: destination_hash,
-                        },
+                        PeerEvent::AnnounceReceived { identity_hash },
                         &self.contact_store,
                     );
                     self.translate_peer_actions_out(peer_actions, out);

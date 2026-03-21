@@ -82,6 +82,10 @@ impl PeerManager {
                                         } = addr
                                         {
                                             if *addr_node_id == node_id {
+                                                // TODO: This infers relayed from the stored
+                                                // config, not the actual connection path. Once
+                                                // TunnelBridgeEvent carries the real relay status
+                                                // from iroh-net, pass it through TunnelEstablished.
                                                 Some(relay_url.is_some())
                                             } else {
                                                 None
@@ -119,7 +123,10 @@ impl PeerManager {
             }
             PeerEvent::TunnelFailed { identity_hash } => {
                 if let Some(peer) = self.peers.get_mut(&identity_hash) {
-                    if matches!(peer.status, PeerStatus::Connecting | PeerStatus::Searching) {
+                    // Only act on Connecting — a stale TunnelFailed arriving after
+                    // the Tick timeout already moved the peer to Searching should
+                    // not double-increment retry_count or corrupt last_probe.
+                    if matches!(peer.status, PeerStatus::Connecting) {
                         peer.last_probe =
                             peer.connecting_since.or(peer.last_seen).or(peer.last_probe);
                         peer.status = PeerStatus::Searching;

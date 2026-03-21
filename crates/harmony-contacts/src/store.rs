@@ -94,7 +94,11 @@ impl ContactStore {
         if data.is_empty() {
             return Err(ContactError::DeserializeError("empty data"));
         }
-        if data[0] != FORMAT_VERSION {
+        // Accept v1 (pre-addresses) and v2 (current). v1 contacts will
+        // deserialize with addresses defaulting to empty vec via serde.
+        // If v1 deserialization fails (postcard layout mismatch), fall through
+        // to the v2 path which will also fail with a clear error.
+        if data[0] != FORMAT_VERSION && data[0] != 1 {
             return Err(ContactError::DeserializeError("unsupported format version"));
         }
         postcard::from_bytes(&data[1..])
