@@ -11,6 +11,8 @@ pub struct PeerInfo {
     pub reticulum_addr: [u8; 16],
     pub proto_version: u8,
     pub last_seen: Instant,
+    /// Pinned peers (from config `[peers]`) are never evicted by stale timeout.
+    pub pinned: bool,
 }
 
 /// Tracks LAN peers discovered via mDNS/DNS-SD.
@@ -71,6 +73,7 @@ impl PeerTable {
                 reticulum_addr,
                 proto_version,
                 last_seen: now,
+                pinned: false,
             });
         // Clean up the old reverse-index entry if the Reticulum address changed.
         if let Some(old_ra) = old_reticulum_addr {
@@ -88,6 +91,43 @@ impl PeerTable {
             .or_default()
             .insert(addr);
         is_new
+    }
+
+    /// Add a pinned peer that is never evicted by stale timeout.
+    /// Uses a unique placeholder Reticulum address derived from the socket address
+    /// to avoid reverse-index collisions between bootstrap peers.
+    pub fn add_pinned_peer(&mut self, addr: SocketAddr) {
+        // Derive a unique placeholder via hash of the full SocketAddr.
+        // Uniform for both IPv4 and IPv6 — no byte-overlap collisions.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        addr.hash(&mut hasher);
+        let hash = hasher.finish().to_le_bytes();
+        let mut placeholder = [0xFEu8; 16]; // 0xFE prefix distinguishes from real addresses
+        placeholder[..8].copy_from_slice(&hash);
+        if placeholder == self.our_addr {
+            tracing::warn!(peer = %addr, "bootstrap peer placeholder collides with our address — skipping");
+            return;
+        }
+        if !self.peers.contains_key(&addr) && self.peers.len() >= MAX_PEERS {
+            tracing::warn!(peer = %addr, "bootstrap peer not added: MAX_PEERS cap reached");
+            return;
+        }
+        // Only update reverse index if we actually insert (not if already present).
+        if self.peers.contains_key(&addr) {
+            return;
+        }
+        let now = Instant::now();
+        self.peers.insert(addr, PeerInfo {
+            reticulum_addr: placeholder,
+            proto_version: 0,
+            last_seen: now,
+            pinned: true,
+        });
+        self.addr_to_sockets
+            .entry(placeholder)
+            .or_default()
+            .insert(addr);
     }
 
     /// Remove all socket addrs associated with `reticulum_addr`.
@@ -121,7 +161,7 @@ impl PeerTable {
         let stale: Vec<(SocketAddr, [u8; 16])> = self
             .peers
             .iter()
-            .filter(|(_, info)| now.duration_since(info.last_seen) > timeout)
+            .filter(|(_, info)| !info.pinned && now.duration_since(info.last_seen) > timeout)
             .map(|(sa, info)| (*sa, info.reticulum_addr))
             .collect();
 
@@ -498,6 +538,36 @@ mod tests {
         ra0[2] = 0x01;
         assert!(!t.add_peer(existing, ra0, 2)); // returns false (not new), but updates
         assert_eq!(t.peers.get(&existing).unwrap().proto_version, 2);
+    }
+
+    // ── pinned peer tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn pinned_peer_survives_eviction() {
+        let mut t = PeerTable::new([0u8; 16], Duration::ZERO);
+        let sa = make_addr(6000);
+        t.add_pinned_peer(sa);
+        assert_eq!(t.peer_count(), 1);
+
+        // Spin past zero timeout
+        let start = Instant::now();
+        while Instant::now().duration_since(start) < Duration::from_nanos(1) {}
+
+        let evicted = t.evict_stale();
+        assert!(evicted.is_empty(), "pinned peer must not be evicted");
+        assert_eq!(t.peer_count(), 1);
+    }
+
+    #[test]
+    fn pinned_peers_have_unique_placeholders() {
+        let mut t = PeerTable::new([0u8; 16], Duration::from_secs(60));
+        let sa1 = make_addr(6001);
+        let sa2 = make_addr(6002);
+        t.add_pinned_peer(sa1);
+        t.add_pinned_peer(sa2);
+        assert_eq!(t.peer_count(), 2);
+        // Each should be in a separate reverse-index bucket
+        assert_eq!(t.addr_to_sockets.len(), 2);
     }
 
     // ── parse_instance_addr tests ────────────────────────────────────────────
