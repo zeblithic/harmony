@@ -36,6 +36,9 @@
         fileset = pkgs.lib.fileset.unions [
           (craneLib.fileset.cargoTomlAndLock ./.)
           (craneLib.fileset.rust ./.)
+          # Include .cargo/config.toml so cross-build rustflags
+          # (e.g., link-self-contained=yes for aarch64 musl) are visible.
+          (pkgs.lib.fileset.maybeMissing ./.cargo/config.toml)
         ];
       };
 
