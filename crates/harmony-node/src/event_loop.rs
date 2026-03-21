@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use crate::runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
-use crate::tunnel_bridge::{TunnelBridgeEvent, TunnelSender};
+use crate::tunnel_bridge::{ReadyConnection, TunnelBridgeEvent, TunnelSender};
 use crate::tunnel_task;
 
 /// Configuration for iroh tunnel connectivity.
@@ -82,6 +82,9 @@ pub async fn run(
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<TunnelBridgeEvent>(256);
     let mut tunnel_senders: HashMap<String, TunnelSender> = HashMap::new();
     let mut next_connection_id: u64 = 0;
+
+    // ── Ready-connection channel: QUIC handshake tasks → select loop ──────
+    let (conn_tx, mut conn_rx) = mpsc::channel::<ReadyConnection>(64);
 
     // ── iroh Endpoint (optional, gated on --relay-url) ─────────────────────
     let iroh_endpoint = if let Some(ref config) = tunnel_config {
@@ -292,22 +295,27 @@ pub async fn run(
                         connection_id,
                     } => {
                         eprintln!("[{interface_name}] tunnel closed: {reason}");
-                        // Only remove the sender if the connection_id matches,
-                        // preventing a stale close from a previous connection
-                        // from removing a newly reconnected peer's sender.
-                        if tunnel_senders
+                        // Only remove the sender AND unregister the router interface
+                        // if the connection_id matches. A stale close from a previous
+                        // connection must not tear down a reconnected peer's interface.
+                        let is_current = tunnel_senders
                             .get(&interface_name)
                             .map(|s| s.connection_id == connection_id)
-                            .unwrap_or(false)
-                        {
+                            .unwrap_or(false);
+                        if is_current {
                             tunnel_senders.remove(&interface_name);
+                            runtime.push_event(RuntimeEvent::TunnelClosed { interface_name });
                         }
-                        runtime.push_event(RuntimeEvent::TunnelClosed { interface_name });
+                        // else: stale close from old connection — ignore
                     }
                 }
             }
 
             // Arm 5: Accept incoming iroh connections.
+            //
+            // The QUIC handshake (connecting.await) is spawned in a separate
+            // task to avoid blocking the event loop for 100-500ms+. Completed
+            // connections arrive on conn_rx (Arm 7).
             incoming = async {
                 if let Some(ref ep) = iroh_endpoint {
                     ep.accept().await
@@ -317,46 +325,39 @@ pub async fn run(
                 }
             } => {
                 if let Some(incoming) = incoming {
+                    // Check connection limit BEFORE spawning the handshake task.
                     if tunnel_senders.len() >= MAX_TUNNEL_CONNECTIONS {
                         eprintln!("[event_loop] tunnel connection limit ({MAX_TUNNEL_CONNECTIONS}) reached — rejecting");
                         drop(incoming); // sends QUIC RESET
                     } else {
+                        let conn_id = next_connection_id;
+                        next_connection_id += 1;
+                        let conn_tx = conn_tx.clone();
+
                         match incoming.accept() {
                             Ok(connecting) => {
-                                match connecting.await {
-                                    Ok(connection) => {
-                                        let iface = match connection.remote_node_id() {
-                                            Ok(id) => format!(
-                                                "tunnel-{}",
-                                                hex::encode(&id.as_bytes()[..4])
-                                            ),
-                                            Err(_) => format!(
-                                                "tunnel-{:08x}",
-                                                rand::random::<u32>()
-                                            ),
-                                        };
-                                        let conn_id = next_connection_id;
-                                        next_connection_id += 1;
-                                        let (cmd_tx, cmd_rx) = mpsc::channel(64);
-                                        tunnel_senders.insert(
-                                            iface.clone(),
-                                            TunnelSender::new(cmd_tx, conn_id),
-                                        );
-
-                                        let tx = tunnel_tx.clone();
-                                        let identity =
-                                            tunnel_config.as_ref().unwrap().local_identity.clone();
-                                        let iface_clone = iface.clone();
-                                        tokio::spawn(async move {
-                                            tunnel_task::run_responder(
-                                                connection, &identity, tx, cmd_rx, iface_clone, conn_id,
-                                            )
-                                            .await;
-                                        });
-                                        eprintln!("[{iface}] accepted incoming tunnel");
+                                tokio::spawn(async move {
+                                    match connecting.await {
+                                        Ok(connection) => {
+                                            let iface = match connection.remote_node_id() {
+                                                Ok(id) => format!(
+                                                    "tunnel-{}",
+                                                    hex::encode(&id.as_bytes()[..4])
+                                                ),
+                                                Err(_) => format!(
+                                                    "tunnel-{:08x}",
+                                                    rand::random::<u32>()
+                                                ),
+                                            };
+                                            let _ = conn_tx.send(ReadyConnection {
+                                                connection,
+                                                connection_id: conn_id,
+                                                interface_name: iface,
+                                            }).await;
+                                        }
+                                        Err(e) => eprintln!("[event_loop] QUIC handshake failed: {e}"),
                                     }
-                                    Err(e) => eprintln!("[event_loop] iroh connecting error: {e}"),
-                                }
+                                });
                             }
                             Err(e) => eprintln!("[event_loop] iroh accept error: {e}"),
                         }
@@ -364,7 +365,30 @@ pub async fn run(
                 }
             }
 
-            // Arm 6: Graceful shutdown (SIGTERM from procd, Ctrl+C).
+            // Arm 6: Ready connection from QUIC handshake task — spawn tunnel.
+            ready = conn_rx.recv() => {
+                if let Some(ReadyConnection { connection, connection_id, interface_name }) = ready {
+                    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+                    tunnel_senders.insert(
+                        interface_name.clone(),
+                        TunnelSender::new(cmd_tx, connection_id),
+                    );
+
+                    let tx = tunnel_tx.clone();
+                    let identity =
+                        tunnel_config.as_ref().unwrap().local_identity.clone();
+                    let iface_clone = interface_name.clone();
+                    tokio::spawn(async move {
+                        tunnel_task::run_responder(
+                            connection, &identity, tx, cmd_rx, iface_clone, connection_id,
+                        )
+                        .await;
+                    });
+                    eprintln!("[{interface_name}] accepted incoming tunnel");
+                }
+            }
+
+            // Arm 7: Graceful shutdown (SIGTERM from procd, Ctrl+C).
             _ = &mut shutdown => {
                 break;
             }

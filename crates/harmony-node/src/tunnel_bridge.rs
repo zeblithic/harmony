@@ -58,24 +58,22 @@ pub enum TunnelCommand {
     Close,
 }
 
+/// A QUIC connection that completed its handshake and is ready for tunnel setup.
+///
+/// Sent from a spawned handshake task back to the event loop via an mpsc channel,
+/// so the QUIC round-trip doesn't block the select loop.
+pub struct ReadyConnection {
+    pub connection: iroh::endpoint::Connection,
+    pub connection_id: u64,
+    pub interface_name: String,
+}
+
 impl TunnelSender {
     pub fn new(tx: mpsc::Sender<TunnelCommand>, connection_id: u64) -> Self {
         Self { tx, connection_id }
     }
 
-    pub async fn send_reticulum(&self, packet: Vec<u8>) -> Result<(), mpsc::error::SendError<TunnelCommand>> {
-        self.tx.send(TunnelCommand::SendReticulum { packet }).await
-    }
-
     pub fn try_send_reticulum(&self, packet: Vec<u8>) -> Result<(), mpsc::error::TrySendError<TunnelCommand>> {
         self.tx.try_send(TunnelCommand::SendReticulum { packet })
-    }
-
-    pub async fn send_zenoh(&self, message: Vec<u8>) -> Result<(), mpsc::error::SendError<TunnelCommand>> {
-        self.tx.send(TunnelCommand::SendZenoh { message }).await
-    }
-
-    pub async fn close(&self) -> Result<(), mpsc::error::SendError<TunnelCommand>> {
-        self.tx.send(TunnelCommand::Close).await
     }
 }
