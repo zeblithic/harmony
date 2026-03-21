@@ -20,7 +20,8 @@ set -euo pipefail
 RELAY_HOSTNAME="${RELAY_HOSTNAME:?Set RELAY_HOSTNAME (e.g. i.q8.fyi)}"
 GCP_PROJECT="${GCP_PROJECT:?Set GCP_PROJECT (e.g. my-gcp-project)}"
 GCP_ZONE="${GCP_ZONE:-us-west1-b}"
-GCP_REGION="${GCP_REGION:-us-west1}"
+# Derive region from zone (strip trailing -a/-b/-c) to prevent mismatch.
+GCP_REGION="${GCP_ZONE%-*}"
 VM_NAME="${VM_NAME:-harmony-relay}"
 MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
 IROH_REPO="${IROH_REPO:-https://github.com/n0-computer/iroh.git}"
@@ -202,26 +203,58 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 UNIT
 
-    # Enable and start
+    # Enable but do NOT start yet — ACME needs DNS to resolve first.
+    # Starting before DNS resolves wastes Let's Encrypt rate limit
+    # attempts (5 failed validations/hour/hostname).
     sudo systemctl daemon-reload
     sudo systemctl enable iroh-relay
-    sudo systemctl restart iroh-relay
 
-    echo 'Service installed and started.'
+    echo 'Service installed and enabled (not started — waiting for DNS).'
+"
+
+# ── Step 7: Wait for DNS, then start ──────────────────────────────
+echo ""
+echo "=== VM provisioned. Static IP: ${STATIC_IP} ==="
+echo ""
+echo "Add this DNS A record with your registrar NOW:"
+echo ""
+echo "    ${RELAY_HOSTNAME}.  A  ${STATIC_IP}"
+echo ""
+
+read -rp "Press Enter after you've added the DNS record (or Ctrl-C to finish later)..."
+
+echo "--- Waiting for DNS to resolve ${RELAY_HOSTNAME} to ${STATIC_IP}..."
+dns_ready=0
+for i in $(seq 1 60); do
+    resolved=$(dig +short "${RELAY_HOSTNAME}" @8.8.8.8 2>/dev/null | head -1)
+    if [ "$resolved" = "$STATIC_IP" ]; then
+        dns_ready=1
+        break
+    fi
+    echo "    Attempt $i/60: got '${resolved:-<empty>}', waiting..."
+    sleep 10
+done
+
+if [ "$dns_ready" -eq 0 ]; then
+    echo ""
+    echo "WARNING: DNS did not resolve after 10 minutes."
+    echo "The service is installed but NOT started to avoid wasting"
+    echo "Let's Encrypt rate limits. Start it manually after DNS propagates:"
+    echo ""
+    echo "    gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- sudo systemctl start iroh-relay"
+    exit 0
+fi
+
+echo "    DNS resolved! Starting iroh-relay..."
+gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
+    sudo systemctl start iroh-relay
 "
 
 # ── Done ──────────────────────────────────────────────────────────
 echo ""
 echo "=== Deployment Complete ==="
 echo ""
-echo "Static IP: ${STATIC_IP}"
-echo ""
-echo "NEXT STEP: Add this DNS A record with your registrar:"
-echo ""
-echo "    ${RELAY_HOSTNAME}.  A  ${STATIC_IP}"
-echo ""
-echo "After DNS propagates, verify with:"
-echo "    curl -s -o /dev/null -w '%{http_code}' https://${RELAY_HOSTNAME}/"
+echo "Relay running at https://${RELAY_HOSTNAME}"
 echo ""
 echo "Connect Harmony nodes with:"
 echo "    harmony-node --relay-url https://${RELAY_HOSTNAME}"

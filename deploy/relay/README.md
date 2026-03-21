@@ -155,6 +155,12 @@ SSH into the VM:
 gcloud compute ssh harmony-relay --zone=us-west1-b
 ```
 
+Then on the VM, set your hostname:
+
+```bash
+export RELAY_HOSTNAME="i.q8.fyi"  # replace with your domain
+```
+
 Then on the VM:
 
 ```bash
