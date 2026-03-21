@@ -475,4 +475,44 @@ mod tests {
             "unexpected error: {msg}"
         );
     }
+
+    #[test]
+    fn cli_parses_no_mdns_flag() {
+        let cli = Cli::try_parse_from(["harmony", "run", "--no-mdns"]).unwrap();
+        if let Commands::Run { no_mdns, .. } = cli.command {
+            assert!(no_mdns);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_no_mdns_default_false() {
+        let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
+        if let Commands::Run { no_mdns, .. } = cli.command {
+            assert!(!no_mdns);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_parses_mdns_stale_timeout() {
+        let cli = Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "120"]).unwrap();
+        if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
+            assert_eq!(mdns_stale_timeout, 120);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_mdns_stale_timeout_default() {
+        let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
+        if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
+            assert_eq!(mdns_stale_timeout, 60);
+        } else {
+            panic!("expected Run command");
+        }
+    }
 }
