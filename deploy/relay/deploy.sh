@@ -25,7 +25,7 @@ GCP_REGION="${GCP_ZONE%-*}"
 VM_NAME="${VM_NAME:-harmony-relay}"
 MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
 IROH_REPO="${IROH_REPO:-https://github.com/n0-computer/iroh.git}"
-IROH_VERSION="${IROH_VERSION:-v0.35.0}"
+IROH_VERSION="${IROH_VERSION:-v0.91.2}"
 CONTACT_EMAIL="${CONTACT_EMAIL:-admin@${RELAY_HOSTNAME}}"
 
 # Rate limits (bytes/sec). Defaults: 100 KB/s sustained, 500 KB burst.
