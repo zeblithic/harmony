@@ -38,7 +38,7 @@ RATE_LIMIT_BURST="${RATE_LIMIT_BURST:-512000}"
 # Prevent shell injection via SSH commands and TOML config corruption.
 # RFC 952: labels start/end with alphanumeric, hyphens only in the middle.
 # No underscores — they cause ACME/Let's Encrypt certificate failures.
-[[ "${RELAY_HOSTNAME}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]] \
+[[ "${RELAY_HOSTNAME}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]] \
     || { echo "ERROR: RELAY_HOSTNAME must be a valid hostname (RFC 952: alphanumeric labels separated by dots, no leading/trailing hyphens)"; exit 1; }
 [[ "${CONTACT_EMAIL}" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$ ]] \
     || { echo "ERROR: CONTACT_EMAIL must be a valid email address (user@domain.tld)"; exit 1; }
