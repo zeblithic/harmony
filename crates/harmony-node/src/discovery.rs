@@ -113,8 +113,12 @@ impl PeerTable {
             tracing::warn!(peer = %addr, "bootstrap peer not added: MAX_PEERS cap reached");
             return;
         }
+        // Only update reverse index if we actually insert (not if already present).
+        if self.peers.contains_key(&addr) {
+            return;
+        }
         let now = Instant::now();
-        self.peers.entry(addr).or_insert(PeerInfo {
+        self.peers.insert(addr, PeerInfo {
             reticulum_addr: placeholder,
             proto_version: 0,
             last_seen: now,

@@ -57,9 +57,12 @@ impl ConfigTunnelPeers {
             peers: entries
                 .into_iter()
                 .map(|entry| ConfigTunnelPeer {
-                    interface_name: entry.name.clone().unwrap_or_else(|| {
-                        format!("tunnel-cfg-{}", &entry.node_id[..8.min(entry.node_id.len())])
-                    }),
+                    interface_name: entry.name.clone()
+                        .map(|n| if n.len() > 15 { n[..15].to_string() } else { n })
+                        .unwrap_or_else(|| {
+                            // "tc-" + 8 hex chars = 11 chars, within IFNAMSIZ (15)
+                            format!("tc-{}", &entry.node_id[..8.min(entry.node_id.len())])
+                        }),
                     node_id: entry.node_id,
                     name: entry.name,
                     next_retry: Some(tokio::time::Instant::now()), // connect immediately
