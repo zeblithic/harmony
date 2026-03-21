@@ -3,7 +3,7 @@ use harmony_content::cid::{ContentFlags, ContentId};
 
 #[test]
 fn browse_target_cid_holds_content_id() {
-    let cid = ContentId::for_blob(b"hello world", ContentFlags::default()).unwrap();
+    let cid = ContentId::for_book(b"hello world", ContentFlags::default()).unwrap();
     let target = BrowseTarget::Cid(cid);
     match target {
         BrowseTarget::Cid(c) => assert_eq!(c, cid),

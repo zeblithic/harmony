@@ -5,7 +5,7 @@ use harmony_content::cid::{ContentFlags, ContentId};
 
 #[test]
 fn navigate_event_holds_browse_target() {
-    let cid = ContentId::for_blob(b"hello", ContentFlags::default()).unwrap();
+    let cid = ContentId::for_book(b"hello", ContentFlags::default()).unwrap();
     let event = BrowserEvent::Navigate(BrowseTarget::Cid(cid));
     match event {
         BrowserEvent::Navigate(BrowseTarget::Cid(c)) => assert_eq!(c, cid),
@@ -15,7 +15,7 @@ fn navigate_event_holds_browse_target() {
 
 #[test]
 fn fetch_action_holds_cid() {
-    let cid = ContentId::for_blob(b"test", ContentFlags::default()).unwrap();
+    let cid = ContentId::for_book(b"test", ContentFlags::default()).unwrap();
     let action = BrowserAction::FetchContent { cid };
     match action {
         BrowserAction::FetchContent { cid: c } => assert_eq!(c, cid),
@@ -25,7 +25,7 @@ fn fetch_action_holds_cid() {
 
 #[test]
 fn render_action_holds_resolved_static() {
-    let cid = ContentId::for_blob(b"# Hello", ContentFlags::default()).unwrap();
+    let cid = ContentId::for_book(b"# Hello", ContentFlags::default()).unwrap();
     let resolved = ResolvedContent::Static {
         cid,
         mime: MimeHint::Markdown,

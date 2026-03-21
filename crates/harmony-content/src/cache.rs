@@ -5,13 +5,13 @@ use hashbrown::HashSet;
 #[cfg(feature = "std")]
 use std::collections::HashSet;
 
-use crate::blob::BlobStore;
+use crate::book::BookStore;
 use crate::cid::{ContentFlags, ContentId};
 use crate::error::ContentError;
 use crate::lru::Lru;
 use crate::sketch::CountMinSketch;
 
-/// A content store that wraps any [`BlobStore`] with W-TinyLFU admission.
+/// A content store that wraps any [`BookStore`] with W-TinyLFU admission.
 ///
 /// The cache tracks access frequency via a [`CountMinSketch`] and maintains
 /// three LRU segments (window, probation, protected) following the W-TinyLFU
@@ -47,7 +47,7 @@ use crate::sketch::CountMinSketch;
 /// doesn't check pins could incorrectly remove backing data for a pinned CID.
 /// Before implementing `store_remove`, all eviction paths must be audited to
 /// skip pinned CIDs.
-pub struct ContentStore<S: BlobStore> {
+pub struct ContentStore<S: BookStore> {
     store: S,
     sketch: CountMinSketch,
     window: Lru,
@@ -56,7 +56,7 @@ pub struct ContentStore<S: BlobStore> {
     pinned: HashSet<ContentId>,
 }
 
-impl<S: BlobStore> fmt::Debug for ContentStore<S> {
+impl<S: BookStore> fmt::Debug for ContentStore<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ContentStore")
             .field("sketch", &self.sketch)
@@ -68,7 +68,7 @@ impl<S: BlobStore> fmt::Debug for ContentStore<S> {
     }
 }
 
-impl<S: BlobStore> ContentStore<S> {
+impl<S: BookStore> ContentStore<S> {
     /// Create a new `ContentStore` wrapping the given backing store.
     ///
     /// The `capacity` is split across three LRU segments:
@@ -142,7 +142,7 @@ impl<S: BlobStore> ContentStore<S> {
 
     /// Retrieve data and record the access for frequency tracking.
     ///
-    /// Unlike [`BlobStore::get`] (which takes `&self` and cannot update cache
+    /// Unlike [`BookStore::get`] (which takes `&self` and cannot update cache
     /// metadata), this method updates the sketch frequency counter and adjusts
     /// segment placement on hits. Returns a cloned copy of the data.
     ///
@@ -152,7 +152,7 @@ impl<S: BlobStore> ContentStore<S> {
     pub fn get_and_record(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
         // Only return data for CIDs tracked in W-TinyLFU segments.
         // The backing store may still hold data for evicted CIDs
-        // (store_remove is a no-op for MemoryBlobStore), so checking
+        // (store_remove is a no-op for MemoryBookStore), so checking
         // admission status prevents stale hits.
         if !self.is_admitted(cid) {
             return None;
@@ -174,7 +174,7 @@ impl<S: BlobStore> ContentStore<S> {
 
     /// Check whether a CID is tracked in the cache's LRU segments.
     ///
-    /// Unlike [`BlobStore::contains`] (which checks the backing store and may
+    /// Unlike [`BookStore::contains`] (which checks the backing store and may
     /// find data that W-TinyLFU rejected but `store_remove` didn't clean up),
     /// this checks the actual admission state in window/probation/protected.
     pub fn is_admitted(&self, cid: &ContentId) -> bool {
@@ -188,7 +188,7 @@ impl<S: BlobStore> ContentStore<S> {
     /// the same CID build frequency over time — even rejected items accumulate
     /// popularity, making future admission more likely.
     ///
-    /// This is separate from [`store`](BlobStore::store) because `store()`
+    /// This is separate from [`store`](BookStore::store) because `store()`
     /// unconditionally adds the item to the window segment. For transit content,
     /// we want to reject cold items upfront rather than storing and announcing
     /// them only for them to be immediately evicted.
@@ -368,7 +368,7 @@ impl<S: BlobStore> ContentStore<S> {
 
     /// Remove a CID from the backing store.
     ///
-    /// No-op for now: `MemoryBlobStore` does not support removal. The CID is
+    /// No-op for now: `MemoryBookStore` does not support removal. The CID is
     /// no longer tracked by the cache but data stays in the store.
     ///
     /// **WARNING:** Before implementing this, audit ALL eviction paths to check
@@ -381,7 +381,7 @@ impl<S: BlobStore> ContentStore<S> {
     }
 }
 
-impl<S: BlobStore> BlobStore for ContentStore<S> {
+impl<S: BookStore> BookStore for ContentStore<S> {
     fn insert_with_flags(
         &mut self,
         data: &[u8],
@@ -409,11 +409,11 @@ impl<S: BlobStore> BlobStore for ContentStore<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::MemoryBlobStore;
+    use crate::book::MemoryBookStore;
 
     #[test]
     fn debug_impl_shows_summary() {
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 100);
         let cid = cs.insert(b"test").unwrap();
         cs.pin(cid);
@@ -441,8 +441,8 @@ mod tests {
     }
 
     #[test]
-    fn content_store_implements_blobstore() {
-        let store = MemoryBlobStore::new();
+    fn content_store_implements_bookstore() {
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 100);
         let data = b"hello cache";
         let cid = cs.insert(data).unwrap();
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn get_and_record_updates_frequency_and_promotes() {
         // Capacity 20: window=1, protected=4, probation=15.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 20);
 
         // Insert target, then push it to probation.
@@ -469,7 +469,7 @@ mod tests {
 
         // Miss returns None.
         let bogus =
-            ContentId::for_blob(b"nonexistent", crate::cid::ContentFlags::default()).unwrap();
+            ContentId::for_book(b"nonexistent", crate::cid::ContentFlags::default()).unwrap();
         assert_eq!(cs.get_and_record(&bogus), None);
     }
 
@@ -477,17 +477,17 @@ mod tests {
     fn store_preadmitted_does_not_double_increment() {
         // Verify that should_admit + store_preadmitted results in exactly
         // one sketch increment, same as a plain store().
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 100);
 
         let data_a = b"via-preadmitted";
-        let cid_a = ContentId::for_blob(data_a, crate::cid::ContentFlags::default()).unwrap();
+        let cid_a = ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
         assert!(cs.should_admit(&cid_a));
         cs.store_preadmitted(cid_a, data_a.to_vec());
         let freq_a = cs.sketch.estimate(&cid_a);
 
         let data_b = b"via-plain-store";
-        let cid_b = ContentId::for_blob(data_b, crate::cid::ContentFlags::default()).unwrap();
+        let cid_b = ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
         cs.store(cid_b, data_b.to_vec());
         let freq_b = cs.sketch.estimate(&cid_b);
 
@@ -499,10 +499,10 @@ mod tests {
 
     #[test]
     fn warm_frequency_boosts_sketch_count() {
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 100);
 
-        let cid = ContentId::for_blob(b"warm-me", crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"warm-me", crate::cid::ContentFlags::default()).unwrap();
         assert_eq!(cs.sketch.estimate(&cid), 0);
 
         cs.warm_frequency(&cid, 5);
@@ -519,7 +519,7 @@ mod tests {
         // hot probation items (freq 10+).
         //
         // Capacity 3: window=1, protected=0, probation=2.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 3);
 
         // Fill probation: insert 3 items → window=1 + probation=2.
@@ -535,7 +535,7 @@ mod tests {
 
         // Cold CID with no frequency history should be rejected.
         let cold_cid =
-            ContentId::for_blob(b"cold-newcomer", crate::cid::ContentFlags::default()).unwrap();
+            ContentId::for_book(b"cold-newcomer", crate::cid::ContentFlags::default()).unwrap();
         assert!(!cs.should_admit(&cold_cid), "cold CID should be rejected");
 
         // But calling should_admit built some frequency. After enough calls,
@@ -553,11 +553,11 @@ mod tests {
     fn is_admitted_reflects_lru_not_backing_store() {
         // Verify that is_admitted checks LRU segments, not the backing store.
         // A CID stored via the backing store directly won't appear in LRU.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 10);
 
         // Store directly into backing store (bypassing admit).
-        let cid = ContentId::for_blob(b"test", crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"test", crate::cid::ContentFlags::default()).unwrap();
         cs.store.store(cid, b"test".to_vec());
 
         // Backing store has it, but LRU segments don't.
@@ -570,7 +570,7 @@ mod tests {
         // Capacity 4: window=1, protected=0, probation=3.
         // Zero protected capacity means record_access builds sketch frequency
         // without moving items out of probation (promote bounces back).
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 4);
 
         // Fill probation with 3 hot items, each accessed 5 times.
@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn probation_to_protected_promotion() {
         // Capacity 20: window=1, protected=4, probation=15.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 20);
 
         // Insert an item — it enters window, then gets pushed to probation
@@ -635,7 +635,7 @@ mod tests {
         // should NOT evict a frequently-accessed hot item.
 
         // Capacity 20: window=1, protected=4, probation=15.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 20);
 
         // Create a hot item and give it lots of frequency.
@@ -665,7 +665,7 @@ mod tests {
         // Capacity 4: window=1, protected=0, probation=3.
         // Zero protected cap means record_access builds sketch frequency
         // without promoting items out of probation.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 4);
 
         // Insert a hot item, push it to probation, build frequency.
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn pin_exempts_from_eviction() {
         // Small cache: capacity 5 → window=1, protected=1, probation=3.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 5);
 
         let pinned_cid = cs.insert(b"pinned-data").unwrap();
@@ -727,7 +727,7 @@ mod tests {
         // capacity=1: window gets the minimum of 1, leaving 0 for both
         // probation and protected. Effectively a 1-entry MRU cache with
         // no admission challenge (nothing to challenge against).
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let cs = ContentStore::new(store, 1);
         assert_eq!(cs.window.capacity(), 1);
         assert_eq!(cs.probation.capacity(), 0);
@@ -739,7 +739,7 @@ mod tests {
         // capacity=2: window=1, probation=1, protected=0.
         // Minimum viable W-TinyLFU: one window slot feeds admission
         // challenge against a single probation entry.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let cs = ContentStore::new(store, 2);
         assert_eq!(cs.window.capacity(), 1);
         assert_eq!(cs.probation.capacity(), 1);
@@ -750,7 +750,7 @@ mod tests {
     fn capacity_four_segment_splits() {
         // capacity=4: window=1, probation=3, protected=0.
         // Still no protected segment (4/5 = 0).
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let cs = ContentStore::new(store, 4);
         assert_eq!(cs.window.capacity(), 1);
         assert_eq!(cs.probation.capacity(), 3);
@@ -761,7 +761,7 @@ mod tests {
     fn capacity_five_segment_splits() {
         // capacity=5: window=1, probation=3, protected=1.
         // First capacity where all three segments are non-zero.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let cs = ContentStore::new(store, 5);
         assert_eq!(cs.window.capacity(), 1);
         assert_eq!(cs.probation.capacity(), 3);
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "capacity must be at least 1")]
     fn zero_capacity_panics() {
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let _cs = ContentStore::new(store, 0);
     }
 
@@ -781,7 +781,7 @@ mod tests {
         // even when it loses the frequency comparison.
         //
         // Capacity 10: window=1, protected=2, probation=7.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 10);
 
         // Fill probation with 7 hot items.
@@ -821,7 +821,7 @@ mod tests {
         // entry instead of dropping the candidate.
         //
         // Capacity 10: window=1, protected=2, probation=7.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 10);
 
         // Fill probation: insert 7 items (each pushes the previous out of window).
@@ -839,7 +839,7 @@ mod tests {
         // Give the next candidate high frequency so it would beat non-pinned victims.
         let candidate_data = b"high-freq-candidate";
         let candidate =
-            ContentId::for_blob(candidate_data, crate::cid::ContentFlags::default()).unwrap();
+            ContentId::for_book(candidate_data, crate::cid::ContentFlags::default()).unwrap();
         for _ in 0..10 {
             cs.sketch.increment(&candidate);
         }
@@ -864,7 +864,7 @@ mod tests {
     #[test]
     fn pin_quota_rejects_over_limit() {
         // Capacity 10: pin limit = 5.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 10);
         assert_eq!(cs.pin_limit(), 5);
 
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn pin_quota_zero_for_capacity_one() {
         // Capacity 1 → total segments = 1 → pin_limit = 0.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 1);
         assert_eq!(cs.pin_limit(), 0);
 
@@ -905,7 +905,7 @@ mod tests {
         // Under pressure, PublicEphemeral items should be evicted first.
         //
         // Capacity 5: window=1, protected=1, probation=3.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 5);
 
         // Insert a PublicDurable item.
@@ -964,7 +964,7 @@ mod tests {
     #[test]
     fn iter_admitted_returns_all_tracked_cids() {
         // Capacity 20: window=1, protected=4, probation=15.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 20);
 
         // Insert several items — they spread across window and probation.
@@ -1001,7 +1001,7 @@ mod tests {
         // Capacity 4: window=1, protected=0, probation=3.
         // When record_access tries to promote from probation to protected,
         // the zero-cap protected segment rejects, and the item stays in probation.
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         let mut cs = ContentStore::new(store, 4);
         assert_eq!(cs.protected.capacity(), 0);
 

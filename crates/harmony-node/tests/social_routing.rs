@@ -8,7 +8,7 @@
 //!
 //! See docs/plans/2026-03-20-social-content-routing-design.md
 
-use harmony_content::blob::MemoryBlobStore;
+use harmony_content::book::MemoryBookStore;
 use harmony_content::cid::{ContentFlags, ContentId};
 use harmony_content::storage_tier::{
     ContentPolicy, FilterBroadcastConfig, StorageBudget, StorageTier, StorageTierAction,
@@ -150,7 +150,7 @@ fn bloom_filter_enables_social_content_discovery() {
         max_pinned_bytes: 1_000_000,
     };
     let (mut tier, _startup_actions) = StorageTier::new(
-        MemoryBlobStore::new(),
+        MemoryBookStore::new(),
         budget,
         ContentPolicy::default(),
         FilterBroadcastConfig {
@@ -163,7 +163,7 @@ fn bloom_filter_enables_social_content_discovery() {
 
     // Bob stores content
     let data = b"hello from the social graph";
-    let cid = ContentId::for_blob(data, ContentFlags::default()).unwrap();
+    let cid = ContentId::for_book(data, ContentFlags::default()).unwrap();
 
     let store_actions = tier.handle(StorageTierEvent::PublishContent {
         cid,

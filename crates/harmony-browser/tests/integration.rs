@@ -4,7 +4,7 @@ use harmony_browser::{
     BrowseTarget, BrowserAction, BrowserCore, BrowserEvent, MimeHint, ResolvedContent,
     TrustDecision,
 };
-use harmony_content::blob::{BlobStore, MemoryBlobStore};
+use harmony_content::book::{BookStore, MemoryBookStore};
 use harmony_content::bundle::BundleBuilder;
 
 #[test]
@@ -17,10 +17,10 @@ fn full_navigation_flow() {
     assert!(matches!(&actions[0], BrowserAction::QueryNamed { .. }));
 
     // 2. Simulate: query resolved to a CID, caller fetched the bundle
-    let mut store = MemoryBlobStore::new();
-    let blob_cid = store.insert(b"# Rust Programming").unwrap();
+    let mut store = MemoryBookStore::new();
+    let book_cid = store.insert(b"# Rust Programming").unwrap();
     let mut builder = BundleBuilder::new();
-    builder.add(blob_cid);
+    builder.add(book_cid);
     builder.with_metadata(19, 1, 1000, *b"text/md\0");
     let (bundle_bytes, bundle_cid) = builder.build().unwrap();
 

@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn content_record_tracks_basic_fields() {
-        let cid = ContentId::for_blob(b"hello world", ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"hello world", ContentFlags::default()).unwrap();
         let record = ContentRecord {
             cid,
             size_bytes: 11,

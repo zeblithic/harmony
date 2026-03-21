@@ -3,7 +3,7 @@ use harmony_content::cid::{ContentFlags, ContentId};
 
 #[test]
 fn parse_cid_hex_with_hmy_prefix() {
-    let cid = ContentId::for_blob(b"test data", ContentFlags::default()).unwrap();
+    let cid = ContentId::for_book(b"test data", ContentFlags::default()).unwrap();
     let hex = hex::encode(cid.to_bytes());
     let input = format!("hmy:{hex}");
     let target = BrowseTarget::parse(&input).unwrap();

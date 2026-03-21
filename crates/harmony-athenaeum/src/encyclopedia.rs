@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::addr::{PageAddr, ALGO_COUNT, BOOK_MAX_SIZE, PAGE_SIZE};
 use crate::athenaeum::{Book, BookError, BookType};
 use crate::hash::sha256_hash;
-use crate::volume::{route_chunk, Volume, MAX_PARTITION_DEPTH};
+use crate::volume::{route_page, Volume, MAX_PARTITION_DEPTH};
 
 /// Threshold for proactive splitting.
 /// 75% of 2^28 = 201,326,592 unique pages.
@@ -21,11 +21,11 @@ pub const SPLIT_THRESHOLD: usize = (1 << 28) * 3 / 4;
 /// Starting bit index for partition routing (bits 0-27 used for addressing).
 const PARTITION_START_BIT: u8 = 28;
 
-/// A complete content-addressed mapping for a corpus of blobs.
+/// A complete content-addressed mapping for a corpus of books.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Encyclopedia {
     pub root: Volume,
-    pub total_blobs: u32,
+    pub total_books: u32,
     pub total_unique_pages: u32,
 }
 
@@ -40,35 +40,35 @@ struct PageInfo {
 }
 
 impl Encyclopedia {
-    /// Build an Encyclopedia from a collection of blobs.
+    /// Build an Encyclopedia from a collection of books.
     ///
-    /// Each blob is identified by its CID (content hash) and raw data.
-    /// All pages across all blobs are deduplicated by content hash and
+    /// Each book is identified by its CID (content hash) and raw data.
+    /// All pages across all books are deduplicated by content hash and
     /// assigned unique 32-bit addresses via power-of-choice. When the
     /// address space fills up, the system recursively partitions by
     /// content-hash bits.
-    pub fn build(blobs: &[([u8; 32], &[u8])]) -> Result<Self, BookError> {
-        for &(_, data) in blobs {
+    pub fn build(entries: &[([u8; 32], &[u8])]) -> Result<Self, BookError> {
+        for &(_, data) in entries {
             if data.len() > BOOK_MAX_SIZE {
-                return Err(BookError::BlobTooLarge { size: data.len() });
+                return Err(BookError::BookTooLarge { size: data.len() });
             }
         }
 
-        if blobs.is_empty() {
+        if entries.is_empty() {
             return Ok(Encyclopedia {
                 root: Volume::leaf(0, 0, Vec::new()),
-                total_blobs: 0,
+                total_books: 0,
                 total_unique_pages: 0,
             });
         }
 
-        // Phase 1: Build Books from all blobs, dedup pages by content hash.
-        let mut books: Vec<Book> = Vec::with_capacity(blobs.len());
+        // Phase 1: Build Books from all entries, dedup pages by content hash.
+        let mut books: Vec<Book> = Vec::with_capacity(entries.len());
         let mut unique_pages: BTreeMap<[u8; 32], PageInfo> = BTreeMap::new();
-        let mut blob_page_hashes: Vec<Vec<[u8; 32]>> = Vec::new();
+        let mut book_page_hashes: Vec<Vec<[u8; 32]>> = Vec::new();
 
-        for &(cid, data) in blobs {
-            let book = Book::from_blob(cid, data)?;
+        for &(cid, data) in entries {
+            let book = Book::from_book(cid, data)?;
 
             // Compute content hashes for each page (zero-padded to PAGE_SIZE)
             let mut hashes = Vec::new();
@@ -87,7 +87,7 @@ impl Encyclopedia {
                 });
             }
 
-            blob_page_hashes.push(hashes);
+            book_page_hashes.push(hashes);
             books.push(book);
         }
 
@@ -98,7 +98,7 @@ impl Encyclopedia {
         let root = Self::build_volume(
             &page_list,
             &books,
-            &blob_page_hashes,
+            &book_page_hashes,
             0, // depth
             0, // path
             PARTITION_START_BIT as u16,
@@ -106,7 +106,7 @@ impl Encyclopedia {
 
         Ok(Encyclopedia {
             root,
-            total_blobs: blobs.len() as u32,
+            total_books: entries.len() as u32,
             total_unique_pages: total_unique,
         })
     }
@@ -115,7 +115,7 @@ impl Encyclopedia {
     fn build_volume(
         pages: &[PageInfo],
         books: &[Book],
-        blob_page_hashes: &[Vec<[u8; 32]>],
+        book_page_hashes: &[Vec<[u8; 32]>],
         depth: u8,
         path: u32,
         bit_index: u16,
@@ -130,7 +130,7 @@ impl Encyclopedia {
 
         if pages.len() <= SPLIT_THRESHOLD {
             // Try to resolve in a single flat volume
-            match Self::resolve_leaf(pages, books, blob_page_hashes, depth, path) {
+            match Self::resolve_leaf(pages, books, book_page_hashes, depth, path) {
                 Ok(vol) => return Ok(vol),
                 Err(_) => {
                     // Fall through to splitting
@@ -143,7 +143,7 @@ impl Encyclopedia {
         let mut left_pages = Vec::new();
         let mut right_pages = Vec::new();
         for page in pages {
-            if route_chunk(&page.content_hash, bit_index_u8) {
+            if route_page(&page.content_hash, bit_index_u8) {
                 right_pages.push(page.clone());
             } else {
                 left_pages.push(page.clone());
@@ -153,7 +153,7 @@ impl Encyclopedia {
         let left = Self::build_volume(
             &left_pages,
             books,
-            blob_page_hashes,
+            book_page_hashes,
             depth + 1,
             path,
             bit_index + 1,
@@ -161,7 +161,7 @@ impl Encyclopedia {
         let right = Self::build_volume(
             &right_pages,
             books,
-            blob_page_hashes,
+            book_page_hashes,
             depth + 1,
             if depth < 32 {
                 path | (1u32 << depth)
@@ -186,11 +186,11 @@ impl Encyclopedia {
     /// — the first collision-free 28-bit hash_bits wins. Leverages the
     /// precomputed variants from each Book's ToC instead of runtime rehashing.
     ///
-    /// Each blob's Book in the leaf contains only the pages that route here.
+    /// Each book's Book in the leaf contains only the pages that route here.
     fn resolve_leaf(
         pages: &[PageInfo],
         books: &[Book],
-        blob_page_hashes: &[Vec<[u8; 32]>],
+        book_page_hashes: &[Vec<[u8; 32]>],
         depth: u8,
         path: u32,
     ) -> Result<Volume, BookError> {
@@ -228,21 +228,21 @@ impl Encyclopedia {
             }
         }
 
-        // Find which blobs (books) have pages in this partition
-        let mut relevant_blob_indices: Vec<usize> = Vec::new();
-        for (blob_idx, page_hashes) in blob_page_hashes.iter().enumerate() {
+        // Find which books have pages in this partition
+        let mut relevant_book_indices: Vec<usize> = Vec::new();
+        for (book_idx, page_hashes) in book_page_hashes.iter().enumerate() {
             if page_hashes.iter().any(|h| partition_hashes.contains(h)) {
-                relevant_blob_indices.push(blob_idx);
+                relevant_book_indices.push(book_idx);
             }
         }
 
-        // Build Books for the leaf: each relevant blob gets its own Book,
+        // Build Books for the leaf: each relevant entry gets its own Book,
         // but only containing the pages that route to this partition
         // with the chosen algorithm variant.
         let mut leaf_books = Vec::new();
-        for &blob_idx in &relevant_blob_indices {
-            let original_book = &books[blob_idx];
-            let page_hashes = &blob_page_hashes[blob_idx];
+        for &book_idx in &relevant_book_indices {
+            let original_book = &books[book_idx];
+            let page_hashes = &book_page_hashes[book_idx];
 
             // Build the page list: only pages in this partition, using the
             // chosen algo variant for each.
@@ -253,22 +253,22 @@ impl Encyclopedia {
                 }
             }
 
-            // Leaf books are partial — blob_size reflects only the content
+            // Leaf books are partial — book_size reflects only the content
             // bytes in the pages routed to this partition. The last page of a
-            // blob may be shorter than PAGE_SIZE, so we must use the original
+            // book may be shorter than PAGE_SIZE, so we must use the original
             // page index to compute each page's true byte contribution.
             let mut partial_size = 0u32;
             for (page_idx, hash) in page_hashes.iter().enumerate() {
                 if partition_hashes.contains(hash) {
                     let page_start = page_idx as u32 * PAGE_SIZE as u32;
-                    let page_end = (page_start + PAGE_SIZE as u32).min(original_book.blob_size);
+                    let page_end = (page_start + PAGE_SIZE as u32).min(original_book.book_size);
                     partial_size += page_end - page_start;
                 }
             }
             leaf_books.push(Book {
                 cid: original_book.cid,
                 pages: new_pages,
-                blob_size: partial_size,
+                book_size: partial_size,
                 book_type: BookType::Raw,
             });
         }
@@ -282,7 +282,7 @@ impl Encyclopedia {
     pub fn route(content_hash: &[u8; 32], depth: u8) -> u32 {
         let mut path = 0u32;
         for d in 0..depth.min(32) {
-            if route_chunk(content_hash, PARTITION_START_BIT + d) {
+            if route_page(content_hash, PARTITION_START_BIT + d) {
                 path |= 1 << d;
             }
         }
@@ -291,13 +291,13 @@ impl Encyclopedia {
 
     /// Serialize the Encyclopedia root metadata.
     ///
-    /// Format: magic "ENCY" (4) + version u8 (1) + total_blobs u32 LE (4)
+    /// Format: magic "ENCY" (4) + version u8 (1) + total_books u32 LE (4)
     /// + total_unique_pages u32 LE (4) + volume_bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"ENCY");
         buf.push(1); // version
-        buf.extend_from_slice(&self.total_blobs.to_le_bytes());
+        buf.extend_from_slice(&self.total_books.to_le_bytes());
         buf.extend_from_slice(&self.total_unique_pages.to_le_bytes());
         buf.extend_from_slice(&self.root.to_bytes());
         buf
@@ -314,14 +314,14 @@ impl Encyclopedia {
         if data[4] != 1 {
             return Err(BookError::BadFormat);
         }
-        let total_blobs =
+        let total_books =
             u32::from_le_bytes(data[5..9].try_into().map_err(|_| BookError::TooShort)?);
         let total_unique_pages =
             u32::from_le_bytes(data[9..13].try_into().map_err(|_| BookError::TooShort)?);
         let root = Volume::from_bytes(&data[13..])?;
         Ok(Encyclopedia {
             root,
-            total_blobs,
+            total_books,
             total_unique_pages,
         })
     }
@@ -340,7 +340,7 @@ mod tests {
         data[PAGE_SIZE] = 0xBB;
         let cid = sha256_hash(&data);
         let enc = Encyclopedia::build(&[(cid, &data)]).unwrap();
-        assert_eq!(enc.total_blobs, 1);
+        assert_eq!(enc.total_books, 1);
         assert_eq!(enc.total_unique_pages, 2);
         assert_eq!(enc.root.page_count(), 2);
     }
@@ -359,7 +359,7 @@ mod tests {
         let cid2 = sha256_hash(&data2);
 
         let enc = Encyclopedia::build(&[(cid1, &data1), (cid2, &data2)]).unwrap();
-        assert_eq!(enc.total_blobs, 2);
+        assert_eq!(enc.total_books, 2);
         assert!(enc.total_unique_pages <= 5);
     }
 
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn build_empty() {
         let enc = Encyclopedia::build(&[]).unwrap();
-        assert_eq!(enc.total_blobs, 0);
+        assert_eq!(enc.total_books, 0);
         assert_eq!(enc.total_unique_pages, 0);
     }
 
@@ -395,7 +395,7 @@ mod tests {
         let data = alloc::vec![0u8; BOOK_MAX_SIZE + 1];
         let cid = sha256_hash(&data);
         let result = Encyclopedia::build(&[(cid, &data)]);
-        assert!(matches!(result, Err(BookError::BlobTooLarge { .. })));
+        assert!(matches!(result, Err(BookError::BookTooLarge { .. })));
     }
 
     #[test]
@@ -453,29 +453,29 @@ mod tests {
     }
 
     #[test]
-    fn partial_last_page_blob_size() {
-        // A blob of 5000 bytes = page 0 (4096 bytes) + page 1 (904 bytes).
-        // When built into an Encyclopedia, the total blob_size across all
-        // leaf Books must sum to the original blob_size (5000), not
+    fn partial_last_page_book_size() {
+        // A book of 5000 bytes = page 0 (4096 bytes) + page 1 (904 bytes).
+        // When built into an Encyclopedia, the total book_size across all
+        // leaf Books must sum to the original book_size (5000), not
         // page_count * PAGE_SIZE (8192).
         let data = alloc::vec![0xFFu8; 5000];
         let cid = sha256_hash(&data);
         let enc = Encyclopedia::build(&[(cid, &data)]).unwrap();
 
-        // Walk the tree and sum blob_size across all Books.
-        fn sum_blob_sizes(vol: &Volume) -> u32 {
+        // Walk the tree and sum book_size across all Books.
+        fn sum_book_sizes(vol: &Volume) -> u32 {
             match vol {
-                Volume::Leaf { books, .. } => books.iter().map(|b| b.blob_size).sum(),
-                Volume::Split { left, right, .. } => sum_blob_sizes(left) + sum_blob_sizes(right),
+                Volume::Leaf { books, .. } => books.iter().map(|b| b.book_size).sum(),
+                Volume::Split { left, right, .. } => sum_book_sizes(left) + sum_book_sizes(right),
             }
         }
 
-        assert_eq!(sum_blob_sizes(&enc.root), 5000);
+        assert_eq!(sum_book_sizes(&enc.root), 5000);
     }
 
     #[test]
     fn resolve_leaf_only_addresses_partition_pages() {
-        // Build with 2 blobs, confirm the total page count across the tree
+        // Build with 2 books, confirm the total page count across the tree
         // equals total_unique_pages (no duplication).
         let mut data1 = alloc::vec![0u8; PAGE_SIZE * 4];
         let mut data2 = alloc::vec![0u8; PAGE_SIZE * 4];

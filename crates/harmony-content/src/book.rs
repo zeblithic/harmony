@@ -7,16 +7,16 @@ use std::collections::HashMap;
 use crate::cid::{ContentFlags, ContentId};
 use crate::error::ContentError;
 
-/// A content-addressed store for blob data.
-pub trait BlobStore {
-    /// Insert raw blob data with explicit flags, returning the blob's ContentId.
+/// A content-addressed store for book data (CID-addressed units up to 1 MB).
+pub trait BookStore {
+    /// Insert raw book data with explicit flags, returning the book's ContentId.
     fn insert_with_flags(
         &mut self,
         data: &[u8],
         flags: ContentFlags,
     ) -> Result<ContentId, ContentError>;
 
-    /// Insert raw blob data, returning the blob's ContentId.
+    /// Insert raw book data, returning the book's ContentId.
     fn insert(&mut self, data: &[u8]) -> Result<ContentId, ContentError> {
         self.insert_with_flags(data, ContentFlags::default())
     }
@@ -32,13 +32,13 @@ pub trait BlobStore {
 }
 
 /// In-memory content-addressed store backed by a HashMap.
-pub struct MemoryBlobStore {
+pub struct MemoryBookStore {
     data: HashMap<ContentId, Vec<u8>>,
 }
 
-impl MemoryBlobStore {
+impl MemoryBookStore {
     pub fn new() -> Self {
-        MemoryBlobStore {
+        MemoryBookStore {
             data: HashMap::new(),
         }
     }
@@ -52,19 +52,19 @@ impl MemoryBlobStore {
     }
 }
 
-impl Default for MemoryBlobStore {
+impl Default for MemoryBookStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl BlobStore for MemoryBlobStore {
+impl BookStore for MemoryBookStore {
     fn insert_with_flags(
         &mut self,
         data: &[u8],
         flags: ContentFlags,
     ) -> Result<ContentId, ContentError> {
-        let cid = ContentId::for_blob(data, flags)?;
+        let cid = ContentId::for_book(data, flags)?;
         self.data.entry(cid).or_insert_with(|| data.to_vec());
         Ok(cid)
     }
@@ -89,17 +89,17 @@ mod tests {
 
     #[test]
     fn insert_and_get_round_trip() {
-        let mut store = MemoryBlobStore::new();
-        let data = b"hello harmony blob store";
+        let mut store = MemoryBookStore::new();
+        let data = b"hello harmony book store";
         let cid = store.insert(data).unwrap();
-        assert_eq!(cid.cid_type(), CidType::Blob);
+        assert_eq!(cid.cid_type(), CidType::Book);
         assert_eq!(cid.payload_size(), data.len() as u32);
         assert_eq!(store.get(&cid).unwrap(), data);
     }
 
     #[test]
     fn duplicate_insert_returns_same_cid() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         let data = b"duplicate data";
         let cid1 = store.insert(data).unwrap();
         let cid2 = store.insert(data).unwrap();
@@ -109,29 +109,29 @@ mod tests {
 
     #[test]
     fn get_unknown_returns_none() {
-        let store = MemoryBlobStore::new();
-        let cid = ContentId::for_blob(b"not stored", ContentFlags::default()).unwrap();
+        let store = MemoryBookStore::new();
+        let cid = ContentId::for_book(b"not stored", ContentFlags::default()).unwrap();
         assert!(store.get(&cid).is_none());
         assert!(!store.contains(&cid));
     }
 
     #[test]
     fn contains_reflects_state() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         let cid = store.insert(b"exists").unwrap();
         assert!(store.contains(&cid));
     }
 
     #[test]
-    fn insert_with_flags_encrypted_blob() {
-        let mut store = MemoryBlobStore::new();
+    fn insert_with_flags_encrypted_book() {
+        let mut store = MemoryBookStore::new();
         let flags = ContentFlags {
             encrypted: true,
             ..ContentFlags::default()
         };
         let data = b"encrypted payload";
         let cid = store.insert_with_flags(data, flags).unwrap();
-        assert_eq!(cid.cid_type(), CidType::Blob);
+        assert_eq!(cid.cid_type(), CidType::Book);
         assert_eq!(cid.flags().encrypted, true);
         assert_eq!(store.get(&cid).unwrap(), data);
         assert!(store.contains(&cid));
@@ -139,9 +139,9 @@ mod tests {
 
     #[test]
     fn store_raw_for_bundle_data() {
-        let mut store = MemoryBlobStore::new();
-        let blob_a = ContentId::for_blob(b"aaa", ContentFlags::default()).unwrap();
-        let blob_b = ContentId::for_blob(b"bbb", ContentFlags::default()).unwrap();
+        let mut store = MemoryBookStore::new();
+        let blob_a = ContentId::for_book(b"aaa", ContentFlags::default()).unwrap();
+        let blob_b = ContentId::for_book(b"bbb", ContentFlags::default()).unwrap();
 
         // Build bundle bytes manually
         let mut bundle_bytes = Vec::new();
