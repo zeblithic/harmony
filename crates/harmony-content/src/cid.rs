@@ -190,8 +190,12 @@ impl ContentId {
     pub fn verify_checksum(&self) -> Result<(), ContentError> {
         let bytes = self.to_bytes();
         let fold = compute_pairwise_xor(&bytes);
-        // Normal CIDs fold to 00, sentinels fold to 11.
-        // Any other result (01, 10) is a checksum failure.
+        // Normal CIDs fold to 00. Inline-mode sentinel CIDs intentionally fold
+        // to 11 (checksum XORed with 0x03). Any other result (01, 10) is a
+        // checksum failure. Note: fold==11 means the CID *could* be a sentinel,
+        // but only inline-mode CIDs use the sentinel convention deliberately;
+        // the vast majority of CIDs with fold==11 are just normal CIDs whose
+        // payload bits happen to produce that checksum incidentally.
         if fold != 0x00 && fold != 0x03 {
             return Err(ContentError::ChecksumMismatch);
         }

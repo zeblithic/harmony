@@ -162,7 +162,7 @@ fn estimate_size(root_cid: &ContentId, store: &dyn BookStore) -> usize {
         if let Some(data) = store.get(root_cid) {
             if let Ok(entries) = bundle::parse_bundle(data) {
                 if let Some(first) = entries.first() {
-                    if first.cid_type() == CidType::InlineData {
+                    if first.is_sentinel() {
                         if let Ok((total_size, _, _, _)) = first.parse_inline_metadata() {
                             return total_size as usize;
                         }
