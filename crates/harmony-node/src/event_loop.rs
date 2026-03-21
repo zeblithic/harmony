@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use harmony_content::blob::MemoryBlobStore;
 use harmony_identity::PqPrivateIdentity;
+use zeroize::Zeroize;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -99,7 +100,9 @@ pub async fn run(
         // This gives a deterministic mapping: same PQ identity → same iroh NodeId,
         // without leaking the secret — the verifying key is public, so deriving
         // from it would let anyone impersonate this node's iroh transport identity.
-        let hash = harmony_crypto::hash::blake3_hash(&config.local_identity.signing_key().as_bytes());
+        let mut sk_bytes = config.local_identity.signing_key().as_bytes();
+        let hash = harmony_crypto::hash::blake3_hash(&sk_bytes);
+        sk_bytes.zeroize(); // as_bytes() returns a Vec — zeroize before dropping
         let secret_key = iroh::SecretKey::from(hash);
 
         let mut builder = iroh::Endpoint::builder()
