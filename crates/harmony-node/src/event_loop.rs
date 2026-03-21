@@ -245,6 +245,16 @@ pub async fn run(
         None
     };
 
+    // ── Push local tunnel info into the runtime ──────────────────────────────
+    if let Some(ref ep) = iroh_endpoint {
+        let node_id_bytes = *ep.node_id().as_bytes();
+        let relay_url = tunnel_config.as_ref().and_then(|c| c.relay_url.clone());
+        runtime.push_event(RuntimeEvent::LocalTunnelInfo {
+            node_id: node_id_bytes,
+            relay_url,
+        });
+    }
+
     // ConfigTunnelPeers tracks config-sourced tunnels and drives backoff reconnection.
     // Actual outbound connection initiation is deferred to Bead harmony-h6k.
     #[allow(unused_variables, unused_mut)]

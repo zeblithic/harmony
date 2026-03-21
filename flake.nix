@@ -36,6 +36,9 @@
         fileset = pkgs.lib.fileset.unions [
           (craneLib.fileset.cargoTomlAndLock ./.)
           (craneLib.fileset.rust ./.)
+          # Include .cargo/config.toml so cross-build rustflags
+          # (e.g., link-self-contained=yes for aarch64 musl) are visible.
+          (pkgs.lib.fileset.maybeMissing ./.cargo/config.toml)
         ];
       };
 
@@ -128,6 +131,12 @@
             "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
           "CC_${builtins.replaceStrings ["-"] ["_"] cargoTarget}" =
             "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
+
+          # Ensure fully static binaries for musl targets. harmony-node
+          # gets this from .cargo/config.toml, but iroh-relay uses its own
+          # source tree, so set it explicitly for both.
+          "CARGO_TARGET_${builtins.replaceStrings ["-"] ["_"] (pkgs.lib.toUpper cargoTarget)}_RUSTFLAGS" =
+            "-C link-self-contained=yes";
 
           nativeBuildInputs = with crossPkgs; [
             buildPackages.pkg-config

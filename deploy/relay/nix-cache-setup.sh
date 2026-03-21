@@ -129,7 +129,13 @@ if command -v systemctl &>/dev/null; then
   sudo systemctl try-restart nix-serve.service
   # Start if not already running (first run)
   sudo systemctl start nix-serve.service 2>/dev/null || true
-  echo "[nix-cache-setup] nix-serve service enabled and started."
+  # Verify the service actually came up
+  if ! sudo systemctl is-active --quiet nix-serve.service; then
+    echo "[nix-cache-setup] WARNING: nix-serve failed to start. Check logs:"
+    echo "  sudo journalctl -u nix-serve.service -n 20"
+  else
+    echo "[nix-cache-setup] nix-serve service enabled and started."
+  fi
 fi
 
 # ---------------------------------------------------------------------------

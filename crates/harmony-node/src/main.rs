@@ -662,13 +662,8 @@ mod tests {
 
     #[test]
     fn cli_parses_listen_address() {
-        let cli = Cli::try_parse_from([
-            "harmony",
-            "run",
-            "--listen-address",
-            "127.0.0.1:9999",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["harmony", "run", "--listen-address", "127.0.0.1:9999"]).unwrap();
         if let Commands::Run { listen_address, .. } = cli.command {
             assert_eq!(listen_address.as_deref(), Some("127.0.0.1:9999"));
         } else {

@@ -20,11 +20,12 @@ path = "src/main.rs"
 harmony-compute.workspace = true
 harmony-contacts = { workspace = true, features = ["std"] }
 harmony-content = { workspace = true, features = ["std"] }
+harmony-discovery = { workspace = true, features = ["std"] }
+harmony-peers = { workspace = true, features = ["std"] }
 harmony-tunnel = { workspace = true, features = ["std"] }
 iroh = { workspace = true }
 harmony-crypto = { workspace = true, features = ["std"] }
 harmony-identity = { workspace = true, features = ["std"] }
-harmony-peers = { workspace = true, features = ["std"] }
 harmony-reticulum = { workspace = true, features = ["std"] }
 harmony-workflow.workspace = true
 harmony-zenoh.workspace = true

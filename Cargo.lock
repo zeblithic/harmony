@@ -1922,6 +1922,7 @@ dependencies = [
  "harmony-contacts",
  "harmony-content",
  "harmony-crypto",
+ "harmony-discovery",
  "harmony-identity",
  "harmony-peers",
  "harmony-reticulum",
