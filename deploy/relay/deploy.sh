@@ -145,13 +145,18 @@ elif command -v nix &>/dev/null; then
         CACHE_PUB_KEY=$(grep -v '^#' "$CACHE_KEY_FILE" | grep -v '^$' | head -1)
     fi
     if [ -n "$CACHE_PUB_KEY" ]; then
-        # Pass as CLI flags instead of NIX_CONFIG — CLI flags are accepted
-        # by the Nix daemon regardless of trusted-users configuration.
+        # Best-effort: ask nix build to check the relay's binary cache.
+        # In multi-user Nix, extra-substituters from non-trusted users are
+        # silently ignored by the daemon. If the cache isn't consulted, the
+        # build compiles from source locally (~2 min) and the push path
+        # handles getting it to the VM. To enable the cache shortcut, add
+        # your username to trusted-users in /etc/nix/nix.conf:
+        #   trusted-users = root @wheel <your-username>
         EXTRA_NIX_ARGS+=(
             --extra-substituters "http://${RELAY_HOSTNAME}:5000"
             --extra-trusted-public-keys "$CACHE_PUB_KEY"
         )
-        echo "    Using binary cache at http://${RELAY_HOSTNAME}:5000"
+        echo "    Binary cache configured (requires trusted-users for cache hits)"
     fi
 
     # Build locally (cross-compiles to x86_64-linux-musl on any host).
