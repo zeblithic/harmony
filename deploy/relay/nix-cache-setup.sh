@@ -119,7 +119,11 @@ echo "[nix-cache-setup] Wrote ${SERVICE_FILE}."
 
 if command -v systemctl &>/dev/null; then
   sudo systemctl daemon-reload
-  sudo systemctl enable --now nix-serve.service
+  sudo systemctl enable nix-serve.service
+  # try-restart: applies new unit file on re-runs without failing if stopped
+  sudo systemctl try-restart nix-serve.service
+  # Start if not already running (first run)
+  sudo systemctl start nix-serve.service 2>/dev/null || true
   echo "[nix-cache-setup] nix-serve service enabled and started."
 fi
 

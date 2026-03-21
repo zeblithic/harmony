@@ -98,17 +98,24 @@ Commit `cache-key.pub` so clients can verify cache signatures.
 ### How It Works
 
 ```
-nix build .#iroh-relay-x86_64-linux
-  └── check local /nix/store
-  └── check binary cache (http://harmony-relay:5000)
-  └── build from source (if cache miss)
-  └── push result to cache
-  └── activate via systemd
+deploy.sh:
+  1. Check VM has Nix (pre-flight)
+  2. Set NIX_CONFIG with relay cache as extra-substituter
+  3. nix build .#iroh-relay-x86_64-linux
+     └── check local /nix/store
+     └── check binary cache (http://<relay>:5000) if cache-key.pub is set
+     └── build from source (if both miss)
+  4. Check if VM already has this store path (nix-store --check-validity)
+  5. If not: push closure via nix-store --export | gcloud ssh | nix-store --import
+  6. Sign entire closure with cache signing key
+  7. Activate binary and restart service
 ```
 
-`deploy.sh` sets `NIX_CONFIG` to point at the relay cache and runs
-`nix build`, then `nix copy --to` to push the result. On subsequent
-deploys the build is a no-op — the cached path is used directly.
+`deploy.sh` configures the VM's binary cache as an `extra-substituter` via
+`NIX_CONFIG`, so `nix build` can pull pre-built artifacts. The closure is
+pushed to the VM via `nix-store --export/--import` over `gcloud compute ssh`
+(not `nix copy`). On subsequent deploys from any machine with the cache
+configured, `nix build` is a cache hit — only the push step runs.
 
 ### Client Configuration
 
