@@ -73,8 +73,9 @@ impl ConfigTunnelPeers {
     fn mark_disconnected(&mut self, interface_name: &str) {
         if let Some(peer) = self.peers.iter_mut().find(|p| p.interface_name == interface_name) {
             peer.connected = false;
-            peer.backoff = (peer.backoff * 2).min(MAX_BACKOFF);
+            // Schedule retry at current backoff, THEN double for next time.
             peer.next_retry = Some(tokio::time::Instant::now() + peer.backoff);
+            peer.backoff = (peer.backoff * 2).min(MAX_BACKOFF);
             tracing::info!(
                 %interface_name,
                 backoff_secs = peer.backoff.as_secs(),

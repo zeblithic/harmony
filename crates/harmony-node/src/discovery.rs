@@ -97,18 +97,14 @@ impl PeerTable {
     /// Uses a unique placeholder Reticulum address derived from the socket address
     /// to avoid reverse-index collisions between bootstrap peers.
     pub fn add_pinned_peer(&mut self, addr: SocketAddr) {
-        // Derive a unique placeholder from the socket address bytes.
-        let mut placeholder = [0xFEu8; 16];
-        match addr {
-            SocketAddr::V4(v4) => {
-                placeholder[..4].copy_from_slice(&v4.ip().octets());
-                placeholder[4..6].copy_from_slice(&v4.port().to_be_bytes());
-            }
-            SocketAddr::V6(v6) => {
-                placeholder = v6.ip().octets();
-                placeholder[14..16].copy_from_slice(&v6.port().to_be_bytes());
-            }
-        }
+        // Derive a unique placeholder via hash of the full SocketAddr.
+        // Uniform for both IPv4 and IPv6 — no byte-overlap collisions.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        addr.hash(&mut hasher);
+        let hash = hasher.finish().to_le_bytes();
+        let mut placeholder = [0xFEu8; 16]; // 0xFE prefix distinguishes from real addresses
+        placeholder[..8].copy_from_slice(&hash);
         if placeholder == self.our_addr {
             return;
         }
