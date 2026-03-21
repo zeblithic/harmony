@@ -90,36 +90,15 @@ pub fn verify_presentation(
     Ok(())
 }
 
-/// Dispatch signature verification based on CryptoSuite.
+/// Delegate signature verification to `harmony_identity`, mapping errors to [`CredentialError::SignatureInvalid`].
 fn verify_signature(
     suite: CryptoSuite,
     key_bytes: &[u8],
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), CredentialError> {
-    match suite {
-        CryptoSuite::Ed25519 => {
-            use ed25519_dalek::Verifier;
-            let key_array: [u8; 32] = key_bytes
-                .try_into()
-                .map_err(|_| CredentialError::SignatureInvalid)?;
-            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key_array)
-                .map_err(|_| CredentialError::SignatureInvalid)?;
-            let sig = ed25519_dalek::Signature::from_slice(signature)
-                .map_err(|_| CredentialError::SignatureInvalid)?;
-            verifying_key
-                .verify(message, &sig)
-                .map_err(|_| CredentialError::SignatureInvalid)
-        }
-        CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => {
-            let pk = harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(key_bytes)
-                .map_err(|_| CredentialError::SignatureInvalid)?;
-            let sig = harmony_crypto::ml_dsa::MlDsaSignature::from_bytes(signature)
-                .map_err(|_| CredentialError::SignatureInvalid)?;
-            harmony_crypto::ml_dsa::verify(&pk, message, &sig)
-                .map_err(|_| CredentialError::SignatureInvalid)
-        }
-    }
+    harmony_identity::verify_signature(suite, key_bytes, message, signature)
+        .map_err(|_| CredentialError::SignatureInvalid)
 }
 
 /// In-memory key resolver for testing.

@@ -56,34 +56,8 @@ fn verify_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), DiscoveryError> {
-    match suite {
-        CryptoSuite::Ed25519 => {
-            use ed25519_dalek::Verifier;
-            let key_array: [u8; 32] = key_bytes
-                .try_into()
-                .map_err(|_| DiscoveryError::SignatureInvalid)?;
-            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key_array)
-                .map_err(|_| DiscoveryError::SignatureInvalid)?;
-            let sig = ed25519_dalek::Signature::from_slice(signature)
-                .map_err(|_| DiscoveryError::SignatureInvalid)?;
-            verifying_key
-                .verify(message, &sig)
-                .map_err(|_| DiscoveryError::SignatureInvalid)
-        }
-        // TODO(v2): MlDsa65Rotatable needs rotation-aware verification —
-        // the current key may differ from the one used to derive
-        // identity_ref.hash. A rotation certificate or KEL chain walk
-        // will be required to prove the new public_key was authorised
-        // by the inception key.
-        CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => {
-            let pk = harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(key_bytes)
-                .map_err(|_| DiscoveryError::SignatureInvalid)?;
-            let sig = harmony_crypto::ml_dsa::MlDsaSignature::from_bytes(signature)
-                .map_err(|_| DiscoveryError::SignatureInvalid)?;
-            harmony_crypto::ml_dsa::verify(&pk, message, &sig)
-                .map_err(|_| DiscoveryError::SignatureInvalid)
-        }
-    }
+    harmony_identity::verify_signature(suite, key_bytes, message, signature)
+        .map_err(|_| DiscoveryError::SignatureInvalid)
 }
 
 #[cfg(test)]
