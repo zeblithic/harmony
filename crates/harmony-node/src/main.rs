@@ -50,6 +50,14 @@ enum Commands {
         /// UDP listen address for Reticulum mesh packets
         #[arg(long, default_value = "0.0.0.0:4242")]
         listen_address: String,
+        /// iroh relay URL for NAT-traversal tunnels (enables tunnel accept)
+        #[arg(long, value_name = "URL")]
+        relay_url: Option<String>,
+        /// iroh NodeId of a peer to connect to (outbound tunnel)
+        /// TODO: Outbound initiator connections need the remote peer's PqIdentity
+        /// for the ML-KEM encapsulation, which comes from the contact store (Bead #3).
+        #[arg(long, value_name = "ADDR")]
+        tunnel_peer: Option<String>,
     },
 }
 
@@ -170,6 +178,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             filter_mutation_threshold,
             identity_file,
             listen_address,
+            relay_url,
+            tunnel_peer,
         } => {
             use crate::runtime::{NodeConfig, NodeRuntime};
             use harmony_compute::InstructionBudget;
@@ -218,7 +228,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let identity = crate::identity_file::load_or_generate(&id_path)?;
             let node_addr = hex::encode(identity.ed25519.public_identity().address_hash);
             eprintln!("Identity: {node_addr} ({})", id_path.display());
-            drop(identity); // key material no longer needed; zeroize-on-drop fires now
+
+            // Destructure to control per-field drop timing.
+            let crate::identity_file::NodeIdentity { pq, ed25519 } = identity;
+
+            // Build tunnel config if --relay-url was provided.
+            // The PQ identity is wrapped in Arc because tunnel tasks need
+            // references and PqPrivateIdentity is not Clone.
+            let tunnel_config = if relay_url.is_some() || tunnel_peer.is_some() {
+                if tunnel_peer.is_some() {
+                    eprintln!("  --tunnel-peer: outbound connections not yet wired (needs contact store, Bead #3)");
+                }
+                Some(crate::event_loop::TunnelConfig {
+                    relay_url,
+                    local_identity: std::sync::Arc::new(pq),
+                })
+            } else {
+                drop(pq); // zeroize-on-drop
+                None
+            };
+            // Ed25519 key material is no longer needed; zeroize-on-drop fires now.
+            drop(ed25519);
 
             let content_policy = ContentPolicy {
                 encrypted_durable_persist,
@@ -250,7 +280,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("  Cache capacity:   {cache_capacity} items");
             eprintln!("  Compute budget:   {compute_budget} fuel/tick");
 
-            crate::event_loop::run(rt, startup_actions, listen_addr).await
+            crate::event_loop::run(rt, startup_actions, listen_addr, tunnel_config).await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
         }

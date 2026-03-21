@@ -1,17 +1,30 @@
-//! Async event loop — drives `NodeRuntime` via tokio select! with UDP, timer, and Zenoh.
+//! Async event loop — drives `NodeRuntime` via tokio select! with UDP, timer, Zenoh, and iroh tunnels.
 //!
 //! `NodeRuntime` is `!Send`; it lives entirely on the select loop task.
 //! Zenoh objects that need spawning are cloned (Session is internally Arc'd).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use harmony_content::blob::MemoryBlobStore;
+use harmony_identity::PqPrivateIdentity;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
 
 use crate::runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
+use crate::tunnel_bridge::{TunnelBridgeEvent, TunnelSender};
+use crate::tunnel_task;
+
+/// Configuration for iroh tunnel connectivity.
+pub struct TunnelConfig {
+    /// Optional relay URL for NAT traversal.
+    pub relay_url: Option<String>,
+    /// Node identity for ML-KEM tunnel handshakes.
+    pub local_identity: Arc<PqPrivateIdentity>,
+}
 
 /// Internal bridge events from spawned Zenoh tasks to the select loop.
 enum ZenohEvent {
@@ -44,10 +57,12 @@ enum ZenohEvent {
 /// - `runtime`: the sans-I/O node state machine (`!Send` — stays on this task).
 /// - `startup_actions`: actions returned by `NodeRuntime::new`, executed before the loop.
 /// - `listen_addr`: UDP socket address to bind (broadcast also sent here).
+/// - `tunnel_config`: optional iroh tunnel configuration (enables tunnel accept/connect).
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBlobStore>,
     startup_actions: Vec<RuntimeAction>,
     listen_addr: SocketAddr,
+    tunnel_config: Option<TunnelConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -62,6 +77,43 @@ pub async fn run(
     // ── mpsc channel: Zenoh tasks → select loop ───────────────────────────────
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
 
+    // ── Tunnel bridge: spawned tunnel tasks → select loop ───────────────────
+    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<TunnelBridgeEvent>(256);
+    let mut tunnel_senders: HashMap<String, TunnelSender> = HashMap::new();
+
+    // ── iroh Endpoint (optional, gated on --relay-url) ─────────────────────
+    let iroh_endpoint = if let Some(ref config) = tunnel_config {
+        // Derive iroh SecretKey from PQ identity's ML-DSA verifying key.
+        // This gives a deterministic mapping: same PQ identity → same iroh NodeId.
+        let pub_id = config.local_identity.public_identity();
+        let hash = harmony_crypto::hash::blake3_hash(&pub_id.verifying_key.as_bytes());
+        let secret_key = iroh::SecretKey::from(hash);
+
+        let mut builder = iroh::Endpoint::builder()
+            .alpns(vec![tunnel_task::HARMONY_TUNNEL_ALPN.to_vec()])
+            .secret_key(secret_key);
+
+        if let Some(ref url) = config.relay_url {
+            let relay_url: iroh::RelayUrl = url
+                .parse()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("invalid relay URL '{url}': {e}").into()
+                })?;
+            let relay_map = iroh::RelayMap::from_iter([relay_url]);
+            builder = builder.relay_mode(iroh::RelayMode::Custom(relay_map));
+        } else {
+            builder = builder.relay_mode(iroh::RelayMode::Disabled);
+        }
+
+        let ep = builder.bind().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("iroh endpoint bind failed: {e}").into()
+        })?;
+        eprintln!("  iroh NodeId:      {}", ep.node_id());
+        Some(ep)
+    } else {
+        None
+    };
+
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
         dispatch_action(
@@ -70,6 +122,7 @@ pub async fn run(
             &zenoh_tx,
             &udp,
             &broadcast_addr,
+            &tunnel_senders,
         )
         .await;
     }
@@ -197,7 +250,95 @@ pub async fn run(
                 }
             }
 
-            // Arm 4: Graceful shutdown (SIGTERM from procd, Ctrl+C).
+            // Arm 4: Tunnel bridge event — buffer only, tick on timer.
+            maybe = tunnel_rx.recv() => {
+                if let Some(event) = maybe {
+                    match event {
+                        TunnelBridgeEvent::HandshakeComplete {
+                            interface_name,
+                            peer_node_id,
+                            ..
+                        } => {
+                            runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
+                                interface_name,
+                                peer_node_id,
+                            });
+                        }
+                        TunnelBridgeEvent::ReticulumReceived {
+                            interface_name,
+                            packet,
+                        } => {
+                            runtime.push_event(RuntimeEvent::TunnelReticulumReceived {
+                                interface_name,
+                                packet,
+                                now: now_ms(),
+                            });
+                        }
+                        TunnelBridgeEvent::ZenohReceived { .. } => {
+                            // TODO: Zenoh over tunnel (Bead #3)
+                        }
+                        TunnelBridgeEvent::TunnelClosed {
+                            interface_name,
+                            reason,
+                        } => {
+                            eprintln!("[{interface_name}] tunnel closed: {reason}");
+                            tunnel_senders.remove(&interface_name);
+                            runtime.push_event(RuntimeEvent::TunnelClosed { interface_name });
+                        }
+                    }
+                }
+            }
+
+            // Arm 5: Accept incoming iroh connections.
+            incoming = async {
+                if let Some(ref ep) = iroh_endpoint {
+                    ep.accept().await
+                } else {
+                    // No iroh endpoint — pend forever (arm disabled).
+                    std::future::pending::<Option<iroh::endpoint::Incoming>>().await
+                }
+            } => {
+                if let Some(incoming) = incoming {
+                    match incoming.accept() {
+                        Ok(connecting) => {
+                            match connecting.await {
+                                Ok(connection) => {
+                                    let iface = match connection.remote_node_id() {
+                                        Ok(id) => format!(
+                                            "tunnel-{}",
+                                            hex::encode(&id.as_bytes()[..4])
+                                        ),
+                                        Err(_) => format!(
+                                            "tunnel-{:08x}",
+                                            rand::random::<u32>()
+                                        ),
+                                    };
+                                    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+                                    tunnel_senders.insert(
+                                        iface.clone(),
+                                        TunnelSender::new(cmd_tx),
+                                    );
+
+                                    let tx = tunnel_tx.clone();
+                                    let identity =
+                                        tunnel_config.as_ref().unwrap().local_identity.clone();
+                                    tokio::spawn(async move {
+                                        tunnel_task::run_responder(
+                                            connection, &identity, tx, cmd_rx,
+                                        )
+                                        .await;
+                                    });
+                                    eprintln!("[{iface}] accepted incoming tunnel");
+                                }
+                                Err(e) => eprintln!("[event_loop] iroh connecting error: {e}"),
+                            }
+                        }
+                        Err(e) => eprintln!("[event_loop] iroh accept error: {e}"),
+                    }
+                }
+            }
+
+            // Arm 6: Graceful shutdown (SIGTERM from procd, Ctrl+C).
             _ = &mut shutdown => {
                 break;
             }
@@ -213,9 +354,15 @@ pub async fn run(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
-                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr).await;
+                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, &tunnel_senders).await;
             }
         }
+    }
+
+    // ── Graceful iroh shutdown ────────────────────────────────────────────
+    if let Some(ref ep) = iroh_endpoint {
+        eprintln!("[event_loop] closing iroh endpoint...");
+        ep.close().await;
     }
 
     Ok(())
@@ -228,14 +375,19 @@ async fn dispatch_action(
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
     udp: &UdpSocket,
     broadcast_addr: &SocketAddr,
+    tunnel_senders: &HashMap<String, TunnelSender>,
 ) {
     match action {
-        // ── Tier 1: UDP broadcast ─────────────────────────────────────────────
-        // Awaited inline (not spawned) because tokio::net::UdpSocket is not
-        // Clone. For Reticulum's small MTU (≤1024 bytes), send_to is
-        // effectively non-blocking on a UDP socket with default buffer sizes.
-        RuntimeAction::SendOnInterface { raw, .. } => {
-            if let Err(e) = udp.send_to(&raw, broadcast_addr).await {
+        // ── Tier 1: Send on interface (UDP broadcast or tunnel) ──────────────
+        RuntimeAction::SendOnInterface {
+            ref interface_name,
+            ref raw,
+        } => {
+            if interface_name.starts_with("tunnel-") {
+                if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {
+                    let _ = sender.send_reticulum(raw.clone()).await;
+                }
+            } else if let Err(e) = udp.send_to(raw, broadcast_addr).await {
                 eprintln!("[event_loop] UDP send error: {e}");
             }
         }
