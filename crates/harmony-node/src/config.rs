@@ -122,9 +122,11 @@ pub fn resolve_config_path(cli_override: Option<&Path>) -> Result<(PathBuf, bool
     if let Some(p) = cli_override {
         return Ok((p.to_path_buf(), true));
     }
-    let home = std::env::var("HOME").map_err(|_| {
-        "Cannot determine config file path: $HOME not set. Use --config.".to_string()
-    })?;
+    // If $HOME is not set (containers, CI), use a path that won't exist.
+    // load() with explicit=false treats missing files as all-defaults.
+    let Ok(home) = std::env::var("HOME") else {
+        return Ok((PathBuf::from("/nonexistent/.harmony/node.toml"), false));
+    };
     Ok((PathBuf::from(home).join(".harmony").join("node.toml"), false))
 }
 
@@ -202,11 +204,11 @@ address = "192.168.1.10:4242"
 address = "192.168.1.11:4242"
 
 [[tunnels]]
-node_id = "aabbccddeeff"
+node_id = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
 name = "my-peer"
 
 [[tunnels]]
-node_id = "112233445566"
+node_id = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
 "#;
         let (_f, path) = write_temp(toml);
         let cfg = load(&path, false).expect("should parse full config");
@@ -233,9 +235,9 @@ node_id = "112233445566"
 
         let tunnels = cfg.tunnels.as_ref().expect("tunnels present");
         assert_eq!(tunnels.len(), 2);
-        assert_eq!(tunnels[0].node_id, "aabbccddeeff");
+        assert_eq!(tunnels[0].node_id, "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
         assert_eq!(tunnels[0].name.as_deref(), Some("my-peer"));
-        assert_eq!(tunnels[1].node_id, "112233445566");
+        assert_eq!(tunnels[1].node_id, "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00");
         assert!(tunnels[1].name.is_none());
     }
 
