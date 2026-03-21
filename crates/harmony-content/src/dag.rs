@@ -84,7 +84,8 @@ pub fn ingest(
 /// returns a single-element vec. For a bundle root, recursively descends
 /// through child bundles, collecting leaf CIDs. Sentinel `InlineData` entries
 /// (metadata CIDs) are skipped; non-sentinel `InlineData` CIDs carry real
-/// inline data and are included. `Stream` CIDs are not walked recursively.
+/// inline data and are included. `Stream` CIDs are structurally invalid inside
+/// a DAG bundle and cause an immediate `MissingContent` error.
 ///
 /// Returns `MissingContent` if any referenced CID is not in the store.
 pub fn walk(root_cid: &ContentId, store: &dyn BookStore) -> Result<Vec<ContentId>, ContentError> {
@@ -119,8 +120,10 @@ fn walk_recursive(
             }
         }
         CidType::Stream => {
-            // Streams are not walked recursively — they're processed
-            // via streaming iteration, not DAG traversal.
+            // Streams cannot appear as children of a well-formed bundle.
+            // A Stream CID in a DAG is structurally invalid — fail rather
+            // than silently producing incomplete output.
+            return Err(ContentError::MissingContent { cid: *cid });
         }
     }
     Ok(())
