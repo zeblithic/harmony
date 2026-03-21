@@ -112,12 +112,16 @@ impl PeerManager {
                             });
                         }
                         PeerStatus::Disabled => {
-                            // Race: CloseLink/tunnel teardown in flight.
+                            // Race: peering was disabled but tunnel completed first.
+                            // Tear down the dangling tunnel connection.
+                            actions.push(PeerAction::CloseLink { identity_hash });
                         }
                         PeerStatus::Connected => {}
                     },
                     None => {
-                        // Contact was removed; ignore stale tunnel completion.
+                        // Race: contact was removed but tunnel completed first.
+                        // Tear down the dangling tunnel connection.
+                        actions.push(PeerAction::CloseLink { identity_hash });
                     }
                 }
             }
