@@ -97,6 +97,11 @@
 
       irohCargoArtifacts = craneLib.buildDepsOnly irohCommonArgs;
 
+      # Native build — dynamically links glibc/openssl. For local
+      # development and testing only. For VM deployment, use the
+      # cross-compiled static musl packages below:
+      #   iroh-relay-x86_64-linux   (e2-micro GCP VMs)
+      #   iroh-relay-aarch64-linux  (ARM VMs)
       iroh-relay = craneLib.buildPackage (irohCommonArgs
         // {
           cargoArtifacts = irohCargoArtifacts;
