@@ -158,7 +158,8 @@ impl ContentId {
     pub fn payload_size(&self) -> u32 {
         let raw = self.raw_size_field();
         match self.depth() {
-            0 | STREAM_DEPTH => raw,
+            0 => raw,
+            STREAM_DEPTH => 0, // Stream size is unknown; use chunk_index() for the sequence number
             _ => {
                 let full = decode_bundle_size(raw);
                 if full > u32::MAX as u64 {
@@ -173,8 +174,19 @@ impl ContentId {
     pub fn payload_size_bytes(&self) -> u64 {
         let raw = self.raw_size_field();
         match self.depth() {
-            0 | STREAM_DEPTH => raw as u64,
+            0 => raw as u64,
+            STREAM_DEPTH => 0,
             _ => decode_bundle_size(raw),
+        }
+    }
+
+    /// For stream CIDs, returns the chunk sequence index stored in the size field.
+    /// For non-stream CIDs, returns None.
+    pub fn chunk_index(&self) -> Option<u32> {
+        if self.depth() == STREAM_DEPTH && !self.is_inline() {
+            Some(self.raw_size_field())
+        } else {
+            None
         }
     }
 
@@ -394,13 +406,11 @@ impl<'de> Deserialize<'de> for ContentId {
 
 impl core::fmt::Display for ContentId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "{} {:?} {}B",
-            hex_prefix(&self.hash),
-            self.cid_type(),
-            self.payload_size()
-        )
+        let cid_type = self.cid_type();
+        match cid_type {
+            CidType::Stream => write!(f, "{} Stream chunk#{}", hex_prefix(&self.hash), self.raw_size_field()),
+            _ => write!(f, "{} {:?} {}B", hex_prefix(&self.hash), cid_type, self.payload_size()),
+        }
     }
 }
 
@@ -508,7 +518,7 @@ pub fn decode_bundle_size(raw: u32) -> u64 {
     if shift >= 64 {
         return u64::MAX;
     }
-    base.checked_shl(shift).unwrap_or(u64::MAX)
+    base.saturating_mul(1u64 << shift)
 }
 
 #[cfg(test)]
@@ -621,6 +631,8 @@ mod tests {
         assert_eq!(cid.cid_type(), CidType::Stream);
         assert_eq!(cid.raw_size_field(), 42);
         assert_eq!(cid.hash, hash);
+        assert_eq!(cid.chunk_index(), Some(42));
+        assert_eq!(cid.payload_size(), 0); // streams have unknown size
     }
 
     #[test]
