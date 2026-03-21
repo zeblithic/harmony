@@ -13,6 +13,10 @@
 
 **Scope:** This plan covers **Bead harmony-h6k** only. Discovery-driven address population comes in Bead harmony-lbv.
 
+**Prerequisites:** PR #84 (iroh-net integration) must be merged. The event loop already has `tunnel_task.rs`, `tunnel_bridge.rs`, iroh Endpoint setup, accept loop, connection management, and `TunnelConfig`. This plan builds on that infrastructure.
+
+**no_std note:** `harmony-contacts` and `harmony-peers` are `no_std`-compatible. `ContactAddress` uses `String` for `relay_url` and `direct_addrs` (not `Url`/`SocketAddr`) because the `url` crate and `core::net::SocketAddr` are not `no_std`-friendly. The spec calls for `Url` but this is a pragmatic deviation documented here. Conversion from `String` to typed `Url`/`SocketAddr` happens at the event loop boundary.
+
 ---
 
 ## File Structure
@@ -110,7 +114,10 @@ pub struct Contact {
 }
 ```
 
-Update `Contact` construction in existing tests to include `addresses: vec![]`.
+Update `Contact` construction in existing tests to include `addresses: vec![]`. This includes:
+- Test helpers in `crates/harmony-contacts/src/store.rs` (e.g., `make_contact`)
+- Test helpers in `crates/harmony-peers/src/manager.rs` (e.g., `make_store_with_contact`)
+- Any other test that constructs `Contact` directly across the workspace
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -531,7 +538,10 @@ RuntimeEvent::TunnelPeerEstablished { identity_hash, node_id, now } => {
         harmony_peers::PeerEvent::TunnelEstablished { identity_hash, node_id, now },
         &self.contact_store,
     );
-    self.peer_action_queue.extend(actions);
+    // Translate peer actions and append to the runtime actions returned by tick().
+    // PeerManager actions are processed in the same tick cycle as router actions.
+    let runtime_actions = self.translate_peer_actions(actions);
+    // These will be returned from tick() alongside router/storage/compute actions.
 }
 // ... similar for TunnelPeerFailed, TunnelPeerDropped, ContactChanged
 ```
@@ -662,7 +672,7 @@ RuntimeAction::InitiateTunnel { identity_hash, node_id, relay_url } => {
 }
 ```
 
-Note: The `dispatch_action` function currently takes specific params. Some of these new params (`next_connection_id`, `conn_tx`, `inflight_handshakes`, `iroh_endpoint`) need to be accessible. This may require restructuring `dispatch_action` to take a context struct, or handling `InitiateTunnel` directly in the select loop's action dispatch code rather than in the standalone function.
+Handle `InitiateTunnel` directly in the action dispatch loop in the select body (where `tick()` results are processed), NOT inside `dispatch_action`. This keeps `dispatch_action` focused on Reticulum/Zenoh I/O while tunnel connection management stays in the main loop where `iroh_endpoint`, `conn_tx`, `next_connection_id`, and `inflight_handshakes` are in scope. Pattern: match on `InitiateTunnel` before calling `dispatch_action` for other variants.
 
 - [ ] **Step 2: Feed TunnelBridgeEvent::HandshakeComplete back to PeerManager**
 
@@ -710,7 +720,7 @@ if is_current {
 }
 ```
 
-Note: TunnelClosed doesn't currently carry `node_id`. You may need to maintain a mapping of `interface_name → (identity_hash, node_id)` in the event loop, or add `node_id` to the TunnelClosed event.
+The event loop already maintains `tunnel_senders: HashMap<String, TunnelSender>`. Add a parallel `tunnel_identities: HashMap<String, [u8; 16]>` mapping `interface_name → identity_hash`. Populate it when `HandshakeComplete` arrives (after looking up identity_hash from node_id via contact store). Use it in the `TunnelClosed` handler to find the identity_hash for the PeerManager notification.
 
 - [ ] **Step 4: Handle SendPathRequest**
 
