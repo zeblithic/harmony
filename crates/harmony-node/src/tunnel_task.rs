@@ -49,7 +49,8 @@ pub async fn run_initiator(
 
     let (session, send_stream, recv_stream) = match handshake_result {
         Ok(Ok(result)) => result,
-        Ok(Err(reason)) => {
+        Ok(Err(Some(reason))) => {
+            // Handshake failed — dispatch has NOT sent TunnelClosed yet.
             let _ = bridge_tx
                 .send(TunnelBridgeEvent::TunnelClosed {
                     interface_name,
@@ -57,6 +58,10 @@ pub async fn run_initiator(
                     connection_id,
                 })
                 .await;
+            return;
+        }
+        Ok(Err(None)) => {
+            // dispatch_tunnel_actions already sent TunnelClosed — don't duplicate.
             return;
         }
         Err(_timeout) => {
@@ -93,7 +98,7 @@ async fn initiator_handshake(
     bridge_tx: &mpsc::Sender<TunnelBridgeEvent>,
     interface_name: &str,
     connection_id: u64,
-) -> Result<(TunnelSession, SendStream, RecvStream), String> {
+) -> Result<(TunnelSession, SendStream, RecvStream), Option<String>> {
     let now_ms = millis_since_start();
 
     // Create TunnelSession as initiator
@@ -104,27 +109,27 @@ async fn initiator_handshake(
         remote_identity,
         now_ms,
     )
-    .map_err(|e| format!("handshake init failed: {e}"))?;
+    .map_err(|e| Some(format!("handshake init failed: {e}")))?;
 
     // Open a bidirectional stream for the tunnel
     let (mut send_stream, mut recv_stream) = conn
         .open_bi()
         .await
-        .map_err(|e| format!("failed to open bi stream: {e}"))?;
+        .map_err(|e| Some(format!("failed to open bi stream: {e}")))?;
 
     // Send TunnelInit (OutboundBytes from init_actions)
     for action in init_actions {
         if let TunnelAction::OutboundBytes { data } = action {
             write_length_prefixed(&mut send_stream, &data)
                 .await
-                .map_err(|e| format!("failed to send TunnelInit: {e}"))?;
+                .map_err(|e| Some(format!("failed to send TunnelInit: {e}")))?;
         }
     }
 
     // Read TunnelAccept
     let accept_bytes = read_length_prefixed(&mut recv_stream, HANDSHAKE_MAX_MESSAGE)
         .await
-        .map_err(|e| format!("failed to read TunnelAccept: {e}"))?;
+        .map_err(|e| Some(format!("failed to read TunnelAccept: {e}")))?;
 
     // Process TunnelAccept through the state machine
     let now_ms = millis_since_start();
@@ -133,11 +138,13 @@ async fn initiator_handshake(
             data: accept_bytes,
             now_ms,
         })
-        .map_err(|e| format!("handshake failed: {e}"))?;
+        .map_err(|e| Some(format!("handshake failed: {e}")))?;
 
     // Dispatch handshake completion actions (HandshakeComplete + any OutboundBytes)
     if !dispatch_tunnel_actions(&actions, &mut send_stream, bridge_tx, interface_name, connection_id).await {
-        return Err("handshake dispatch failed".to_string());
+        // dispatch_tunnel_actions already sent TunnelClosed to bridge_tx.
+        // Return None to signal the caller should NOT send a duplicate.
+        return Err(None);
     }
 
     Ok((session, send_stream, recv_stream))
@@ -164,7 +171,8 @@ pub async fn run_responder(
 
     let (session, send_stream, recv_stream) = match handshake_result {
         Ok(Ok(result)) => result,
-        Ok(Err(reason)) => {
+        Ok(Err(Some(reason))) => {
+            // Handshake failed — dispatch has NOT sent TunnelClosed yet.
             let _ = bridge_tx
                 .send(TunnelBridgeEvent::TunnelClosed {
                     interface_name,
@@ -172,6 +180,10 @@ pub async fn run_responder(
                     connection_id,
                 })
                 .await;
+            return;
+        }
+        Ok(Err(None)) => {
+            // dispatch_tunnel_actions already sent TunnelClosed — don't duplicate.
             return;
         }
         Err(_timeout) => {
@@ -207,17 +219,17 @@ async fn responder_handshake(
     bridge_tx: &mpsc::Sender<TunnelBridgeEvent>,
     interface_name: &str,
     connection_id: u64,
-) -> Result<(TunnelSession, SendStream, RecvStream), String> {
+) -> Result<(TunnelSession, SendStream, RecvStream), Option<String>> {
     // Accept the bidirectional stream
     let (mut send_stream, mut recv_stream) = conn
         .accept_bi()
         .await
-        .map_err(|e| format!("failed to accept bi stream: {e}"))?;
+        .map_err(|e| Some(format!("failed to accept bi stream: {e}")))?;
 
     // Read TunnelInit
     let init_bytes = read_length_prefixed(&mut recv_stream, HANDSHAKE_MAX_MESSAGE)
         .await
-        .map_err(|e| format!("failed to read TunnelInit: {e}"))?;
+        .map_err(|e| Some(format!("failed to read TunnelInit: {e}")))?;
 
     // Create TunnelSession as responder
     let mut rng = rand::rngs::OsRng;
@@ -228,7 +240,7 @@ async fn responder_handshake(
         &init_bytes,
         now_ms,
     )
-    .map_err(|e| format!("responder handshake failed: {e}"))?;
+    .map_err(|e| Some(format!("responder handshake failed: {e}")))?;
 
     // Dispatch accept actions (sends TunnelAccept + emits HandshakeComplete)
     if !dispatch_tunnel_actions(
@@ -240,7 +252,8 @@ async fn responder_handshake(
     )
     .await
     {
-        return Err("handshake dispatch failed".to_string());
+        // dispatch_tunnel_actions already sent TunnelClosed to bridge_tx.
+        return Err(None);
     }
 
     Ok((session, send_stream, recv_stream))
