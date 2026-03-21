@@ -288,7 +288,7 @@ impl ContentId {
     /// Parse an inline metadata CID, returning (total_size, chunk_count, timestamp, mime).
     pub fn parse_inline_metadata(&self) -> Result<(u64, u32, u64, [u8; 8]), ContentError> {
         if self.cid_type() != CidType::InlineMetadata {
-            return Err(ContentError::NotInlineMetadata);
+            return Err(ContentError::NotInlineData);
         }
 
         let total_size = u64::from_be_bytes(self.hash[0..8].try_into().unwrap());

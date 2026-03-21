@@ -59,7 +59,7 @@ In `crates/harmony-contacts/src/contact.rs`, add to tests:
 fn contact_address_tunnel_roundtrip() {
     let addr = ContactAddress::Tunnel {
         node_id: [0xAB; 32],
-        relay_url: Some("https://iroh.q8.fyi".into()),
+        relay_url: Some("https://i.q8.fyi".into()),
         direct_addrs: vec![],
     };
     let serialized = postcard::to_allocvec(&addr).unwrap();
@@ -67,7 +67,7 @@ fn contact_address_tunnel_roundtrip() {
     match deserialized {
         ContactAddress::Tunnel { node_id, relay_url, .. } => {
             assert_eq!(node_id, [0xAB; 32]);
-            assert_eq!(relay_url.as_deref(), Some("https://iroh.q8.fyi"));
+            assert_eq!(relay_url.as_deref(), Some("https://i.q8.fyi"));
         }
         _ => panic!("expected Tunnel variant"),
     }
@@ -96,7 +96,7 @@ pub enum ContactAddress {
     Tunnel {
         /// BLAKE3(ML-DSA-65 public key) — the iroh NodeId seed.
         node_id: [u8; 32],
-        /// Preferred relay server URL (e.g., "https://iroh.q8.fyi").
+        /// Preferred relay server URL (e.g., "https://i.q8.fyi").
         relay_url: Option<alloc::string::String>,
         /// Known direct socket addresses (ephemeral, may be stale).
         direct_addrs: alloc::vec::Vec<alloc::string::String>,
@@ -270,7 +270,7 @@ fn tunnel_address_emits_initiate_tunnel() {
         notes: None,
         addresses: vec![ContactAddress::Tunnel {
             node_id: [0xAA; 32],
-            relay_url: Some("https://iroh.q8.fyi".into()),
+            relay_url: Some("https://i.q8.fyi".into()),
             direct_addrs: vec![],
         }],
     }).unwrap();
@@ -758,7 +758,7 @@ Add a `--add-tunnel-peer` CLI arg that adds a contact with a tunnel address befo
 ```rust
         /// Add a tunnel peer contact before starting.
         /// Format: <identity_hash_hex>:<node_id_hex>[@relay_url]
-        /// Example: aabbccdd...:<node_id>@https://iroh.q8.fyi
+        /// Example: aabbccdd...:<node_id>@https://i.q8.fyi
         #[arg(long, value_name = "PEER_SPEC")]
         add_tunnel_peer: Vec<String>,
 ```

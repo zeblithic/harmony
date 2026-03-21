@@ -12,8 +12,11 @@ pub enum ContentError {
     #[error("invalid CID: child depth {child} must be less than parent depth {parent}")]
     DepthViolation { child: u8, parent: u8 },
 
-    #[error("not an inline metadata CID")]
-    NotInlineMetadata,
+    #[error("not an inline data CID")]
+    NotInlineData,
+
+    #[error("invalid content flags: inline mode is incompatible with this CID type")]
+    InvalidFlags,
 
     #[error("invalid bundle length: {len} is not a multiple of 32")]
     InvalidBundleLength { len: usize },
