@@ -137,7 +137,7 @@ To deploy a new version of `iroh-relay`, update the flake input:
 
 ```bash
 # Edit flake.nix to change the iroh input rev/tag, then:
-nix flake update iroh
+nix flake update iroh-src
 
 # Commit the updated flake.lock
 git add flake.lock && git commit -m "chore: bump iroh-relay to <new-version>"
