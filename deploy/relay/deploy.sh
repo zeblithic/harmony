@@ -167,7 +167,12 @@ elif command -v nix &>/dev/null; then
         echo "    VM already has this store path — skipping push."
     else
         echo "    Pushing Nix closure to VM..."
-        nix-store -qR "$STORE_PATH" | xargs nix-store --export | \
+        # Collect all closure paths into an array first, then export in a
+        # single nix-store --export call. xargs would split into multiple
+        # invocations for large closures, and nix-store --import only reads
+        # one export stream — subsequent streams would be silently dropped.
+        mapfile -t CLOSURE < <(nix-store -qR "$STORE_PATH")
+        nix-store --export "${CLOSURE[@]}" | \
             gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" -- \
             "sudo nix-store --import"
         echo "    Closure pushed."

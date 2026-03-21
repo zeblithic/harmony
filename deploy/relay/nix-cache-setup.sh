@@ -63,12 +63,10 @@ fi
 # ---------------------------------------------------------------------------
 if ! command -v nix-serve &>/dev/null; then
   echo "[nix-cache-setup] Installing nix-serve..."
-  # Ensure the current user has the nixpkgs channel (multi-user installer
-  # only adds it for root; gcloud ssh connects as a regular user).
-  if ! nix-channel --list 2>/dev/null | grep -q nixpkgs; then
-    # Use stable channel for production infrastructure (not nixpkgs-unstable)
-    nix-channel --add https://nixos.org/channels/nixos-24.11 nixpkgs
-  fi
+  # Always set channel to pinned stable release. nix-channel --add is
+  # idempotent (overwrites existing channel of same name). This ensures
+  # we use nixos-24.11 even if the installer registered nixpkgs-unstable.
+  nix-channel --add https://nixos.org/channels/nixos-24.11 nixpkgs
   nix-channel --update nixpkgs
   nix-env -iA nixpkgs.nix-serve
 else
