@@ -34,9 +34,11 @@ Peer A (behind NAT) ──QUIC──→ i.q8.fyi ←──QUIC── Peer B (beh
 - [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) (`gcloud` CLI)
 - A GCP project with billing enabled
 - A domain with DNS you control
+- [Nix package manager](https://nixos.org/download/) (used to build `iroh-relay` via the binary cache)
 
-**Manual runbook (Step 4 builds locally):**
-- All of the above, plus a local Rust toolchain
+**Manual runbook (Step 4 builds via Nix):**
+- All of the above, plus Nix installed locally
+- Alternatively, set `LOCAL_BINARY=/path/to/iroh-relay` to skip the Nix build and supply a pre-built binary directly
 
 ### Automated Deployment
 
@@ -53,7 +55,7 @@ The script will:
 1. Create an `e2-micro` VM in `us-west1-b` with Debian 12
 2. Reserve a static external IP
 3. Configure firewall rules (80/tcp, 443/tcp, 7842/udp)
-4. Install Rust and build `iroh-relay` on the VM
+4. Pull `iroh-relay` from the Nix binary cache (or build via `nix build` if not cached)
 5. Install the systemd unit and config
 6. Start the service
 
@@ -67,6 +69,89 @@ i.q8.fyi.  A  <static-ip>
 ### Manual Deployment
 
 See the step-by-step runbook below.
+
+## Binary Cache
+
+The deployment uses a Nix binary cache on the relay VM so that `iroh-relay`
+builds are fast and reproducible without a local Rust toolchain.
+
+### First-Time Setup
+
+After the VM is created (Step 1 of the runbook), run the cache setup script:
+
+```bash
+gcloud compute ssh harmony-relay --zone=us-west1-b -- \
+    'bash -s' < ./deploy/relay/nix-cache-setup.sh
+```
+
+This generates a signing keypair at `/etc/nix/cache-key` on the VM, installs
+Nix, and configures the VM to serve as an HTTP binary cache on port 5000.
+After running, copy the public key back into the repo:
+
+```bash
+gcloud compute ssh harmony-relay --zone=us-west1-b -- \
+    cat /etc/nix/cache-key.pub > ./deploy/relay/cache-key.pub
+```
+
+Commit `cache-key.pub` so clients can verify cache signatures.
+
+### How It Works
+
+```
+nix build .#iroh-relay
+  └── check local /nix/store
+  └── check binary cache (http://harmony-relay:5000)
+  └── build from source (if cache miss)
+  └── push result to cache
+  └── activate via systemd
+```
+
+`deploy.sh` sets `NIX_CONFIG` to point at the relay cache and runs
+`nix build`, then `nix copy --to` to push the result. On subsequent
+deploys the build is a no-op — the cached path is used directly.
+
+### Client Configuration
+
+To use the relay's binary cache on your local machine, add to `/etc/nix/nix.conf`
+(or `~/.config/nix/nix.conf`):
+
+```
+substituters = https://cache.nixos.org http://i.q8.fyi:5000
+trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= <contents of deploy/relay/cache-key.pub>
+```
+
+Replace `<contents of deploy/relay/cache-key.pub>` with the single line from that file.
+
+### Updating the Version
+
+To deploy a new version of `iroh-relay`, update the flake input:
+
+```bash
+# Edit flake.nix to change the iroh input rev/tag, then:
+nix flake update iroh
+
+# Commit the updated flake.lock
+git add flake.lock && git commit -m "chore: bump iroh-relay to <new-version>"
+
+# Re-run deploy.sh — it will build the new version and push to cache
+./deploy/relay/deploy.sh
+```
+
+### Rollback
+
+Previous versions remain in `/nix/store` on the VM. To roll back:
+
+```bash
+# List recent iroh-relay store paths
+gcloud compute ssh harmony-relay --zone=us-west1-b -- \
+    ls -lt /nix/store | grep iroh-relay | head -5
+
+# Activate an older store path directly
+gcloud compute ssh harmony-relay --zone=us-west1-b -- \
+    sudo systemctl stop iroh-relay && \
+    sudo ln -sf /nix/store/<old-path>/bin/iroh-relay /usr/local/bin/iroh-relay && \
+    sudo systemctl start iroh-relay
+```
 
 ## Runbook: Step-by-Step Manual Deployment
 
@@ -97,7 +182,7 @@ gcloud compute instances create harmony-relay \
     --tags=harmony-relay \
     --metadata=startup-script='#!/bin/bash
         apt-get update -qq
-        apt-get install -y -qq build-essential pkg-config libssl-dev'
+        apt-get install -y -qq curl xz-utils'
 ```
 
 ### 2. Configure Firewall Rules
@@ -132,18 +217,24 @@ i.q8.fyi.  A  <static-ip-from-step-1>
 
 Wait for propagation (check with `dig i.q8.fyi`).
 
-### 4. Build and Upload iroh-relay
+### 4. Build and Upload iroh-relay via Nix
 
-On your local machine (or on the VM):
+Run the cache setup first (see **Binary Cache** section above), then build and upload:
 
 ```bash
-# Clone iroh and build the relay binary
-git clone https://github.com/n0-computer/iroh.git /tmp/iroh-build
-cd /tmp/iroh-build
-cargo build --release -p iroh-relay --features server --bin iroh-relay
+# Build iroh-relay using Nix (pulls from binary cache if available)
+nix build .#iroh-relay
 
 # Upload to the VM
-gcloud compute scp /tmp/iroh-build/target/release/iroh-relay \
+gcloud compute scp result/bin/iroh-relay \
+    harmony-relay:/tmp/iroh-relay --zone=us-west1-b
+```
+
+If you have a pre-built binary, set `LOCAL_BINARY` instead:
+
+```bash
+export LOCAL_BINARY=/path/to/iroh-relay
+gcloud compute scp "$LOCAL_BINARY" \
     harmony-relay:/tmp/iroh-relay --zone=us-west1-b
 ```
 
@@ -290,12 +381,12 @@ gcloud compute ssh harmony-relay --zone=us-west1-b -- \
 
 ## Updating
 
-```bash
-# Build new version locally
-cd /tmp/iroh-build && git pull && cargo build --release -p iroh-relay --features server
+See the **Binary Cache → Updating the Version** section above for the Nix-based
+update workflow. For a quick in-place update without Nix:
 
-# Upload and restart
-gcloud compute scp /tmp/iroh-build/target/release/iroh-relay \
+```bash
+# Build or obtain the new binary, then upload and restart
+gcloud compute scp /path/to/new/iroh-relay \
     harmony-relay:/tmp/iroh-relay --zone=us-west1-b
 
 gcloud compute ssh harmony-relay --zone=us-west1-b -- \
