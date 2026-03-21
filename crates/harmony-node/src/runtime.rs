@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use harmony_compute::InstructionBudget;
+use harmony_contacts::ContactStore;
 use harmony_content::book::BookStore;
 use harmony_content::bloom::BloomFilter;
 use harmony_content::cid::ContentId;
@@ -16,6 +17,7 @@ use harmony_content::storage_tier::{
     ContentPolicy, FilterBroadcastConfig, StorageBudget, StorageMetrics, StorageTier,
     StorageTierAction, StorageTierEvent,
 };
+use harmony_peers::{PeerAction, PeerEvent, PeerManager};
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
 use harmony_zenoh::namespace::content as content_ns;
@@ -135,6 +137,18 @@ pub enum RuntimeEvent {
         cid: [u8; 32],
         result: Result<Vec<u8>, String>,
     },
+    /// Peer lifecycle: a tunnel connection has been established to a peer.
+    TunnelPeerEstablished {
+        identity_hash: [u8; 16],
+        node_id: [u8; 32],
+        now: u64,
+    },
+    /// Peer lifecycle: a tunnel connection attempt failed.
+    TunnelPeerFailed { identity_hash: [u8; 16] },
+    /// Peer lifecycle: an established tunnel connection was dropped.
+    TunnelPeerDropped { identity_hash: [u8; 16] },
+    /// Peer lifecycle: a contact was added or modified.
+    ContactChanged { identity_hash: [u8; 16] },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -158,6 +172,14 @@ pub enum RuntimeAction {
     DeclareQueryable { key_expr: String },
     /// Setup: Subscribe to a key expression.
     Subscribe { key_expr: String },
+    /// Peer lifecycle: initiate a tunnel connection to a peer via iroh-net.
+    InitiateTunnel {
+        identity_hash: [u8; 16],
+        node_id: [u8; 32],
+        relay_url: Option<String>,
+    },
+    /// Peer lifecycle: send a path request (announce probe) for a peer.
+    SendPathRequest { identity_hash: [u8; 16] },
 }
 
 /// Filter state received from a peer, with metadata.
@@ -294,6 +316,10 @@ pub struct NodeRuntime<B: BookStore> {
     storage: StorageTier<B>,
     // Tier 3: Compute (workflow engine)
     workflow: WorkflowEngine,
+    // Peer lifecycle manager (sans-I/O)
+    peer_manager: PeerManager,
+    // Contact store — intentional peer relationships
+    contact_store: ContactStore,
     // Internal priority queues
     router_queue: VecDeque<NodeEvent>,
     storage_queue: VecDeque<StorageTierEvent>,
@@ -331,6 +357,8 @@ pub struct NodeRuntime<B: BookStore> {
     pending_filter_broadcast: Option<Vec<u8>>,
     // Coalesces cuckoo filter broadcasts (flatpack reverse-index) within a single tick.
     pending_cuckoo_broadcast: Option<Vec<u8>>,
+    // Most recent monotonic timestamp from TimerTick (used for PeerManager ticks).
+    last_now: u64,
 }
 
 impl<B: BookStore> NodeRuntime<B> {
@@ -418,6 +446,8 @@ impl<B: BookStore> NodeRuntime<B> {
             queryable_router,
             storage,
             workflow,
+            peer_manager: PeerManager::new(),
+            contact_store: ContactStore::new(),
             router_queue: VecDeque::new(),
             storage_queue: VecDeque::new(),
             storage_queryable_ids,
@@ -437,6 +467,7 @@ impl<B: BookStore> NodeRuntime<B> {
             filter_broadcast_interval_ticks,
             pending_filter_broadcast: None,
             pending_cuckoo_broadcast: None,
+            last_now: 0,
         };
 
         (rt, actions)
@@ -492,6 +523,16 @@ impl<B: BookStore> NodeRuntime<B> {
             .should_query_flatpack(peer_addr, child_cid, self.tick_count)
     }
 
+    /// Read-only access to the contact store.
+    pub fn contact_store(&self) -> &ContactStore {
+        &self.contact_store
+    }
+
+    /// Mutable access to the contact store.
+    pub fn contact_store_mut(&mut self) -> &mut ContactStore {
+        &mut self.contact_store
+    }
+
     /// Number of malformed filter payloads that failed deserialization.
     pub fn peer_filter_parse_errors(&self) -> u64 {
         self.peer_filters.parse_errors()
@@ -533,6 +574,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 });
             }
             RuntimeEvent::TimerTick { now } => {
+                self.last_now = now;
                 self.router_queue.push_back(NodeEvent::TimerTick { now });
             }
             RuntimeEvent::QueryReceived {
@@ -603,6 +645,38 @@ impl<B: BookStore> NodeRuntime<B> {
                 };
                 let actions = self.workflow.handle(event);
                 self.pending_workflow_actions.extend(actions);
+            }
+            RuntimeEvent::TunnelPeerEstablished {
+                identity_hash,
+                node_id,
+                now,
+            } => {
+                let peer_actions = self.peer_manager.on_event(
+                    PeerEvent::TunnelEstablished { identity_hash, node_id, now },
+                    &self.contact_store,
+                );
+                self.translate_peer_actions(peer_actions);
+            }
+            RuntimeEvent::TunnelPeerFailed { identity_hash } => {
+                let peer_actions = self.peer_manager.on_event(
+                    PeerEvent::TunnelFailed { identity_hash },
+                    &self.contact_store,
+                );
+                self.translate_peer_actions(peer_actions);
+            }
+            RuntimeEvent::TunnelPeerDropped { identity_hash } => {
+                let peer_actions = self.peer_manager.on_event(
+                    PeerEvent::TunnelDropped { identity_hash },
+                    &self.contact_store,
+                );
+                self.translate_peer_actions(peer_actions);
+            }
+            RuntimeEvent::ContactChanged { identity_hash } => {
+                let peer_actions = self.peer_manager.on_event(
+                    PeerEvent::ContactChanged { identity_hash },
+                    &self.contact_store,
+                );
+                self.translate_peer_actions(peer_actions);
             }
         }
     }
@@ -749,6 +823,13 @@ impl<B: BookStore> NodeRuntime<B> {
             }
         }
 
+        // Peer lifecycle tick — process probe timers, connecting timeouts.
+        let peer_actions = self.peer_manager.on_event(
+            PeerEvent::Tick { now: self.last_now },
+            &self.contact_store,
+        );
+        self.translate_peer_actions_out(peer_actions, &mut actions);
+
         actions
     }
 
@@ -758,17 +839,32 @@ impl<B: BookStore> NodeRuntime<B> {
         out: &mut Vec<RuntimeAction>,
     ) {
         for action in node_actions {
-            if let NodeAction::SendOnInterface {
-                interface_name,
-                raw,
-            } = action
-            {
-                out.push(RuntimeAction::SendOnInterface {
+            match action {
+                NodeAction::SendOnInterface {
                     interface_name,
                     raw,
-                });
+                } => {
+                    out.push(RuntimeAction::SendOnInterface {
+                        interface_name,
+                        raw,
+                    });
+                }
+                NodeAction::AnnounceReceived {
+                    destination_hash, ..
+                } => {
+                    // Feed announce into PeerManager so it can trigger
+                    // link/tunnel initiation for known contacts.
+                    let peer_actions = self.peer_manager.on_event(
+                        PeerEvent::AnnounceReceived {
+                            identity_hash: destination_hash,
+                        },
+                        &self.contact_store,
+                    );
+                    self.translate_peer_actions_out(peer_actions, out);
+                }
+                // Other router actions are diagnostics — drop for now.
+                _ => {}
             }
-            // Other router actions are diagnostics -- drop for now.
         }
     }
 
@@ -964,6 +1060,79 @@ impl<B: BookStore> NodeRuntime<B> {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// Translate PeerActions into RuntimeActions, buffering into pending_direct_actions.
+    /// Used from push_event where no output vec is available.
+    fn translate_peer_actions(&mut self, peer_actions: Vec<PeerAction>) {
+        for action in peer_actions {
+            match action {
+                PeerAction::InitiateTunnel {
+                    identity_hash,
+                    node_id,
+                    relay_url,
+                } => {
+                    self.pending_direct_actions
+                        .push(RuntimeAction::InitiateTunnel {
+                            identity_hash,
+                            node_id,
+                            relay_url,
+                        });
+                }
+                PeerAction::SendPathRequest { identity_hash } => {
+                    self.pending_direct_actions
+                        .push(RuntimeAction::SendPathRequest { identity_hash });
+                }
+                PeerAction::UpdateLastSeen {
+                    identity_hash,
+                    timestamp,
+                } => {
+                    self.contact_store
+                        .update_last_seen(&identity_hash, timestamp);
+                }
+                PeerAction::InitiateLink { .. } | PeerAction::CloseLink { .. } => {
+                    // Reticulum link initiation/close — stub for now.
+                    // These will be wired when Link protocol is implemented.
+                }
+            }
+        }
+    }
+
+    /// Translate PeerActions into RuntimeActions, pushing directly to an output vec.
+    /// Used from tick() and dispatch_router_actions where an output vec is available.
+    fn translate_peer_actions_out(
+        &mut self,
+        peer_actions: Vec<PeerAction>,
+        out: &mut Vec<RuntimeAction>,
+    ) {
+        for action in peer_actions {
+            match action {
+                PeerAction::InitiateTunnel {
+                    identity_hash,
+                    node_id,
+                    relay_url,
+                } => {
+                    out.push(RuntimeAction::InitiateTunnel {
+                        identity_hash,
+                        node_id,
+                        relay_url,
+                    });
+                }
+                PeerAction::SendPathRequest { identity_hash } => {
+                    out.push(RuntimeAction::SendPathRequest { identity_hash });
+                }
+                PeerAction::UpdateLastSeen {
+                    identity_hash,
+                    timestamp,
+                } => {
+                    self.contact_store
+                        .update_last_seen(&identity_hash, timestamp);
+                }
+                PeerAction::InitiateLink { .. } | PeerAction::CloseLink { .. } => {
+                    // Reticulum link initiation/close — stub for now.
+                }
+            }
         }
     }
 
@@ -2236,6 +2405,129 @@ mod tests {
         assert!(
             !table.should_query_flatpack("peer-a", &cid, 20),
             "fresh flatpack filter with empty cuckoo should say 'definitely no'"
+        );
+    }
+
+    #[test]
+    fn runtime_event_peer_variants_exist() {
+        let _e1 = RuntimeEvent::TunnelPeerEstablished {
+            identity_hash: [0xAA; 16],
+            node_id: [0xBB; 32],
+            now: 5000,
+        };
+        let _e2 = RuntimeEvent::TunnelPeerFailed {
+            identity_hash: [0xCC; 16],
+        };
+        let _e3 = RuntimeEvent::TunnelPeerDropped {
+            identity_hash: [0xDD; 16],
+        };
+        let _e4 = RuntimeEvent::ContactChanged {
+            identity_hash: [0xEE; 16],
+        };
+    }
+
+    #[test]
+    fn runtime_action_peer_variants_exist() {
+        let _a1 = RuntimeAction::InitiateTunnel {
+            identity_hash: [0xAA; 16],
+            node_id: [0xBB; 32],
+            relay_url: Some("https://relay.example.com".into()),
+        };
+        let _a2 = RuntimeAction::SendPathRequest {
+            identity_hash: [0xCC; 16],
+        };
+    }
+
+    #[test]
+    fn contact_store_accessible() {
+        let (rt, _) = make_runtime();
+        assert!(rt.contact_store().is_empty());
+    }
+
+    #[test]
+    fn contact_store_mut_accessible() {
+        let (mut rt, _) = make_runtime();
+        let contact = harmony_contacts::Contact {
+            identity_hash: [0xAA; 16],
+            display_name: None,
+            peering: harmony_contacts::PeeringPolicy {
+                enabled: true,
+                priority: harmony_contacts::PeeringPriority::Normal,
+            },
+            added_at: 1000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![],
+        };
+        rt.contact_store_mut().add(contact).unwrap();
+        assert_eq!(rt.contact_store().len(), 1);
+    }
+
+    #[test]
+    fn contact_changed_event_registers_peer() {
+        let (mut rt, _) = make_runtime();
+        let contact = harmony_contacts::Contact {
+            identity_hash: [0xAA; 16],
+            display_name: None,
+            peering: harmony_contacts::PeeringPolicy {
+                enabled: true,
+                priority: harmony_contacts::PeeringPriority::High,
+            },
+            added_at: 1000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![],
+        };
+        rt.contact_store_mut().add(contact).unwrap();
+        rt.push_event(RuntimeEvent::ContactChanged {
+            identity_hash: [0xAA; 16],
+        });
+        // Tick with a timer to trigger PeerManager tick, which should produce
+        // a SendPathRequest for the High-priority peer.
+        rt.push_event(RuntimeEvent::TimerTick { now: 1000 });
+        let actions = rt.tick();
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                RuntimeAction::SendPathRequest { identity_hash }
+                if *identity_hash == [0xAA; 16]
+            )),
+            "expected SendPathRequest for [0xAA;16], got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn tunnel_established_event_updates_contact_last_seen() {
+        let (mut rt, _) = make_runtime();
+        let contact = harmony_contacts::Contact {
+            identity_hash: [0xBB; 16],
+            display_name: None,
+            peering: harmony_contacts::PeeringPolicy {
+                enabled: true,
+                priority: harmony_contacts::PeeringPriority::High,
+            },
+            added_at: 1000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![harmony_contacts::ContactAddress::Tunnel {
+                node_id: [0xCC; 32],
+                relay_url: None,
+                direct_addrs: vec![],
+            }],
+        };
+        rt.contact_store_mut().add(contact).unwrap();
+        rt.push_event(RuntimeEvent::ContactChanged {
+            identity_hash: [0xBB; 16],
+        });
+        rt.push_event(RuntimeEvent::TunnelPeerEstablished {
+            identity_hash: [0xBB; 16],
+            node_id: [0xCC; 32],
+            now: 5000,
+        });
+        // UpdateLastSeen should have been applied by translate_peer_actions.
+        assert_eq!(
+            rt.contact_store().get(&[0xBB; 16]).unwrap().last_seen,
+            Some(5000)
         );
     }
 }
