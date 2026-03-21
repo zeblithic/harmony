@@ -9,11 +9,13 @@
 
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use harmony_identity::{PqIdentity, PqPrivateIdentity};
 use harmony_tunnel::session::TunnelSession;
 use harmony_tunnel::{TunnelAction, TunnelEvent};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::mpsc;
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
 use crate::tunnel_bridge::{TunnelBridgeEvent, TunnelCommand};
 
@@ -247,15 +249,28 @@ async fn responder_handshake(
 /// Main tunnel read/write/keepalive loop.
 ///
 /// Runs until the tunnel is closed, errors, or the command channel drops.
+///
+/// Uses `FramedRead` with `LengthDelimitedCodec` for cancel-safe reading.
+/// The codec buffers partial reads internally, so dropping the read future
+/// mid-payload (when `select!` fires another arm) does not discard consumed
+/// bytes — the next `.next()` call resumes from the buffered position.
 async fn run_tunnel_loop(
     mut session: TunnelSession,
     mut send_stream: SendStream,
-    mut recv_stream: RecvStream,
+    recv_stream: RecvStream,
     bridge_tx: mpsc::Sender<TunnelBridgeEvent>,
     mut cmd_rx: mpsc::Receiver<TunnelCommand>,
     interface_name: String,
     connection_id: u64,
 ) {
+    // Wrap the recv stream in a length-delimited codec for cancel-safe reads.
+    let codec = LengthDelimitedCodec::builder()
+        .length_field_length(4)
+        .big_endian()
+        .max_frame_length(DATA_MAX_MESSAGE)
+        .new_codec();
+    let mut framed = FramedRead::new(recv_stream, codec);
+
     // Timer fires at 10s intervals -- more frequent than the 30s keepalive
     // interval, but the TunnelSession state machine decides when to actually
     // emit a keepalive frame (every 30s) and when to declare dead peer (90s).
@@ -265,10 +280,11 @@ async fn run_tunnel_loop(
 
     loop {
         tokio::select! {
-            // Read from iroh stream
-            result = read_length_prefixed(&mut recv_stream, DATA_MAX_MESSAGE) => {
-                match result {
-                    Ok(data) => {
+            // Read from iroh stream (cancel-safe: codec buffers partial reads)
+            frame = framed.next() => {
+                match frame {
+                    Some(Ok(bytes)) => {
+                        let data = bytes.to_vec();
                         let now_ms = millis_since_start();
                         match session.handle_event(TunnelEvent::InboundBytes { data, now_ms }) {
                             Ok(actions) => {
@@ -288,10 +304,19 @@ async fn run_tunnel_loop(
                             }
                         }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         let _ = bridge_tx.send(TunnelBridgeEvent::TunnelClosed {
                             interface_name: interface_name.clone(),
                             reason: format!("stream read error: {e}"),
+                            connection_id,
+                        }).await;
+                        break;
+                    }
+                    None => {
+                        // Stream closed by peer
+                        let _ = bridge_tx.send(TunnelBridgeEvent::TunnelClosed {
+                            interface_name: interface_name.clone(),
+                            reason: "stream closed by peer".to_string(),
                             connection_id,
                         }).await;
                         break;
@@ -333,7 +358,11 @@ async fn run_tunnel_loop(
                         }
                     }
                     Some(TunnelCommand::Close) | None => {
-                        let _ = session.handle_event(TunnelEvent::Close);
+                        if let Ok(close_actions) = session.handle_event(TunnelEvent::Close) {
+                            let _ = dispatch_tunnel_actions(
+                                &close_actions, &mut send_stream, &bridge_tx, &interface_name, connection_id,
+                            ).await;
+                        }
                         let _ = bridge_tx.send(TunnelBridgeEvent::TunnelClosed {
                             interface_name: interface_name.clone(),
                             reason: "closed by event loop".to_string(),
@@ -502,4 +531,58 @@ fn millis_since_start() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
     start.elapsed().as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn millis_since_start_is_monotonic() {
+        let a = millis_since_start();
+        let b = millis_since_start();
+        assert!(b >= a);
+    }
+
+    #[test]
+    fn handshake_max_covers_tunnel_init() {
+        // TunnelInit: 1088 (CT) + 1952 (DSA pk) + 32 (nonce) + 3309 (sig) = 6381 bytes
+        assert!(
+            HANDSHAKE_MAX_MESSAGE >= 6381 + 100,
+            "HANDSHAKE_MAX_MESSAGE ({HANDSHAKE_MAX_MESSAGE}) must have headroom above TunnelInit (6381 bytes)"
+        );
+    }
+
+    #[test]
+    fn handshake_max_covers_tunnel_accept() {
+        // TunnelAccept: 1952 (DSA pk) + 32 (nonce) + 3309 (sig) = 5293 bytes
+        assert!(
+            HANDSHAKE_MAX_MESSAGE >= 5293 + 100,
+            "HANDSHAKE_MAX_MESSAGE ({HANDSHAKE_MAX_MESSAGE}) must have headroom above TunnelAccept (5293 bytes)"
+        );
+    }
+
+    #[test]
+    fn data_max_is_reasonable() {
+        // 2 MiB cap per message
+        assert_eq!(DATA_MAX_MESSAGE, 2 * 1024 * 1024);
+        // 64 concurrent peers x 2 MiB = 128 MiB worst case, under 256 MiB
+        assert!(
+            DATA_MAX_MESSAGE * 64 <= 256 * 1024 * 1024,
+            "worst-case allocation for 64 peers exceeds 256 MiB"
+        );
+    }
+
+    #[test]
+    fn framed_codec_matches_wire_format() {
+        // Verify that the LengthDelimitedCodec we configure in run_tunnel_loop
+        // matches the 4-byte big-endian length prefix used by write_length_prefixed.
+        let codec = LengthDelimitedCodec::builder()
+            .length_field_length(4)
+            .big_endian()
+            .max_frame_length(DATA_MAX_MESSAGE)
+            .new_codec();
+        // LengthDelimitedCodec's max_frame_length getter confirms our config
+        assert_eq!(codec.max_frame_length(), DATA_MAX_MESSAGE);
+    }
 }

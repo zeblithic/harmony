@@ -1919,6 +1919,7 @@ name = "harmony-node"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures-util",
  "harmony-compute",
  "harmony-content",
  "harmony-crypto",
@@ -1932,6 +1933,7 @@ dependencies = [
  "rand 0.8.5",
  "tempfile",
  "tokio",
+ "tokio-util",
  "zenoh",
  "zeroize",
 ]

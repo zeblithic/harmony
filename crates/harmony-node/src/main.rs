@@ -59,7 +59,7 @@ enum Commands {
         /// iroh NodeId of a peer to connect to (outbound tunnel)
         /// TODO: Outbound initiator connections need the remote peer's PqIdentity
         /// for the ML-KEM encapsulation, which comes from the contact store (Bead #3).
-        #[arg(long, value_name = "ADDR")]
+        #[arg(long, value_name = "NODE_ID")]
         tunnel_peer: Option<String>,
     },
 }
