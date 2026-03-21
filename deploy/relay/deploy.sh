@@ -36,8 +36,10 @@ RATE_LIMIT_BURST="${RATE_LIMIT_BURST:-512000}"
 
 # ── Input validation ──────────────────────────────────────────────
 # Prevent shell injection via SSH commands and TOML config corruption.
-[[ "${RELAY_HOSTNAME}" =~ ^[a-zA-Z0-9._-]+$ ]] \
-    || { echo "ERROR: RELAY_HOSTNAME must be a valid hostname (alphanumeric, dots, hyphens)"; exit 1; }
+# RFC 952: labels start/end with alphanumeric, hyphens only in the middle.
+# No underscores — they cause ACME/Let's Encrypt certificate failures.
+[[ "${RELAY_HOSTNAME}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]] \
+    || { echo "ERROR: RELAY_HOSTNAME must be a valid hostname (RFC 952: alphanumeric labels separated by dots, no leading/trailing hyphens)"; exit 1; }
 [[ "${CONTACT_EMAIL}" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$ ]] \
     || { echo "ERROR: CONTACT_EMAIL must be a valid email address (user@domain.tld)"; exit 1; }
 # Validate LOCAL_BINARY early: if set but missing, fail now rather than
@@ -51,7 +53,8 @@ fi
 if [ -z "${LOCAL_BINARY}" ]; then
     [[ "${IROH_VERSION}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?(\+[a-zA-Z0-9._-]+)?$ ]] \
         || { echo "ERROR: IROH_VERSION must be a valid semver tag (e.g. v0.91.2)"; exit 1; }
-    [[ "${IROH_REPO}" =~ ^https://[a-zA-Z0-9._/-]+(:[0-9]+)?/[a-zA-Z0-9._/-]+\.git$ ]] \
+    # Host excludes / so it can't consume path segments; path segments separated by literal /.
+    [[ "${IROH_REPO}" =~ ^https://[a-zA-Z0-9._-]+(:[0-9]+)?(/[a-zA-Z0-9._-]+)+\.git$ ]] \
         || { echo "ERROR: IROH_REPO must be a valid https git URL ending in .git"; exit 1; }
 fi
 # TOML forbids leading zeros in integers — match (0|[1-9][0-9]*).
