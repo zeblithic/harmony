@@ -26,7 +26,8 @@ pub struct Contact {
     pub last_seen: Option<u64>,
     pub notes: Option<String>,
     /// Network addresses where this contact can be reached.
-    #[serde(default)]
+    /// Note: `#[serde(default)]` is ineffective with postcard (non-self-describing).
+    /// Backward compat is handled by FORMAT_VERSION gating in ContactStore.
     pub addresses: Vec<ContactAddress>,
 }
 

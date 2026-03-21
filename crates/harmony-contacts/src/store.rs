@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::contact::{Contact, PeeringPriority};
 use crate::error::ContactError;
 
-const FORMAT_VERSION: u8 = 1;
+// Bumped from 1 → 2: Contact gained `addresses: Vec<ContactAddress>`.
+// postcard is non-self-describing — `#[serde(default)]` is ineffective,
+// so v1 data cannot be deserialized into v2 structs.
+const FORMAT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactStore {

@@ -360,9 +360,6 @@ pub struct NodeRuntime<B: BookStore> {
     contact_store: ContactStore,
     // Peer lifecycle manager
     peer_manager: PeerManager,
-    // Most recent `now` value from events (milliseconds). Used for
-    // feeding discovery tick with second-resolution timestamps.
-    last_now: u64,
     // Local tunnel routing hint (populated when iroh endpoint binds).
     // TODO: Wire into AnnounceBuilder when outgoing announce publishing
     // is implemented via DiscoveryAction::PublishAnnounce + Zenoh put.
@@ -476,7 +473,6 @@ impl<B: BookStore> NodeRuntime<B> {
             discovery: DiscoveryManager::new(),
             contact_store: ContactStore::new(),
             peer_manager: PeerManager::new(),
-            last_now: 0,
             local_tunnel_hint: None,
         };
 
@@ -584,7 +580,6 @@ impl<B: BookStore> NodeRuntime<B> {
                 });
             }
             RuntimeEvent::TimerTick { now } => {
-                self.last_now = now;
                 self.router_queue.push_back(NodeEvent::TimerTick { now });
             }
             RuntimeEvent::QueryReceived {
@@ -686,8 +681,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 tracing::info!(%interface_name, "tunnel closed — interface unregistered");
                 self.router.unregister_interface(&interface_name);
             }
-            RuntimeEvent::DiscoveryAnnounceReceived { record_bytes, now } => {
-                self.last_now = now;
+            RuntimeEvent::DiscoveryAnnounceReceived { record_bytes, now: _ } => {
                 let record = match harmony_discovery::AnnounceRecord::deserialize(&record_bytes) {
                     Ok(r) => r,
                     Err(e) => {
