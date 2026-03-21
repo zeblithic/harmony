@@ -702,15 +702,11 @@ impl<B: BookStore> NodeRuntime<B> {
                     tracing::debug!("announce verification failed: {e:?}");
                     return;
                 }
-                // Process tunnel hints directly from the verified record.
-                // DiscoveryManager.IdentityDiscovered requires the peer to be in
-                // the `online` set (via LivelinessChange), which needs Zenoh
-                // liveliness token wiring — not yet implemented. By processing
-                // hints here, tunnel contacts are populated on first announce
-                // without waiting for the full liveliness flow.
-                self.process_discovered_tunnel_hints(&record);
+                let identity_hash = record.identity_ref.hash;
+                let published_at = record.published_at;
 
-                // Still feed the record to DiscoveryManager for caching/expiry.
+                // Feed to DiscoveryManager first — it performs staleness checks
+                // (rejects records with published_at <= cached published_at).
                 let actions =
                     self.discovery
                         .on_event(harmony_discovery::DiscoveryEvent::AnnounceReceived {
@@ -718,6 +714,25 @@ impl<B: BookStore> NodeRuntime<B> {
                             now: unix_now,
                         });
                 self.dispatch_discovery_actions(actions);
+
+                // Only process tunnel hints if the manager accepted the record
+                // (not rejected as stale). Check by comparing the cached record's
+                // published_at with the one we submitted.
+                let accepted = self
+                    .discovery
+                    .get_record(&identity_hash, unix_now)
+                    .map(|r| r.published_at == published_at)
+                    .unwrap_or(false);
+                if accepted {
+                    // DiscoveryManager.IdentityDiscovered requires the peer to
+                    // be in the `online` set (via LivelinessChange), which needs
+                    // Zenoh liveliness token wiring — not yet implemented.
+                    // Process hints directly from the accepted record.
+                    if let Some(cached) = self.discovery.get_record(&identity_hash, unix_now) {
+                        let cached_clone = cached.clone();
+                        self.process_discovered_tunnel_hints(&cached_clone);
+                    }
+                }
             }
             RuntimeEvent::LocalTunnelInfo { node_id, relay_url } => {
                 self.local_tunnel_hint = Some(harmony_discovery::RoutingHint::Tunnel {
@@ -946,14 +961,12 @@ impl<B: BookStore> NodeRuntime<B> {
         }
     }
 
-    fn dispatch_discovery_actions(&mut self, actions: Vec<harmony_discovery::DiscoveryAction>) {
-        for action in actions {
-            if let harmony_discovery::DiscoveryAction::IdentityDiscovered { record } = action {
-                self.process_discovered_tunnel_hints(&record);
-            }
-            // Other discovery actions (PublishAnnounce, SetLiveliness, etc.)
-            // deferred to full Zenoh wiring.
-        }
+    fn dispatch_discovery_actions(&mut self, _actions: Vec<harmony_discovery::DiscoveryAction>) {
+        // Tunnel hint processing is done at the call site (after staleness
+        // check) rather than here via IdentityDiscovered, because
+        // IdentityDiscovered requires Zenoh liveliness tokens (not wired).
+        // Other actions (PublishAnnounce, SetLiveliness, etc.) deferred to
+        // full Zenoh wiring.
     }
 
     /// Extract `RoutingHint::Tunnel` from a discovery record and auto-populate
