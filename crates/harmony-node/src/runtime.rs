@@ -1066,37 +1066,9 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Translate PeerActions into RuntimeActions, buffering into pending_direct_actions.
     /// Used from push_event where no output vec is available.
     fn translate_peer_actions(&mut self, peer_actions: Vec<PeerAction>) {
-        for action in peer_actions {
-            match action {
-                PeerAction::InitiateTunnel {
-                    identity_hash,
-                    node_id,
-                    relay_url,
-                } => {
-                    self.pending_direct_actions
-                        .push(RuntimeAction::InitiateTunnel {
-                            identity_hash,
-                            node_id,
-                            relay_url,
-                        });
-                }
-                PeerAction::SendPathRequest { identity_hash } => {
-                    self.pending_direct_actions
-                        .push(RuntimeAction::SendPathRequest { identity_hash });
-                }
-                PeerAction::UpdateLastSeen {
-                    identity_hash,
-                    timestamp,
-                } => {
-                    self.contact_store
-                        .update_last_seen(&identity_hash, timestamp);
-                }
-                PeerAction::InitiateLink { .. } | PeerAction::CloseLink { .. } => {
-                    // Reticulum link initiation/close — stub for now.
-                    // These will be wired when Link protocol is implemented.
-                }
-            }
-        }
+        let mut out = std::mem::take(&mut self.pending_direct_actions);
+        self.translate_peer_actions_out(peer_actions, &mut out);
+        self.pending_direct_actions = out;
     }
 
     /// Translate PeerActions into RuntimeActions, pushing directly to an output vec.

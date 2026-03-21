@@ -120,6 +120,8 @@ impl PeerManager {
             PeerEvent::TunnelFailed { identity_hash } => {
                 if let Some(peer) = self.peers.get_mut(&identity_hash) {
                     if matches!(peer.status, PeerStatus::Connecting | PeerStatus::Searching) {
+                        peer.last_probe =
+                            peer.connecting_since.or(peer.last_seen).or(peer.last_probe);
                         peer.status = PeerStatus::Searching;
                         peer.retry_count = peer.retry_count.saturating_add(1);
                         peer.connecting_since = None;
@@ -150,6 +152,7 @@ impl PeerManager {
 
                         if has_reticulum {
                             actions.push(PeerAction::InitiateLink { identity_hash });
+                            peer.status = PeerStatus::Connecting;
                         }
                     }
                 }
@@ -1020,7 +1023,8 @@ mod tests {
         let actions =
             mgr.on_event(PeerEvent::TunnelDropped { identity_hash: id }, &store);
         let peer = mgr.peers.get(&id).unwrap();
-        assert_eq!(peer.status, PeerStatus::Searching);
+        // Falls back to Reticulum immediately — status is Connecting, not Searching.
+        assert_eq!(peer.status, PeerStatus::Connecting);
         assert_eq!(peer.retry_count, 1);
         assert!(peer.connection_quality.is_none());
         // Should immediately emit InitiateLink as Reticulum fallback

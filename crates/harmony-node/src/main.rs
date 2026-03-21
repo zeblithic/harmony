@@ -285,7 +285,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         enabled: true,
                         priority: harmony_contacts::PeeringPriority::Normal,
                     },
-                    added_at: 0,
+                    added_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
                     last_seen: None,
                     notes: None,
                     addresses: vec![harmony_contacts::ContactAddress::Tunnel {

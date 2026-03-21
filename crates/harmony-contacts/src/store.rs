@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::contact::{Contact, ContactAddress, PeeringPriority};
 use crate::error::ContactError;
 
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactStore {
