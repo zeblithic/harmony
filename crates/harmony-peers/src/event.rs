@@ -1,3 +1,4 @@
+use alloc::string::String;
 use harmony_identity::IdentityHash;
 
 /// Events fed into the PeerManager by the caller/runtime.
@@ -19,6 +20,17 @@ pub enum PeerEvent {
     LinkClosed {
         identity_hash: IdentityHash,
     },
+    TunnelEstablished {
+        identity_hash: IdentityHash,
+        node_id: [u8; 32],
+        now: u64,
+    },
+    TunnelFailed {
+        identity_hash: IdentityHash,
+    },
+    TunnelDropped {
+        identity_hash: IdentityHash,
+    },
     Tick {
         now: u64,
     },
@@ -30,10 +42,19 @@ pub enum PeerAction {
     InitiateLink {
         identity_hash: IdentityHash,
     },
+    InitiateTunnel {
+        identity_hash: IdentityHash,
+        node_id: [u8; 32],
+        relay_url: Option<String>,
+    },
     SendPathRequest {
         identity_hash: IdentityHash,
     },
     CloseLink {
+        identity_hash: IdentityHash,
+    },
+    /// Tear down an active tunnel connection.
+    CloseTunnel {
         identity_hash: IdentityHash,
     },
     UpdateLastSeen {
