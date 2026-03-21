@@ -247,13 +247,22 @@ mod tests {
 
     #[test]
     fn ml_dsa65_invalid_signature_length_rejected() {
-        let err = verify_signature(
-            CryptoSuite::MlDsa65,
-            &[0x00; 1952], // valid-length key placeholder
-            b"msg",
-            &[0x00; 64], // ML-DSA-65 signatures are 3309 bytes
-        )
-        .unwrap_err();
-        assert!(matches!(err, IdentityError::SignatureInvalid));
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (sign_pk, _) = harmony_crypto::ml_dsa::generate(&mut OsRng);
+
+                let err = verify_signature(
+                    CryptoSuite::MlDsa65,
+                    &sign_pk.as_bytes(),
+                    b"msg",
+                    &[0x00; 64], // ML-DSA-65 signatures are 3309 bytes
+                )
+                .unwrap_err();
+                assert!(matches!(err, IdentityError::SignatureInvalid));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 }
