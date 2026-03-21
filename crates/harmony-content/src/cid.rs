@@ -252,13 +252,13 @@ impl ContentId {
         if flags.is_inline() {
             return Err(ContentError::InvalidFlags);
         }
-        Ok(Self::assemble(
-            flags,
-            STREAM_DEPTH,
-            chunk_index & 0xF_FFFF,
-            hash,
-            false,
-        ))
+        if chunk_index > 0xF_FFFF {
+            return Err(ContentError::PayloadTooLarge {
+                size: chunk_index as usize,
+                max: 0xF_FFFF,
+            });
+        }
+        Ok(Self::assemble(flags, STREAM_DEPTH, chunk_index, hash, false))
     }
 
     pub fn inline_data(data: &[u8], flags: ContentFlags) -> Result<Self, ContentError> {
@@ -501,10 +501,9 @@ pub fn decode_bundle_size(raw: u32) -> u64 {
     let base = 4096u64 + mantissa as u64; // (1 + M/4096) * 4096
     let shift = exponent + 8; // 2^(E+20) / 4096 = 2^(E+8)
     if shift >= 64 {
-        u64::MAX
-    } else {
-        base << shift
+        return u64::MAX;
     }
+    base.checked_shl(shift).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
