@@ -33,32 +33,41 @@ impl PeerTable {
     }
 
     /// Add or refresh a peer. No-op when `reticulum_addr == our_addr`.
-    pub fn add_peer(&mut self, addr: SocketAddr, reticulum_addr: [u8; 16], proto_version: u8) {
+    /// Returns `true` if the peer was newly inserted, `false` if an existing entry was updated.
+    pub fn add_peer(
+        &mut self,
+        addr: SocketAddr,
+        reticulum_addr: [u8; 16],
+        proto_version: u8,
+    ) -> bool {
         if reticulum_addr == self.our_addr {
-            return;
+            return false;
         }
         let now = Instant::now();
-        let entry = self.peers.entry(addr).or_insert_with(|| PeerInfo {
-            reticulum_addr,
-            proto_version,
-            last_seen: now,
-            discovered_at: now,
-        });
-        // Upsert: update mutable fields on subsequent calls for the same socket.
-        entry.reticulum_addr = reticulum_addr;
-        entry.proto_version = proto_version;
-        entry.last_seen = now;
-
+        let is_new = !self.peers.contains_key(&addr);
+        self.peers
+            .entry(addr)
+            .and_modify(|p| {
+                p.last_seen = now;
+                p.proto_version = proto_version;
+            })
+            .or_insert(PeerInfo {
+                reticulum_addr,
+                proto_version,
+                last_seen: now,
+                discovered_at: now,
+            });
         self.addr_to_sockets
             .entry(reticulum_addr)
             .or_default()
             .insert(addr);
+        is_new
     }
 
     /// Remove all socket addrs associated with `reticulum_addr`.
     /// Returns the number of socket entries removed.
-    pub fn remove_by_reticulum_addr(&mut self, reticulum_addr: [u8; 16]) -> usize {
-        let Some(sockets) = self.addr_to_sockets.remove(&reticulum_addr) else {
+    pub fn remove_by_reticulum_addr(&mut self, reticulum_addr: &[u8; 16]) -> usize {
+        let Some(sockets) = self.addr_to_sockets.remove(reticulum_addr) else {
             return 0;
         };
         let count = sockets.len();
@@ -69,8 +78,8 @@ impl PeerTable {
     }
 
     /// Update `last_seen` for a known socket address. No-op for unknown addrs.
-    pub fn mark_seen(&mut self, src_addr: SocketAddr) {
-        if let Some(info) = self.peers.get_mut(&src_addr) {
+    pub fn mark_seen(&mut self, src_addr: &SocketAddr) {
+        if let Some(info) = self.peers.get_mut(src_addr) {
             info.last_seen = Instant::now();
         }
     }
@@ -123,7 +132,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn make_addr(port: u16) -> SocketAddr {
-        SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, port as u8)), port)
+        SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, port as u8)),
+            port,
+        )
     }
 
     fn make_reticulum_addr(tag: u8) -> [u8; 16] {
@@ -175,7 +187,10 @@ mod tests {
 
         assert_eq!(t.peer_count(), 1);
         let info = t.peers.get(&sa).unwrap();
-        assert_eq!(info.proto_version, 2, "proto_version should be updated on upsert");
+        assert_eq!(
+            info.proto_version, 2,
+            "proto_version should be updated on upsert"
+        );
         assert_eq!(
             t.addr_to_sockets.get(&ra).unwrap().len(),
             1,
@@ -211,7 +226,7 @@ mod tests {
         t.add_peer(sa1, ra, 1);
         t.add_peer(sa2, ra, 1);
 
-        let removed = t.remove_by_reticulum_addr(ra);
+        let removed = t.remove_by_reticulum_addr(&ra);
 
         assert_eq!(removed, 2);
         assert_eq!(t.peer_count(), 0);
@@ -224,7 +239,7 @@ mod tests {
         let mut t = table_with_timeout(60);
         let ra = make_reticulum_addr(5);
 
-        let removed = t.remove_by_reticulum_addr(ra);
+        let removed = t.remove_by_reticulum_addr(&ra);
 
         assert_eq!(removed, 0);
     }
@@ -243,10 +258,13 @@ mod tests {
         let start = Instant::now();
         while Instant::now().duration_since(start) < Duration::from_nanos(1) {}
 
-        t.mark_seen(sa);
+        t.mark_seen(&sa);
         let after = t.peers.get(&sa).unwrap().last_seen;
 
-        assert!(after >= before, "last_seen should be non-decreasing after mark_seen");
+        assert!(
+            after >= before,
+            "last_seen should be non-decreasing after mark_seen"
+        );
     }
 
     // ── 8. mark_seen_unknown_addr_is_noop ────────────────────────────────────
@@ -256,7 +274,7 @@ mod tests {
         let unknown = make_addr(9999);
 
         // Must not panic or insert.
-        t.mark_seen(unknown);
+        t.mark_seen(&unknown);
         assert_eq!(t.peer_count(), 0);
     }
 
@@ -278,7 +296,10 @@ mod tests {
 
         assert!(evicted.contains(&sa));
         assert_eq!(t.peer_count(), 0);
-        assert!(t.addr_to_sockets.get(&ra).is_none(), "reverse index must be cleaned");
+        assert!(
+            t.addr_to_sockets.get(&ra).is_none(),
+            "reverse index must be cleaned"
+        );
     }
 
     // ── 10. evict_stale_keeps_fresh_peers ────────────────────────────────────
