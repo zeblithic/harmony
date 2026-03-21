@@ -125,13 +125,7 @@ if [ -n "$LOCAL_BINARY" ] && [ -f "$LOCAL_BINARY" ]; then
 elif command -v nix &>/dev/null; then
     echo "--- Step 4: Building iroh-relay via Nix..."
 
-    # Build locally (cross-compiles to x86_64-linux-musl on any host)
-    echo "    Running: nix build .#iroh-relay-x86_64-linux (from ${REPO_ROOT})"
-    # Single-output derivation — no ^out selector needed (and ^out requires Nix ≥ 2.9).
-    STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux" --print-out-paths --no-link)
-    echo "    Store path: ${STORE_PATH}"
-
-    # Verify Nix is installed on the VM before any nix-store operations
+    # Verify Nix is installed on the VM BEFORE building locally (~2 min).
     if ! gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" \
         --command="command -v nix-store" &>/dev/null; then
         echo "ERROR: Nix is not installed on ${VM_NAME}."
@@ -140,9 +134,15 @@ elif command -v nix &>/dev/null; then
         exit 1
     fi
 
-    # Check if VM already has this exact store path (fast path)
+    # Build locally (cross-compiles to x86_64-linux-musl on any host)
+    echo "    Running: nix build .#iroh-relay-x86_64-linux (from ${REPO_ROOT})"
+    STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux" --print-out-paths --no-link)
+    echo "    Store path: ${STORE_PATH}"
+
+    # Check if VM already has this exact store path (fast path).
+    # Uses nix-store (stable CLI) instead of nix path-info (requires experimental nix-command).
     if gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" \
-        --command="nix path-info '$STORE_PATH'" &>/dev/null; then
+        --command="nix-store --check-validity '$STORE_PATH'" &>/dev/null; then
         echo "    VM already has this store path — skipping push."
     else
         echo "    Pushing Nix closure to VM..."
@@ -152,10 +152,11 @@ elif command -v nix &>/dev/null; then
         echo "    Closure pushed."
     fi
 
-    # Sign the store path on the VM if a cache signing key exists
+    # Sign the entire closure on the VM if a cache signing key exists.
+    # Uses nix-store --sign (stable CLI) instead of nix store sign (requires nix-command).
     gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
         if [ -f /etc/nix/cache-key.pem ]; then
-            sudo nix store sign --key-file /etc/nix/cache-key.pem '$STORE_PATH'
+            nix-store -qR '$STORE_PATH' | xargs sudo nix-store --sign --key-file /etc/nix/cache-key.pem
         fi
     "
 

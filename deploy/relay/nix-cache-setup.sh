@@ -60,7 +60,12 @@ fi
 # ---------------------------------------------------------------------------
 if ! command -v nix-serve &>/dev/null; then
   echo "[nix-cache-setup] Installing nix-serve..."
-  nix-channel --update nixpkgs 2>/dev/null || true
+  # Ensure the current user has the nixpkgs channel (multi-user installer
+  # only adds it for root; gcloud ssh connects as a regular user).
+  if ! nix-channel --list 2>/dev/null | grep -q nixpkgs; then
+    nix-channel --add https://nixos.org/channels/nixpkgs-unstable nixpkgs
+  fi
+  nix-channel --update nixpkgs
   nix-env -iA nixpkgs.nix-serve
 else
   echo "[nix-cache-setup] nix-serve already installed — skipping."
