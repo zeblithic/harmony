@@ -145,9 +145,14 @@ if [ -n "$LOCAL_BINARY" ] && [ -f "$LOCAL_BINARY" ]; then
 elif command -v nix &>/dev/null; then
     echo "--- Step 4: Building iroh-relay via Nix..."
 
+    # gcloud compute ssh runs a non-login, non-interactive shell where
+    # /etc/profile.d/nix.sh is never sourced. Prefix all remote commands
+    # with Nix PATH setup so nix-store is found (NixOS/nix#2587).
+    NIX_SSH_PREFIX='export PATH="/nix/var/nix/profiles/default/bin:$PATH";'
+
     # Verify Nix is installed on the VM BEFORE building locally (~2 min).
     if ! gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" \
-        --command="command -v nix-store" &>/dev/null; then
+        --command="${NIX_SSH_PREFIX} command -v nix-store" &>/dev/null; then
         echo "ERROR: Nix is not installed on ${VM_NAME}."
         echo "Run nix-cache-setup.sh first:"
         echo "  gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- 'bash -s' < deploy/relay/nix-cache-setup.sh"
@@ -188,7 +193,7 @@ elif command -v nix &>/dev/null; then
     # Check if VM already has this exact store path (fast path).
     # Uses nix-store (stable CLI) instead of nix path-info (requires experimental nix-command).
     if gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" \
-        --command="nix-store --check-validity '$STORE_PATH'" &>/dev/null; then
+        --command="${NIX_SSH_PREFIX} nix-store --check-validity '$STORE_PATH'" &>/dev/null; then
         echo "    VM already has this store path — skipping push."
     else
         echo "    Pushing Nix closure to VM..."
@@ -203,7 +208,7 @@ elif command -v nix &>/dev/null; then
         done < <(nix-store -qR "$STORE_PATH")
         nix-store --export "${CLOSURE[@]}" | \
             gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" -- \
-            "sudo nix-store --import"
+            "${NIX_SSH_PREFIX} sudo nix-store --import"
         echo "    Closure pushed."
     fi
 

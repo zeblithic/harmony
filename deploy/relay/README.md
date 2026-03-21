@@ -100,7 +100,7 @@ Commit `cache-key.pub` so clients can verify cache signatures.
 ```
 deploy.sh:
   1. Check VM has Nix (pre-flight)
-  2. Set NIX_CONFIG with relay cache as extra-substituter
+  2. Pass --extra-substituters to nix build (best-effort cache hit)
   3. nix build .#iroh-relay-x86_64-linux
      └── check local /nix/store
      └── check binary cache (http://<relay>:5000) if cache-key.pub is set
@@ -114,7 +114,7 @@ by nix-cache-setup.sh). No explicit signing step in the deploy script.
 ```
 
 `deploy.sh` configures the VM's binary cache as an `extra-substituter` via
-`NIX_CONFIG`, so `nix build` can pull pre-built artifacts. The closure is
+`--extra-substituters` CLI flags, so `nix build` can pull pre-built artifacts. The closure is
 pushed to the VM via `nix-store --export/--import` over `gcloud compute ssh`
 (not `nix copy`). On subsequent deploys from any machine with the cache
 configured, `nix build` is a cache hit — only the push step runs.

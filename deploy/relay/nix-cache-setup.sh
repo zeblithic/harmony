@@ -84,11 +84,18 @@ NIX_SERVE_BIN="$(readlink -f "$(command -v nix-serve)")"
 SERVICE_FILE=/etc/systemd/system/nix-serve.service
 
 # Create a dedicated unprivileged user for nix-serve.
-# nix-serve only needs read access to /nix/store (world-readable)
-# and read access to the signing key.
+# nix-serve needs: read access to /nix/store (world-readable), read access
+# to the signing key, and access to the Nix daemon socket (group-owned by
+# nixbld on multi-user installs).
 if ! id -u nix-serve &>/dev/null; then
     sudo useradd -r -s /bin/false -d /nonexistent nix-serve
     echo "[nix-cache-setup] Created nix-serve user."
+fi
+# Ensure nix-serve can talk to the nix-daemon socket (group-owned by nixbld).
+NIX_GROUP=$(stat -c '%G' /nix/var/nix/daemon-socket/socket 2>/dev/null || echo nixbld)
+if ! id -nG nix-serve 2>/dev/null | grep -qw "$NIX_GROUP"; then
+    sudo usermod -aG "$NIX_GROUP" nix-serve
+    echo "[nix-cache-setup] Added nix-serve to group ${NIX_GROUP}."
 fi
 # Grant nix-serve group read on the signing key
 sudo chgrp nix-serve "${PRIVATE_KEY}" 2>/dev/null || true
