@@ -26,6 +26,14 @@ pub trait CredentialKeyResolver {
     fn resolve(&self, issuer: &IdentityRef, issued_at: u64) -> Option<Vec<u8>>;
 }
 
+/// Resolve a credential by its content hash for chain verification.
+///
+/// Used by `verify_chain` to walk delegation chains. Implementations
+/// may fetch from a local cache, database, or network.
+pub trait CredentialResolver {
+    fn resolve(&self, content_hash: &[u8; 32]) -> Option<Credential>;
+}
+
 /// Verify a credential's time bounds, signature, and revocation status.
 pub fn verify_credential(
     credential: &Credential,
@@ -90,6 +98,88 @@ pub fn verify_presentation(
     Ok(())
 }
 
+/// Maximum delegation chain depth. Chains deeper than this are rejected.
+pub const MAX_CHAIN_DEPTH: usize = 8;
+
+/// Verify a credential and its full delegation chain.
+///
+/// Recursively verifies every ancestor credential -- time bounds,
+/// signature, and revocation status. If any ancestor is expired,
+/// revoked, or invalid, the entire chain fails.
+///
+/// For root credentials (no `proof` field), this behaves identically
+/// to `verify_credential`.
+pub fn verify_chain(
+    credential: &Credential,
+    now: u64,
+    keys: &impl CredentialKeyResolver,
+    status_lists: &impl StatusListResolver,
+    credentials: &impl CredentialResolver,
+) -> Result<(), CredentialError> {
+    let mut seen = [[0u8; 32]; MAX_CHAIN_DEPTH + 1];
+    seen[0] = credential.content_hash();
+    let mut seen_len = 1;
+
+    verify_chain_inner(
+        credential,
+        now,
+        keys,
+        status_lists,
+        credentials,
+        &mut seen,
+        &mut seen_len,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_chain_inner(
+    credential: &Credential,
+    now: u64,
+    keys: &impl CredentialKeyResolver,
+    status_lists: &impl StatusListResolver,
+    credentials: &impl CredentialResolver,
+    seen: &mut [[u8; 32]; MAX_CHAIN_DEPTH + 1],
+    seen_len: &mut usize,
+    depth: usize,
+) -> Result<(), CredentialError> {
+    verify_credential(credential, now, keys, status_lists)?;
+
+    if let Some(parent_hash) = credential.proof {
+        if seen[..*seen_len].contains(&parent_hash) {
+            return Err(CredentialError::ChainLoop);
+        }
+
+        if depth + 1 > MAX_CHAIN_DEPTH {
+            return Err(CredentialError::ChainTooDeep);
+        }
+
+        seen[*seen_len] = parent_hash;
+        *seen_len += 1;
+
+        let parent = credentials
+            .resolve(&parent_hash)
+            .ok_or(CredentialError::ProofNotFound)?;
+
+        if parent.subject != credential.issuer {
+            return Err(CredentialError::ChainBroken);
+        }
+
+        verify_chain_inner(
+            &parent,
+            now,
+            keys,
+            status_lists,
+            credentials,
+            seen,
+            seen_len,
+            depth + 1,
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Delegate signature verification to `harmony_identity`, mapping errors to [`CredentialError::SignatureInvalid`].
 fn verify_signature(
     suite: CryptoSuite,
@@ -103,7 +193,7 @@ fn verify_signature(
 
 /// In-memory key resolver for testing.
 ///
-/// Ignores `issued_at` — only correct for non-rotatable identities or
+/// Ignores `issued_at` -- only correct for non-rotatable identities or
 /// rotatable identities that have never rotated. Not suitable for
 /// production use with `MlDsa65Rotatable` issuers that have undergone
 /// key rotation.
@@ -132,6 +222,33 @@ impl CredentialKeyResolver for MemoryKeyResolver {
     }
 }
 
+/// In-memory credential resolver for testing.
+#[cfg(any(test, feature = "test-utils"))]
+pub struct MemoryCredentialResolver {
+    credentials: hashbrown::HashMap<[u8; 32], Credential>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl MemoryCredentialResolver {
+    pub fn new() -> Self {
+        Self {
+            credentials: hashbrown::HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, credential: Credential) {
+        let hash = credential.content_hash();
+        self.credentials.insert(hash, credential);
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl CredentialResolver for MemoryCredentialResolver {
+    fn resolve(&self, content_hash: &[u8; 32]) -> Option<Credential> {
+        self.credentials.get(content_hash).cloned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +258,8 @@ mod tests {
     use crate::status_list::{MemoryStatusListResolver, StatusList};
     use harmony_identity::{CryptoSuite, IdentityRef};
     use rand::rngs::OsRng;
+
+    use super::MemoryCredentialResolver;
 
     /// Build a signed credential using a real Ed25519 keypair.
     fn build_signed_credential() -> (
@@ -176,6 +295,46 @@ mod tests {
 
     fn empty_status() -> MemoryStatusListResolver {
         MemoryStatusListResolver::new()
+    }
+
+    fn build_delegation(
+        issuer_priv: &harmony_identity::PrivateIdentity,
+        subject_ref: IdentityRef,
+        proof: Option<[u8; 32]>,
+    ) -> Credential {
+        let issuer_ref = IdentityRef::from(issuer_priv.public_identity());
+        let mut builder = CredentialBuilder::new(issuer_ref, subject_ref, 1000, 5000, [0x30; 16]);
+        builder.add_claim(1, alloc::vec![0x01], [0xA1; 16]);
+        if let Some(hash) = proof {
+            builder.proof(hash);
+        }
+        let payload = builder.signable_payload();
+        let signature = issuer_priv.sign(&payload);
+        let (cred, _) = builder.build(signature.to_vec());
+        cred
+    }
+
+    fn setup_chain_resolvers(
+        identities: &[(&harmony_identity::PrivateIdentity, &IdentityRef)],
+        credentials: &[&Credential],
+    ) -> (
+        MemoryKeyResolver,
+        MemoryStatusListResolver,
+        MemoryCredentialResolver,
+    ) {
+        let mut keys = MemoryKeyResolver::new();
+        for (priv_id, id_ref) in identities {
+            keys.insert(
+                id_ref.hash,
+                priv_id.public_identity().verifying_key.to_bytes().to_vec(),
+            );
+        }
+        let status = MemoryStatusListResolver::new();
+        let mut creds = MemoryCredentialResolver::new();
+        for cred in credentials {
+            creds.insert((*cred).clone());
+        }
+        (keys, status, creds)
     }
 
     // ---- verify_credential tests ----
@@ -340,8 +499,14 @@ mod tests {
             disclosed_claims: claims,
         };
         assert_eq!(
-            verify_presentation(&presentation, 1500, Some(&wrong_subject), &resolver, &status)
-                .unwrap_err(),
+            verify_presentation(
+                &presentation,
+                1500,
+                Some(&wrong_subject),
+                &resolver,
+                &status
+            )
+            .unwrap_err(),
             CredentialError::SubjectMismatch
         );
     }
@@ -473,5 +638,278 @@ mod tests {
             verify_credential(&cred, 2000, &resolver, &status2).unwrap_err(),
             CredentialError::Revoked
         );
+    }
+
+    // ---- verify_chain tests ----
+
+    #[test]
+    fn chain_root_credential_no_proof() {
+        let (private, cred, _, issuer_ref) = build_signed_credential();
+        let resolver = setup_resolver(private.public_identity(), &issuer_ref);
+        let status = empty_status();
+        let creds = MemoryCredentialResolver::new();
+        assert!(verify_chain(&cred, 1500, &resolver, &status, &creds).is_ok());
+    }
+
+    #[test]
+    fn chain_valid_two_level() {
+        let gov_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let uni_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let gov_ref = IdentityRef::from(gov_priv.public_identity());
+        let uni_ref = IdentityRef::from(uni_priv.public_identity());
+        let student_ref = IdentityRef::new([0xCC; 16], CryptoSuite::Ed25519);
+
+        let delegation = build_delegation(&gov_priv, uni_ref, None);
+        let delegation_hash = delegation.content_hash();
+        let degree = build_delegation(&uni_priv, student_ref, Some(delegation_hash));
+
+        let (keys, status, creds) = setup_chain_resolvers(
+            &[(&gov_priv, &gov_ref), (&uni_priv, &uni_ref)],
+            &[&delegation],
+        );
+        assert!(verify_chain(&degree, 1500, &keys, &status, &creds).is_ok());
+    }
+
+    #[test]
+    fn chain_valid_three_level() {
+        let gov_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let uni_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let dept_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let gov_ref = IdentityRef::from(gov_priv.public_identity());
+        let uni_ref = IdentityRef::from(uni_priv.public_identity());
+        let dept_ref = IdentityRef::from(dept_priv.public_identity());
+        let student_ref = IdentityRef::new([0xCC; 16], CryptoSuite::Ed25519);
+
+        let gov_cred = build_delegation(&gov_priv, uni_ref, None);
+        let uni_cred = build_delegation(&uni_priv, dept_ref, Some(gov_cred.content_hash()));
+        let dept_cred = build_delegation(&dept_priv, student_ref, Some(uni_cred.content_hash()));
+
+        let (keys, status, creds) = setup_chain_resolvers(
+            &[
+                (&gov_priv, &gov_ref),
+                (&uni_priv, &uni_ref),
+                (&dept_priv, &dept_ref),
+            ],
+            &[&gov_cred, &uni_cred],
+        );
+        assert!(verify_chain(&dept_cred, 1500, &keys, &status, &creds).is_ok());
+    }
+
+    #[test]
+    fn chain_revoked_ancestor_fails() {
+        let gov_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let uni_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let gov_ref = IdentityRef::from(gov_priv.public_identity());
+        let uni_ref = IdentityRef::from(uni_priv.public_identity());
+        let student_ref = IdentityRef::new([0xCC; 16], CryptoSuite::Ed25519);
+
+        let mut builder = CredentialBuilder::new(gov_ref, uni_ref, 1000, 5000, [0x30; 16]);
+        builder.add_claim(1, alloc::vec![0x01], [0xA1; 16]);
+        builder.status_list_index(0);
+        let payload = builder.signable_payload();
+        let delegation = {
+            let sig = gov_priv.sign(&payload);
+            let (cred, _) = builder.build(sig.to_vec());
+            cred
+        };
+        let delegation_hash = delegation.content_hash();
+        let degree = build_delegation(&uni_priv, student_ref, Some(delegation_hash));
+
+        let mut keys = MemoryKeyResolver::new();
+        keys.insert(
+            gov_ref.hash,
+            gov_priv.public_identity().verifying_key.to_bytes().to_vec(),
+        );
+        keys.insert(
+            uni_ref.hash,
+            uni_priv.public_identity().verifying_key.to_bytes().to_vec(),
+        );
+
+        let mut status = MemoryStatusListResolver::new();
+        let mut list = StatusList::new(128);
+        list.revoke(0).unwrap();
+        status.insert(gov_ref.hash, list);
+
+        let mut creds = MemoryCredentialResolver::new();
+        creds.insert(delegation);
+
+        assert_eq!(
+            verify_chain(&degree, 1500, &keys, &status, &creds).unwrap_err(),
+            CredentialError::Revoked
+        );
+    }
+
+    #[test]
+    fn chain_broken_subject_issuer_mismatch() {
+        let gov_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let uni_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let gov_ref = IdentityRef::from(gov_priv.public_identity());
+        let uni_ref = IdentityRef::from(uni_priv.public_identity());
+        let student_ref = IdentityRef::new([0xCC; 16], CryptoSuite::Ed25519);
+
+        let wrong_ref = IdentityRef::new([0xEE; 16], CryptoSuite::Ed25519);
+        let delegation = build_delegation(&gov_priv, wrong_ref, None);
+        let delegation_hash = delegation.content_hash();
+        let degree = build_delegation(&uni_priv, student_ref, Some(delegation_hash));
+
+        let (keys, status, creds) = setup_chain_resolvers(
+            &[(&gov_priv, &gov_ref), (&uni_priv, &uni_ref)],
+            &[&delegation],
+        );
+        assert_eq!(
+            verify_chain(&degree, 1500, &keys, &status, &creds).unwrap_err(),
+            CredentialError::ChainBroken
+        );
+    }
+
+    #[test]
+    fn chain_proof_not_found() {
+        let uni_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let uni_ref = IdentityRef::from(uni_priv.public_identity());
+        let student_ref = IdentityRef::new([0xCC; 16], CryptoSuite::Ed25519);
+
+        let degree = build_delegation(&uni_priv, student_ref, Some([0xFF; 32]));
+
+        let mut keys = MemoryKeyResolver::new();
+        keys.insert(
+            uni_ref.hash,
+            uni_priv.public_identity().verifying_key.to_bytes().to_vec(),
+        );
+        let status = empty_status();
+        let creds = MemoryCredentialResolver::new();
+
+        assert_eq!(
+            verify_chain(&degree, 1500, &keys, &status, &creds).unwrap_err(),
+            CredentialError::ProofNotFound
+        );
+    }
+
+    #[test]
+    fn chain_too_deep() {
+        let privates: Vec<harmony_identity::PrivateIdentity> = (0..10)
+            .map(|_| harmony_identity::PrivateIdentity::generate(&mut OsRng))
+            .collect();
+        let refs: Vec<IdentityRef> = privates
+            .iter()
+            .map(|p| IdentityRef::from(p.public_identity()))
+            .collect();
+
+        let mut keys = MemoryKeyResolver::new();
+        for (i, p) in privates.iter().enumerate() {
+            keys.insert(
+                refs[i].hash,
+                p.public_identity().verifying_key.to_bytes().to_vec(),
+            );
+        }
+
+        let mut creds = MemoryCredentialResolver::new();
+        let mut prev_hash: Option<[u8; 32]> = None;
+
+        for i in 0..9 {
+            let cred = build_delegation(&privates[i], refs[i + 1], prev_hash);
+            prev_hash = Some(cred.content_hash());
+            creds.insert(cred);
+        }
+
+        let leaf_subject = IdentityRef::new([0xCC; 16], CryptoSuite::Ed25519);
+        let leaf = build_delegation(&privates[9], leaf_subject, prev_hash);
+
+        let status = empty_status();
+        assert_eq!(
+            verify_chain(&leaf, 1500, &keys, &status, &creds).unwrap_err(),
+            CredentialError::ChainTooDeep
+        );
+    }
+
+    #[test]
+    fn chain_loop_detected() {
+        // Content hashes make honest cycles impossible, so we use a custom
+        // resolver that deliberately returns a credential whose proof
+        // points back to the leaf.
+        let alice_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let bob_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let alice_ref = IdentityRef::from(alice_priv.public_identity());
+        let bob_ref = IdentityRef::from(bob_priv.public_identity());
+
+        let fake_parent_hash = [0xAA; 32];
+        let leaf = build_delegation(&alice_priv, bob_ref, Some(fake_parent_hash));
+        let leaf_hash = leaf.content_hash();
+
+        // Parent whose proof points back to the leaf (cycle)
+        let parent = build_delegation(&bob_priv, alice_ref, Some(leaf_hash));
+
+        // Custom resolver that always returns the cyclic parent
+        struct CyclicResolver(Credential);
+        impl CredentialResolver for CyclicResolver {
+            fn resolve(&self, _content_hash: &[u8; 32]) -> Option<Credential> {
+                Some(self.0.clone())
+            }
+        }
+
+        let mut keys = MemoryKeyResolver::new();
+        keys.insert(
+            alice_ref.hash,
+            alice_priv
+                .public_identity()
+                .verifying_key
+                .to_bytes()
+                .to_vec(),
+        );
+        keys.insert(
+            bob_ref.hash,
+            bob_priv.public_identity().verifying_key.to_bytes().to_vec(),
+        );
+        let status = empty_status();
+
+        let result = verify_chain(&leaf, 1500, &keys, &status, &CyclicResolver(parent));
+        assert_eq!(result.unwrap_err(), CredentialError::ChainLoop);
+    }
+
+    #[test]
+    fn chain_valid_two_level_ml_dsa65() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (gov_sign_pk, gov_sign_sk) = harmony_crypto::ml_dsa::generate(&mut OsRng);
+                let (gov_enc_pk, _) = harmony_crypto::ml_kem::generate(&mut OsRng);
+                let gov_pq =
+                    harmony_identity::PqIdentity::from_public_keys(gov_enc_pk, gov_sign_pk.clone());
+                let gov_ref = IdentityRef::from(&gov_pq);
+
+                let (uni_sign_pk, uni_sign_sk) = harmony_crypto::ml_dsa::generate(&mut OsRng);
+                let (uni_enc_pk, _) = harmony_crypto::ml_kem::generate(&mut OsRng);
+                let uni_pq =
+                    harmony_identity::PqIdentity::from_public_keys(uni_enc_pk, uni_sign_pk.clone());
+                let uni_ref = IdentityRef::from(&uni_pq);
+
+                let student_ref = IdentityRef::new([0xCC; 16], CryptoSuite::MlDsa65);
+
+                let mut builder = CredentialBuilder::new(gov_ref, uni_ref, 1000, 5000, [0x30; 16]);
+                builder.add_claim(1, alloc::vec![0x01], [0xA1; 16]);
+                let payload = builder.signable_payload();
+                let sig = harmony_crypto::ml_dsa::sign(&gov_sign_sk, &payload).unwrap();
+                let (delegation, _) = builder.build(sig.as_bytes().to_vec());
+                let delegation_hash = delegation.content_hash();
+
+                let mut builder2 =
+                    CredentialBuilder::new(uni_ref, student_ref, 1000, 5000, [0x31; 16]);
+                builder2.add_claim(1, alloc::vec![0x02], [0xA2; 16]);
+                builder2.proof(delegation_hash);
+                let payload2 = builder2.signable_payload();
+                let sig2 = harmony_crypto::ml_dsa::sign(&uni_sign_sk, &payload2).unwrap();
+                let (degree, _) = builder2.build(sig2.as_bytes().to_vec());
+
+                let mut keys = MemoryKeyResolver::new();
+                keys.insert(gov_ref.hash, gov_sign_pk.as_bytes());
+                keys.insert(uni_ref.hash, uni_sign_pk.as_bytes());
+                let status = MemoryStatusListResolver::new();
+                let mut creds = MemoryCredentialResolver::new();
+                creds.insert(delegation);
+
+                assert!(verify_chain(&degree, 1500, &keys, &status, &creds).is_ok());
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 }
