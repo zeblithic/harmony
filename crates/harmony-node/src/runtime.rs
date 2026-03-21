@@ -364,6 +364,8 @@ pub struct NodeRuntime<B: BookStore> {
     // feeding discovery tick with second-resolution timestamps.
     last_now: u64,
     // Local tunnel routing hint (populated when iroh endpoint binds).
+    // TODO: Wire into AnnounceBuilder when outgoing announce publishing
+    // is implemented via DiscoveryAction::PublishAnnounce + Zenoh put.
     local_tunnel_hint: Option<harmony_discovery::RoutingHint>,
 }
 
@@ -693,6 +695,8 @@ impl<B: BookStore> NodeRuntime<B> {
                         return;
                     }
                 };
+                // Pre-reject before touching the manager's cache. DiscoveryManager
+                // also verifies internally, but this avoids unnecessary state mutations.
                 if let Err(e) = harmony_discovery::verify_announce(&record, now / 1000) {
                     tracing::debug!("announce verification failed: {e:?}");
                     return;
@@ -1009,11 +1013,11 @@ impl<B: BookStore> NodeRuntime<B> {
         }
     }
 
-    fn translate_peer_actions(&mut self, _actions: Vec<harmony_peers::PeerAction>) {
+    fn translate_peer_actions(&mut self, actions: Vec<harmony_peers::PeerAction>) {
         // Peer actions (InitiateLink, SendPathRequest, CloseLink, UpdateLastSeen)
         // require full Reticulum link wiring — deferred to a follow-up bead.
         // For now, we log them at debug level.
-        for action in _actions {
+        for action in actions {
             tracing::debug!(?action, "peer action deferred");
         }
     }

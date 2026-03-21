@@ -104,9 +104,13 @@ impl AnnounceRecord {
         if data.is_empty() {
             return Err(DiscoveryError::DeserializeError("empty data"));
         }
-        if data[0] != FORMAT_VERSION && data[0] != 1 {
+        // Strict version check. V1 records would fail signature verification
+        // because signable_bytes() uses the compile-time FORMAT_VERSION (2),
+        // producing different payload bytes than the v1 signer used. Rejecting
+        // v1 upfront gives a clear error instead of a cryptic signature failure.
+        if data[0] != FORMAT_VERSION {
             return Err(DiscoveryError::DeserializeError(
-                "unsupported format version",
+                "unsupported announce format version",
             ));
         }
         postcard::from_bytes(&data[1..])
