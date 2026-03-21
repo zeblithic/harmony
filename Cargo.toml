@@ -82,6 +82,9 @@ wasmtime = "38"
 # Networking
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
 zenoh = "1"
+iroh = "0.91"
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = "0.3"
 
 # Logging
 tracing = "0.1"
@@ -124,3 +127,4 @@ harmony-zenoh = { path = "crates/harmony-zenoh" }
 inherits = "release"
 strip = true
 lto = "thin"
+

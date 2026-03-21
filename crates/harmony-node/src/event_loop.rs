@@ -1,17 +1,32 @@
-//! Async event loop — drives `NodeRuntime` via tokio select! with UDP, timer, and Zenoh.
+//! Async event loop — drives `NodeRuntime` via tokio select! with UDP, timer, Zenoh, and iroh tunnels.
 //!
 //! `NodeRuntime` is `!Send`; it lives entirely on the select loop task.
 //! Zenoh objects that need spawning are cloned (Session is internally Arc'd).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use harmony_content::book::MemoryBookStore;
+use harmony_identity::PqPrivateIdentity;
+use zeroize::Zeroize;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
 
+use crate::discovery::{self, PeerTable};
 use crate::runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
+use crate::tunnel_bridge::{ReadyConnection, TunnelBridgeEvent, TunnelSender};
+use crate::tunnel_task;
+
+/// Configuration for iroh tunnel connectivity.
+pub struct TunnelConfig {
+    /// Optional relay URL for NAT traversal.
+    pub relay_url: Option<String>,
+    /// Node identity for ML-KEM tunnel handshakes.
+    pub local_identity: Arc<PqPrivateIdentity>,
+}
 
 /// Internal bridge events from spawned Zenoh tasks to the select loop.
 enum ZenohEvent {
@@ -44,10 +59,16 @@ enum ZenohEvent {
 /// - `runtime`: the sans-I/O node state machine (`!Send` — stays on this task).
 /// - `startup_actions`: actions returned by `NodeRuntime::new`, executed before the loop.
 /// - `listen_addr`: UDP socket address to bind (broadcast also sent here).
+/// - `mdns_addr`: optional 16-byte Reticulum address for mDNS discovery (None = disabled).
+/// - `mdns_stale_timeout`: duration after which silent mDNS peers are evicted.
+/// - `tunnel_config`: optional iroh tunnel configuration (enables tunnel accept/connect).
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
     listen_addr: SocketAddr,
+    mdns_addr: Option<[u8; 16]>,
+    mdns_stale_timeout: Duration,
+    tunnel_config: Option<TunnelConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -56,11 +77,86 @@ pub async fn run(
         .parse()
         .expect("static broadcast addr");
 
+    // ── mDNS peer discovery (optional) ──────────────────────────────────────
+    let mut peer_table = PeerTable::new(
+        mdns_addr.unwrap_or([0; 16]),
+        mdns_stale_timeout,
+    );
+    let mut mdns_state = match mdns_addr {
+        Some(addr) => match discovery::start_mdns(listen_addr.port(), &addr) {
+            Ok((daemon, rx)) => {
+                tracing::info!("mDNS discovery started on _harmony._udp.local.");
+                Some((daemon, rx))
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "mDNS discovery failed to start — broadcast only");
+                None
+            }
+        },
+        None => {
+            tracing::info!("mDNS discovery disabled (--no-mdns)");
+            None
+        }
+    };
+
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
 
     // ── mpsc channel: Zenoh tasks → select loop ───────────────────────────────
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
+
+    // ── Tunnel bridge: spawned tunnel tasks → select loop ───────────────────
+    const MAX_TUNNEL_CONNECTIONS: usize = 64;
+    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<TunnelBridgeEvent>(256);
+    let mut tunnel_senders: HashMap<String, TunnelSender> = HashMap::new();
+    let mut next_connection_id: u64 = 0;
+
+    // ── Ready-connection channel: QUIC handshake tasks → select loop ──────
+    // Sends Some(ReadyConnection) on success, None on handshake failure.
+    // None lets the event loop decrement inflight_handshakes even when the
+    // spawned task never produces a usable connection.
+    let (conn_tx, mut conn_rx) = mpsc::channel::<Option<ReadyConnection>>(64);
+    // Counts QUIC handshakes that have been spawned but have not yet delivered
+    // a result on conn_rx. Added to tunnel_senders.len() for the connection cap
+    // so a burst of simultaneous connects cannot all slip under the limit.
+    let mut inflight_handshakes: usize = 0;
+
+    // ── iroh Endpoint (optional, gated on --relay-url) ─────────────────────
+    let mut iroh_endpoint = if let Some(ref config) = tunnel_config {
+        // Derive iroh SecretKey from PQ identity's ML-DSA *private* signing key.
+        // This gives a deterministic mapping: same PQ identity → same iroh NodeId,
+        // without leaking the secret — the verifying key is public, so deriving
+        // from it would let anyone impersonate this node's iroh transport identity.
+        let mut sk_bytes = config.local_identity.signing_key().as_bytes();
+        let mut hash = harmony_crypto::hash::blake3_hash(&sk_bytes);
+        sk_bytes.zeroize();
+        let secret_key = iroh::SecretKey::from(hash);
+        hash.zeroize(); // [u8; 32] is Copy — SecretKey::from copies it, zeroize the original
+
+        let mut builder = iroh::Endpoint::builder()
+            .alpns(vec![tunnel_task::HARMONY_TUNNEL_ALPN.to_vec()])
+            .secret_key(secret_key);
+
+        if let Some(ref url) = config.relay_url {
+            let relay_url: iroh::RelayUrl = url
+                .parse()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("invalid relay URL '{url}': {e}").into()
+                })?;
+            let relay_map = iroh::RelayMap::from_iter([relay_url]);
+            builder = builder.relay_mode(iroh::RelayMode::Custom(relay_map));
+        } else {
+            builder = builder.relay_mode(iroh::RelayMode::Disabled);
+        }
+
+        let ep = builder.bind().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("iroh endpoint bind failed: {e}").into()
+        })?;
+        tracing::info!(node_id = %ep.node_id(), "iroh tunnel endpoint ready");
+        Some(ep)
+    } else {
+        None
+    };
 
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
@@ -70,13 +166,15 @@ pub async fn run(
             &zenoh_tx,
             &udp,
             &broadcast_addr,
+            None,
+            &tunnel_senders,
         )
         .await;
     }
 
     // ── Monotonic epoch ─────────────────────────────────────────────────────
-    let epoch = Instant::now();
-    let now_ms = || epoch.elapsed().as_millis() as u64;
+    // Shared with tunnel_task::millis_since_start() via OnceLock — same epoch.
+    let now_ms = crate::tunnel_task::millis_since_start;
 
     // ── Timer (250 ms tick) ───────────────────────────────────────────────────
     let mut timer = time::interval(Duration::from_millis(250));
@@ -139,7 +237,10 @@ pub async fn run(
             // Arm 1: UDP packet received — buffer only, tick on timer.
             result = udp.recv_from(&mut udp_buf) => {
                 match result {
-                    Ok((len, _src)) => {
+                    Ok((len, src)) => {
+                        // Invariant: src port matches the peer's mDNS-announced listen port
+                        // because each node sends from its bound --listen-address socket.
+                        peer_table.mark_seen(&src);
                         runtime.push_event(RuntimeEvent::InboundPacket {
                             interface_name: "udp0".to_string(),
                             raw: udp_buf[..len].to_vec(),
@@ -161,6 +262,9 @@ pub async fn run(
             _ = timer.tick() => {
                 runtime.push_event(RuntimeEvent::TimerTick { now: now_ms() });
                 should_tick = true;
+                for addr in peer_table.evict_stale() {
+                    tracing::info!(peer = %addr, "evicted stale mDNS peer");
+                }
             }
 
             // Arm 3: Zenoh bridge event — buffer only, tick on timer.
@@ -197,7 +301,251 @@ pub async fn run(
                 }
             }
 
-            // Arm 4: Graceful shutdown (SIGTERM from procd, Ctrl+C).
+            // Arm 4: mDNS discovery events (when enabled).
+            result = async {
+                match &mdns_state {
+                    Some((_, rx)) => Some(rx.recv_async().await),
+                    None => std::future::pending::<Option<Result<mdns_sd::ServiceEvent, _>>>().await,
+                }
+            } => {
+                match result {
+                    Some(Ok(event)) => match event {
+                        mdns_sd::ServiceEvent::ServiceResolved(info) => {
+                            let properties = info.get_properties();
+                            if let Some(reticulum_addr) = discovery::parse_txt_addr(properties) {
+                                let proto = discovery::parse_txt_proto(properties);
+                                for ip in info.get_addresses() {
+                                    let ip_addr = ip.to_ip_addr();
+                                    // Only track addresses matching our socket family
+                                    let matches = match listen_addr {
+                                        SocketAddr::V4(_) => ip_addr.is_ipv4(),
+                                        SocketAddr::V6(_) => ip_addr.is_ipv6(),
+                                    };
+                                    if !matches {
+                                        continue;
+                                    }
+                                    let socket_addr = SocketAddr::new(ip_addr, info.get_port());
+                                    if peer_table.add_peer(socket_addr, reticulum_addr, proto) {
+                                        tracing::info!(
+                                            peer = %socket_addr,
+                                            addr = %hex::encode(reticulum_addr),
+                                            proto,
+                                            "mDNS peer discovered"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        mdns_sd::ServiceEvent::ServiceRemoved(_service_type, fullname) => {
+                            if let Some(reticulum_addr) = discovery::parse_instance_addr(&fullname) {
+                                let removed = peer_table.remove_by_reticulum_addr(&reticulum_addr);
+                                if removed > 0 {
+                                    tracing::info!(
+                                        addr = %hex::encode(reticulum_addr),
+                                        removed,
+                                        "mDNS peer removed (goodbye)"
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    Some(Err(_)) => {
+                        tracing::warn!("mDNS channel disconnected — discovery disabled");
+                        if let Some((daemon, _)) = mdns_state.take() {
+                            if let Err(e) = daemon.shutdown() {
+                                tracing::warn!(err = %e, "mDNS shutdown error");
+                            }
+                        }
+                    }
+                    None => unreachable!("pending future cannot resolve to None"),
+                }
+            }
+
+            // Arm 5: Tunnel bridge event — buffer only, tick on timer.
+            maybe = tunnel_rx.recv() => {
+                let event = match maybe {
+                    None => {
+                        tracing::warn!("tunnel bridge channel closed");
+                        break;
+                    }
+                    Some(e) => e,
+                };
+                match event {
+                    TunnelBridgeEvent::HandshakeComplete {
+                        interface_name,
+                        peer_node_id,
+                        peer_dsa_pubkey: _, // TODO(harmony-h6k): store in contact registry
+                        connection_id,
+                    } => {
+                        // Guard against stale handshake completions: only register the
+                        // interface if the connection_id still matches the current sender.
+                        // Without this, a delayed handshake from a previous connection
+                        // could double-register the router interface.
+                        let is_current = tunnel_senders
+                            .get(&interface_name)
+                            .map(|s| s.connection_id == connection_id)
+                            .unwrap_or(false);
+                        if is_current {
+                            runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
+                                interface_name,
+                                peer_node_id,
+                            });
+                        }
+                    }
+                    TunnelBridgeEvent::ReticulumReceived {
+                        interface_name,
+                        packet,
+                        connection_id,
+                    } => {
+                        let is_current = tunnel_senders
+                            .get(&interface_name)
+                            .map(|s| s.connection_id == connection_id)
+                            .unwrap_or(false);
+                        if is_current {
+                            runtime.push_event(RuntimeEvent::TunnelReticulumReceived {
+                                interface_name,
+                                packet,
+                                now: now_ms(),
+                            });
+                        }
+                    }
+                    TunnelBridgeEvent::ZenohReceived { connection_id, .. } => {
+                        // TODO(harmony-h6k): Zenoh over tunnel
+                        let _ = connection_id; // will be guarded like ReticulumReceived
+                    }
+                    TunnelBridgeEvent::TunnelClosed {
+                        interface_name,
+                        reason,
+                        connection_id,
+                    } => {
+                        tracing::info!(%interface_name, %reason, "tunnel closed");
+                        // Only remove the sender AND unregister the router interface
+                        // if the connection_id matches. A stale close from a previous
+                        // connection must not tear down a reconnected peer's interface.
+                        let is_current = tunnel_senders
+                            .get(&interface_name)
+                            .map(|s| s.connection_id == connection_id)
+                            .unwrap_or(false);
+                        if is_current {
+                            tunnel_senders.remove(&interface_name);
+                            runtime.push_event(RuntimeEvent::TunnelClosed { interface_name });
+                        }
+                        // else: stale close from old connection — ignore
+                    }
+                }
+            }
+
+            // Arm 6: Accept incoming iroh connections.
+            //
+            // The QUIC handshake (connecting.await) is spawned in a separate
+            // task to avoid blocking the event loop for 100-500ms+. Completed
+            // connections arrive on conn_rx (Arm 7).
+            incoming = async {
+                if let Some(ref ep) = iroh_endpoint {
+                    ep.accept().await
+                } else {
+                    // No iroh endpoint — pend forever (arm disabled).
+                    std::future::pending::<Option<iroh::endpoint::Incoming>>().await
+                }
+            } => {
+                if incoming.is_none() {
+                    // ep.accept() returned None — endpoint is closed.
+                    // Disable this arm to prevent busy-spinning.
+                    tracing::warn!("iroh endpoint closed — disabling tunnel accept");
+                    iroh_endpoint = None;
+                }
+                if let Some(incoming) = incoming {
+                    // Check connection limit BEFORE spawning the handshake task.
+                    // Include inflight handshakes so a burst of simultaneous
+                    // connects cannot all pass before any completes.
+                    if tunnel_senders.len() + inflight_handshakes >= MAX_TUNNEL_CONNECTIONS {
+                        tracing::warn!(limit = MAX_TUNNEL_CONNECTIONS, "tunnel connection limit reached — rejecting");
+                        drop(incoming); // sends QUIC RESET
+                    } else {
+                        let conn_id = next_connection_id;
+                        next_connection_id += 1;
+                        let conn_tx = conn_tx.clone();
+                        inflight_handshakes += 1;
+
+                        match incoming.accept() {
+                            Ok(connecting) => {
+                                tokio::spawn(async move {
+                                    match connecting.await {
+                                        Ok(connection) => {
+                                            let iface = match connection.remote_node_id() {
+                                                Ok(id) => format!(
+                                                    "tunnel-{}",
+                                                    hex::encode(&id.as_bytes()[..8])
+                                                ),
+                                                Err(_) => format!(
+                                                    "tunnel-{:08x}",
+                                                    rand::random::<u32>()
+                                                ),
+                                            };
+                                            let _ = conn_tx.send(Some(ReadyConnection {
+                                                connection,
+                                                connection_id: conn_id,
+                                                interface_name: iface,
+                                            })).await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(err = %e, "QUIC handshake failed");
+                                            // Signal failure so the event loop can decrement
+                                            // inflight_handshakes even though no connection arrived.
+                                            let _ = conn_tx.send(None).await;
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(err = %e, "iroh accept error");
+                                // accept() failed synchronously — no task was spawned, so
+                                // decrement the counter we just incremented.
+                                inflight_handshakes = inflight_handshakes.saturating_sub(1);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Arm 7: Ready connection from QUIC handshake task — spawn tunnel.
+            ready = conn_rx.recv() => {
+                match ready {
+                    Some(Some(ReadyConnection { connection, connection_id, interface_name })) => {
+                        inflight_handshakes = inflight_handshakes.saturating_sub(1);
+                        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+                        tunnel_senders.insert(
+                            interface_name.clone(),
+                            TunnelSender::new(cmd_tx, connection_id),
+                        );
+
+                        let tx = tunnel_tx.clone();
+                        let identity =
+                            tunnel_config.as_ref().expect("conn_rx received a connection but tunnel_config is None").local_identity.clone();
+                        let iface_clone = interface_name.clone();
+                        tokio::spawn(async move {
+                            tunnel_task::run_responder(
+                                connection, &identity, tx, cmd_rx, iface_clone, connection_id,
+                            )
+                            .await;
+                        });
+                        tracing::info!(%interface_name, "accepted incoming tunnel");
+                    }
+                    Some(None) => {
+                        // Handshake failed — decrement the inflight counter so future
+                        // connections are not incorrectly blocked by the ghost slot.
+                        inflight_handshakes = inflight_handshakes.saturating_sub(1);
+                    }
+                    None => {
+                        // Channel closed — should not happen while the loop is live.
+                        tracing::warn!("ready-connection channel closed");
+                        break;
+                    }
+                }
+            }
+
+            // Arm 8: Graceful shutdown (SIGTERM from procd, Ctrl+C).
             _ = &mut shutdown => {
                 break;
             }
@@ -213,9 +561,22 @@ pub async fn run(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
-                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr).await;
+                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, Some(&peer_table), &tunnel_senders).await;
             }
         }
+    }
+
+    // ── Graceful mDNS shutdown ────────────────────────────────────────────
+    if let Some((daemon, _)) = mdns_state {
+        if let Err(e) = daemon.shutdown() {
+            tracing::warn!(err = %e, "mDNS shutdown error");
+        }
+    }
+
+    // ── Graceful iroh shutdown ────────────────────────────────────────────
+    if let Some(ref ep) = iroh_endpoint {
+        tracing::info!("closing iroh endpoint");
+        ep.close().await;
     }
 
     Ok(())
@@ -228,15 +589,36 @@ async fn dispatch_action(
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
     udp: &UdpSocket,
     broadcast_addr: &SocketAddr,
+    peer_table: Option<&PeerTable>,
+    tunnel_senders: &HashMap<String, TunnelSender>,
 ) {
     match action {
-        // ── Tier 1: UDP broadcast ─────────────────────────────────────────────
+        // ── Tier 1: Send on interface (UDP broadcast + unicast, or tunnel) ────
         // Awaited inline (not spawned) because tokio::net::UdpSocket is not
         // Clone. For Reticulum's small MTU (≤1024 bytes), send_to is
         // effectively non-blocking on a UDP socket with default buffer sizes.
-        RuntimeAction::SendOnInterface { raw, .. } => {
-            if let Err(e) = udp.send_to(&raw, broadcast_addr).await {
-                tracing::warn!(err = %e, "UDP send error");
+        // Tunnel interfaces route through TunnelSender (non-blocking try_send).
+        RuntimeAction::SendOnInterface {
+            ref interface_name,
+            ref raw,
+        } => {
+            if interface_name.starts_with("tunnel-") {
+                if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {
+                    if sender.try_send_reticulum(raw.clone()).is_err() {
+                        tracing::warn!(%interface_name, "tunnel send queue full — dropping packet");
+                    }
+                }
+            } else {
+                if let Err(e) = udp.send_to(raw, broadcast_addr).await {
+                    tracing::warn!(err = %e, "UDP broadcast send error");
+                }
+                if let Some(peers) = peer_table {
+                    for addr in peers.peer_addrs() {
+                        if let Err(e) = udp.send_to(raw, addr).await {
+                            tracing::warn!(peer = %addr, err = %e, "UDP unicast send error");
+                        }
+                    }
+                }
             }
         }
 

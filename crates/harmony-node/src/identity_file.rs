@@ -109,7 +109,7 @@ pub fn save(path: &Path, identity: &NodeIdentity) -> Result<(), String> {
                 .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
         };
         use std::io::Write;
-        (&f).write_all(&*buf)
+        (&f).write_all(&buf)
             .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
         f.sync_all()
             .map_err(|e| format!("Failed to fsync {}: {e}", tmp_path.display()))?;

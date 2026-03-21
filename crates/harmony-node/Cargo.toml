@@ -19,6 +19,8 @@ path = "src/main.rs"
 [dependencies]
 harmony-compute.workspace = true
 harmony-content = { workspace = true, features = ["std"] }
+harmony-tunnel = { workspace = true, features = ["std"] }
+iroh = { workspace = true }
 harmony-crypto = { workspace = true, features = ["std"] }
 harmony-identity = { workspace = true, features = ["std"] }
 harmony-reticulum = { workspace = true, features = ["std"] }
@@ -29,6 +31,8 @@ hex.workspace = true
 mdns-sd = { version = "0.18", features = ["async"] }
 rand.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zenoh.workspace = true
