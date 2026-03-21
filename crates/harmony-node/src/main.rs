@@ -332,7 +332,8 @@ fn parse_tunnel_peer_spec(
     spec: &str,
 ) -> Result<TunnelPeerSpec, Box<dyn std::error::Error>> {
     let (id_and_node, relay_url) = match spec.split_once('@') {
-        Some((left, url)) => (left, Some(url.to_string())),
+        Some((left, url)) if !url.is_empty() => (left, Some(url.to_string())),
+        Some((left, _)) => (left, None), // trailing '@' with no URL → treat as no relay
         None => (spec, None),
     };
     let (id_hex, node_hex) = id_and_node.split_once(':').ok_or_else(|| {
