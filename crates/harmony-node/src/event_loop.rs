@@ -227,7 +227,7 @@ pub async fn run(
                 }
             }
 
-            // Arm 5: mDNS discovery events (when enabled).
+            // Arm 4: mDNS discovery events (when enabled).
             Some(event) = async {
                 match &mdns_state {
                     Some((_, rx)) => rx.recv_async().await.ok(),
@@ -268,7 +268,7 @@ pub async fn run(
                 }
             }
 
-            // Arm 4: Graceful shutdown (SIGTERM from procd, Ctrl+C).
+            // Arm 5: Graceful shutdown (SIGTERM from procd, Ctrl+C).
             _ = &mut shutdown => {
                 break;
             }

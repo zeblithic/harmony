@@ -49,11 +49,13 @@ impl PeerTable {
         }
         let now = Instant::now();
         let is_new = !self.peers.contains_key(&addr);
+        let old_reticulum_addr = self.peers.get(&addr).map(|p| p.reticulum_addr);
         self.peers
             .entry(addr)
             .and_modify(|p| {
                 p.last_seen = now;
                 p.proto_version = proto_version;
+                p.reticulum_addr = reticulum_addr;
             })
             .or_insert(PeerInfo {
                 reticulum_addr,
@@ -61,6 +63,17 @@ impl PeerTable {
                 last_seen: now,
                 discovered_at: now,
             });
+        // Clean up the old reverse-index entry if the Reticulum address changed.
+        if let Some(old_ra) = old_reticulum_addr {
+            if old_ra != reticulum_addr {
+                if let Some(sockets) = self.addr_to_sockets.get_mut(&old_ra) {
+                    sockets.remove(&addr);
+                    if sockets.is_empty() {
+                        self.addr_to_sockets.remove(&old_ra);
+                    }
+                }
+            }
+        }
         self.addr_to_sockets
             .entry(reticulum_addr)
             .or_default()
@@ -215,7 +228,7 @@ mod tests {
 
     fn make_addr(port: u16) -> SocketAddr {
         SocketAddr::new(
-            std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, port as u8)),
+            std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
             port,
         )
     }
@@ -278,6 +291,31 @@ mod tests {
             1,
             "reverse index should still have one entry"
         );
+    }
+
+    #[test]
+    fn identity_rotation_cleans_reverse_index() {
+        let mut t = table_with_timeout(60);
+        let sa = make_addr(4004);
+        let ra_old = make_reticulum_addr(10);
+        let ra_new = make_reticulum_addr(11);
+
+        t.add_peer(sa, ra_old, 1);
+        assert_eq!(t.peer_count(), 1);
+        assert!(t.addr_to_sockets.get(&ra_old).unwrap().contains(&sa));
+
+        // Same socket, new Reticulum address (identity rotation)
+        t.add_peer(sa, ra_new, 1);
+        assert_eq!(t.peer_count(), 1);
+        // Old reverse-index entry must be gone
+        assert!(
+            t.addr_to_sockets.get(&ra_old).is_none(),
+            "old reticulum addr must be removed from reverse index"
+        );
+        // New reverse-index entry must exist
+        assert!(t.addr_to_sockets.get(&ra_new).unwrap().contains(&sa));
+        // PeerInfo must reflect the new address
+        assert_eq!(t.peers.get(&sa).unwrap().reticulum_addr, ra_new);
     }
 
     // ── 4. multiple_addrs_per_reticulum_peer ──────────────────────────────────

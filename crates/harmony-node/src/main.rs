@@ -240,6 +240,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
+            if mdns_stale_timeout == 0 {
+                return Err(
+                    "--mdns-stale-timeout must be > 0: a zero timeout evicts every peer \
+                     on every timer tick, silently disabling unicast delivery"
+                        .into(),
+                );
+            }
+
             let listen_addr: std::net::SocketAddr = listen_address
                 .parse()
                 .map_err(|e| format!("Invalid --listen-address: {e}"))?;
@@ -514,5 +522,18 @@ mod tests {
         } else {
             panic!("expected Run command");
         }
+    }
+
+    #[tokio::test]
+    async fn cli_rejects_zero_mdns_stale_timeout() {
+        let cli =
+            Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "0"]).unwrap();
+        let result = run(cli).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--mdns-stale-timeout must be > 0"),
+            "unexpected error: {msg}"
+        );
     }
 }
