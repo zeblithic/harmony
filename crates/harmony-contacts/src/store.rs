@@ -3,7 +3,7 @@ use harmony_identity::IdentityHash;
 use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::contact::{Contact, PeeringPriority};
+use crate::contact::{Contact, ContactAddress, PeeringPriority};
 use crate::error::ContactError;
 
 const FORMAT_VERSION: u8 = 1;
@@ -72,6 +72,15 @@ impl ContactStore {
         self.contacts.iter()
     }
 
+    pub fn find_by_tunnel_node_id(&self, node_id: &[u8; 32]) -> Option<&Contact> {
+        self.contacts.values().find(|c| {
+            c.addresses.iter().any(|addr| match addr {
+                ContactAddress::Tunnel { node_id: id, .. } => id == node_id,
+                _ => false,
+            })
+        })
+    }
+
     pub fn serialize(&self) -> Result<Vec<u8>, ContactError> {
         let mut buf = Vec::new();
         buf.push(FORMAT_VERSION);
@@ -112,6 +121,7 @@ mod tests {
             added_at: 1710000000,
             last_seen: None,
             notes: None,
+            addresses: vec![],
         }
     }
 
@@ -224,5 +234,51 @@ mod tests {
     fn deserialize_bad_data() {
         let result = ContactStore::deserialize(&[0xFF, 0xFF, 0xFF]);
         assert!(matches!(result, Err(ContactError::DeserializeError(_))));
+    }
+
+    #[test]
+    fn find_by_tunnel_node_id_finds_match() {
+        use crate::contact::ContactAddress;
+        let node_id = [0x42u8; 32];
+        let mut store = ContactStore::new();
+        let mut contact = make_contact(0xAA, true, PeeringPriority::Normal);
+        contact.addresses.push(ContactAddress::Tunnel {
+            node_id,
+            relay_url: None,
+            direct_addrs: vec![],
+        });
+        store.add(contact).unwrap();
+        let found = store.find_by_tunnel_node_id(&node_id);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().identity_hash, [0xAA; 16]);
+    }
+
+    #[test]
+    fn find_by_tunnel_node_id_no_match() {
+        use crate::contact::ContactAddress;
+        let node_id = [0x42u8; 32];
+        let other_node_id = [0x99u8; 32];
+        let mut store = ContactStore::new();
+        let mut contact = make_contact(0xBB, true, PeeringPriority::Normal);
+        contact.addresses.push(ContactAddress::Tunnel {
+            node_id,
+            relay_url: None,
+            direct_addrs: vec![],
+        });
+        store.add(contact).unwrap();
+        assert!(store.find_by_tunnel_node_id(&other_node_id).is_none());
+    }
+
+    #[test]
+    fn find_by_tunnel_node_id_skips_reticulum_addresses() {
+        use crate::contact::ContactAddress;
+        let node_id = [0x11u8; 32];
+        let mut store = ContactStore::new();
+        let mut contact = make_contact(0xCC, true, PeeringPriority::Normal);
+        contact.addresses.push(ContactAddress::Reticulum {
+            destination_hash: [0x11; 16],
+        });
+        store.add(contact).unwrap();
+        assert!(store.find_by_tunnel_node_id(&node_id).is_none());
     }
 }
