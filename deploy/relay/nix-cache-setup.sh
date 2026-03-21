@@ -66,7 +66,10 @@ else
   echo "[nix-cache-setup] nix-serve already installed — skipping."
 fi
 
-NIX_SERVE_BIN="$(command -v nix-serve)"
+# Resolve through all symlinks to get the canonical /nix/store/... path.
+# This is critical: ProtectHome=yes makes ~/.nix-profile inaccessible to
+# the service process, so ExecStart must point to the store path directly.
+NIX_SERVE_BIN="$(readlink -f "$(command -v nix-serve)")"
 
 # ---------------------------------------------------------------------------
 # 4. Create systemd service for nix-serve on port 5000
