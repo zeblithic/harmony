@@ -28,6 +28,7 @@ harmony-workflow.workspace = true
 harmony-zenoh.workspace = true
 clap = { version = "4", features = ["derive"] }
 hex.workspace = true
+mdns-sd = { version = "0.18", features = ["async"] }
 rand.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true }

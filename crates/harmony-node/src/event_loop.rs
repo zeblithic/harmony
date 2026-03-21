@@ -15,6 +15,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
 
+use crate::discovery::{self, PeerTable};
 use crate::runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
 use crate::tunnel_bridge::{ReadyConnection, TunnelBridgeEvent, TunnelSender};
 use crate::tunnel_task;
@@ -58,11 +59,15 @@ enum ZenohEvent {
 /// - `runtime`: the sans-I/O node state machine (`!Send` — stays on this task).
 /// - `startup_actions`: actions returned by `NodeRuntime::new`, executed before the loop.
 /// - `listen_addr`: UDP socket address to bind (broadcast also sent here).
+/// - `mdns_addr`: optional 16-byte Reticulum address for mDNS discovery (None = disabled).
+/// - `mdns_stale_timeout`: duration after which silent mDNS peers are evicted.
 /// - `tunnel_config`: optional iroh tunnel configuration (enables tunnel accept/connect).
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
     listen_addr: SocketAddr,
+    mdns_addr: Option<[u8; 16]>,
+    mdns_stale_timeout: Duration,
     tunnel_config: Option<TunnelConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
@@ -71,6 +76,28 @@ pub async fn run(
     let broadcast_addr: SocketAddr = format!("255.255.255.255:{}", listen_addr.port())
         .parse()
         .expect("static broadcast addr");
+
+    // ── mDNS peer discovery (optional) ──────────────────────────────────────
+    let mut peer_table = PeerTable::new(
+        mdns_addr.unwrap_or([0; 16]),
+        mdns_stale_timeout,
+    );
+    let mut mdns_state = match mdns_addr {
+        Some(addr) => match discovery::start_mdns(listen_addr.port(), &addr) {
+            Ok((daemon, rx)) => {
+                tracing::info!("mDNS discovery started on _harmony._udp.local.");
+                Some((daemon, rx))
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "mDNS discovery failed to start — broadcast only");
+                None
+            }
+        },
+        None => {
+            tracing::info!("mDNS discovery disabled (--no-mdns)");
+            None
+        }
+    };
 
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
@@ -139,6 +166,7 @@ pub async fn run(
             &zenoh_tx,
             &udp,
             &broadcast_addr,
+            None,
             &tunnel_senders,
         )
         .await;
@@ -209,7 +237,10 @@ pub async fn run(
             // Arm 1: UDP packet received — buffer only, tick on timer.
             result = udp.recv_from(&mut udp_buf) => {
                 match result {
-                    Ok((len, _src)) => {
+                    Ok((len, src)) => {
+                        // Invariant: src port matches the peer's mDNS-announced listen port
+                        // because each node sends from its bound --listen-address socket.
+                        peer_table.mark_seen(&src);
                         runtime.push_event(RuntimeEvent::InboundPacket {
                             interface_name: "udp0".to_string(),
                             raw: udp_buf[..len].to_vec(),
@@ -231,6 +262,9 @@ pub async fn run(
             _ = timer.tick() => {
                 runtime.push_event(RuntimeEvent::TimerTick { now: now_ms() });
                 should_tick = true;
+                for addr in peer_table.evict_stale() {
+                    tracing::info!(peer = %addr, "evicted stale mDNS peer");
+                }
             }
 
             // Arm 3: Zenoh bridge event — buffer only, tick on timer.
@@ -267,7 +301,68 @@ pub async fn run(
                 }
             }
 
-            // Arm 4: Tunnel bridge event — buffer only, tick on timer.
+            // Arm 4: mDNS discovery events (when enabled).
+            result = async {
+                match &mdns_state {
+                    Some((_, rx)) => Some(rx.recv_async().await),
+                    None => std::future::pending::<Option<Result<mdns_sd::ServiceEvent, _>>>().await,
+                }
+            } => {
+                match result {
+                    Some(Ok(event)) => match event {
+                        mdns_sd::ServiceEvent::ServiceResolved(info) => {
+                            let properties = info.get_properties();
+                            if let Some(reticulum_addr) = discovery::parse_txt_addr(properties) {
+                                let proto = discovery::parse_txt_proto(properties);
+                                for ip in info.get_addresses() {
+                                    let ip_addr = ip.to_ip_addr();
+                                    // Only track addresses matching our socket family
+                                    let matches = match listen_addr {
+                                        SocketAddr::V4(_) => ip_addr.is_ipv4(),
+                                        SocketAddr::V6(_) => ip_addr.is_ipv6(),
+                                    };
+                                    if !matches {
+                                        continue;
+                                    }
+                                    let socket_addr = SocketAddr::new(ip_addr, info.get_port());
+                                    if peer_table.add_peer(socket_addr, reticulum_addr, proto) {
+                                        tracing::info!(
+                                            peer = %socket_addr,
+                                            addr = %hex::encode(reticulum_addr),
+                                            proto,
+                                            "mDNS peer discovered"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        mdns_sd::ServiceEvent::ServiceRemoved(_service_type, fullname) => {
+                            if let Some(reticulum_addr) = discovery::parse_instance_addr(&fullname) {
+                                let removed = peer_table.remove_by_reticulum_addr(&reticulum_addr);
+                                if removed > 0 {
+                                    tracing::info!(
+                                        addr = %hex::encode(reticulum_addr),
+                                        removed,
+                                        "mDNS peer removed (goodbye)"
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    Some(Err(_)) => {
+                        tracing::warn!("mDNS channel disconnected — discovery disabled");
+                        if let Some((daemon, _)) = mdns_state.take() {
+                            if let Err(e) = daemon.shutdown() {
+                                tracing::warn!(err = %e, "mDNS shutdown error");
+                            }
+                        }
+                    }
+                    None => unreachable!("pending future cannot resolve to None"),
+                }
+            }
+
+            // Arm 5: Tunnel bridge event — buffer only, tick on timer.
             maybe = tunnel_rx.recv() => {
                 let event = match maybe {
                     None => {
@@ -341,11 +436,11 @@ pub async fn run(
                 }
             }
 
-            // Arm 5: Accept incoming iroh connections.
+            // Arm 6: Accept incoming iroh connections.
             //
             // The QUIC handshake (connecting.await) is spawned in a separate
             // task to avoid blocking the event loop for 100-500ms+. Completed
-            // connections arrive on conn_rx (Arm 6).
+            // connections arrive on conn_rx (Arm 7).
             incoming = async {
                 if let Some(ref ep) = iroh_endpoint {
                     ep.accept().await
@@ -414,7 +509,7 @@ pub async fn run(
                 }
             }
 
-            // Arm 6: Ready connection from QUIC handshake task — spawn tunnel.
+            // Arm 7: Ready connection from QUIC handshake task — spawn tunnel.
             ready = conn_rx.recv() => {
                 match ready {
                     Some(Some(ReadyConnection { connection, connection_id, interface_name })) => {
@@ -450,7 +545,7 @@ pub async fn run(
                 }
             }
 
-            // Arm 7: Graceful shutdown (SIGTERM from procd, Ctrl+C).
+            // Arm 8: Graceful shutdown (SIGTERM from procd, Ctrl+C).
             _ = &mut shutdown => {
                 break;
             }
@@ -466,8 +561,15 @@ pub async fn run(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
-                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, &tunnel_senders).await;
+                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, Some(&peer_table), &tunnel_senders).await;
             }
+        }
+    }
+
+    // ── Graceful mDNS shutdown ────────────────────────────────────────────
+    if let Some((daemon, _)) = mdns_state {
+        if let Err(e) = daemon.shutdown() {
+            tracing::warn!(err = %e, "mDNS shutdown error");
         }
     }
 
@@ -487,10 +589,11 @@ async fn dispatch_action(
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
     udp: &UdpSocket,
     broadcast_addr: &SocketAddr,
+    peer_table: Option<&PeerTable>,
     tunnel_senders: &HashMap<String, TunnelSender>,
 ) {
     match action {
-        // ── Tier 1: Send on interface (UDP broadcast or tunnel) ──────────────
+        // ── Tier 1: Send on interface (UDP broadcast + unicast, or tunnel) ────
         // Awaited inline (not spawned) because tokio::net::UdpSocket is not
         // Clone. For Reticulum's small MTU (≤1024 bytes), send_to is
         // effectively non-blocking on a UDP socket with default buffer sizes.
@@ -505,8 +608,17 @@ async fn dispatch_action(
                         tracing::warn!(%interface_name, "tunnel send queue full — dropping packet");
                     }
                 }
-            } else if let Err(e) = udp.send_to(raw, broadcast_addr).await {
-                tracing::warn!(err = %e, "UDP send error");
+            } else {
+                if let Err(e) = udp.send_to(raw, broadcast_addr).await {
+                    tracing::warn!(err = %e, "UDP broadcast send error");
+                }
+                if let Some(peers) = peer_table {
+                    for addr in peers.peer_addrs() {
+                        if let Err(e) = udp.send_to(raw, addr).await {
+                            tracing::warn!(peer = %addr, err = %e, "UDP unicast send error");
+                        }
+                    }
+                }
             }
         }
 

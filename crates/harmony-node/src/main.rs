@@ -1,4 +1,5 @@
 mod compute;
+mod discovery;
 mod event_loop;
 mod identity_file;
 mod runtime;
@@ -53,6 +54,12 @@ enum Commands {
         /// UDP listen address for Reticulum mesh packets
         #[arg(long, default_value = "0.0.0.0:4242")]
         listen_address: String,
+        /// Disable mDNS peer discovery (broadcast-only mode)
+        #[arg(long)]
+        no_mdns: bool,
+        /// Seconds before evicting a silent mDNS peer (default: 60)
+        #[arg(long, default_value_t = 60)]
+        mdns_stale_timeout: u64,
         /// iroh relay URL for NAT-traversal tunnels (enables tunnel accept)
         #[arg(long, value_name = "URL")]
         relay_url: Option<String>,
@@ -205,6 +212,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             filter_mutation_threshold,
             identity_file,
             listen_address,
+            no_mdns,
+            mdns_stale_timeout,
             relay_url,
             tunnel_peer,
         } => {
@@ -246,6 +255,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
+            if !no_mdns && mdns_stale_timeout == 0 {
+                return Err(
+                    "--mdns-stale-timeout must be > 0: a zero timeout evicts every peer \
+                     on every timer tick, silently disabling unicast delivery"
+                        .into(),
+                );
+            }
+
             let listen_addr: std::net::SocketAddr = listen_address
                 .parse()
                 .map_err(|e| format!("Invalid --listen-address: {e}"))?;
@@ -253,7 +270,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Load or generate node identity (after validation so bad flags exit fast).
             let id_path = crate::identity_file::resolve_path(identity_file.as_deref())?;
             let identity = crate::identity_file::load_or_generate(&id_path)?;
-            let node_addr = hex::encode(identity.ed25519.public_identity().address_hash);
+            let our_addr_bytes: [u8; 16] = identity.ed25519.public_identity().address_hash;
+            let node_addr = hex::encode(our_addr_bytes);
             tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
 
             // Destructure to control per-field drop timing.
@@ -305,7 +323,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             tracing::info!(cache_capacity, compute_budget, %listen_addr, "harmony node starting");
 
-            crate::event_loop::run(rt, startup_actions, listen_addr, tunnel_config).await
+            crate::event_loop::run(
+                rt,
+                startup_actions,
+                listen_addr,
+                if no_mdns { None } else { Some(our_addr_bytes) },
+                std::time::Duration::from_secs(mdns_stale_timeout),
+                tunnel_config,
+            ).await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
         }
@@ -491,6 +516,59 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("Invalid --listen-address"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cli_parses_no_mdns_flag() {
+        let cli = Cli::try_parse_from(["harmony", "run", "--no-mdns"]).unwrap();
+        if let Commands::Run { no_mdns, .. } = cli.command {
+            assert!(no_mdns);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_no_mdns_default_false() {
+        let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
+        if let Commands::Run { no_mdns, .. } = cli.command {
+            assert!(!no_mdns);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_parses_mdns_stale_timeout() {
+        let cli = Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "120"]).unwrap();
+        if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
+            assert_eq!(mdns_stale_timeout, 120);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_mdns_stale_timeout_default() {
+        let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
+        if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
+            assert_eq!(mdns_stale_timeout, 60);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_rejects_zero_mdns_stale_timeout() {
+        let cli =
+            Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "0"]).unwrap();
+        let result = run(cli).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--mdns-stale-timeout must be > 0"),
             "unexpected error: {msg}"
         );
     }
