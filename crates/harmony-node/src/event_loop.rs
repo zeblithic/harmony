@@ -111,7 +111,7 @@ pub async fn run(
                 Some(_) = sigterm.recv() => tracing::info!("SIGTERM received — shutting down"),
                 result = tokio::signal::ctrl_c() => match result {
                     Ok(()) => tracing::info!("Ctrl+C received — shutting down"),
-                    Err(e) => tracing::error!(err = %e, "SIGINT handler failed — shutting down"),
+                    Err(e) => tracing::warn!(err = %e, "SIGINT handler failed — shutting down"),
                 },
             }
         }
@@ -119,7 +119,7 @@ pub async fn run(
         {
             match tokio::signal::ctrl_c().await {
                 Ok(()) => tracing::info!("Ctrl+C received — shutting down"),
-                Err(e) => tracing::error!(err = %e, "SIGINT handler failed — shutting down"),
+                Err(e) => tracing::warn!(err = %e, "SIGINT handler failed — shutting down"),
             }
         }
     };
