@@ -50,10 +50,10 @@ export GCP_PROJECT="your-gcp-project-id"
 ```
 
 The script will:
-1. Create a `e2-micro` VM in `us-west1-b` with Container-Optimized OS
+1. Create an `e2-micro` VM in `us-west1-b` with Debian 12
 2. Reserve a static external IP
 3. Configure firewall rules (80/tcp, 443/tcp, 7842/udp)
-4. Build and upload the `iroh-relay` binary
+4. Install Rust and build `iroh-relay` on the VM
 5. Install the systemd unit and config
 6. Start the service
 
@@ -155,6 +155,12 @@ SSH into the VM:
 gcloud compute ssh harmony-relay --zone=us-west1-b
 ```
 
+Then on the VM, set your hostname:
+
+```bash
+export RELAY_HOSTNAME="i.q8.fyi"  # replace with your domain
+```
+
 Then on the VM:
 
 ```bash
@@ -221,6 +227,7 @@ Environment="RUST_LOG=info"
 
 # Allow binding to privileged ports (80, 443)
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

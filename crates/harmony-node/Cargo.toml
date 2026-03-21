@@ -18,11 +18,13 @@ path = "src/main.rs"
 
 [dependencies]
 harmony-compute.workspace = true
+harmony-contacts = { workspace = true, features = ["std"] }
 harmony-content = { workspace = true, features = ["std"] }
 harmony-tunnel = { workspace = true, features = ["std"] }
 iroh = { workspace = true }
 harmony-crypto = { workspace = true, features = ["std"] }
 harmony-identity = { workspace = true, features = ["std"] }
+harmony-peers = { workspace = true, features = ["std"] }
 harmony-reticulum = { workspace = true, features = ["std"] }
 harmony-workflow.workspace = true
 harmony-zenoh.workspace = true
@@ -30,7 +32,9 @@ clap = { version = "4", features = ["derive"] }
 hex.workspace = true
 mdns-sd = { version = "0.18", features = ["async"] }
 rand.workspace = true
+serde = { workspace = true, features = ["std", "derive"] }
 tokio.workspace = true
+toml.workspace = true
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
 tracing.workspace = true
