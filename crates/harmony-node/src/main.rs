@@ -2,7 +2,10 @@ mod compute;
 mod event_loop;
 mod identity_file;
 mod runtime;
+// Zenoh-over-tunnel, initiator, and close paths are forward-looking (Bead #3).
+#[allow(dead_code)]
 mod tunnel_bridge;
+#[allow(dead_code)]
 mod tunnel_task;
 
 use clap::{Parser, Subcommand};
