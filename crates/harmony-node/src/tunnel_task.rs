@@ -360,15 +360,19 @@ async fn run_tunnel_loop(
                         }
                     }
                     Some(TunnelCommand::Close) | None => {
-                        let mut dispatch_sent_close = false;
-                        if let Ok(close_actions) = session.handle_event(TunnelEvent::Close) {
-                            // dispatch returns false when a Closed/Error action was
-                            // dispatched (already sent TunnelClosed to bridge_tx).
-                            dispatch_sent_close = !dispatch_tunnel_actions(
+                        // Dispatch close actions (e.g., outbound close frames).
+                        // If dispatch already sent a TunnelClosed event (because
+                        // the session returned a Closed/Error action), skip the
+                        // explicit fallback send to avoid duplicates.
+                        let already_notified = if let Ok(close_actions) = session.handle_event(TunnelEvent::Close) {
+                            // dispatch returns false when it sent TunnelClosed
+                            !dispatch_tunnel_actions(
                                 &close_actions, &mut send_stream, &bridge_tx, &interface_name, connection_id,
-                            ).await;
-                        }
-                        if !dispatch_sent_close {
+                            ).await
+                        } else {
+                            false
+                        };
+                        if !already_notified {
                             let _ = bridge_tx.send(TunnelBridgeEvent::TunnelClosed {
                                 interface_name: interface_name.clone(),
                                 reason: "closed by event loop".to_string(),
@@ -485,6 +489,7 @@ async fn dispatch_tunnel_actions(
                     .send(TunnelBridgeEvent::ReticulumReceived {
                         interface_name: interface_name.to_string(),
                         packet: packet.clone(),
+                        connection_id,
                     })
                     .await;
             }
@@ -493,6 +498,7 @@ async fn dispatch_tunnel_actions(
                     .send(TunnelBridgeEvent::ZenohReceived {
                         interface_name: interface_name.to_string(),
                         message: message.clone(),
+                        connection_id,
                     })
                     .await;
             }

@@ -297,15 +297,23 @@ pub async fn run(
                     TunnelBridgeEvent::ReticulumReceived {
                         interface_name,
                         packet,
+                        connection_id,
                     } => {
-                        runtime.push_event(RuntimeEvent::TunnelReticulumReceived {
-                            interface_name,
-                            packet,
-                            now: now_ms(),
-                        });
+                        let is_current = tunnel_senders
+                            .get(&interface_name)
+                            .map(|s| s.connection_id == connection_id)
+                            .unwrap_or(false);
+                        if is_current {
+                            runtime.push_event(RuntimeEvent::TunnelReticulumReceived {
+                                interface_name,
+                                packet,
+                                now: now_ms(),
+                            });
+                        }
                     }
-                    TunnelBridgeEvent::ZenohReceived { .. } => {
-                        // TODO: Zenoh over tunnel (Bead #3)
+                    TunnelBridgeEvent::ZenohReceived { connection_id, .. } => {
+                        // TODO(harmony-h6k): Zenoh over tunnel
+                        let _ = connection_id; // will be guarded like ReticulumReceived
                     }
                     TunnelBridgeEvent::TunnelClosed {
                         interface_name,
@@ -333,7 +341,7 @@ pub async fn run(
             //
             // The QUIC handshake (connecting.await) is spawned in a separate
             // task to avoid blocking the event loop for 100-500ms+. Completed
-            // connections arrive on conn_rx (Arm 7).
+            // connections arrive on conn_rx (Arm 6).
             incoming = async {
                 if let Some(ref ep) = iroh_endpoint {
                     ep.accept().await

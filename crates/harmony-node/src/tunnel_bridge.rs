@@ -24,11 +24,13 @@ pub enum TunnelBridgeEvent {
     ReticulumReceived {
         interface_name: String,
         packet: Vec<u8>,
+        connection_id: u64,
     },
     /// A decrypted Zenoh message arrived from a tunnel peer.
     ZenohReceived {
         interface_name: String,
         message: Vec<u8>,
+        connection_id: u64,
     },
     /// A tunnel connection was closed or errored.
     TunnelClosed {
