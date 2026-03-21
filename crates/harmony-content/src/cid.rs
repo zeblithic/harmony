@@ -190,13 +190,18 @@ impl ContentId {
     pub fn verify_checksum(&self) -> Result<(), ContentError> {
         let bytes = self.to_bytes();
         let fold = compute_pairwise_xor(&bytes);
-        // Normal CIDs fold to 00. Inline-mode sentinel CIDs intentionally fold
-        // to 11 (checksum XORed with 0x03). Any other result (01, 10) is a
-        // checksum failure. Note: fold==11 means the CID *could* be a sentinel,
-        // but only inline-mode CIDs use the sentinel convention deliberately;
-        // the vast majority of CIDs with fold==11 are just normal CIDs whose
-        // payload bits happen to produce that checksum incidentally.
-        if fold != 0x00 && fold != 0x03 {
+        // Non-sentinel CIDs are assembled so their pairwise XOR folds to 00.
+        // Sentinel inline CIDs are assembled so their fold is 11 (checksum
+        // XORed with 0x03). A non-inline CID with fold==11 is corrupted.
+        //
+        // - is_inline() → fold can be 0x00 (normal inline data) or 0x03
+        //   (sentinel metadata)
+        // - NOT is_inline() → fold must be 0x00; 0x03 means corruption
+        if self.is_inline() {
+            if fold != 0x00 && fold != 0x03 {
+                return Err(ContentError::ChecksumMismatch);
+            }
+        } else if fold != 0x00 {
             return Err(ContentError::ChecksumMismatch);
         }
         Ok(())
@@ -649,6 +654,25 @@ mod tests {
         let mut bytes = cid.to_bytes();
         bytes[10] ^= 0x01;
         assert!(ContentId::from_bytes(bytes).verify_checksum().is_err());
+    }
+
+    #[test]
+    fn checksum_rejects_fold_03_for_non_inline() {
+        // A non-inline CID whose pairwise XOR fold is 0x03 is corrupted:
+        // only inline sentinels intentionally produce fold==0x03.
+        // Craft a non-inline CID with fold==0x03 by flipping one bit.
+        let mut cid = ContentId::for_book(b"valid data", ContentFlags::default()).unwrap();
+        let mut bytes = cid.to_bytes();
+        // Flip the lowest bit of the checksum nibble (bits 1-0 of header byte 3)
+        // so that fold goes from 0x00 to 0x03 without touching mode/depth/size.
+        // XOR two low-order bits of byte 3 to change fold by 0x03.
+        bytes[3] ^= 0x03;
+        cid = ContentId::from_bytes(bytes);
+        assert!(!cid.is_inline(), "test setup: expected non-inline CID");
+        assert!(
+            cid.verify_checksum().is_err(),
+            "non-inline CID with fold==0x03 must fail verify_checksum"
+        );
     }
 
     #[test]
