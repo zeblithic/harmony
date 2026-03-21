@@ -3,6 +3,11 @@ mod discovery;
 mod event_loop;
 mod identity_file;
 mod runtime;
+// Zenoh-over-tunnel, initiator, and close paths are forward-looking (Bead #3).
+#[allow(dead_code)]
+mod tunnel_bridge;
+#[allow(dead_code)]
+mod tunnel_task;
 
 use clap::{Parser, Subcommand};
 
@@ -55,6 +60,14 @@ enum Commands {
         /// Seconds before evicting a silent mDNS peer (default: 60)
         #[arg(long, default_value_t = 60)]
         mdns_stale_timeout: u64,
+        /// iroh relay URL for NAT-traversal tunnels (enables tunnel accept)
+        #[arg(long, value_name = "URL")]
+        relay_url: Option<String>,
+        /// iroh NodeId of a peer to connect to (outbound tunnel)
+        /// TODO: Outbound initiator connections need the remote peer's PqIdentity
+        /// for the ML-KEM encapsulation, which comes from the contact store (Bead #3).
+        #[arg(long, value_name = "NODE_ID")]
+        tunnel_peer: Option<String>,
     },
 }
 
@@ -201,6 +214,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             listen_address,
             no_mdns,
             mdns_stale_timeout,
+            relay_url,
+            tunnel_peer,
         } => {
             use crate::runtime::{NodeConfig, NodeRuntime};
             use harmony_compute::InstructionBudget;
@@ -258,7 +273,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let our_addr_bytes: [u8; 16] = identity.ed25519.public_identity().address_hash;
             let node_addr = hex::encode(our_addr_bytes);
             tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
-            drop(identity); // key material no longer needed; zeroize-on-drop fires now
+
+            // Destructure to control per-field drop timing.
+            let crate::identity_file::NodeIdentity { pq, ed25519 } = identity;
+
+            // Build tunnel config if --relay-url was provided.
+            // The PQ identity is wrapped in Arc because tunnel tasks need
+            // references and PqPrivateIdentity is not Clone.
+            let tunnel_config = if relay_url.is_some() || tunnel_peer.is_some() {
+                if tunnel_peer.is_some() {
+                    tracing::warn!("--tunnel-peer: outbound connections not yet wired (needs contact store, Bead #3)");
+                }
+                Some(crate::event_loop::TunnelConfig {
+                    relay_url,
+                    local_identity: std::sync::Arc::new(pq),
+                })
+            } else {
+                drop(pq); // zeroize-on-drop
+                None
+            };
+            // Ed25519 key material is no longer needed; zeroize-on-drop fires now.
+            drop(ed25519);
 
             let content_policy = ContentPolicy {
                 encrypted_durable_persist,
@@ -294,6 +329,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 listen_addr,
                 if no_mdns { None } else { Some(our_addr_bytes) },
                 std::time::Duration::from_secs(mdns_stale_timeout),
+                tunnel_config,
             ).await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
