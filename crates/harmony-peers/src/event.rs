@@ -53,6 +53,10 @@ pub enum PeerAction {
     CloseLink {
         identity_hash: IdentityHash,
     },
+    /// Tear down an active tunnel connection.
+    CloseTunnel {
+        identity_hash: IdentityHash,
+    },
     UpdateLastSeen {
         identity_hash: IdentityHash,
         timestamp: u64,

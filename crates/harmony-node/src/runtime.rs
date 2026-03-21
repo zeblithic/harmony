@@ -193,6 +193,8 @@ pub enum RuntimeAction {
     },
     /// Peer lifecycle: send a path request (announce probe) for a peer.
     SendPathRequest { identity_hash: [u8; 16] },
+    /// Peer lifecycle: close an active tunnel connection for a peer.
+    CloseTunnel { identity_hash: [u8; 16] },
 }
 
 /// Filter state received from a peer, with metadata.
@@ -1157,6 +1159,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
                 PeerAction::InitiateLink { .. } | PeerAction::CloseLink { .. } => {
                     // Reticulum link initiation/close — stub for now.
+                }
+                PeerAction::CloseTunnel { identity_hash } => {
+                    out.push(RuntimeAction::CloseTunnel { identity_hash });
                 }
             }
         }

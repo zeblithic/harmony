@@ -114,14 +114,14 @@ impl PeerManager {
                         PeerStatus::Disabled => {
                             // Race: peering was disabled but tunnel completed first.
                             // Tear down the dangling tunnel connection.
-                            actions.push(PeerAction::CloseLink { identity_hash });
+                            actions.push(PeerAction::CloseTunnel { identity_hash });
                         }
                         PeerStatus::Connected => {}
                     },
                     None => {
                         // Race: contact was removed but tunnel completed first.
                         // Tear down the dangling tunnel connection.
-                        actions.push(PeerAction::CloseLink { identity_hash });
+                        actions.push(PeerAction::CloseTunnel { identity_hash });
                     }
                 }
             }

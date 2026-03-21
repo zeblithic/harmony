@@ -754,6 +754,16 @@ async fn dispatch_action(
                 "SendPathRequest (stub)"
             );
         }
+        RuntimeAction::CloseTunnel { identity_hash } => {
+            // TODO: look up tunnel_sender by identity_hash (via tunnel_identities map)
+            // and send TunnelCommand::Close. Requires the tunnel_identities map to be
+            // accessible here, which will be wired when the full tunnel lifecycle is
+            // integrated with the event loop's tunnel infrastructure.
+            tracing::debug!(
+                identity = %hex::encode(identity_hash),
+                "CloseTunnel (stub)"
+            );
+        }
     }
 }
 
