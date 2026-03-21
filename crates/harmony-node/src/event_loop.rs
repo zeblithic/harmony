@@ -95,10 +95,11 @@ pub async fn run(
 
     // ── iroh Endpoint (optional, gated on --relay-url) ─────────────────────
     let mut iroh_endpoint = if let Some(ref config) = tunnel_config {
-        // Derive iroh SecretKey from PQ identity's ML-DSA verifying key.
-        // This gives a deterministic mapping: same PQ identity → same iroh NodeId.
-        let pub_id = config.local_identity.public_identity();
-        let hash = harmony_crypto::hash::blake3_hash(&pub_id.verifying_key.as_bytes());
+        // Derive iroh SecretKey from PQ identity's ML-DSA *private* signing key.
+        // This gives a deterministic mapping: same PQ identity → same iroh NodeId,
+        // without leaking the secret — the verifying key is public, so deriving
+        // from it would let anyone impersonate this node's iroh transport identity.
+        let hash = harmony_crypto::hash::blake3_hash(&config.local_identity.signing_key().as_bytes());
         let secret_key = iroh::SecretKey::from(hash);
 
         let mut builder = iroh::Endpoint::builder()

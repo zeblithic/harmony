@@ -120,7 +120,7 @@ async fn initiator_handshake(
     }
 
     // Read TunnelAccept
-    let accept_bytes = read_length_prefixed(&mut recv_stream)
+    let accept_bytes = read_length_prefixed(&mut recv_stream, HANDSHAKE_MAX_MESSAGE)
         .await
         .map_err(|e| format!("failed to read TunnelAccept: {e}"))?;
 
@@ -213,7 +213,7 @@ async fn responder_handshake(
         .map_err(|e| format!("failed to accept bi stream: {e}"))?;
 
     // Read TunnelInit
-    let init_bytes = read_length_prefixed(&mut recv_stream)
+    let init_bytes = read_length_prefixed(&mut recv_stream, HANDSHAKE_MAX_MESSAGE)
         .await
         .map_err(|e| format!("failed to read TunnelInit: {e}"))?;
 
@@ -266,7 +266,7 @@ async fn run_tunnel_loop(
     loop {
         tokio::select! {
             // Read from iroh stream
-            result = read_length_prefixed(&mut recv_stream) => {
+            result = read_length_prefixed(&mut recv_stream, DATA_MAX_MESSAGE) => {
                 match result {
                     Ok(data) => {
                         let now_ms = millis_since_start();
@@ -461,17 +461,31 @@ async fn write_length_prefixed(
     Ok(())
 }
 
+/// Maximum message size during handshake (pre-authentication).
+///
+/// TunnelInit is ~6381 bytes (1088 CT + 1952 DSA pk + 32 nonce + 3309 sig).
+/// TunnelAccept is ~5293 bytes (1952 DSA pk + 32 nonce + 3309 sig).
+/// 8 KiB gives comfortable headroom. This caps pre-auth allocation to
+/// MAX_TUNNEL_CONNECTIONS × 8 KiB = 512 KiB total.
+const HANDSHAKE_MAX_MESSAGE: usize = 8 * 1024;
+
+/// Maximum message size during the authenticated data phase.
+const DATA_MAX_MESSAGE: usize = 16 * 1024 * 1024;
+
 /// Read a length-prefixed message: [4 bytes big-endian length][payload].
+///
+/// `max_bytes` caps the allocation to prevent unauthenticated peers from
+/// triggering large allocations during the handshake phase.
 async fn read_length_prefixed(
     stream: &mut RecvStream,
+    max_bytes: usize,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
 
-    // Sanity check: reject messages larger than 16 MiB
-    if len > 16 * 1024 * 1024 {
-        return Err(format!("message too large: {len} bytes").into());
+    if len > max_bytes {
+        return Err(format!("message too large: {len} bytes (max {max_bytes})").into());
     }
 
     let mut buf = vec![0u8; len];
