@@ -107,8 +107,10 @@ deploy.sh:
      └── build from source (if both miss)
   4. Check if VM already has this store path (nix-store --check-validity)
   5. If not: push closure via nix-store --export | gcloud ssh | nix-store --import
-  6. Sign entire closure with cache signing key
-  7. Activate binary and restart service
+  6. Activate binary and restart service
+
+Note: nix-serve signs NARs on-the-fly via NIX_SECRET_KEY_FILE (configured
+by nix-cache-setup.sh). No explicit signing step in the deploy script.
 ```
 
 `deploy.sh` configures the VM's binary cache as an `extra-substituter` via

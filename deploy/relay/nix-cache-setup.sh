@@ -15,16 +15,19 @@ if ! command -v nix &>/dev/null; then
   echo "[nix-cache-setup] Installing multi-user Nix..."
   # Multi-user Nix installer requires root for daemon setup
   curl -fsSL https://nixos.org/nix/install | sudo sh -s -- --daemon --yes
-  # Re-source profile so `nix` is available for the rest of this script
-  if [ -e /etc/profile.d/nix.sh ]; then
-    # shellcheck source=/dev/null
-    . /etc/profile.d/nix.sh
-  elif [ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]; then
-    # shellcheck source=/dev/null
-    . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-  fi
 else
   echo "[nix-cache-setup] Nix already installed — skipping."
+fi
+
+# Always source Nix profile — gcloud ssh runs a non-login shell so
+# /etc/profile.d/ is never loaded automatically. This is needed on
+# both first install AND re-runs.
+if [ -e /etc/profile.d/nix.sh ]; then
+  # shellcheck source=/dev/null
+  . /etc/profile.d/nix.sh
+elif [ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]; then
+  # shellcheck source=/dev/null
+  . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
 fi
 
 # Ensure the nix daemon is running before proceeding
@@ -63,7 +66,8 @@ if ! command -v nix-serve &>/dev/null; then
   # Ensure the current user has the nixpkgs channel (multi-user installer
   # only adds it for root; gcloud ssh connects as a regular user).
   if ! nix-channel --list 2>/dev/null | grep -q nixpkgs; then
-    nix-channel --add https://nixos.org/channels/nixpkgs-unstable nixpkgs
+    # Use stable channel for production infrastructure (not nixpkgs-unstable)
+    nix-channel --add https://nixos.org/channels/nixos-24.11 nixpkgs
   fi
   nix-channel --update nixpkgs
   nix-env -iA nixpkgs.nix-serve
