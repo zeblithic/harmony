@@ -236,7 +236,7 @@ enum ContactAddress {
         destination_hash: [u8; 16],     // Reticulum destination
     },
     Tunnel {
-        node_id: [u8; 32],              // BLAKE3(ML-DSA-65 pub key)
+        node_id: [u8; 32],              // iroh NodeId (Ed25519 pub derived from BLAKE3(signing_key) seed)
         relay_url: Option<Url>,          // preferred relay (parsed/validated)
         direct_addrs: Vec<SocketAddr>,   // known direct addresses
     },
@@ -301,7 +301,7 @@ Existing variants:
 New variant:
 ```
 RoutingHint::Tunnel {
-    node_id: [u8; 32],              // BLAKE3(ML-DSA-65 pub key)
+    node_id: [u8; 32],              // iroh NodeId (Ed25519 pub derived from BLAKE3(signing_key) seed)
     relay_url: Option<String>,       // e.g., "https://iroh.q8.fyi"
     direct_addrs: Vec<SocketAddr>,   // publicly reachable addrs
 }

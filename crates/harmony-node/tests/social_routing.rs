@@ -178,7 +178,15 @@ fn bloom_filter_enables_social_content_discovery() {
         "storing content should announce it"
     );
 
-    // Trigger filter broadcast
+    // mutation_threshold=1 should trigger inline BroadcastFilter on first publish
+    assert!(
+        store_actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
+        "mutation_threshold=1 should trigger an inline BroadcastFilter on first publish"
+    );
+
+    // Timer tick also broadcasts (exercises the timer-based path separately)
     let tick_actions = tier.handle(StorageTierEvent::FilterTimerTick);
 
     // Find the BroadcastFilter action (Bloom filter for content availability)

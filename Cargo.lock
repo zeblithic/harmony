@@ -1634,6 +1634,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-tunnel"
+version = "0.1.0"
+dependencies = [
+ "harmony-crypto",
+ "harmony-identity",
+ "hex",
+ "rand 0.8.5",
+ "rand_core 0.6.4",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "harmony-workflow"
 version = "0.1.0"
 dependencies = [
