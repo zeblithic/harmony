@@ -101,9 +101,10 @@ pub async fn run(
         // without leaking the secret — the verifying key is public, so deriving
         // from it would let anyone impersonate this node's iroh transport identity.
         let mut sk_bytes = config.local_identity.signing_key().as_bytes();
-        let hash = harmony_crypto::hash::blake3_hash(&sk_bytes);
-        sk_bytes.zeroize(); // as_bytes() returns a Vec — zeroize before dropping
+        let mut hash = harmony_crypto::hash::blake3_hash(&sk_bytes);
+        sk_bytes.zeroize();
         let secret_key = iroh::SecretKey::from(hash);
+        hash.zeroize(); // [u8; 32] is Copy — SecretKey::from copies it, zeroize the original
 
         let mut builder = iroh::Endpoint::builder()
             .alpns(vec![tunnel_task::HARMONY_TUNNEL_ALPN.to_vec()])
