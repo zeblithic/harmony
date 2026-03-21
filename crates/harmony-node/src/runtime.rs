@@ -651,8 +651,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 node_id,
                 now,
             } => {
+                // PeerManager uses seconds; event loop provides milliseconds.
                 let peer_actions = self.peer_manager.on_event(
-                    PeerEvent::TunnelEstablished { identity_hash, node_id, now },
+                    PeerEvent::TunnelEstablished { identity_hash, node_id, now: now / 1000 },
                     &self.contact_store,
                 );
                 self.translate_peer_actions(peer_actions);
@@ -824,8 +825,10 @@ impl<B: BookStore> NodeRuntime<B> {
         }
 
         // Peer lifecycle tick — process probe timers, connecting timeouts.
+        // PeerManager constants are in seconds; the event loop provides
+        // milliseconds via millis_since_start(). Convert at the boundary.
         let peer_actions = self.peer_manager.on_event(
-            PeerEvent::Tick { now: self.last_now },
+            PeerEvent::Tick { now: self.last_now / 1000 },
             &self.contact_store,
         );
         self.translate_peer_actions_out(peer_actions, &mut actions);
@@ -2492,15 +2495,16 @@ mod tests {
         rt.push_event(RuntimeEvent::ContactChanged {
             identity_hash: [0xBB; 16],
         });
+        // Event loop provides milliseconds; PeerManager converts to seconds.
         rt.push_event(RuntimeEvent::TunnelPeerEstablished {
             identity_hash: [0xBB; 16],
             node_id: [0xCC; 32],
-            now: 5000,
+            now: 5000, // 5000ms from event loop
         });
-        // UpdateLastSeen should have been applied by translate_peer_actions.
+        // UpdateLastSeen stores the value in seconds (5000ms → 5s).
         assert_eq!(
             rt.contact_store().get(&[0xBB; 16]).unwrap().last_seen,
-            Some(5000)
+            Some(5) // 5000ms / 1000 = 5s
         );
     }
 }
