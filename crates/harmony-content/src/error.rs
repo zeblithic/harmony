@@ -9,7 +9,7 @@ pub enum ContentError {
     #[error("invalid CID: checksum mismatch")]
     ChecksumMismatch,
 
-    #[error("invalid CID: child depth {child} must be less than parent depth {parent}")]
+    #[error("invalid CID: child depth {child} exceeds maximum bundle depth {parent}")]
     DepthViolation { child: u8, parent: u8 },
 
     #[error("not an inline data CID")]

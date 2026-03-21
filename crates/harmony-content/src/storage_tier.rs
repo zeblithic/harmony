@@ -950,7 +950,7 @@ mod tests {
         let mut bytes = real_cid.to_bytes();
         // Corrupt the size: set size to 999 instead of 12.
         let header = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
-        let keep_mask = 0xF0C0_0003u32; // mode + depth + checksum
+        let keep_mask = 0xFFC0_0003u32; // mode (bits 31-28) + full depth (bits 27-22) + checksum (bits 1-0)
         let fake_header = (header & keep_mask) | ((999u32 & 0xF_FFFF) << 2);
         bytes[0..4].copy_from_slice(&fake_header.to_be_bytes());
         let bad_cid = ContentId::from_bytes(bytes);

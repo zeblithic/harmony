@@ -232,7 +232,7 @@ impl ContentId {
         if bundle_depth > MAX_BUNDLE_DEPTH {
             return Err(ContentError::DepthViolation {
                 child: max_child_depth,
-                parent: bundle_depth,
+                parent: MAX_BUNDLE_DEPTH,
             });
         }
         let hash = compute_hash(bundle_bytes, &flags);
@@ -287,7 +287,18 @@ impl ContentId {
         if len > MAX_INLINE_DATA {
             return Err(ContentError::NotInlineData);
         }
-        Ok(self.hash[1..1 + len].to_vec())
+        let data = &self.hash[1..1 + len];
+        // Verify 4-bit XOR checksum stored in top nibble of hash[0].
+        let stored_xor = (self.hash[0] >> 4) & 0x0F;
+        let mut computed_xor: u8 = 0;
+        for &b in data {
+            computed_xor ^= (b >> 4) ^ (b & 0x0F);
+        }
+        computed_xor &= 0x0F;
+        if stored_xor != computed_xor {
+            return Err(ContentError::ChecksumMismatch);
+        }
+        Ok(data.to_vec())
     }
 
     pub fn inline_metadata(
