@@ -50,10 +50,10 @@ export GCP_PROJECT="your-gcp-project-id"
 ```
 
 The script will:
-1. Create a `e2-micro` VM in `us-west1-b` with Container-Optimized OS
+1. Create an `e2-micro` VM in `us-west1-b` with Debian 12
 2. Reserve a static external IP
 3. Configure firewall rules (80/tcp, 443/tcp, 7842/udp)
-4. Build and upload the `iroh-relay` binary
+4. Install Rust and build `iroh-relay` on the VM
 5. Install the systemd unit and config
 6. Start the service
 

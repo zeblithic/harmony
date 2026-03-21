@@ -107,6 +107,7 @@ fi
 # ── Step 4: Install build tools on VM ─────────────────────────────
 echo "--- Installing build dependencies on VM..."
 gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
+    set -euo pipefail
     if ! command -v cargo &>/dev/null; then
         sudo apt-get update -qq
         sudo apt-get install -y -qq build-essential pkg-config libssl-dev curl
@@ -119,6 +120,7 @@ gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
 # ── Step 5: Build iroh-relay on VM ────────────────────────────────
 echo "--- Building iroh-relay on VM (this takes a few minutes)..."
 gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
+    set -euo pipefail
     source \"\$HOME/.cargo/env\"
     if [ ! -d /tmp/iroh-build ]; then
         git clone --depth=1 --branch '${IROH_VERSION}' '${IROH_REPO}' /tmp/iroh-build
