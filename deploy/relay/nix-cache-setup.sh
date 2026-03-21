@@ -71,6 +71,17 @@ NIX_SERVE_BIN="$(command -v nix-serve)"
 # ---------------------------------------------------------------------------
 SERVICE_FILE=/etc/systemd/system/nix-serve.service
 
+# Create a dedicated unprivileged user for nix-serve.
+# nix-serve only needs read access to /nix/store (world-readable)
+# and read access to the signing key.
+if ! id -u nix-serve &>/dev/null; then
+    useradd -r -s /bin/false -d /nonexistent nix-serve
+    echo "[nix-cache-setup] Created nix-serve user."
+fi
+# Grant nix-serve group read on the signing key
+chgrp nix-serve "${PRIVATE_KEY}" 2>/dev/null || true
+chmod 640 "${PRIVATE_KEY}" 2>/dev/null || true
+
 cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=Nix binary cache server
@@ -79,11 +90,16 @@ Wants=nix-daemon.service
 
 [Service]
 Type=simple
-User=root
+User=nix-serve
+Group=nix-serve
 Environment=NIX_SECRET_KEY_FILE=${PRIVATE_KEY}
 ExecStart=${NIX_SERVE_BIN} --listen 0.0.0.0:5000
 Restart=on-failure
 RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
