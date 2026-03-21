@@ -196,6 +196,7 @@ StandardError=journal
 SyslogIdentifier=iroh-relay
 Environment=RUST_LOG=info
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
