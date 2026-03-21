@@ -303,8 +303,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 entries
             };
 
-            // Suppress unused-variable warnings until Tasks 4/5 consume these.
-            let _ = &bootstrap_peers;
+            // Suppress unused-variable warning until Task 5 consumes tunnel_entries.
             let _ = &tunnel_entries;
 
             if cache_capacity == 0 {
@@ -413,6 +412,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 if no_mdns { None } else { Some(our_addr_bytes) },
                 std::time::Duration::from_secs(mdns_stale_timeout),
                 tunnel_config,
+                bootstrap_peers,
             ).await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())

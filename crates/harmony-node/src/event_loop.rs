@@ -62,6 +62,8 @@ enum ZenohEvent {
 /// - `mdns_addr`: optional 16-byte Reticulum address for mDNS discovery (None = disabled).
 /// - `mdns_stale_timeout`: duration after which silent mDNS peers are evicted.
 /// - `tunnel_config`: optional iroh tunnel configuration (enables tunnel accept/connect).
+/// - `bootstrap_peers`: static peers from the config `[peers]` section; added to PeerTable
+///   at startup so they receive unicast traffic even when not reachable via mDNS.
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -69,6 +71,7 @@ pub async fn run(
     mdns_addr: Option<[u8; 16]>,
     mdns_stale_timeout: Duration,
     tunnel_config: Option<TunnelConfig>,
+    bootstrap_peers: Vec<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -98,6 +101,15 @@ pub async fn run(
             None
         }
     };
+
+    // ── Bootstrap peers from config file ────────────────────────────────────
+    // Add each to the PeerTable so they receive unicast traffic alongside
+    // broadcast. Uses a placeholder Reticulum address — the peer's actual
+    // address will be learned from their Reticulum announce.
+    for peer_addr in &bootstrap_peers {
+        tracing::info!(peer = %peer_addr, "adding bootstrap peer");
+        peer_table.add_peer(*peer_addr, [0x01; 16], 0);
+    }
 
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
