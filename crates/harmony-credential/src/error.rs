@@ -11,6 +11,10 @@ pub enum CredentialError {
     DuplicateDisclosure,
     SubjectMismatch,
     IndexOutOfBounds,
+    ChainTooDeep,
+    ProofNotFound,
+    ChainBroken,
+    ChainLoop,
     SerializeError(&'static str),
     DeserializeError(&'static str),
 }
@@ -28,6 +32,12 @@ impl core::fmt::Display for CredentialError {
             Self::DuplicateDisclosure => write!(f, "duplicate disclosed claim"),
             Self::SubjectMismatch => write!(f, "presenter does not match credential subject"),
             Self::IndexOutOfBounds => write!(f, "status list index out of bounds"),
+            Self::ChainTooDeep => write!(f, "delegation chain exceeds maximum depth"),
+            Self::ProofNotFound => {
+                write!(f, "parent credential not found for proof reference")
+            }
+            Self::ChainBroken => write!(f, "parent subject does not match child issuer"),
+            Self::ChainLoop => write!(f, "delegation chain contains a loop"),
             Self::SerializeError(msg) => write!(f, "serialize error: {msg}"),
             Self::DeserializeError(msg) => write!(f, "deserialize error: {msg}"),
         }

@@ -21,6 +21,7 @@ struct SignablePayload {
     expires_at: u64,
     issued_at: u64,
     nonce: [u8; 16],
+    proof: Option<[u8; 32]>,
 }
 
 /// A compact binary verifiable credential.
@@ -37,6 +38,7 @@ pub struct Credential {
     pub expires_at: u64,
     pub issued_at: u64,
     pub nonce: [u8; 16],
+    pub proof: Option<[u8; 32]>,
     pub signature: Vec<u8>,
 }
 
@@ -60,6 +62,7 @@ impl Credential {
             expires_at: self.expires_at,
             issued_at: self.issued_at,
             nonce: self.nonce,
+            proof: self.proof,
         };
         postcard::to_allocvec(&payload).expect("signable payload serialization cannot fail")
     }
@@ -107,6 +110,7 @@ pub struct CredentialBuilder {
     nonce: [u8; 16],
     claims: Vec<SaltedClaim>,
     status_list_index: Option<u32>,
+    proof: Option<[u8; 32]>,
 }
 
 impl CredentialBuilder {
@@ -139,6 +143,7 @@ impl CredentialBuilder {
             nonce,
             claims: Vec::new(),
             status_list_index: None,
+            proof: None,
         }
     }
 
@@ -172,6 +177,13 @@ impl CredentialBuilder {
         self
     }
 
+    /// Set the proof reference to a parent credential's content hash.
+    /// Used for delegation chains.
+    pub fn proof(&mut self, parent_hash: [u8; 32]) -> &mut Self {
+        self.proof = Some(parent_hash);
+        self
+    }
+
     /// Produce the signable payload bytes.
     ///
     /// The caller signs these bytes externally with their private key.
@@ -187,6 +199,7 @@ impl CredentialBuilder {
             expires_at: self.expires_at,
             issued_at: self.issued_at,
             nonce: self.nonce,
+            proof: self.proof,
         };
         postcard::to_allocvec(&payload).expect("signable payload serialization cannot fail")
     }
@@ -206,6 +219,7 @@ impl CredentialBuilder {
             expires_at: self.expires_at,
             issued_at: self.issued_at,
             nonce: self.nonce,
+            proof: self.proof,
             signature,
         };
         (credential, self.claims)
@@ -362,5 +376,57 @@ mod tests {
                 "unsupported format version"
             ))
         ));
+    }
+
+    #[test]
+    fn proof_field_set_on_credential() {
+        let parent_hash = [0xDD; 32];
+        let mut builder =
+            CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
+        builder.proof(parent_hash);
+        let payload = builder.signable_payload();
+        let (cred, _) = builder.build(payload);
+        assert_eq!(cred.proof, Some(parent_hash));
+    }
+
+    #[test]
+    fn proof_defaults_to_none() {
+        let builder = CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
+        let payload = builder.signable_payload();
+        let (cred, _) = builder.build(payload);
+        assert!(cred.proof.is_none());
+    }
+
+    #[test]
+    fn proof_affects_content_hash() {
+        let mut builder_a =
+            CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
+        builder_a.add_claim(1, alloc::vec![0xAA], [0x11; 16]);
+        let payload_a = builder_a.signable_payload();
+        let (cred_a, _) = builder_a.build(payload_a);
+
+        let mut builder_b =
+            CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
+        builder_b.add_claim(1, alloc::vec![0xAA], [0x11; 16]);
+        builder_b.proof([0xFF; 32]);
+        let payload_b = builder_b.signable_payload();
+        let (cred_b, _) = builder_b.build(payload_b);
+
+        assert_ne!(cred_a.content_hash(), cred_b.content_hash());
+    }
+
+    #[test]
+    fn serde_round_trip_with_proof() {
+        let mut builder =
+            CredentialBuilder::new(test_issuer(), test_subject(), 1000, 2000, [0x01; 16]);
+        builder.add_claim(1, alloc::vec![0xAA], [0x11; 16]);
+        builder.proof([0xCC; 32]);
+        let payload = builder.signable_payload();
+        let (cred, _) = builder.build(payload);
+
+        let bytes = cred.serialize().unwrap();
+        let restored = Credential::deserialize(&bytes).unwrap();
+        assert_eq!(restored.proof, Some([0xCC; 32]));
+        assert_eq!(restored.content_hash(), cred.content_hash());
     }
 }

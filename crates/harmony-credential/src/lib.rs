@@ -13,9 +13,13 @@ pub use credential::{Credential, CredentialBuilder};
 pub use disclosure::Presentation;
 pub use error::CredentialError;
 pub use status_list::{StatusList, StatusListResolver};
-pub use verify::{verify_credential, verify_presentation, CredentialKeyResolver};
+pub use verify::{
+    verify_chain, verify_credential, verify_presentation, CredentialKeyResolver, CredentialResolver,
+};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use status_list::MemoryStatusListResolver;
+#[cfg(any(test, feature = "test-utils"))]
+pub use verify::MemoryCredentialResolver;
 #[cfg(any(test, feature = "test-utils"))]
 pub use verify::MemoryKeyResolver;
