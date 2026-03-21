@@ -169,12 +169,12 @@ pub async fn run(
     };
 
     // ── Bootstrap peers from config file ────────────────────────────────────
-    // Add each to the PeerTable so they receive unicast traffic alongside
-    // broadcast. Uses a placeholder Reticulum address — the peer's actual
-    // address will be learned from their Reticulum announce.
+    // Add each as a pinned peer — exempt from stale eviction so cross-subnet
+    // peers that never send us traffic are retained indefinitely. Each gets a
+    // unique placeholder Reticulum address derived from its socket address.
     for peer_addr in &bootstrap_peers {
-        tracing::info!(peer = %peer_addr, "adding bootstrap peer");
-        peer_table.add_peer(*peer_addr, [0x01; 16], 0);
+        tracing::info!(peer = %peer_addr, "adding pinned bootstrap peer");
+        peer_table.add_pinned_peer(*peer_addr);
     }
 
     // ── Zenoh session ─────────────────────────────────────────────────────────

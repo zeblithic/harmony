@@ -297,8 +297,14 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     });
                 }
                 for entry in &entries {
-                    hex::decode(&entry.node_id)
+                    let decoded = hex::decode(&entry.node_id)
                         .map_err(|e| format!("invalid tunnel node_id '{}': {e}", entry.node_id))?;
+                    if decoded.len() != 32 {
+                        return Err(format!(
+                            "invalid tunnel node_id '{}': expected 32 bytes (64 hex chars), got {}",
+                            entry.node_id, decoded.len()
+                        ).into());
+                    }
                 }
                 entries
             };
@@ -359,7 +365,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             // Build tunnel config if --relay-url was provided.
             // The PQ identity is wrapped in Arc because tunnel tasks need
             // references and PqPrivateIdentity is not Clone.
-            let tunnel_config = if relay_url.is_some() || tunnel_peer.is_some() {
+            let tunnel_config = if relay_url.is_some() || tunnel_peer.is_some() || !tunnel_entries.is_empty() {
                 if tunnel_peer.is_some() {
                     tracing::warn!("--tunnel-peer: outbound connections not yet wired (needs contact store, Bead #3)");
                 }
@@ -501,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_announce_without_persist() {
-        let cli = Cli::try_parse_from(["harmony", "run", "--encrypted-durable-announce"]).unwrap();
+        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--encrypted-durable-announce"]).unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -513,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_zero_cache_capacity() {
-        let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "0"]).unwrap();
+        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--cache-capacity", "0"]).unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -526,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn cli_rejects_oversized_cache_capacity() {
         // 200_000_001 exceeds MAX_CACHE_CAPACITY (200M).
-        let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "200000001"]).unwrap();
+        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--cache-capacity", "200000001"]).unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -559,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_filter_broadcast_ticks_below_two() {
-        let cli = Cli::try_parse_from(["harmony", "run", "--filter-broadcast-ticks", "1"]).unwrap();
+        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--filter-broadcast-ticks", "1"]).unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -598,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn cli_rejects_invalid_listen_address() {
         let cli =
-            Cli::try_parse_from(["harmony", "run", "--listen-address", "not-an-addr"]).unwrap();
+            Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--listen-address", "not-an-addr"]).unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -651,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn cli_rejects_zero_mdns_stale_timeout() {
         let cli =
-            Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "0"]).unwrap();
+            Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--mdns-stale-timeout", "0"]).unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
