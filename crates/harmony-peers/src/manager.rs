@@ -201,6 +201,7 @@ mod tests {
                 added_at: 1000,
                 last_seen: None,
                 notes: None,
+                addresses: vec![],
             })
             .unwrap();
         store

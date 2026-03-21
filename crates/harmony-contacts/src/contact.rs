@@ -1,6 +1,21 @@
 use alloc::string::String;
+use alloc::vec::Vec;
 use harmony_identity::IdentityHash;
 use serde::{Deserialize, Serialize};
+
+/// A reachable address for a contact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContactAddress {
+    /// iroh-net tunnel: NodeId + optional relay + optional direct addresses.
+    Tunnel {
+        /// iroh NodeId (32 bytes).
+        node_id: [u8; 32],
+        /// Preferred relay server URL (e.g., "https://iroh.q8.fyi").
+        relay_url: Option<String>,
+        /// Known direct socket addresses (ephemeral, may be stale).
+        direct_addrs: Vec<String>,
+    },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
@@ -10,6 +25,9 @@ pub struct Contact {
     pub added_at: u64,
     pub last_seen: Option<u64>,
     pub notes: Option<String>,
+    /// Network addresses where this contact can be reached.
+    #[serde(default)]
+    pub addresses: Vec<ContactAddress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +81,7 @@ mod tests {
             added_at: 1710000000,
             last_seen: None,
             notes: None,
+            addresses: vec![],
         };
         assert_eq!(contact.identity_hash, [0xAB; 16]);
         assert!(contact.peering.enabled);
@@ -80,6 +99,7 @@ mod tests {
             added_at: 1710000000,
             last_seen: Some(1710001000),
             notes: Some("My friend".into()),
+            addresses: vec![],
         };
         let bytes = postcard::to_allocvec(&contact).unwrap();
         let decoded: Contact = postcard::from_bytes(&bytes).unwrap();
@@ -87,5 +107,27 @@ mod tests {
         assert_eq!(decoded.display_name, contact.display_name);
         assert_eq!(decoded.peering.priority, PeeringPriority::Normal);
         assert_eq!(decoded.last_seen, Some(1710001000));
+    }
+
+    #[test]
+    fn contact_with_tunnel_address() {
+        let contact = Contact {
+            identity_hash: [0xCC; 16],
+            display_name: None,
+            peering: PeeringPolicy::default(),
+            added_at: 1710000000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![ContactAddress::Tunnel {
+                node_id: [0xEE; 32],
+                relay_url: Some("https://iroh.q8.fyi".into()),
+                direct_addrs: vec!["192.168.1.10:4242".into()],
+            }],
+        };
+        assert_eq!(contact.addresses.len(), 1);
+        assert!(matches!(
+            &contact.addresses[0],
+            ContactAddress::Tunnel { node_id, .. } if *node_id == [0xEE; 32]
+        ));
     }
 }

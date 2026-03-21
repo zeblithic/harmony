@@ -112,6 +112,7 @@ mod tests {
             added_at: 1710000000,
             last_seen: None,
             notes: None,
+            addresses: vec![],
         }
     }
 
