@@ -18,7 +18,7 @@ The design follows Harmony's sans-I/O paradigm: all protocol logic lives in pure
 | Transport | iroh-net (wraps Quinn/QUIC) | Handles hole-punching, relay, connection migration; already in dep tree |
 | Crypto | PQ-first (ML-KEM-768 + ML-DSA-65) | Ed25519 is legacy/Reticulum-compat only; new infra is PQ-native from day 0 |
 | Peer treatment | Dual-path (Reticulum control + Zenoh data) | 500B MTU fine for control plane; data plane needs native QUIC throughput |
-| Relay identity | BLAKE3(ML-DSA-65 pub)[:32] as NodeId | Stock iroh-relay, no fork needed; relay routes by opaque key hash |
+| Relay identity | NodeId derived from BLAKE3(ML-DSA-65 signing key)[:32] seed | Stock iroh-relay, no fork needed; relay routes by opaque key hash |
 | Handshake | ML-KEM encaps + ML-DSA mutual auth → HKDF-SHA256 → ChaCha20-Poly1305 | Simple, PQ-native, reuses existing HKDF-SHA256 impl |
 | Relay access | Open baseline + reputation bonus | Anyone can bootstrap; trust scores unlock higher limits |
 | Relay domain | `iroh.q8.fyi` | User-owned domain, dedicated to Harmony IP-bridge infrastructure |
@@ -76,13 +76,13 @@ The handshake is purpose-built for tunnel establishment. It does not replace the
 After handshake, the tunnel carries two frame types over the same encrypted session:
 
 - **Reticulum frames** (tag `0x01`): Raw Reticulum packets (up to 500 bytes). Fed into the `Node` state machine as `InboundPacket` events on a virtual "tunnel interface."
-- **Zenoh frames** (tag `0x02`): Zenoh protocol messages (arbitrary size, QUIC handles fragmentation). Fed into the `Session` state machine.
+- **Zenoh frames** (tag `0x02`): Zenoh protocol messages (up to 4 GiB per frame; QUIC handles transport fragmentation). Fed into the `Session` state machine.
 
 **Frame format (plaintext, before encryption):**
 ```
-[1 byte tag] [2 bytes length (big-endian)] [payload]
+[1 byte tag] [4 bytes length (big-endian)] [payload]
      ↑              ↑                          ↑
-  0x00-0x02    up to 65535                 frame data
+  0x00-0x02    up to 2^32-1                frame data
 ```
 
 - `0x00` — Keepalive (zero-length payload)
@@ -149,7 +149,7 @@ select! {
 At node startup (if tunnel support is configured):
 
 - Create an `iroh::Endpoint` with:
-  - `SecretKey` derived from PQ identity: `BLAKE3(ml_dsa_65_private_key)[:32]` — used **only** for iroh-net internal addressing, **not** for Harmony authentication
+  - `SecretKey` seeded from PQ identity: `BLAKE3(ml_dsa_65_signing_key)[:32]` — iroh derives `NodeId` from this seed via Ed25519 key derivation. Used **only** for iroh-net internal addressing, **not** for Harmony authentication
   - Relay URL: `https://iroh.q8.fyi` (configurable via CLI `--relay-url` or TOML config)
   - ALPN: `b"harmony-tunnel/1"`
 - If no relay URL and no tunnel contacts are configured, iroh-net is not started (zero overhead)
@@ -236,7 +236,7 @@ enum ContactAddress {
         destination_hash: [u8; 16],     // Reticulum destination
     },
     Tunnel {
-        node_id: [u8; 32],              // BLAKE3(ML-DSA-65 pub key)
+        node_id: [u8; 32],              // iroh NodeId (Ed25519 pub derived from BLAKE3(signing_key) seed)
         relay_url: Option<Url>,          // preferred relay (parsed/validated)
         direct_addrs: Vec<SocketAddr>,   // known direct addresses
     },
@@ -301,7 +301,7 @@ Existing variants:
 New variant:
 ```
 RoutingHint::Tunnel {
-    node_id: [u8; 32],              // BLAKE3(ML-DSA-65 pub key)
+    node_id: [u8; 32],              // iroh NodeId (Ed25519 pub derived from BLAKE3(signing_key) seed)
     relay_url: Option<String>,       // e.g., "https://iroh.q8.fyi"
     direct_addrs: Vec<SocketAddr>,   // publicly reachable addrs
 }
