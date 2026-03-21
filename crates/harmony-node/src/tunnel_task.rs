@@ -562,8 +562,11 @@ async fn read_length_prefixed(
     Ok(buf)
 }
 
-/// Monotonic milliseconds since process start (for TunnelSession timestamps).
-fn millis_since_start() -> u64 {
+/// Monotonic milliseconds since process start.
+///
+/// Shared epoch across all callers (event loop + tunnel tasks) via `OnceLock`.
+/// Used for TunnelSession timestamps and RuntimeEvent timestamps.
+pub(crate) fn millis_since_start() -> u64 {
     use std::sync::OnceLock;
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use harmony_content::blob::MemoryBlobStore;
 use harmony_identity::PqPrivateIdentity;
@@ -144,8 +144,8 @@ pub async fn run(
     }
 
     // ── Monotonic epoch ─────────────────────────────────────────────────────
-    let epoch = Instant::now();
-    let now_ms = || epoch.elapsed().as_millis() as u64;
+    // Shared with tunnel_task::millis_since_start() via OnceLock — same epoch.
+    let now_ms = crate::tunnel_task::millis_since_start;
 
     // ── Timer (250 ms tick) ───────────────────────────────────────────────────
     let mut timer = time::interval(Duration::from_millis(250));
