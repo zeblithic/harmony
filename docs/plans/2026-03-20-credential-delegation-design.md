@@ -36,6 +36,9 @@ pub proof: Option<[u8; 32]>,  // BLAKE3 content_hash of parent credential
 The `proof` field is included in `SignablePayload` and covered by the
 signature. It cannot be added or removed after issuance.
 
+`FORMAT_VERSION` remains 1. No credentials have been issued in
+production — the v1 wire format is still unstable.
+
 ### Builder Change
 
 `CredentialBuilder` gains a `.proof(hash: [u8; 32])` setter, following
@@ -75,7 +78,9 @@ Verifying Credential B checks that A.subject == B.issuer (University).
 
 ## Chain Verification
 
-### New Public Function
+#### New Public Function
+
+Lives in `verify.rs` alongside `verify_credential` and `verify_presentation`.
 
 ```rust
 pub fn verify_chain(
@@ -89,10 +94,11 @@ pub fn verify_chain(
 
 ### Algorithm
 
-1. Call `verify_credential` on the leaf (full check: time bounds,
+1. Compute the leaf's `content_hash` and seed the `seen` array with it.
+2. Call `verify_credential` on the leaf (full check: time bounds,
    signature, revocation).
-2. If `credential.proof` is `Some(parent_hash)`:
-   a. Check `parent_hash` against a `seen` set — if present, return
+3. If `credential.proof` is `Some(parent_hash)`:
+   a. Check `parent_hash` against `seen` — if present, return
       `ChainLoop`.
    b. Add `parent_hash` to `seen`.
    c. Increment depth counter — if depth > `MAX_CHAIN_DEPTH` (8),
@@ -102,13 +108,20 @@ pub fn verify_chain(
    e. Verify parent's subject matches child's issuer — if mismatch,
       return `ChainBroken`.
    f. Recursively verify the parent (full check + chain walk).
-3. If `credential.proof` is `None`, this is the root — done.
+4. If `credential.proof` is `None`, this is the root — done.
+
+A parent whose time bounds have lapsed causes the entire chain to
+fail. This is intentional: delegation authority is time-limited. An
+expired delegation invalidates all downstream credentials, just as
+a revoked delegation does.
 
 ### Loop Detection
 
-A `HashSet<[u8; 32]>` tracks content hashes seen during the walk. If
-a hash appears twice, return `ChainLoop`. This is O(n) in chain depth
-with negligible cost since chains are at most 8 deep.
+A fixed-size array `[[u8; 32]; MAX_CHAIN_DEPTH + 1]` with a length
+counter tracks content hashes seen during the walk. If a hash appears
+twice, return `ChainLoop`. This is zero-allocation and `no_std`-
+compatible — no `HashSet` needed since the depth is bounded to 9
+entries (leaf + up to 8 ancestors).
 
 ### Max Chain Depth
 
@@ -149,10 +162,10 @@ pub struct MemoryCredentialResolver {
 ```rust
 pub enum CredentialError {
     // ... existing variants ...
-    ChainTooDeep,
-    ProofNotFound,
-    ChainBroken,
-    ChainLoop,
+    ChainTooDeep,    // "credential chain exceeds maximum depth (8)"
+    ProofNotFound,   // "parent credential not found in resolver"
+    ChainBroken,     // "parent subject does not match child issuer"
+    ChainLoop,       // "credential chain contains a cycle"
 }
 ```
 
@@ -187,5 +200,11 @@ PQ coverage.
 - `verify_chain` function
 - `ChainTooDeep`, `ProofNotFound`, `ChainBroken`, `ChainLoop` errors
 - `MAX_CHAIN_DEPTH` constant (8)
+- Re-exports: `CredentialResolver` from `lib.rs`, `MemoryCredentialResolver` behind `test-utils`
 - ~150-200 lines of production code, ~300 lines of tests
 - No new crate, no breaking changes
+
+`CredentialResolver::resolve` returns `Option<Credential>` by value
+(owned). This allocates per resolution, but is consistent with the
+existing `CredentialKeyResolver::resolve` → `Option<Vec<u8>>` pattern.
+For chains of depth ≤ 8, the allocation cost is negligible.
