@@ -413,6 +413,11 @@ async fn run_tunnel_loop(
 /// Two-pass dispatch: OutboundBytes are written first (ensuring e.g. TunnelAccept
 /// is on the wire before HandshakeComplete registers the interface), then
 /// bridge events (HandshakeComplete, ReticulumReceived, etc.) are forwarded.
+///
+/// **Invariant:** TunnelSession guarantees that OutboundBytes always precede
+/// Error/Closed in the returned action slice. If this invariant is violated,
+/// pass 1 would return early on Error/Closed before writing trailing
+/// OutboundBytes. This is acceptable — the session is being torn down anyway.
 async fn dispatch_tunnel_actions(
     actions: &[TunnelAction],
     send_stream: &mut SendStream,
@@ -501,13 +506,18 @@ async fn dispatch_tunnel_actions(
 // -- Wire helpers -----------------------------------------------------------
 
 /// Write a length-prefixed message: [4 bytes big-endian length][payload].
+///
+/// Combines prefix and payload into a single buffer before writing to
+/// ensure atomicity — a partial write (prefix sent, payload fails) would
+/// leave the remote's LengthDelimitedCodec in a misaligned state.
 async fn write_length_prefixed(
     stream: &mut SendStream,
     data: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let len = (data.len() as u32).to_be_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(data).await?;
+    let mut frame = Vec::with_capacity(4 + data.len());
+    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    frame.extend_from_slice(data);
+    stream.write_all(&frame).await?;
     Ok(())
 }
 
