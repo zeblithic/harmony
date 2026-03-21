@@ -132,6 +132,12 @@
           "CC_${builtins.replaceStrings ["-"] ["_"] cargoTarget}" =
             "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
 
+          # Ensure fully static binaries for musl targets. harmony-node
+          # gets this from .cargo/config.toml, but iroh-relay uses its own
+          # source tree, so set it explicitly for both.
+          "CARGO_TARGET_${builtins.replaceStrings ["-"] ["_"] (pkgs.lib.toUpper cargoTarget)}_RUSTFLAGS" =
+            "-C link-self-contained=yes";
+
           nativeBuildInputs = with crossPkgs; [
             buildPackages.pkg-config
             buildPackages.cmake
