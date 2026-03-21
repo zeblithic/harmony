@@ -240,7 +240,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
-            if mdns_stale_timeout == 0 {
+            if !no_mdns && mdns_stale_timeout == 0 {
                 return Err(
                     "--mdns-stale-timeout must be > 0: a zero timeout evicts every peer \
                      on every timer tick, silently disabling unicast delivery"

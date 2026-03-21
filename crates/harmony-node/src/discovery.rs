@@ -202,8 +202,7 @@ pub fn start_mdns(
     let instance_name = hex::encode(reticulum_addr);
     let host = format!("{instance_name}.local.");
 
-    let hex_addr = hex::encode(reticulum_addr);
-    let properties: [(&str, &str); 2] = [("addr", &hex_addr), ("proto", "1")];
+    let properties: [(&str, &str); 2] = [("addr", &instance_name), ("proto", "1")];
 
     let service = ServiceInfo::new(
         SERVICE_TYPE,
@@ -481,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_instance_addr_wrong_suffix() {
+    fn parse_instance_addr_ignores_suffix() {
         let fullname = "aabbccdd11223344aabbccdd11223344._other._tcp.local.";
         assert!(parse_instance_addr(fullname).is_some());
     }

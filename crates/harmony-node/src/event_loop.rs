@@ -64,7 +64,7 @@ pub async fn run(
         mdns_addr.unwrap_or([0; 16]),
         mdns_stale_timeout,
     );
-    let mdns_state = match mdns_addr {
+    let mut mdns_state = match mdns_addr {
         Some(addr) => match discovery::start_mdns(listen_addr.port(), &addr) {
             Ok((daemon, rx)) => {
                 tracing::info!("mDNS discovery started on _harmony._udp.local.");
@@ -228,43 +228,50 @@ pub async fn run(
             }
 
             // Arm 4: mDNS discovery events (when enabled).
-            Some(event) = async {
+            result = async {
                 match &mdns_state {
-                    Some((_, rx)) => rx.recv_async().await.ok(),
-                    None => std::future::pending::<Option<mdns_sd::ServiceEvent>>().await,
+                    Some((_, rx)) => Some(rx.recv_async().await),
+                    None => std::future::pending::<Option<Result<mdns_sd::ServiceEvent, _>>>().await,
                 }
             } => {
-                match event {
-                    mdns_sd::ServiceEvent::ServiceResolved(info) => {
-                        let properties = info.get_properties();
-                        if let Some(reticulum_addr) = discovery::parse_txt_addr(properties) {
-                            let proto = discovery::parse_txt_proto(properties);
-                            for ip in info.get_addresses() {
-                                let socket_addr = SocketAddr::new(ip.to_ip_addr(), info.get_port());
-                                if peer_table.add_peer(socket_addr, reticulum_addr, proto) {
+                match result {
+                    Some(Ok(event)) => match event {
+                        mdns_sd::ServiceEvent::ServiceResolved(info) => {
+                            let properties = info.get_properties();
+                            if let Some(reticulum_addr) = discovery::parse_txt_addr(properties) {
+                                let proto = discovery::parse_txt_proto(properties);
+                                for ip in info.get_addresses() {
+                                    let socket_addr = SocketAddr::new(ip.to_ip_addr(), info.get_port());
+                                    if peer_table.add_peer(socket_addr, reticulum_addr, proto) {
+                                        tracing::info!(
+                                            peer = %socket_addr,
+                                            addr = %hex::encode(reticulum_addr),
+                                            proto,
+                                            "mDNS peer discovered"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        mdns_sd::ServiceEvent::ServiceRemoved(_service_type, fullname) => {
+                            if let Some(reticulum_addr) = discovery::parse_instance_addr(&fullname) {
+                                let removed = peer_table.remove_by_reticulum_addr(&reticulum_addr);
+                                if removed > 0 {
                                     tracing::info!(
-                                        peer = %socket_addr,
                                         addr = %hex::encode(reticulum_addr),
-                                        proto,
-                                        "mDNS peer discovered"
+                                        removed,
+                                        "mDNS peer removed (goodbye)"
                                     );
                                 }
                             }
                         }
+                        _ => {}
+                    },
+                    Some(Err(_)) => {
+                        tracing::warn!("mDNS channel disconnected — discovery disabled");
+                        mdns_state = None;
                     }
-                    mdns_sd::ServiceEvent::ServiceRemoved(_service_type, fullname) => {
-                        if let Some(reticulum_addr) = discovery::parse_instance_addr(&fullname) {
-                            let removed = peer_table.remove_by_reticulum_addr(&reticulum_addr);
-                            if removed > 0 {
-                                tracing::info!(
-                                    addr = %hex::encode(reticulum_addr),
-                                    removed,
-                                    "mDNS peer removed (goodbye)"
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
+                    None => unreachable!("pending future cannot resolve to None"),
                 }
             }
 
