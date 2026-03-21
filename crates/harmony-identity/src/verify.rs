@@ -192,6 +192,53 @@ mod tests {
     }
 
     #[test]
+    fn ml_dsa65_tampered_message_rejected() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (sign_pk, sign_sk) = harmony_crypto::ml_dsa::generate(&mut OsRng);
+                let signature =
+                    harmony_crypto::ml_dsa::sign(&sign_sk, b"original message").unwrap();
+
+                let err = verify_signature(
+                    CryptoSuite::MlDsa65,
+                    &sign_pk.as_bytes(),
+                    b"tampered message",
+                    signature.as_bytes(),
+                )
+                .unwrap_err();
+                assert!(matches!(err, IdentityError::SignatureInvalid));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn ml_dsa65_rotatable_wrong_key_rejected() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (_sign_pk, sign_sk) = harmony_crypto::ml_dsa::generate(&mut OsRng);
+                let (other_pk, _) = harmony_crypto::ml_dsa::generate(&mut OsRng);
+                let message = b"rotatable wrong key";
+                let signature = harmony_crypto::ml_dsa::sign(&sign_sk, message).unwrap();
+
+                let err = verify_signature(
+                    CryptoSuite::MlDsa65Rotatable,
+                    &other_pk.as_bytes(),
+                    message,
+                    signature.as_bytes(),
+                )
+                .unwrap_err();
+                assert!(matches!(err, IdentityError::SignatureInvalid));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
     fn ml_dsa65_invalid_key_length_rejected() {
         let err =
             verify_signature(CryptoSuite::MlDsa65, &[0x00; 32], b"msg", &[0x00; 64]).unwrap_err();
