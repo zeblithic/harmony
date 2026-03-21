@@ -94,6 +94,7 @@ async fn main() {
                 }),
         )
         .with_target(false)
+        .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
 
