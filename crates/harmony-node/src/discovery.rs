@@ -11,7 +11,6 @@ pub struct PeerInfo {
     pub reticulum_addr: [u8; 16],
     pub proto_version: u8,
     pub last_seen: Instant,
-    pub discovered_at: Instant,
 }
 
 /// Tracks LAN peers discovered via mDNS/DNS-SD.
@@ -61,7 +60,6 @@ impl PeerTable {
                 reticulum_addr,
                 proto_version,
                 last_seen: now,
-                discovered_at: now,
             });
         // Clean up the old reverse-index entry if the Reticulum address changed.
         if let Some(old_ra) = old_reticulum_addr {

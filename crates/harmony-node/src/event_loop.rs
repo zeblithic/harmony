@@ -241,7 +241,16 @@ pub async fn run(
                             if let Some(reticulum_addr) = discovery::parse_txt_addr(properties) {
                                 let proto = discovery::parse_txt_proto(properties);
                                 for ip in info.get_addresses() {
-                                    let socket_addr = SocketAddr::new(ip.to_ip_addr(), info.get_port());
+                                    let ip_addr = ip.to_ip_addr();
+                                    // Only track addresses matching our socket family
+                                    let matches = match listen_addr {
+                                        SocketAddr::V4(_) => ip_addr.is_ipv4(),
+                                        SocketAddr::V6(_) => ip_addr.is_ipv6(),
+                                    };
+                                    if !matches {
+                                        continue;
+                                    }
+                                    let socket_addr = SocketAddr::new(ip_addr, info.get_port());
                                     if peer_table.add_peer(socket_addr, reticulum_addr, proto) {
                                         tracing::info!(
                                             peer = %socket_addr,
