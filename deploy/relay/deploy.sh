@@ -34,6 +34,35 @@ LOCAL_BINARY="${LOCAL_BINARY:-}"
 RATE_LIMIT_BPS="${RATE_LIMIT_BPS:-102400}"
 RATE_LIMIT_BURST="${RATE_LIMIT_BURST:-512000}"
 
+# ── Input validation ──────────────────────────────────────────────
+# Prevent shell injection via SSH commands and TOML config corruption.
+# RFC 952: labels start/end with alphanumeric, hyphens only in the middle.
+# No underscores — they cause ACME/Let's Encrypt certificate failures.
+[[ "${RELAY_HOSTNAME}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]] \
+    || { echo "ERROR: RELAY_HOSTNAME must be a valid hostname (RFC 952: alphanumeric labels separated by dots, no leading/trailing hyphens)"; exit 1; }
+[[ "${CONTACT_EMAIL}" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$ ]] \
+    || { echo "ERROR: CONTACT_EMAIL must be a valid email address (user@domain.tld)"; exit 1; }
+# Validate LOCAL_BINARY early: if set but missing, fail now rather than
+# falling through to the build paths with unvalidated IROH_VERSION/IROH_REPO.
+if [ -n "${LOCAL_BINARY}" ] && [ ! -f "${LOCAL_BINARY}" ]; then
+    echo "ERROR: LOCAL_BINARY set to '${LOCAL_BINARY}' but file does not exist"
+    exit 1
+fi
+# Only validate build-time vars when LOCAL_BINARY is not provided —
+# IROH_VERSION and IROH_REPO are unused when deploying a pre-built binary.
+if [ -z "${LOCAL_BINARY}" ]; then
+    [[ "${IROH_VERSION}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?(\+[a-zA-Z0-9._-]+)?$ ]] \
+        || { echo "ERROR: IROH_VERSION must be a valid semver tag (e.g. v0.91.2)"; exit 1; }
+    # Host excludes / so it can't consume path segments; path segments separated by literal /.
+    [[ "${IROH_REPO}" =~ ^https://[a-zA-Z0-9._-]+(:[0-9]+)?(/[a-zA-Z0-9._-]+)+\.git$ ]] \
+        || { echo "ERROR: IROH_REPO must be a valid https git URL ending in .git"; exit 1; }
+fi
+# TOML forbids leading zeros in integers — match (0|[1-9][0-9]*).
+[[ "${RATE_LIMIT_BPS}" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || { echo "ERROR: RATE_LIMIT_BPS must be a non-negative integer (no leading zeros)"; exit 1; }
+[[ "${RATE_LIMIT_BURST}" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || { echo "ERROR: RATE_LIMIT_BURST must be a non-negative integer (no leading zeros)"; exit 1; }
+
 echo "=== Harmony Relay Deployment ==="
 echo "  Hostname:     ${RELAY_HOSTNAME}"
 echo "  Project:      ${GCP_PROJECT}"
