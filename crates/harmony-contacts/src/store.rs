@@ -72,6 +72,11 @@ impl ContactStore {
         self.contacts.iter()
     }
 
+    /// Find a contact by iroh tunnel NodeId.
+    ///
+    /// Used by the event loop to map `TunnelBridgeEvent::HandshakeComplete { peer_node_id }`
+    /// back to the contact's `identity_hash` for PeerManager notification.
+    /// Consumer: `harmony-node` event loop (harmony-dgb/harmony-h6k integration).
     pub fn find_by_tunnel_node_id(&self, node_id: &[u8; 32]) -> Option<&Contact> {
         self.contacts.values().find(|c| {
             c.addresses.iter().any(|addr| match addr {
