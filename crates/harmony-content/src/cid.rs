@@ -831,9 +831,9 @@ mod tests {
     fn verify_hash_matches_for_bundle() {
         // Bundle CID has a different type tag than book, but verify_hash
         // should still pass because it only checks the hash portion.
-        let blob_a = ContentId::for_book(b"child-a", ContentFlags::default()).unwrap();
-        let blob_b = ContentId::for_book(b"child-b", ContentFlags::default()).unwrap();
-        let children = [blob_a, blob_b];
+        let book_a = ContentId::for_book(b"child-a", ContentFlags::default()).unwrap();
+        let book_b = ContentId::for_book(b"child-b", ContentFlags::default()).unwrap();
+        let children = [book_a, book_b];
         let bundle_bytes: Vec<u8> = children.iter().flat_map(|c| c.to_bytes()).collect();
         let bundle_cid =
             ContentId::for_bundle(&bundle_bytes, &children, ContentFlags::default()).unwrap();
@@ -869,9 +869,9 @@ mod tests {
     #[test]
     fn for_bundle_basic() {
         // Create two book CIDs, then bundle them
-        let blob_a = ContentId::for_book(b"chunk a", ContentFlags::default()).unwrap();
-        let blob_b = ContentId::for_book(b"chunk b", ContentFlags::default()).unwrap();
-        let children = [blob_a, blob_b];
+        let book_a = ContentId::for_book(b"chunk a", ContentFlags::default()).unwrap();
+        let book_b = ContentId::for_book(b"chunk b", ContentFlags::default()).unwrap();
+        let children = [book_a, book_b];
         let bundle_bytes = children_to_bytes(&children);
         let cid = ContentId::for_bundle(&bundle_bytes, &children, ContentFlags::default()).unwrap();
         assert_eq!(cid.cid_type(), CidType::Bundle(1)); // one level above blobs
@@ -1278,10 +1278,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_vector_bundle_of_two_blobs() {
-        let blob_a = ContentId::for_book(b"aaa", ContentFlags::default()).unwrap();
-        let blob_b = ContentId::for_book(b"bbb", ContentFlags::default()).unwrap();
-        let children = [blob_a, blob_b];
+    fn canonical_vector_bundle_of_two_books() {
+        let book_a = ContentId::for_book(b"aaa", ContentFlags::default()).unwrap();
+        let book_b = ContentId::for_book(b"bbb", ContentFlags::default()).unwrap();
+        let children = [book_a, book_b];
         let bundle_bytes = children_to_bytes(&children);
         let bundle =
             ContentId::for_bundle(&bundle_bytes, &children, ContentFlags::default()).unwrap();
@@ -1292,11 +1292,11 @@ mod tests {
         // Full 32-byte canonical hex (independently verifiable by other implementations).
         // Pin child CIDs so the bundle hash is fully determined:
         assert_eq!(
-            hex::encode(blob_a.to_bytes()),
+            hex::encode(book_a.to_bytes()),
             "1834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af00003537",
         );
         assert_eq!(
-            hex::encode(blob_b.to_bytes()),
+            hex::encode(book_b.to_bytes()),
             "1e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c93558000035db",
         );
         assert_eq!(

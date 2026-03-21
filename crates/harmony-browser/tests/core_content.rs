@@ -8,10 +8,10 @@ use harmony_content::cid::{ContentFlags, ContentId};
 /// Helper: build a content bundle with inline metadata.
 fn build_test_bundle(data: &[u8], mime: [u8; 8]) -> (ContentId, Vec<u8>) {
     let mut store = MemoryBookStore::new();
-    let blob_cid = store.insert(data).unwrap();
+    let book_cid = store.insert(data).unwrap();
 
     let mut builder = BundleBuilder::new();
-    builder.add(blob_cid);
+    builder.add(book_cid);
     builder.with_metadata(data.len() as u64, 1, 1000, mime);
     let (bundle_bytes, bundle_cid) = builder.build().unwrap();
     (bundle_cid, bundle_bytes)
