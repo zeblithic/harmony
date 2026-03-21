@@ -676,7 +676,7 @@ This is the main integration task. Add the iroh Endpoint setup, the accept loop,
 In `main.rs`, add to the `Commands::Run` struct:
 
 ```rust
-        /// Relay server URL for tunnel connections (e.g., https://iroh.q8.fyi).
+        /// Relay server URL for tunnel connections (e.g., https://i.q8.fyi).
         /// If not set, tunnel support is disabled.
         #[arg(long, value_name = "URL")]
         relay_url: Option<String>,
@@ -708,7 +708,7 @@ In `event_loop.rs`, after the Zenoh session setup, conditionally create the iroh
         let secret_key = derive_iroh_secret_key(&tunnel_config.local_identity);
 
         // Use empty_builder to avoid including N0's default relay servers.
-        // We only want our own relay (iroh.q8.fyi) or no relay at all.
+        // We only want our own relay (i.q8.fyi) or no relay at all.
         let relay_mode = if tunnel_config.relay_url.is_some() {
             iroh::RelayMode::Disabled // Overridden below with Custom
         } else {
@@ -944,4 +944,4 @@ git commit -m "feat(node): cleanup and graceful iroh endpoint shutdown"
 **Notes:**
 - This plan focuses on the transport plumbing. The responder path is fully functional (any iroh peer can connect and exchange encrypted Reticulum packets). The initiator path requires the remote peer's PqIdentity, which comes from the contact store (Bead #3 — `harmony-h6k`) or discovery hints (Bead #4 — `harmony-lbv`). For now, outbound connections are stubbed with a TODO.
 - **Zenoh session over tunnel:** The spec (Section 2, point 2 of Interface Registration) calls for opening a Zenoh Session over the tunnel's Zenoh frame path. This plan registers only the Reticulum interface on handshake. Zenoh session integration over tunnels is deferred to Bead #3 (`harmony-h6k`) where the peer lifecycle manages both protocol layers. The `ZenohReceived` bridge event is plumbed but marked TODO.
-- **N0 relays excluded:** The plan uses `Endpoint::empty_builder()` to avoid including N0's default relay servers. Only the user-configured relay (e.g., `iroh.q8.fyi`) is used, or no relay if `--relay-url` is omitted.
+- **N0 relays excluded:** The plan uses `Endpoint::empty_builder()` to avoid including N0's default relay servers. Only the user-configured relay (e.g., `i.q8.fyi`) is used, or no relay if `--relay-url` is omitted.
