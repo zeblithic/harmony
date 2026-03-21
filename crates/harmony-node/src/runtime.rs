@@ -152,7 +152,8 @@ pub enum RuntimeEvent {
     /// A tunnel was closed.
     TunnelClosed { interface_name: String },
     /// A discovery announce record was received from the network.
-    DiscoveryAnnounceReceived { record_bytes: Vec<u8>, now: u64 },
+    /// `unix_now` is Unix epoch seconds (NOT monotonic millis_since_start).
+    DiscoveryAnnounceReceived { record_bytes: Vec<u8>, unix_now: u64 },
     /// Local tunnel endpoint info became available.
     LocalTunnelInfo {
         node_id: [u8; 32],
@@ -681,7 +682,10 @@ impl<B: BookStore> NodeRuntime<B> {
                 tracing::info!(%interface_name, "tunnel closed — interface unregistered");
                 self.router.unregister_interface(&interface_name);
             }
-            RuntimeEvent::DiscoveryAnnounceReceived { record_bytes, now: _ } => {
+            RuntimeEvent::DiscoveryAnnounceReceived { record_bytes, unix_now } => {
+                // unix_now is Unix epoch seconds, provided by the caller for
+                // sans-I/O testability. Discovery timestamps (published_at,
+                // expires_at) are Unix epoch seconds.
                 let record = match harmony_discovery::AnnounceRecord::deserialize(&record_bytes) {
                     Ok(r) => r,
                     Err(e) => {
@@ -689,13 +693,6 @@ impl<B: BookStore> NodeRuntime<B> {
                         return;
                     }
                 };
-                // Discovery uses Unix epoch seconds for published_at/expires_at
-                // and the `now` parameter. The event loop provides monotonic
-                // millis_since_start() which is NOT Unix epoch — use wall-clock.
-                let unix_now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
                 // Pre-reject before touching the manager's cache. DiscoveryManager
                 // also verifies internally, but this avoids unnecessary state mutations.
                 if let Err(e) = harmony_discovery::verify_announce(&record, unix_now) {
@@ -703,9 +700,16 @@ impl<B: BookStore> NodeRuntime<B> {
                     return;
                 }
                 let identity_hash = record.identity_ref.hash;
-                let published_at = record.published_at;
 
-                // Feed to DiscoveryManager first — it performs staleness checks
+                // Snapshot the cached published_at BEFORE feeding to the manager,
+                // so we can detect whether the record was actually accepted
+                // (not rejected as stale duplicate).
+                let old_published_at = self
+                    .discovery
+                    .get_record(&identity_hash, unix_now)
+                    .map(|r| r.published_at);
+
+                // Feed to DiscoveryManager — it performs staleness checks
                 // (rejects records with published_at <= cached published_at).
                 let actions =
                     self.discovery
@@ -715,15 +719,14 @@ impl<B: BookStore> NodeRuntime<B> {
                         });
                 self.dispatch_discovery_actions(actions);
 
-                // Only process tunnel hints if the manager accepted the record
-                // (not rejected as stale). Check by comparing the cached record's
-                // published_at with the one we submitted.
-                let accepted = self
+                // Only process tunnel hints if the manager actually updated
+                // the cached record (strictly newer published_at, or first seen).
+                let new_published_at = self
                     .discovery
                     .get_record(&identity_hash, unix_now)
-                    .map(|r| r.published_at == published_at)
-                    .unwrap_or(false);
-                if accepted {
+                    .map(|r| r.published_at);
+                let was_updated = new_published_at != old_published_at;
+                if was_updated {
                     // DiscoveryManager.IdentityDiscovered requires the peer to
                     // be in the `online` set (via LivelinessChange), which needs
                     // Zenoh liveliness token wiring — not yet implemented.
@@ -888,6 +891,11 @@ impl<B: BookStore> NodeRuntime<B> {
 
         // Feed discovery tick — uses Unix epoch seconds (not monotonic)
         // because AnnounceRecord.published_at/expires_at are Unix epoch.
+        // NOTE: This is the one place where tick() calls SystemTime::now()
+        // rather than using a passed-in timestamp. Discovery expiry needs
+        // wall-clock time; the caller (event loop) only provides monotonic
+        // millis. If tick() is later refactored to accept a unix_now param,
+        // this should use it instead.
         let disc_unix_now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1380,7 +1388,7 @@ mod tests {
         };
         let _e7 = RuntimeEvent::DiscoveryAnnounceReceived {
             record_bytes: vec![0u8; 10],
-            now: 1000,
+            unix_now: 1000,
         };
         let _e8 = RuntimeEvent::LocalTunnelInfo {
             node_id: [0u8; 32],
