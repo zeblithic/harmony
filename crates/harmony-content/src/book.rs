@@ -123,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_with_flags_encrypted_blob() {
+    fn insert_with_flags_encrypted_book() {
         let mut store = MemoryBookStore::new();
         let flags = ContentFlags {
             encrypted: true,

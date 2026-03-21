@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn validate_depth_accepts_mixed_children() {
-        // L3 bundle containing [blob, L1, L2] — valid (mixed depths, all < 3)
+        // L3 bundle containing [book, L1, L2] — valid (mixed depths, all < 3)
         let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
         let l1_bytes = book.to_bytes().to_vec();
         let l1 = ContentId::for_bundle(&l1_bytes, &[book], ContentFlags::default()).unwrap();
@@ -262,7 +262,7 @@ mod tests {
 
         let (bytes, cid) = builder.build().unwrap();
         assert_eq!(cid.cid_type(), CidType::Bundle(1));
-        // 2 entries: metadata + blob
+        // 2 entries: metadata + book
         assert_eq!(bytes.len(), 64);
 
         let parsed = parse_bundle(&bytes).unwrap();
@@ -397,19 +397,19 @@ mod tests {
     fn two_level_bundle_tree() {
         let mut store = MemoryBookStore::new();
 
-        // Create 4 blobs
+        // Create 4 books
         let cids: Vec<ContentId> = (0..4)
             .map(|i| store.insert(format!("chunk {i}").as_bytes()).unwrap())
             .collect();
 
-        // L1 bundle: first 2 blobs
+        // L1 bundle: first 2 books
         let mut b1 = BundleBuilder::new();
         b1.add(cids[0]).add(cids[1]);
         let (b1_bytes, b1_cid) = b1.build().unwrap();
         assert_eq!(b1_cid.cid_type(), CidType::Bundle(1));
         store.store(b1_cid, b1_bytes);
 
-        // L1 bundle: last 2 blobs
+        // L1 bundle: last 2 books
         let mut b2 = BundleBuilder::new();
         b2.add(cids[2]).add(cids[3]);
         let (b2_bytes, b2_cid) = b2.build().unwrap();

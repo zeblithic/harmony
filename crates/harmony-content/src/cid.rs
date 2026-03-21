@@ -880,8 +880,8 @@ mod tests {
 
     #[test]
     fn for_bundle_depth_is_max_child_plus_one() {
-        let blob = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
-        let l1_children = [blob];
+        let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
+        let l1_children = [book];
         let l1_bytes = children_to_bytes(&l1_children);
         let l1 = ContentId::for_bundle(&l1_bytes, &l1_children, ContentFlags::default()).unwrap();
         assert_eq!(l1.cid_type(), CidType::Bundle(1));
@@ -895,9 +895,9 @@ mod tests {
     #[test]
     fn for_bundle_rejects_depth_overflow() {
         // Can't create a Bundle(8) — max is 7
-        let blob = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
+        let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
         // Build up to depth 7
-        let mut current = blob;
+        let mut current = book;
         for _ in 0..7 {
             let children = [current];
             let bytes = children_to_bytes(&children);
@@ -1070,8 +1070,8 @@ mod tests {
 
     #[test]
     fn for_bundle_with_flags() {
-        let blob = ContentId::for_book(b"child", ContentFlags::default()).unwrap();
-        let children = [blob];
+        let book = ContentId::for_book(b"child", ContentFlags::default()).unwrap();
+        let children = [book];
         let bytes = children_to_bytes(&children);
 
         let flags = ContentFlags {
@@ -1167,8 +1167,8 @@ mod tests {
 
     #[test]
     fn parse_inline_metadata_rejects_non_metadata_cid() {
-        let blob = ContentId::for_book(b"not metadata", ContentFlags::default()).unwrap();
-        assert!(blob.parse_inline_metadata().is_err());
+        let book = ContentId::for_book(b"not metadata", ContentFlags::default()).unwrap();
+        assert!(book.parse_inline_metadata().is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -1192,8 +1192,8 @@ mod tests {
 
     #[test]
     fn checksum_verification_passes_for_bundle() {
-        let blob = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
-        let children = [blob];
+        let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
+        let children = [book];
         let bytes = children_to_bytes(&children);
         let bundle = ContentId::for_bundle(&bytes, &children, ContentFlags::default()).unwrap();
         assert!(bundle.verify_checksum().is_ok());
@@ -1209,8 +1209,8 @@ mod tests {
     fn checksum_detects_type_corruption() {
         // A Book CID with its tag bits corrupted to InlineMetadata should
         // fail checksum verification, even though both types have depth 0.
-        let blob = ContentId::for_book(b"test", ContentFlags::default()).unwrap();
-        let mut bytes = blob.to_bytes();
+        let book = ContentId::for_book(b"test", ContentFlags::default()).unwrap();
+        let mut bytes = book.to_bytes();
         // Corrupt the tag: overwrite bottom 12 bits with an InlineMetadata tag.
         // InlineMetadata prefix = 0xFF0 (9 bits: 1111_1111_0), with 3-bit checksum.
         let packed = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
