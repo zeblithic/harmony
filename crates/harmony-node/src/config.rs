@@ -126,6 +126,22 @@ pub fn resolve_config_path(cli_override: Option<&Path>) -> Result<(PathBuf, bool
 }
 
 // ---------------------------------------------------------------------------
+// Merge helpers
+// ---------------------------------------------------------------------------
+
+/// Three-way merge: CLI (highest) > config file > hardcoded default.
+pub fn resolve<T>(cli: Option<T>, file: Option<T>, default: T) -> T {
+    cli.or(file).unwrap_or(default)
+}
+
+/// Merge a boolean CLI flag with a config file value.
+/// CLI booleans are `bool` not `Option<bool>` — `true` means "explicitly passed".
+/// Only works for flags where the CLI default is `false`.
+pub fn resolve_bool(cli: bool, file: Option<bool>, default: bool) -> bool {
+    if cli { true } else { file.unwrap_or(default) }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -254,5 +270,37 @@ node_id = "112233445566"
         assert!(!is_explicit);
         let expected = PathBuf::from(home).join(".harmony").join("node.toml");
         assert_eq!(path, expected);
+    }
+
+    // ── Merge helper tests ──────────────────────────────────────────────
+
+    #[test]
+    fn resolve_cli_wins() {
+        assert_eq!(resolve(Some(42), Some(99), 0), 42);
+    }
+
+    #[test]
+    fn resolve_file_wins_when_cli_none() {
+        assert_eq!(resolve(None, Some(99), 0), 99);
+    }
+
+    #[test]
+    fn resolve_default_when_both_none() {
+        assert_eq!(resolve::<i32>(None, None, 7), 7);
+    }
+
+    #[test]
+    fn resolve_bool_cli_true_wins() {
+        assert_eq!(resolve_bool(true, Some(false), false), true);
+    }
+
+    #[test]
+    fn resolve_bool_cli_false_defers_to_file() {
+        assert_eq!(resolve_bool(false, Some(true), false), true);
+    }
+
+    #[test]
+    fn resolve_bool_all_false_returns_default() {
+        assert_eq!(resolve_bool(false, None, false), false);
     }
 }

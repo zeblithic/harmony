@@ -28,12 +28,15 @@ enum Commands {
     },
     /// Start the Harmony node runtime
     Run {
+        /// Path to config file (default: ~/.harmony/node.toml)
+        #[arg(long, value_name = "PATH")]
+        config: Option<std::path::PathBuf>,
         /// W-TinyLFU cache capacity (number of items)
-        #[arg(long, default_value_t = 1024)]
-        cache_capacity: usize,
+        #[arg(long)]
+        cache_capacity: Option<usize>,
         /// WASM compute fuel budget per tick
-        #[arg(long, default_value_t = 100_000)]
-        compute_budget: u64,
+        #[arg(long)]
+        compute_budget: Option<u64>,
         /// Accept encrypted durable (10) content for storage
         #[arg(long)]
         encrypted_durable_persist: bool,
@@ -44,23 +47,23 @@ enum Commands {
         #[arg(long)]
         no_public_ephemeral_announce: bool,
         /// Bloom filter broadcast interval in ticks
-        #[arg(long, default_value_t = 30)]
-        filter_broadcast_ticks: u32,
+        #[arg(long)]
+        filter_broadcast_ticks: Option<u32>,
         /// Bloom filter broadcast mutation threshold
-        #[arg(long, default_value_t = 100)]
-        filter_mutation_threshold: u32,
+        #[arg(long)]
+        filter_mutation_threshold: Option<u32>,
         /// Path to the identity key file
         #[arg(long, value_name = "PATH")]
         identity_file: Option<std::path::PathBuf>,
         /// UDP listen address for Reticulum mesh packets
-        #[arg(long, default_value = "0.0.0.0:4242")]
-        listen_address: String,
+        #[arg(long)]
+        listen_address: Option<String>,
         /// Disable mDNS peer discovery (broadcast-only mode)
         #[arg(long)]
         no_mdns: bool,
         /// Seconds before evicting a silent mDNS peer (default: 60)
-        #[arg(long, default_value_t = 60)]
-        mdns_stale_timeout: u64,
+        #[arg(long)]
+        mdns_stale_timeout: Option<u64>,
         /// iroh relay URL for NAT-traversal tunnels (enables tunnel accept)
         #[arg(long, value_name = "URL")]
         relay_url: Option<String>,
@@ -204,6 +207,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Commands::Run {
+            config,
             cache_capacity,
             compute_budget,
             encrypted_durable_persist,
@@ -224,6 +228,55 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             use harmony_content::storage_tier::{
                 ContentPolicy, FilterBroadcastConfig, StorageBudget,
             };
+
+            // ── Load config file ────────────────────────────────────────
+            let (config_path, explicit) = crate::config::resolve_config_path(config.as_deref())?;
+            if explicit && !config_path.exists() {
+                return Err(format!("config file not found: {}", config_path.display()).into());
+            }
+            let config_file = crate::config::load(&config_path).map_err(|e| format!("{e}"))?;
+
+            // ── Merge CLI > file > defaults ─────────────────────────────
+            use crate::config::{resolve, resolve_bool};
+            let cache_capacity = resolve(cache_capacity, config_file.cache_capacity, 1024);
+            let compute_budget = resolve(compute_budget, config_file.compute_budget, 100_000);
+            let filter_broadcast_ticks = resolve(filter_broadcast_ticks, config_file.filter_broadcast_ticks, 30);
+            let filter_mutation_threshold = resolve(filter_mutation_threshold, config_file.filter_mutation_threshold, 100);
+            let mdns_stale_timeout = resolve(mdns_stale_timeout, config_file.mdns_stale_timeout, 60);
+            let listen_address = resolve(listen_address, config_file.listen_address, "0.0.0.0:4242".to_string());
+            let identity_file = identity_file.or(config_file.identity_file);
+            let relay_url = relay_url.or(config_file.relay_url);
+            let no_mdns = resolve_bool(no_mdns, config_file.no_mdns, false);
+            let encrypted_durable_persist = resolve_bool(encrypted_durable_persist, config_file.encrypted_durable_persist, false);
+            let encrypted_durable_announce = resolve_bool(encrypted_durable_announce, config_file.encrypted_durable_announce, false);
+            let no_public_ephemeral_announce = resolve_bool(no_public_ephemeral_announce, config_file.no_public_ephemeral_announce, false);
+
+            // ── Parse config-only sections ───────────────────────────────
+            let bootstrap_peers: Vec<std::net::SocketAddr> = config_file.peers
+                .unwrap_or_default()
+                .iter()
+                .map(|p| p.address.parse::<std::net::SocketAddr>())
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("invalid peer address in config file: {e}"))?;
+
+            let tunnel_entries: Vec<crate::config::TunnelEntry> = {
+                let mut entries = config_file.tunnels.unwrap_or_default();
+                if let Some(ref peer) = tunnel_peer {
+                    entries.push(crate::config::TunnelEntry {
+                        node_id: peer.clone(),
+                        name: None,
+                    });
+                }
+                for entry in &entries {
+                    hex::decode(&entry.node_id)
+                        .map_err(|e| format!("invalid tunnel node_id '{}': {e}", entry.node_id))?;
+                }
+                entries
+            };
+
+            // Suppress unused-variable warnings until Tasks 4/5 consume these.
+            let _ = &bootstrap_peers;
+            let _ = &tunnel_entries;
 
             if cache_capacity == 0 {
                 return Err("--cache-capacity must be > 0".into());
@@ -353,7 +406,7 @@ mod tests {
     fn cli_parses_run_with_compute_budget() {
         let cli = Cli::try_parse_from(["harmony", "run", "--compute-budget", "50000"]).unwrap();
         if let Commands::Run { compute_budget, .. } = cli.command {
-            assert_eq!(compute_budget, 50000);
+            assert_eq!(compute_budget, Some(50000));
         } else {
             panic!("expected Run command");
         }
@@ -363,7 +416,7 @@ mod tests {
     fn cli_parses_run_with_cache_capacity() {
         let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "2048"]).unwrap();
         if let Commands::Run { cache_capacity, .. } = cli.command {
-            assert_eq!(cache_capacity, 2048);
+            assert_eq!(cache_capacity, Some(2048));
         } else {
             panic!("expected Run command");
         }
@@ -463,8 +516,8 @@ mod tests {
             ..
         } = cli.command
         {
-            assert_eq!(filter_broadcast_ticks, 60);
-            assert_eq!(filter_mutation_threshold, 200);
+            assert_eq!(filter_broadcast_ticks, Some(60));
+            assert_eq!(filter_mutation_threshold, Some(200));
         } else {
             panic!("expected Run command");
         }
@@ -492,7 +545,7 @@ mod tests {
         ])
         .unwrap();
         if let Commands::Run { listen_address, .. } = cli.command {
-            assert_eq!(listen_address, "127.0.0.1:9999");
+            assert_eq!(listen_address.as_deref(), Some("127.0.0.1:9999"));
         } else {
             panic!("expected Run command");
         }
@@ -502,7 +555,7 @@ mod tests {
     fn cli_listen_address_default() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
         if let Commands::Run { listen_address, .. } = cli.command {
-            assert_eq!(listen_address, "0.0.0.0:4242");
+            assert!(listen_address.is_none());
         } else {
             panic!("expected Run command");
         }
@@ -545,7 +598,7 @@ mod tests {
     fn cli_parses_mdns_stale_timeout() {
         let cli = Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "120"]).unwrap();
         if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
-            assert_eq!(mdns_stale_timeout, 120);
+            assert_eq!(mdns_stale_timeout, Some(120));
         } else {
             panic!("expected Run command");
         }
@@ -555,7 +608,7 @@ mod tests {
     fn cli_mdns_stale_timeout_default() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
         if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
-            assert_eq!(mdns_stale_timeout, 60);
+            assert!(mdns_stale_timeout.is_none());
         } else {
             panic!("expected Run command");
         }
@@ -572,5 +625,25 @@ mod tests {
             msg.contains("--mdns-stale-timeout must be > 0"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn cli_parses_config_flag() {
+        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/tmp/test.toml"]).unwrap();
+        if let Commands::Run { config, .. } = cli.command {
+            assert_eq!(config, Some(std::path::PathBuf::from("/tmp/test.toml")));
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_config_default_none() {
+        let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
+        if let Commands::Run { config, .. } = cli.command {
+            assert!(config.is_none());
+        } else {
+            panic!("expected Run command");
+        }
     }
 }
