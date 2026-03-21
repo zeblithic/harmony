@@ -40,12 +40,18 @@ RATE_LIMIT_BURST="${RATE_LIMIT_BURST:-512000}"
     || { echo "ERROR: RELAY_HOSTNAME must be a valid hostname (alphanumeric, dots, hyphens)"; exit 1; }
 [[ "${CONTACT_EMAIL}" =~ ^[a-zA-Z0-9._%+@-]+$ ]] \
     || { echo "ERROR: CONTACT_EMAIL must be a valid email address (alphanumeric plus . _ % + @ -)"; exit 1; }
+# Validate LOCAL_BINARY early: if set but missing, fail now rather than
+# falling through to the build paths with unvalidated IROH_VERSION/IROH_REPO.
+if [ -n "${LOCAL_BINARY}" ] && [ ! -f "${LOCAL_BINARY}" ]; then
+    echo "ERROR: LOCAL_BINARY set to '${LOCAL_BINARY}' but file does not exist"
+    exit 1
+fi
 # Only validate build-time vars when LOCAL_BINARY is not provided —
 # IROH_VERSION and IROH_REPO are unused when deploying a pre-built binary.
 if [ -z "${LOCAL_BINARY}" ]; then
     [[ "${IROH_VERSION}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?(\+[a-zA-Z0-9._-]+)?$ ]] \
         || { echo "ERROR: IROH_VERSION must be a valid semver tag (e.g. v0.91.2)"; exit 1; }
-    [[ "${IROH_REPO}" =~ ^https://[a-zA-Z0-9._/-]+\.git$ ]] \
+    [[ "${IROH_REPO}" =~ ^https://[a-zA-Z0-9._/-]+(:[0-9]+)?/[a-zA-Z0-9._/-]+\.git$ ]] \
         || { echo "ERROR: IROH_REPO must be a valid https git URL ending in .git"; exit 1; }
 fi
 # TOML forbids leading zeros in integers — match (0|[1-9][0-9]*).

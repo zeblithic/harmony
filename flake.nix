@@ -30,10 +30,12 @@
       # Common source filtering for harmony workspace
       harmonySrc = pkgs.lib.fileset.toSource {
         root = ./.;
+        # Only include Cargo manifests + Rust source. Avoids
+        # fileset.toml which picks up non-Cargo TOML files and
+        # widens the cache invalidation boundary.
         fileset = pkgs.lib.fileset.unions [
           (craneLib.fileset.cargoTomlAndLock ./.)
           (craneLib.fileset.rust ./.)
-          (craneLib.fileset.toml ./.)
         ];
       };
 
