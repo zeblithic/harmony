@@ -34,6 +34,21 @@ LOCAL_BINARY="${LOCAL_BINARY:-}"
 RATE_LIMIT_BPS="${RATE_LIMIT_BPS:-102400}"
 RATE_LIMIT_BURST="${RATE_LIMIT_BURST:-512000}"
 
+# ── Input validation ──────────────────────────────────────────────
+# Prevent shell injection via SSH commands and TOML config corruption.
+[[ "${RELAY_HOSTNAME}" =~ ^[a-zA-Z0-9._-]+$ ]] \
+    || { echo "ERROR: RELAY_HOSTNAME must be a valid hostname (alphanumeric, dots, hyphens)"; exit 1; }
+[[ "${CONTACT_EMAIL}" =~ ^[^\"[:space:]\\]+$ ]] \
+    || { echo "ERROR: CONTACT_EMAIL must not contain quotes, backslashes, or whitespace"; exit 1; }
+[[ "${IROH_VERSION}" =~ ^v?[0-9a-zA-Z._-]+$ ]] \
+    || { echo "ERROR: IROH_VERSION must be a valid semver tag (e.g. v0.91.2)"; exit 1; }
+[[ "${IROH_REPO}" =~ ^https://[a-zA-Z0-9._/-]+\.git$ ]] \
+    || { echo "ERROR: IROH_REPO must be a valid https git URL ending in .git"; exit 1; }
+[[ "${RATE_LIMIT_BPS}" =~ ^[0-9]+$ ]] \
+    || { echo "ERROR: RATE_LIMIT_BPS must be a non-negative integer"; exit 1; }
+[[ "${RATE_LIMIT_BURST}" =~ ^[0-9]+$ ]] \
+    || { echo "ERROR: RATE_LIMIT_BURST must be a non-negative integer"; exit 1; }
+
 echo "=== Harmony Relay Deployment ==="
 echo "  Hostname:     ${RELAY_HOSTNAME}"
 echo "  Project:      ${GCP_PROJECT}"
