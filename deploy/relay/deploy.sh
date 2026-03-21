@@ -108,12 +108,12 @@ fi
 echo "--- Installing build dependencies on VM..."
 gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
     set -euo pipefail
-    if ! command -v cargo &>/dev/null; then
+    if [ ! -f \"\$HOME/.cargo/bin/cargo\" ]; then
         sudo apt-get update -qq
-        sudo apt-get install -y -qq build-essential pkg-config libssl-dev curl
+        sudo apt-get install -y -qq build-essential pkg-config libssl-dev curl git
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        source \"\$HOME/.cargo/env\"
     fi
+    source \"\$HOME/.cargo/env\"
     echo 'Build tools ready.'
 "
 
