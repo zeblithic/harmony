@@ -82,7 +82,7 @@ pub fn ingest(
 ///
 /// Performs a depth-first left-to-right traversal. For a bare blob root,
 /// returns a single-element vec. For a bundle root, recursively descends
-/// through child bundles, collecting blob CIDs. InlineMetadata entries
+/// through child bundles, collecting blob CIDs. InlineData entries
 /// are skipped (they carry metadata, not data).
 ///
 /// Returns `MissingContent` if any referenced CID is not in the store.
@@ -110,7 +110,7 @@ fn walk_recursive(
                 walk_recursive(child, store, result)?;
             }
         }
-        CidType::InlineMetadata => {
+        CidType::InlineData => {
             // Skip — metadata entries don't carry data.
         }
         _ => {
@@ -151,7 +151,7 @@ fn estimate_size(root_cid: &ContentId, store: &dyn BookStore) -> usize {
         if let Some(data) = store.get(root_cid) {
             if let Ok(entries) = bundle::parse_bundle(data) {
                 if let Some(first) = entries.first() {
-                    if first.cid_type() == CidType::InlineMetadata {
+                    if first.cid_type() == CidType::InlineData {
                         if let Ok((total_size, _, _, _)) = first.parse_inline_metadata() {
                             return total_size as usize;
                         }
@@ -226,10 +226,10 @@ mod tests {
         let data: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
         let root_cid = ingest(&data, &test_config(), &mut store).unwrap();
 
-        // Parse the root bundle and check first entry is InlineMetadata.
+        // Parse the root bundle and check first entry is InlineData.
         let root_bytes = store.get(&root_cid).unwrap();
         let entries = bundle::parse_bundle(root_bytes).unwrap();
-        assert_eq!(entries[0].cid_type(), CidType::InlineMetadata);
+        assert_eq!(entries[0].cid_type(), CidType::InlineData);
 
         let (total_size, chunk_count, _ts, _mime) = entries[0].parse_inline_metadata().unwrap();
         assert_eq!(total_size, data.len() as u64);

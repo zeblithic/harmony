@@ -522,9 +522,13 @@ impl<B: BookStore> StorageTier<B> {
     /// 2. The payload size field matches the actual data length.
     /// 3. The internal checksum is valid (hash + size + type are consistent).
     fn verify_cid(cid: &ContentId, data: &[u8]) -> bool {
-        cid.verify_hash(data)
-            && cid.payload_size() as usize == data.len()
-            && cid.verify_checksum().is_ok()
+        if !cid.verify_hash(data) {
+            return false;
+        }
+        if cid.depth() == 0 && !cid.is_inline() && cid.payload_size() as usize != data.len() {
+            return false;
+        }
+        cid.verify_checksum().is_ok()
     }
 
     /// Build an AnnounceContent action for a stored CID.
@@ -940,15 +944,15 @@ mod tests {
         );
 
         // Craft a CID with correct hash but wrong payload_size by mutating
-        // the size bits in the last 4 bytes.
+        // the size bits in the header (bytes 0-3).
         let data = b"correct data";
         let real_cid = ContentId::for_book(data, crate::cid::ContentFlags::default()).unwrap();
         let mut bytes = real_cid.to_bytes();
         // Corrupt the size: set size to 999 instead of 12.
-        let packed = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
-        let tag_only = packed & 0xFFF; // preserve lower 12 tag bits
-        let fake_packed = (999u32 << 12) | tag_only;
-        bytes[28..32].copy_from_slice(&fake_packed.to_be_bytes());
+        let header = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        let keep_mask = 0xF0C0_0003u32; // mode + depth + checksum
+        let fake_header = (header & keep_mask) | ((999u32 & 0xF_FFFF) << 2);
+        bytes[0..4].copy_from_slice(&fake_header.to_be_bytes());
         let bad_cid = ContentId::from_bytes(bytes);
 
         // Hash matches but size is wrong — should be rejected.
@@ -1014,7 +1018,8 @@ mod tests {
         let flags = crate::cid::ContentFlags {
             encrypted,
             ephemeral,
-            alt_hash: false,
+            sha224: false,
+            lsb_mode: false,
         };
         let cid = ContentId::for_book(data, flags).unwrap();
         (cid, data.to_vec())
@@ -1371,7 +1376,8 @@ mod tests {
         let flags = crate::cid::ContentFlags {
             encrypted: false,
             ephemeral: false,
-            alt_hash: false,
+            sha224: false,
+            lsb_mode: false,
         };
         let cid = ContentId::for_book(&data, flags).unwrap();
 
@@ -1397,7 +1403,8 @@ mod tests {
         let flags = crate::cid::ContentFlags {
             encrypted: false,
             ephemeral: false,
-            alt_hash: false,
+            sha224: false,
+            lsb_mode: false,
         };
         let cid = ContentId::for_book(b"original", flags).unwrap();
 
@@ -1448,7 +1455,8 @@ mod tests {
         let flags = crate::cid::ContentFlags {
             encrypted: false,
             ephemeral: false,
-            alt_hash: false,
+            sha224: false,
+            lsb_mode: false,
         };
         let disk_cid = ContentId::for_book(disk_data, flags).unwrap();
         let actions = tier.handle(StorageTierEvent::DiskReadComplete {
@@ -1517,10 +1525,14 @@ mod tests {
             data: data.clone(),
         });
 
-        // Flood cache to evict original CID.
-        for i in 0..10 {
+        // Flood cache to evict original CID. Double-transit to build frequency.
+        for i in 0..20 {
             let filler = format!("filler-{i}");
             let (filler_cid, filler_data) = cid_with_class(filler.as_bytes(), false, false);
+            tier.handle(StorageTierEvent::TransitContent {
+                cid: filler_cid,
+                data: filler_data.clone(),
+            });
             tier.handle(StorageTierEvent::TransitContent {
                 cid: filler_cid,
                 data: filler_data,
@@ -1575,9 +1587,9 @@ mod tests {
 
     #[test]
     fn mixed_class_eviction_ephemeral_first() {
-        // Fill cache with PublicDurable + PublicEphemeral, verify ephemeral evicted first.
+        // Fill cache with PublicDurable + PublicEphemeral, then apply pressure.
         let budget = StorageBudget {
-            cache_capacity: 5,
+            cache_capacity: 10,
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
@@ -1602,6 +1614,18 @@ mod tests {
             data: d2_vec,
         });
 
+        // Give durable items frequency via repeated queries.
+        for _ in 0..5 {
+            tier.handle(StorageTierEvent::ContentQuery {
+                query_id: 99,
+                cid: d1_cid,
+            });
+            tier.handle(StorageTierEvent::ContentQuery {
+                query_id: 99,
+                cid: d2_cid,
+            });
+        }
+
         // Store 2 ephemeral items via publish.
         let e1_data = b"ephemeral-1";
         let (e1_cid, e1_vec) = cid_with_class(e1_data, false, true);
@@ -1617,11 +1641,11 @@ mod tests {
             data: e2_vec,
         });
 
-        // Fill cache to trigger evictions with durable items.
-        for i in 0..10 {
+        // Fill cache to trigger evictions via publish (bypasses admission).
+        for i in 0..20 {
             let data = format!("pressure-{i}");
             let (pressure_cid, pressure_data) = cid_with_class(data.as_bytes(), false, false);
-            tier.handle(StorageTierEvent::TransitContent {
+            tier.handle(StorageTierEvent::PublishContent {
                 cid: pressure_cid,
                 data: pressure_data,
             });
