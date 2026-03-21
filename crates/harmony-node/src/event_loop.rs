@@ -58,7 +58,20 @@ impl ConfigTunnelPeers {
                 .into_iter()
                 .map(|entry| ConfigTunnelPeer {
                     interface_name: entry.name.clone()
-                        .map(|n| if n.len() > 15 { n[..15].to_string() } else { n })
+                        .map(|n| {
+                            // Clamp to IFNAMSIZ (15 bytes). Find the last valid
+                            // char boundary at or before byte 15 to avoid panic
+                            // on multi-byte UTF-8.
+                            if n.len() <= 15 {
+                                n
+                            } else {
+                                let mut end = 15;
+                                while end > 0 && !n.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                n[..end].to_string()
+                            }
+                        })
                         .unwrap_or_else(|| {
                             // "tc-" + 8 hex chars = 11 chars, within IFNAMSIZ (15)
                             format!("tc-{}", &entry.node_id[..8.min(entry.node_id.len())])
