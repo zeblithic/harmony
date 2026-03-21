@@ -53,16 +53,16 @@ fn active_session_pair() -> (Session, Session) {
 
 // ── Test 1: Interest propagation through tunnel peers ─────────────
 
-/// Proves the full social routing cycle:
-/// 1. Alice (subscriber) declares interest in Bob's vine announces
-/// 2. Bob (publisher) receives the interest declaration
-/// 3. Bob publishes a vine — write-side filter allows it because Alice wants it
-/// 4. Without interest, the same publish is silently dropped
+/// Proves write-side interest filtering on the publisher side:
+/// 1. Without any remote interest, a publish is silently dropped.
+/// 2. Once a `SubscriberDeclared` event is received (Alice's interest
+///    propagated via the tunnel), the same publish emits `SendMessage`.
 ///
-/// This is how social content routing works: your Zenoh subscriptions
-/// flow to your tunnel peers, who serve matching content. The social
-/// graph topology (who you're peered with) determines who gets your
-/// publications.
+/// This is the publisher half of social content routing: the social
+/// graph topology (who you're peered with) determines who receives
+/// your publications. The subscriber side — Alice's router dispatching
+/// the inbound message to her local subscriber — is covered by
+/// harmony-zenoh's own unit tests.
 #[test]
 fn vine_interest_filtering_on_publisher_side() {
     let (_alice_session, mut bob_session) = active_session_pair();

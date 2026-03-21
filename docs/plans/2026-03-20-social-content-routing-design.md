@@ -170,25 +170,14 @@ The existing infrastructure (`harmony-zenoh`, `harmony-content`,
 `harmony-peers`, `harmony-contacts`, `harmony-trust`) already
 implements social routing. This bead formalizes and verifies.
 
-## Integration Test Dependencies
+## Integration Test Location
 
-```toml
-[dev-dependencies]
-harmony-zenoh = { path = "crates/harmony-zenoh" }
-harmony-content = { path = "crates/harmony-content" }
-harmony-contacts = { path = "crates/harmony-contacts" }
-harmony-peers = { path = "crates/harmony-peers" }
-harmony-trust = { path = "crates/harmony-trust" }
-harmony-identity = { path = "crates/harmony-identity" }
-harmony-crypto = { path = "crates/harmony-crypto" }
-```
+The tests live at `crates/harmony-node/tests/social_routing.rs`
+and rely only on crates already declared in `harmony-node`'s
+`[dependencies]` — no extra `[dev-dependencies]` were needed.
 
 Tests compose the sans-I/O state machines directly — no live Zenoh
 runtime needed. Events are injected, actions are inspected.
-
-The workspace root currently has no `tests/` directory. The
-implementation will create `tests/social_routing.rs` and add the
-dev-dependencies to the workspace root `Cargo.toml`.
 
 ## Future Beads
 
