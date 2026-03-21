@@ -89,7 +89,10 @@ async fn main() {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|e| {
-                    eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
+                    // Only warn if RUST_LOG is set but malformed — missing is the normal case.
+                    if std::env::var("RUST_LOG").is_ok() {
+                        eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
+                    }
                     tracing_subscriber::EnvFilter::new("info")
                 }),
         )
