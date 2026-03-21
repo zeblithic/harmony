@@ -470,7 +470,10 @@ async fn write_length_prefixed(
 const HANDSHAKE_MAX_MESSAGE: usize = 8 * 1024;
 
 /// Maximum message size during the authenticated data phase.
-const DATA_MAX_MESSAGE: usize = 16 * 1024 * 1024;
+/// Reticulum MTU is 500–1024 bytes; the higher cap here covers Zenoh
+/// content-item frames routed over the tunnel (Bead #3). Capped at 2 MiB
+/// to limit per-peer allocation (64 peers × 2 MiB = 128 MiB worst case).
+const DATA_MAX_MESSAGE: usize = 2 * 1024 * 1024;
 
 /// Read a length-prefixed message: [4 bytes big-endian length][payload].
 ///

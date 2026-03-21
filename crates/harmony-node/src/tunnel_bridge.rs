@@ -40,7 +40,7 @@ pub enum TunnelBridgeEvent {
 }
 
 /// Handle for sending commands into a tunnel task (held by the event loop).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TunnelSender {
     tx: mpsc::Sender<TunnelCommand>,
     /// Monotonic connection ID for stale-close detection.

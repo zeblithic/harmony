@@ -415,7 +415,7 @@ pub async fn run(
 
                         let tx = tunnel_tx.clone();
                         let identity =
-                            tunnel_config.as_ref().unwrap().local_identity.clone();
+                            tunnel_config.as_ref().expect("conn_rx received a connection but tunnel_config is None").local_identity.clone();
                         let iface_clone = interface_name.clone();
                         tokio::spawn(async move {
                             tunnel_task::run_responder(
