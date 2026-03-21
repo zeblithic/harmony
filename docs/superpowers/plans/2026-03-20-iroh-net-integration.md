@@ -395,6 +395,10 @@ async fn run_tunnel_loop(
     mut cmd_rx: mpsc::Receiver<TunnelCommand>,
     interface_name: String,
 ) {
+    // Timer fires at 10s intervals — more frequent than the 30s keepalive
+    // interval, but the TunnelSession state machine decides when to actually
+    // emit a keepalive frame (every 30s) and when to declare dead peer (90s).
+    // The 10s tick ensures responsive timeout detection.
     let mut keepalive_timer = tokio::time::interval(Duration::from_secs(10));
     keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -702,14 +706,21 @@ In `event_loop.rs`, after the Zenoh session setup, conditionally create the iroh
     let iroh_endpoint = if let Some(ref tunnel_config) = tunnel_config {
         let secret_key = derive_iroh_secret_key(&tunnel_config.local_identity);
 
-        let mut builder = iroh::Endpoint::builder()
+        // Use empty_builder to avoid including N0's default relay servers.
+        // We only want our own relay (iroh.q8.fyi) or no relay at all.
+        let relay_mode = if tunnel_config.relay_url.is_some() {
+            iroh::RelayMode::Disabled // Overridden below with Custom
+        } else {
+            iroh::RelayMode::Disabled
+        };
+        let mut builder = iroh::Endpoint::empty_builder(relay_mode)
             .alpns(vec![HARMONY_TUNNEL_ALPN.to_vec()])
             .secret_key(secret_key);
 
         if let Some(ref url) = tunnel_config.relay_url {
             let relay_url: iroh::RelayUrl = url.parse()
                 .expect("invalid relay URL");
-            let relay_map = iroh::RelayMap::from_url(relay_url);
+            let relay_map = iroh::RelayMap::from(relay_url);
             builder = builder.relay_mode(iroh::RelayMode::Custom(relay_map));
         }
 
@@ -929,4 +940,7 @@ git commit -m "feat(node): cleanup and graceful iroh endpoint shutdown"
 | 5 | Outbound tunnel connection support | `--tunnel-peer` CLI arg |
 | 6 | Integration smoke test + cleanup | Clippy clean, workspace tests pass |
 
-**Note:** This plan focuses on the transport plumbing. The responder path is fully functional (any iroh peer can connect and exchange encrypted Reticulum packets). The initiator path requires the remote peer's PqIdentity, which comes from the contact store (Bead #3 — `harmony-h6k`) or discovery hints (Bead #4 — `harmony-lbv`). For now, outbound connections are stubbed with a TODO.
+**Notes:**
+- This plan focuses on the transport plumbing. The responder path is fully functional (any iroh peer can connect and exchange encrypted Reticulum packets). The initiator path requires the remote peer's PqIdentity, which comes from the contact store (Bead #3 — `harmony-h6k`) or discovery hints (Bead #4 — `harmony-lbv`). For now, outbound connections are stubbed with a TODO.
+- **Zenoh session over tunnel:** The spec (Section 2, point 2 of Interface Registration) calls for opening a Zenoh Session over the tunnel's Zenoh frame path. This plan registers only the Reticulum interface on handshake. Zenoh session integration over tunnels is deferred to Bead #3 (`harmony-h6k`) where the peer lifecycle manages both protocol layers. The `ZenohReceived` bridge event is plumbed but marked TODO.
+- **N0 relays excluded:** The plan uses `Endpoint::empty_builder()` to avoid including N0's default relay servers. Only the user-configured relay (e.g., `iroh.q8.fyi`) is used, or no relay if `--relay-url` is omitted.
