@@ -334,7 +334,7 @@ mod tests {
     fn full_pipeline_store_books_build_bundle_retrieve() {
         let mut store = MemoryBookStore::new();
 
-        // Insert blobs
+        // Insert books
         let cid_a = store.insert(b"chunk alpha").unwrap();
         let cid_b = store.insert(b"chunk beta").unwrap();
         let cid_c = store.insert(b"chunk gamma").unwrap();
