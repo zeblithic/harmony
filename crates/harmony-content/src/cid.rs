@@ -874,7 +874,7 @@ mod tests {
         let children = [book_a, book_b];
         let bundle_bytes = children_to_bytes(&children);
         let cid = ContentId::for_bundle(&bundle_bytes, &children, ContentFlags::default()).unwrap();
-        assert_eq!(cid.cid_type(), CidType::Bundle(1)); // one level above blobs
+        assert_eq!(cid.cid_type(), CidType::Bundle(1)); // one level above books
         assert_eq!(cid.payload_size(), bundle_bytes.len() as u32);
     }
 
@@ -1250,7 +1250,7 @@ mod tests {
     // of the hash compared to raw SHA-256.
 
     #[test]
-    fn canonical_vector_empty_blob() {
+    fn canonical_vector_empty_book() {
         let cid = ContentId::for_book(b"", ContentFlags::default()).unwrap();
         // SHA-256("")[:28] with top 3 bits cleared: e3 & 0x1F = 0x03
         assert_eq!(cid.hash[0], 0x03);
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_vector_hello_blob() {
+    fn canonical_vector_hello_book() {
         let cid = ContentId::for_book(b"hello", ContentFlags::default()).unwrap();
         // SHA-256("hello")[:28] with top 3 bits cleared: 2c & 0x1F = 0x0c
         assert_eq!(cid.hash[0], 0x0c);

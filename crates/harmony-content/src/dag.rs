@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_small_returns_blob_cid() {
+    fn ingest_small_returns_book_cid() {
         let mut store = MemoryBookStore::new();
         let data = b"hello small file";
         let cid = ingest(data, &test_config(), &mut store).unwrap();
@@ -211,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_exact_max_chunk_returns_blob() {
+    fn ingest_exact_max_chunk_returns_book() {
         let mut store = MemoryBookStore::new();
         let config = test_config();
         // Data exactly at max_chunk — single chunk, no bundle.
@@ -237,24 +237,24 @@ mod tests {
     }
 
     #[test]
-    fn walk_blob_returns_single_cid() {
+    fn walk_book_returns_single_cid() {
         let mut store = MemoryBookStore::new();
-        let data = b"small blob";
+        let data = b"small book";
         let cid = store.insert(data).unwrap();
-        let blobs = walk(&cid, &store).unwrap();
-        assert_eq!(blobs, vec![cid]);
+        let books = walk(&cid, &store).unwrap();
+        assert_eq!(books, vec![cid]);
     }
 
     #[test]
-    fn walk_bundle_returns_blobs_in_order() {
+    fn walk_bundle_returns_books_in_order() {
         let mut store = MemoryBookStore::new();
         let data: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
         let root = ingest(&data, &test_config(), &mut store).unwrap();
-        let blobs = walk(&root, &store).unwrap();
+        let books = walk(&root, &store).unwrap();
 
-        // Should have multiple blobs, all of type Blob.
-        assert!(blobs.len() > 1);
-        for cid in &blobs {
+        // Should have multiple books, all of type Book.
+        assert!(books.len() > 1);
+        for cid in &books {
             assert_eq!(cid.cid_type(), CidType::Book);
         }
     }
