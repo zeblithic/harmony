@@ -48,6 +48,12 @@ enum Commands {
         /// UDP listen address for Reticulum mesh packets
         #[arg(long, default_value = "0.0.0.0:4242")]
         listen_address: String,
+        /// Add a tunnel peer: <identity_hash_hex>:<node_id_hex>[@relay_url]
+        ///
+        /// Can be specified multiple times. Each peer is added as a contact
+        /// with tunnel addressing and peering enabled at Normal priority.
+        #[arg(long, value_name = "PEER_SPEC")]
+        add_tunnel_peer: Vec<String>,
     },
 }
 
@@ -192,6 +198,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             filter_mutation_threshold,
             identity_file,
             listen_address,
+            add_tunnel_peer,
         } => {
             use crate::runtime::{NodeConfig, NodeRuntime};
             use harmony_compute::InstructionBudget;
@@ -266,7 +273,39 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 node_addr,
             };
-            let (rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
+            let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
+
+            // Register tunnel peers from CLI.
+            for spec in &add_tunnel_peer {
+                let TunnelPeerSpec { identity_hash, node_id, relay_url } = parse_tunnel_peer_spec(spec)?;
+                let contact = harmony_contacts::Contact {
+                    identity_hash,
+                    display_name: None,
+                    peering: harmony_contacts::PeeringPolicy {
+                        enabled: true,
+                        priority: harmony_contacts::PeeringPriority::Normal,
+                    },
+                    added_at: 0,
+                    last_seen: None,
+                    notes: None,
+                    addresses: vec![harmony_contacts::ContactAddress::Tunnel {
+                        node_id,
+                        relay_url,
+                        direct_addrs: vec![],
+                    }],
+                };
+                rt.contact_store_mut()
+                    .add(contact)
+                    .map_err(|e| format!("failed to add tunnel peer: {e}"))?;
+                rt.push_event(crate::runtime::RuntimeEvent::ContactChanged {
+                    identity_hash,
+                });
+                tracing::info!(
+                    identity = %hex::encode(identity_hash),
+                    node_id = %hex::encode(&node_id[..8]),
+                    "tunnel peer registered"
+                );
+            }
 
             tracing::info!(cache_capacity, compute_budget, %listen_addr, "harmony node starting");
 
@@ -275,6 +314,50 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
+}
+
+/// Parsed tunnel peer specification.
+#[derive(Debug)]
+struct TunnelPeerSpec {
+    identity_hash: [u8; 16],
+    node_id: [u8; 32],
+    relay_url: Option<String>,
+}
+
+/// Parse a tunnel peer spec: `<identity_hash_hex>:<node_id_hex>[@relay_url]`
+fn parse_tunnel_peer_spec(
+    spec: &str,
+) -> Result<TunnelPeerSpec, Box<dyn std::error::Error>> {
+    let (id_and_node, relay_url) = match spec.split_once('@') {
+        Some((left, url)) => (left, Some(url.to_string())),
+        None => (spec, None),
+    };
+    let (id_hex, node_hex) = id_and_node.split_once(':').ok_or_else(|| {
+        format!(
+            "invalid --add-tunnel-peer format: expected <identity_hash>:<node_id>[@relay_url], got '{spec}'"
+        )
+    })?;
+    let id_bytes = hex::decode(id_hex)
+        .map_err(|e| format!("invalid identity_hash hex in --add-tunnel-peer: {e}"))?;
+    let node_bytes = hex::decode(node_hex)
+        .map_err(|e| format!("invalid node_id hex in --add-tunnel-peer: {e}"))?;
+    let identity_hash: [u8; 16] = id_bytes.try_into().map_err(|v: Vec<u8>| {
+        format!(
+            "identity_hash must be 16 bytes (32 hex chars), got {} bytes",
+            v.len()
+        )
+    })?;
+    let node_id: [u8; 32] = node_bytes.try_into().map_err(|v: Vec<u8>| {
+        format!(
+            "node_id must be 32 bytes (64 hex chars), got {} bytes",
+            v.len()
+        )
+    })?;
+    Ok(TunnelPeerSpec {
+        identity_hash,
+        node_id,
+        relay_url,
+    })
 }
 
 #[cfg(test)]
@@ -458,5 +541,101 @@ mod tests {
             msg.contains("Invalid --listen-address"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_tunnel_peer_spec_full() {
+        let id_hex = "aa".repeat(16); // 32 hex chars = 16 bytes
+        let node_hex = "bb".repeat(32); // 64 hex chars = 32 bytes
+        let spec = format!("{id_hex}:{node_hex}@https://relay.example.com");
+        let parsed = parse_tunnel_peer_spec(&spec).unwrap();
+        assert_eq!(parsed.identity_hash, [0xAA; 16]);
+        assert_eq!(parsed.node_id, [0xBB; 32]);
+        assert_eq!(parsed.relay_url, Some("https://relay.example.com".to_string()));
+    }
+
+    #[test]
+    fn parse_tunnel_peer_spec_no_relay() {
+        let id_hex = "cc".repeat(16);
+        let node_hex = "dd".repeat(32);
+        let spec = format!("{id_hex}:{node_hex}");
+        let parsed = parse_tunnel_peer_spec(&spec).unwrap();
+        assert_eq!(parsed.identity_hash, [0xCC; 16]);
+        assert_eq!(parsed.node_id, [0xDD; 32]);
+        assert_eq!(parsed.relay_url, None);
+    }
+
+    #[test]
+    fn parse_tunnel_peer_spec_bad_format() {
+        let result = parse_tunnel_peer_spec("no-colon-here");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("invalid --add-tunnel-peer format"), "{msg}");
+    }
+
+    #[test]
+    fn parse_tunnel_peer_spec_bad_hex() {
+        let result = parse_tunnel_peer_spec("gggg:hhhh");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_tunnel_peer_spec_wrong_id_length() {
+        let node_hex = "bb".repeat(32);
+        let spec = format!("aabb:{node_hex}");
+        let result = parse_tunnel_peer_spec(&spec);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("identity_hash must be 16 bytes"), "{msg}");
+    }
+
+    #[test]
+    fn parse_tunnel_peer_spec_wrong_node_length() {
+        let id_hex = "aa".repeat(16);
+        let spec = format!("{id_hex}:bbcc");
+        let result = parse_tunnel_peer_spec(&spec);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("node_id must be 32 bytes"), "{msg}");
+    }
+
+    #[test]
+    fn cli_parses_add_tunnel_peer() {
+        let id_hex = "aa".repeat(16);
+        let node_hex = "bb".repeat(32);
+        let spec = format!("{id_hex}:{node_hex}@https://relay.example.com");
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--add-tunnel-peer",
+            &spec,
+        ])
+        .unwrap();
+        if let Commands::Run { add_tunnel_peer, .. } = cli.command {
+            assert_eq!(add_tunnel_peer.len(), 1);
+            assert_eq!(add_tunnel_peer[0], spec);
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_parses_multiple_tunnel_peers() {
+        let spec1 = format!("{}:{}",  "aa".repeat(16), "bb".repeat(32));
+        let spec2 = format!("{}:{}", "cc".repeat(16), "dd".repeat(32));
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--add-tunnel-peer",
+            &spec1,
+            "--add-tunnel-peer",
+            &spec2,
+        ])
+        .unwrap();
+        if let Commands::Run { add_tunnel_peer, .. } = cli.command {
+            assert_eq!(add_tunnel_peer.len(), 2);
+        } else {
+            panic!("expected Run command");
+        }
     }
 }
