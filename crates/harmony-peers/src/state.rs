@@ -1,5 +1,18 @@
 use harmony_contacts::PeeringPriority;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Lan,
+    Tunnel { relayed: bool },
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectionQuality {
+    pub rtt_ms: Option<u32>,
+    pub transport: Transport,
+    pub connected_since: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerState {
     pub status: PeerStatus,
@@ -8,6 +21,7 @@ pub struct PeerState {
     pub last_seen: Option<u64>,
     pub connecting_since: Option<u64>,
     pub retry_count: u32,
+    pub connection_quality: Option<ConnectionQuality>,
 }
 
 impl PeerState {
@@ -19,6 +33,7 @@ impl PeerState {
             last_seen: None,
             connecting_since: None,
             retry_count: 0,
+            connection_quality: None,
         }
     }
 
@@ -30,6 +45,7 @@ impl PeerState {
             last_seen: None,
             connecting_since: None,
             retry_count: 0,
+            connection_quality: None,
         }
     }
 }
