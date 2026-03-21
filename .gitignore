@@ -29,4 +29,5 @@ target
 .beads/dolt-monitor.pid
 .beads/dolt-server.activity
 .beads/dolt-server.port
+.beads/backup/
 
