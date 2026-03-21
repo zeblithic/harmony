@@ -192,7 +192,7 @@ mod tests {
     use crate::cid::ContentFlags;
 
     fn make_cid(i: usize) -> ContentId {
-        ContentId::for_blob(
+        ContentId::for_book(
             format!("flatpack-test-{i}").as_bytes(),
             ContentFlags::default(),
         )

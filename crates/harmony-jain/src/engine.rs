@@ -435,7 +435,7 @@ mod tests {
     use harmony_content::ContentFlags;
 
     fn make_cid(data: &[u8]) -> ContentId {
-        ContentId::for_blob(data, ContentFlags::default()).unwrap()
+        ContentId::for_book(data, ContentFlags::default()).unwrap()
     }
 
     fn default_engine() -> JainEngine {

@@ -210,7 +210,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             use crate::runtime::{NodeConfig, NodeRuntime};
             use harmony_compute::InstructionBudget;
-            use harmony_content::blob::MemoryBlobStore;
+            use harmony_content::book::MemoryBookStore;
             use harmony_content::storage_tier::{
                 ContentPolicy, FilterBroadcastConfig, StorageBudget,
             };
@@ -301,7 +301,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 node_addr,
             };
-            let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
+            let (rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 
             tracing::info!(cache_capacity, compute_budget, %listen_addr, "harmony node starting");
 

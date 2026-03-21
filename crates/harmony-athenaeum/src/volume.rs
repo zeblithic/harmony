@@ -237,7 +237,7 @@ impl Volume {
 /// Format:
 /// ```text
 ///   32 bytes: cid
-///    4 bytes: blob_size (u32 LE)
+///    4 bytes: book_size (u32 LE)
 ///    2 bytes: page_count (u16 LE)
 ///    1 byte:  flags (bits 0-1 = book_type: 00=Raw, 01=SelfIndexing, 10=Encrypted)
 ///    1 byte:  metadata_pages (for Encrypted books; 0 otherwise)
@@ -250,7 +250,7 @@ fn serialize_book(book: &Book) -> Vec<u8> {
     let mut buf = Vec::with_capacity(size);
 
     buf.extend_from_slice(&book.cid);
-    buf.extend_from_slice(&book.blob_size.to_le_bytes());
+    buf.extend_from_slice(&book.book_size.to_le_bytes());
     buf.extend_from_slice(&(pc as u16).to_le_bytes());
     let flags: u8 = match book.book_type {
         BookType::Raw => 0b00,
@@ -274,7 +274,7 @@ fn serialize_book(book: &Book) -> Vec<u8> {
 
 /// Deserialize a Book from Volume leaf storage.
 fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
-    // Minimum header: 32 (cid) + 4 (blob_size) + 2 (page_count) + 2 (reserved) = 40
+    // Minimum header: 32 (cid) + 4 (book_size) + 2 (page_count) + 2 (reserved) = 40
     if data.len() < 40 {
         return Err(BookError::TooShort);
     }
@@ -282,8 +282,8 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
     let mut cid = [0u8; 32];
     cid.copy_from_slice(&data[..32]);
 
-    let blob_size = u32::from_le_bytes(data[32..36].try_into().map_err(|_| BookError::TooShort)?);
-    if blob_size as usize > crate::addr::BOOK_MAX_SIZE {
+    let book_size = u32::from_le_bytes(data[32..36].try_into().map_err(|_| BookError::TooShort)?);
+    if book_size as usize > crate::addr::BOOK_MAX_SIZE {
         return Err(BookError::BadFormat);
     }
 
@@ -320,9 +320,9 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
         return Err(BookError::BadFormat);
     }
 
-    // blob_size must be consistent with data capacity.
+    // book_size must be consistent with data capacity.
     let data_pages = page_count - overhead;
-    if blob_size as usize > data_pages * crate::addr::PAGE_SIZE {
+    if book_size as usize > data_pages * crate::addr::PAGE_SIZE {
         return Err(BookError::BadFormat);
     }
 
@@ -357,7 +357,7 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
     Ok(Book {
         cid,
         pages,
-        blob_size,
+        book_size,
         book_type,
     })
 }
@@ -366,7 +366,7 @@ fn deserialize_book(data: &[u8]) -> Result<Book, BookError> {
 ///
 /// Reads bit `bit_index` from a SHA-256 content hash.
 /// Returns `false` for left (bit=0), `true` for right (bit=1).
-pub fn route_chunk(content_hash: &[u8; 32], bit_index: u8) -> bool {
+pub fn route_page(content_hash: &[u8; 32], bit_index: u8) -> bool {
     let byte_idx = (bit_index / 8) as usize;
     let bit_offset = 7 - (bit_index % 8);
     (content_hash[byte_idx] >> bit_offset) & 1 == 1
@@ -378,28 +378,28 @@ mod tests {
     use crate::addr::PAGE_SIZE;
 
     fn sample_book() -> Book {
-        Book::from_blob([0xAA; 32], &[0x42u8; PAGE_SIZE * 2]).unwrap()
+        Book::from_book([0xAA; 32], &[0x42u8; PAGE_SIZE * 2]).unwrap()
     }
 
     #[test]
-    fn route_chunk_bit_22() {
+    fn route_page_bit_22() {
         let mut hash = [0u8; 32];
         // Bit 22 is in byte 2 (bits 16-23), bit_offset = 7 - (22 % 8) = 7 - 6 = 1
         hash[2] = 0b0000_0010; // bit 22 = 1
-        assert!(route_chunk(&hash, 22));
+        assert!(route_page(&hash, 22));
 
         hash[2] = 0b0000_0000; // bit 22 = 0
-        assert!(!route_chunk(&hash, 22));
+        assert!(!route_page(&hash, 22));
     }
 
     #[test]
-    fn route_chunk_bit_0() {
+    fn route_page_bit_0() {
         let mut hash = [0u8; 32];
         hash[0] = 0x80; // bit 0 = 1 (MSB of byte 0)
-        assert!(route_chunk(&hash, 0));
+        assert!(route_page(&hash, 0));
 
         hash[0] = 0x00;
-        assert!(!route_chunk(&hash, 0));
+        assert!(!route_page(&hash, 0));
     }
 
     #[test]
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn empty_book_serialization_round_trip() {
-        let book = Book::from_blob([0xBB; 32], &[]).unwrap();
+        let book = Book::from_book([0xBB; 32], &[]).unwrap();
         assert_eq!(book.page_count(), 0);
         let serialized = serialize_book(&book);
         let deserialized = deserialize_book(&serialized).unwrap();
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn self_indexing_book_serialization_round_trip() {
-        let book = Book::from_blob_self_indexing([0xCC; 32], &[0x55u8; PAGE_SIZE * 2]).unwrap();
+        let book = Book::from_book_self_indexing([0xCC; 32], &[0x55u8; PAGE_SIZE * 2]).unwrap();
         assert!(book.is_self_indexing());
         let serialized = serialize_book(&book);
         let deserialized = deserialize_book(&serialized).unwrap();
@@ -532,14 +532,14 @@ mod tests {
     }
 
     #[test]
-    fn self_indexing_rejects_blob_size_exceeding_data_capacity() {
-        // Build a valid self-indexing book, then tamper with blob_size
+    fn self_indexing_rejects_book_size_exceeding_data_capacity() {
+        // Build a valid self-indexing book, then tamper with book_size
         // to exceed the data capacity of (page_count - 1) pages.
-        let book = Book::from_blob_self_indexing([0xDD; 32], &[0x77u8; PAGE_SIZE]).unwrap();
+        let book = Book::from_book_self_indexing([0xDD; 32], &[0x77u8; PAGE_SIZE]).unwrap();
         assert_eq!(book.page_count(), 2); // 1 ToC + 1 data
         let mut serialized = serialize_book(&book);
 
-        // Overwrite blob_size to page_count * PAGE_SIZE (too large by 1 page).
+        // Overwrite book_size to page_count * PAGE_SIZE (too large by 1 page).
         let bad_size = (book.page_count() * PAGE_SIZE) as u32;
         serialized[32..36].copy_from_slice(&bad_size.to_le_bytes());
 

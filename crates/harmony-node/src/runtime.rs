@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use harmony_compute::InstructionBudget;
-use harmony_content::blob::BlobStore;
+use harmony_content::book::BookStore;
 use harmony_content::bloom::BloomFilter;
 use harmony_content::cid::ContentId;
 use harmony_content::cuckoo::CuckooFilter;
@@ -298,7 +298,7 @@ impl PeerFilterTable {
 /// With default configuration, behavior is: drain all router events, drain all
 /// storage events, then run one compute slice — information flow is never
 /// starved and compute gets whatever budget remains.
-pub struct NodeRuntime<B: BlobStore> {
+pub struct NodeRuntime<B: BookStore> {
     // Tier 1: Reticulum packet router
     router: Node,
     // Tier 1/2: Zenoh query dispatch
@@ -346,7 +346,7 @@ pub struct NodeRuntime<B: BlobStore> {
     pending_cuckoo_broadcast: Option<Vec<u8>>,
 }
 
-impl<B: BlobStore> NodeRuntime<B> {
+impl<B: BookStore> NodeRuntime<B> {
     /// Construct a new node runtime, returning startup actions the caller
     /// must execute (queryable declarations, subscriptions).
     pub fn new(config: NodeConfig, store: B) -> (Self, Vec<RuntimeAction>) {
@@ -1148,11 +1148,11 @@ mod tests {
 
     #[test]
     fn runtime_exposes_schedule() {
-        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::book::MemoryBookStore;
 
         let mut config = NodeConfig::default();
         config.schedule.router_max_per_tick = Some(5);
-        let (rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.schedule().router_max_per_tick, Some(5));
     }
 
@@ -1225,11 +1225,11 @@ mod tests {
         assert!((schedule.adaptive_compute.floor_fraction - 0.1).abs() < f64::EPSILON);
     }
 
-    use harmony_content::blob::MemoryBlobStore;
+    use harmony_content::book::MemoryBookStore;
 
-    fn make_runtime() -> (NodeRuntime<MemoryBlobStore>, Vec<RuntimeAction>) {
+    fn make_runtime() -> (NodeRuntime<MemoryBookStore>, Vec<RuntimeAction>) {
         let config = NodeConfig::default();
-        NodeRuntime::new(config, MemoryBlobStore::new())
+        NodeRuntime::new(config, MemoryBookStore::new())
     }
 
     #[test]
@@ -1343,7 +1343,7 @@ mod tests {
 
     /// Helper: build a valid CID hex string for test data.
     fn cid_hex_for(data: &[u8]) -> (ContentId, String) {
-        let cid = ContentId::for_blob(data, harmony_content::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(data, harmony_content::cid::ContentFlags::default()).unwrap();
         let hex = hex::encode(cid.to_bytes());
         (cid, hex)
     }
@@ -1712,13 +1712,13 @@ mod tests {
 
     #[test]
     fn effective_fuel_scales_with_queue_depth() {
-        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::book::MemoryBookStore;
 
         let mut config = NodeConfig::default();
         config.compute_budget = InstructionBudget { fuel: 1000 };
         config.schedule.adaptive_compute.high_water = 10;
         config.schedule.adaptive_compute.floor_fraction = 0.1;
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         // Empty queues → full budget
         assert_eq!(rt.effective_fuel(), 1000);
@@ -1750,7 +1750,7 @@ mod tests {
     fn router_max_per_tick_caps_drain() {
         let mut config = NodeConfig::default();
         config.schedule.router_max_per_tick = Some(2);
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         // Push 5 router events
         for i in 0..5 {
@@ -1775,7 +1775,7 @@ mod tests {
     fn storage_max_per_tick_caps_drain() {
         let mut config = NodeConfig::default();
         config.schedule.storage_max_per_tick = Some(1);
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         // Push 3 storage events (stats queries)
         for i in 0..3 {
@@ -1803,7 +1803,7 @@ mod tests {
     fn starvation_counters_track_idle_ticks() {
         let mut config = NodeConfig::default();
         config.schedule.router_max_per_tick = Some(1);
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         // No events at all → all tiers idle
         rt.tick();
@@ -1831,7 +1831,7 @@ mod tests {
         let mut config = NodeConfig::default();
         config.schedule.router_max_per_tick = Some(1);
         config.schedule.starvation_threshold = 3;
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         // Push many router events but no storage events
         for i in 0..10 {
@@ -1918,7 +1918,7 @@ mod tests {
     fn zero_router_limit_panics() {
         let mut config = NodeConfig::default();
         config.schedule.router_max_per_tick = Some(0);
-        let _ = NodeRuntime::new(config, MemoryBlobStore::new());
+        let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
 
     #[test]
@@ -1926,7 +1926,7 @@ mod tests {
     fn zero_storage_limit_panics() {
         let mut config = NodeConfig::default();
         config.schedule.storage_max_per_tick = Some(0);
-        let _ = NodeRuntime::new(config, MemoryBlobStore::new());
+        let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
 
     #[test]
@@ -1935,7 +1935,7 @@ mod tests {
         config.compute_budget = InstructionBudget { fuel: 1000 };
         config.schedule.adaptive_compute.high_water = 10;
         config.schedule.adaptive_compute.floor_fraction = 0.1;
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         // Verify full fuel with empty queues
         assert_eq!(rt.effective_fuel(), 1000);
@@ -1953,7 +1953,7 @@ mod tests {
 
     #[test]
     fn runtime_uses_content_policy() {
-        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::book::MemoryBookStore;
 
         let config = NodeConfig {
             storage_budget: StorageBudget {
@@ -1970,7 +1970,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "test".to_string(),
         };
-        let (rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
     }
 
@@ -1982,8 +1982,8 @@ mod tests {
     fn peer_filter_table_skips_definite_miss() {
         let mut table = PeerFilterTable::new(100);
         let mut filter = BloomFilter::new(1000, 0.01);
-        let cid_in = ContentId::for_blob(b"present", ContentFlags::default()).unwrap();
-        let cid_out = ContentId::for_blob(b"absent", ContentFlags::default()).unwrap();
+        let cid_in = ContentId::for_book(b"present", ContentFlags::default()).unwrap();
+        let cid_out = ContentId::for_book(b"absent", ContentFlags::default()).unwrap();
         filter.insert(&cid_in);
         table.upsert_content("peer-1".into(), filter, 10);
 
@@ -1994,7 +1994,7 @@ mod tests {
     #[test]
     fn peer_filter_table_queries_unknown_peer() {
         let table = PeerFilterTable::new(100);
-        let cid = ContentId::for_blob(b"test", ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"test", ContentFlags::default()).unwrap();
         assert!(table.should_query("unknown", &cid, 10));
     }
 
@@ -2004,7 +2004,7 @@ mod tests {
         let filter = BloomFilter::new(1000, 0.01);
         table.upsert_content("peer-1".into(), filter, 10);
 
-        let cid = ContentId::for_blob(b"test", ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"test", ContentFlags::default()).unwrap();
         // Fresh filter with no items => definite miss, should NOT query
         assert!(!table.should_query("peer-1", &cid, 10));
         // Stale filter (current_tick - received_tick > staleness_ticks) => should query
@@ -2022,7 +2022,7 @@ mod tests {
 
     #[test]
     fn route_subscription_counts_malformed_filter() {
-        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::book::MemoryBookStore;
 
         let config = NodeConfig {
             storage_budget: StorageBudget {
@@ -2035,7 +2035,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "self-node".to_string(),
         };
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         // Send a malformed filter payload from a peer.
         rt.push_event(RuntimeEvent::SubscriptionMessage {
@@ -2050,7 +2050,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "filter_broadcast_interval_ticks must be >= 2")]
     fn filter_interval_rejects_less_than_two() {
-        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::book::MemoryBookStore;
 
         let config = NodeConfig {
             storage_budget: StorageBudget {
@@ -2066,12 +2066,12 @@ mod tests {
             },
             node_addr: "reject-test".to_string(),
         };
-        let _ = NodeRuntime::new(config, MemoryBlobStore::new());
+        let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
 
     #[test]
     fn timer_skipped_when_threshold_broadcast_pending() {
-        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::book::MemoryBookStore;
         use harmony_content::cid::ContentFlags;
 
         // Set mutation_threshold=2 and max_interval_ticks=2.
@@ -2094,7 +2094,7 @@ mod tests {
             },
             node_addr: "skip-timer-test".to_string(),
         };
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         // Tick 1: no events, no broadcast.
         rt.tick();
@@ -2102,7 +2102,7 @@ mod tests {
         // Queue 2 transit events to cross the mutation threshold.
         for i in 0..2u8 {
             let data = [i; 16];
-            let cid = ContentId::for_blob(&data, ContentFlags::default()).unwrap();
+            let cid = ContentId::for_book(&data, ContentFlags::default()).unwrap();
             let cid_hex = hex::encode(cid.to_bytes());
             let key_expr = format!("harmony/content/transit/{cid_hex}");
             rt.push_event(RuntimeEvent::SubscriptionMessage {
@@ -2130,7 +2130,7 @@ mod tests {
 
     #[test]
     fn filter_broadcasts_coalesced_within_tick() {
-        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::book::MemoryBookStore;
         use harmony_content::cid::ContentFlags;
 
         // mutation_threshold=2: every 2 transit events triggers a rebuild.
@@ -2149,12 +2149,12 @@ mod tests {
             },
             node_addr: "coalesce-test".to_string(),
         };
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         // Queue 6 transit events (each unique CID).
         for i in 0..6u8 {
             let data = [i; 16];
-            let cid = ContentId::for_blob(&data, ContentFlags::default()).unwrap();
+            let cid = ContentId::for_book(&data, ContentFlags::default()).unwrap();
             let cid_hex = hex::encode(cid.to_bytes());
             let key_expr = format!("harmony/content/transit/{cid_hex}");
             rt.push_event(RuntimeEvent::SubscriptionMessage {
@@ -2182,7 +2182,7 @@ mod tests {
 
     #[test]
     fn cuckoo_filter_broadcast_dispatched() {
-        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::book::MemoryBookStore;
 
         let config = NodeConfig {
             storage_budget: StorageBudget {
@@ -2195,7 +2195,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "cuckoo-test".to_string(),
         };
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         // Tick enough times to trigger the timer (default interval is 30).
         // The timer fires on the 30th tick.
@@ -2220,7 +2220,7 @@ mod tests {
 
     #[test]
     fn route_subscription_parses_cuckoo_filter() {
-        use harmony_content::blob::MemoryBlobStore;
+        use harmony_content::book::MemoryBookStore;
         use harmony_content::cuckoo::CuckooFilter;
 
         let config = NodeConfig {
@@ -2234,7 +2234,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "self-node".to_string(),
         };
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBlobStore::new());
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
         let cf = CuckooFilter::new(100);
         let payload = cf.to_bytes();
@@ -2251,7 +2251,7 @@ mod tests {
     #[test]
     fn staleness_tracking_independent_per_filter_type() {
         let mut table = PeerFilterTable::new(10);
-        let cid = ContentId::for_blob(b"staleness-test", ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"staleness-test", ContentFlags::default()).unwrap();
 
         // Insert content filter at tick 5.
         let bf = BloomFilter::new(100, 0.01);

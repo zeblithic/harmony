@@ -90,7 +90,7 @@ mod tests {
 
     fn base_record() -> ContentRecord {
         ContentRecord {
-            cid: ContentId::for_blob(b"test-content", ContentFlags::default()).unwrap(),
+            cid: ContentId::for_book(b"test-content", ContentFlags::default()).unwrap(),
             size_bytes: 1024,
             content_type: ContentCategory::Music,
             origin: ContentOrigin::CachedInTransit,

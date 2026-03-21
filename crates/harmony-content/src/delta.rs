@@ -186,7 +186,7 @@ mod tests {
         (0..n)
             .map(|i| {
                 let data = format!("test-blob-{i}");
-                ContentId::for_blob(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap()
+                ContentId::for_book(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap()
             })
             .collect()
     }
@@ -215,7 +215,7 @@ mod tests {
         let mut cids = make_cids(5);
         let old = bundle_bytes(&cids);
         // Change middle CID.
-        cids[2] = ContentId::for_blob(b"replacement", crate::cid::ContentFlags::default()).unwrap();
+        cids[2] = ContentId::for_book(b"replacement", crate::cid::ContentFlags::default()).unwrap();
         let new = bundle_bytes(&cids);
         let delta = compute_delta(&old, &new).unwrap();
         // COPY(0,2) + INSERT(1) + COPY(3,2) = 5 + 35 + 5 = 45 bytes.
@@ -256,7 +256,7 @@ mod tests {
     fn apply_delta_round_trip() {
         let old_cids = make_cids(5);
         let mut new_cids = old_cids.clone();
-        new_cids[2] = ContentId::for_blob(b"changed", crate::cid::ContentFlags::default()).unwrap();
+        new_cids[2] = ContentId::for_book(b"changed", crate::cid::ContentFlags::default()).unwrap();
 
         let old = bundle_bytes(&old_cids);
         let new = bundle_bytes(&new_cids);
@@ -305,7 +305,7 @@ mod tests {
         let cids = make_cids(10);
         let mut changed = cids.clone();
         changed[5] =
-            ContentId::for_blob(b"one-change", crate::cid::ContentFlags::default()).unwrap();
+            ContentId::for_book(b"one-change", crate::cid::ContentFlags::default()).unwrap();
         let old = bundle_bytes(&cids);
         let new = bundle_bytes(&changed);
         let update = encode_update(&old, &new).unwrap();
@@ -318,7 +318,7 @@ mod tests {
         let old_cids = make_cids(3);
         let new_cids: Vec<ContentId> = (100..103)
             .map(|i| {
-                ContentId::for_blob(
+                ContentId::for_book(
                     format!("different-{i}").as_bytes(),
                     crate::cid::ContentFlags::default(),
                 )

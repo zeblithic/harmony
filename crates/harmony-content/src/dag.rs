@@ -1,4 +1,4 @@
-use crate::blob::BlobStore;
+use crate::book::BookStore;
 use crate::bundle::{self, BundleBuilder, MAX_BUNDLE_ENTRIES};
 use crate::chunker::{chunk_all, ChunkerConfig};
 use crate::cid::{CidType, ContentId};
@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 pub fn ingest(
     data: &[u8],
     config: &ChunkerConfig,
-    store: &mut dyn BlobStore,
+    store: &mut dyn BookStore,
 ) -> Result<ContentId, ContentError> {
     if data.is_empty() {
         return Err(ContentError::EmptyData);
@@ -86,7 +86,7 @@ pub fn ingest(
 /// are skipped (they carry metadata, not data).
 ///
 /// Returns `MissingContent` if any referenced CID is not in the store.
-pub fn walk(root_cid: &ContentId, store: &dyn BlobStore) -> Result<Vec<ContentId>, ContentError> {
+pub fn walk(root_cid: &ContentId, store: &dyn BookStore) -> Result<Vec<ContentId>, ContentError> {
     let mut result = Vec::new();
     walk_recursive(root_cid, store, &mut result)?;
     Ok(result)
@@ -94,11 +94,11 @@ pub fn walk(root_cid: &ContentId, store: &dyn BlobStore) -> Result<Vec<ContentId
 
 fn walk_recursive(
     cid: &ContentId,
-    store: &dyn BlobStore,
+    store: &dyn BookStore,
     result: &mut Vec<ContentId>,
 ) -> Result<(), ContentError> {
     match cid.cid_type() {
-        CidType::Blob => {
+        CidType::Book => {
             result.push(*cid);
         }
         CidType::Bundle(_) => {
@@ -128,7 +128,7 @@ fn walk_recursive(
 /// pre-allocates the output buffer using the total file size.
 ///
 /// Guarantees: `reassemble(ingest(data)) == data` for all non-empty inputs.
-pub fn reassemble(root_cid: &ContentId, store: &dyn BlobStore) -> Result<Vec<u8>, ContentError> {
+pub fn reassemble(root_cid: &ContentId, store: &dyn BookStore) -> Result<Vec<u8>, ContentError> {
     // Try to pre-allocate using inline metadata if available.
     let capacity = estimate_size(root_cid, store);
     let mut output = Vec::with_capacity(capacity);
@@ -146,7 +146,7 @@ pub fn reassemble(root_cid: &ContentId, store: &dyn BlobStore) -> Result<Vec<u8>
 
 /// Estimate total data size from inline metadata (if present).
 /// Returns 0 if unavailable — Vec will grow dynamically.
-fn estimate_size(root_cid: &ContentId, store: &dyn BlobStore) -> usize {
+fn estimate_size(root_cid: &ContentId, store: &dyn BookStore) -> usize {
     if let CidType::Bundle(_) = root_cid.cid_type() {
         if let Some(data) = store.get(root_cid) {
             if let Ok(entries) = bundle::parse_bundle(data) {
@@ -159,7 +159,7 @@ fn estimate_size(root_cid: &ContentId, store: &dyn BlobStore) -> usize {
                 }
             }
         }
-    } else if let CidType::Blob = root_cid.cid_type() {
+    } else if let CidType::Book = root_cid.cid_type() {
         return root_cid.payload_size() as usize;
     }
     0
@@ -168,7 +168,7 @@ fn estimate_size(root_cid: &ContentId, store: &dyn BlobStore) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::MemoryBlobStore;
+    use crate::book::MemoryBookStore;
     use crate::chunker::ChunkerConfig;
 
     /// Small chunker config for fast tests (min=64, avg=128, max=256 bytes).
@@ -182,47 +182,47 @@ mod tests {
 
     #[test]
     fn module_compiles() {
-        let _store = MemoryBlobStore::new();
+        let _store = MemoryBookStore::new();
         let _config = test_config();
     }
 
     #[test]
     fn ingest_empty_returns_error() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         let result = ingest(&[], &test_config(), &mut store);
         assert!(matches!(result, Err(ContentError::EmptyData)));
     }
 
     #[test]
-    fn ingest_small_returns_blob_cid() {
-        let mut store = MemoryBlobStore::new();
+    fn ingest_small_returns_book_cid() {
+        let mut store = MemoryBookStore::new();
         let data = b"hello small file";
         let cid = ingest(data, &test_config(), &mut store).unwrap();
-        assert_eq!(cid.cid_type(), CidType::Blob);
+        assert_eq!(cid.cid_type(), CidType::Book);
         assert_eq!(store.get(&cid).unwrap(), data);
     }
 
     #[test]
     fn ingest_multi_chunk_returns_bundle_cid() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         let data: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
         let cid = ingest(&data, &test_config(), &mut store).unwrap();
         assert!(matches!(cid.cid_type(), CidType::Bundle(_)));
     }
 
     #[test]
-    fn ingest_exact_max_chunk_returns_blob() {
-        let mut store = MemoryBlobStore::new();
+    fn ingest_exact_max_chunk_returns_book() {
+        let mut store = MemoryBookStore::new();
         let config = test_config();
         // Data exactly at max_chunk — single chunk, no bundle.
         let data = vec![0xAB; config.max_chunk];
         let cid = ingest(&data, &config, &mut store).unwrap();
-        assert_eq!(cid.cid_type(), CidType::Blob);
+        assert_eq!(cid.cid_type(), CidType::Book);
     }
 
     #[test]
     fn ingest_multi_chunk_has_inline_metadata() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         let data: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
         let root_cid = ingest(&data, &test_config(), &mut store).unwrap();
 
@@ -237,33 +237,33 @@ mod tests {
     }
 
     #[test]
-    fn walk_blob_returns_single_cid() {
-        let mut store = MemoryBlobStore::new();
-        let data = b"small blob";
+    fn walk_book_returns_single_cid() {
+        let mut store = MemoryBookStore::new();
+        let data = b"small book";
         let cid = store.insert(data).unwrap();
-        let blobs = walk(&cid, &store).unwrap();
-        assert_eq!(blobs, vec![cid]);
+        let books = walk(&cid, &store).unwrap();
+        assert_eq!(books, vec![cid]);
     }
 
     #[test]
-    fn walk_bundle_returns_blobs_in_order() {
-        let mut store = MemoryBlobStore::new();
+    fn walk_bundle_returns_books_in_order() {
+        let mut store = MemoryBookStore::new();
         let data: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
         let root = ingest(&data, &test_config(), &mut store).unwrap();
-        let blobs = walk(&root, &store).unwrap();
+        let books = walk(&root, &store).unwrap();
 
-        // Should have multiple blobs, all of type Blob.
-        assert!(blobs.len() > 1);
-        for cid in &blobs {
-            assert_eq!(cid.cid_type(), CidType::Blob);
+        // Should have multiple books, all of type Book.
+        assert!(books.len() > 1);
+        for cid in &books {
+            assert_eq!(cid.cid_type(), CidType::Book);
         }
     }
 
     #[test]
     fn walk_missing_cid_returns_error() {
-        let store = MemoryBlobStore::new();
+        let store = MemoryBookStore::new();
         // Ingest into a different store, then walk from empty store.
-        let mut other_store = MemoryBlobStore::new();
+        let mut other_store = MemoryBookStore::new();
         let data: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
         let root = ingest(&data, &test_config(), &mut other_store).unwrap();
 
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn round_trip_small_data() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         let data = b"hello round trip";
         let root = ingest(data.as_slice(), &test_config(), &mut store).unwrap();
         let recovered = reassemble(&root, &store).unwrap();
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn round_trip_medium_data() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         let data: Vec<u8> = (0..2048).map(|i| (i * 37 % 256) as u8).collect();
         let root = ingest(&data, &test_config(), &mut store).unwrap();
         let recovered = reassemble(&root, &store).unwrap();
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn round_trip_large_data() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         // 8KB+ should produce two+ bundle levels with small config.
         let data: Vec<u8> = (0..8192).map(|i| (i * 41 % 256) as u8).collect();
         let root = ingest(&data, &test_config(), &mut store).unwrap();
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn round_trip_exact_max_chunk() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         let config = test_config();
         let data = vec![0xCD; config.max_chunk];
         let root = ingest(&data, &config, &mut store).unwrap();
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn structural_sharing_across_versions() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
         let config = test_config();
 
         // Version 1

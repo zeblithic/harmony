@@ -1,7 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
-pub mod blob;
+pub mod book;
 pub mod bloom;
 pub mod bundle;
 pub mod cache;

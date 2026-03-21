@@ -207,7 +207,7 @@ mod tests {
     use harmony_content::ContentFlags;
 
     fn make_cid(data: &[u8]) -> harmony_content::ContentId {
-        harmony_content::ContentId::for_blob(data, ContentFlags::default()).unwrap()
+        harmony_content::ContentId::for_book(data, ContentFlags::default()).unwrap()
     }
 
     #[test]

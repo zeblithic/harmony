@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harmony_content::blob::MemoryBlobStore;
+use harmony_content::book::MemoryBookStore;
 use harmony_identity::PqPrivateIdentity;
 use zeroize::Zeroize;
 use tokio::net::UdpSocket;
@@ -60,7 +60,7 @@ enum ZenohEvent {
 /// - `listen_addr`: UDP socket address to bind (broadcast also sent here).
 /// - `tunnel_config`: optional iroh tunnel configuration (enables tunnel accept/connect).
 pub async fn run(
-    mut runtime: NodeRuntime<MemoryBlobStore>,
+    mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
     listen_addr: SocketAddr,
     tunnel_config: Option<TunnelConfig>,

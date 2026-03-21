@@ -151,22 +151,22 @@ impl Default for BundleBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::{BlobStore, MemoryBlobStore};
+    use crate::book::{BookStore, MemoryBookStore};
     use crate::cid::CidType;
 
     #[test]
     fn parse_valid_bundle() {
-        let blob_a = ContentId::for_blob(b"chunk a", ContentFlags::default()).unwrap();
-        let blob_b = ContentId::for_blob(b"chunk b", ContentFlags::default()).unwrap();
+        let book_a = ContentId::for_book(b"chunk a", ContentFlags::default()).unwrap();
+        let book_b = ContentId::for_book(b"chunk b", ContentFlags::default()).unwrap();
 
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&blob_a.to_bytes());
-        bytes.extend_from_slice(&blob_b.to_bytes());
+        bytes.extend_from_slice(&book_a.to_bytes());
+        bytes.extend_from_slice(&book_b.to_bytes());
 
         let cids = parse_bundle(&bytes).unwrap();
         assert_eq!(cids.len(), 2);
-        assert_eq!(cids[0], blob_a);
-        assert_eq!(cids[1], blob_b);
+        assert_eq!(cids[0], book_a);
+        assert_eq!(cids[1], book_b);
     }
 
     #[test]
@@ -187,9 +187,9 @@ mod tests {
     #[test]
     fn validate_depth_accepts_valid_sparse_tree() {
         // L4 bundle containing only L2 children — valid (sparse)
-        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
-        let l1_bytes = blob.to_bytes().to_vec();
-        let l1 = ContentId::for_bundle(&l1_bytes, &[blob], ContentFlags::default()).unwrap();
+        let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
+        let l1_bytes = book.to_bytes().to_vec();
+        let l1 = ContentId::for_bundle(&l1_bytes, &[book], ContentFlags::default()).unwrap();
         let l2_bytes = l1.to_bytes().to_vec();
         let l2 = ContentId::for_bundle(&l2_bytes, &[l1], ContentFlags::default()).unwrap();
         assert_eq!(l2.cid_type(), CidType::Bundle(2));
@@ -200,9 +200,9 @@ mod tests {
 
     #[test]
     fn validate_depth_rejects_equal_depth() {
-        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
-        let l1_bytes = blob.to_bytes().to_vec();
-        let l1 = ContentId::for_bundle(&l1_bytes, &[blob], ContentFlags::default()).unwrap();
+        let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
+        let l1_bytes = book.to_bytes().to_vec();
+        let l1 = ContentId::for_bundle(&l1_bytes, &[book], ContentFlags::default()).unwrap();
         assert_eq!(l1.cid_type(), CidType::Bundle(1));
 
         // L1 parent cannot contain L1 children (depth not strictly less)
@@ -211,9 +211,9 @@ mod tests {
 
     #[test]
     fn validate_depth_rejects_deeper_child() {
-        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
-        let l1_bytes = blob.to_bytes().to_vec();
-        let l1 = ContentId::for_bundle(&l1_bytes, &[blob], ContentFlags::default()).unwrap();
+        let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
+        let l1_bytes = book.to_bytes().to_vec();
+        let l1 = ContentId::for_bundle(&l1_bytes, &[book], ContentFlags::default()).unwrap();
         let l2_bytes = l1.to_bytes().to_vec();
         let l2 = ContentId::for_bundle(&l2_bytes, &[l1], ContentFlags::default()).unwrap();
         assert_eq!(l2.cid_type(), CidType::Bundle(2));
@@ -224,23 +224,23 @@ mod tests {
 
     #[test]
     fn validate_depth_accepts_mixed_children() {
-        // L3 bundle containing [blob, L1, L2] — valid (mixed depths, all < 3)
-        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
-        let l1_bytes = blob.to_bytes().to_vec();
-        let l1 = ContentId::for_bundle(&l1_bytes, &[blob], ContentFlags::default()).unwrap();
+        // L3 bundle containing [book, L1, L2] — valid (mixed depths, all < 3)
+        let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
+        let l1_bytes = book.to_bytes().to_vec();
+        let l1 = ContentId::for_bundle(&l1_bytes, &[book], ContentFlags::default()).unwrap();
         let l2_bytes = l1.to_bytes().to_vec();
         let l2 = ContentId::for_bundle(&l2_bytes, &[l1], ContentFlags::default()).unwrap();
 
-        assert!(validate_bundle_depth(3, &[blob, l1, l2]).is_ok());
+        assert!(validate_bundle_depth(3, &[book, l1, l2]).is_ok());
     }
 
     #[test]
-    fn builder_basic_two_blobs() {
-        let blob_a = ContentId::for_blob(b"chunk a", ContentFlags::default()).unwrap();
-        let blob_b = ContentId::for_blob(b"chunk b", ContentFlags::default()).unwrap();
+    fn builder_basic_two_books() {
+        let book_a = ContentId::for_book(b"chunk a", ContentFlags::default()).unwrap();
+        let book_b = ContentId::for_book(b"chunk b", ContentFlags::default()).unwrap();
 
         let mut builder = BundleBuilder::new();
-        builder.add(blob_a).add(blob_b);
+        builder.add(book_a).add(book_b);
 
         let (bytes, cid) = builder.build().unwrap();
         assert_eq!(cid.cid_type(), CidType::Bundle(1));
@@ -250,34 +250,34 @@ mod tests {
         // Parse back and verify
         let parsed = parse_bundle(&bytes).unwrap();
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0], blob_a);
-        assert_eq!(parsed[1], blob_b);
+        assert_eq!(parsed[0], book_a);
+        assert_eq!(parsed[1], book_b);
     }
 
     #[test]
     fn builder_with_metadata() {
-        let blob = ContentId::for_blob(b"data", ContentFlags::default()).unwrap();
+        let book = ContentId::for_book(b"data", ContentFlags::default()).unwrap();
         let mut builder = BundleBuilder::new();
-        builder.add(blob).with_metadata(1000, 1, 0, *b"text/pln");
+        builder.add(book).with_metadata(1000, 1, 0, *b"text/pln");
 
         let (bytes, cid) = builder.build().unwrap();
         assert_eq!(cid.cid_type(), CidType::Bundle(1));
-        // 2 entries: metadata + blob
+        // 2 entries: metadata + book
         assert_eq!(bytes.len(), 64);
 
         let parsed = parse_bundle(&bytes).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].cid_type(), CidType::InlineMetadata);
-        assert_eq!(parsed[1], blob);
+        assert_eq!(parsed[1], book);
     }
 
     #[test]
     fn builder_depth_cascade() {
-        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
+        let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
 
         // L1 bundle
         let mut b1 = BundleBuilder::new();
-        b1.add(blob);
+        b1.add(book);
         let (_, l1_cid) = b1.build().unwrap();
         assert_eq!(l1_cid.cid_type(), CidType::Bundle(1));
 
@@ -290,11 +290,11 @@ mod tests {
 
     #[test]
     fn build_with_flags_encrypted_bundle() {
-        let blob_a = ContentId::for_blob(b"chunk a", ContentFlags::default()).unwrap();
-        let blob_b = ContentId::for_blob(b"chunk b", ContentFlags::default()).unwrap();
+        let book_a = ContentId::for_book(b"chunk a", ContentFlags::default()).unwrap();
+        let book_b = ContentId::for_book(b"chunk b", ContentFlags::default()).unwrap();
 
         let mut builder = BundleBuilder::new();
-        builder.add(blob_a).add(blob_b);
+        builder.add(book_a).add(book_b);
 
         let flags = ContentFlags {
             encrypted: true,
@@ -315,8 +315,8 @@ mod tests {
     #[test]
     fn builder_rejects_depth_overflow() {
         // Build up to depth 7 then try to wrap
-        let blob = ContentId::for_blob(b"leaf", ContentFlags::default()).unwrap();
-        let mut current = blob;
+        let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
+        let mut current = book;
         for _ in 0..7 {
             let mut b = BundleBuilder::new();
             b.add(current);
@@ -331,10 +331,10 @@ mod tests {
     }
 
     #[test]
-    fn full_pipeline_store_blobs_build_bundle_retrieve() {
-        let mut store = MemoryBlobStore::new();
+    fn full_pipeline_store_books_build_bundle_retrieve() {
+        let mut store = MemoryBookStore::new();
 
-        // Insert blobs
+        // Insert books
         let cid_a = store.insert(b"chunk alpha").unwrap();
         let cid_b = store.insert(b"chunk beta").unwrap();
         let cid_c = store.insert(b"chunk gamma").unwrap();
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(children[1], cid_b);
         assert_eq!(children[2], cid_c);
 
-        // Verify each child blob is still retrievable
+        // Verify each child book is still retrievable
         assert_eq!(store.get(&cid_a).unwrap(), b"chunk alpha");
         assert_eq!(store.get(&cid_b).unwrap(), b"chunk beta");
         assert_eq!(store.get(&cid_c).unwrap(), b"chunk gamma");
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn full_pipeline_with_metadata_root_bundle() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
 
         let cid_a = store.insert(b"part 1").unwrap();
         let cid_b = store.insert(b"part 2").unwrap();
@@ -388,28 +388,28 @@ mod tests {
         assert_eq!(ts, 1709337600000);
         assert_eq!(&mime, b"text/pln");
 
-        // Remaining entries are the blobs
+        // Remaining entries are the books
         assert_eq!(entries[1], cid_a);
         assert_eq!(entries[2], cid_b);
     }
 
     #[test]
     fn two_level_bundle_tree() {
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryBookStore::new();
 
-        // Create 4 blobs
+        // Create 4 books
         let cids: Vec<ContentId> = (0..4)
             .map(|i| store.insert(format!("chunk {i}").as_bytes()).unwrap())
             .collect();
 
-        // L1 bundle: first 2 blobs
+        // L1 bundle: first 2 books
         let mut b1 = BundleBuilder::new();
         b1.add(cids[0]).add(cids[1]);
         let (b1_bytes, b1_cid) = b1.build().unwrap();
         assert_eq!(b1_cid.cid_type(), CidType::Bundle(1));
         store.store(b1_cid, b1_bytes);
 
-        // L1 bundle: last 2 blobs
+        // L1 bundle: last 2 books
         let mut b2 = BundleBuilder::new();
         b2.add(cids[2]).add(cids[3]);
         let (b2_bytes, b2_cid) = b2.build().unwrap();
