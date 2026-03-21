@@ -30,10 +30,13 @@ Peer A (behind NAT) ──QUIC──→ i.q8.fyi ←──QUIC── Peer B (beh
 
 ### Prerequisites
 
+**Automated (`deploy.sh`):**
 - [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) (`gcloud` CLI)
 - A GCP project with billing enabled
 - A domain with DNS you control
-- Rust toolchain (to build iroh-relay from source)
+
+**Manual runbook (Step 4 builds locally):**
+- All of the above, plus a local Rust toolchain
 
 ### Automated Deployment
 
