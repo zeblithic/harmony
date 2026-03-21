@@ -8,14 +8,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use harmony_compute::InstructionBudget;
-use harmony_content::book::BookStore;
+use harmony_contacts::ContactStore;
 use harmony_content::bloom::BloomFilter;
+use harmony_content::book::BookStore;
 use harmony_content::cid::ContentId;
 use harmony_content::cuckoo::CuckooFilter;
 use harmony_content::storage_tier::{
     ContentPolicy, FilterBroadcastConfig, StorageBudget, StorageMetrics, StorageTier,
     StorageTierAction, StorageTierEvent,
 };
+use harmony_discovery::DiscoveryManager;
+use harmony_peers::PeerManager;
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
 use harmony_zenoh::namespace::content as content_ns;
@@ -148,6 +151,13 @@ pub enum RuntimeEvent {
     },
     /// A tunnel was closed.
     TunnelClosed { interface_name: String },
+    /// A discovery announce record was received from the network.
+    DiscoveryAnnounceReceived { record_bytes: Vec<u8>, now: u64 },
+    /// Local tunnel endpoint info became available.
+    LocalTunnelInfo {
+        node_id: [u8; 32],
+        relay_url: Option<String>,
+    },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -344,6 +354,17 @@ pub struct NodeRuntime<B: BookStore> {
     pending_filter_broadcast: Option<Vec<u8>>,
     // Coalesces cuckoo filter broadcasts (flatpack reverse-index) within a single tick.
     pending_cuckoo_broadcast: Option<Vec<u8>>,
+    // Identity discovery manager (sans-I/O)
+    discovery: DiscoveryManager,
+    // Contact store for intentional peer relationships
+    contact_store: ContactStore,
+    // Peer lifecycle manager
+    peer_manager: PeerManager,
+    // Most recent `now` value from events (milliseconds). Used for
+    // feeding discovery tick with second-resolution timestamps.
+    last_now: u64,
+    // Local tunnel routing hint (populated when iroh endpoint binds).
+    local_tunnel_hint: Option<harmony_discovery::RoutingHint>,
 }
 
 impl<B: BookStore> NodeRuntime<B> {
@@ -450,6 +471,11 @@ impl<B: BookStore> NodeRuntime<B> {
             filter_broadcast_interval_ticks,
             pending_filter_broadcast: None,
             pending_cuckoo_broadcast: None,
+            discovery: DiscoveryManager::new(),
+            contact_store: ContactStore::new(),
+            peer_manager: PeerManager::new(),
+            last_now: 0,
+            local_tunnel_hint: None,
         };
 
         (rt, actions)
@@ -510,6 +536,16 @@ impl<B: BookStore> NodeRuntime<B> {
         self.peer_filters.parse_errors()
     }
 
+    /// Read-only access to the contact store.
+    pub fn contact_store(&self) -> &ContactStore {
+        &self.contact_store
+    }
+
+    /// Mutable access to the contact store.
+    pub fn contact_store_mut(&mut self) -> &mut ContactStore {
+        &mut self.contact_store
+    }
+
     /// Calculate the effective compute fuel budget based on data-plane queue depth.
     ///
     /// At zero depth, returns the full base budget. As combined queue depth
@@ -546,6 +582,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 });
             }
             RuntimeEvent::TimerTick { now } => {
+                self.last_now = now;
                 self.router_queue.push_back(NodeEvent::TimerTick { now });
             }
             RuntimeEvent::QueryReceived {
@@ -647,6 +684,34 @@ impl<B: BookStore> NodeRuntime<B> {
                 tracing::info!(%interface_name, "tunnel closed — interface unregistered");
                 self.router.unregister_interface(&interface_name);
             }
+            RuntimeEvent::DiscoveryAnnounceReceived { record_bytes, now } => {
+                self.last_now = now;
+                let record = match harmony_discovery::AnnounceRecord::deserialize(&record_bytes) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!("invalid announce record: {e:?}");
+                        return;
+                    }
+                };
+                if let Err(e) = harmony_discovery::verify_announce(&record, now / 1000) {
+                    tracing::debug!("announce verification failed: {e:?}");
+                    return;
+                }
+                let actions =
+                    self.discovery
+                        .on_event(harmony_discovery::DiscoveryEvent::AnnounceReceived {
+                            record,
+                            now: now / 1000,
+                        });
+                self.dispatch_discovery_actions(actions);
+            }
+            RuntimeEvent::LocalTunnelInfo { node_id, relay_url } => {
+                self.local_tunnel_hint = Some(harmony_discovery::RoutingHint::Tunnel {
+                    node_id,
+                    relay_url,
+                    direct_addrs: vec![],
+                });
+            }
         }
     }
 
@@ -726,8 +791,8 @@ impl<B: BookStore> NodeRuntime<B> {
                     // Snapshot the timer state BEFORE processing events — a
                     // threshold-triggered BroadcastFilter resets the counter,
                     // but should not suppress the timer if it was due to fire.
-                    let timer_due = self.ticks_since_filter_broadcast
-                        >= self.filter_broadcast_interval_ticks;
+                    let timer_due =
+                        self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks;
 
                     let limit = self.schedule.storage_max_per_tick.unwrap_or(usize::MAX);
                     let mut processed = 0;
@@ -792,6 +857,14 @@ impl<B: BookStore> NodeRuntime<B> {
             }
         }
 
+        // Feed discovery tick (after all tiers, using second-resolution timestamp).
+        let disc_actions = self
+            .discovery
+            .on_event(harmony_discovery::DiscoveryEvent::Tick {
+                now: self.last_now / 1000,
+            });
+        self.dispatch_discovery_actions(disc_actions);
+
         actions
     }
 
@@ -851,6 +924,97 @@ impl<B: BookStore> NodeRuntime<B> {
                     self.pending_cuckoo_broadcast = Some(payload);
                 }
             }
+        }
+    }
+
+    fn dispatch_discovery_actions(&mut self, actions: Vec<harmony_discovery::DiscoveryAction>) {
+        for action in actions {
+            if let harmony_discovery::DiscoveryAction::IdentityDiscovered { record } = action {
+                self.process_discovered_tunnel_hints(&record);
+            }
+            // Other discovery actions (PublishAnnounce, SetLiveliness, etc.)
+            // deferred to full Zenoh wiring.
+        }
+    }
+
+    /// Extract `RoutingHint::Tunnel` from a discovery record and auto-populate
+    /// `ContactAddress::Tunnel` in the contact store.
+    pub fn process_discovered_tunnel_hints(&mut self, record: &harmony_discovery::AnnounceRecord) {
+        use harmony_contacts::{Contact, ContactAddress, PeeringPolicy, PeeringPriority};
+        use harmony_discovery::RoutingHint;
+
+        let identity_hash = record.identity_ref.hash;
+
+        let tunnel_hints: Vec<_> = record
+            .routing_hints
+            .iter()
+            .filter_map(|hint| {
+                if let RoutingHint::Tunnel {
+                    node_id,
+                    relay_url,
+                    direct_addrs,
+                } = hint
+                {
+                    Some(ContactAddress::Tunnel {
+                        node_id: *node_id,
+                        relay_url: relay_url.clone(),
+                        direct_addrs: direct_addrs.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if tunnel_hints.is_empty() {
+            return;
+        }
+
+        if let Some(contact) = self.contact_store.get_mut(&identity_hash) {
+            // Replace stale tunnel addresses with fresh ones.
+            contact
+                .addresses
+                .retain(|a| !matches!(a, ContactAddress::Tunnel { .. }));
+            contact.addresses.extend(tunnel_hints);
+            let peer_actions = self.peer_manager.on_event(
+                harmony_peers::PeerEvent::ContactChanged { identity_hash },
+                &self.contact_store,
+            );
+            self.translate_peer_actions(peer_actions);
+        } else {
+            // Auto-create contact for discovered peer.
+            let unix_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let contact = Contact {
+                identity_hash,
+                display_name: None,
+                peering: PeeringPolicy {
+                    enabled: true,
+                    priority: PeeringPriority::Normal,
+                },
+                added_at: unix_now,
+                last_seen: None,
+                notes: None,
+                addresses: tunnel_hints,
+            };
+            if self.contact_store.add(contact).is_ok() {
+                let peer_actions = self.peer_manager.on_event(
+                    harmony_peers::PeerEvent::ContactChanged { identity_hash },
+                    &self.contact_store,
+                );
+                self.translate_peer_actions(peer_actions);
+            }
+        }
+    }
+
+    fn translate_peer_actions(&mut self, _actions: Vec<harmony_peers::PeerAction>) {
+        // Peer actions (InitiateLink, SendPathRequest, CloseLink, UpdateLastSeen)
+        // require full Reticulum link wiring — deferred to a follow-up bead.
+        // For now, we log them at debug level.
+        for action in _actions {
+            tracing::debug!(?action, "peer action deferred");
         }
     }
 
@@ -1181,6 +1345,14 @@ mod tests {
         let _e6 = RuntimeEvent::ModuleFetchResponse {
             cid: [0u8; 32],
             result: Ok(vec![1, 2, 3]),
+        };
+        let _e7 = RuntimeEvent::DiscoveryAnnounceReceived {
+            record_bytes: vec![0u8; 10],
+            now: 1000,
+        };
+        let _e8 = RuntimeEvent::LocalTunnelInfo {
+            node_id: [0u8; 32],
+            relay_url: Some("https://iroh.q8.fyi".into()),
         };
     }
 
@@ -2280,5 +2452,119 @@ mod tests {
             !table.should_query_flatpack("peer-a", &cid, 20),
             "fresh flatpack filter with empty cuckoo should say 'definitely no'"
         );
+    }
+
+    // ── Discovery integration tests ─────────────────────────────────
+
+    #[test]
+    fn discovery_tunnel_hint_creates_contact() {
+        let (mut rt, _) = make_runtime();
+        let record = harmony_discovery::AnnounceRecord {
+            identity_ref: harmony_identity::IdentityRef {
+                hash: [0xDD; 16],
+                suite: harmony_identity::CryptoSuite::Ed25519,
+            },
+            public_key: vec![0u8; 32],
+            routing_hints: vec![harmony_discovery::RoutingHint::Tunnel {
+                node_id: [0xEE; 32],
+                relay_url: Some("https://iroh.q8.fyi".into()),
+                direct_addrs: vec![],
+            }],
+            published_at: 1000,
+            expires_at: 2000,
+            nonce: [0u8; 16],
+            signature: vec![0u8; 64],
+        };
+        rt.process_discovered_tunnel_hints(&record);
+        let contact = rt.contact_store().get(&[0xDD; 16]).unwrap();
+        assert_eq!(contact.addresses.len(), 1);
+        assert!(matches!(
+            &contact.addresses[0],
+            harmony_contacts::ContactAddress::Tunnel { node_id, .. } if *node_id == [0xEE; 32]
+        ));
+    }
+
+    #[test]
+    fn discovery_tunnel_hint_updates_existing_contact() {
+        let (mut rt, _) = make_runtime();
+        // Pre-add contact
+        let contact = harmony_contacts::Contact {
+            identity_hash: [0xFF; 16],
+            display_name: None,
+            peering: harmony_contacts::PeeringPolicy {
+                enabled: true,
+                priority: harmony_contacts::PeeringPriority::High,
+            },
+            added_at: 1000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![harmony_contacts::ContactAddress::Tunnel {
+                node_id: [0x11; 32],
+                relay_url: None,
+                direct_addrs: vec![],
+            }],
+        };
+        rt.contact_store_mut().add(contact).unwrap();
+
+        let record = harmony_discovery::AnnounceRecord {
+            identity_ref: harmony_identity::IdentityRef {
+                hash: [0xFF; 16],
+                suite: harmony_identity::CryptoSuite::Ed25519,
+            },
+            public_key: vec![0u8; 32],
+            routing_hints: vec![harmony_discovery::RoutingHint::Tunnel {
+                node_id: [0x22; 32],
+                relay_url: Some("https://new-relay.example.com".into()),
+                direct_addrs: vec![],
+            }],
+            published_at: 2000,
+            expires_at: 3000,
+            nonce: [0u8; 16],
+            signature: vec![0u8; 64],
+        };
+        rt.process_discovered_tunnel_hints(&record);
+
+        let contact = rt.contact_store().get(&[0xFF; 16]).unwrap();
+        assert_eq!(contact.addresses.len(), 1);
+        assert!(matches!(
+            &contact.addresses[0],
+            harmony_contacts::ContactAddress::Tunnel { node_id, .. } if *node_id == [0x22; 32]
+        ));
+    }
+
+    #[test]
+    fn discovery_no_tunnel_hints_is_noop() {
+        let (mut rt, _) = make_runtime();
+        let record = harmony_discovery::AnnounceRecord {
+            identity_ref: harmony_identity::IdentityRef {
+                hash: [0xCC; 16],
+                suite: harmony_identity::CryptoSuite::Ed25519,
+            },
+            public_key: vec![0u8; 32],
+            routing_hints: vec![harmony_discovery::RoutingHint::Reticulum {
+                destination_hash: [0xAA; 16],
+            }],
+            published_at: 1000,
+            expires_at: 2000,
+            nonce: [0u8; 16],
+            signature: vec![0u8; 64],
+        };
+        rt.process_discovered_tunnel_hints(&record);
+        assert!(rt.contact_store().get(&[0xCC; 16]).is_none());
+    }
+
+    #[test]
+    fn local_tunnel_info_stores_hint() {
+        let (mut rt, _) = make_runtime();
+        assert!(rt.local_tunnel_hint.is_none());
+        rt.push_event(RuntimeEvent::LocalTunnelInfo {
+            node_id: [0xAA; 32],
+            relay_url: Some("https://iroh.q8.fyi".into()),
+        });
+        assert!(matches!(
+            &rt.local_tunnel_hint,
+            Some(harmony_discovery::RoutingHint::Tunnel { node_id, relay_url, .. })
+            if *node_id == [0xAA; 32] && relay_url.as_deref() == Some("https://iroh.q8.fyi")
+        ));
     }
 }
