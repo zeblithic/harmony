@@ -644,6 +644,7 @@ impl<B: BlobStore> NodeRuntime<B> {
             }
             RuntimeEvent::TunnelClosed { interface_name } => {
                 eprintln!("[{interface_name}] tunnel closed");
+                self.router.unregister_interface(&interface_name);
             }
         }
     }

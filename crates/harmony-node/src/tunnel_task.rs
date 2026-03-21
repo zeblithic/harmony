@@ -30,11 +30,8 @@ pub async fn run_initiator(
     remote_identity: &PqIdentity,
     bridge_tx: mpsc::Sender<TunnelBridgeEvent>,
     cmd_rx: mpsc::Receiver<TunnelCommand>,
+    interface_name: String,
 ) {
-    let interface_name = match conn.remote_node_id() {
-        Ok(node_id) => format!("tunnel-{}", hex::encode(&node_id.as_bytes()[..4])),
-        Err(_) => format!("tunnel-{:08x}", rand::random::<u32>()),
-    };
 
     let now_ms = millis_since_start();
 
@@ -145,11 +142,8 @@ pub async fn run_responder(
     local_identity: &PqPrivateIdentity,
     bridge_tx: mpsc::Sender<TunnelBridgeEvent>,
     cmd_rx: mpsc::Receiver<TunnelCommand>,
+    interface_name: String,
 ) {
-    let interface_name = match conn.remote_node_id() {
-        Ok(node_id) => format!("tunnel-{}", hex::encode(&node_id.as_bytes()[..4])),
-        Err(_) => format!("tunnel-{:08x}", rand::random::<u32>()),
-    };
 
     // Accept the bidirectional stream
     let (mut send_stream, mut recv_stream) = match conn.accept_bi().await {

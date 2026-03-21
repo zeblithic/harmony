@@ -61,6 +61,10 @@ impl TunnelSender {
         self.tx.send(TunnelCommand::SendReticulum { packet }).await
     }
 
+    pub fn try_send_reticulum(&self, packet: Vec<u8>) -> Result<(), mpsc::error::TrySendError<TunnelCommand>> {
+        self.tx.try_send(TunnelCommand::SendReticulum { packet })
+    }
+
     pub async fn send_zenoh(&self, message: Vec<u8>) -> Result<(), mpsc::error::SendError<TunnelCommand>> {
         self.tx.send(TunnelCommand::SendZenoh { message }).await
     }

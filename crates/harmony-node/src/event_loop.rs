@@ -252,39 +252,44 @@ pub async fn run(
 
             // Arm 4: Tunnel bridge event — buffer only, tick on timer.
             maybe = tunnel_rx.recv() => {
-                if let Some(event) = maybe {
-                    match event {
-                        TunnelBridgeEvent::HandshakeComplete {
+                let event = match maybe {
+                    None => {
+                        eprintln!("[event_loop] tunnel bridge channel closed");
+                        break;
+                    }
+                    Some(e) => e,
+                };
+                match event {
+                    TunnelBridgeEvent::HandshakeComplete {
+                        interface_name,
+                        peer_node_id,
+                        peer_dsa_pubkey: _, // TODO(harmony-h6k): store in contact registry for peer lifecycle
+                    } => {
+                        runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
                             interface_name,
                             peer_node_id,
-                            ..
-                        } => {
-                            runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
-                                interface_name,
-                                peer_node_id,
-                            });
-                        }
-                        TunnelBridgeEvent::ReticulumReceived {
+                        });
+                    }
+                    TunnelBridgeEvent::ReticulumReceived {
+                        interface_name,
+                        packet,
+                    } => {
+                        runtime.push_event(RuntimeEvent::TunnelReticulumReceived {
                             interface_name,
                             packet,
-                        } => {
-                            runtime.push_event(RuntimeEvent::TunnelReticulumReceived {
-                                interface_name,
-                                packet,
-                                now: now_ms(),
-                            });
-                        }
-                        TunnelBridgeEvent::ZenohReceived { .. } => {
-                            // TODO: Zenoh over tunnel (Bead #3)
-                        }
-                        TunnelBridgeEvent::TunnelClosed {
-                            interface_name,
-                            reason,
-                        } => {
-                            eprintln!("[{interface_name}] tunnel closed: {reason}");
-                            tunnel_senders.remove(&interface_name);
-                            runtime.push_event(RuntimeEvent::TunnelClosed { interface_name });
-                        }
+                            now: now_ms(),
+                        });
+                    }
+                    TunnelBridgeEvent::ZenohReceived { .. } => {
+                        // TODO: Zenoh over tunnel (Bead #3)
+                    }
+                    TunnelBridgeEvent::TunnelClosed {
+                        interface_name,
+                        reason,
+                    } => {
+                        eprintln!("[{interface_name}] tunnel closed: {reason}");
+                        tunnel_senders.remove(&interface_name);
+                        runtime.push_event(RuntimeEvent::TunnelClosed { interface_name });
                     }
                 }
             }
@@ -322,9 +327,10 @@ pub async fn run(
                                     let tx = tunnel_tx.clone();
                                     let identity =
                                         tunnel_config.as_ref().unwrap().local_identity.clone();
+                                    let iface_clone = iface.clone();
                                     tokio::spawn(async move {
                                         tunnel_task::run_responder(
-                                            connection, &identity, tx, cmd_rx,
+                                            connection, &identity, tx, cmd_rx, iface_clone,
                                         )
                                         .await;
                                     });
@@ -385,7 +391,9 @@ async fn dispatch_action(
         } => {
             if interface_name.starts_with("tunnel-") {
                 if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {
-                    let _ = sender.send_reticulum(raw.clone()).await;
+                    if sender.try_send_reticulum(raw.clone()).is_err() {
+                        eprintln!("[{interface_name}] tunnel send queue full — dropping packet");
+                    }
                 }
             } else if let Err(e) = udp.send_to(raw, broadcast_addr).await {
                 eprintln!("[event_loop] UDP send error: {e}");
