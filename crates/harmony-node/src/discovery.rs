@@ -275,10 +275,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn make_addr(port: u16) -> SocketAddr {
-        SocketAddr::new(
-            std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
-            port,
-        )
+        SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), port)
     }
 
     fn make_reticulum_addr(tag: u8) -> [u8; 16] {

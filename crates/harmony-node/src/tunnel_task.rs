@@ -43,7 +43,14 @@ pub async fn run_initiator(
     // Wrap handshake phase in timeout
     let handshake_result = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        initiator_handshake(&conn, local_identity, remote_identity, &bridge_tx, &interface_name, connection_id),
+        initiator_handshake(
+            &conn,
+            local_identity,
+            remote_identity,
+            &bridge_tx,
+            &interface_name,
+            connection_id,
+        ),
     )
     .await;
 
@@ -103,13 +110,9 @@ async fn initiator_handshake(
 
     // Create TunnelSession as initiator
     let mut rng = rand::rngs::OsRng;
-    let (mut session, init_actions) = TunnelSession::new_initiator(
-        &mut rng,
-        local_identity,
-        remote_identity,
-        now_ms,
-    )
-    .map_err(|e| Some(format!("handshake init failed: {e}")))?;
+    let (mut session, init_actions) =
+        TunnelSession::new_initiator(&mut rng, local_identity, remote_identity, now_ms)
+            .map_err(|e| Some(format!("handshake init failed: {e}")))?;
 
     // Open a bidirectional stream for the tunnel
     let (mut send_stream, mut recv_stream) = conn
@@ -141,7 +144,15 @@ async fn initiator_handshake(
         .map_err(|e| Some(format!("handshake failed: {e}")))?;
 
     // Dispatch handshake completion actions (HandshakeComplete + any OutboundBytes)
-    if !dispatch_tunnel_actions(&actions, &mut send_stream, bridge_tx, interface_name, connection_id).await {
+    if !dispatch_tunnel_actions(
+        &actions,
+        &mut send_stream,
+        bridge_tx,
+        interface_name,
+        connection_id,
+    )
+    .await
+    {
         // dispatch_tunnel_actions already sent TunnelClosed to bridge_tx.
         // Return None to signal the caller should NOT send a duplicate.
         return Err(None);
@@ -165,7 +176,13 @@ pub async fn run_responder(
     // Wrap handshake phase in timeout
     let handshake_result = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        responder_handshake(&conn, local_identity, &bridge_tx, &interface_name, connection_id),
+        responder_handshake(
+            &conn,
+            local_identity,
+            &bridge_tx,
+            &interface_name,
+            connection_id,
+        ),
     )
     .await;
 
@@ -234,13 +251,9 @@ async fn responder_handshake(
     // Create TunnelSession as responder
     let mut rng = rand::rngs::OsRng;
     let now_ms = millis_since_start();
-    let (session, accept_actions) = TunnelSession::new_responder(
-        &mut rng,
-        local_identity,
-        &init_bytes,
-        now_ms,
-    )
-    .map_err(|e| Some(format!("responder handshake failed: {e}")))?;
+    let (session, accept_actions) =
+        TunnelSession::new_responder(&mut rng, local_identity, &init_bytes, now_ms)
+            .map_err(|e| Some(format!("responder handshake failed: {e}")))?;
 
     // Dispatch accept actions (sends TunnelAccept + emits HandshakeComplete)
     if !dispatch_tunnel_actions(
