@@ -302,7 +302,7 @@ mod tests {
         assert!(matches!(
             AnnounceRecord::deserialize(&[0xFF]),
             Err(DiscoveryError::DeserializeError(
-                "unsupported format version"
+                "unsupported announce format version"
             ))
         ));
     }

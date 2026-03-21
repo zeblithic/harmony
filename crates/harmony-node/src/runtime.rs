@@ -695,9 +695,16 @@ impl<B: BookStore> NodeRuntime<B> {
                         return;
                     }
                 };
+                // Discovery uses Unix epoch seconds for published_at/expires_at
+                // and the `now` parameter. The event loop provides monotonic
+                // millis_since_start() which is NOT Unix epoch — use wall-clock.
+                let unix_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 // Pre-reject before touching the manager's cache. DiscoveryManager
                 // also verifies internally, but this avoids unnecessary state mutations.
-                if let Err(e) = harmony_discovery::verify_announce(&record, now / 1000) {
+                if let Err(e) = harmony_discovery::verify_announce(&record, unix_now) {
                     tracing::debug!("announce verification failed: {e:?}");
                     return;
                 }
@@ -705,7 +712,7 @@ impl<B: BookStore> NodeRuntime<B> {
                     self.discovery
                         .on_event(harmony_discovery::DiscoveryEvent::AnnounceReceived {
                             record,
-                            now: now / 1000,
+                            now: unix_now,
                         });
                 self.dispatch_discovery_actions(actions);
             }
@@ -861,11 +868,16 @@ impl<B: BookStore> NodeRuntime<B> {
             }
         }
 
-        // Feed discovery tick (after all tiers, using second-resolution timestamp).
+        // Feed discovery tick — uses Unix epoch seconds (not monotonic)
+        // because AnnounceRecord.published_at/expires_at are Unix epoch.
+        let disc_unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let disc_actions = self
             .discovery
             .on_event(harmony_discovery::DiscoveryEvent::Tick {
-                now: self.last_now / 1000,
+                now: disc_unix_now,
             });
         self.dispatch_discovery_actions(disc_actions);
 
