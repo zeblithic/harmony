@@ -13,7 +13,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 if ! command -v nix &>/dev/null; then
   echo "[nix-cache-setup] Installing multi-user Nix..."
-  curl -fsSL https://nixos.org/nix/install | sh -s -- --daemon --yes
+  # Multi-user Nix installer requires root for daemon setup
+  curl -fsSL https://nixos.org/nix/install | sudo sh -s -- --daemon --yes
   # Re-source profile so `nix` is available for the rest of this script
   if [ -e /etc/profile.d/nix.sh ]; then
     # shellcheck source=/dev/null
@@ -28,7 +29,7 @@ fi
 
 # Ensure the nix daemon is running before proceeding
 if command -v systemctl &>/dev/null; then
-  systemctl enable --now nix-daemon.service 2>/dev/null || true
+  sudo systemctl enable --now nix-daemon.service 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------------------
@@ -40,15 +41,15 @@ PUBLIC_KEY="${KEY_DIR}/cache-key.pub"
 
 if [ ! -f "${PRIVATE_KEY}" ]; then
   echo "[nix-cache-setup] Generating signing keypair..."
-  install -d -m 755 "${KEY_DIR}"
+  sudo install -d -m 755 "${KEY_DIR}"
   # nix-store --generate-binary-cache-key produces:
   #   <name>.pem  — private key (keep secret)
   #   <name>.pub  — public key  (add to clients' nix.conf trusted-public-keys)
   # The key name is embedded in signatures, so use a stable host-based name.
   KEY_NAME="$(hostname -f)-cache-1"
-  nix-store --generate-binary-cache-key "${KEY_NAME}" "${PRIVATE_KEY}" "${PUBLIC_KEY}"
-  chmod 600 "${PRIVATE_KEY}"
-  chmod 644 "${PUBLIC_KEY}"
+  sudo nix-store --generate-binary-cache-key "${KEY_NAME}" "${PRIVATE_KEY}" "${PUBLIC_KEY}"
+  sudo chmod 600 "${PRIVATE_KEY}"
+  sudo chmod 644 "${PUBLIC_KEY}"
   echo "[nix-cache-setup] Signing keypair written to ${KEY_DIR}."
 else
   echo "[nix-cache-setup] Signing keypair already exists — skipping."
@@ -59,6 +60,7 @@ fi
 # ---------------------------------------------------------------------------
 if ! command -v nix-serve &>/dev/null; then
   echo "[nix-cache-setup] Installing nix-serve..."
+  nix-channel --update nixpkgs 2>/dev/null || true
   nix-env -iA nixpkgs.nix-serve
 else
   echo "[nix-cache-setup] nix-serve already installed — skipping."
@@ -75,14 +77,14 @@ SERVICE_FILE=/etc/systemd/system/nix-serve.service
 # nix-serve only needs read access to /nix/store (world-readable)
 # and read access to the signing key.
 if ! id -u nix-serve &>/dev/null; then
-    useradd -r -s /bin/false -d /nonexistent nix-serve
+    sudo useradd -r -s /bin/false -d /nonexistent nix-serve
     echo "[nix-cache-setup] Created nix-serve user."
 fi
 # Grant nix-serve group read on the signing key
-chgrp nix-serve "${PRIVATE_KEY}" 2>/dev/null || true
-chmod 640 "${PRIVATE_KEY}" 2>/dev/null || true
+sudo chgrp nix-serve "${PRIVATE_KEY}" 2>/dev/null || true
+sudo chmod 640 "${PRIVATE_KEY}" 2>/dev/null || true
 
-cat > "${SERVICE_FILE}" <<EOF
+sudo tee "${SERVICE_FILE}" > /dev/null <<EOF
 [Unit]
 Description=Nix binary cache server
 After=network.target nix-daemon.service
@@ -108,8 +110,8 @@ EOF
 echo "[nix-cache-setup] Wrote ${SERVICE_FILE}."
 
 if command -v systemctl &>/dev/null; then
-  systemctl daemon-reload
-  systemctl enable --now nix-serve.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now nix-serve.service
   echo "[nix-cache-setup] nix-serve service enabled and started."
 fi
 

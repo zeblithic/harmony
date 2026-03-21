@@ -98,7 +98,7 @@ Commit `cache-key.pub` so clients can verify cache signatures.
 ### How It Works
 
 ```
-nix build .#iroh-relay
+nix build .#iroh-relay-x86_64-linux
   └── check local /nix/store
   └── check binary cache (http://harmony-relay:5000)
   └── build from source (if cache miss)
@@ -143,14 +143,16 @@ Previous versions remain in `/nix/store` on the VM. To roll back:
 
 ```bash
 # List recent iroh-relay store paths
-gcloud compute ssh harmony-relay --zone=us-west1-b -- \
+gcloud compute ssh harmony-relay --zone=us-west1-b --command="
     ls -lt /nix/store | grep iroh-relay | head -5
+"
 
 # Activate an older store path directly
-gcloud compute ssh harmony-relay --zone=us-west1-b -- \
-    sudo systemctl stop iroh-relay && \
-    sudo ln -sf /nix/store/<old-path>/bin/iroh-relay /usr/local/bin/iroh-relay && \
+gcloud compute ssh harmony-relay --zone=us-west1-b --command="
+    sudo systemctl stop iroh-relay &&
+    sudo cp /nix/store/<old-path>/bin/iroh-relay /usr/local/bin/iroh-relay &&
     sudo systemctl start iroh-relay
+"
 ```
 
 ## Runbook: Step-by-Step Manual Deployment
@@ -223,7 +225,7 @@ Run the cache setup first (see **Binary Cache** section above), then build and u
 
 ```bash
 # Build iroh-relay using Nix (pulls from binary cache if available)
-nix build .#iroh-relay
+nix build .#iroh-relay-x86_64-linux
 
 # Upload to the VM
 gcloud compute scp result/bin/iroh-relay \

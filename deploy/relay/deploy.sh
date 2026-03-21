@@ -127,7 +127,7 @@ elif command -v nix &>/dev/null; then
 
     # Build locally (cross-compiles to x86_64-linux-musl on any host)
     echo "    Running: nix build .#iroh-relay-x86_64-linux (from ${REPO_ROOT})"
-    STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux" --print-out-paths --no-link)
+    STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux^out" --print-out-paths --no-link)
     echo "    Store path: ${STORE_PATH}"
 
     # Verify Nix is installed on the VM before any nix-store operations
