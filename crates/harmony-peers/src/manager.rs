@@ -126,65 +126,25 @@ impl PeerManager {
                 }
             }
             PeerEvent::TunnelFailed { identity_hash } => {
-                if let Some(peer) = self.peers.get_mut(&identity_hash) {
-                    // Only act on Connecting — a stale TunnelFailed arriving after
-                    // the Tick timeout already moved the peer to Searching should
-                    // not double-increment retry_count or corrupt last_probe.
-                    if matches!(peer.status, PeerStatus::Connecting) {
-                        peer.last_probe =
-                            peer.connecting_since.or(peer.last_seen).or(peer.last_probe);
-                        peer.status = PeerStatus::Searching;
-                        peer.retry_count = peer.retry_count.saturating_add(1);
-                        peer.connecting_since = None;
-                        peer.connection_quality = None;
-
-                        // If the contact also has a Reticulum address, immediately
-                        // fall back — same logic as TunnelDropped. Without this,
-                        // dual-address contacts retry the tunnel indefinitely with
-                        // backoff, never trying the available Reticulum path.
-                        let has_reticulum = contacts
-                            .get(&identity_hash)
-                            .map(|c| {
-                                c.addresses.iter().any(|addr| {
-                                    matches!(addr, ContactAddress::Reticulum { .. })
-                                })
-                            })
-                            .unwrap_or(false);
-
-                        if has_reticulum {
-                            actions.push(PeerAction::InitiateLink { identity_hash });
-                            peer.status = PeerStatus::Connecting;
-                        }
-                    }
-                }
+                // Only act on Connecting — a stale TunnelFailed arriving after
+                // the Tick timeout already moved the peer to Searching should
+                // not double-increment retry_count or corrupt last_probe.
+                Self::handle_tunnel_disconnect(
+                    &mut self.peers,
+                    identity_hash,
+                    &[PeerStatus::Connecting],
+                    contacts,
+                    &mut actions,
+                );
             }
             PeerEvent::TunnelDropped { identity_hash } => {
-                if let Some(peer) = self.peers.get_mut(&identity_hash) {
-                    if matches!(peer.status, PeerStatus::Connected | PeerStatus::Connecting) {
-                        peer.last_probe =
-                            peer.connecting_since.or(peer.last_seen).or(peer.last_probe);
-                        peer.status = PeerStatus::Searching;
-                        peer.retry_count = peer.retry_count.saturating_add(1);
-                        peer.connecting_since = None;
-                        peer.connection_quality = None;
-
-                        // If the contact also has a Reticulum address, immediately fall back
-                        // to a Reticulum link — no backoff for a fallback path.
-                        let has_reticulum = contacts
-                            .get(&identity_hash)
-                            .map(|c| {
-                                c.addresses.iter().any(|addr| {
-                                    matches!(addr, ContactAddress::Reticulum { .. })
-                                })
-                            })
-                            .unwrap_or(false);
-
-                        if has_reticulum {
-                            actions.push(PeerAction::InitiateLink { identity_hash });
-                            peer.status = PeerStatus::Connecting;
-                        }
-                    }
-                }
+                Self::handle_tunnel_disconnect(
+                    &mut self.peers,
+                    identity_hash,
+                    &[PeerStatus::Connected, PeerStatus::Connecting],
+                    contacts,
+                    &mut actions,
+                );
             }
             PeerEvent::LinkEstablished { identity_hash, now } => {
                 match self.peers.get_mut(&identity_hash) {
@@ -230,6 +190,45 @@ impl PeerManager {
             }
         }
         actions
+    }
+
+    /// Shared disconnect handler for TunnelFailed and TunnelDropped.
+    ///
+    /// Resets probe timing, increments retry count, clears connection quality,
+    /// and falls back to Reticulum if the contact has a Reticulum address.
+    fn handle_tunnel_disconnect(
+        peers: &mut HashMap<IdentityHash, PeerState>,
+        identity_hash: IdentityHash,
+        valid_states: &[PeerStatus],
+        contacts: &ContactStore,
+        actions: &mut Vec<PeerAction>,
+    ) {
+        if let Some(peer) = peers.get_mut(&identity_hash) {
+            if valid_states.contains(&peer.status) {
+                peer.last_probe =
+                    peer.connecting_since.or(peer.last_seen).or(peer.last_probe);
+                peer.status = PeerStatus::Searching;
+                peer.retry_count = peer.retry_count.saturating_add(1);
+                peer.connecting_since = None;
+                peer.connection_quality = None;
+
+                // If the contact also has a Reticulum address, immediately
+                // fall back — no backoff for the fallback path.
+                let has_reticulum = contacts
+                    .get(&identity_hash)
+                    .map(|c| {
+                        c.addresses
+                            .iter()
+                            .any(|addr| matches!(addr, ContactAddress::Reticulum { .. }))
+                    })
+                    .unwrap_or(false);
+
+                if has_reticulum {
+                    actions.push(PeerAction::InitiateLink { identity_hash });
+                    peer.status = PeerStatus::Connecting;
+                }
+            }
+        }
     }
 
     fn handle_contact_changed(
