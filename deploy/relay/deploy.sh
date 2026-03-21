@@ -38,8 +38,8 @@ RATE_LIMIT_BURST="${RATE_LIMIT_BURST:-512000}"
 # Prevent shell injection via SSH commands and TOML config corruption.
 [[ "${RELAY_HOSTNAME}" =~ ^[a-zA-Z0-9._-]+$ ]] \
     || { echo "ERROR: RELAY_HOSTNAME must be a valid hostname (alphanumeric, dots, hyphens)"; exit 1; }
-[[ "${CONTACT_EMAIL}" =~ ^[^\"[:space:]\\]+$ ]] \
-    || { echo "ERROR: CONTACT_EMAIL must not contain quotes, backslashes, or whitespace"; exit 1; }
+[[ "${CONTACT_EMAIL}" =~ ^[a-zA-Z0-9._%+@-]+$ ]] \
+    || { echo "ERROR: CONTACT_EMAIL must be a valid email address (alphanumeric plus . _ % + @ -)"; exit 1; }
 [[ "${IROH_VERSION}" =~ ^v?[0-9a-zA-Z._-]+$ ]] \
     || { echo "ERROR: IROH_VERSION must be a valid semver tag (e.g. v0.91.2)"; exit 1; }
 [[ "${IROH_REPO}" =~ ^https://[a-zA-Z0-9._/-]+\.git$ ]] \
