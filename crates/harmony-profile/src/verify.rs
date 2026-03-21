@@ -72,7 +72,7 @@ fn check_time_bounds(published_at: u64, expires_at: u64, now: u64) -> Result<(),
     Ok(())
 }
 
-/// Dispatch signature verification based on CryptoSuite.
+/// Delegate signature verification to `harmony_identity`, mapping errors to [`ProfileError::SignatureInvalid`].
 fn verify_signature(
     suite: CryptoSuite,
     key_bytes: &[u8],

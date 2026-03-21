@@ -90,7 +90,7 @@ pub fn verify_presentation(
     Ok(())
 }
 
-/// Dispatch signature verification based on CryptoSuite.
+/// Delegate signature verification to `harmony_identity`, mapping errors to [`CredentialError::SignatureInvalid`].
 fn verify_signature(
     suite: CryptoSuite,
     key_bytes: &[u8],

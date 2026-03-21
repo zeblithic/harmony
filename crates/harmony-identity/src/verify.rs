@@ -244,4 +244,16 @@ mod tests {
             verify_signature(CryptoSuite::MlDsa65, &[0x00; 32], b"msg", &[0x00; 64]).unwrap_err();
         assert!(matches!(err, IdentityError::SignatureInvalid));
     }
+
+    #[test]
+    fn ml_dsa65_invalid_signature_length_rejected() {
+        let err = verify_signature(
+            CryptoSuite::MlDsa65,
+            &[0x00; 1952], // valid-length key placeholder
+            b"msg",
+            &[0x00; 64], // ML-DSA-65 signatures are 3309 bytes
+        )
+        .unwrap_err();
+        assert!(matches!(err, IdentityError::SignatureInvalid));
+    }
 }
