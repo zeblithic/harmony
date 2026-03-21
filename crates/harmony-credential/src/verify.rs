@@ -161,6 +161,12 @@ fn verify_chain_inner(
             .resolve(&parent_hash)
             .ok_or(CredentialError::ProofNotFound)?;
 
+        // Verify the resolved credential matches the referenced hash.
+        // A buggy or compromised resolver could return a different credential.
+        if parent.content_hash() != parent_hash {
+            return Err(CredentialError::ProofNotFound);
+        }
+
         if parent.subject != credential.issuer {
             return Err(CredentialError::ChainBroken);
         }
@@ -822,10 +828,12 @@ mod tests {
     }
 
     #[test]
-    fn chain_loop_detected() {
-        // Content hashes make honest cycles impossible, so we use a custom
-        // resolver that deliberately returns a credential whose proof
-        // points back to the leaf.
+    fn chain_dishonest_resolver_caught_by_hash_check() {
+        // Content hashes make honest cycles impossible (chicken-and-egg).
+        // A dishonest resolver returning the wrong credential is caught
+        // by the content_hash verification — returns ProofNotFound.
+        // The ChainLoop code path is defense-in-depth, unreachable with
+        // honest resolvers, but kept for safety.
         let alice_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
         let bob_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
         let alice_ref = IdentityRef::from(alice_priv.public_identity());
@@ -835,12 +843,12 @@ mod tests {
         let leaf = build_delegation(&alice_priv, bob_ref, Some(fake_parent_hash));
         let leaf_hash = leaf.content_hash();
 
-        // Parent whose proof points back to the leaf (cycle)
+        // Parent whose proof points back to the leaf
         let parent = build_delegation(&bob_priv, alice_ref, Some(leaf_hash));
 
-        // Custom resolver that always returns the cyclic parent
-        struct CyclicResolver(Credential);
-        impl CredentialResolver for CyclicResolver {
+        // Dishonest resolver: returns parent regardless of requested hash
+        struct DishonestResolver(Credential);
+        impl CredentialResolver for DishonestResolver {
             fn resolve(&self, _content_hash: &[u8; 32]) -> Option<Credential> {
                 Some(self.0.clone())
             }
@@ -861,8 +869,9 @@ mod tests {
         );
         let status = empty_status();
 
-        let result = verify_chain(&leaf, 1500, &keys, &status, &CyclicResolver(parent));
-        assert_eq!(result.unwrap_err(), CredentialError::ChainLoop);
+        // Caught by content hash verification — resolver returned wrong credential
+        let result = verify_chain(&leaf, 1500, &keys, &status, &DishonestResolver(parent));
+        assert_eq!(result.unwrap_err(), CredentialError::ProofNotFound);
     }
 
     #[test]
