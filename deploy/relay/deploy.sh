@@ -2,17 +2,18 @@
 # deploy.sh — Provision and configure a Harmony relay server on GCP.
 #
 # Usage:
-#   RELAY_HOSTNAME="i.q8.fyi" GCP_PROJECT="my-project" ./deploy.sh
+#   RELAY_HOSTNAME="i.q8.fyi" GCP_PROJECT="my-project" ./deploy/relay/deploy.sh
 #
 # Prerequisites:
 #   - gcloud CLI authenticated (gcloud auth login)
 #   - A GCP project with billing enabled
 #   - A domain with DNS you control
-#   - DNS: After this script runs, point RELAY_HOSTNAME's A record
-#     at the printed static IP address.
 #
-# Note: Rust is installed on the remote VM automatically — no local
-# Rust toolchain needed for automated deployment.
+# The script builds iroh-relay locally if Rust is available (fast, ~2 min),
+# otherwise falls back to building on the remote VM (slow, ~15 min on
+# e2-micro). Set LOCAL_BINARY to skip building entirely:
+#
+#   LOCAL_BINARY=/path/to/iroh-relay ./deploy/relay/deploy.sh
 
 set -euo pipefail
 
@@ -27,22 +28,24 @@ MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
 IROH_REPO="${IROH_REPO:-https://github.com/n0-computer/iroh.git}"
 IROH_VERSION="${IROH_VERSION:-v0.91.2}"
 CONTACT_EMAIL="${CONTACT_EMAIL:-admin@${RELAY_HOSTNAME}}"
+LOCAL_BINARY="${LOCAL_BINARY:-}"
 
 # Rate limits (bytes/sec). Defaults: 100 KB/s sustained, 500 KB burst.
 RATE_LIMIT_BPS="${RATE_LIMIT_BPS:-102400}"
 RATE_LIMIT_BURST="${RATE_LIMIT_BURST:-512000}"
 
 echo "=== Harmony Relay Deployment ==="
-echo "  Hostname:  ${RELAY_HOSTNAME}"
-echo "  Project:   ${GCP_PROJECT}"
-echo "  Zone:      ${GCP_ZONE}"
-echo "  VM:        ${VM_NAME} (${MACHINE_TYPE})"
+echo "  Hostname:     ${RELAY_HOSTNAME}"
+echo "  Project:      ${GCP_PROJECT}"
+echo "  Zone:         ${GCP_ZONE} (region: ${GCP_REGION})"
+echo "  VM:           ${VM_NAME} (${MACHINE_TYPE})"
+echo "  iroh version: ${IROH_VERSION}"
 echo ""
 
 gcloud config set project "$GCP_PROJECT" --quiet
 
 # ── Step 1: Reserve static IP ─────────────────────────────────────
-echo "--- Reserving static IP..."
+echo "--- Step 1: Reserving static IP..."
 if gcloud compute addresses describe "$VM_NAME" --region="$GCP_REGION" &>/dev/null; then
     echo "    Static IP '$VM_NAME' already exists."
 else
@@ -54,7 +57,7 @@ STATIC_IP=$(gcloud compute addresses describe "$VM_NAME" \
 echo "    Static IP: ${STATIC_IP}"
 
 # ── Step 2: Create firewall rules ─────────────────────────────────
-echo "--- Configuring firewall rules..."
+echo "--- Step 2: Configuring firewall rules..."
 for rule in \
     "${VM_NAME}-http:tcp:80:HTTP" \
     "${VM_NAME}-https:tcp:443:HTTPS" \
@@ -73,7 +76,7 @@ for rule in \
 done
 
 # ── Step 3: Create VM ─────────────────────────────────────────────
-echo "--- Creating VM..."
+echo "--- Step 3: Creating VM..."
 if gcloud compute instances describe "$VM_NAME" --zone="$GCP_ZONE" &>/dev/null; then
     echo "    VM '$VM_NAME' already exists."
 else
@@ -105,44 +108,96 @@ else
     fi
 fi
 
-# ── Step 4: Install build tools on VM ─────────────────────────────
-echo "--- Installing build dependencies on VM..."
-gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
-    set -euo pipefail
-    if [ ! -f \"\$HOME/.cargo/bin/cargo\" ]; then
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq build-essential pkg-config libssl-dev curl git
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    fi
-    source \"\$HOME/.cargo/env\"
-    echo 'Build tools ready.'
-"
+# ── Step 4: Build iroh-relay ──────────────────────────────────────
+# Three strategies, in order of preference:
+#   1. Use a pre-built binary (LOCAL_BINARY env var)
+#   2. Build locally and SCP (if cargo is available — fast, ~2 min)
+#   3. Build on the VM (slow, ~15 min on e2-micro)
 
-# ── Step 5: Build iroh-relay on VM ────────────────────────────────
-echo "--- Building iroh-relay on VM (this takes a few minutes)..."
-gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
-    set -euo pipefail
-    source \"\$HOME/.cargo/env\"
-    if [ ! -d /tmp/iroh-build ]; then
-        git clone --depth=1 --branch '${IROH_VERSION}' '${IROH_REPO}' /tmp/iroh-build
+BINARY_PATH=""
+
+if [ -n "$LOCAL_BINARY" ] && [ -f "$LOCAL_BINARY" ]; then
+    echo "--- Step 4: Using pre-built binary: ${LOCAL_BINARY}"
+    BINARY_PATH="$LOCAL_BINARY"
+
+elif command -v cargo &>/dev/null; then
+    echo "--- Step 4: Building iroh-relay locally (faster than remote build)..."
+    BUILD_DIR="/tmp/iroh-relay-build"
+    if [ ! -d "$BUILD_DIR" ]; then
+        git clone --depth=1 --branch "$IROH_VERSION" "$IROH_REPO" "$BUILD_DIR"
     else
-        cd /tmp/iroh-build
-        git fetch --depth=1 origin '${IROH_VERSION}'
+        cd "$BUILD_DIR"
+        git fetch --depth=1 origin "$IROH_VERSION"
         git checkout FETCH_HEAD
+        cd - > /dev/null
     fi
-    cd /tmp/iroh-build
-    cargo build --release -p iroh-relay --features server --bin iroh-relay
-    echo 'Build complete.'
-"
+    echo "    Building (this takes ~2 min locally)..."
+    cargo build --release --manifest-path "$BUILD_DIR/Cargo.toml" \
+        -p iroh-relay --features server --bin iroh-relay
+    BINARY_PATH="$BUILD_DIR/target/release/iroh-relay"
+    echo "    Local build complete."
 
-# ── Step 6: Install and configure ─────────────────────────────────
-echo "--- Installing iroh-relay service..."
+else
+    echo "--- Step 4: No local Rust — building on VM (slow, ~15 min on e2-micro)..."
+
+    # Install build deps on VM
+    echo "    Installing build dependencies..."
+    gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
+        set -euo pipefail
+        if [ ! -f \"\$HOME/.cargo/bin/cargo\" ]; then
+            sudo apt-get update -qq > /dev/null
+            sudo apt-get install -y -qq build-essential pkg-config libssl-dev curl git > /dev/null
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y > /dev/null 2>&1
+        fi
+        [ -f \"\$HOME/.cargo/env\" ] && . \"\$HOME/.cargo/env\"
+        cargo --version
+    "
+
+    # Build on VM
+    echo "    Building iroh-relay on VM..."
+    gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
+        set -euo pipefail
+        [ -f \"\$HOME/.cargo/env\" ] && . \"\$HOME/.cargo/env\"
+        if [ ! -d /tmp/iroh-build ]; then
+            git clone --depth=1 --branch '${IROH_VERSION}' '${IROH_REPO}' /tmp/iroh-build
+        else
+            cd /tmp/iroh-build
+            git fetch --depth=1 origin '${IROH_VERSION}'
+            git checkout FETCH_HEAD
+        fi
+        cd /tmp/iroh-build
+        cargo build --release -p iroh-relay --features server --bin iroh-relay 2>&1 | tail -3
+        echo 'Remote build complete.'
+    "
+fi
+
+# ── Step 5: Upload binary and install service ─────────────────────
+echo "--- Step 5: Installing iroh-relay service..."
+
+# Upload binary if we built locally
+if [ -n "$BINARY_PATH" ]; then
+    echo "    Uploading binary to VM..."
+    gcloud compute scp "$BINARY_PATH" "$VM_NAME:/tmp/iroh-relay" --zone="$GCP_ZONE"
+    gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
+        sudo mv -f /tmp/iroh-relay /usr/local/bin/iroh-relay
+        sudo chmod +x /usr/local/bin/iroh-relay
+    "
+fi
+
 gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
     set -euo pipefail
 
-    # Install binary
-    sudo cp -f /tmp/iroh-build/target/release/iroh-relay /usr/local/bin/iroh-relay
-    sudo chmod +x /usr/local/bin/iroh-relay
+    # If remote build, install binary from build dir
+    if [ -f /tmp/iroh-build/target/release/iroh-relay ]; then
+        sudo cp -f /tmp/iroh-build/target/release/iroh-relay /usr/local/bin/iroh-relay
+        sudo chmod +x /usr/local/bin/iroh-relay
+    fi
+
+    # Verify binary exists
+    /usr/local/bin/iroh-relay --help > /dev/null 2>&1 || {
+        echo 'ERROR: iroh-relay binary not found or not executable.'
+        exit 1
+    }
 
     # Create service user (idempotent)
     id -u iroh-relay &>/dev/null || sudo useradd -r -s /bin/false iroh-relay
@@ -204,60 +259,68 @@ WantedBy=multi-user.target
 UNIT
 
     # Enable but do NOT start yet — ACME needs DNS to resolve first.
-    # Starting before DNS resolves wastes Let's Encrypt rate limit
-    # attempts (5 failed validations/hour/hostname).
     sudo systemctl daemon-reload
     sudo systemctl enable iroh-relay
 
-    echo 'Service installed and enabled (not started — waiting for DNS).'
+    echo 'Service installed and enabled.'
 "
 
-# ── Step 7: Wait for DNS, then start ──────────────────────────────
+# ── Step 6: DNS check and service start ───────────────────────────
 echo ""
 echo "=== VM provisioned. Static IP: ${STATIC_IP} ==="
 echo ""
-echo "Add this DNS A record with your registrar NOW:"
-echo ""
+echo "DNS A record needed:"
 echo "    ${RELAY_HOSTNAME}.  A  ${STATIC_IP}"
 echo ""
 
-read -rp "Press Enter after you've added the DNS record (or Ctrl-C to finish later)..."
-
-echo "--- Waiting for DNS to resolve ${RELAY_HOSTNAME} to ${STATIC_IP}..."
-dns_ready=0
-for i in $(seq 1 60); do
-    resolved=$(dig +short "${RELAY_HOSTNAME}" @8.8.8.8 2>/dev/null | head -1)
-    if [ "$resolved" = "$STATIC_IP" ]; then
-        dns_ready=1
-        break
-    fi
-    echo "    Attempt $i/60: got '${resolved:-<empty>}', waiting..."
-    sleep 10
-done
-
-if [ "$dns_ready" -eq 0 ]; then
+# Check if DNS already resolves (user may have set it up in advance)
+resolved=$(dig +short "${RELAY_HOSTNAME}" @8.8.8.8 2>/dev/null | head -1)
+if [ "$resolved" = "$STATIC_IP" ]; then
+    echo "DNS already resolves correctly. Starting service..."
+    gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="sudo systemctl start iroh-relay"
     echo ""
-    echo "WARNING: DNS did not resolve after 10 minutes."
-    echo "The service is installed but NOT started to avoid wasting"
-    echo "Let's Encrypt rate limits. Start it manually after DNS propagates:"
+    echo "=== Deployment Complete ==="
+    echo "Relay running at https://${RELAY_HOSTNAME}"
     echo ""
-    echo "    gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- sudo systemctl start iroh-relay"
+    echo "Connect nodes:  harmony-node --relay-url https://${RELAY_HOSTNAME}"
+    echo "View logs:      gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- sudo journalctl -u iroh-relay -f"
     exit 0
 fi
 
-echo "    DNS resolved! Starting iroh-relay..."
-gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
-    sudo systemctl start iroh-relay
-"
+# Interactive mode: wait for DNS
+if [ -t 0 ]; then
+    read -rp "Press Enter after you've added the DNS record (or Ctrl-C to finish later)..."
 
-# ── Done ──────────────────────────────────────────────────────────
+    echo "--- Waiting for DNS to resolve ${RELAY_HOSTNAME} to ${STATIC_IP}..."
+    dns_ready=0
+    for i in $(seq 1 60); do
+        resolved=$(dig +short "${RELAY_HOSTNAME}" @8.8.8.8 2>/dev/null | head -1)
+        if [ "$resolved" = "$STATIC_IP" ]; then
+            dns_ready=1
+            break
+        fi
+        echo "    Attempt $i/60: got '${resolved:-<empty>}', waiting..."
+        sleep 10
+    done
+
+    if [ "$dns_ready" -eq 1 ]; then
+        echo "    DNS resolved! Starting iroh-relay..."
+        gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="sudo systemctl start iroh-relay"
+        echo ""
+        echo "=== Deployment Complete ==="
+        echo "Relay running at https://${RELAY_HOSTNAME}"
+    else
+        echo ""
+        echo "WARNING: DNS did not resolve after 10 minutes."
+        echo "Start manually after DNS propagates:"
+        echo "    gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- sudo systemctl start iroh-relay"
+    fi
+else
+    # Non-interactive: just print instructions
+    echo "Non-interactive mode. After adding the DNS record, start the service:"
+    echo "    gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- sudo systemctl start iroh-relay"
+fi
+
 echo ""
-echo "=== Deployment Complete ==="
-echo ""
-echo "Relay running at https://${RELAY_HOSTNAME}"
-echo ""
-echo "Connect Harmony nodes with:"
-echo "    harmony-node --relay-url https://${RELAY_HOSTNAME}"
-echo ""
-echo "View logs:"
-echo "    gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- sudo journalctl -u iroh-relay -f"
+echo "Connect nodes:  harmony-node --relay-url https://${RELAY_HOSTNAME}"
+echo "View logs:      gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- sudo journalctl -u iroh-relay -f"
