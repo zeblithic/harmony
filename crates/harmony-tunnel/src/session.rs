@@ -390,7 +390,10 @@ mod tests {
 
         // Initiator processes TunnelAccept
         let actions = initiator
-            .handle_event(TunnelEvent::InboundBytes { data: accept_bytes, now_ms: 0 })
+            .handle_event(TunnelEvent::InboundBytes {
+                data: accept_bytes,
+                now_ms: 0,
+            })
             .unwrap();
 
         assert_eq!(initiator.state(), TunnelState::Active);
@@ -425,7 +428,10 @@ mod tests {
             .unwrap();
 
         initiator
-            .handle_event(TunnelEvent::InboundBytes { data: accept_bytes, now_ms: 0 })
+            .handle_event(TunnelEvent::InboundBytes {
+                data: accept_bytes,
+                now_ms: 0,
+            })
             .unwrap();
 
         // Initiator sends Reticulum packet to responder
@@ -442,7 +448,10 @@ mod tests {
         };
 
         let actions = responder
-            .handle_event(TunnelEvent::InboundBytes { data: encrypted, now_ms: 0 })
+            .handle_event(TunnelEvent::InboundBytes {
+                data: encrypted,
+                now_ms: 0,
+            })
             .unwrap();
 
         assert!(matches!(
@@ -464,7 +473,10 @@ mod tests {
         };
 
         let actions = initiator
-            .handle_event(TunnelEvent::InboundBytes { data: encrypted, now_ms: 0 })
+            .handle_event(TunnelEvent::InboundBytes {
+                data: encrypted,
+                now_ms: 0,
+            })
             .unwrap();
 
         assert!(matches!(
@@ -503,7 +515,10 @@ mod tests {
             .unwrap();
 
         initiator
-            .handle_event(TunnelEvent::InboundBytes { data: accept_bytes, now_ms: 0 })
+            .handle_event(TunnelEvent::InboundBytes {
+                data: accept_bytes,
+                now_ms: 0,
+            })
             .unwrap();
 
         assert_eq!(initiator.state(), TunnelState::Active);
@@ -600,16 +615,17 @@ mod tests {
         let actions = initiator
             .handle_event(TunnelEvent::Tick { now_ms: 15_000 })
             .unwrap();
-        assert!(
-            actions.is_empty(),
-            "tick at 15s should not send keepalive"
-        );
+        assert!(actions.is_empty(), "tick at 15s should not send keepalive");
 
         // Tick at t=30001: 30001ms >= KEEPALIVE_INTERVAL_MS (30000) → keepalive sent
         let actions = initiator
             .handle_event(TunnelEvent::Tick { now_ms: 30_001 })
             .unwrap();
-        assert_eq!(actions.len(), 1, "tick at 30001ms must emit exactly one keepalive");
+        assert_eq!(
+            actions.len(),
+            1,
+            "tick at 30001ms must emit exactly one keepalive"
+        );
         assert!(
             matches!(&actions[0], TunnelAction::OutboundBytes { .. }),
             "keepalive must be OutboundBytes"
@@ -671,7 +687,10 @@ mod tests {
 
         // Initiator receives it at now_ms=50_000 — resets last_received_ms to 50_000
         initiator
-            .handle_event(TunnelEvent::InboundBytes { data: encrypted, now_ms: 50_000 })
+            .handle_event(TunnelEvent::InboundBytes {
+                data: encrypted,
+                now_ms: 50_000,
+            })
             .unwrap();
         assert_eq!(initiator.last_received_ms, 50_000);
 
@@ -699,5 +718,4 @@ mod tests {
             "must timeout at 140001ms"
         );
     }
-
 }

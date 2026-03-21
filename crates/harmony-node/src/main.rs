@@ -107,14 +107,13 @@ async fn main() {
     // it for syslog on OpenWRT). Filter via RUST_LOG env var, default info.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|e| {
-                    // Only warn if RUST_LOG is set but malformed — missing is the normal case.
-                    if std::env::var("RUST_LOG").is_ok() {
-                        eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
-                    }
-                    tracing_subscriber::EnvFilter::new("info")
-                }),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|e| {
+                // Only warn if RUST_LOG is set but malformed — missing is the normal case.
+                if std::env::var("RUST_LOG").is_ok() {
+                    eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
+                }
+                tracing_subscriber::EnvFilter::new("info")
+            }),
         )
         .with_target(false)
         .with_ansi(false)
@@ -330,8 +329,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if no_mdns { None } else { Some(our_addr_bytes) },
                 std::time::Duration::from_secs(mdns_stale_timeout),
                 tunnel_config,
-            ).await
-                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            )
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
         }
     }
@@ -483,13 +483,8 @@ mod tests {
 
     #[test]
     fn cli_parses_listen_address() {
-        let cli = Cli::try_parse_from([
-            "harmony",
-            "run",
-            "--listen-address",
-            "127.0.0.1:9999",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["harmony", "run", "--listen-address", "127.0.0.1:9999"]).unwrap();
         if let Commands::Run { listen_address, .. } = cli.command {
             assert_eq!(listen_address, "127.0.0.1:9999");
         } else {
@@ -543,7 +538,10 @@ mod tests {
     #[test]
     fn cli_parses_mdns_stale_timeout() {
         let cli = Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "120"]).unwrap();
-        if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
+        if let Commands::Run {
+            mdns_stale_timeout, ..
+        } = cli.command
+        {
             assert_eq!(mdns_stale_timeout, 120);
         } else {
             panic!("expected Run command");
@@ -553,7 +551,10 @@ mod tests {
     #[test]
     fn cli_mdns_stale_timeout_default() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
-        if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
+        if let Commands::Run {
+            mdns_stale_timeout, ..
+        } = cli.command
+        {
             assert_eq!(mdns_stale_timeout, 60);
         } else {
             panic!("expected Run command");
@@ -562,8 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_zero_mdns_stale_timeout() {
-        let cli =
-            Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "0"]).unwrap();
+        let cli = Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "0"]).unwrap();
         let result = run(cli).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();

@@ -18,6 +18,6 @@ pub use ucan::{
     verify_revocation, verify_token, CapabilityType, IdentityResolver, PqUcanToken, ProofResolver,
     Revocation, RevocationSet, UcanError, UcanToken,
 };
-pub use verify::verify_signature;
 #[cfg(any(test, feature = "test-utils"))]
 pub use ucan::{MemoryIdentityStore, MemoryProofStore, MemoryRevocationSet};
+pub use verify::verify_signature;

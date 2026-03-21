@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use harmony_content::book::MemoryBookStore;
 use harmony_identity::PqPrivateIdentity;
-use zeroize::Zeroize;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
+use zeroize::Zeroize;
 
 use crate::discovery::{self, PeerTable};
 use crate::runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
@@ -31,20 +31,11 @@ pub struct TunnelConfig {
 /// Internal bridge events from spawned Zenoh tasks to the select loop.
 enum ZenohEvent {
     /// Inbound Zenoh query (non-compute).
-    Query {
-        key_expr: String,
-        payload: Vec<u8>,
-    },
+    Query { key_expr: String, payload: Vec<u8> },
     /// Inbound Zenoh query on a compute key expression.
-    ComputeQuery {
-        key_expr: String,
-        payload: Vec<u8>,
-    },
+    ComputeQuery { key_expr: String, payload: Vec<u8> },
     /// Inbound Zenoh subscription sample.
-    Subscription {
-        key_expr: String,
-        payload: Vec<u8>,
-    },
+    Subscription { key_expr: String, payload: Vec<u8> },
     /// Response to a FetchContent / FetchModule get() call.
     FetchResponse {
         cid: [u8; 32],
@@ -78,10 +69,7 @@ pub async fn run(
         .expect("static broadcast addr");
 
     // ── mDNS peer discovery (optional) ──────────────────────────────────────
-    let mut peer_table = PeerTable::new(
-        mdns_addr.unwrap_or([0; 16]),
-        mdns_stale_timeout,
-    );
+    let mut peer_table = PeerTable::new(mdns_addr.unwrap_or([0; 16]), mdns_stale_timeout);
     let mut mdns_state = match mdns_addr {
         Some(addr) => match discovery::start_mdns(listen_addr.port(), &addr) {
             Ok((daemon, rx)) => {
@@ -138,20 +126,23 @@ pub async fn run(
             .secret_key(secret_key);
 
         if let Some(ref url) = config.relay_url {
-            let relay_url: iroh::RelayUrl = url
-                .parse()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("invalid relay URL '{url}': {e}").into()
-                })?;
+            let relay_url: iroh::RelayUrl =
+                url.parse()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("invalid relay URL '{url}': {e}").into()
+                    })?;
             let relay_map = iroh::RelayMap::from_iter([relay_url]);
             builder = builder.relay_mode(iroh::RelayMode::Custom(relay_map));
         } else {
             builder = builder.relay_mode(iroh::RelayMode::Disabled);
         }
 
-        let ep = builder.bind().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("iroh endpoint bind failed: {e}").into()
-        })?;
+        let ep = builder
+            .bind()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("iroh endpoint bind failed: {e}").into()
+            })?;
         tracing::info!(node_id = %ep.node_id(), "iroh tunnel endpoint ready");
         Some(ep)
     } else {
@@ -194,10 +185,11 @@ pub async fn run(
     #[cfg(unix)]
     let mut sigterm = {
         use tokio::signal::unix::{signal, SignalKind};
-        signal(SignalKind::terminate())
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        signal(SignalKind::terminate()).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("failed to register SIGTERM handler: {e}").into()
-            })?
+            },
+        )?
     };
 
     let shutdown = async {
@@ -561,7 +553,16 @@ pub async fn run(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
-                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, Some(&peer_table), &tunnel_senders).await;
+                dispatch_action(
+                    action,
+                    &session,
+                    &zenoh_tx,
+                    &udp,
+                    &broadcast_addr,
+                    Some(&peer_table),
+                    &tunnel_senders,
+                )
+                .await;
             }
         }
     }
@@ -649,7 +650,11 @@ async fn dispatch_action(
             tokio::spawn(async move {
                 let result = fetch_via_zenoh(&session, &key_expr).await;
                 let _ = tx
-                    .send(ZenohEvent::FetchResponse { cid, is_module: false, result })
+                    .send(ZenohEvent::FetchResponse {
+                        cid,
+                        is_module: false,
+                        result,
+                    })
                     .await;
             });
         }
@@ -666,7 +671,11 @@ async fn dispatch_action(
             tokio::spawn(async move {
                 let result = fetch_via_zenoh(&session, &key_expr).await;
                 let _ = tx
-                    .send(ZenohEvent::FetchResponse { cid, is_module: true, result })
+                    .send(ZenohEvent::FetchResponse {
+                        cid,
+                        is_module: true,
+                        result,
+                    })
                     .await;
             });
         }
@@ -688,9 +697,15 @@ async fn dispatch_action(
                                 .map(|p| p.to_bytes().to_vec())
                                 .unwrap_or_default();
                             let ev = if is_compute {
-                                ZenohEvent::ComputeQuery { key_expr: qkey, payload }
+                                ZenohEvent::ComputeQuery {
+                                    key_expr: qkey,
+                                    payload,
+                                }
                             } else {
-                                ZenohEvent::Query { key_expr: qkey, payload }
+                                ZenohEvent::Query {
+                                    key_expr: qkey,
+                                    payload,
+                                }
                             };
                             if tx.send(ev).await.is_err() {
                                 break;
@@ -714,7 +729,10 @@ async fn dispatch_action(
                             let skey = sample.key_expr().to_string();
                             let payload = sample.payload().to_bytes().to_vec();
                             if tx
-                                .send(ZenohEvent::Subscription { key_expr: skey, payload })
+                                .send(ZenohEvent::Subscription {
+                                    key_expr: skey,
+                                    payload,
+                                })
                                 .await
                                 .is_err()
                             {
@@ -736,10 +754,7 @@ async fn dispatch_action(
 /// The entire fetch (including all reply iterations) is bounded by a 30-second
 /// wall-clock deadline. This prevents spawned tasks from accumulating
 /// indefinitely — even if a peer sends repeated error replies.
-async fn fetch_via_zenoh(
-    session: &zenoh::Session,
-    key_expr: &str,
-) -> Result<Vec<u8>, String> {
+async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec<u8>, String> {
     let replies = session
         .get(key_expr)
         .await
@@ -761,5 +776,9 @@ async fn fetch_via_zenoh(
         Err(format!("no successful reply for '{key_expr}'"))
     })
     .await
-    .unwrap_or_else(|_| Err(format!("no successful reply for '{key_expr}' (timed out after 30s)")))
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "no successful reply for '{key_expr}' (timed out after 30s)"
+        ))
+    })
 }

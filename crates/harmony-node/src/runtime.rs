@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use harmony_compute::InstructionBudget;
-use harmony_content::book::BookStore;
 use harmony_content::bloom::BloomFilter;
+use harmony_content::book::BookStore;
 use harmony_content::cid::ContentId;
 use harmony_content::cuckoo::CuckooFilter;
 use harmony_content::storage_tier::{
@@ -726,8 +726,8 @@ impl<B: BookStore> NodeRuntime<B> {
                     // Snapshot the timer state BEFORE processing events — a
                     // threshold-triggered BroadcastFilter resets the counter,
                     // but should not suppress the timer if it was due to fire.
-                    let timer_due = self.ticks_since_filter_broadcast
-                        >= self.filter_broadcast_interval_ticks;
+                    let timer_due =
+                        self.ticks_since_filter_broadcast >= self.filter_broadcast_interval_ticks;
 
                     let limit = self.schedule.storage_max_per_tick.unwrap_or(usize::MAX);
                     let mut processed = 0;
