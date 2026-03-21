@@ -12,6 +12,11 @@ mod tunnel_task;
 
 use clap::{Parser, Subcommand};
 
+type LogReloadHandle = tracing_subscriber::reload::Handle<
+    tracing_subscriber::EnvFilter,
+    tracing_subscriber::Registry,
+>;
+
 #[derive(Parser)]
 #[command(name = "harmony", about = "Harmony decentralized network tools")]
 struct Cli {
@@ -109,27 +114,34 @@ enum IdentityAction {
 async fn main() {
     // Initialize structured logging. Output goes to stderr (procd captures
     // it for syslog on OpenWRT). Filter via RUST_LOG env var, default info.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|e| {
-                    // Only warn if RUST_LOG is set but malformed — missing is the normal case.
-                    if std::env::var("RUST_LOG").is_ok() {
-                        eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
-                    }
-                    tracing_subscriber::EnvFilter::new("info")
-                }),
+    // Uses reload::Handle so [logging].level from config file can reconfigure
+    // the filter after loading.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|e| {
+            // Only warn if RUST_LOG is set but malformed — missing is the normal case.
+            if std::env::var("RUST_LOG").is_ok() {
+                eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
+            }
+            tracing_subscriber::EnvFilter::new("info")
+        });
+    let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(std::io::stderr),
         )
-        .with_target(false)
-        .with_ansi(false)
-        .without_time()
-        .with_writer(std::io::stderr)
         .init();
     // Tip: use RUST_LOG=harmony_node=debug for harmony-only debug output.
     // Plain RUST_LOG=debug includes Zenoh's verbose internal traces.
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+    if let Err(e) = run(cli, reload_handle).await {
         // Use eprintln for the top-level error — tracing may not flush to
         // a piped stderr before process::exit, and integration tests check
         // this output for specific error messages.
@@ -154,7 +166,7 @@ fn decode_hex_key(
     Ok(bytes)
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Identity { action } => match action {
             IdentityAction::New => {
@@ -235,6 +247,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("config file not found: {}", config_path.display()).into());
             }
             let config_file = crate::config::load(&config_path).map_err(|e| format!("{e}"))?;
+
+            // Apply config file log level if RUST_LOG is not set.
+            if std::env::var("RUST_LOG").is_err() {
+                if let Some(ref logging) = config_file.logging {
+                    if let Some(ref level) = logging.level {
+                        match level.parse::<tracing_subscriber::EnvFilter>() {
+                            Ok(new_filter) => {
+                                let _ = reload_handle.reload(new_filter);
+                                tracing::debug!(level = %level, "applied log level from config file");
+                            }
+                            Err(e) => {
+                                tracing::warn!(level = %level, err = %e, "invalid log level in config file — keeping default");
+                            }
+                        }
+                    }
+                }
+            }
 
             // ── Merge CLI > file > defaults ─────────────────────────────
             use crate::config::{resolve, resolve_bool};
@@ -396,6 +425,13 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// Create a dummy `LogReloadHandle` for tests that call `run()`.
+    fn dummy_reload_handle() -> LogReloadHandle {
+        let filter = tracing_subscriber::EnvFilter::new("info");
+        let (_layer, handle) = tracing_subscriber::reload::Layer::new(filter);
+        handle
+    }
+
     #[test]
     fn cli_parses_run_command() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
@@ -468,7 +504,7 @@ mod tests {
     #[tokio::test]
     async fn cli_rejects_announce_without_persist() {
         let cli = Cli::try_parse_from(["harmony", "run", "--encrypted-durable-announce"]).unwrap();
-        let result = run(cli).await;
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -480,7 +516,7 @@ mod tests {
     #[tokio::test]
     async fn cli_rejects_zero_cache_capacity() {
         let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "0"]).unwrap();
-        let result = run(cli).await;
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -493,7 +529,7 @@ mod tests {
     async fn cli_rejects_oversized_cache_capacity() {
         // 200_000_001 exceeds MAX_CACHE_CAPACITY (200M).
         let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "200000001"]).unwrap();
-        let result = run(cli).await;
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("exceeds maximum"), "unexpected error: {msg}");
@@ -526,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn cli_rejects_filter_broadcast_ticks_below_two() {
         let cli = Cli::try_parse_from(["harmony", "run", "--filter-broadcast-ticks", "1"]).unwrap();
-        let result = run(cli).await;
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -565,7 +601,7 @@ mod tests {
     async fn cli_rejects_invalid_listen_address() {
         let cli =
             Cli::try_parse_from(["harmony", "run", "--listen-address", "not-an-addr"]).unwrap();
-        let result = run(cli).await;
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -618,7 +654,7 @@ mod tests {
     async fn cli_rejects_zero_mdns_stale_timeout() {
         let cli =
             Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "0"]).unwrap();
-        let result = run(cli).await;
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
