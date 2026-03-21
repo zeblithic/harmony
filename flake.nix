@@ -119,7 +119,7 @@
           # Tell cargo/cc which linker and C compiler to use for the target
           "CARGO_TARGET_${builtins.replaceStrings ["-"] ["_"] (pkgs.lib.toUpper cargoTarget)}_LINKER" =
             "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
-          CC_${builtins.replaceStrings ["-"] ["_"] cargoTarget} =
+          "CC_${builtins.replaceStrings ["-"] ["_"] cargoTarget}" =
             "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
 
           nativeBuildInputs = with crossPkgs; [
