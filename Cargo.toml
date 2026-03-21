@@ -83,6 +83,12 @@ wasmtime = "38"
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
 zenoh = "1"
 iroh = "0.91"
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = "0.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI and config
 serde = { version = "1", default-features = false }

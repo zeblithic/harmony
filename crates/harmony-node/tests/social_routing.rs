@@ -53,33 +53,37 @@ fn active_session_pair() -> (Session, Session) {
 
 // ── Test 1: Interest propagation through tunnel peers ─────────────
 
-/// Proves the full social routing cycle:
-/// 1. Alice (subscriber) declares interest in Bob's vine announces
-/// 2. Bob (publisher) receives the interest declaration
-/// 3. Bob publishes a vine — write-side filter allows it because Alice wants it
-/// 4. Without interest, the same publish is silently dropped
+/// Proves write-side interest filtering on the publisher side:
+/// 1. Without any remote interest, a publish is silently dropped.
+/// 2. Once a `SubscriberDeclared` event is received (Alice's interest
+///    propagated via the tunnel), the same publish emits `SendMessage`.
 ///
-/// This is how social content routing works: your Zenoh subscriptions
-/// flow to your tunnel peers, who serve matching content. The social
-/// graph topology (who you're peered with) determines who gets your
-/// publications.
+/// This is the publisher half of social content routing: the social
+/// graph topology (who you're peered with) determines who receives
+/// your publications. The subscriber side — Alice's router dispatching
+/// the inbound message to her local subscriber — is covered by
+/// harmony-zenoh's own unit tests.
 #[test]
-fn vine_interest_propagates_through_tunnel_peer() {
-    let (mut alice_session, _bob_session) = active_session_pair();
+fn vine_interest_filtering_on_publisher_side() {
+    let (_alice_session, mut bob_session) = active_session_pair();
     let mut bob_router = PubSubRouter::new();
 
     // Bob declares a publisher on his vine announce key expression.
-    // The key expression uses the actual Harmony namespace convention.
-    let (pub_id, _) = bob_router
+    // Uses bob_session (Bob is local, Alice is remote).
+    let (pub_id, pub_actions) = bob_router
         .declare_publisher(
             "harmony/vines/aa00bb11cc22dd33ee44ff5566778899/announce/post1".into(),
-            &mut alice_session,
+            &mut bob_session,
         )
         .unwrap();
+    assert!(
+        !pub_actions.is_empty(),
+        "declare_publisher should emit resource declaration actions"
+    );
 
     // Without interest: publish is silently dropped (write-side filtering)
     let actions = bob_router
-        .publish(pub_id, b"vine content".to_vec(), &alice_session)
+        .publish(pub_id, b"vine content".to_vec(), &bob_session)
         .unwrap();
     assert!(
         actions.is_empty(),
@@ -87,19 +91,19 @@ fn vine_interest_propagates_through_tunnel_peer() {
     );
 
     // Alice declares interest in Bob's vine announces (simulating
-    // the SubscriberDeclared event arriving from Alice's session)
+    // the SubscriberDeclared event arriving from Alice via the tunnel)
     bob_router
         .handle_event(
             PubSubEvent::SubscriberDeclared {
                 key_expr: "harmony/vines/aa00bb11cc22dd33ee44ff5566778899/announce/**".into(),
             },
-            &alice_session,
+            &bob_session,
         )
         .unwrap();
 
     // Now publish should emit SendMessage — Alice wants this content
     let actions = bob_router
-        .publish(pub_id, b"vine content".to_vec(), &alice_session)
+        .publish(pub_id, b"vine content".to_vec(), &bob_session)
         .unwrap();
     assert_eq!(actions.len(), 1);
     assert!(
@@ -174,7 +178,15 @@ fn bloom_filter_enables_social_content_discovery() {
         "storing content should announce it"
     );
 
-    // Trigger filter broadcast
+    // mutation_threshold=1 should trigger inline BroadcastFilter on first publish
+    assert!(
+        store_actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::BroadcastFilter { .. })),
+        "mutation_threshold=1 should trigger an inline BroadcastFilter on first publish"
+    );
+
+    // Timer tick also broadcasts (exercises the timer-based path separately)
     let tick_actions = tier.handle(StorageTierEvent::FilterTimerTick);
 
     // Find the BroadcastFilter action (Bloom filter for content availability)
@@ -183,17 +195,18 @@ fn bloom_filter_enables_social_content_discovery() {
         _ => None,
     });
 
-    if let Some(payload) = filter_payload {
-        // Alice receives and deserializes the Bloom filter
-        let filter =
-            harmony_content::bloom::BloomFilter::from_bytes(&payload).expect("valid Bloom filter");
+    let payload = filter_payload
+        .expect("FilterTimerTick should emit BroadcastFilter after mutation_threshold=1");
 
-        // Alice checks: does Bob likely have my CID?
-        assert!(
-            filter.may_contain(&cid),
-            "Bloom filter should indicate Bob likely has the CID"
-        );
-    }
+    // Alice receives and deserializes the Bloom filter
+    let filter =
+        harmony_content::bloom::BloomFilter::from_bytes(&payload).expect("valid Bloom filter");
+
+    // Alice checks: does Bob likely have my CID?
+    assert!(
+        filter.may_contain(&cid),
+        "Bloom filter should indicate Bob likely has the CID"
+    );
 
     // Alice queries Bob for the content — should get a reply
     let query_actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });

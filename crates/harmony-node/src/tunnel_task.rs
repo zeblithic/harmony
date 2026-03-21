@@ -264,6 +264,8 @@ async fn run_tunnel_loop(
     connection_id: u64,
 ) {
     // Wrap the recv stream in a length-delimited codec for cancel-safe reads.
+    // max_frame_length is checked against the decoded length value (payload size),
+    // not the total frame size including header — verified in tokio-util source.
     let codec = LengthDelimitedCodec::builder()
         .length_field_length(4)
         .big_endian()
@@ -338,7 +340,7 @@ async fn run_tunnel_loop(
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[{interface_name}] send reticulum error: {e}");
+                                tracing::warn!(%interface_name, err = %e, "send reticulum error");
                             }
                         }
                     }
@@ -353,21 +355,26 @@ async fn run_tunnel_loop(
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[{interface_name}] send zenoh error: {e}");
+                                tracing::warn!(%interface_name, err = %e, "send zenoh error");
                             }
                         }
                     }
                     Some(TunnelCommand::Close) | None => {
+                        let mut dispatch_sent_close = false;
                         if let Ok(close_actions) = session.handle_event(TunnelEvent::Close) {
-                            let _ = dispatch_tunnel_actions(
+                            // dispatch returns false when a Closed/Error action was
+                            // dispatched (already sent TunnelClosed to bridge_tx).
+                            dispatch_sent_close = !dispatch_tunnel_actions(
                                 &close_actions, &mut send_stream, &bridge_tx, &interface_name, connection_id,
                             ).await;
                         }
-                        let _ = bridge_tx.send(TunnelBridgeEvent::TunnelClosed {
-                            interface_name: interface_name.clone(),
-                            reason: "closed by event loop".to_string(),
-                            connection_id,
-                        }).await;
+                        if !dispatch_sent_close {
+                            let _ = bridge_tx.send(TunnelBridgeEvent::TunnelClosed {
+                                interface_name: interface_name.clone(),
+                                reason: "closed by event loop".to_string(),
+                                connection_id,
+                            }).await;
+                        }
                         break;
                     }
                 }
@@ -402,6 +409,10 @@ async fn run_tunnel_loop(
 ///
 /// Returns `false` if the tunnel should be closed (Error or Closed action
 /// received), `true` to continue.
+///
+/// Two-pass dispatch: OutboundBytes are written first (ensuring e.g. TunnelAccept
+/// is on the wire before HandshakeComplete registers the interface), then
+/// bridge events (HandshakeComplete, ReticulumReceived, etc.) are forwarded.
 async fn dispatch_tunnel_actions(
     actions: &[TunnelAction],
     send_stream: &mut SendStream,
@@ -409,6 +420,7 @@ async fn dispatch_tunnel_actions(
     interface_name: &str,
     connection_id: u64,
 ) -> bool {
+    // Pass 1: write all outbound bytes and check for terminal actions.
     for action in actions {
         match action {
             TunnelAction::OutboundBytes { data } => {
@@ -422,35 +434,6 @@ async fn dispatch_tunnel_actions(
                         .await;
                     return false;
                 }
-            }
-            TunnelAction::ReticulumReceived { packet } => {
-                let _ = bridge_tx
-                    .send(TunnelBridgeEvent::ReticulumReceived {
-                        interface_name: interface_name.to_string(),
-                        packet: packet.clone(),
-                    })
-                    .await;
-            }
-            TunnelAction::ZenohReceived { message } => {
-                let _ = bridge_tx
-                    .send(TunnelBridgeEvent::ZenohReceived {
-                        interface_name: interface_name.to_string(),
-                        message: message.clone(),
-                    })
-                    .await;
-            }
-            TunnelAction::HandshakeComplete {
-                peer_dsa_pubkey,
-                peer_node_id,
-            } => {
-                let _ = bridge_tx
-                    .send(TunnelBridgeEvent::HandshakeComplete {
-                        interface_name: interface_name.to_string(),
-                        peer_node_id: *peer_node_id,
-                        peer_dsa_pubkey: peer_dsa_pubkey.clone(),
-                        connection_id,
-                    })
-                    .await;
             }
             TunnelAction::Error { reason } => {
                 let _ = bridge_tx
@@ -472,6 +455,44 @@ async fn dispatch_tunnel_actions(
                     .await;
                 return false;
             }
+            _ => {} // handled in pass 2
+        }
+    }
+
+    // Pass 2: forward bridge events (only after outbound bytes are written).
+    for action in actions {
+        match action {
+            TunnelAction::HandshakeComplete {
+                peer_dsa_pubkey,
+                peer_node_id,
+            } => {
+                let _ = bridge_tx
+                    .send(TunnelBridgeEvent::HandshakeComplete {
+                        interface_name: interface_name.to_string(),
+                        peer_node_id: *peer_node_id,
+                        peer_dsa_pubkey: peer_dsa_pubkey.clone(),
+                        connection_id,
+                    })
+                    .await;
+            }
+            TunnelAction::ReticulumReceived { packet } => {
+                let _ = bridge_tx
+                    .send(TunnelBridgeEvent::ReticulumReceived {
+                        interface_name: interface_name.to_string(),
+                        packet: packet.clone(),
+                    })
+                    .await;
+            }
+            TunnelAction::ZenohReceived { message } => {
+                let _ = bridge_tx
+                    .send(TunnelBridgeEvent::ZenohReceived {
+                        interface_name: interface_name.to_string(),
+                        message: message.clone(),
+                    })
+                    .await;
+            }
+            // OutboundBytes, Error, Closed handled in pass 1
+            _ => {}
         }
     }
     true

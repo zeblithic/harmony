@@ -96,8 +96,32 @@ enum IdentityAction {
 // is ever added to the tokio feature set.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Initialize structured logging. Output goes to stderr (procd captures
+    // it for syslog on OpenWRT). Filter via RUST_LOG env var, default info.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|e| {
+                    // Only warn if RUST_LOG is set but malformed — missing is the normal case.
+                    if std::env::var("RUST_LOG").is_ok() {
+                        eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
+                    }
+                    tracing_subscriber::EnvFilter::new("info")
+                }),
+        )
+        .with_target(false)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(std::io::stderr)
+        .init();
+    // Tip: use RUST_LOG=harmony_node=debug for harmony-only debug output.
+    // Plain RUST_LOG=debug includes Zenoh's verbose internal traces.
+
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {
+        // Use eprintln for the top-level error — tracing may not flush to
+        // a piped stderr before process::exit, and integration tests check
+        // this output for specific error messages.
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
@@ -165,7 +189,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Ok(())
                     }
                     Err(_) => {
-                        eprintln!("Invalid");
+                        eprintln!("Error: invalid signature");
                         std::process::exit(1);
                     }
                 }
@@ -230,7 +254,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let id_path = crate::identity_file::resolve_path(identity_file.as_deref())?;
             let identity = crate::identity_file::load_or_generate(&id_path)?;
             let node_addr = hex::encode(identity.ed25519.public_identity().address_hash);
-            eprintln!("Identity: {node_addr} ({})", id_path.display());
+            tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
 
             // Destructure to control per-field drop timing.
             let crate::identity_file::NodeIdentity { pq, ed25519 } = identity;
@@ -240,7 +264,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // references and PqPrivateIdentity is not Clone.
             let tunnel_config = if relay_url.is_some() || tunnel_peer.is_some() {
                 if tunnel_peer.is_some() {
-                    eprintln!("  --tunnel-peer: outbound connections not yet wired (needs contact store, Bead #3)");
+                    tracing::warn!("--tunnel-peer: outbound connections not yet wired (needs contact store, Bead #3)");
                 }
                 Some(crate::event_loop::TunnelConfig {
                     relay_url,
@@ -279,9 +303,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 
-            eprintln!("Harmony node starting...");
-            eprintln!("  Cache capacity:   {cache_capacity} items");
-            eprintln!("  Compute budget:   {compute_budget} fuel/tick");
+            tracing::info!(cache_capacity, compute_budget, %listen_addr, "harmony node starting");
 
             crate::event_loop::run(rt, startup_actions, listen_addr, tunnel_config).await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;

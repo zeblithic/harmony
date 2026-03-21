@@ -7,6 +7,7 @@ pub mod identity;
 pub mod identity_ref;
 pub mod pq_identity;
 pub mod ucan;
+pub mod verify;
 
 pub use crypto_suite::CryptoSuite;
 pub use error::IdentityError;
@@ -17,5 +18,6 @@ pub use ucan::{
     verify_revocation, verify_token, CapabilityType, IdentityResolver, PqUcanToken, ProofResolver,
     Revocation, RevocationSet, UcanError, UcanToken,
 };
+pub use verify::verify_signature;
 #[cfg(any(test, feature = "test-utils"))]
 pub use ucan::{MemoryIdentityStore, MemoryProofStore, MemoryRevocationSet};

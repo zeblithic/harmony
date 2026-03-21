@@ -1799,7 +1799,6 @@ dependencies = [
 name = "harmony-credential"
 version = "0.1.0"
 dependencies = [
- "ed25519-dalek",
  "harmony-crypto",
  "harmony-identity",
  "hashbrown 0.15.5",
@@ -1838,7 +1837,6 @@ dependencies = [
 name = "harmony-discovery"
 version = "0.1.0"
 dependencies = [
- "ed25519-dalek",
  "harmony-crypto",
  "harmony-identity",
  "hashbrown 0.15.5",
@@ -1934,6 +1932,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "zenoh",
  "zeroize",
 ]
@@ -1970,7 +1970,6 @@ dependencies = [
 name = "harmony-profile"
 version = "0.1.0"
 dependencies = [
- "ed25519-dalek",
  "harmony-crypto",
  "harmony-identity",
  "hashbrown 0.15.5",
@@ -2776,7 +2775,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

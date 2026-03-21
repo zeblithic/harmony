@@ -30,8 +30,10 @@ clap = { version = "4", features = ["derive"] }
 hex.workspace = true
 rand.workspace = true
 tokio.workspace = true
-tokio-util = { version = "0.7", features = ["codec"] }
-futures-util = "0.3"
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 zenoh.workspace = true
 zeroize = { workspace = true, features = ["std"] }
 

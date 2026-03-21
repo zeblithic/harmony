@@ -121,7 +121,7 @@ pub async fn run(
         let ep = builder.bind().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("iroh endpoint bind failed: {e}").into()
         })?;
-        eprintln!("  iroh NodeId:      {}", ep.node_id());
+        tracing::info!(node_id = %ep.node_id(), "iroh tunnel endpoint ready");
         Some(ep)
     } else {
         None
@@ -174,18 +174,18 @@ pub async fn run(
             tokio::select! {
                 // Some(_) pattern: if recv() returns None (stream exhausted),
                 // the arm is disabled rather than triggering a spurious shutdown.
-                Some(_) = sigterm.recv() => eprintln!("[event_loop] SIGTERM received — shutting down"),
+                Some(_) = sigterm.recv() => tracing::info!("SIGTERM received — shutting down"),
                 result = tokio::signal::ctrl_c() => match result {
-                    Ok(()) => eprintln!("[event_loop] Ctrl+C received — shutting down"),
-                    Err(e) => eprintln!("[event_loop] SIGINT handler failed: {e} — shutting down"),
+                    Ok(()) => tracing::info!("Ctrl+C received — shutting down"),
+                    Err(e) => tracing::warn!(err = %e, "SIGINT handler failed — shutting down"),
                 },
             }
         }
         #[cfg(not(unix))]
         {
             match tokio::signal::ctrl_c().await {
-                Ok(()) => eprintln!("[event_loop] Ctrl+C received — shutting down"),
-                Err(e) => eprintln!("[event_loop] SIGINT handler failed: {e} — shutting down"),
+                Ok(()) => tracing::info!("Ctrl+C received — shutting down"),
+                Err(e) => tracing::warn!(err = %e, "SIGINT handler failed — shutting down"),
             }
         }
     };
@@ -213,7 +213,7 @@ pub async fn run(
                         });
                     }
                     Err(e) => {
-                        eprintln!("[event_loop] UDP recv error: {e}");
+                        tracing::warn!(err = %e, "UDP recv error");
                         use std::io::ErrorKind::*;
                         match e.kind() {
                             WouldBlock | Interrupted => {}
@@ -235,7 +235,7 @@ pub async fn run(
             maybe = zenoh_rx.recv() => {
                 match maybe {
                     None => {
-                        eprintln!("[event_loop] Zenoh channel closed — exiting");
+                        tracing::warn!("zenoh channel closed — exiting");
                         break;
                     }
                     Some(ev) => match ev {
@@ -267,7 +267,7 @@ pub async fn run(
             maybe = tunnel_rx.recv() => {
                 let event = match maybe {
                     None => {
-                        eprintln!("[event_loop] tunnel bridge channel closed");
+                        tracing::warn!("tunnel bridge channel closed");
                         break;
                     }
                     Some(e) => e,
@@ -312,7 +312,7 @@ pub async fn run(
                         reason,
                         connection_id,
                     } => {
-                        eprintln!("[{interface_name}] tunnel closed: {reason}");
+                        tracing::info!(%interface_name, %reason, "tunnel closed");
                         // Only remove the sender AND unregister the router interface
                         // if the connection_id matches. A stale close from a previous
                         // connection must not tear down a reconnected peer's interface.
@@ -345,7 +345,7 @@ pub async fn run(
                 if incoming.is_none() {
                     // ep.accept() returned None — endpoint is closed.
                     // Disable this arm to prevent busy-spinning.
-                    eprintln!("[event_loop] iroh endpoint closed — disabling tunnel accept");
+                    tracing::warn!("iroh endpoint closed — disabling tunnel accept");
                     iroh_endpoint = None;
                 }
                 if let Some(incoming) = incoming {
@@ -353,7 +353,7 @@ pub async fn run(
                     // Include inflight handshakes so a burst of simultaneous
                     // connects cannot all pass before any completes.
                     if tunnel_senders.len() + inflight_handshakes >= MAX_TUNNEL_CONNECTIONS {
-                        eprintln!("[event_loop] tunnel connection limit ({MAX_TUNNEL_CONNECTIONS}) reached — rejecting");
+                        tracing::warn!(limit = MAX_TUNNEL_CONNECTIONS, "tunnel connection limit reached — rejecting");
                         drop(incoming); // sends QUIC RESET
                     } else {
                         let conn_id = next_connection_id;
@@ -369,7 +369,7 @@ pub async fn run(
                                             let iface = match connection.remote_node_id() {
                                                 Ok(id) => format!(
                                                     "tunnel-{}",
-                                                    hex::encode(&id.as_bytes()[..4])
+                                                    hex::encode(&id.as_bytes()[..8])
                                                 ),
                                                 Err(_) => format!(
                                                     "tunnel-{:08x}",
@@ -383,7 +383,7 @@ pub async fn run(
                                             })).await;
                                         }
                                         Err(e) => {
-                                            eprintln!("[event_loop] QUIC handshake failed: {e}");
+                                            tracing::warn!(err = %e, "QUIC handshake failed");
                                             // Signal failure so the event loop can decrement
                                             // inflight_handshakes even though no connection arrived.
                                             let _ = conn_tx.send(None).await;
@@ -392,7 +392,7 @@ pub async fn run(
                                 });
                             }
                             Err(e) => {
-                                eprintln!("[event_loop] iroh accept error: {e}");
+                                tracing::warn!(err = %e, "iroh accept error");
                                 // accept() failed synchronously — no task was spawned, so
                                 // decrement the counter we just incremented.
                                 inflight_handshakes = inflight_handshakes.saturating_sub(1);
@@ -423,7 +423,7 @@ pub async fn run(
                             )
                             .await;
                         });
-                        eprintln!("[{interface_name}] accepted incoming tunnel");
+                        tracing::info!(%interface_name, "accepted incoming tunnel");
                     }
                     Some(None) => {
                         // Handshake failed — decrement the inflight counter so future
@@ -432,7 +432,7 @@ pub async fn run(
                     }
                     None => {
                         // Channel closed — should not happen while the loop is live.
-                        eprintln!("[event_loop] ready-connection channel closed");
+                        tracing::warn!("ready-connection channel closed");
                         break;
                     }
                 }
@@ -461,7 +461,7 @@ pub async fn run(
 
     // ── Graceful iroh shutdown ────────────────────────────────────────────
     if let Some(ref ep) = iroh_endpoint {
-        eprintln!("[event_loop] closing iroh endpoint...");
+        tracing::info!("closing iroh endpoint");
         ep.close().await;
     }
 
@@ -479,6 +479,10 @@ async fn dispatch_action(
 ) {
     match action {
         // ── Tier 1: Send on interface (UDP broadcast or tunnel) ──────────────
+        // Awaited inline (not spawned) because tokio::net::UdpSocket is not
+        // Clone. For Reticulum's small MTU (≤1024 bytes), send_to is
+        // effectively non-blocking on a UDP socket with default buffer sizes.
+        // Tunnel interfaces route through TunnelSender (non-blocking try_send).
         RuntimeAction::SendOnInterface {
             ref interface_name,
             ref raw,
@@ -486,11 +490,11 @@ async fn dispatch_action(
             if interface_name.starts_with("tunnel-") {
                 if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {
                     if sender.try_send_reticulum(raw.clone()).is_err() {
-                        eprintln!("[{interface_name}] tunnel send queue full — dropping packet");
+                        tracing::warn!(%interface_name, "tunnel send queue full — dropping packet");
                     }
                 }
             } else if let Err(e) = udp.send_to(raw, broadcast_addr).await {
-                eprintln!("[event_loop] UDP send error: {e}");
+                tracing::warn!(err = %e, "UDP send error");
             }
         }
 
@@ -499,7 +503,7 @@ async fn dispatch_action(
             let session = session.clone();
             tokio::spawn(async move {
                 if let Err(e) = session.put(&key_expr, payload).await {
-                    eprintln!("[event_loop] Zenoh put error on '{key_expr}': {e}");
+                    tracing::warn!(%key_expr, err = %e, "zenoh put error");
                 }
             });
         }
@@ -509,7 +513,7 @@ async fn dispatch_action(
         // restructuring (the query handle must stay alive on the spawned task).
         // Deferred to a follow-up bead.
         RuntimeAction::SendReply { query_id, .. } => {
-            eprintln!("[event_loop] SendReply query_id={query_id}: reply passthrough not yet implemented");
+            tracing::debug!(query_id, "SendReply not yet implemented");
         }
 
         // ── Tier 3: Fetch content via Zenoh get() ─────────────────────────────
@@ -571,7 +575,7 @@ async fn dispatch_action(
                     });
                 }
                 Err(e) => {
-                    eprintln!("[event_loop] declare_queryable '{key_expr}' failed: {e}");
+                    tracing::error!(%key_expr, err = %e, "declare_queryable failed");
                 }
             }
         }
@@ -596,7 +600,7 @@ async fn dispatch_action(
                     });
                 }
                 Err(e) => {
-                    eprintln!("[event_loop] declare_subscriber '{key_expr}' failed: {e}");
+                    tracing::error!(%key_expr, err = %e, "declare_subscriber failed");
                 }
             }
         }
@@ -626,7 +630,7 @@ async fn fetch_via_zenoh(
                 }
                 Err(err) => {
                     let msg = String::from_utf8_lossy(&err.payload().to_bytes()).into_owned();
-                    eprintln!("[event_loop] get reply error: {msg}");
+                    tracing::warn!(%key_expr, err = %msg, "zenoh get reply error");
                 }
             }
         }

@@ -621,9 +621,10 @@ impl<B: BlobStore> NodeRuntime<B> {
                 interface_name,
                 peer_node_id,
             } => {
-                eprintln!(
-                    "[{interface_name}] tunnel handshake complete, peer={}",
-                    hex::encode(&peer_node_id[..4])
+                tracing::info!(
+                    %interface_name,
+                    peer = %hex::encode(&peer_node_id[..4]),
+                    "tunnel handshake complete"
                 );
                 self.router.register_interface(
                     interface_name,
@@ -643,7 +644,7 @@ impl<B: BlobStore> NodeRuntime<B> {
                 });
             }
             RuntimeEvent::TunnelClosed { interface_name } => {
-                eprintln!("[{interface_name}] tunnel closed");
+                tracing::info!(%interface_name, "tunnel closed — interface unregistered");
                 self.router.unregister_interface(&interface_name);
             }
         }
