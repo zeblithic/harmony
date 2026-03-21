@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use harmony_content::blob::MemoryBlobStore;
+use harmony_content::book::MemoryBookStore;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -45,7 +45,7 @@ enum ZenohEvent {
 /// - `startup_actions`: actions returned by `NodeRuntime::new`, executed before the loop.
 /// - `listen_addr`: UDP socket address to bind (broadcast also sent here).
 pub async fn run(
-    mut runtime: NodeRuntime<MemoryBlobStore>,
+    mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
     listen_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

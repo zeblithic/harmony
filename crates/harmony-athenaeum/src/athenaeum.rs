@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-//! Book — a single CID blob stored as fixed-size 4KB pages.
+//! Book — a single CID book stored as fixed-size 4KB pages.
 //!
 //! Each page has all 4 algorithm variants precomputed, enabling
 //! collision-free routing without runtime rehashing.
@@ -42,31 +42,31 @@ pub enum BookError {
     TooShort,
 }
 
-/// A Book maps a single CID blob into up to 256 fixed-size 4KB pages.
+/// A Book maps a single CID book into up to 256 fixed-size 4KB pages.
 ///
 /// Every page has all 4 algorithm variants precomputed, stored as
 /// `[PageAddr; ALGO_COUNT]` in Algorithm selector order:
 /// `[Sha256Msb, Sha256Lsb, Sha224Msb, Sha224Lsb]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Book {
-    /// 256-bit blob identifier (content ID).
+    /// 256-bit book identifier (content ID).
     pub cid: [u8; 32],
     /// Page addresses — up to 256 entries, each with all 4 algorithm variants.
     pub pages: Vec<[PageAddr; ALGO_COUNT]>,
-    /// Actual byte count of the original blob (at most 1MB).
-    pub blob_size: u32,
+    /// Actual byte count of the original book (at most 1MB).
+    pub book_size: u32,
     /// How this book's pages are structured.
     pub book_type: BookType,
 }
 
 impl Book {
-    /// Build a Book by splitting a blob into 4KB pages and computing all
+    /// Build a Book by splitting a book into 4KB pages and computing all
     /// algorithm variants for each page.
     ///
     /// - Empty data produces a Book with 0 pages.
     /// - The last page is zero-padded to a full 4KB before hashing.
-    /// - `page_count = ceil(blob_size / PAGE_SIZE)`.
-    pub fn from_blob(cid: [u8; 32], data: &[u8]) -> Result<Self, BookError> {
+    /// - `page_count = ceil(book_size / PAGE_SIZE)`.
+    pub fn from_book(cid: [u8; 32], data: &[u8]) -> Result<Self, BookError> {
         if data.len() > BOOK_MAX_SIZE {
             return Err(BookError::BlobTooLarge { size: data.len() });
         }
@@ -75,7 +75,7 @@ impl Book {
             return Ok(Book {
                 cid,
                 pages: Vec::new(),
-                blob_size: 0,
+                book_size: 0,
                 book_type: BookType::Raw,
             });
         }
@@ -110,7 +110,7 @@ impl Book {
         Ok(Book {
             cid,
             pages,
-            blob_size: data.len() as u32,
+            book_size: data.len() as u32,
             book_type: BookType::Raw,
         })
     }
@@ -197,19 +197,19 @@ impl Book {
         buf
     }
 
-    /// Split the original blob into page-sized buffers (4KB each).
+    /// Split the original book into page-sized buffers (4KB each).
     ///
     /// For self-indexing books, the ToC page is prepended at index 0.
     /// The last data page is zero-padded to a full 4KB.
-    pub fn page_data_from_blob(&self, data: &[u8]) -> Vec<Vec<u8>> {
+    pub fn page_data_from_book(&self, data: &[u8]) -> Vec<Vec<u8>> {
         debug_assert!(
             !self.is_encrypted(),
-            "page_data_from_blob called on encrypted book — use page_data_from_blob_encrypted"
+            "page_data_from_book called on encrypted book — use page_data_from_book_encrypted"
         );
         debug_assert_eq!(
             data.len(),
-            self.blob_size as usize,
-            "data length does not match blob_size"
+            self.book_size as usize,
+            "data length does not match book_size"
         );
         let mut pages = Vec::new();
         if self.is_self_indexing() {
@@ -231,7 +231,7 @@ impl Book {
     ///
     /// - Maximum data: 255 pages (1,044,480 bytes).
     /// - Empty data produces a Book with 1 page (just the ToC).
-    pub fn from_blob_self_indexing(cid: [u8; 32], data: &[u8]) -> Result<Self, BookError> {
+    pub fn from_book_self_indexing(cid: [u8; 32], data: &[u8]) -> Result<Self, BookError> {
         if data.len() > SELF_INDEXING_MAX_DATA_SIZE {
             return Err(BookError::BlobTooLarge { size: data.len() });
         }
@@ -297,29 +297,29 @@ impl Book {
         Ok(Book {
             cid,
             pages,
-            blob_size: data.len() as u32,
+            book_size: data.len() as u32,
             book_type: BookType::SelfIndexing,
         })
     }
 
-    /// Detect whether a blob starts with a self-indexing ToC.
+    /// Detect whether a book starts with a self-indexing ToC.
     ///
     /// Validates all 4 sentinel values at offsets 0, 1024, 2048, 3072
     /// (the first entry of each algorithm section). A raw book matching
     /// all 4 sentinels by coincidence requires 128 bits of collision.
     ///
     /// Returns `false` for blobs smaller than a full page (4096 bytes).
-    pub fn is_self_indexing_blob(blob: &[u8]) -> bool {
-        if blob.len() < PAGE_SIZE {
+    pub fn is_self_indexing_book(book: &[u8]) -> bool {
+        if book.len() < PAGE_SIZE {
             return false;
         }
         for (algo_idx, &sentinel) in crate::addr::SELF_INDEX_SENTINELS.iter().enumerate() {
             let offset = algo_idx * PAGES_PER_BOOK * 4;
             let val = u32::from_le_bytes([
-                blob[offset],
-                blob[offset + 1],
-                blob[offset + 2],
-                blob[offset + 3],
+                book[offset],
+                book[offset + 1],
+                book[offset + 2],
+                book[offset + 3],
             ]);
             if val != sentinel {
                 return false;
@@ -328,15 +328,15 @@ impl Book {
         true
     }
 
-    /// Reassemble the original blob by fetching pages by index.
+    /// Reassemble the original book by fetching pages by index.
     ///
     /// For self-indexing books, page 0 (ToC) is skipped — only data pages
     /// (1..page_count) are fetched. For raw books, all pages are fetched.
     /// For encrypted books, metadata pages are skipped.
     ///
-    /// Pages are concatenated and truncated to `blob_size`.
+    /// Pages are concatenated and truncated to `book_size`.
     pub fn reassemble(&self, fetch: impl Fn(u8) -> Option<Vec<u8>>) -> Result<Vec<u8>, BookError> {
-        let mut result = Vec::with_capacity(self.blob_size as usize);
+        let mut result = Vec::with_capacity(self.book_size as usize);
 
         let start = self.overhead_pages();
         for i in start..self.pages.len() {
@@ -349,16 +349,16 @@ impl Book {
             result.extend_from_slice(&page_data);
         }
 
-        result.truncate(self.blob_size as usize);
+        result.truncate(self.book_size as usize);
         Ok(result)
     }
 
     /// Build an encrypted Book with metadata pages followed by data pages.
     ///
     /// The metadata is serialized into sentinel-prefixed pages that occupy
-    /// the first N page slots. Data pages follow. The `blob_size` records
+    /// the first N page slots. Data pages follow. The `book_size` records
     /// only the data portion — metadata is structural overhead.
-    pub fn from_blob_encrypted(
+    pub fn from_book_encrypted(
         cid: [u8; 32],
         data: &[u8],
         metadata: &EncryptedBookMetadata,
@@ -416,7 +416,7 @@ impl Book {
         Ok(Book {
             cid,
             pages,
-            blob_size: data.len() as u32,
+            book_size: data.len() as u32,
             book_type: BookType::Encrypted {
                 metadata_pages: metadata.pages_needed(),
             },
@@ -427,11 +427,11 @@ impl Book {
     ///
     /// This checks the first 4 bytes for the `11` sentinel value, which marks
     /// encrypted book metadata pages.
-    pub fn is_encrypted_blob(blob: &[u8]) -> bool {
-        if blob.len() < 4 {
+    pub fn is_encrypted_book(book: &[u8]) -> bool {
+        if book.len() < 4 {
             return false;
         }
-        let first = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+        let first = u32::from_le_bytes([book[0], book[1], book[2], book[3]]);
         first == ENCRYPTED_SENTINEL
     }
 
@@ -446,20 +446,20 @@ impl Book {
     /// Generate all page data for an encrypted book (metadata + data pages).
     ///
     /// Metadata pages are serialized from the provided metadata, and data
-    /// pages are split from the data blob with zero-padding on the last page.
-    pub fn page_data_from_blob_encrypted(
+    /// pages are split from the data book with zero-padding on the last page.
+    pub fn page_data_from_book_encrypted(
         &self,
         data: &[u8],
         metadata: &EncryptedBookMetadata,
     ) -> Vec<Vec<u8>> {
         debug_assert!(
             self.is_encrypted(),
-            "page_data_from_blob_encrypted called on non-encrypted book"
+            "page_data_from_book_encrypted called on non-encrypted book"
         );
         debug_assert_eq!(
             data.len(),
-            self.blob_size as usize,
-            "data length does not match blob_size"
+            self.book_size as usize,
+            "data length does not match book_size"
         );
 
         let mut pages = Vec::new();
@@ -494,42 +494,42 @@ mod tests {
     }
 
     #[test]
-    fn from_blob_single_page() {
+    fn from_book_single_page() {
         let data = vec![0xABu8; 100];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         assert_eq!(book.page_count(), 1);
-        assert_eq!(book.blob_size, 100);
+        assert_eq!(book.book_size, 100);
     }
 
     #[test]
-    fn from_blob_full_page() {
+    fn from_book_full_page() {
         let data = vec![0xCDu8; PAGE_SIZE];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         assert_eq!(book.page_count(), 1);
-        assert_eq!(book.blob_size, PAGE_SIZE as u32);
+        assert_eq!(book.book_size, PAGE_SIZE as u32);
     }
 
     #[test]
-    fn from_blob_multiple_pages() {
+    fn from_book_multiple_pages() {
         // 3 full pages + 1 partial = 4 pages
         let data = vec![0xEFu8; PAGE_SIZE * 3 + 100];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         assert_eq!(book.page_count(), 4);
-        assert_eq!(book.blob_size, (PAGE_SIZE * 3 + 100) as u32);
+        assert_eq!(book.book_size, (PAGE_SIZE * 3 + 100) as u32);
     }
 
     #[test]
-    fn from_blob_max_size() {
+    fn from_book_max_size() {
         let data = vec![0u8; BOOK_MAX_SIZE];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         assert_eq!(book.page_count(), PAGES_PER_BOOK);
-        assert_eq!(book.blob_size, BOOK_MAX_SIZE as u32);
+        assert_eq!(book.book_size, BOOK_MAX_SIZE as u32);
     }
 
     #[test]
-    fn from_blob_too_large() {
+    fn from_book_too_large() {
         let data = vec![0u8; BOOK_MAX_SIZE + 1];
-        let err = Book::from_blob(test_cid(), &data).unwrap_err();
+        let err = Book::from_book(test_cid(), &data).unwrap_err();
         assert_eq!(
             err,
             BookError::BlobTooLarge {
@@ -539,17 +539,17 @@ mod tests {
     }
 
     #[test]
-    fn from_blob_empty() {
-        let book = Book::from_blob(test_cid(), &[]).unwrap();
+    fn from_book_empty() {
+        let book = Book::from_book(test_cid(), &[]).unwrap();
         assert_eq!(book.page_count(), 0);
-        assert_eq!(book.blob_size, 0);
+        assert_eq!(book.book_size, 0);
     }
 
     #[test]
-    fn from_blob_cid_preserved() {
+    fn from_book_cid_preserved() {
         let cid = test_cid();
         let data = vec![1u8; 4096];
-        let book = Book::from_blob(cid, &data).unwrap();
+        let book = Book::from_book(cid, &data).unwrap();
         assert_eq!(book.cid, cid);
     }
 
@@ -557,7 +557,7 @@ mod tests {
     fn last_page_zero_padded_produces_valid_addr() {
         // 100 bytes of data → 1 page, zero-padded to 4KB
         let data = vec![0x42u8; 100];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         assert_eq!(book.page_count(), 1);
 
         // All 4 variants should have valid checksums
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn all_four_variants_precomputed() {
         let data = vec![0xFFu8; PAGE_SIZE];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
 
         // Verify the order matches Algorithm::ALL
         let expected_algos = [
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn toc_is_4kb() {
         let data = vec![0u8; PAGE_SIZE * 3];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         let toc = book.toc();
         assert_eq!(toc.len(), PAGE_SIZE);
     }
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn toc_layout_sections() {
         let data = vec![0xAAu8; PAGE_SIZE * 2];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         let toc = book.toc();
 
         // Check section offsets and values for existing pages
@@ -673,8 +673,8 @@ mod tests {
             let pos = i as u32;
             *b = (pos ^ (pos >> 8) ^ (pos >> 16)) as u8;
         }
-        let book = Book::from_blob(test_cid(), &data).unwrap();
-        let page_bufs = book.page_data_from_blob(&data);
+        let book = Book::from_book(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_book(&data);
 
         let reassembled = book
             .reassemble(|idx| page_bufs.get(idx as usize).cloned())
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn reassemble_missing_page_fails() {
         let data = vec![1u8; PAGE_SIZE * 2];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         let result = book.reassemble(|_idx| None);
         assert!(result.is_err());
         assert_eq!(
@@ -697,15 +697,15 @@ mod tests {
     }
 
     #[test]
-    fn blob_size_preserved() {
+    fn book_size_preserved() {
         let data = vec![0xFFu8; 5000];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
-        assert_eq!(book.blob_size, 5000);
+        let book = Book::from_book(test_cid(), &data).unwrap();
+        assert_eq!(book.book_size, 5000);
     }
 
     #[test]
     fn toc_empty_book() {
-        let book = Book::from_blob(test_cid(), &[]).unwrap();
+        let book = Book::from_book(test_cid(), &[]).unwrap();
         let toc = book.toc();
         assert_eq!(toc.len(), PAGE_SIZE);
         // All entries should be NULL_PAGE
@@ -724,14 +724,14 @@ mod tests {
     #[test]
     fn raw_book_is_not_self_indexing() {
         let data = vec![0xABu8; 100];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         assert!(!book.is_self_indexing());
     }
 
     #[test]
     fn raw_book_data_page_count_equals_page_count() {
         let data = vec![0xABu8; PAGE_SIZE * 3];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         assert_eq!(book.data_page_count(), 3);
         assert_eq!(book.data_page_count(), book.page_count());
     }
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn raw_book_data_pages_returns_all() {
         let data = vec![0xABu8; PAGE_SIZE * 2];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         let dp = book.data_pages();
         assert_eq!(dp.len(), 2);
         assert_eq!(dp[0], book.pages[0]);
@@ -749,15 +749,15 @@ mod tests {
     #[test]
     fn raw_book_toc_page_returns_none() {
         let data = vec![0xABu8; 100];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         assert!(book.toc_page().is_none());
     }
 
     #[test]
-    fn page_data_from_blob_zero_pads() {
+    fn page_data_from_book_zero_pads() {
         let data = vec![0xBBu8; PAGE_SIZE + 100];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
-        let page_bufs = book.page_data_from_blob(&data);
+        let book = Book::from_book(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_book(&data);
 
         assert_eq!(page_bufs.len(), 2);
         assert_eq!(page_bufs[0].len(), PAGE_SIZE);
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn self_indexing_toc_has_sentinels_at_position_zero() {
         let data = vec![0xAAu8; PAGE_SIZE * 2];
-        let raw_book = Book::from_blob(test_cid(), &data).unwrap();
+        let raw_book = Book::from_book(test_cid(), &data).unwrap();
         // Manually build a self-indexing book to test toc()
         let mut pages = Vec::with_capacity(3);
         pages.push([PageAddr(NULL_PAGE); ALGO_COUNT]); // placeholder at page 0
@@ -782,7 +782,7 @@ mod tests {
         let si_book = Book {
             cid: test_cid(),
             pages,
-            blob_size: data.len() as u32,
+            book_size: data.len() as u32,
             book_type: BookType::SelfIndexing,
         };
         let toc = si_book.toc();
@@ -805,14 +805,14 @@ mod tests {
     #[test]
     fn self_indexing_toc_data_pages_at_correct_positions() {
         let data = vec![0xBBu8; PAGE_SIZE * 2];
-        let raw_book = Book::from_blob(test_cid(), &data).unwrap();
+        let raw_book = Book::from_book(test_cid(), &data).unwrap();
         let mut pages = Vec::with_capacity(3);
         pages.push([PageAddr(NULL_PAGE); ALGO_COUNT]);
         pages.extend_from_slice(&raw_book.pages);
         let si_book = Book {
             cid: test_cid(),
             pages,
-            blob_size: data.len() as u32,
+            book_size: data.len() as u32,
             book_type: BookType::SelfIndexing,
         };
         let toc = si_book.toc();
@@ -835,14 +835,14 @@ mod tests {
     #[test]
     fn self_indexing_toc_unused_entries_are_null() {
         let data = vec![0xCCu8; PAGE_SIZE];
-        let raw_book = Book::from_blob(test_cid(), &data).unwrap();
+        let raw_book = Book::from_book(test_cid(), &data).unwrap();
         let mut pages = Vec::with_capacity(2);
         pages.push([PageAddr(NULL_PAGE); ALGO_COUNT]);
         pages.extend_from_slice(&raw_book.pages);
         let si_book = Book {
             cid: test_cid(),
             pages,
-            blob_size: data.len() as u32,
+            book_size: data.len() as u32,
             book_type: BookType::SelfIndexing,
         };
         let toc = si_book.toc();
@@ -861,37 +861,37 @@ mod tests {
     }
 
     #[test]
-    fn from_blob_self_indexing_single_page() {
+    fn from_book_self_indexing_single_page() {
         let data = vec![0xAAu8; 100];
-        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let book = Book::from_book_self_indexing(test_cid(), &data).unwrap();
         assert!(book.is_self_indexing());
         assert_eq!(book.page_count(), 2); // ToC + 1 data
         assert_eq!(book.data_page_count(), 1);
-        assert_eq!(book.blob_size, 100);
+        assert_eq!(book.book_size, 100);
     }
 
     #[test]
-    fn from_blob_self_indexing_multiple_pages() {
+    fn from_book_self_indexing_multiple_pages() {
         let data = vec![0xBBu8; PAGE_SIZE * 3 + 100];
-        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let book = Book::from_book_self_indexing(test_cid(), &data).unwrap();
         assert!(book.is_self_indexing());
         assert_eq!(book.page_count(), 5); // ToC + 4 data
         assert_eq!(book.data_page_count(), 4);
-        assert_eq!(book.blob_size, (PAGE_SIZE * 3 + 100) as u32);
+        assert_eq!(book.book_size, (PAGE_SIZE * 3 + 100) as u32);
     }
 
     #[test]
-    fn from_blob_self_indexing_max_data() {
+    fn from_book_self_indexing_max_data() {
         let data = vec![0xCCu8; SELF_INDEXING_MAX_DATA_SIZE];
-        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let book = Book::from_book_self_indexing(test_cid(), &data).unwrap();
         assert_eq!(book.data_page_count(), 255);
         assert_eq!(book.page_count(), 256);
     }
 
     #[test]
-    fn from_blob_self_indexing_too_large() {
+    fn from_book_self_indexing_too_large() {
         let data = vec![0u8; SELF_INDEXING_MAX_DATA_SIZE + 1];
-        let err = Book::from_blob_self_indexing(test_cid(), &data).unwrap_err();
+        let err = Book::from_book_self_indexing(test_cid(), &data).unwrap_err();
         assert_eq!(
             err,
             BookError::BlobTooLarge {
@@ -901,18 +901,18 @@ mod tests {
     }
 
     #[test]
-    fn from_blob_self_indexing_empty() {
-        let book = Book::from_blob_self_indexing(test_cid(), &[]).unwrap();
+    fn from_book_self_indexing_empty() {
+        let book = Book::from_book_self_indexing(test_cid(), &[]).unwrap();
         assert!(book.is_self_indexing());
         assert_eq!(book.page_count(), 1); // Just ToC
         assert_eq!(book.data_page_count(), 0);
-        assert_eq!(book.blob_size, 0);
+        assert_eq!(book.book_size, 0);
     }
 
     #[test]
-    fn from_blob_self_indexing_toc_page_zero_valid() {
+    fn from_book_self_indexing_toc_page_zero_valid() {
         let data = vec![0xDDu8; PAGE_SIZE * 2];
-        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let book = Book::from_book_self_indexing(test_cid(), &data).unwrap();
         for addr in &book.pages[0] {
             assert!(addr.verify_checksum());
             assert!(!is_toc_sentinel(addr.0));
@@ -920,18 +920,18 @@ mod tests {
     }
 
     #[test]
-    fn from_blob_self_indexing_toc_starts_with_sentinel() {
+    fn from_book_self_indexing_toc_starts_with_sentinel() {
         let data = vec![0xEEu8; PAGE_SIZE];
-        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let book = Book::from_book_self_indexing(test_cid(), &data).unwrap();
         let toc = book.toc();
         let first_u32 = u32::from_le_bytes([toc[0], toc[1], toc[2], toc[3]]);
         assert_eq!(first_u32, SELF_INDEX_SENTINEL_00);
     }
 
     #[test]
-    fn from_blob_self_indexing_toc_verifies_against_page_zero_addr() {
+    fn from_book_self_indexing_toc_verifies_against_page_zero_addr() {
         let data = vec![0xFFu8; PAGE_SIZE * 2];
-        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let book = Book::from_book_self_indexing(test_cid(), &data).unwrap();
         let toc = book.toc();
         for addr in &book.pages[0] {
             assert!(addr.verify_data(&toc));
@@ -941,8 +941,8 @@ mod tests {
     #[test]
     fn page_data_self_indexing_includes_toc() {
         let data = vec![0xAAu8; PAGE_SIZE + 100];
-        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
-        let page_bufs = book.page_data_from_blob(&data);
+        let book = Book::from_book_self_indexing(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_book(&data);
         assert_eq!(page_bufs.len(), 3); // ToC + 2 data pages
         assert_eq!(page_bufs[0].len(), PAGE_SIZE);
         let first_u32 = u32::from_le_bytes([
@@ -957,8 +957,8 @@ mod tests {
     #[test]
     fn page_data_self_indexing_toc_matches_toc_method() {
         let data = vec![0xBBu8; PAGE_SIZE * 2];
-        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
-        let page_bufs = book.page_data_from_blob(&data);
+        let book = Book::from_book_self_indexing(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_book(&data);
         let toc = book.toc();
         assert_eq!(page_bufs[0], toc);
     }
@@ -970,8 +970,8 @@ mod tests {
             let pos = i as u32;
             *b = (pos ^ (pos >> 8) ^ (pos >> 16)) as u8;
         }
-        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
-        let page_bufs = book.page_data_from_blob(&data);
+        let book = Book::from_book_self_indexing(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_book(&data);
         let reassembled = book
             .reassemble(|idx| page_bufs.get(idx as usize).cloned())
             .unwrap();
@@ -981,8 +981,8 @@ mod tests {
 
     #[test]
     fn reassemble_self_indexing_empty() {
-        let book = Book::from_blob_self_indexing(test_cid(), &[]).unwrap();
-        let page_bufs = book.page_data_from_blob(&[]);
+        let book = Book::from_book_self_indexing(test_cid(), &[]).unwrap();
+        let page_bufs = book.page_data_from_book(&[]);
         let reassembled = book
             .reassemble(|idx| page_bufs.get(idx as usize).cloned())
             .unwrap();
@@ -990,31 +990,31 @@ mod tests {
     }
 
     #[test]
-    fn is_self_indexing_blob_detects_self_indexing() {
+    fn is_self_indexing_book_detects_self_indexing() {
         let data = vec![0xAAu8; PAGE_SIZE * 2];
-        let book = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
-        let page_bufs = book.page_data_from_blob(&data);
-        let blob: Vec<u8> = page_bufs.into_iter().flatten().collect();
-        assert!(Book::is_self_indexing_blob(&blob));
+        let book = Book::from_book_self_indexing(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_book(&data);
+        let book_bytes: Vec<u8> = page_bufs.into_iter().flatten().collect();
+        assert!(Book::is_self_indexing_book(&book_bytes));
     }
 
     #[test]
-    fn is_self_indexing_blob_rejects_raw() {
+    fn is_self_indexing_book_rejects_raw() {
         let data = vec![0xBBu8; PAGE_SIZE * 2];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
-        let page_bufs = book.page_data_from_blob(&data);
-        let blob: Vec<u8> = page_bufs.into_iter().flatten().collect();
-        assert!(!Book::is_self_indexing_blob(&blob));
+        let book = Book::from_book(test_cid(), &data).unwrap();
+        let page_bufs = book.page_data_from_book(&data);
+        let book_bytes: Vec<u8> = page_bufs.into_iter().flatten().collect();
+        assert!(!Book::is_self_indexing_book(&book_bytes));
     }
 
     #[test]
-    fn is_self_indexing_blob_rejects_short() {
-        assert!(!Book::is_self_indexing_blob(&[0xFF, 0xFF, 0xFF]));
-        assert!(!Book::is_self_indexing_blob(&[]));
+    fn is_self_indexing_book_rejects_short() {
+        assert!(!Book::is_self_indexing_book(&[0xFF, 0xFF, 0xFF]));
+        assert!(!Book::is_self_indexing_book(&[]));
         // Less than PAGE_SIZE but starts with sentinel bytes
         let mut almost = vec![0u8; PAGE_SIZE - 1];
         almost[0..4].copy_from_slice(&0x3FFF_FFFFu32.to_le_bytes());
-        assert!(!Book::is_self_indexing_blob(&almost));
+        assert!(!Book::is_self_indexing_book(&almost));
     }
 
     // --- Encrypted book tests ---
@@ -1032,10 +1032,10 @@ mod tests {
     }
 
     #[test]
-    fn from_blob_encrypted_basic() {
+    fn from_book_encrypted_basic() {
         let meta = sample_encrypted_metadata();
         let data = vec![0x42u8; PAGE_SIZE * 2];
-        let book = Book::from_blob_encrypted([0xDD; 32], &data, &meta).unwrap();
+        let book = Book::from_book_encrypted([0xDD; 32], &data, &meta).unwrap();
         assert!(book.is_encrypted());
         assert_eq!(book.book_type, BookType::Encrypted { metadata_pages: 2 });
         assert_eq!(book.data_page_count(), 2);
@@ -1044,60 +1044,60 @@ mod tests {
     }
 
     #[test]
-    fn from_blob_encrypted_preserves_cid() {
+    fn from_book_encrypted_preserves_cid() {
         let meta = sample_encrypted_metadata();
         let cid = [0xDD; 32];
         let data = vec![0x42u8; PAGE_SIZE];
-        let book = Book::from_blob_encrypted(cid, &data, &meta).unwrap();
+        let book = Book::from_book_encrypted(cid, &data, &meta).unwrap();
         assert_eq!(book.cid, cid);
     }
 
     #[test]
-    fn from_blob_encrypted_blob_size_is_data_only() {
+    fn from_book_encrypted_book_size_is_data_only() {
         let meta = sample_encrypted_metadata();
         let data = vec![0x42u8; PAGE_SIZE + 100];
-        let book = Book::from_blob_encrypted([0; 32], &data, &meta).unwrap();
-        // blob_size should record only the data, not metadata
-        assert_eq!(book.blob_size, (PAGE_SIZE + 100) as u32);
+        let book = Book::from_book_encrypted([0; 32], &data, &meta).unwrap();
+        // book_size should record only the data, not metadata
+        assert_eq!(book.book_size, (PAGE_SIZE + 100) as u32);
     }
 
     #[test]
-    fn from_blob_encrypted_empty_data() {
+    fn from_book_encrypted_empty_data() {
         let meta = sample_encrypted_metadata();
-        let book = Book::from_blob_encrypted([0; 32], &[], &meta).unwrap();
+        let book = Book::from_book_encrypted([0; 32], &[], &meta).unwrap();
         assert!(book.is_encrypted());
         assert_eq!(book.data_page_count(), 0);
         // Only metadata pages
         assert_eq!(book.page_count(), 2);
-        assert_eq!(book.blob_size, 0);
+        assert_eq!(book.book_size, 0);
     }
 
     #[test]
-    fn from_blob_encrypted_too_large() {
+    fn from_book_encrypted_too_large() {
         let meta = sample_encrypted_metadata();
         let meta_pages = meta.pages_needed() as usize; // 2
         let max_data = (PAGES_PER_BOOK - meta_pages) * PAGE_SIZE;
         let data = vec![0u8; max_data + 1];
-        let err = Book::from_blob_encrypted([0; 32], &data, &meta).unwrap_err();
+        let err = Book::from_book_encrypted([0; 32], &data, &meta).unwrap_err();
         assert_eq!(err, BookError::BlobTooLarge { size: max_data + 1 });
     }
 
     #[test]
-    fn is_encrypted_blob_detection() {
+    fn is_encrypted_book_detection() {
         // A page starting with 0xFFFFFFFC (11 sentinel in LE) should be detected
         let mut page = vec![0u8; PAGE_SIZE];
         page[..4].copy_from_slice(&ENCRYPTED_SENTINEL.to_le_bytes());
-        assert!(Book::is_encrypted_blob(&page));
+        assert!(Book::is_encrypted_book(&page));
 
         // Regular data page should not be detected
         let data_page = vec![0x42u8; PAGE_SIZE];
-        assert!(!Book::is_encrypted_blob(&data_page));
+        assert!(!Book::is_encrypted_book(&data_page));
     }
 
     #[test]
-    fn is_encrypted_blob_rejects_short() {
-        assert!(!Book::is_encrypted_blob(&[]));
-        assert!(!Book::is_encrypted_blob(&[0xFC, 0xFF, 0xFF]));
+    fn is_encrypted_book_rejects_short() {
+        assert!(!Book::is_encrypted_book(&[]));
+        assert!(!Book::is_encrypted_book(&[0xFC, 0xFF, 0xFF]));
     }
 
     #[test]
@@ -1105,8 +1105,8 @@ mod tests {
         let meta = sample_encrypted_metadata();
         // Use data that isn't page-aligned to test truncation
         let data = vec![0x77u8; PAGE_SIZE + 100];
-        let book = Book::from_blob_encrypted([0xDD; 32], &data, &meta).unwrap();
-        let all_pages = book.page_data_from_blob_encrypted(&data, &meta);
+        let book = Book::from_book_encrypted([0xDD; 32], &data, &meta).unwrap();
+        let all_pages = book.page_data_from_book_encrypted(&data, &meta);
 
         // Reassemble should skip metadata pages and return original data
         let reassembled = book
@@ -1119,8 +1119,8 @@ mod tests {
     #[test]
     fn encrypted_book_reassemble_empty_data() {
         let meta = sample_encrypted_metadata();
-        let book = Book::from_blob_encrypted([0; 32], &[], &meta).unwrap();
-        let all_pages = book.page_data_from_blob_encrypted(&[], &meta);
+        let book = Book::from_book_encrypted([0; 32], &[], &meta).unwrap();
+        let all_pages = book.page_data_from_book_encrypted(&[], &meta);
         let reassembled = book
             .reassemble(|idx| all_pages.get(idx as usize).cloned())
             .unwrap();
@@ -1131,16 +1131,16 @@ mod tests {
     fn metadata_pages_accessible() {
         let meta = sample_encrypted_metadata();
         let data = vec![0x55u8; PAGE_SIZE * 3];
-        let book = Book::from_blob_encrypted([0xDD; 32], &data, &meta).unwrap();
+        let book = Book::from_book_encrypted([0xDD; 32], &data, &meta).unwrap();
         assert_eq!(book.metadata_page_count(), 2);
     }
 
     #[test]
     fn metadata_page_count_zero_for_non_encrypted() {
         let data = vec![0xABu8; PAGE_SIZE];
-        let raw = Book::from_blob(test_cid(), &data).unwrap();
+        let raw = Book::from_book(test_cid(), &data).unwrap();
         assert_eq!(raw.metadata_page_count(), 0);
-        let si = Book::from_blob_self_indexing(test_cid(), &data).unwrap();
+        let si = Book::from_book_self_indexing(test_cid(), &data).unwrap();
         assert_eq!(si.metadata_page_count(), 0);
     }
 
@@ -1148,7 +1148,7 @@ mod tests {
     fn encrypted_data_pages_excludes_metadata() {
         let meta = sample_encrypted_metadata();
         let data = vec![0x55u8; PAGE_SIZE * 3];
-        let book = Book::from_blob_encrypted([0; 32], &data, &meta).unwrap();
+        let book = Book::from_book_encrypted([0; 32], &data, &meta).unwrap();
         let dp = book.data_pages();
         assert_eq!(dp.len(), 3);
         // Data pages should have valid checksums
@@ -1163,8 +1163,8 @@ mod tests {
     fn encrypted_page_addrs_match_page_data() {
         let meta = sample_encrypted_metadata();
         let data = vec![0x42u8; PAGE_SIZE * 2];
-        let book = Book::from_blob_encrypted([0; 32], &data, &meta).unwrap();
-        let all_pages = book.page_data_from_blob_encrypted(&data, &meta);
+        let book = Book::from_book_encrypted([0; 32], &data, &meta).unwrap();
+        let all_pages = book.page_data_from_book_encrypted(&data, &meta);
 
         // Verify each page's address variants match the page data
         for (i, page_data) in all_pages.iter().enumerate() {
@@ -1182,8 +1182,8 @@ mod tests {
     fn encrypted_metadata_pages_start_with_sentinel() {
         let meta = sample_encrypted_metadata();
         let data = vec![0x42u8; PAGE_SIZE];
-        let book = Book::from_blob_encrypted([0; 32], &data, &meta).unwrap();
-        let all_pages = book.page_data_from_blob_encrypted(&data, &meta);
+        let book = Book::from_book_encrypted([0; 32], &data, &meta).unwrap();
+        let all_pages = book.page_data_from_book_encrypted(&data, &meta);
 
         let meta_count = book.metadata_page_count();
         for i in 0..meta_count {
@@ -1200,7 +1200,7 @@ mod tests {
     #[test]
     fn raw_book_is_not_encrypted() {
         let data = vec![0xABu8; 100];
-        let book = Book::from_blob(test_cid(), &data).unwrap();
+        let book = Book::from_book(test_cid(), &data).unwrap();
         assert!(!book.is_encrypted());
     }
 }

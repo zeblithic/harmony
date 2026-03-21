@@ -1,6 +1,6 @@
 //! StorageTier: sans-I/O wrapper integrating ContentStore with Zenoh patterns.
 
-use crate::blob::BlobStore;
+use crate::book::BookStore;
 use crate::cache::ContentStore;
 use crate::cid::{ContentClass, ContentId};
 use crate::flatpack::FlatpackIndex;
@@ -189,7 +189,7 @@ impl Default for FilterBroadcastConfig {
 /// declarations) that the caller must execute. Subsequent calls to
 /// [`handle`](Self::handle) process inbound events and return outbound
 /// actions.
-pub struct StorageTier<B: BlobStore> {
+pub struct StorageTier<B: BookStore> {
     cache: ContentStore<B>,
     /// Reserved for future byte-based pin limits. Currently only count-based
     /// limits are enforced via [`ContentStore::pin_limit`].
@@ -211,7 +211,7 @@ pub struct StorageTier<B: BlobStore> {
     flatpack: FlatpackIndex,
 }
 
-impl<B: BlobStore> StorageTier<B> {
+impl<B: BookStore> StorageTier<B> {
     /// Create a new StorageTier with startup actions.
     pub fn new(
         store: B,
@@ -576,7 +576,7 @@ mod tests {
     fn event_and_action_types_exist() {
         let _event = StorageTierEvent::ContentQuery {
             query_id: 1,
-            cid: ContentId::for_blob(b"test", crate::cid::ContentFlags::default()).unwrap(),
+            cid: ContentId::for_book(b"test", crate::cid::ContentFlags::default()).unwrap(),
         };
         let _action = StorageTierAction::SendReply {
             query_id: 1,
@@ -584,7 +584,7 @@ mod tests {
         };
     }
 
-    use crate::blob::MemoryBlobStore;
+    use crate::book::MemoryBookStore;
 
     #[test]
     fn content_query_hit_returns_reply() {
@@ -593,7 +593,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
@@ -623,12 +623,12 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
         );
-        let cid = ContentId::for_blob(b"not stored", crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"not stored", crate::cid::ContentFlags::default()).unwrap();
 
         let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 99, cid });
         assert!(actions.is_empty());
@@ -643,14 +643,14 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
         );
 
         let data = b"stats test blob";
-        let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(data, crate::cid::ContentFlags::default()).unwrap();
         tier.handle(StorageTierEvent::PublishContent {
             cid,
             data: data.to_vec(),
@@ -677,13 +677,13 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
         );
         let data = b"explicitly published blob";
-        let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(data, crate::cid::ContentFlags::default()).unwrap();
 
         let actions = tier.handle(StorageTierEvent::PublishContent {
             cid,
@@ -714,13 +714,13 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
         );
         let data = b"transiting blob";
-        let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(data, crate::cid::ContentFlags::default()).unwrap();
 
         let actions = tier.handle(StorageTierEvent::TransitContent {
             cid,
@@ -749,13 +749,13 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
         );
         let data = b"repeated transit";
-        let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(data, crate::cid::ContentFlags::default()).unwrap();
 
         tier.handle(StorageTierEvent::TransitContent {
             cid,
@@ -779,7 +779,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
@@ -789,7 +789,7 @@ mod tests {
         for i in 0..3 {
             let data = format!("hot-{i}");
             let cid =
-                ContentId::for_blob(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap();
+                ContentId::for_book(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap();
             tier.handle(StorageTierEvent::TransitContent {
                 cid,
                 data: data.into_bytes(),
@@ -799,7 +799,7 @@ mod tests {
         for i in 0..2 {
             let data = format!("hot-{i}");
             let cid =
-                ContentId::for_blob(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap();
+                ContentId::for_book(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap();
             for _ in 0..10 {
                 tier.handle(StorageTierEvent::ContentQuery { query_id: 0, cid });
             }
@@ -809,7 +809,7 @@ mod tests {
 
         // Cold transit item with zero frequency should be rejected.
         let cold_data = b"cold-newcomer-will-lose";
-        let cold_cid = ContentId::for_blob(cold_data, crate::cid::ContentFlags::default()).unwrap();
+        let cold_cid = ContentId::for_book(cold_data, crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::TransitContent {
             cid: cold_cid,
             data: cold_data.to_vec(),
@@ -840,15 +840,15 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
         );
 
-        let blob_a = ContentId::for_blob(b"child-a", crate::cid::ContentFlags::default()).unwrap();
-        let blob_b = ContentId::for_blob(b"child-b", crate::cid::ContentFlags::default()).unwrap();
-        let children = [blob_a, blob_b];
+        let book_a = ContentId::for_book(b"child-a", crate::cid::ContentFlags::default()).unwrap();
+        let book_b = ContentId::for_book(b"child-b", crate::cid::ContentFlags::default()).unwrap();
+        let children = [book_a, book_b];
         let bundle_bytes: Vec<u8> = children.iter().flat_map(|c| c.to_bytes()).collect();
         let bundle_cid = ContentId::for_bundle(
             &bundle_bytes,
@@ -878,14 +878,14 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
         );
 
         // CID for "real data" but send "tampered data"
-        let cid = ContentId::for_blob(b"real data", crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"real data", crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::TransitContent {
             cid,
             data: b"tampered data".to_vec(),
@@ -906,13 +906,13 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
         );
 
-        let cid = ContentId::for_blob(b"original", crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"original", crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::PublishContent {
             cid,
             data: b"different".to_vec(),
@@ -933,7 +933,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
@@ -942,7 +942,7 @@ mod tests {
         // Craft a CID with correct hash but wrong payload_size by mutating
         // the size bits in the last 4 bytes.
         let data = b"correct data";
-        let real_cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
+        let real_cid = ContentId::for_book(data, crate::cid::ContentFlags::default()).unwrap();
         let mut bytes = real_cid.to_bytes();
         // Corrupt the size: set size to 999 instead of 12.
         let packed = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
@@ -968,7 +968,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (tier, actions) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
@@ -996,13 +996,13 @@ mod tests {
         }
     }
 
-    fn make_tier_with_policy(policy: ContentPolicy) -> StorageTier<MemoryBlobStore> {
+    fn make_tier_with_policy(policy: ContentPolicy) -> StorageTier<MemoryBookStore> {
         let budget = StorageBudget {
             cache_capacity: 100,
             max_pinned_bytes: 1_000_000,
         };
         let (tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             policy,
             FilterBroadcastConfig::default(),
@@ -1016,7 +1016,7 @@ mod tests {
             ephemeral,
             alt_hash: false,
         };
-        let cid = ContentId::for_blob(data, flags).unwrap();
+        let cid = ContentId::for_book(data, flags).unwrap();
         (cid, data.to_vec())
     }
 
@@ -1151,7 +1151,7 @@ mod tests {
             ..ContentPolicy::default()
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             policy,
             FilterBroadcastConfig::default(),
@@ -1241,7 +1241,7 @@ mod tests {
         };
         let policy = ContentPolicy::default();
         let (tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             policy,
             FilterBroadcastConfig::default(),
@@ -1373,7 +1373,7 @@ mod tests {
             ephemeral: false,
             alt_hash: false,
         };
-        let cid = ContentId::for_blob(&data, flags).unwrap();
+        let cid = ContentId::for_book(&data, flags).unwrap();
 
         let actions = tier.handle(StorageTierEvent::DiskReadComplete {
             cid,
@@ -1399,7 +1399,7 @@ mod tests {
             ephemeral: false,
             alt_hash: false,
         };
-        let cid = ContentId::for_blob(b"original", flags).unwrap();
+        let cid = ContentId::for_book(b"original", flags).unwrap();
 
         // DiskReadComplete with data that doesn't match the CID hash.
         let actions = tier.handle(StorageTierEvent::DiskReadComplete {
@@ -1431,7 +1431,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
@@ -1450,7 +1450,7 @@ mod tests {
             ephemeral: false,
             alt_hash: false,
         };
-        let disk_cid = ContentId::for_blob(disk_data, flags).unwrap();
+        let disk_cid = ContentId::for_book(disk_data, flags).unwrap();
         let actions = tier.handle(StorageTierEvent::DiskReadComplete {
             cid: disk_cid,
             query_id: 50,
@@ -1479,7 +1479,7 @@ mod tests {
     #[test]
     fn disk_read_failed_sends_empty_reply() {
         let mut tier = make_tier_with_policy(ContentPolicy::default());
-        let cid = ContentId::for_blob(b"missing", crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(b"missing", crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::DiskReadFailed { cid, query_id: 42 });
         assert_eq!(actions.len(), 1);
         match &actions[0] {
@@ -1504,7 +1504,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
@@ -1581,7 +1581,7 @@ mod tests {
             max_pinned_bytes: 1_000_000,
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
@@ -1693,7 +1693,7 @@ mod tests {
             ..FilterBroadcastConfig::default()
         };
         let (tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             filter_config,
@@ -1717,7 +1717,7 @@ mod tests {
             ..FilterBroadcastConfig::default()
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             filter_config,
@@ -1727,7 +1727,7 @@ mod tests {
         for i in 0..2 {
             let data = format!("transit-{i}");
             let cid =
-                ContentId::for_blob(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap();
+                ContentId::for_book(data.as_bytes(), crate::cid::ContentFlags::default()).unwrap();
             let actions = tier.handle(StorageTierEvent::TransitContent {
                 cid,
                 data: data.into_bytes(),
@@ -1742,7 +1742,7 @@ mod tests {
 
         // 3rd transit: should include BroadcastFilter action.
         let data = b"transit-2";
-        let cid = ContentId::for_blob(data, crate::cid::ContentFlags::default()).unwrap();
+        let cid = ContentId::for_book(data, crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::TransitContent {
             cid,
             data: data.to_vec(),
@@ -1825,7 +1825,7 @@ mod tests {
             ..FilterBroadcastConfig::default()
         };
         let (mut tier, _) = StorageTier::new(
-            MemoryBlobStore::new(),
+            MemoryBookStore::new(),
             budget,
             ContentPolicy::default(),
             filter_config,

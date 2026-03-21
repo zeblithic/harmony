@@ -403,7 +403,7 @@ mod tests {
     use super::*;
 
     fn make_cid(i: usize) -> ContentId {
-        ContentId::for_blob(
+        ContentId::for_book(
             format!("cuckoo-test-{i}").as_bytes(),
             crate::cid::ContentFlags::default(),
         )

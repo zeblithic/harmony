@@ -8,7 +8,7 @@ fn make_core() -> BrowserCore {
 #[test]
 fn navigate_to_cid_emits_fetch() {
     let mut core = make_core();
-    let cid = ContentId::for_blob(b"hello", ContentFlags::default()).unwrap();
+    let cid = ContentId::for_book(b"hello", ContentFlags::default()).unwrap();
     let actions = core.handle_event(BrowserEvent::Navigate(BrowseTarget::Cid(cid)));
     assert_eq!(actions.len(), 1);
     match &actions[0] {

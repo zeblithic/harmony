@@ -114,8 +114,8 @@ mod tests {
 
     fn make_test_manifest(artist: &PrivateIdentity) -> LicenseManifest {
         let content_cid =
-            harmony_content::ContentId::for_blob(b"test content", ContentFlags::default()).unwrap();
-        let key_cid = harmony_content::ContentId::for_blob(
+            harmony_content::ContentId::for_book(b"test content", ContentFlags::default()).unwrap();
+        let key_cid = harmony_content::ContentId::for_book(
             b"encrypted key blob",
             ContentFlags {
                 encrypted: true,
@@ -198,9 +198,9 @@ mod tests {
     fn free_manifest_has_no_price_or_duration() {
         let artist = PrivateIdentity::generate(&mut OsRng);
         let content_cid =
-            harmony_content::ContentId::for_blob(b"free content", ContentFlags::default()).unwrap();
+            harmony_content::ContentId::for_book(b"free content", ContentFlags::default()).unwrap();
         let key_cid =
-            harmony_content::ContentId::for_blob(b"public key", ContentFlags::default()).unwrap();
+            harmony_content::ContentId::for_book(b"public key", ContentFlags::default()).unwrap();
         let mut manifest = LicenseManifest {
             creator: artist.public_identity().address_hash,
             content_cid,
