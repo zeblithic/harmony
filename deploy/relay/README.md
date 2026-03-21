@@ -221,6 +221,7 @@ Environment="RUST_LOG=info"
 
 # Allow binding to privileged ports (80, 443)
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
