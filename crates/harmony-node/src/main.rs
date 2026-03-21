@@ -2,6 +2,8 @@ mod compute;
 mod event_loop;
 mod identity_file;
 mod runtime;
+mod tunnel_bridge;
+mod tunnel_task;
 
 use clap::{Parser, Subcommand};
 

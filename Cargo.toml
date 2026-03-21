@@ -82,6 +82,7 @@ wasmtime = "38"
 # Networking
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
 zenoh = "1"
+iroh = "0.91"
 
 # CLI and config
 serde = { version = "1", default-features = false }
@@ -120,3 +121,4 @@ harmony-zenoh = { path = "crates/harmony-zenoh" }
 inherits = "release"
 strip = true
 lto = "thin"
+
