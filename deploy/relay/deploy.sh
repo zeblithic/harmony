@@ -138,7 +138,7 @@ elif command -v nix &>/dev/null; then
     # pull pre-built artifacts instead of compiling. The public key is in
     # the repo; if it's a placeholder, skip the substituter (first deploy).
     CACHE_KEY_FILE="${SCRIPT_DIR}/cache-key.pub"
-    if [ -f "$CACHE_KEY_FILE" ] && ! grep -q "^#" "$CACHE_KEY_FILE"; then
+    if [ -f "$CACHE_KEY_FILE" ] && [ -s "$CACHE_KEY_FILE" ] && ! grep -q "^#" "$CACHE_KEY_FILE"; then
         CACHE_PUB_KEY=$(cat "$CACHE_KEY_FILE")
         export NIX_CONFIG="extra-substituters = http://${RELAY_HOSTNAME}:5000
 extra-trusted-public-keys = ${CACHE_PUB_KEY}"
