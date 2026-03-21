@@ -136,19 +136,28 @@ elif command -v nix &>/dev/null; then
 
     # Configure the VM's binary cache as a substituter so nix build can
     # pull pre-built artifacts instead of compiling. The public key is in
-    # the repo; if it's a placeholder, skip the substituter (first deploy).
+    # the repo; if it's a placeholder (comment-only), skip the substituter.
     CACHE_KEY_FILE="${SCRIPT_DIR}/cache-key.pub"
-    if [ -f "$CACHE_KEY_FILE" ] && [ -s "$CACHE_KEY_FILE" ] && ! grep -q "^#" "$CACHE_KEY_FILE"; then
-        CACHE_PUB_KEY=$(cat "$CACHE_KEY_FILE")
-        export NIX_CONFIG="extra-substituters = http://${RELAY_HOSTNAME}:5000
-extra-trusted-public-keys = ${CACHE_PUB_KEY}"
+    EXTRA_NIX_ARGS=()
+    # Extract the actual key line (strip comments and blank lines)
+    CACHE_PUB_KEY=""
+    if [ -f "$CACHE_KEY_FILE" ] && [ -s "$CACHE_KEY_FILE" ]; then
+        CACHE_PUB_KEY=$(grep -v '^#' "$CACHE_KEY_FILE" | grep -v '^$' | head -1)
+    fi
+    if [ -n "$CACHE_PUB_KEY" ]; then
+        # Pass as CLI flags instead of NIX_CONFIG — CLI flags are accepted
+        # by the Nix daemon regardless of trusted-users configuration.
+        EXTRA_NIX_ARGS+=(
+            --extra-substituters "http://${RELAY_HOSTNAME}:5000"
+            --extra-trusted-public-keys "$CACHE_PUB_KEY"
+        )
         echo "    Using binary cache at http://${RELAY_HOSTNAME}:5000"
     fi
 
     # Build locally (cross-compiles to x86_64-linux-musl on any host).
     # If the binary cache has this derivation, nix build fetches instead of compiling.
     echo "    Running: nix build .#iroh-relay-x86_64-linux (from ${REPO_ROOT})"
-    STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux" --print-out-paths --no-link)
+    STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux" "${EXTRA_NIX_ARGS[@]}" --print-out-paths --no-link)
     echo "    Store path: ${STORE_PATH}"
 
     # Check if VM already has this exact store path (fast path).
