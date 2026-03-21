@@ -280,7 +280,7 @@ impl ContentId {
     }
 
     pub fn extract_inline_data(&self) -> Result<alloc::vec::Vec<u8>, ContentError> {
-        if !self.is_inline() {
+        if !self.is_inline() || self.is_sentinel() {
             return Err(ContentError::NotInlineData);
         }
         let len = self.raw_size_field() as usize;
@@ -472,8 +472,16 @@ pub fn encode_bundle_size(size_bytes: u64) -> u32 {
     // Round up: if the encoded value decodes to less than size_bytes, bump mantissa.
     let encoded = (mantissa << 8) | exponent;
     let decoded = decode_bundle_size(encoded);
-    if decoded < size_bytes && mantissa < 4095 {
-        ((mantissa + 1) << 8) | exponent
+    if decoded < size_bytes {
+        if mantissa < 4095 {
+            ((mantissa + 1) << 8) | exponent
+        } else if exponent < 255 {
+            // Mantissa maxed out — roll to next exponent with mantissa 0
+            (0u32 << 8) | (exponent + 1)
+        } else {
+            // Both maxed — return maximum representable value
+            (4095u32 << 8) | 255
+        }
     } else {
         encoded
     }

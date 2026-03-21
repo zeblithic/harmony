@@ -122,10 +122,6 @@ fn walk_recursive(
             // Streams are not walked recursively — they're processed
             // via streaming iteration, not DAG traversal.
         }
-        _ => {
-            // Reserved types — should not appear in a well-formed DAG.
-            return Err(ContentError::MissingContent { cid: *cid });
-        }
     }
     Ok(())
 }
