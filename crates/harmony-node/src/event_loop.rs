@@ -108,18 +108,18 @@ pub async fn run(
             tokio::select! {
                 // Some(_) pattern: if recv() returns None (stream exhausted),
                 // the arm is disabled rather than triggering a spurious shutdown.
-                Some(_) = sigterm.recv() => eprintln!("[event_loop] SIGTERM received — shutting down"),
+                Some(_) = sigterm.recv() => tracing::info!("SIGTERM received — shutting down"),
                 result = tokio::signal::ctrl_c() => match result {
-                    Ok(()) => eprintln!("[event_loop] Ctrl+C received — shutting down"),
-                    Err(e) => eprintln!("[event_loop] SIGINT handler failed: {e} — shutting down"),
+                    Ok(()) => tracing::info!("Ctrl+C received — shutting down"),
+                    Err(e) => tracing::warn!(err = %e, "SIGINT handler failed — shutting down"),
                 },
             }
         }
         #[cfg(not(unix))]
         {
             match tokio::signal::ctrl_c().await {
-                Ok(()) => eprintln!("[event_loop] Ctrl+C received — shutting down"),
-                Err(e) => eprintln!("[event_loop] SIGINT handler failed: {e} — shutting down"),
+                Ok(()) => tracing::info!("Ctrl+C received — shutting down"),
+                Err(e) => tracing::warn!(err = %e, "SIGINT handler failed — shutting down"),
             }
         }
     };
@@ -147,7 +147,7 @@ pub async fn run(
                         });
                     }
                     Err(e) => {
-                        eprintln!("[event_loop] UDP recv error: {e}");
+                        tracing::warn!(err = %e, "UDP recv error");
                         use std::io::ErrorKind::*;
                         match e.kind() {
                             WouldBlock | Interrupted => {}
@@ -169,7 +169,7 @@ pub async fn run(
             maybe = zenoh_rx.recv() => {
                 match maybe {
                     None => {
-                        eprintln!("[event_loop] Zenoh channel closed — exiting");
+                        tracing::warn!("zenoh channel closed — exiting");
                         break;
                     }
                     Some(ev) => match ev {
@@ -236,7 +236,7 @@ async fn dispatch_action(
         // effectively non-blocking on a UDP socket with default buffer sizes.
         RuntimeAction::SendOnInterface { raw, .. } => {
             if let Err(e) = udp.send_to(&raw, broadcast_addr).await {
-                eprintln!("[event_loop] UDP send error: {e}");
+                tracing::warn!(err = %e, "UDP send error");
             }
         }
 
@@ -245,7 +245,7 @@ async fn dispatch_action(
             let session = session.clone();
             tokio::spawn(async move {
                 if let Err(e) = session.put(&key_expr, payload).await {
-                    eprintln!("[event_loop] Zenoh put error on '{key_expr}': {e}");
+                    tracing::warn!(%key_expr, err = %e, "zenoh put error");
                 }
             });
         }
@@ -255,7 +255,7 @@ async fn dispatch_action(
         // restructuring (the query handle must stay alive on the spawned task).
         // Deferred to a follow-up bead.
         RuntimeAction::SendReply { query_id, .. } => {
-            eprintln!("[event_loop] SendReply query_id={query_id}: reply passthrough not yet implemented");
+            tracing::debug!(query_id, "SendReply not yet implemented");
         }
 
         // ── Tier 3: Fetch content via Zenoh get() ─────────────────────────────
@@ -317,7 +317,7 @@ async fn dispatch_action(
                     });
                 }
                 Err(e) => {
-                    eprintln!("[event_loop] declare_queryable '{key_expr}' failed: {e}");
+                    tracing::error!(%key_expr, err = %e, "declare_queryable failed");
                 }
             }
         }
@@ -342,7 +342,7 @@ async fn dispatch_action(
                     });
                 }
                 Err(e) => {
-                    eprintln!("[event_loop] declare_subscriber '{key_expr}' failed: {e}");
+                    tracing::error!(%key_expr, err = %e, "declare_subscriber failed");
                 }
             }
         }
@@ -372,7 +372,7 @@ async fn fetch_via_zenoh(
                 }
                 Err(err) => {
                     let msg = String::from_utf8_lossy(&err.payload().to_bytes()).into_owned();
-                    eprintln!("[event_loop] get reply error: {msg}");
+                    tracing::warn!(%key_expr, err = %msg, "zenoh get reply error");
                 }
             }
         }
