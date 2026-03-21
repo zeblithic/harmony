@@ -2,6 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+
+const SERVICE_TYPE: &str = "_harmony._udp.local.";
+
 /// Information about a discovered LAN peer.
 pub struct PeerInfo {
     pub reticulum_addr: [u8; 16],
@@ -123,6 +127,84 @@ impl PeerTable {
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
+}
+
+// ── mDNS/DNS-SD helpers ─────────────────────────────────────────────────────
+
+/// Parse the Reticulum address from a DNS-SD TXT record property set.
+///
+/// Expects a property `addr=<32 hex chars>`. Returns `None` if missing or malformed.
+pub fn parse_txt_addr(properties: &mdns_sd::TxtProperties) -> Option<[u8; 16]> {
+    let val_str = properties.get_property_val_str("addr")?;
+    let bytes = hex::decode(val_str).ok()?;
+    if bytes.len() != 16 {
+        return None;
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
+}
+
+/// Parse the protocol version from a DNS-SD TXT record property set.
+///
+/// Expects a property `proto=<u8>`. Returns 0 if missing or malformed.
+pub fn parse_txt_proto(properties: &mdns_sd::TxtProperties) -> u8 {
+    properties
+        .get_property_val_str("proto")
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(0)
+}
+
+/// Parse the Reticulum address from an mDNS instance fullname.
+///
+/// The fullname has the format `<32 hex chars>._harmony._udp.local.`
+/// Returns `None` if the prefix is not valid hex or wrong length.
+pub fn parse_instance_addr(fullname: &str) -> Option<[u8; 16]> {
+    let prefix = fullname.split('.').next()?;
+    if prefix.len() != 32 {
+        return None;
+    }
+    let bytes = hex::decode(prefix).ok()?;
+    if bytes.len() != 16 {
+        return None;
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
+}
+
+/// Start the mDNS daemon: register our service and browse for peers.
+///
+/// Returns the daemon handle (for shutdown) and the Receiver for events.
+/// On failure (e.g., can't bind port 5353), returns `Err` — caller should log
+/// and proceed without discovery.
+pub fn start_mdns(
+    listen_port: u16,
+    reticulum_addr: &[u8; 16],
+) -> Result<
+    (ServiceDaemon, mdns_sd::Receiver<ServiceEvent>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let daemon = ServiceDaemon::new()?;
+    let instance_name = hex::encode(reticulum_addr);
+    let host = format!("{instance_name}.local.");
+
+    let hex_addr = hex::encode(reticulum_addr);
+    let properties: [(&str, &str); 2] = [("addr", &hex_addr), ("proto", "1")];
+
+    let service = ServiceInfo::new(
+        SERVICE_TYPE,
+        &instance_name,
+        &host,
+        "",
+        listen_port,
+        &properties[..],
+    )?
+    .enable_addr_auto();
+
+    daemon.register(service)?;
+    let receiver = daemon.browse(SERVICE_TYPE)?;
+    Ok((daemon, receiver))
 }
 
 #[cfg(test)]
@@ -341,5 +423,34 @@ mod tests {
             t.addr_to_sockets.get(&ra).is_none(),
             "addr_to_sockets must be empty after all sockets for a reticulum addr evict"
         );
+    }
+
+    // ── parse_instance_addr tests ────────────────────────────────────────────
+
+    #[test]
+    fn parse_instance_addr_valid() {
+        let hex_addr = "aabbccdd11223344aabbccdd11223344";
+        let fullname = format!("{hex_addr}._harmony._udp.local.");
+        let result = parse_instance_addr(&fullname);
+        assert!(result.is_some());
+        assert_eq!(hex::encode(result.unwrap()), hex_addr);
+    }
+
+    #[test]
+    fn parse_instance_addr_invalid_hex() {
+        let fullname = "not_valid_hex_here_0000000000000._harmony._udp.local.";
+        assert!(parse_instance_addr(fullname).is_none());
+    }
+
+    #[test]
+    fn parse_instance_addr_wrong_suffix() {
+        let fullname = "aabbccdd11223344aabbccdd11223344._other._tcp.local.";
+        assert!(parse_instance_addr(fullname).is_some());
+    }
+
+    #[test]
+    fn parse_instance_addr_too_short() {
+        let fullname = "aabb._harmony._udp.local.";
+        assert!(parse_instance_addr(fullname).is_none());
     }
 }
