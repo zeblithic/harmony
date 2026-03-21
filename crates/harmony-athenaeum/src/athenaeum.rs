@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-//! Book — a single CID book stored as fixed-size 4KB pages.
+//! Book — a CID-addressed content unit split into fixed-size 4KB pages.
 //!
 //! Each page has all 4 algorithm variants precomputed, enabling
 //! collision-free routing without runtime rehashing.
@@ -28,8 +28,8 @@ pub enum BookType {
 /// Error when constructing or reassembling a Book.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BookError {
-    /// Blob exceeds the 1MB maximum.
-    BlobTooLarge { size: usize },
+    /// Book exceeds the 1 MB maximum.
+    BookTooLarge { size: usize },
     /// All 4 algorithm variants produced the same address for a page.
     AllAlgorithmsCollide { page_index: usize },
     /// A required page was not available during reassembly.
@@ -42,14 +42,14 @@ pub enum BookError {
     TooShort,
 }
 
-/// A Book maps a single CID book into up to 256 fixed-size 4KB pages.
+/// Maps a CID-addressed content unit into up to 256 fixed-size 4KB pages.
 ///
 /// Every page has all 4 algorithm variants precomputed, stored as
 /// `[PageAddr; ALGO_COUNT]` in Algorithm selector order:
 /// `[Sha256Msb, Sha256Lsb, Sha224Msb, Sha224Lsb]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Book {
-    /// 256-bit book identifier (content ID).
+    /// 256-bit content identifier (CID).
     pub cid: [u8; 32],
     /// Page addresses — up to 256 entries, each with all 4 algorithm variants.
     pub pages: Vec<[PageAddr; ALGO_COUNT]>,
@@ -68,7 +68,7 @@ impl Book {
     /// - `page_count = ceil(book_size / PAGE_SIZE)`.
     pub fn from_book(cid: [u8; 32], data: &[u8]) -> Result<Self, BookError> {
         if data.len() > BOOK_MAX_SIZE {
-            return Err(BookError::BlobTooLarge { size: data.len() });
+            return Err(BookError::BookTooLarge { size: data.len() });
         }
 
         if data.is_empty() {
@@ -233,7 +233,7 @@ impl Book {
     /// - Empty data produces a Book with 1 page (just the ToC).
     pub fn from_book_self_indexing(cid: [u8; 32], data: &[u8]) -> Result<Self, BookError> {
         if data.len() > SELF_INDEXING_MAX_DATA_SIZE {
-            return Err(BookError::BlobTooLarge { size: data.len() });
+            return Err(BookError::BookTooLarge { size: data.len() });
         }
 
         // Step 1: Compute data page addresses
@@ -366,7 +366,7 @@ impl Book {
         let meta_page_count = metadata.pages_needed() as usize;
         let max_data = (PAGES_PER_BOOK - meta_page_count) * PAGE_SIZE;
         if data.len() > max_data {
-            return Err(BookError::BlobTooLarge { size: data.len() });
+            return Err(BookError::BookTooLarge { size: data.len() });
         }
 
         let data_page_count = if data.is_empty() {
@@ -532,7 +532,7 @@ mod tests {
         let err = Book::from_book(test_cid(), &data).unwrap_err();
         assert_eq!(
             err,
-            BookError::BlobTooLarge {
+            BookError::BookTooLarge {
                 size: BOOK_MAX_SIZE + 1
             }
         );
@@ -894,7 +894,7 @@ mod tests {
         let err = Book::from_book_self_indexing(test_cid(), &data).unwrap_err();
         assert_eq!(
             err,
-            BookError::BlobTooLarge {
+            BookError::BookTooLarge {
                 size: SELF_INDEXING_MAX_DATA_SIZE + 1,
             }
         );
@@ -1079,7 +1079,7 @@ mod tests {
         let max_data = (PAGES_PER_BOOK - meta_pages) * PAGE_SIZE;
         let data = vec![0u8; max_data + 1];
         let err = Book::from_book_encrypted([0; 32], &data, &meta).unwrap_err();
-        assert_eq!(err, BookError::BlobTooLarge { size: max_data + 1 });
+        assert_eq!(err, BookError::BookTooLarge { size: max_data + 1 });
     }
 
     #[test]

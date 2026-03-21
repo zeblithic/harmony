@@ -85,12 +85,12 @@ mod tests {
     #[test]
     fn unpack_detects_wrong_cid_header() {
         let mut store = MemoryBookStore::new();
-        let data_a = b"blob A content";
-        let data_b = b"blob B different content";
+        let data_a = b"book A content";
+        let data_b = b"book B different content";
         let cid_a = store.insert(data_a).unwrap();
         let _cid_b = store.insert(data_b).unwrap();
 
-        // Pack blob B's data with blob A's CID header.
+        // Pack book B's data with book A's CID header.
         let packed = pack_for_transport(&cid_a, data_b);
 
         let result = unpack_from_transport(&packed);

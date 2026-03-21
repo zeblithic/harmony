@@ -50,7 +50,7 @@ impl Encyclopedia {
     pub fn build(entries: &[([u8; 32], &[u8])]) -> Result<Self, BookError> {
         for &(_, data) in entries {
             if data.len() > BOOK_MAX_SIZE {
-                return Err(BookError::BlobTooLarge { size: data.len() });
+                return Err(BookError::BookTooLarge { size: data.len() });
             }
         }
 
@@ -395,7 +395,7 @@ mod tests {
         let data = alloc::vec![0u8; BOOK_MAX_SIZE + 1];
         let cid = sha256_hash(&data);
         let result = Encyclopedia::build(&[(cid, &data)]);
-        assert!(matches!(result, Err(BookError::BlobTooLarge { .. })));
+        assert!(matches!(result, Err(BookError::BookTooLarge { .. })));
     }
 
     #[test]
