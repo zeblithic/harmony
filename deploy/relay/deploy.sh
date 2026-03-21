@@ -38,8 +38,8 @@ RATE_LIMIT_BURST="${RATE_LIMIT_BURST:-512000}"
 # Prevent shell injection via SSH commands and TOML config corruption.
 [[ "${RELAY_HOSTNAME}" =~ ^[a-zA-Z0-9._-]+$ ]] \
     || { echo "ERROR: RELAY_HOSTNAME must be a valid hostname (alphanumeric, dots, hyphens)"; exit 1; }
-[[ "${CONTACT_EMAIL}" =~ ^[a-zA-Z0-9._%+@-]+$ ]] \
-    || { echo "ERROR: CONTACT_EMAIL must be a valid email address (alphanumeric plus . _ % + @ -)"; exit 1; }
+[[ "${CONTACT_EMAIL}" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$ ]] \
+    || { echo "ERROR: CONTACT_EMAIL must be a valid email address (user@domain.tld)"; exit 1; }
 # Validate LOCAL_BINARY early: if set but missing, fail now rather than
 # falling through to the build paths with unvalidated IROH_VERSION/IROH_REPO.
 if [ -n "${LOCAL_BINARY}" ] && [ ! -f "${LOCAL_BINARY}" ]; then
