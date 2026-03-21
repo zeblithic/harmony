@@ -111,16 +111,18 @@ fi
 # ── Step 4: Build iroh-relay ──────────────────────────────────────
 # Three strategies, in order of preference:
 #   1. Use a pre-built binary (LOCAL_BINARY env var)
-#   2. Build locally and SCP (if cargo is available — fast, ~2 min)
+#   2. Build locally and SCP (if host is x86_64-linux and cargo available)
 #   3. Build on the VM (slow, ~15 min on e2-micro)
 
 BINARY_PATH=""
+BUILD_STRATEGY=""
 
 if [ -n "$LOCAL_BINARY" ] && [ -f "$LOCAL_BINARY" ]; then
     echo "--- Step 4: Using pre-built binary: ${LOCAL_BINARY}"
     BINARY_PATH="$LOCAL_BINARY"
+    BUILD_STRATEGY="prebuilt"
 
-elif command -v cargo &>/dev/null; then
+elif command -v cargo &>/dev/null && [ "$(uname -sm)" = "Linux x86_64" ]; then
     echo "--- Step 4: Building iroh-relay locally (faster than remote build)..."
     BUILD_DIR="/tmp/iroh-relay-build"
     if [ ! -d "$BUILD_DIR" ]; then
@@ -135,10 +137,17 @@ elif command -v cargo &>/dev/null; then
     cargo build --release --manifest-path "$BUILD_DIR/Cargo.toml" \
         -p iroh-relay --features server --bin iroh-relay
     BINARY_PATH="$BUILD_DIR/target/release/iroh-relay"
+    BUILD_STRATEGY="local"
     echo "    Local build complete."
 
 else
+    if command -v cargo &>/dev/null; then
+        echo "--- Step 4: Local Rust found but host arch ($(uname -sm)) != VM (Linux x86_64)."
+        echo "    Falling back to remote build..."
+    fi
     echo "--- Step 4: No local Rust — building on VM (slow, ~15 min on e2-micro)..."
+
+    BUILD_STRATEGY="remote"
 
     # Install build deps on VM
     echo "    Installing build dependencies..."
@@ -174,7 +183,7 @@ fi
 # ── Step 5: Upload binary and install service ─────────────────────
 echo "--- Step 5: Installing iroh-relay service..."
 
-# Upload binary if we built locally
+# Upload binary if we built locally or have a pre-built one
 if [ -n "$BINARY_PATH" ]; then
     echo "    Uploading binary to VM..."
     gcloud compute scp "$BINARY_PATH" "$VM_NAME:/tmp/iroh-relay" --zone="$GCP_ZONE"
@@ -182,16 +191,16 @@ if [ -n "$BINARY_PATH" ]; then
         sudo mv -f /tmp/iroh-relay /usr/local/bin/iroh-relay
         sudo chmod +x /usr/local/bin/iroh-relay
     "
+elif [ "$BUILD_STRATEGY" = "remote" ]; then
+    # Install from remote build directory
+    gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
+        sudo cp -f /tmp/iroh-build/target/release/iroh-relay /usr/local/bin/iroh-relay
+        sudo chmod +x /usr/local/bin/iroh-relay
+    "
 fi
 
 gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
     set -euo pipefail
-
-    # If remote build, install binary from build dir
-    if [ -f /tmp/iroh-build/target/release/iroh-relay ]; then
-        sudo cp -f /tmp/iroh-build/target/release/iroh-relay /usr/local/bin/iroh-relay
-        sudo chmod +x /usr/local/bin/iroh-relay
-    fi
 
     # Verify binary exists
     /usr/local/bin/iroh-relay --help > /dev/null 2>&1 || {
