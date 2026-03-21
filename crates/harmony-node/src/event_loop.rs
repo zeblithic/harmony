@@ -74,11 +74,12 @@ impl ConfigTunnelPeers {
         if let Some(peer) = self.peers.iter_mut().find(|p| p.interface_name == interface_name) {
             peer.connected = false;
             // Schedule retry at current backoff, THEN double for next time.
-            peer.next_retry = Some(tokio::time::Instant::now() + peer.backoff);
+            let retry_delay = peer.backoff;
+            peer.next_retry = Some(tokio::time::Instant::now() + retry_delay);
             peer.backoff = (peer.backoff * 2).min(MAX_BACKOFF);
             tracing::info!(
                 %interface_name,
-                backoff_secs = peer.backoff.as_secs(),
+                retry_in_secs = retry_delay.as_secs(),
                 "config tunnel disconnected — scheduling reconnect"
             );
         }

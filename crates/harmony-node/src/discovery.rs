@@ -106,6 +106,11 @@ impl PeerTable {
         let mut placeholder = [0xFEu8; 16]; // 0xFE prefix distinguishes from real addresses
         placeholder[..8].copy_from_slice(&hash);
         if placeholder == self.our_addr {
+            tracing::warn!(peer = %addr, "bootstrap peer placeholder collides with our address — skipping");
+            return;
+        }
+        if !self.peers.contains_key(&addr) && self.peers.len() >= MAX_PEERS {
+            tracing::warn!(peer = %addr, "bootstrap peer not added: MAX_PEERS cap reached");
             return;
         }
         let now = Instant::now();
