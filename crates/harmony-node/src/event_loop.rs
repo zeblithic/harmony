@@ -84,7 +84,14 @@ pub async fn run(
     let mut next_connection_id: u64 = 0;
 
     // ── Ready-connection channel: QUIC handshake tasks → select loop ──────
-    let (conn_tx, mut conn_rx) = mpsc::channel::<ReadyConnection>(64);
+    // Sends Some(ReadyConnection) on success, None on handshake failure.
+    // None lets the event loop decrement inflight_handshakes even when the
+    // spawned task never produces a usable connection.
+    let (conn_tx, mut conn_rx) = mpsc::channel::<Option<ReadyConnection>>(64);
+    // Counts QUIC handshakes that have been spawned but have not yet delivered
+    // a result on conn_rx. Added to tunnel_senders.len() for the connection cap
+    // so a burst of simultaneous connects cannot all slip under the limit.
+    let mut inflight_handshakes: usize = 0;
 
     // ── iroh Endpoint (optional, gated on --relay-url) ─────────────────────
     let iroh_endpoint = if let Some(ref config) = tunnel_config {
@@ -268,13 +275,23 @@ pub async fn run(
                     TunnelBridgeEvent::HandshakeComplete {
                         interface_name,
                         peer_node_id,
-                        peer_dsa_pubkey: _, // TODO(harmony-h6k): store in contact registry for peer lifecycle
-                        connection_id: _, // informational — sender already registered
+                        peer_dsa_pubkey: _, // TODO(harmony-h6k): store in contact registry
+                        connection_id,
                     } => {
-                        runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
-                            interface_name,
-                            peer_node_id,
-                        });
+                        // Guard against stale handshake completions: only register the
+                        // interface if the connection_id still matches the current sender.
+                        // Without this, a delayed handshake from a previous connection
+                        // could double-register the router interface.
+                        let is_current = tunnel_senders
+                            .get(&interface_name)
+                            .map(|s| s.connection_id == connection_id)
+                            .unwrap_or(false);
+                        if is_current {
+                            runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
+                                interface_name,
+                                peer_node_id,
+                            });
+                        }
                     }
                     TunnelBridgeEvent::ReticulumReceived {
                         interface_name,
@@ -326,13 +343,16 @@ pub async fn run(
             } => {
                 if let Some(incoming) = incoming {
                     // Check connection limit BEFORE spawning the handshake task.
-                    if tunnel_senders.len() >= MAX_TUNNEL_CONNECTIONS {
+                    // Include inflight handshakes so a burst of simultaneous
+                    // connects cannot all pass before any completes.
+                    if tunnel_senders.len() + inflight_handshakes >= MAX_TUNNEL_CONNECTIONS {
                         eprintln!("[event_loop] tunnel connection limit ({MAX_TUNNEL_CONNECTIONS}) reached — rejecting");
                         drop(incoming); // sends QUIC RESET
                     } else {
                         let conn_id = next_connection_id;
                         next_connection_id += 1;
                         let conn_tx = conn_tx.clone();
+                        inflight_handshakes += 1;
 
                         match incoming.accept() {
                             Ok(connecting) => {
@@ -349,17 +369,27 @@ pub async fn run(
                                                     rand::random::<u32>()
                                                 ),
                                             };
-                                            let _ = conn_tx.send(ReadyConnection {
+                                            let _ = conn_tx.send(Some(ReadyConnection {
                                                 connection,
                                                 connection_id: conn_id,
                                                 interface_name: iface,
-                                            }).await;
+                                            })).await;
                                         }
-                                        Err(e) => eprintln!("[event_loop] QUIC handshake failed: {e}"),
+                                        Err(e) => {
+                                            eprintln!("[event_loop] QUIC handshake failed: {e}");
+                                            // Signal failure so the event loop can decrement
+                                            // inflight_handshakes even though no connection arrived.
+                                            let _ = conn_tx.send(None).await;
+                                        }
                                     }
                                 });
                             }
-                            Err(e) => eprintln!("[event_loop] iroh accept error: {e}"),
+                            Err(e) => {
+                                eprintln!("[event_loop] iroh accept error: {e}");
+                                // accept() failed synchronously — no task was spawned, so
+                                // decrement the counter we just incremented.
+                                inflight_handshakes = inflight_handshakes.saturating_sub(1);
+                            }
                         }
                     }
                 }
@@ -367,24 +397,37 @@ pub async fn run(
 
             // Arm 6: Ready connection from QUIC handshake task — spawn tunnel.
             ready = conn_rx.recv() => {
-                if let Some(ReadyConnection { connection, connection_id, interface_name }) = ready {
-                    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-                    tunnel_senders.insert(
-                        interface_name.clone(),
-                        TunnelSender::new(cmd_tx, connection_id),
-                    );
+                match ready {
+                    Some(Some(ReadyConnection { connection, connection_id, interface_name })) => {
+                        inflight_handshakes = inflight_handshakes.saturating_sub(1);
+                        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+                        tunnel_senders.insert(
+                            interface_name.clone(),
+                            TunnelSender::new(cmd_tx, connection_id),
+                        );
 
-                    let tx = tunnel_tx.clone();
-                    let identity =
-                        tunnel_config.as_ref().unwrap().local_identity.clone();
-                    let iface_clone = interface_name.clone();
-                    tokio::spawn(async move {
-                        tunnel_task::run_responder(
-                            connection, &identity, tx, cmd_rx, iface_clone, connection_id,
-                        )
-                        .await;
-                    });
-                    eprintln!("[{interface_name}] accepted incoming tunnel");
+                        let tx = tunnel_tx.clone();
+                        let identity =
+                            tunnel_config.as_ref().unwrap().local_identity.clone();
+                        let iface_clone = interface_name.clone();
+                        tokio::spawn(async move {
+                            tunnel_task::run_responder(
+                                connection, &identity, tx, cmd_rx, iface_clone, connection_id,
+                            )
+                            .await;
+                        });
+                        eprintln!("[{interface_name}] accepted incoming tunnel");
+                    }
+                    Some(None) => {
+                        // Handshake failed — decrement the inflight counter so future
+                        // connections are not incorrectly blocked by the ghost slot.
+                        inflight_handshakes = inflight_handshakes.saturating_sub(1);
+                    }
+                    None => {
+                        // Channel closed — should not happen while the loop is live.
+                        eprintln!("[event_loop] ready-connection channel closed");
+                        break;
+                    }
                 }
             }
 

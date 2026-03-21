@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Note:** The `- [ ]` checkboxes below are execution tracking markers for the agentic worker, not persistent TODO items. Task tracking uses `bd` (beads) — see bead `harmony-dgb`.
+
 **Goal:** Wire iroh-net into the harmony-node async event loop so tunnel peers can connect via QUIC, with automatic relay fallback and hole-punching.
 
 **Architecture:** The iroh `Endpoint` runs alongside the existing UDP socket and Zenoh session. A bridge channel (like the existing Zenoh bridge) forwards tunnel events from spawned per-connection tasks to the main `select!` loop. Each tunnel connection spawns a task that drives a `TunnelSession` state machine, converting between iroh `Connection` streams and `TunnelEvent`/`TunnelAction`. When a tunnel completes its PQ handshake, the event loop registers a virtual Reticulum interface (`PointToPoint` mode) and a Zenoh session for the peer.
