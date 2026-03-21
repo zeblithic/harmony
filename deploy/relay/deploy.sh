@@ -6,9 +6,13 @@
 #
 # Prerequisites:
 #   - gcloud CLI authenticated (gcloud auth login)
-#   - Rust toolchain installed (for building iroh-relay)
+#   - A GCP project with billing enabled
+#   - A domain with DNS you control
 #   - DNS: After this script runs, point RELAY_HOSTNAME's A record
 #     at the printed static IP address.
+#
+# Note: Rust is installed on the remote VM automatically — no local
+# Rust toolchain needed for automated deployment.
 
 set -euo pipefail
 
@@ -20,6 +24,7 @@ GCP_REGION="${GCP_REGION:-us-west1}"
 VM_NAME="${VM_NAME:-harmony-relay}"
 MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
 IROH_REPO="${IROH_REPO:-https://github.com/n0-computer/iroh.git}"
+IROH_VERSION="${IROH_VERSION:-v0.35.0}"
 CONTACT_EMAIL="${CONTACT_EMAIL:-admin@${RELAY_HOSTNAME}}"
 
 # Rate limits (bytes/sec). Defaults: 100 KB/s sustained, 500 KB burst.
@@ -83,13 +88,20 @@ else
     echo "    Created VM: $VM_NAME"
 
     echo "    Waiting for SSH to become available..."
+    ssh_ready=0
     for i in $(seq 1 30); do
         if gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" \
             --command="echo ready" &>/dev/null; then
+            ssh_ready=1
             break
         fi
         sleep 5
     done
+    if [ "$ssh_ready" -eq 0 ]; then
+        echo "ERROR: VM SSH not available after 150s. Check VM logs:"
+        echo "  gcloud compute instances get-serial-port-output $VM_NAME --zone=$GCP_ZONE"
+        exit 1
+    fi
 fi
 
 # ── Step 4: Install build tools on VM ─────────────────────────────
@@ -109,9 +121,11 @@ echo "--- Building iroh-relay on VM (this takes a few minutes)..."
 gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
     source \"\$HOME/.cargo/env\"
     if [ ! -d /tmp/iroh-build ]; then
-        git clone --depth=1 '${IROH_REPO}' /tmp/iroh-build
+        git clone --depth=1 --branch '${IROH_VERSION}' '${IROH_REPO}' /tmp/iroh-build
     else
-        cd /tmp/iroh-build && git pull --ff-only
+        cd /tmp/iroh-build
+        git fetch --depth=1 origin '${IROH_VERSION}'
+        git checkout FETCH_HEAD
     fi
     cd /tmp/iroh-build
     cargo build --release -p iroh-relay --features server --bin iroh-relay
