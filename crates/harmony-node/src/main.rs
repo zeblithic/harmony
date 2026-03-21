@@ -1,4 +1,5 @@
 mod compute;
+mod config;
 mod discovery;
 mod event_loop;
 mod identity_file;
