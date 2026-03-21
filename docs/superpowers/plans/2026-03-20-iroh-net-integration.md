@@ -2,17 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Note:** The `- [ ]` checkboxes below are execution tracking markers for the agentic worker, not persistent TODO items. Task tracking uses `bd` (beads) — see bead `harmony-dgb`.
 **Goal:** Wire iroh-net into the harmony-node async event loop so tunnel peers can connect via QUIC, with automatic relay fallback and hole-punching.
 
 **Architecture:** The iroh `Endpoint` runs alongside the existing UDP socket and Zenoh session. A bridge channel (like the existing Zenoh bridge) forwards tunnel events from spawned per-connection tasks to the main `select!` loop. Each tunnel connection spawns a task that drives a `TunnelSession` state machine, converting between iroh `Connection` streams and `TunnelEvent`/`TunnelAction`. When a tunnel completes its PQ handshake, the event loop registers a virtual Reticulum interface (`PointToPoint` mode) and a Zenoh session for the peer.
 
-**Tech Stack:** `iroh` 0.96 (Endpoint, Connection, SecretKey, RelayMode), `harmony-tunnel` (TunnelSession), tokio (select!, mpsc, spawn_local)
+**Tech Stack:** `iroh` 0.91 (Endpoint, Connection, SecretKey, RelayMode — 0.96 has ml-dsa digest-chain conflicts), `harmony-tunnel` (TunnelSession), tokio (select!, mpsc, spawn_local)
 
 **Spec:** `docs/superpowers/specs/2026-03-20-tunnel-peer-infrastructure-design.md` — Section 2
 
 **Scope:** This plan covers **Bead harmony-dgb** only. Beads #3-5 (peer lifecycle, discovery hints, relay deployment) have separate plans.
 
-**MSRV note:** iroh 0.96 requires MSRV 1.89 / edition 2024. Our workspace MSRV is 1.85 / edition 2021. This works because iroh is a *dependency*, not a workspace member — Cargo applies the dependency's own edition/MSRV rules when compiling it. Our local rustc is 1.92 which satisfies iroh's 1.89 requirement. The workspace `rust-version = "1.85"` in `Cargo.toml` applies only to our own crates.
+**MSRV note:** iroh 0.91 requires MSRV 1.82 / edition 2021. Our workspace MSRV is 1.85 / edition 2021. This works because iroh is a *dependency*, not a workspace member — Cargo applies the dependency's own edition/MSRV rules when compiling it. The workspace `rust-version = "1.85"` in `Cargo.toml` applies only to our own crates.
 
 ---
 
@@ -44,7 +45,7 @@ crates/harmony-node/
 In `Cargo.toml` (workspace root), under `[workspace.dependencies]` in the `# Networking` section:
 
 ```toml
-iroh = "0.96"
+iroh = "0.91"
 ```
 
 - [ ] **Step 2: Add iroh + harmony-tunnel to harmony-node deps**

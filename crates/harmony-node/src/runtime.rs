@@ -137,6 +137,19 @@ pub enum RuntimeEvent {
         cid: [u8; 32],
         result: Result<Vec<u8>, String>,
     },
+    /// A tunnel handshake completed — register as a point-to-point interface.
+    TunnelHandshakeComplete {
+        interface_name: String,
+        peer_node_id: [u8; 32],
+    },
+    /// A Reticulum packet arrived via a tunnel interface.
+    TunnelReticulumReceived {
+        interface_name: String,
+        packet: Vec<u8>,
+        now: u64,
+    },
+    /// A tunnel was closed.
+    TunnelClosed { interface_name: String },
     /// Peer lifecycle: a tunnel connection has been established to a peer.
     TunnelPeerEstablished {
         identity_hash: [u8; 16],
@@ -645,6 +658,36 @@ impl<B: BookStore> NodeRuntime<B> {
                 };
                 let actions = self.workflow.handle(event);
                 self.pending_workflow_actions.extend(actions);
+            }
+            RuntimeEvent::TunnelHandshakeComplete {
+                interface_name,
+                peer_node_id,
+            } => {
+                tracing::info!(
+                    %interface_name,
+                    peer = %hex::encode(&peer_node_id[..4]),
+                    "tunnel handshake complete"
+                );
+                self.router.register_interface(
+                    interface_name,
+                    harmony_reticulum::InterfaceMode::PointToPoint,
+                    None,
+                );
+            }
+            RuntimeEvent::TunnelReticulumReceived {
+                interface_name,
+                packet,
+                now,
+            } => {
+                self.router_queue.push_back(NodeEvent::InboundPacket {
+                    interface_name,
+                    raw: packet,
+                    now,
+                });
+            }
+            RuntimeEvent::TunnelClosed { interface_name } => {
+                tracing::info!(%interface_name, "tunnel closed — interface unregistered");
+                self.router.unregister_interface(&interface_name);
             }
             RuntimeEvent::TunnelPeerEstablished {
                 identity_hash,
