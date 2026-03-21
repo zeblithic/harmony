@@ -164,13 +164,10 @@ extra-trusted-public-keys = ${CACHE_PUB_KEY}"
         echo "    Closure pushed."
     fi
 
-    # Sign the entire closure on the VM if a cache signing key exists.
-    # Uses nix-store --sign (stable CLI) instead of nix store sign (requires nix-command).
-    gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
-        if [ -f /etc/nix/cache-key.pem ]; then
-            nix-store -qR '$STORE_PATH' | xargs sudo nix-store --sign --key-file /etc/nix/cache-key.pem
-        fi
-    "
+    # No explicit signing step needed — nix-serve signs NARs on-the-fly
+    # when NIX_SECRET_KEY_FILE is set in its systemd unit (configured by
+    # nix-cache-setup.sh). This avoids the nix-store --sign / nix store sign
+    # CLI compatibility issue entirely.
 
     BUILD_STRATEGY="nix"
     echo "    Nix build strategy complete."

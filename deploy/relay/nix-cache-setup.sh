@@ -107,7 +107,10 @@ ExecStart=${NIX_SERVE_BIN} --listen 0.0.0.0:5000
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
-ProtectSystem=strict
+# ProtectSystem=full (not strict) — nix-serve needs access to the Nix
+# daemon socket at /nix/var/nix/daemon-socket/socket for store queries.
+# strict would mount / read-only and block the socket connect().
+ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
 
