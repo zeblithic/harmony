@@ -11,6 +11,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
 
+use crate::discovery::{self, PeerTable};
 use crate::runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
 
 /// Internal bridge events from spawned Zenoh tasks to the select loop.
@@ -48,6 +49,8 @@ pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
     listen_addr: SocketAddr,
+    mdns_addr: Option<[u8; 16]>,
+    mdns_stale_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -55,6 +58,28 @@ pub async fn run(
     let broadcast_addr: SocketAddr = format!("255.255.255.255:{}", listen_addr.port())
         .parse()
         .expect("static broadcast addr");
+
+    // ── mDNS peer discovery (optional) ──────────────────────────────────────
+    let mut peer_table = PeerTable::new(
+        mdns_addr.unwrap_or([0; 16]),
+        mdns_stale_timeout,
+    );
+    let mdns_state = match mdns_addr {
+        Some(addr) => match discovery::start_mdns(listen_addr.port(), &addr) {
+            Ok((daemon, rx)) => {
+                tracing::info!("mDNS discovery started on _harmony._udp.local.");
+                Some((daemon, rx))
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "mDNS discovery failed to start — broadcast only");
+                None
+            }
+        },
+        None => {
+            tracing::info!("mDNS discovery disabled (--no-mdns)");
+            None
+        }
+    };
 
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
@@ -70,6 +95,7 @@ pub async fn run(
             &zenoh_tx,
             &udp,
             &broadcast_addr,
+            None,
         )
         .await;
     }
@@ -139,7 +165,8 @@ pub async fn run(
             // Arm 1: UDP packet received — buffer only, tick on timer.
             result = udp.recv_from(&mut udp_buf) => {
                 match result {
-                    Ok((len, _src)) => {
+                    Ok((len, src)) => {
+                        peer_table.mark_seen(&src);
                         runtime.push_event(RuntimeEvent::InboundPacket {
                             interface_name: "udp0".to_string(),
                             raw: udp_buf[..len].to_vec(),
@@ -161,6 +188,9 @@ pub async fn run(
             _ = timer.tick() => {
                 runtime.push_event(RuntimeEvent::TimerTick { now: now_ms() });
                 should_tick = true;
+                for addr in peer_table.evict_stale() {
+                    tracing::info!(peer = %addr, "evicted stale mDNS peer");
+                }
             }
 
             // Arm 3: Zenoh bridge event — buffer only, tick on timer.
@@ -197,6 +227,47 @@ pub async fn run(
                 }
             }
 
+            // Arm 5: mDNS discovery events (when enabled).
+            Some(event) = async {
+                match &mdns_state {
+                    Some((_, rx)) => rx.recv_async().await.ok(),
+                    None => std::future::pending::<Option<mdns_sd::ServiceEvent>>().await,
+                }
+            } => {
+                match event {
+                    mdns_sd::ServiceEvent::ServiceResolved(info) => {
+                        let properties = info.get_properties();
+                        if let Some(reticulum_addr) = discovery::parse_txt_addr(properties) {
+                            let proto = discovery::parse_txt_proto(properties);
+                            for ip in info.get_addresses() {
+                                let socket_addr = SocketAddr::new(ip.to_ip_addr(), info.get_port());
+                                if peer_table.add_peer(socket_addr, reticulum_addr, proto) {
+                                    tracing::info!(
+                                        peer = %socket_addr,
+                                        addr = %hex::encode(reticulum_addr),
+                                        proto,
+                                        "mDNS peer discovered"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    mdns_sd::ServiceEvent::ServiceRemoved(_service_type, fullname) => {
+                        if let Some(reticulum_addr) = discovery::parse_instance_addr(&fullname) {
+                            let removed = peer_table.remove_by_reticulum_addr(&reticulum_addr);
+                            if removed > 0 {
+                                tracing::info!(
+                                    addr = %hex::encode(reticulum_addr),
+                                    removed,
+                                    "mDNS peer removed (goodbye)"
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             // Arm 4: Graceful shutdown (SIGTERM from procd, Ctrl+C).
             _ = &mut shutdown => {
                 break;
@@ -213,8 +284,14 @@ pub async fn run(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
-                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr).await;
+                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, Some(&peer_table)).await;
             }
+        }
+    }
+
+    if let Some((daemon, _)) = mdns_state {
+        if let Err(e) = daemon.shutdown() {
+            tracing::warn!(err = %e, "mDNS shutdown error");
         }
     }
 
@@ -228,15 +305,23 @@ async fn dispatch_action(
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
     udp: &UdpSocket,
     broadcast_addr: &SocketAddr,
+    peer_table: Option<&PeerTable>,
 ) {
     match action {
-        // ── Tier 1: UDP broadcast ─────────────────────────────────────────────
+        // ── Tier 1: UDP broadcast + unicast fan-out ───────────────────────────
         // Awaited inline (not spawned) because tokio::net::UdpSocket is not
         // Clone. For Reticulum's small MTU (≤1024 bytes), send_to is
         // effectively non-blocking on a UDP socket with default buffer sizes.
         RuntimeAction::SendOnInterface { raw, .. } => {
             if let Err(e) = udp.send_to(&raw, broadcast_addr).await {
-                tracing::warn!(err = %e, "UDP send error");
+                tracing::warn!(err = %e, "UDP broadcast send error");
+            }
+            if let Some(peers) = peer_table {
+                for addr in peers.peer_addrs() {
+                    if let Err(e) = udp.send_to(&raw, addr).await {
+                        tracing::warn!(peer = %addr, err = %e, "UDP unicast send error");
+                    }
+                }
             }
         }
 

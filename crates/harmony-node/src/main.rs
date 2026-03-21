@@ -49,6 +49,12 @@ enum Commands {
         /// UDP listen address for Reticulum mesh packets
         #[arg(long, default_value = "0.0.0.0:4242")]
         listen_address: String,
+        /// Disable mDNS peer discovery (broadcast-only mode)
+        #[arg(long)]
+        no_mdns: bool,
+        /// Seconds before evicting a silent mDNS peer (default: 60)
+        #[arg(long, default_value_t = 60)]
+        mdns_stale_timeout: u64,
     },
 }
 
@@ -193,6 +199,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             filter_mutation_threshold,
             identity_file,
             listen_address,
+            no_mdns,
+            mdns_stale_timeout,
         } => {
             use crate::runtime::{NodeConfig, NodeRuntime};
             use harmony_compute::InstructionBudget;
@@ -239,7 +247,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Load or generate node identity (after validation so bad flags exit fast).
             let id_path = crate::identity_file::resolve_path(identity_file.as_deref())?;
             let identity = crate::identity_file::load_or_generate(&id_path)?;
-            let node_addr = hex::encode(identity.ed25519.public_identity().address_hash);
+            let our_addr_bytes: [u8; 16] = identity.ed25519.public_identity().address_hash;
+            let node_addr = hex::encode(our_addr_bytes);
             tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
             drop(identity); // key material no longer needed; zeroize-on-drop fires now
 
@@ -271,7 +280,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             tracing::info!(cache_capacity, compute_budget, %listen_addr, "harmony node starting");
 
-            crate::event_loop::run(rt, startup_actions, listen_addr).await
+            crate::event_loop::run(
+                rt,
+                startup_actions,
+                listen_addr,
+                if no_mdns { None } else { Some(our_addr_bytes) },
+                std::time::Duration::from_secs(mdns_stale_timeout),
+            ).await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
         }
