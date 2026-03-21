@@ -43,12 +43,15 @@ caching, and integrates with Nix's cross-compilation infrastructure.
 
 **harmony-node:** Built from the local workspace source. Crane
 builds the full workspace dependency tree, then compiles the
-`harmony-node` binary crate.
+`harmony-node` binary crate. Note: the Nix package is named
+`harmony-node` (matching the crate), but the installed binary
+is `harmony` (matching `[[bin]] name = "harmony"` in Cargo.toml).
 
 **iroh-relay:** Built from a pinned source fetch (GitHub archive
-at tag v0.91.2, matching the workspace's Cargo.lock). This is an
-external project — we fetch, build, and package it, but don't
-modify its source.
+at the tag matching the version in Cargo.lock — currently v0.91.2).
+Implementer must verify the exact version from `Cargo.lock` before
+writing the flake. This is an external project — we fetch, build,
+and package it, but don't modify its source.
 
 **Cross-compilation:** Uses Nix's `pkgsCross` infrastructure to
 cross-compile for Linux targets from any host (including macOS).
@@ -85,7 +88,9 @@ The build strategy in `deploy/relay/deploy.sh` becomes four tiers:
 4. **Remote build on VM** — unchanged fallback for hosts without Nix
 
 The architecture check (`uname -sm == Linux x86_64`) is removed —
-Nix cross-compiles correctly regardless of host platform.
+Nix cross-compiles correctly regardless of host platform. The
+fallback echo message is updated to say "No Nix found" instead
+of referencing the old arch check.
 
 ### Updated Detection Logic
 
@@ -96,8 +101,10 @@ elif command -v nix &>/dev/null; then
     # Tier 2: nix build (cross-compiles for target)
     nix build .#iroh-relay
     BINARY_PATH="./result/bin/iroh-relay"
+# Tier 3 (reserved for harmony-m5y): fetch from Nix/Zenoh cache
 else
-    # Tier 4: remote build on VM (slow fallback)
+    # Tier 3 (current): remote build on VM — no Nix available
+    echo "No Nix found — building on VM (slow, ~15 min on e2-micro)..."
 fi
 ```
 
@@ -121,7 +128,8 @@ fi
 - `nix build .#harmony-node` produces a working ELF binary
 - `nix build .#iroh-relay` produces a working ELF binary
 - `nix flake check` passes
-- `file result/bin/harmony-node` confirms ELF x86_64 (not Mach-O)
+- `file result/bin/harmony` confirms ELF x86_64 (not Mach-O)
+  (binary is named `harmony`, not `harmony-node`)
 - Deploy script uses Nix-built binary successfully
 
 ## Future: Connection to harmony-m5y
