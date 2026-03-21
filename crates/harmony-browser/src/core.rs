@@ -117,7 +117,7 @@ impl BrowserCore {
                 Ok(children) => children
                     .iter()
                     .find_map(|child| {
-                        if child.cid_type() == CidType::InlineMetadata {
+                        if child.is_sentinel() {
                             child
                                 .parse_inline_metadata()
                                 .ok()

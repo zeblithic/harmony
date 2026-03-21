@@ -3,12 +3,9 @@ use harmony_identity::IdentityHash;
 use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::contact::{Contact, PeeringPriority};
+use crate::contact::{Contact, ContactAddress, PeeringPriority};
 use crate::error::ContactError;
 
-// Bumped from 1 → 2: Contact gained `addresses: Vec<ContactAddress>`.
-// postcard is non-self-describing — `#[serde(default)]` is ineffective,
-// so v1 data cannot be deserialized into v2 structs.
 const FORMAT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +72,20 @@ impl ContactStore {
         self.contacts.iter()
     }
 
+    /// Find a contact by iroh tunnel NodeId.
+    ///
+    /// Used by the event loop to map `TunnelBridgeEvent::HandshakeComplete { peer_node_id }`
+    /// back to the contact's `identity_hash` for PeerManager notification.
+    /// Consumer: `harmony-node` event loop (harmony-dgb/harmony-h6k integration).
+    pub fn find_by_tunnel_node_id(&self, node_id: &[u8; 32]) -> Option<&Contact> {
+        self.contacts.values().find(|c| {
+            c.addresses.iter().any(|addr| match addr {
+                ContactAddress::Tunnel { node_id: id, .. } => id == node_id,
+                _ => false,
+            })
+        })
+    }
+
     pub fn serialize(&self) -> Result<Vec<u8>, ContactError> {
         let mut buf = Vec::new();
         buf.push(FORMAT_VERSION);
@@ -88,8 +99,15 @@ impl ContactStore {
         if data.is_empty() {
             return Err(ContactError::DeserializeError("empty data"));
         }
+        // Strict version check — postcard is a compact binary format with no
+        // support for default/missing fields, so v1 data (pre-addresses field)
+        // cannot be deserialized into v2 Contact structs. In practice, the
+        // contact store has never been persisted to disk; it's rebuilt from
+        // CLI args or discovery on each startup.
         if data[0] != FORMAT_VERSION {
-            return Err(ContactError::DeserializeError("unsupported format version"));
+            return Err(ContactError::DeserializeError(
+                "unsupported contact store format version (expected v2)",
+            ));
         }
         postcard::from_bytes(&data[1..])
             .map_err(|_| ContactError::DeserializeError("postcard decode failed"))
@@ -228,5 +246,51 @@ mod tests {
     fn deserialize_bad_data() {
         let result = ContactStore::deserialize(&[0xFF, 0xFF, 0xFF]);
         assert!(matches!(result, Err(ContactError::DeserializeError(_))));
+    }
+
+    #[test]
+    fn find_by_tunnel_node_id_finds_match() {
+        use crate::contact::ContactAddress;
+        let node_id = [0x42u8; 32];
+        let mut store = ContactStore::new();
+        let mut contact = make_contact(0xAA, true, PeeringPriority::Normal);
+        contact.addresses.push(ContactAddress::Tunnel {
+            node_id,
+            relay_url: None,
+            direct_addrs: vec![],
+        });
+        store.add(contact).unwrap();
+        let found = store.find_by_tunnel_node_id(&node_id);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().identity_hash, [0xAA; 16]);
+    }
+
+    #[test]
+    fn find_by_tunnel_node_id_no_match() {
+        use crate::contact::ContactAddress;
+        let node_id = [0x42u8; 32];
+        let other_node_id = [0x99u8; 32];
+        let mut store = ContactStore::new();
+        let mut contact = make_contact(0xBB, true, PeeringPriority::Normal);
+        contact.addresses.push(ContactAddress::Tunnel {
+            node_id,
+            relay_url: None,
+            direct_addrs: vec![],
+        });
+        store.add(contact).unwrap();
+        assert!(store.find_by_tunnel_node_id(&other_node_id).is_none());
+    }
+
+    #[test]
+    fn find_by_tunnel_node_id_skips_reticulum_addresses() {
+        use crate::contact::ContactAddress;
+        let node_id = [0x11u8; 32];
+        let mut store = ContactStore::new();
+        let mut contact = make_contact(0xCC, true, PeeringPriority::Normal);
+        contact.addresses.push(ContactAddress::Reticulum {
+            destination_hash: [0x11; 16],
+        });
+        store.add(contact).unwrap();
+        assert!(store.find_by_tunnel_node_id(&node_id).is_none());
     }
 }

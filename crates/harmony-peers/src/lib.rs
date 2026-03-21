@@ -7,4 +7,4 @@ pub mod state;
 
 pub use event::{PeerAction, PeerEvent};
 pub use manager::PeerManager;
-pub use state::{PeerState, PeerStatus};
+pub use state::{ConnectionQuality, PeerState, PeerStatus, Transport};

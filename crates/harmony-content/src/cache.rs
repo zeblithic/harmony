@@ -912,7 +912,8 @@ mod tests {
         let durable_flags = ContentFlags {
             encrypted: false,
             ephemeral: false,
-            alt_hash: false,
+            sha224: false,
+            lsb_mode: false,
         };
         let durable_cid = cs
             .insert_with_flags(b"durable-data", durable_flags)
@@ -922,7 +923,8 @@ mod tests {
         let ephemeral_flags = ContentFlags {
             encrypted: false,
             ephemeral: true,
-            alt_hash: false,
+            sha224: false,
+            lsb_mode: false,
         };
         let ephemeral_cid = cs
             .insert_with_flags(b"ephemeral-data", ephemeral_flags)

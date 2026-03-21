@@ -28,6 +28,88 @@ pub struct TunnelConfig {
     pub local_identity: Arc<PqPrivateIdentity>,
 }
 
+/// Tracks tunnel peers from the config file for persistent reconnection.
+/// Fields are populated now but actual reconnection is deferred to Bead harmony-h6k.
+#[allow(dead_code)]
+struct ConfigTunnelPeers {
+    peers: Vec<ConfigTunnelPeer>,
+}
+
+#[allow(dead_code)]
+struct ConfigTunnelPeer {
+    node_id: String,
+    name: Option<String>,
+    interface_name: String,
+    next_retry: Option<tokio::time::Instant>,
+    backoff: std::time::Duration,
+    connected: bool,
+}
+
+#[allow(dead_code)]
+const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+#[allow(dead_code)]
+const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[allow(dead_code)]
+impl ConfigTunnelPeers {
+    fn new(entries: Vec<crate::config::TunnelEntry>) -> Self {
+        Self {
+            peers: entries
+                .into_iter()
+                .map(|entry| ConfigTunnelPeer {
+                    interface_name: entry.name.clone()
+                        .map(|n| {
+                            // Clamp to IFNAMSIZ (15 bytes). Find the last valid
+                            // char boundary at or before byte 15 to avoid panic
+                            // on multi-byte UTF-8.
+                            if n.len() <= 15 {
+                                n
+                            } else {
+                                let mut end = 15;
+                                while end > 0 && !n.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                n[..end].to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            // "tc-" + 8 hex chars = 11 chars, within IFNAMSIZ (15)
+                            format!("tc-{}", &entry.node_id[..8.min(entry.node_id.len())])
+                        }),
+                    node_id: entry.node_id,
+                    name: entry.name,
+                    next_retry: Some(tokio::time::Instant::now()), // connect immediately
+                    backoff: INITIAL_BACKOFF,
+                    connected: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn mark_disconnected(&mut self, interface_name: &str) {
+        if let Some(peer) = self.peers.iter_mut().find(|p| p.interface_name == interface_name) {
+            peer.connected = false;
+            // Schedule retry at current backoff, THEN double for next time.
+            let retry_delay = peer.backoff;
+            peer.next_retry = Some(tokio::time::Instant::now() + retry_delay);
+            peer.backoff = (peer.backoff * 2).min(MAX_BACKOFF);
+            tracing::info!(
+                %interface_name,
+                retry_in_secs = retry_delay.as_secs(),
+                "config tunnel disconnected — scheduling reconnect"
+            );
+        }
+    }
+
+    fn mark_connected(&mut self, interface_name: &str) {
+        if let Some(peer) = self.peers.iter_mut().find(|p| p.interface_name == interface_name) {
+            peer.connected = true;
+            peer.backoff = INITIAL_BACKOFF;
+            peer.next_retry = None;
+        }
+    }
+}
+
 /// Internal bridge events from spawned Zenoh tasks to the select loop.
 enum ZenohEvent {
     /// Inbound Zenoh query (non-compute).
@@ -53,6 +135,9 @@ enum ZenohEvent {
 /// - `mdns_addr`: optional 16-byte Reticulum address for mDNS discovery (None = disabled).
 /// - `mdns_stale_timeout`: duration after which silent mDNS peers are evicted.
 /// - `tunnel_config`: optional iroh tunnel configuration (enables tunnel accept/connect).
+/// - `bootstrap_peers`: static peers from the config `[peers]` section; added to PeerTable
+///   at startup so they receive unicast traffic even when not reachable via mDNS.
+/// - `tunnel_entries`: config-sourced tunnel peers to track for reconnection.
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -60,6 +145,8 @@ pub async fn run(
     mdns_addr: Option<[u8; 16]>,
     mdns_stale_timeout: Duration,
     tunnel_config: Option<TunnelConfig>,
+    bootstrap_peers: Vec<SocketAddr>,
+    tunnel_entries: Vec<crate::config::TunnelEntry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -86,6 +173,15 @@ pub async fn run(
             None
         }
     };
+
+    // ── Bootstrap peers from config file ────────────────────────────────────
+    // Add each as a pinned peer — exempt from stale eviction so cross-subnet
+    // peers that never send us traffic are retained indefinitely. Each gets a
+    // unique placeholder Reticulum address derived from its socket address.
+    for peer_addr in &bootstrap_peers {
+        tracing::info!(peer = %peer_addr, "adding pinned bootstrap peer");
+        peer_table.add_pinned_peer(*peer_addr);
+    }
 
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
@@ -158,6 +254,11 @@ pub async fn run(
             relay_url,
         });
     }
+
+    // ConfigTunnelPeers tracks config-sourced tunnels and drives backoff reconnection.
+    // Actual outbound connection initiation is deferred to Bead harmony-h6k.
+    #[allow(unused_variables, unused_mut)]
+    let mut config_tunnels = ConfigTunnelPeers::new(tunnel_entries);
 
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
@@ -755,6 +856,42 @@ async fn dispatch_action(
                     tracing::error!(%key_expr, err = %e, "declare_subscriber failed");
                 }
             }
+        }
+
+        // ── Peer lifecycle: Tunnel initiation ─────────────────────────────────
+        // Stub — actual iroh-net Endpoint.connect() wiring deferred until
+        // tunnel infrastructure (tunnel_task.rs, tunnel_bridge.rs) is integrated.
+        RuntimeAction::InitiateTunnel {
+            identity_hash,
+            node_id,
+            relay_url,
+        } => {
+            tracing::info!(
+                identity = %hex::encode(identity_hash),
+                node_id = %hex::encode(&node_id[..8]),
+                relay = ?relay_url,
+                "InitiateTunnel requested (stub — iroh-net not yet wired)"
+            );
+        }
+
+        // ── Peer lifecycle: Path request ──────────────────────────────────────
+        // Stub — announce probing will be wired when path request packets are
+        // implemented in the Reticulum router.
+        RuntimeAction::SendPathRequest { identity_hash } => {
+            tracing::debug!(
+                identity = %hex::encode(identity_hash),
+                "SendPathRequest (stub)"
+            );
+        }
+        RuntimeAction::CloseTunnel { identity_hash } => {
+            // TODO: look up tunnel_sender by identity_hash (via tunnel_identities map)
+            // and send TunnelCommand::Close. Requires the tunnel_identities map to be
+            // accessible here, which will be wired when the full tunnel lifecycle is
+            // integrated with the event loop's tunnel infrastructure.
+            tracing::debug!(
+                identity = %hex::encode(identity_hash),
+                "CloseTunnel (stub)"
+            );
         }
     }
 }

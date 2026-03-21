@@ -9,11 +9,14 @@ pub enum ContentError {
     #[error("invalid CID: checksum mismatch")]
     ChecksumMismatch,
 
-    #[error("invalid CID: child depth {child} must be less than parent depth {parent}")]
+    #[error("invalid CID: child depth {child} exceeds maximum bundle depth {parent}")]
     DepthViolation { child: u8, parent: u8 },
 
-    #[error("not an inline metadata CID")]
-    NotInlineMetadata,
+    #[error("not an inline data CID")]
+    NotInlineData,
+
+    #[error("invalid content flags: inline mode is incompatible with this CID type")]
+    InvalidFlags,
 
     #[error("invalid bundle length: {len} is not a multiple of 32")]
     InvalidBundleLength { len: usize },
@@ -35,4 +38,7 @@ pub enum ContentError {
 
     #[error("invalid delta: {reason}")]
     InvalidDelta { reason: &'static str },
+
+    #[error("chunk index {index} exceeds maximum {max}")]
+    ChunkIndexTooLarge { index: u32, max: u32 },
 }

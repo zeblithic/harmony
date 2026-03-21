@@ -3,16 +3,12 @@ use alloc::vec::Vec;
 use harmony_identity::IdentityHash;
 use serde::{Deserialize, Serialize};
 
-/// A reachable address for a contact.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ContactAddress {
-    /// iroh-net tunnel: NodeId + optional relay + optional direct addresses.
+    Reticulum { destination_hash: [u8; 16] },
     Tunnel {
-        /// iroh NodeId (32 bytes).
         node_id: [u8; 32],
-        /// Preferred relay server URL (e.g., "https://iroh.q8.fyi").
         relay_url: Option<String>,
-        /// Known direct socket addresses (ephemeral, may be stale).
         direct_addrs: Vec<String>,
     },
 }
@@ -25,9 +21,6 @@ pub struct Contact {
     pub added_at: u64,
     pub last_seen: Option<u64>,
     pub notes: Option<String>,
-    /// Network addresses where this contact can be reached.
-    /// Note: `#[serde(default)]` is ineffective with postcard (non-self-describing).
-    /// Backward compat is handled by FORMAT_VERSION gating in ContactStore.
     pub addresses: Vec<ContactAddress>,
 }
 
@@ -130,5 +123,67 @@ mod tests {
             &contact.addresses[0],
             ContactAddress::Tunnel { node_id, .. } if *node_id == [0xEE; 32]
         ));
+    }
+
+    #[test]
+    fn contact_address_serde_round_trip() {
+        let reticulum_addr = ContactAddress::Reticulum {
+            destination_hash: [0x11; 16],
+        };
+        let bytes = postcard::to_allocvec(&reticulum_addr).unwrap();
+        let decoded: ContactAddress = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, reticulum_addr);
+
+        let tunnel_addr = ContactAddress::Tunnel {
+            node_id: [0x22; 32],
+            relay_url: Some("https://relay.example.com".into()),
+            direct_addrs: vec!["192.168.1.1:1234".into(), "10.0.0.1:5678".into()],
+        };
+        let bytes = postcard::to_allocvec(&tunnel_addr).unwrap();
+        let decoded: ContactAddress = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, tunnel_addr);
+
+        let tunnel_addr_no_relay = ContactAddress::Tunnel {
+            node_id: [0x33; 32],
+            relay_url: None,
+            direct_addrs: vec![],
+        };
+        let bytes = postcard::to_allocvec(&tunnel_addr_no_relay).unwrap();
+        let decoded: ContactAddress = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, tunnel_addr_no_relay);
+    }
+
+    #[test]
+    fn contact_with_addresses_serde_round_trip() {
+        let contact = Contact {
+            identity_hash: [0x55; 16],
+            display_name: Some("Charlie".into()),
+            peering: PeeringPolicy {
+                enabled: true,
+                priority: PeeringPriority::High,
+            },
+            added_at: 1710000000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![
+                ContactAddress::Reticulum {
+                    destination_hash: [0xAA; 16],
+                },
+                ContactAddress::Tunnel {
+                    node_id: [0xBB; 32],
+                    relay_url: Some("https://relay.example.com".into()),
+                    direct_addrs: vec!["127.0.0.1:1234".into()],
+                },
+            ],
+        };
+        let bytes = postcard::to_allocvec(&contact).unwrap();
+        let decoded: Contact = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.addresses.len(), 2);
+        assert_eq!(
+            decoded.addresses[0],
+            ContactAddress::Reticulum {
+                destination_hash: [0xAA; 16]
+            }
+        );
     }
 }

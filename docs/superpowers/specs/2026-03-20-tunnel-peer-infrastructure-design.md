@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-20
 **Status:** Draft
-**Scope:** `harmony-tunnel` crate, `harmony-node` iroh-net integration, `iroh.q8.fyi` relay, `harmony-peers` tunnel lifecycle, `harmony-discovery` tunnel routing hints
+**Scope:** `harmony-tunnel` crate, `harmony-node` iroh-net integration, `i.q8.fyi` relay, `harmony-peers` tunnel lifecycle, `harmony-discovery` tunnel routing hints
 
 ## Overview
 
@@ -21,7 +21,7 @@ The design follows Harmony's sans-I/O paradigm: all protocol logic lives in pure
 | Relay identity | NodeId derived from BLAKE3(ML-DSA-65 signing key)[:32] seed | Stock iroh-relay, no fork needed; relay routes by opaque key hash |
 | Handshake | ML-KEM encaps + ML-DSA mutual auth → HKDF-SHA256 → ChaCha20-Poly1305 | Simple, PQ-native, reuses existing HKDF-SHA256 impl |
 | Relay access | Open baseline + reputation bonus | Anyone can bootstrap; trust scores unlock higher limits |
-| Relay domain | `iroh.q8.fyi` | User-owned domain, dedicated to Harmony IP-bridge infrastructure |
+| Relay domain | `i.q8.fyi` | User-owned domain, dedicated to Harmony IP-bridge infrastructure |
 
 ## Section 1: `harmony-tunnel` Crate — PQ Tunnel State Machine
 
@@ -150,7 +150,7 @@ At node startup (if tunnel support is configured):
 
 - Create an `iroh::Endpoint` with:
   - `SecretKey` seeded from PQ identity: `BLAKE3(ml_dsa_65_signing_key)[:32]` — iroh derives `NodeId` from this seed via Ed25519 key derivation. Used **only** for iroh-net internal addressing, **not** for Harmony authentication
-  - Relay URL: `https://iroh.q8.fyi` (configurable via CLI `--relay-url` or TOML config)
+  - Relay URL: `https://i.q8.fyi` (configurable via CLI `--relay-url` or TOML config)
   - ALPN: `b"harmony-tunnel/1"`
 - If no relay URL and no tunnel contacts are configured, iroh-net is not started (zero overhead)
 
@@ -184,7 +184,7 @@ On `HandshakeComplete(peer_identity)`, the event loop:
 - Tunnel drops → PeerManager handles reconnection with exponential backoff
 - iroh-net reports direct address upgrade → connection silently migrates off relay
 
-## Section 3: Relay Server at `iroh.q8.fyi`
+## Section 3: Relay Server at `i.q8.fyi`
 
 ### Purpose
 
@@ -212,13 +212,13 @@ Public rendezvous/relay for Harmony peers behind different NATs. Runs stock `iro
 
 ### Node-Side Configuration
 
-- `--relay-url https://iroh.q8.fyi` (CLI flag or TOML config)
+- `--relay-url https://i.q8.fyi` (CLI flag or TOML config)
 - `--relay-token <ucan>` (optional, for authenticated tier)
 - Default: no relay (LAN-only). Explicit opt-in for WAN connectivity.
 
 ### Deployment Order
 
-This is the last piece to deploy. All protocol work can be tested on a local subnet without any relay. Deploy `iroh.q8.fyi` when cross-NAT connectivity is needed.
+This is the last piece to deploy. All protocol work can be tested on a local subnet without any relay. Deploy `i.q8.fyi` when cross-NAT connectivity is needed.
 
 ## Section 4: Tunnel Peer Lifecycle in `harmony-peers`
 
@@ -302,7 +302,7 @@ New variant:
 ```
 RoutingHint::Tunnel {
     node_id: [u8; 32],              // iroh NodeId (Ed25519 pub derived from BLAKE3(signing_key) seed)
-    relay_url: Option<String>,       // e.g., "https://iroh.q8.fyi"
+    relay_url: Option<String>,       // e.g., "https://i.q8.fyi"
     direct_addrs: Vec<SocketAddr>,   // publicly reachable addrs
 }
 ```
@@ -344,7 +344,7 @@ An AnnounceRecord can carry **multiple** routing hints — a peer might be reach
 | 2 | iroh-net integration in `harmony-node` event loop | P1 | #1 | Endpoint setup, connection mgmt, interface registration |
 | 3 | Tunnel peer lifecycle in `harmony-peers` | P2 | #1, #2 | ContactAddress::Tunnel, PeerManager extension, quality tracking |
 | 4 | Tunnel routing hints in `harmony-discovery` | P2 | #1 | RoutingHint::Tunnel, publish/consume hints, freshness. Can be implemented in parallel with #3 (independent at code level, co-dependent at integration level). |
-| 5 | Relay server deployment at `iroh.q8.fyi` | P3 | #2 | Stock iroh-relay, rate limiting proxy, UCAN validation |
+| 5 | Relay server deployment at `i.q8.fyi` | P3 | #2 | Stock iroh-relay, rate limiting proxy, UCAN validation |
 
 ## Implementation Order
 
@@ -352,4 +352,4 @@ An AnnounceRecord can carry **multiple** routing hints — a peer might be reach
 2. **iroh-net in `harmony-node`** — wire transport to state machine
 3. **`harmony-peers` tunnel lifecycle** — peer management for tunnels
 4. **`harmony-discovery` tunnel hints** — advertise/discover tunnel reachability
-5. **`iroh.q8.fyi` relay** — deploy when cross-NAT needed (LAN works without it)
+5. **`i.q8.fyi` relay** — deploy when cross-NAT needed (LAN works without it)
