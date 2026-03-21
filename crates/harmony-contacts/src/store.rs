@@ -94,12 +94,15 @@ impl ContactStore {
         if data.is_empty() {
             return Err(ContactError::DeserializeError("empty data"));
         }
-        // Accept v1 (pre-addresses) and v2 (current). v1 contacts will
-        // deserialize with addresses defaulting to empty vec via serde.
-        // If v1 deserialization fails (postcard layout mismatch), fall through
-        // to the v2 path which will also fail with a clear error.
-        if data[0] != FORMAT_VERSION && data[0] != 1 {
-            return Err(ContactError::DeserializeError("unsupported format version"));
+        // Strict version check — postcard is a compact binary format with no
+        // support for default/missing fields, so v1 data (pre-addresses field)
+        // cannot be deserialized into v2 Contact structs. In practice, the
+        // contact store has never been persisted to disk; it's rebuilt from
+        // CLI args or discovery on each startup.
+        if data[0] != FORMAT_VERSION {
+            return Err(ContactError::DeserializeError(
+                "unsupported contact store format version (expected v2)",
+            ));
         }
         postcard::from_bytes(&data[1..])
             .map_err(|_| ContactError::DeserializeError("postcard decode failed"))

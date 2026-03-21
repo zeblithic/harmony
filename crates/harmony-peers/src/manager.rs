@@ -199,6 +199,7 @@ impl PeerManager {
                         peer.status = PeerStatus::Searching;
                         peer.retry_count = peer.retry_count.saturating_add(1);
                         peer.connecting_since = None;
+                        peer.connection_quality = None;
                     }
                 }
             }
