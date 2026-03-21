@@ -28,6 +28,8 @@ clap = { version = "4", features = ["derive"] }
 hex.workspace = true
 rand.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 zenoh.workspace = true
 zeroize = { workspace = true, features = ["std"] }
 

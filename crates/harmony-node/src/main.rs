@@ -83,8 +83,21 @@ enum IdentityAction {
 // is ever added to the tokio feature set.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Initialize structured logging. Output goes to stderr (procd captures
+    // it for syslog on OpenWRT). Filter via RUST_LOG env var, default info.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {
+        // Use eprintln for the top-level error — tracing may not flush to
+        // a piped stderr before process::exit, and integration tests check
+        // this output for specific error messages.
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
@@ -152,7 +165,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Ok(())
                     }
                     Err(_) => {
-                        eprintln!("Invalid");
+                        tracing::error!("invalid signature");
                         std::process::exit(1);
                     }
                 }
@@ -215,7 +228,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let id_path = crate::identity_file::resolve_path(identity_file.as_deref())?;
             let identity = crate::identity_file::load_or_generate(&id_path)?;
             let node_addr = hex::encode(identity.ed25519.public_identity().address_hash);
-            eprintln!("Identity: {node_addr} ({})", id_path.display());
+            tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
             drop(identity); // key material no longer needed; zeroize-on-drop fires now
 
             let content_policy = ContentPolicy {
@@ -244,9 +257,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             let (rt, startup_actions) = NodeRuntime::new(config, MemoryBlobStore::new());
 
-            eprintln!("Harmony node starting...");
-            eprintln!("  Cache capacity:   {cache_capacity} items");
-            eprintln!("  Compute budget:   {compute_budget} fuel/tick");
+            tracing::info!(cache_capacity, compute_budget, %listen_addr, "harmony node starting");
 
             crate::event_loop::run(rt, startup_actions, listen_addr).await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
