@@ -17,6 +17,8 @@ pub enum TunnelBridgeEvent {
         peer_node_id: [u8; 32],
         /// The remote peer's ML-DSA public key bytes.
         peer_dsa_pubkey: Vec<u8>,
+        /// Monotonic connection ID assigned by the event loop.
+        connection_id: u64,
     },
     /// A decrypted Reticulum packet arrived from a tunnel peer.
     ReticulumReceived {
@@ -32,6 +34,8 @@ pub enum TunnelBridgeEvent {
     TunnelClosed {
         interface_name: String,
         reason: String,
+        /// Monotonic connection ID — only remove the sender if it matches.
+        connection_id: u64,
     },
 }
 
@@ -39,6 +43,8 @@ pub enum TunnelBridgeEvent {
 #[derive(Debug, Clone)]
 pub struct TunnelSender {
     tx: mpsc::Sender<TunnelCommand>,
+    /// Monotonic connection ID for stale-close detection.
+    pub connection_id: u64,
 }
 
 /// Commands sent from the event loop to a tunnel task.
@@ -53,8 +59,8 @@ pub enum TunnelCommand {
 }
 
 impl TunnelSender {
-    pub fn new(tx: mpsc::Sender<TunnelCommand>) -> Self {
-        Self { tx }
+    pub fn new(tx: mpsc::Sender<TunnelCommand>, connection_id: u64) -> Self {
+        Self { tx, connection_id }
     }
 
     pub async fn send_reticulum(&self, packet: Vec<u8>) -> Result<(), mpsc::error::SendError<TunnelCommand>> {

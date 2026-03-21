@@ -20,6 +20,11 @@ use crate::tunnel_bridge::{TunnelBridgeEvent, TunnelCommand};
 /// ALPN protocol identifier for harmony tunnels.
 pub const HARMONY_TUNNEL_ALPN: &[u8] = b"harmony-tunnel/1";
 
+/// Maximum time allowed for the handshake phase (stream open/accept,
+/// length-prefixed message exchange, TunnelSession creation). The main loop
+/// has its own keepalive/dead-peer timeout and does not need this.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Run the initiator side of a tunnel connection.
 ///
 /// Creates a TunnelSession, sends TunnelInit over the stream, waits for
@@ -31,95 +36,38 @@ pub async fn run_initiator(
     bridge_tx: mpsc::Sender<TunnelBridgeEvent>,
     cmd_rx: mpsc::Receiver<TunnelCommand>,
     interface_name: String,
+    connection_id: u64,
 ) {
+    // Wrap handshake phase in timeout
+    let handshake_result = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        initiator_handshake(&conn, local_identity, remote_identity, &bridge_tx, &interface_name, connection_id),
+    )
+    .await;
 
-    let now_ms = millis_since_start();
-
-    // Create TunnelSession as initiator
-    let mut rng = rand::rngs::OsRng;
-    let (mut session, init_actions) = match TunnelSession::new_initiator(
-        &mut rng,
-        local_identity,
-        remote_identity,
-        now_ms,
-    ) {
-        Ok(result) => result,
-        Err(e) => {
+    let (session, send_stream, recv_stream) = match handshake_result {
+        Ok(Ok(result)) => result,
+        Ok(Err(reason)) => {
             let _ = bridge_tx
                 .send(TunnelBridgeEvent::TunnelClosed {
                     interface_name,
-                    reason: format!("handshake init failed: {e}"),
+                    reason,
+                    connection_id,
+                })
+                .await;
+            return;
+        }
+        Err(_timeout) => {
+            let _ = bridge_tx
+                .send(TunnelBridgeEvent::TunnelClosed {
+                    interface_name,
+                    reason: "handshake timed out".to_string(),
+                    connection_id,
                 })
                 .await;
             return;
         }
     };
-
-    // Open a bidirectional stream for the tunnel
-    let (mut send_stream, mut recv_stream) = match conn.open_bi().await {
-        Ok(streams) => streams,
-        Err(e) => {
-            let _ = bridge_tx
-                .send(TunnelBridgeEvent::TunnelClosed {
-                    interface_name,
-                    reason: format!("failed to open bi stream: {e}"),
-                })
-                .await;
-            return;
-        }
-    };
-
-    // Send TunnelInit (OutboundBytes from init_actions)
-    for action in init_actions {
-        if let TunnelAction::OutboundBytes { data } = action {
-            if let Err(e) = write_length_prefixed(&mut send_stream, &data).await {
-                let _ = bridge_tx
-                    .send(TunnelBridgeEvent::TunnelClosed {
-                        interface_name,
-                        reason: format!("failed to send TunnelInit: {e}"),
-                    })
-                    .await;
-                return;
-            }
-        }
-    }
-
-    // Read TunnelAccept
-    let accept_bytes = match read_length_prefixed(&mut recv_stream).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            let _ = bridge_tx
-                .send(TunnelBridgeEvent::TunnelClosed {
-                    interface_name,
-                    reason: format!("failed to read TunnelAccept: {e}"),
-                })
-                .await;
-            return;
-        }
-    };
-
-    // Process TunnelAccept through the state machine
-    let now_ms = millis_since_start();
-    let actions = match session.handle_event(TunnelEvent::InboundBytes {
-        data: accept_bytes,
-        now_ms,
-    }) {
-        Ok(actions) => actions,
-        Err(e) => {
-            let _ = bridge_tx
-                .send(TunnelBridgeEvent::TunnelClosed {
-                    interface_name,
-                    reason: format!("handshake failed: {e}"),
-                })
-                .await;
-            return;
-        }
-    };
-
-    // Dispatch handshake completion actions (HandshakeComplete + any OutboundBytes)
-    if !dispatch_tunnel_actions(&actions, &mut send_stream, &bridge_tx, &interface_name).await {
-        return;
-    }
 
     // Enter main loop
     run_tunnel_loop(
@@ -129,8 +77,68 @@ pub async fn run_initiator(
         bridge_tx,
         cmd_rx,
         interface_name,
+        connection_id,
     )
     .await;
+}
+
+/// Handshake phase for the initiator: open bi stream, send TunnelInit,
+/// read TunnelAccept, process handshake completion actions.
+async fn initiator_handshake(
+    conn: &Connection,
+    local_identity: &PqPrivateIdentity,
+    remote_identity: &PqIdentity,
+    bridge_tx: &mpsc::Sender<TunnelBridgeEvent>,
+    interface_name: &str,
+    connection_id: u64,
+) -> Result<(TunnelSession, SendStream, RecvStream), String> {
+    let now_ms = millis_since_start();
+
+    // Create TunnelSession as initiator
+    let mut rng = rand::rngs::OsRng;
+    let (mut session, init_actions) = TunnelSession::new_initiator(
+        &mut rng,
+        local_identity,
+        remote_identity,
+        now_ms,
+    )
+    .map_err(|e| format!("handshake init failed: {e}"))?;
+
+    // Open a bidirectional stream for the tunnel
+    let (mut send_stream, mut recv_stream) = conn
+        .open_bi()
+        .await
+        .map_err(|e| format!("failed to open bi stream: {e}"))?;
+
+    // Send TunnelInit (OutboundBytes from init_actions)
+    for action in init_actions {
+        if let TunnelAction::OutboundBytes { data } = action {
+            write_length_prefixed(&mut send_stream, &data)
+                .await
+                .map_err(|e| format!("failed to send TunnelInit: {e}"))?;
+        }
+    }
+
+    // Read TunnelAccept
+    let accept_bytes = read_length_prefixed(&mut recv_stream)
+        .await
+        .map_err(|e| format!("failed to read TunnelAccept: {e}"))?;
+
+    // Process TunnelAccept through the state machine
+    let now_ms = millis_since_start();
+    let actions = session
+        .handle_event(TunnelEvent::InboundBytes {
+            data: accept_bytes,
+            now_ms,
+        })
+        .map_err(|e| format!("handshake failed: {e}"))?;
+
+    // Dispatch handshake completion actions (HandshakeComplete + any OutboundBytes)
+    if !dispatch_tunnel_actions(&actions, &mut send_stream, bridge_tx, interface_name, connection_id).await {
+        return Err("handshake dispatch failed".to_string());
+    }
+
+    Ok((session, send_stream, recv_stream))
 }
 
 /// Run the responder side of a tunnel connection.
@@ -143,68 +151,38 @@ pub async fn run_responder(
     bridge_tx: mpsc::Sender<TunnelBridgeEvent>,
     cmd_rx: mpsc::Receiver<TunnelCommand>,
     interface_name: String,
+    connection_id: u64,
 ) {
-
-    // Accept the bidirectional stream
-    let (mut send_stream, mut recv_stream) = match conn.accept_bi().await {
-        Ok(streams) => streams,
-        Err(e) => {
-            let _ = bridge_tx
-                .send(TunnelBridgeEvent::TunnelClosed {
-                    interface_name,
-                    reason: format!("failed to accept bi stream: {e}"),
-                })
-                .await;
-            return;
-        }
-    };
-
-    // Read TunnelInit
-    let init_bytes = match read_length_prefixed(&mut recv_stream).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            let _ = bridge_tx
-                .send(TunnelBridgeEvent::TunnelClosed {
-                    interface_name,
-                    reason: format!("failed to read TunnelInit: {e}"),
-                })
-                .await;
-            return;
-        }
-    };
-
-    // Create TunnelSession as responder
-    let mut rng = rand::rngs::OsRng;
-    let now_ms = millis_since_start();
-    let (session, accept_actions) = match TunnelSession::new_responder(
-        &mut rng,
-        local_identity,
-        &init_bytes,
-        now_ms,
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            let _ = bridge_tx
-                .send(TunnelBridgeEvent::TunnelClosed {
-                    interface_name,
-                    reason: format!("responder handshake failed: {e}"),
-                })
-                .await;
-            return;
-        }
-    };
-
-    // Dispatch accept actions (sends TunnelAccept + emits HandshakeComplete)
-    if !dispatch_tunnel_actions(
-        &accept_actions,
-        &mut send_stream,
-        &bridge_tx,
-        &interface_name,
+    // Wrap handshake phase in timeout
+    let handshake_result = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        responder_handshake(&conn, local_identity, &bridge_tx, &interface_name, connection_id),
     )
-    .await
-    {
-        return;
-    }
+    .await;
+
+    let (session, send_stream, recv_stream) = match handshake_result {
+        Ok(Ok(result)) => result,
+        Ok(Err(reason)) => {
+            let _ = bridge_tx
+                .send(TunnelBridgeEvent::TunnelClosed {
+                    interface_name,
+                    reason,
+                    connection_id,
+                })
+                .await;
+            return;
+        }
+        Err(_timeout) => {
+            let _ = bridge_tx
+                .send(TunnelBridgeEvent::TunnelClosed {
+                    interface_name,
+                    reason: "handshake timed out".to_string(),
+                    connection_id,
+                })
+                .await;
+            return;
+        }
+    };
 
     // Enter main loop
     run_tunnel_loop(
@@ -214,8 +192,56 @@ pub async fn run_responder(
         bridge_tx,
         cmd_rx,
         interface_name,
+        connection_id,
     )
     .await;
+}
+
+/// Handshake phase for the responder: accept bi stream, read TunnelInit,
+/// create TunnelSession, send TunnelAccept.
+async fn responder_handshake(
+    conn: &Connection,
+    local_identity: &PqPrivateIdentity,
+    bridge_tx: &mpsc::Sender<TunnelBridgeEvent>,
+    interface_name: &str,
+    connection_id: u64,
+) -> Result<(TunnelSession, SendStream, RecvStream), String> {
+    // Accept the bidirectional stream
+    let (mut send_stream, mut recv_stream) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| format!("failed to accept bi stream: {e}"))?;
+
+    // Read TunnelInit
+    let init_bytes = read_length_prefixed(&mut recv_stream)
+        .await
+        .map_err(|e| format!("failed to read TunnelInit: {e}"))?;
+
+    // Create TunnelSession as responder
+    let mut rng = rand::rngs::OsRng;
+    let now_ms = millis_since_start();
+    let (session, accept_actions) = TunnelSession::new_responder(
+        &mut rng,
+        local_identity,
+        &init_bytes,
+        now_ms,
+    )
+    .map_err(|e| format!("responder handshake failed: {e}"))?;
+
+    // Dispatch accept actions (sends TunnelAccept + emits HandshakeComplete)
+    if !dispatch_tunnel_actions(
+        &accept_actions,
+        &mut send_stream,
+        bridge_tx,
+        interface_name,
+        connection_id,
+    )
+    .await
+    {
+        return Err("handshake dispatch failed".to_string());
+    }
+
+    Ok((session, send_stream, recv_stream))
 }
 
 /// Main tunnel read/write/keepalive loop.
@@ -228,6 +254,7 @@ async fn run_tunnel_loop(
     bridge_tx: mpsc::Sender<TunnelBridgeEvent>,
     mut cmd_rx: mpsc::Receiver<TunnelCommand>,
     interface_name: String,
+    connection_id: u64,
 ) {
     // Timer fires at 10s intervals -- more frequent than the 30s keepalive
     // interval, but the TunnelSession state machine decides when to actually
@@ -246,7 +273,7 @@ async fn run_tunnel_loop(
                         match session.handle_event(TunnelEvent::InboundBytes { data, now_ms }) {
                             Ok(actions) => {
                                 if !dispatch_tunnel_actions(
-                                    &actions, &mut send_stream, &bridge_tx, &interface_name,
+                                    &actions, &mut send_stream, &bridge_tx, &interface_name, connection_id,
                                 ).await {
                                     break;
                                 }
@@ -255,6 +282,7 @@ async fn run_tunnel_loop(
                                 let _ = bridge_tx.send(TunnelBridgeEvent::TunnelClosed {
                                     interface_name: interface_name.clone(),
                                     reason: format!("tunnel error: {e}"),
+                                    connection_id,
                                 }).await;
                                 break;
                             }
@@ -264,6 +292,7 @@ async fn run_tunnel_loop(
                         let _ = bridge_tx.send(TunnelBridgeEvent::TunnelClosed {
                             interface_name: interface_name.clone(),
                             reason: format!("stream read error: {e}"),
+                            connection_id,
                         }).await;
                         break;
                     }
@@ -278,7 +307,7 @@ async fn run_tunnel_loop(
                         match session.handle_event(TunnelEvent::SendReticulum { packet, now_ms }) {
                             Ok(actions) => {
                                 if !dispatch_tunnel_actions(
-                                    &actions, &mut send_stream, &bridge_tx, &interface_name,
+                                    &actions, &mut send_stream, &bridge_tx, &interface_name, connection_id,
                                 ).await {
                                     break;
                                 }
@@ -293,7 +322,7 @@ async fn run_tunnel_loop(
                         match session.handle_event(TunnelEvent::SendZenoh { message, now_ms }) {
                             Ok(actions) => {
                                 if !dispatch_tunnel_actions(
-                                    &actions, &mut send_stream, &bridge_tx, &interface_name,
+                                    &actions, &mut send_stream, &bridge_tx, &interface_name, connection_id,
                                 ).await {
                                     break;
                                 }
@@ -308,6 +337,7 @@ async fn run_tunnel_loop(
                         let _ = bridge_tx.send(TunnelBridgeEvent::TunnelClosed {
                             interface_name: interface_name.clone(),
                             reason: "closed by event loop".to_string(),
+                            connection_id,
                         }).await;
                         break;
                     }
@@ -320,7 +350,7 @@ async fn run_tunnel_loop(
                 match session.handle_event(TunnelEvent::Tick { now_ms }) {
                     Ok(actions) => {
                         if !dispatch_tunnel_actions(
-                            &actions, &mut send_stream, &bridge_tx, &interface_name,
+                            &actions, &mut send_stream, &bridge_tx, &interface_name, connection_id,
                         ).await {
                             break;
                         }
@@ -329,6 +359,7 @@ async fn run_tunnel_loop(
                         let _ = bridge_tx.send(TunnelBridgeEvent::TunnelClosed {
                             interface_name: interface_name.clone(),
                             reason: format!("tick error: {e}"),
+                            connection_id,
                         }).await;
                         break;
                     }
@@ -347,6 +378,7 @@ async fn dispatch_tunnel_actions(
     send_stream: &mut SendStream,
     bridge_tx: &mpsc::Sender<TunnelBridgeEvent>,
     interface_name: &str,
+    connection_id: u64,
 ) -> bool {
     for action in actions {
         match action {
@@ -356,6 +388,7 @@ async fn dispatch_tunnel_actions(
                         .send(TunnelBridgeEvent::TunnelClosed {
                             interface_name: interface_name.to_string(),
                             reason: format!("write error: {e}"),
+                            connection_id,
                         })
                         .await;
                     return false;
@@ -386,6 +419,7 @@ async fn dispatch_tunnel_actions(
                         interface_name: interface_name.to_string(),
                         peer_node_id: *peer_node_id,
                         peer_dsa_pubkey: peer_dsa_pubkey.clone(),
+                        connection_id,
                     })
                     .await;
             }
@@ -394,6 +428,7 @@ async fn dispatch_tunnel_actions(
                     .send(TunnelBridgeEvent::TunnelClosed {
                         interface_name: interface_name.to_string(),
                         reason: reason.clone(),
+                        connection_id,
                     })
                     .await;
                 return false;
@@ -403,6 +438,7 @@ async fn dispatch_tunnel_actions(
                     .send(TunnelBridgeEvent::TunnelClosed {
                         interface_name: interface_name.to_string(),
                         reason: "session closed".to_string(),
+                        connection_id,
                     })
                     .await;
                 return false;

@@ -78,8 +78,10 @@ pub async fn run(
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
 
     // ── Tunnel bridge: spawned tunnel tasks → select loop ───────────────────
+    const MAX_TUNNEL_CONNECTIONS: usize = 64;
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<TunnelBridgeEvent>(256);
     let mut tunnel_senders: HashMap<String, TunnelSender> = HashMap::new();
+    let mut next_connection_id: u64 = 0;
 
     // ── iroh Endpoint (optional, gated on --relay-url) ─────────────────────
     let iroh_endpoint = if let Some(ref config) = tunnel_config {
@@ -264,6 +266,7 @@ pub async fn run(
                         interface_name,
                         peer_node_id,
                         peer_dsa_pubkey: _, // TODO(harmony-h6k): store in contact registry for peer lifecycle
+                        connection_id: _, // informational — sender already registered
                     } => {
                         runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
                             interface_name,
@@ -286,9 +289,19 @@ pub async fn run(
                     TunnelBridgeEvent::TunnelClosed {
                         interface_name,
                         reason,
+                        connection_id,
                     } => {
                         eprintln!("[{interface_name}] tunnel closed: {reason}");
-                        tunnel_senders.remove(&interface_name);
+                        // Only remove the sender if the connection_id matches,
+                        // preventing a stale close from a previous connection
+                        // from removing a newly reconnected peer's sender.
+                        if tunnel_senders
+                            .get(&interface_name)
+                            .map(|s| s.connection_id == connection_id)
+                            .unwrap_or(false)
+                        {
+                            tunnel_senders.remove(&interface_name);
+                        }
                         runtime.push_event(RuntimeEvent::TunnelClosed { interface_name });
                     }
                 }
@@ -304,42 +317,49 @@ pub async fn run(
                 }
             } => {
                 if let Some(incoming) = incoming {
-                    match incoming.accept() {
-                        Ok(connecting) => {
-                            match connecting.await {
-                                Ok(connection) => {
-                                    let iface = match connection.remote_node_id() {
-                                        Ok(id) => format!(
-                                            "tunnel-{}",
-                                            hex::encode(&id.as_bytes()[..4])
-                                        ),
-                                        Err(_) => format!(
-                                            "tunnel-{:08x}",
-                                            rand::random::<u32>()
-                                        ),
-                                    };
-                                    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-                                    tunnel_senders.insert(
-                                        iface.clone(),
-                                        TunnelSender::new(cmd_tx),
-                                    );
+                    if tunnel_senders.len() >= MAX_TUNNEL_CONNECTIONS {
+                        eprintln!("[event_loop] tunnel connection limit ({MAX_TUNNEL_CONNECTIONS}) reached — rejecting");
+                        drop(incoming); // sends QUIC RESET
+                    } else {
+                        match incoming.accept() {
+                            Ok(connecting) => {
+                                match connecting.await {
+                                    Ok(connection) => {
+                                        let iface = match connection.remote_node_id() {
+                                            Ok(id) => format!(
+                                                "tunnel-{}",
+                                                hex::encode(&id.as_bytes()[..4])
+                                            ),
+                                            Err(_) => format!(
+                                                "tunnel-{:08x}",
+                                                rand::random::<u32>()
+                                            ),
+                                        };
+                                        let conn_id = next_connection_id;
+                                        next_connection_id += 1;
+                                        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+                                        tunnel_senders.insert(
+                                            iface.clone(),
+                                            TunnelSender::new(cmd_tx, conn_id),
+                                        );
 
-                                    let tx = tunnel_tx.clone();
-                                    let identity =
-                                        tunnel_config.as_ref().unwrap().local_identity.clone();
-                                    let iface_clone = iface.clone();
-                                    tokio::spawn(async move {
-                                        tunnel_task::run_responder(
-                                            connection, &identity, tx, cmd_rx, iface_clone,
-                                        )
-                                        .await;
-                                    });
-                                    eprintln!("[{iface}] accepted incoming tunnel");
+                                        let tx = tunnel_tx.clone();
+                                        let identity =
+                                            tunnel_config.as_ref().unwrap().local_identity.clone();
+                                        let iface_clone = iface.clone();
+                                        tokio::spawn(async move {
+                                            tunnel_task::run_responder(
+                                                connection, &identity, tx, cmd_rx, iface_clone, conn_id,
+                                            )
+                                            .await;
+                                        });
+                                        eprintln!("[{iface}] accepted incoming tunnel");
+                                    }
+                                    Err(e) => eprintln!("[event_loop] iroh connecting error: {e}"),
                                 }
-                                Err(e) => eprintln!("[event_loop] iroh connecting error: {e}"),
                             }
+                            Err(e) => eprintln!("[event_loop] iroh accept error: {e}"),
                         }
-                        Err(e) => eprintln!("[event_loop] iroh accept error: {e}"),
                     }
                 }
             }
