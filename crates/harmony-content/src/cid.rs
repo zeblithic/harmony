@@ -415,6 +415,7 @@ fn hex_prefix(hash: &[u8; HASH_LEN]) -> String {
 }
 
 fn compute_hash(data: &[u8], flags: &ContentFlags) -> [u8; HASH_LEN] {
+    debug_assert!(!flags.is_inline(), "compute_hash called with inline flags");
     if flags.sha224 && !flags.lsb_mode {
         harmony_crypto::hash::sha224_hash(data)
     } else if flags.lsb_mode && !flags.sha224 {
@@ -443,15 +444,18 @@ pub fn compute_pairwise_xor(bytes: &[u8; 32]) -> u8 {
 }
 
 /// Encode a byte size into a 20-bit bundle size field (12-bit mantissa + 8-bit exponent).
+///
+/// The formula is `(1 + M/4096) * 2^(E+20)` = `(4096 + M) << (E+8)`.
+/// Raw value 0 (M=0, E=0) encodes exactly 1MB = 1,048,576 bytes, the minimum valid bundle size.
+/// Values below 1MB are rounded up to the 1MB minimum.
+/// The encoding always rounds up so that the decoded value is >= the actual size.
 pub fn encode_bundle_size(size_bytes: u64) -> u32 {
-    if size_bytes == 0 {
+    if size_bytes <= (1u64 << 20) {
+        // Minimum bundle size is 1MB. Round up to the minimum encoding (raw=0).
         return 0;
     }
     let bit_len = 64 - size_bytes.leading_zeros();
-    if bit_len <= 20 {
-        return 0;
-    }
-    let exp_raw = bit_len - 21;
+    let exp_raw = bit_len - 21; // bits above 2^20
     let exponent = if exp_raw > 255 { 255u32 } else { exp_raw };
     let shift = exponent + 20;
     let mantissa = if shift < 64 {
@@ -465,22 +469,29 @@ pub fn encode_bundle_size(size_bytes: u64) -> u32 {
     } else {
         0u32
     };
-    (mantissa << 8) | exponent
+    // Round up: if the encoded value decodes to less than size_bytes, bump mantissa.
+    let encoded = (mantissa << 8) | exponent;
+    let decoded = decode_bundle_size(encoded);
+    if decoded < size_bytes && mantissa < 4095 {
+        ((mantissa + 1) << 8) | exponent
+    } else {
+        encoded
+    }
 }
 
 /// Decode a 20-bit bundle size field to a byte count.
+///
+/// The formula is `(4096 + M) << (E+8)`.
+/// Raw value 0 (M=0, E=0) decodes to exactly 1MB = 1,048,576 bytes.
 pub fn decode_bundle_size(raw: u32) -> u64 {
-    if raw == 0 {
-        return 0;
-    }
     let mantissa = (raw >> 8) & 0xFFF;
     let exponent = raw & 0xFF;
-    let base = 4096u64 + mantissa as u64;
-    let shift = exponent + 8;
+    let base = 4096u64 + mantissa as u64; // (1 + M/4096) * 4096
+    let shift = exponent + 8; // 2^(E+20) / 4096 = 2^(E+8)
     if shift >= 64 {
         u64::MAX
     } else {
-        base.saturating_mul(1u64 << shift)
+        base << shift
     }
 }
 
@@ -738,20 +749,27 @@ mod tests {
 
     #[test]
     fn bundle_size_encode_decode() {
-        for &(input, expected) in &[(0u64, 0u64), (1_048_576, 0), (2_097_152, 2_097_152)] {
-            let decoded = decode_bundle_size(encode_bundle_size(input));
-            if expected == 0 {
-                assert_eq!(decoded, 0);
-            } else {
-                let ratio = decoded as f64 / expected as f64;
-                assert!((0.97..=1.03).contains(&ratio));
-            }
+        // Sub-1MB values round up to 1MB minimum.
+        assert_eq!(decode_bundle_size(encode_bundle_size(0)), 1_048_576);
+        assert_eq!(decode_bundle_size(encode_bundle_size(512)), 1_048_576);
+        // Exactly 1MB encodes as raw=0, decodes back to 1MB.
+        assert_eq!(encode_bundle_size(1_048_576), 0);
+        assert_eq!(decode_bundle_size(encode_bundle_size(1_048_576)), 1_048_576);
+        // 2MB encodes and decodes with <=3% tolerance.
+        let decoded_2mb = decode_bundle_size(encode_bundle_size(2_097_152));
+        let ratio = decoded_2mb as f64 / 2_097_152f64;
+        assert!((0.97..=1.03).contains(&ratio));
+        // Encoding always rounds up (decoded >= input).
+        for &size in &[1_048_577u64, 1_500_000, 10_000_000, 1_000_000_000] {
+            let decoded = decode_bundle_size(encode_bundle_size(size));
+            assert!(decoded >= size, "encode_bundle_size({size}) decoded {decoded} < input");
         }
     }
 
     #[test]
     fn bundle_size_min_max_range() {
-        assert_eq!(decode_bundle_size(0), 0);
+        // raw=0 is 1MB (minimum valid bundle size), not a sentinel.
+        assert_eq!(decode_bundle_size(0), 1_048_576);
         assert_eq!(decode_bundle_size((0 << 8) | 1), 2_097_152);
         assert_eq!(decode_bundle_size((4095 << 8) | 255), u64::MAX);
     }
