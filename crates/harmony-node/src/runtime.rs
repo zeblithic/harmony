@@ -702,6 +702,15 @@ impl<B: BookStore> NodeRuntime<B> {
                     tracing::debug!("announce verification failed: {e:?}");
                     return;
                 }
+                // Process tunnel hints directly from the verified record.
+                // DiscoveryManager.IdentityDiscovered requires the peer to be in
+                // the `online` set (via LivelinessChange), which needs Zenoh
+                // liveliness token wiring — not yet implemented. By processing
+                // hints here, tunnel contacts are populated on first announce
+                // without waiting for the full liveliness flow.
+                self.process_discovered_tunnel_hints(&record);
+
+                // Still feed the record to DiscoveryManager for caching/expiry.
                 let actions =
                     self.discovery
                         .on_event(harmony_discovery::DiscoveryEvent::AnnounceReceived {
