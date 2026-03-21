@@ -91,6 +91,7 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -165,7 +166,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Ok(())
                     }
                     Err(_) => {
-                        tracing::error!("invalid signature");
+                        eprintln!("Error: invalid signature");
                         std::process::exit(1);
                     }
                 }

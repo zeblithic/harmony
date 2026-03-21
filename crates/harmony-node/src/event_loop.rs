@@ -111,7 +111,7 @@ pub async fn run(
                 Some(_) = sigterm.recv() => tracing::info!("SIGTERM received — shutting down"),
                 result = tokio::signal::ctrl_c() => match result {
                     Ok(()) => tracing::info!("Ctrl+C received — shutting down"),
-                    Err(e) => tracing::error!("SIGINT handler failed: {e} — shutting down"),
+                    Err(e) => tracing::error!(err = %e, "SIGINT handler failed — shutting down"),
                 },
             }
         }
@@ -119,7 +119,7 @@ pub async fn run(
         {
             match tokio::signal::ctrl_c().await {
                 Ok(()) => tracing::info!("Ctrl+C received — shutting down"),
-                Err(e) => tracing::error!("SIGINT handler failed: {e} — shutting down"),
+                Err(e) => tracing::error!(err = %e, "SIGINT handler failed — shutting down"),
             }
         }
     };
@@ -147,7 +147,7 @@ pub async fn run(
                         });
                     }
                     Err(e) => {
-                        tracing::warn!("UDP recv error: {e}");
+                        tracing::warn!(err = %e, "UDP recv error");
                         use std::io::ErrorKind::*;
                         match e.kind() {
                             WouldBlock | Interrupted => {}
@@ -236,7 +236,7 @@ async fn dispatch_action(
         // effectively non-blocking on a UDP socket with default buffer sizes.
         RuntimeAction::SendOnInterface { raw, .. } => {
             if let Err(e) = udp.send_to(&raw, broadcast_addr).await {
-                tracing::warn!("UDP send error: {e}");
+                tracing::warn!(err = %e, "UDP send error");
             }
         }
 
@@ -245,7 +245,7 @@ async fn dispatch_action(
             let session = session.clone();
             tokio::spawn(async move {
                 if let Err(e) = session.put(&key_expr, payload).await {
-                    tracing::warn!(%key_expr, "zenoh put error: {e}");
+                    tracing::warn!(%key_expr, err = %e, "zenoh put error");
                 }
             });
         }
@@ -317,7 +317,7 @@ async fn dispatch_action(
                     });
                 }
                 Err(e) => {
-                    tracing::error!(%key_expr, "declare_queryable failed: {e}");
+                    tracing::error!(%key_expr, err = %e, "declare_queryable failed");
                 }
             }
         }
@@ -342,7 +342,7 @@ async fn dispatch_action(
                     });
                 }
                 Err(e) => {
-                    tracing::error!(%key_expr, "declare_subscriber failed: {e}");
+                    tracing::error!(%key_expr, err = %e, "declare_subscriber failed");
                 }
             }
         }
@@ -372,7 +372,7 @@ async fn fetch_via_zenoh(
                 }
                 Err(err) => {
                     let msg = String::from_utf8_lossy(&err.payload().to_bytes()).into_owned();
-                    tracing::warn!(%key_expr, "zenoh get reply error: {msg}");
+                    tracing::warn!(%key_expr, err = %msg, "zenoh get reply error");
                 }
             }
         }
