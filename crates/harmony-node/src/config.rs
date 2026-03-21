@@ -88,12 +88,15 @@ pub struct TunnelEntry {
 
 /// Load a `ConfigFile` from `path`.
 ///
-/// Returns `Ok(ConfigFile::default())` when the file does not exist, so callers
-/// can treat a missing config identically to an all-defaults config.
-pub fn load(path: &Path) -> Result<ConfigFile, ConfigError> {
+/// When `explicit` is false (default path), returns `Ok(ConfigFile::default())`
+/// if the file does not exist. When `explicit` is true (`--config` was given),
+/// a missing file is an error — the user explicitly asked for this file.
+pub fn load(path: &Path, explicit: bool) -> Result<ConfigFile, ConfigError> {
     let content = match std::fs::read_to_string(path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ConfigFile::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => {
+            return Ok(ConfigFile::default());
+        }
         Err(e) => {
             return Err(ConfigError::Io {
                 path: path.to_path_buf(),
@@ -134,13 +137,6 @@ pub fn resolve<T>(cli: Option<T>, file: Option<T>, default: T) -> T {
     cli.or(file).unwrap_or(default)
 }
 
-/// Merge a boolean CLI flag with a config file value.
-/// CLI booleans are `bool` not `Option<bool>` — `true` means "explicitly passed".
-/// Only works for flags where the CLI default is `false`.
-pub fn resolve_bool(cli: bool, file: Option<bool>, default: bool) -> bool {
-    if cli { true } else { file.unwrap_or(default) }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -160,16 +156,23 @@ mod tests {
     #[test]
     fn load_missing_file_returns_default() {
         let path = PathBuf::from("/tmp/harmony-config-does-not-exist-xyzzy.toml");
-        let cfg = load(&path).expect("missing file should return Ok(default)");
+        let cfg = load(&path, false).expect("missing file should return Ok(default)");
         assert!(cfg.listen_address.is_none());
         assert!(cfg.peers.is_none());
         assert!(cfg.tunnels.is_none());
     }
 
     #[test]
+    fn load_missing_explicit_file_errors() {
+        let path = PathBuf::from("/tmp/harmony-config-does-not-exist-xyzzy.toml");
+        let err = load(&path, true).expect_err("explicit missing file should error");
+        assert!(matches!(err, ConfigError::Io { .. }));
+    }
+
+    #[test]
     fn load_valid_minimal_file() {
         let (_f, path) = write_temp(r#"listen_address = "127.0.0.1:4242""#);
-        let cfg = load(&path).expect("should parse minimal config");
+        let cfg = load(&path, false).expect("should parse minimal config");
         assert_eq!(cfg.listen_address.as_deref(), Some("127.0.0.1:4242"));
         assert!(cfg.cache_capacity.is_none());
     }
@@ -206,7 +209,7 @@ name = "my-peer"
 node_id = "112233445566"
 "#;
         let (_f, path) = write_temp(toml);
-        let cfg = load(&path).expect("should parse full config");
+        let cfg = load(&path, false).expect("should parse full config");
 
         assert_eq!(cfg.listen_address.as_deref(), Some("0.0.0.0:4242"));
         assert_eq!(cfg.cache_capacity, Some(2048));
@@ -239,7 +242,7 @@ node_id = "112233445566"
     #[test]
     fn load_malformed_toml_errors() {
         let (_f, path) = write_temp("listen_address = [unclosed");
-        let err = load(&path).expect_err("malformed TOML should fail");
+        let err = load(&path, false).expect_err("malformed TOML should fail");
         assert!(matches!(err, ConfigError::Parse { .. }));
         let msg = err.to_string();
         assert!(msg.contains("failed to parse config file"), "unexpected: {msg}");
@@ -248,7 +251,7 @@ node_id = "112233445566"
     #[test]
     fn load_unknown_key_errors() {
         let (_f, path) = write_temp("typo_key = true\n");
-        let err = load(&path).expect_err("unknown key should fail due to deny_unknown_fields");
+        let err = load(&path, false).expect_err("unknown key should fail due to deny_unknown_fields");
         assert!(matches!(err, ConfigError::Parse { .. }));
     }
 
@@ -287,20 +290,5 @@ node_id = "112233445566"
     #[test]
     fn resolve_default_when_both_none() {
         assert_eq!(resolve::<i32>(None, None, 7), 7);
-    }
-
-    #[test]
-    fn resolve_bool_cli_true_wins() {
-        assert_eq!(resolve_bool(true, Some(false), false), true);
-    }
-
-    #[test]
-    fn resolve_bool_cli_false_defers_to_file() {
-        assert_eq!(resolve_bool(false, Some(true), false), true);
-    }
-
-    #[test]
-    fn resolve_bool_all_false_returns_default() {
-        assert_eq!(resolve_bool(false, None, false), false);
     }
 }

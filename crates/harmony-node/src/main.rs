@@ -43,14 +43,14 @@ enum Commands {
         #[arg(long)]
         compute_budget: Option<u64>,
         /// Accept encrypted durable (10) content for storage
-        #[arg(long)]
-        encrypted_durable_persist: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        encrypted_durable_persist: Option<bool>,
         /// Announce encrypted durable (10) content on Zenoh
-        #[arg(long)]
-        encrypted_durable_announce: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        encrypted_durable_announce: Option<bool>,
         /// Disable announcing public ephemeral (01) content on Zenoh
-        #[arg(long)]
-        no_public_ephemeral_announce: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        no_public_ephemeral_announce: Option<bool>,
         /// Bloom filter broadcast interval in ticks
         #[arg(long)]
         filter_broadcast_ticks: Option<u32>,
@@ -64,8 +64,8 @@ enum Commands {
         #[arg(long)]
         listen_address: Option<String>,
         /// Disable mDNS peer discovery (broadcast-only mode)
-        #[arg(long)]
-        no_mdns: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        no_mdns: Option<bool>,
         /// Seconds before evicting a silent mDNS peer (default: 60)
         #[arg(long)]
         mdns_stale_timeout: Option<u64>,
@@ -243,16 +243,14 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
 
             // ── Load config file ────────────────────────────────────────
             let (config_path, explicit) = crate::config::resolve_config_path(config.as_deref())?;
-            if explicit && !config_path.exists() {
-                return Err(format!("config file not found: {}", config_path.display()).into());
-            }
-            let config_file = crate::config::load(&config_path).map_err(|e| format!("{e}"))?;
+            let config_file = crate::config::load(&config_path, explicit)
+                .map_err(|e| format!("{e}"))?;
 
             // Apply config file log level if RUST_LOG is not set.
             if std::env::var("RUST_LOG").is_err() {
                 if let Some(ref logging) = config_file.logging {
                     if let Some(ref level) = logging.level {
-                        match level.parse::<tracing_subscriber::EnvFilter>() {
+                        match tracing_subscriber::EnvFilter::try_new(level) {
                             Ok(new_filter) => {
                                 let _ = reload_handle.reload(new_filter);
                                 tracing::debug!(level = %level, "applied log level from config file");
@@ -266,7 +264,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             }
 
             // ── Merge CLI > file > defaults ─────────────────────────────
-            use crate::config::{resolve, resolve_bool};
+            use crate::config::resolve;
             let cache_capacity = resolve(cache_capacity, config_file.cache_capacity, 1024);
             let compute_budget = resolve(compute_budget, config_file.compute_budget, 100_000);
             let filter_broadcast_ticks = resolve(filter_broadcast_ticks, config_file.filter_broadcast_ticks, 30);
@@ -275,10 +273,10 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             let listen_address = resolve(listen_address, config_file.listen_address, "0.0.0.0:4242".to_string());
             let identity_file = identity_file.or(config_file.identity_file);
             let relay_url = relay_url.or(config_file.relay_url);
-            let no_mdns = resolve_bool(no_mdns, config_file.no_mdns, false);
-            let encrypted_durable_persist = resolve_bool(encrypted_durable_persist, config_file.encrypted_durable_persist, false);
-            let encrypted_durable_announce = resolve_bool(encrypted_durable_announce, config_file.encrypted_durable_announce, false);
-            let no_public_ephemeral_announce = resolve_bool(no_public_ephemeral_announce, config_file.no_public_ephemeral_announce, false);
+            let no_mdns = resolve(no_mdns, config_file.no_mdns, false);
+            let encrypted_durable_persist = resolve(encrypted_durable_persist, config_file.encrypted_durable_persist, false);
+            let encrypted_durable_announce = resolve(encrypted_durable_announce, config_file.encrypted_durable_announce, false);
+            let no_public_ephemeral_announce = resolve(no_public_ephemeral_announce, config_file.no_public_ephemeral_announce, false);
 
             // ── Parse config-only sections ───────────────────────────────
             let bootstrap_peers: Vec<std::net::SocketAddr> = config_file.peers
@@ -479,9 +477,9 @@ mod tests {
             ..
         } = cli.command
         {
-            assert!(encrypted_durable_persist);
-            assert!(encrypted_durable_announce);
-            assert!(no_public_ephemeral_announce);
+            assert_eq!(encrypted_durable_persist, Some(true));
+            assert_eq!(encrypted_durable_announce, Some(true));
+            assert_eq!(no_public_ephemeral_announce, Some(true));
         } else {
             panic!("expected Run command");
         }
@@ -497,9 +495,9 @@ mod tests {
             ..
         } = cli.command
         {
-            assert!(!encrypted_durable_persist);
-            assert!(!encrypted_durable_announce);
-            assert!(!no_public_ephemeral_announce);
+            assert_eq!(encrypted_durable_persist, None);
+            assert_eq!(encrypted_durable_announce, None);
+            assert_eq!(no_public_ephemeral_announce, None);
         } else {
             panic!("expected Run command");
         }
@@ -618,7 +616,7 @@ mod tests {
     fn cli_parses_no_mdns_flag() {
         let cli = Cli::try_parse_from(["harmony", "run", "--no-mdns"]).unwrap();
         if let Commands::Run { no_mdns, .. } = cli.command {
-            assert!(no_mdns);
+            assert_eq!(no_mdns, Some(true));
         } else {
             panic!("expected Run command");
         }
@@ -628,7 +626,7 @@ mod tests {
     fn cli_no_mdns_default_false() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
         if let Commands::Run { no_mdns, .. } = cli.command {
-            assert!(!no_mdns);
+            assert_eq!(no_mdns, None);
         } else {
             panic!("expected Run command");
         }
