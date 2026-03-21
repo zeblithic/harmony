@@ -1100,10 +1100,17 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
                 PeerAction::UpdateLastSeen {
                     identity_hash,
-                    timestamp,
+                    timestamp: _, // PeerManager provides monotonic seconds; ignore it
                 } => {
+                    // Contact.last_seen uses Unix epoch seconds (like added_at).
+                    // PeerManager operates on monotonic timestamps internally,
+                    // so we use wall-clock time here at the boundary.
+                    let unix_now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
                     self.contact_store
-                        .update_last_seen(&identity_hash, timestamp);
+                        .update_last_seen(&identity_hash, unix_now);
                 }
                 PeerAction::InitiateLink { .. } | PeerAction::CloseLink { .. } => {
                     // Reticulum link initiation/close — stub for now.
@@ -2501,10 +2508,10 @@ mod tests {
             node_id: [0xCC; 32],
             now: 5000, // 5000ms from event loop
         });
-        // UpdateLastSeen stores the value in seconds (5000ms → 5s).
-        assert_eq!(
-            rt.contact_store().get(&[0xBB; 16]).unwrap().last_seen,
-            Some(5) // 5000ms / 1000 = 5s
-        );
+        // UpdateLastSeen stores wall-clock Unix epoch seconds (not monotonic).
+        let last_seen = rt.contact_store().get(&[0xBB; 16]).unwrap().last_seen;
+        assert!(last_seen.is_some());
+        // Should be a plausible Unix timestamp (after 2024-01-01).
+        assert!(last_seen.unwrap() > 1_700_000_000);
     }
 }
