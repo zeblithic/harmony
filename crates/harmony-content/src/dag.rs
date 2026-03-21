@@ -78,12 +78,13 @@ pub fn ingest(
     }
 }
 
-/// Walk a Merkle DAG from the root, returning leaf blob CIDs in order.
+/// Walk a Merkle DAG from the root, returning leaf CIDs in order.
 ///
 /// Performs a depth-first left-to-right traversal. For a bare blob root,
 /// returns a single-element vec. For a bundle root, recursively descends
-/// through child bundles, collecting blob CIDs. InlineData entries
-/// are skipped (they carry metadata, not data).
+/// through child bundles, collecting leaf CIDs. Sentinel `InlineData` entries
+/// (metadata CIDs) are skipped; non-sentinel `InlineData` CIDs carry real
+/// inline data and are included. `Stream` CIDs are not walked recursively.
 ///
 /// Returns `MissingContent` if any referenced CID is not in the store.
 pub fn walk(root_cid: &ContentId, store: &dyn BookStore) -> Result<Vec<ContentId>, ContentError> {
@@ -111,7 +112,15 @@ fn walk_recursive(
             }
         }
         CidType::InlineData => {
-            // Skip — metadata entries don't carry data.
+            // Sentinel inline CIDs are metadata — skip them.
+            // Non-sentinel inline CIDs carry real data — include them.
+            if !cid.is_sentinel() {
+                result.push(*cid);
+            }
+        }
+        CidType::Stream => {
+            // Streams are not walked recursively — they're processed
+            // via streaming iteration, not DAG traversal.
         }
         _ => {
             // Reserved types — should not appear in a well-formed DAG.
@@ -135,10 +144,16 @@ pub fn reassemble(root_cid: &ContentId, store: &dyn BookStore) -> Result<Vec<u8>
 
     let blob_cids = walk(root_cid, store)?;
     for cid in &blob_cids {
-        let data = store
-            .get(cid)
-            .ok_or(ContentError::MissingContent { cid: *cid })?;
-        output.extend_from_slice(data);
+        if cid.cid_type() == CidType::InlineData {
+            // Non-sentinel inline CIDs carry data in the CID itself.
+            let inline = cid.extract_inline_data()?;
+            output.extend_from_slice(&inline);
+        } else {
+            let data = store
+                .get(cid)
+                .ok_or(ContentError::MissingContent { cid: *cid })?;
+            output.extend_from_slice(data);
+        }
     }
 
     Ok(output)
