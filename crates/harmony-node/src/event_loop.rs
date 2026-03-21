@@ -346,6 +346,32 @@ async fn dispatch_action(
                 }
             }
         }
+
+        // ── Peer lifecycle: Tunnel initiation ─────────────────────────────────
+        // Stub — actual iroh-net Endpoint.connect() wiring deferred until
+        // tunnel infrastructure (tunnel_task.rs, tunnel_bridge.rs) is integrated.
+        RuntimeAction::InitiateTunnel {
+            identity_hash,
+            node_id,
+            relay_url,
+        } => {
+            tracing::info!(
+                identity = %hex::encode(identity_hash),
+                node_id = %hex::encode(&node_id[..8]),
+                relay = ?relay_url,
+                "InitiateTunnel requested (stub — iroh-net not yet wired)"
+            );
+        }
+
+        // ── Peer lifecycle: Path request ──────────────────────────────────────
+        // Stub — announce probing will be wired when path request packets are
+        // implemented in the Reticulum router.
+        RuntimeAction::SendPathRequest { identity_hash } => {
+            tracing::debug!(
+                identity = %hex::encode(identity_hash),
+                "SendPathRequest (stub)"
+            );
+        }
     }
 }
 
