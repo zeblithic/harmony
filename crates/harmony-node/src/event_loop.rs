@@ -94,7 +94,7 @@ pub async fn run(
     let mut inflight_handshakes: usize = 0;
 
     // ── iroh Endpoint (optional, gated on --relay-url) ─────────────────────
-    let iroh_endpoint = if let Some(ref config) = tunnel_config {
+    let mut iroh_endpoint = if let Some(ref config) = tunnel_config {
         // Derive iroh SecretKey from PQ identity's ML-DSA verifying key.
         // This gives a deterministic mapping: same PQ identity → same iroh NodeId.
         let pub_id = config.local_identity.public_identity();
@@ -341,6 +341,12 @@ pub async fn run(
                     std::future::pending::<Option<iroh::endpoint::Incoming>>().await
                 }
             } => {
+                if incoming.is_none() {
+                    // ep.accept() returned None — endpoint is closed.
+                    // Disable this arm to prevent busy-spinning.
+                    eprintln!("[event_loop] iroh endpoint closed — disabling tunnel accept");
+                    iroh_endpoint = None;
+                }
                 if let Some(incoming) = incoming {
                     // Check connection limit BEFORE spawning the handshake task.
                     // Include inflight handshakes so a burst of simultaneous
