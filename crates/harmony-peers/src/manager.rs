@@ -137,6 +137,24 @@ impl PeerManager {
                         peer.retry_count = peer.retry_count.saturating_add(1);
                         peer.connecting_since = None;
                         peer.connection_quality = None;
+
+                        // If the contact also has a Reticulum address, immediately
+                        // fall back — same logic as TunnelDropped. Without this,
+                        // dual-address contacts retry the tunnel indefinitely with
+                        // backoff, never trying the available Reticulum path.
+                        let has_reticulum = contacts
+                            .get(&identity_hash)
+                            .map(|c| {
+                                c.addresses.iter().any(|addr| {
+                                    matches!(addr, ContactAddress::Reticulum { .. })
+                                })
+                            })
+                            .unwrap_or(false);
+
+                        if has_reticulum {
+                            actions.push(PeerAction::InitiateLink { identity_hash });
+                            peer.status = PeerStatus::Connecting;
+                        }
                     }
                 }
             }
