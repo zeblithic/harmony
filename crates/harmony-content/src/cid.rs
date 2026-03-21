@@ -253,8 +253,8 @@ impl ContentId {
             return Err(ContentError::InvalidFlags);
         }
         if chunk_index > 0xF_FFFF {
-            return Err(ContentError::PayloadTooLarge {
-                size: chunk_index as usize,
+            return Err(ContentError::ChunkIndexTooLarge {
+                index: chunk_index,
                 max: 0xF_FFFF,
             });
         }

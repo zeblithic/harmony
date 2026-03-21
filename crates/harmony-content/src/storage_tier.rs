@@ -519,13 +519,15 @@ impl<B: BookStore> StorageTier<B> {
     ///
     /// Checks three things:
     /// 1. The truncated SHA-256 hash matches the data.
-    /// 2. The payload size field matches the actual data length.
+    /// 2. The payload size field matches the actual data length (leaf books only).
     /// 3. The internal checksum is valid (hash + size + type are consistent).
     fn verify_cid(cid: &ContentId, data: &[u8]) -> bool {
         if !cid.verify_hash(data) {
             return false;
         }
         if cid.depth() == 0 && !cid.is_inline() && cid.payload_size() as usize != data.len() {
+            // Only exact-size check for leaf books — bundles use float-encoded
+            // size (approximate), so their sizes can't be validated exactly.
             return false;
         }
         cid.verify_checksum().is_ok()

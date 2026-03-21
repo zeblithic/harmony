@@ -38,4 +38,7 @@ pub enum ContentError {
 
     #[error("invalid delta: {reason}")]
     InvalidDelta { reason: &'static str },
+
+    #[error("chunk index {index} exceeds maximum {max}")]
+    ChunkIndexTooLarge { index: u32, max: u32 },
 }
