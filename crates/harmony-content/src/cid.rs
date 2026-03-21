@@ -190,11 +190,9 @@ impl ContentId {
     pub fn verify_checksum(&self) -> Result<(), ContentError> {
         let bytes = self.to_bytes();
         let fold = compute_pairwise_xor(&bytes);
-        if self.is_sentinel() {
-            if fold != 0x03 {
-                return Err(ContentError::ChecksumMismatch);
-            }
-        } else if fold != 0x00 {
+        // Normal CIDs fold to 00, sentinels fold to 11.
+        // Any other result (01, 10) is a checksum failure.
+        if fold != 0x00 && fold != 0x03 {
             return Err(ContentError::ChecksumMismatch);
         }
         Ok(())
@@ -209,10 +207,7 @@ impl ContentId {
 
     pub fn for_book(data: &[u8], flags: ContentFlags) -> Result<Self, ContentError> {
         if flags.is_inline() {
-            return Err(ContentError::PayloadTooLarge {
-                size: data.len(),
-                max: MAX_INLINE_DATA,
-            });
+            return Err(ContentError::InvalidFlags);
         }
         if data.len() > MAX_PAYLOAD_SIZE {
             return Err(ContentError::PayloadTooLarge {
@@ -230,10 +225,7 @@ impl ContentId {
         flags: ContentFlags,
     ) -> Result<Self, ContentError> {
         if flags.is_inline() {
-            return Err(ContentError::PayloadTooLarge {
-                size: bundle_bytes.len(),
-                max: MAX_INLINE_DATA,
-            });
+            return Err(ContentError::InvalidFlags);
         }
         let max_child_depth = children.iter().map(|c| c.depth()).max().unwrap_or(0);
         let bundle_depth = max_child_depth + 1;
@@ -248,8 +240,21 @@ impl ContentId {
         Ok(Self::assemble(flags, bundle_depth, raw_size, hash, false))
     }
 
-    pub fn for_stream(hash: [u8; HASH_LEN], flags: ContentFlags, chunk_index: u32) -> Self {
-        Self::assemble(flags, STREAM_DEPTH, chunk_index & 0xF_FFFF, hash, false)
+    pub fn for_stream(
+        hash: [u8; HASH_LEN],
+        flags: ContentFlags,
+        chunk_index: u32,
+    ) -> Result<Self, ContentError> {
+        if flags.is_inline() {
+            return Err(ContentError::InvalidFlags);
+        }
+        Ok(Self::assemble(
+            flags,
+            STREAM_DEPTH,
+            chunk_index & 0xF_FFFF,
+            hash,
+            false,
+        ))
     }
 
     pub fn inline_data(data: &[u8], flags: ContentFlags) -> Result<Self, ContentError> {
@@ -276,11 +281,11 @@ impl ContentId {
 
     pub fn extract_inline_data(&self) -> Result<alloc::vec::Vec<u8>, ContentError> {
         if !self.is_inline() {
-            return Err(ContentError::NotInlineMetadata);
+            return Err(ContentError::NotInlineData);
         }
         let len = self.raw_size_field() as usize;
         if len > MAX_INLINE_DATA {
-            return Err(ContentError::NotInlineMetadata);
+            return Err(ContentError::NotInlineData);
         }
         Ok(self.hash[1..1 + len].to_vec())
     }
@@ -306,7 +311,7 @@ impl ContentId {
 
     pub fn parse_inline_metadata(&self) -> Result<(u64, u32, u64, [u8; 8]), ContentError> {
         if !self.is_inline() || !self.is_sentinel() {
-            return Err(ContentError::NotInlineMetadata);
+            return Err(ContentError::NotInlineData);
         }
         let total_size = u64::from_be_bytes(self.hash[0..8].try_into().unwrap());
         let chunk_count = u32::from_be_bytes(self.hash[8..12].try_into().unwrap());
@@ -439,11 +444,7 @@ pub fn encode_bundle_size(size_bytes: u64) -> u32 {
     let exponent = if exp_raw > 255 { 255u32 } else { exp_raw };
     let shift = exponent + 20;
     let mantissa = if shift < 64 {
-        let scaled = if shift <= 12 {
-            (size_bytes << 12) >> shift
-        } else {
-            size_bytes >> (shift - 12)
-        };
+        let scaled = size_bytes >> (shift - 12);
         let m = scaled.saturating_sub(4096);
         if m > 4095 {
             4095u32
@@ -577,7 +578,7 @@ mod tests {
     #[test]
     fn for_stream_basic() {
         let hash = [0xABu8; HASH_LEN];
-        let cid = ContentId::for_stream(hash, ContentFlags::default(), 42);
+        let cid = ContentId::for_stream(hash, ContentFlags::default(), 42).unwrap();
         assert_eq!(cid.depth(), STREAM_DEPTH);
         assert_eq!(cid.cid_type(), CidType::Stream);
         assert_eq!(cid.raw_size_field(), 42);
