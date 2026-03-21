@@ -28,6 +28,70 @@ pub struct TunnelConfig {
     pub local_identity: Arc<PqPrivateIdentity>,
 }
 
+/// Tracks tunnel peers from the config file for persistent reconnection.
+/// Fields are populated now but actual reconnection is deferred to Bead harmony-h6k.
+#[allow(dead_code)]
+struct ConfigTunnelPeers {
+    peers: Vec<ConfigTunnelPeer>,
+}
+
+#[allow(dead_code)]
+struct ConfigTunnelPeer {
+    node_id: String,
+    name: Option<String>,
+    interface_name: String,
+    next_retry: Option<tokio::time::Instant>,
+    backoff: std::time::Duration,
+    connected: bool,
+}
+
+#[allow(dead_code)]
+const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+#[allow(dead_code)]
+const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[allow(dead_code)]
+impl ConfigTunnelPeers {
+    fn new(entries: Vec<crate::config::TunnelEntry>) -> Self {
+        Self {
+            peers: entries
+                .into_iter()
+                .map(|entry| ConfigTunnelPeer {
+                    interface_name: entry.name.clone().unwrap_or_else(|| {
+                        format!("tunnel-cfg-{}", &entry.node_id[..8.min(entry.node_id.len())])
+                    }),
+                    node_id: entry.node_id,
+                    name: entry.name,
+                    next_retry: Some(tokio::time::Instant::now()), // connect immediately
+                    backoff: INITIAL_BACKOFF,
+                    connected: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn mark_disconnected(&mut self, interface_name: &str) {
+        if let Some(peer) = self.peers.iter_mut().find(|p| p.interface_name == interface_name) {
+            peer.connected = false;
+            peer.backoff = (peer.backoff * 2).min(MAX_BACKOFF);
+            peer.next_retry = Some(tokio::time::Instant::now() + peer.backoff);
+            tracing::info!(
+                %interface_name,
+                backoff_secs = peer.backoff.as_secs(),
+                "config tunnel disconnected — scheduling reconnect"
+            );
+        }
+    }
+
+    fn mark_connected(&mut self, interface_name: &str) {
+        if let Some(peer) = self.peers.iter_mut().find(|p| p.interface_name == interface_name) {
+            peer.connected = true;
+            peer.backoff = INITIAL_BACKOFF;
+            peer.next_retry = None;
+        }
+    }
+}
+
 /// Internal bridge events from spawned Zenoh tasks to the select loop.
 enum ZenohEvent {
     /// Inbound Zenoh query (non-compute).
@@ -64,6 +128,7 @@ enum ZenohEvent {
 /// - `tunnel_config`: optional iroh tunnel configuration (enables tunnel accept/connect).
 /// - `bootstrap_peers`: static peers from the config `[peers]` section; added to PeerTable
 ///   at startup so they receive unicast traffic even when not reachable via mDNS.
+/// - `tunnel_entries`: config-sourced tunnel peers to track for reconnection.
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -72,6 +137,7 @@ pub async fn run(
     mdns_stale_timeout: Duration,
     tunnel_config: Option<TunnelConfig>,
     bootstrap_peers: Vec<SocketAddr>,
+    tunnel_entries: Vec<crate::config::TunnelEntry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -169,6 +235,11 @@ pub async fn run(
     } else {
         None
     };
+
+    // ConfigTunnelPeers tracks config-sourced tunnels and drives backoff reconnection.
+    // Actual outbound connection initiation is deferred to Bead harmony-h6k.
+    #[allow(unused_variables, unused_mut)]
+    let mut config_tunnels = ConfigTunnelPeers::new(tunnel_entries);
 
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {

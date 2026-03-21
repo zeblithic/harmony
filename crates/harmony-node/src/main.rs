@@ -303,9 +303,6 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 entries
             };
 
-            // Suppress unused-variable warning until Task 5 consumes tunnel_entries.
-            let _ = &tunnel_entries;
-
             if cache_capacity == 0 {
                 return Err("--cache-capacity must be > 0".into());
             }
@@ -413,6 +410,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 std::time::Duration::from_secs(mdns_stale_timeout),
                 tunnel_config,
                 bootstrap_peers,
+                tunnel_entries,
             ).await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
