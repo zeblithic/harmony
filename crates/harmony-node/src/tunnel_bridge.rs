@@ -75,7 +75,10 @@ impl TunnelSender {
         Self { tx, connection_id }
     }
 
-    pub fn try_send_reticulum(&self, packet: Vec<u8>) -> Result<(), mpsc::error::TrySendError<TunnelCommand>> {
+    pub fn try_send_reticulum(
+        &self,
+        packet: Vec<u8>,
+    ) -> Result<(), mpsc::error::TrySendError<TunnelCommand>> {
         self.tx.try_send(TunnelCommand::SendReticulum { packet })
     }
 }

@@ -32,7 +32,12 @@ pub fn verify_profile(
         .ok_or(ProfileError::KeyNotFound)?;
 
     let payload = record.signable_bytes();
-    verify_signature(record.identity_ref.suite, &key_bytes, &payload, &record.signature)
+    verify_signature(
+        record.identity_ref.suite,
+        &key_bytes,
+        &payload,
+        &record.signature,
+    )
 }
 
 /// Verify an endorsement record's signature and time bounds.
@@ -54,7 +59,12 @@ pub fn verify_endorsement(
         .ok_or(ProfileError::KeyNotFound)?;
 
     let payload = record.signable_bytes();
-    verify_signature(record.endorser.suite, &key_bytes, &payload, &record.signature)
+    verify_signature(
+        record.endorser.suite,
+        &key_bytes,
+        &payload,
+        &record.signature,
+    )
 }
 
 /// Validity window is half-open: `[published_at, expires_at)`.
@@ -129,7 +139,10 @@ mod tests {
         identity_ref: &IdentityRef,
     ) -> MemoryKeyResolver {
         let mut resolver = MemoryKeyResolver::new();
-        resolver.insert(identity_ref.hash, identity.verifying_key.to_bytes().to_vec());
+        resolver.insert(
+            identity_ref.hash,
+            identity.verifying_key.to_bytes().to_vec(),
+        );
         resolver
     }
 
@@ -173,9 +186,8 @@ mod tests {
                 let endorser_ref = IdentityRef::from(&pq_id);
                 let endorsee_ref = IdentityRef::new([0xBB; 16], CryptoSuite::MlDsa65);
 
-                let builder = EndorsementBuilder::new(
-                    endorser_ref, endorsee_ref, 42, 1000, 2000, [0x01; 16],
-                );
+                let builder =
+                    EndorsementBuilder::new(endorser_ref, endorsee_ref, 42, 1000, 2000, [0x01; 16]);
                 let payload = builder.signable_payload();
                 let sig = harmony_crypto::ml_dsa::sign(&sign_sk, &payload).unwrap();
                 let record = builder.build(sig.as_bytes().to_vec());
@@ -216,9 +228,8 @@ mod tests {
         let endorser_ref = IdentityRef::from(identity);
         let endorsee_ref = IdentityRef::new([0xBB; 16], CryptoSuite::Ed25519);
 
-        let builder = EndorsementBuilder::new(
-            endorser_ref, endorsee_ref, 42, 1000, 2000, [0x01; 16],
-        );
+        let builder =
+            EndorsementBuilder::new(endorser_ref, endorsee_ref, 42, 1000, 2000, [0x01; 16]);
         let payload = builder.signable_payload();
         let signature = private.sign(&payload);
         let record = builder.build(signature.to_vec());

@@ -219,13 +219,8 @@ mod tests {
         let hint = RoutingHint::Reticulum {
             destination_hash: [0xDE; 16],
         };
-        let mut builder = AnnounceBuilder::new(
-            test_identity(),
-            test_public_key(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
         builder.add_routing_hint(hint.clone());
         let record = builder.build(alloc::vec![0x51, 0x67]);
 
@@ -240,13 +235,8 @@ mod tests {
 
     #[test]
     fn signable_payload_is_deterministic() {
-        let builder = AnnounceBuilder::new(
-            test_identity(),
-            test_public_key(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let builder =
+            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
         let p1 = builder.signable_payload();
         let p2 = builder.signable_payload();
         assert_eq!(p1, p2);
@@ -266,13 +256,8 @@ mod tests {
 
     #[test]
     fn multiple_routing_hints() {
-        let mut builder = AnnounceBuilder::new(
-            test_identity(),
-            test_public_key(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
         builder.add_routing_hint(RoutingHint::Reticulum {
             destination_hash: [0xAA; 16],
         });
@@ -285,13 +270,8 @@ mod tests {
 
     #[test]
     fn serde_round_trip() {
-        let mut builder = AnnounceBuilder::new(
-            test_identity(),
-            test_public_key(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
         builder.add_routing_hint(RoutingHint::Reticulum {
             destination_hash: [0xBB; 16],
         });
@@ -342,13 +322,8 @@ mod tests {
             relay_url: Some("https://relay.example.com".into()),
             direct_addrs: vec!["10.0.0.1:7777".into(), "203.0.113.5:7777".into()],
         };
-        let mut builder = AnnounceBuilder::new(
-            test_identity(),
-            test_public_key(),
-            1000,
-            2000,
-            [0x42; 16],
-        );
+        let mut builder =
+            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x42; 16]);
         builder.add_routing_hint(hint.clone());
         let record = builder.build(alloc::vec![0xCA, 0xFE]);
 
