@@ -1,0 +1,28 @@
+[package]
+name = "harmony-tunnel"
+description = "PQ-authenticated encrypted tunnel state machine for Harmony peer-to-peer connections"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harmony-crypto = { workspace = true }
+harmony-identity = { workspace = true }
+rand_core = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+    "harmony-crypto/std",
+    "harmony-identity/std",
+    "rand_core/getrandom",
+    "thiserror/std",
+]
+
+[dev-dependencies]
+rand = { workspace = true }
+hex = { workspace = true }

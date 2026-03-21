@@ -237,6 +237,11 @@ impl PqPrivateIdentity {
         &self.encryption_secret
     }
 
+    /// Returns a reference to the ML-DSA-65 signing key.
+    pub fn signing_key(&self) -> &harmony_crypto::ml_dsa::MlDsaSecretKey {
+        &self.signing_key
+    }
+
     /// Decrypt ciphertext encrypted to this identity.
     ///
     /// Expects wire format: `[1088B ML-KEM ciphertext][12B nonce][encrypted data + 16B tag]`

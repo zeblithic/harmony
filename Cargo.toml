@@ -21,6 +21,7 @@ members = [
     "crates/harmony-reticulum",
     "crates/harmony-roxy",
     "crates/harmony-trust",
+    "crates/harmony-tunnel",
     "crates/harmony-oluo",
     "crates/harmony-semantic",
     "crates/harmony-workflow",
@@ -109,6 +110,7 @@ harmony-roxy = { path = "crates/harmony-roxy", default-features = false }
 harmony-oluo = { path = "crates/harmony-oluo", default-features = false }
 harmony-semantic = { path = "crates/harmony-semantic", default-features = false }
 harmony-trust = { path = "crates/harmony-trust", default-features = false }
+harmony-tunnel = { path = "crates/harmony-tunnel", default-features = false }
 harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
 
