@@ -1225,8 +1225,9 @@ impl<B: BookStore> NodeRuntime<B> {
             return None;
         }
 
-        // 4. Check expiry
-        if token.expires_at != 0 && token.expires_at <= unix_now {
+        // 4. Check expiry — use `>` (not `>=`) to match verify_token in ucan.rs,
+        //    which accepts the token at the exact expires_at timestamp.
+        if token.expires_at != 0 && unix_now > token.expires_at {
             tracing::debug!("token expired");
             return None;
         }
@@ -3409,5 +3410,33 @@ mod tests {
         // Even though the owner is known and pubkey is cached, no replica for this CID.
         let result = rt.handle_pull_with_token(requester_hash, missing_cid, token_bytes);
         assert!(result.is_none(), "missing replica should be rejected");
+    }
+
+    #[test]
+    fn pull_with_token_wrong_audience_rejected() {
+        use rand::rngs::OsRng;
+
+        let (rt, owner, cid) = setup_pull_with_token_runtime();
+
+        // Token issued to [0x42; 16] but presented by [0x99; 16].
+        let intended_audience = [0x42u8; 16];
+        let actual_requester = [0x99u8; 16];
+        let token = owner
+            .issue_pq_root_token(
+                &mut OsRng,
+                &intended_audience,
+                harmony_identity::CapabilityType::Content,
+                &cid,
+                0,
+                0,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        let result = rt.handle_pull_with_token(actual_requester, cid, token_bytes);
+        assert!(
+            result.is_none(),
+            "token with wrong audience should be rejected"
+        );
     }
 }
