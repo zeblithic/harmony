@@ -43,7 +43,8 @@ pub struct Disclosure {
     pub salt: String,
     /// Claim name (absent for array element disclosures).
     pub claim_name: Option<String>,
-    /// Raw JSON bytes of the claim value (always available, no_std safe).
+    /// Re-serialised JSON bytes of the claim value (canonical compact form; no_std safe).
+    /// Note: this is a re-encoding via serde_json, not the verbatim original bytes.
     pub claim_value: Vec<u8>,
     /// Parsed claim value (requires `std` for JSON parsing).
     #[cfg(feature = "std")]

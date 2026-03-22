@@ -70,6 +70,17 @@ pub fn signing_input(compact: &str) -> Result<(&str, &str), SdJwtError> {
 ///
 /// This function requires the `std` feature because it uses `serde_json` for
 /// JSON deserialization.
+/// Parse an SD-JWT compact serialization string.
+///
+/// # Security
+///
+/// This function verifies structure and decodes components, but does **not**
+/// verify that each disclosure's hash appears in `payload.sd_digests`.
+/// Callers MUST hash each `Disclosure::raw` value (using `payload.sd_alg`,
+/// defaulting to `sha-256`) and confirm the digest is present in
+/// `payload.sd_digests` before treating any disclosed claim as
+/// issuer-attested. Without this check, an attacker could append forged
+/// disclosures that were never signed by the issuer.
 #[cfg(feature = "std")]
 pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
     use alloc::string::{String, ToString};
