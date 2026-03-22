@@ -53,7 +53,8 @@ if [ ! -f "${PRIVATE_KEY}" ]; then
   #   <name>.pub  — public key  (add to clients' nix.conf trusted-public-keys)
   # The key name is embedded in signatures, so use a stable host-based name.
   KEY_NAME="$(hostname -f)-cache-1"
-  sudo nix-store --generate-binary-cache-key "${KEY_NAME}" "${PRIVATE_KEY}" "${PUBLIC_KEY}"
+  # Use absolute path — sudo's secure_path doesn't include /nix/var/nix/profiles/default/bin.
+  sudo /nix/var/nix/profiles/default/bin/nix-store --generate-binary-cache-key "${KEY_NAME}" "${PRIVATE_KEY}" "${PUBLIC_KEY}"
   sudo chmod 600 "${PRIVATE_KEY}"
   sudo chmod 644 "${PUBLIC_KEY}"
   echo "[nix-cache-setup] Signing keypair written to ${KEY_DIR}."

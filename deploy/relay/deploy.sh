@@ -149,14 +149,21 @@ elif command -v nix &>/dev/null; then
     # /etc/profile.d/nix.sh is never sourced. Prefix all remote commands
     # with Nix PATH setup so nix-store is found (NixOS/nix#2587).
     NIX_SSH_PREFIX='export PATH="/nix/var/nix/profiles/default/bin:$PATH";'
+    # Absolute path for sudo calls — Debian's secure_path doesn't include Nix.
+    NIX_STORE_BIN="/nix/var/nix/profiles/default/bin/nix-store"
 
     # Verify Nix is installed on the VM BEFORE building locally (~2 min).
+    # On a brand-new VM, auto-run nix-cache-setup.sh to install Nix + nix-serve.
     if ! gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" \
         --command="${NIX_SSH_PREFIX} command -v nix-store" &>/dev/null; then
-        echo "ERROR: Nix is not installed on ${VM_NAME}."
-        echo "Run nix-cache-setup.sh first:"
-        echo "  gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- 'bash -s' < deploy/relay/nix-cache-setup.sh"
-        exit 1
+        echo "    Nix not found on ${VM_NAME} — running nix-cache-setup.sh..."
+        SETUP_SCRIPT="${SCRIPT_DIR}/nix-cache-setup.sh"
+        if [ ! -f "$SETUP_SCRIPT" ]; then
+            echo "ERROR: ${SETUP_SCRIPT} not found."
+            exit 1
+        fi
+        gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" -- "bash -s" < "$SETUP_SCRIPT"
+        echo "    Nix setup complete."
     fi
 
     # Configure the VM's binary cache as a substituter so nix build can
@@ -219,7 +226,7 @@ elif command -v nix &>/dev/null; then
         done < <(nix-store -qR "$STORE_PATH")
         nix-store --export "${CLOSURE[@]}" | \
             gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" -- \
-            "${NIX_SSH_PREFIX} sudo nix-store --import"
+            "sudo ${NIX_STORE_BIN} --import"
         echo "    Closure pushed."
     fi
 
