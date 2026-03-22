@@ -188,6 +188,8 @@ pub enum RuntimeEvent {
         peer_identity: [u8; 16],
         cid: [u8; 32],
         token_bytes: Vec<u8>,
+        /// Unix epoch seconds — injected by the event loop for sans-I/O testability.
+        unix_now: u64,
     },
     /// A peer's ML-DSA public key was learned (from handshake or discovery).
     PeerPublicKeyLearned {
@@ -434,7 +436,8 @@ pub struct NodeRuntime<B: BookStore> {
     ticks_since_replica_scan: u32,
     // Cache of ML-DSA public keys by identity hash.
     // Populated from HandshakeComplete and AnnounceRecord events.
-    // Capped at MAX_PUBKEY_CACHE_SIZE entries — evicts oldest on overflow.
+    // Capped at MAX_PUBKEY_CACHE_SIZE entries — evicts an arbitrary entry
+    // on overflow (not LRU). A future improvement could use an LRU structure.
     // SECURITY(V1): Announce records don't verify pubkey→hash binding.
     // Until address re-derivation is implemented, a forged announce can
     // poison this cache. See harmony-discovery crate Security docs.
@@ -898,9 +901,10 @@ impl<B: BookStore> NodeRuntime<B> {
                 peer_identity,
                 cid,
                 token_bytes,
+                unix_now,
             } => {
                 if let Some(action) =
-                    self.handle_pull_with_token(peer_identity, cid, token_bytes)
+                    self.handle_pull_with_token(peer_identity, cid, token_bytes, unix_now)
                 {
                     self.pending_direct_actions.push(action);
                 }
@@ -1212,24 +1216,16 @@ impl<B: BookStore> NodeRuntime<B> {
     /// 8-step validation: deserialize token, check capability==Content,
     /// check resource==cid, check expiry, check not-before, verify
     /// ML-DSA-65 signature, check audience==peer_identity, retrieve replica.
+    /// `unix_now` is Unix epoch seconds, injected by the caller for sans-I/O
+    /// testability. The event loop computes this from `SystemTime::now()`.
     fn handle_pull_with_token(
         &self,
         peer_identity: [u8; 16],
         cid: [u8; 32],
         token_bytes: Vec<u8>,
+        unix_now: u64,
     ) -> Option<RuntimeAction> {
         use harmony_content::replica::ReplicaStore;
-
-        // Fail-closed: if the system clock is before the UNIX epoch
-        // (RTC not initialized, container clock drift), reject the token
-        // rather than silently bypassing expiry checks with unix_now=0.
-        let unix_now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_secs(),
-            Err(_) => {
-                tracing::warn!("system clock before UNIX epoch; rejecting token for safety");
-                return None;
-            }
-        };
 
         // 0. Reject oversized payloads before allocating for deserialization.
         //    A PqUcanToken with a 32-byte resource + ML-DSA-65 signature (3309B)
@@ -3323,7 +3319,7 @@ mod tests {
             .unwrap();
         let token_bytes = token.to_bytes();
 
-        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes);
+        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
         assert!(result.is_some(), "valid token should produce a response");
         match result.unwrap() {
             RuntimeAction::ReplicaPullResponse {
@@ -3359,7 +3355,7 @@ mod tests {
             .unwrap();
         let token_bytes = token.to_bytes();
 
-        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes);
+        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
         assert!(result.is_none(), "expired token should be rejected");
     }
 
@@ -3385,7 +3381,7 @@ mod tests {
         let token_bytes = token.to_bytes();
 
         // Request with the actual CID, but token says different CID.
-        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes);
+        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
         assert!(result.is_none(), "wrong CID should be rejected");
     }
 
@@ -3416,7 +3412,7 @@ mod tests {
         // The owner's pubkey is cached, but the token issuer is the stranger.
         rt.pubkey_cache.remove(&stranger_hash);
 
-        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes);
+        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
         assert!(result.is_none(), "unknown issuer should be rejected");
     }
 
@@ -3443,7 +3439,7 @@ mod tests {
         let token_bytes = token.to_bytes();
 
         // Even though the owner is known and pubkey is cached, no replica for this CID.
-        let result = rt.handle_pull_with_token(requester_hash, missing_cid, token_bytes);
+        let result = rt.handle_pull_with_token(requester_hash, missing_cid, token_bytes, 1_700_000_000);
         assert!(result.is_none(), "missing replica should be rejected");
     }
 
@@ -3468,7 +3464,7 @@ mod tests {
             .unwrap();
         let token_bytes = token.to_bytes();
 
-        let result = rt.handle_pull_with_token(actual_requester, cid, token_bytes);
+        let result = rt.handle_pull_with_token(actual_requester, cid, token_bytes, 1_700_000_000);
         assert!(
             result.is_none(),
             "token with wrong audience should be rejected"

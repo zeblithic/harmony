@@ -606,10 +606,15 @@ pub async fn run(
                                                 });
                                             }
                                             ReplicationOp::PullWithToken => {
+                                                let unix_now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs())
+                                                    .unwrap_or(0); // fail-closed handled in runtime
                                                 runtime.push_event(RuntimeEvent::ReplicaPullWithTokenReceived {
                                                     peer_identity: peer_id,
                                                     cid: rep_msg.cid,
                                                     token_bytes: rep_msg.payload,
+                                                    unix_now,
                                                 });
                                             }
                                             _ => {} // Other ops (Pull, Status, etc.) not yet handled
