@@ -38,13 +38,13 @@ pub struct CooperationTable {
     floor: f32,
     /// Starting score for newly registered interfaces (default 0.5).
     initial: f32,
-    /// Milliseconds of inactivity before staleness decay kicks in (default 300_000 = 5 min).
+    /// Seconds of inactivity before staleness decay kicks in (default 300 = 5 min).
     staleness_window: u64,
 }
 
 impl Default for CooperationTable {
     fn default() -> Self {
-        Self::new(0.1, 0.05, 0.5, 300_000)
+        Self::new(0.1, 0.05, 0.5, 300)
     }
 }
 
@@ -54,7 +54,7 @@ impl CooperationTable {
     /// - `alpha`: EMA smoothing factor (0 < alpha ≤ 1). Smaller = slower adaptation.
     /// - `floor`: minimum score floor after decay.
     /// - `initial`: starting score for new interfaces.
-    /// - `staleness_window`: milliseconds after which an interface is considered stale.
+    /// - `staleness_window`: seconds after which an interface is considered stale.
     pub fn new(alpha: f32, floor: f32, initial: f32, staleness_window: u64) -> Self {
         Self {
             scores: HashMap::new(),

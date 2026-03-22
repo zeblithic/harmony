@@ -39,7 +39,10 @@ const RATE_TABLE_EXPIRY: u64 = 21_600;
 
 /// Milliseconds to wait for an announce echo before recording a negative
 /// cooperation observation. Conservative at 90s (3x a typical 30s interval).
-const ECHO_TIMEOUT_MS: u64 = 90_000;
+/// Announce echo timeout in seconds. If we don't hear our own announce
+/// echo back within this window, record a negative observation.
+/// 90 seconds ≈ 3× a typical 30-second announce interval.
+const ECHO_TIMEOUT: u64 = 90;
 
 /// Reverse table entries older than this are expired (8 minutes).
 /// Matches Python `Transport.REVERSE_TIMEOUT`.
@@ -644,12 +647,12 @@ impl Node {
                 let expired_echoes: Vec<(Arc<str>, DestinationHash)> = self
                     .pending_echoes
                     .iter()
-                    .filter(|(_, &ts)| now.saturating_sub(ts) > ECHO_TIMEOUT_MS)
+                    .filter(|(_, &ts)| now.saturating_sub(ts) > ECHO_TIMEOUT)
                     .map(|(key, _)| key.clone())
                     .collect();
-                for (iface, _dest) in &expired_echoes {
+                for (iface, dest) in &expired_echoes {
                     self.cooperation.observe_announce_timeout(iface, now);
-                    self.pending_echoes.remove(&(Arc::clone(iface), *_dest));
+                    self.pending_echoes.remove(&(Arc::clone(iface), *dest));
                 }
 
                 // Decay scores for interfaces that haven't been observed recently.
@@ -1166,10 +1169,12 @@ impl Node {
             if has_pending {
                 self.cooperation
                     .observe_announce_forwarded(&interface_name, now);
-                // Clear pending echoes for this dest — announce is propagating.
-                // New echoes will be tracked from the next announce cycle.
+                // Only remove the echoing interface's entry — leave other interfaces'
+                // entries so they can independently earn credit or timeout. This prevents
+                // first-echo-wins bias where the fastest neighbor monopolizes positive
+                // observations while equally-cooperative neighbors get nothing.
                 self.pending_echoes
-                    .retain(|(_, dh), _| *dh != destination_hash);
+                    .remove(&(Arc::clone(&interface_name), destination_hash));
             }
         }
 
@@ -1685,11 +1690,16 @@ impl Node {
         };
 
         // Mark proof received and record positive cooperation observation.
+        // Only credit the first proof — duplicate proofs from redundant mesh paths
+        // should not inflate the score.
+        let already_received = entry.proof_received;
         entry.proof_received = true;
         let outbound_iface = entry.outbound_interface.clone();
         let received_iface = entry.received_interface.clone();
 
-        self.cooperation.observe_proof_delivered(&outbound_iface, now);
+        if !already_received {
+            self.cooperation.observe_proof_delivered(&outbound_iface, now);
+        }
 
         // Forward proof with current hops (already incremented in inbound pipeline)
         let forwarded = Packet {
@@ -5224,11 +5234,13 @@ mod tests {
              positive echo observation, got {weight_after}"
         );
 
-        // Pending echoes should be cleared for this destination.
+        // Only the echoing interface's entry is removed (wlan0 had no entry since
+        // it was registered after the announce). eth0's entry remains for independent
+        // timeout tracking.
         assert_eq!(
             node.pending_echoes_len(),
-            0,
-            "pending echoes should be cleared after echo received"
+            1,
+            "eth0's pending echo should remain (wlan0 had no entry to remove)"
         );
     }
 
@@ -5273,7 +5285,7 @@ mod tests {
         );
 
         // Tick past the echo timeout without any echo arriving.
-        let timeout_now = now + ECHO_TIMEOUT_MS + 1;
+        let timeout_now = now + ECHO_TIMEOUT + 1;
         node.handle_event(NodeEvent::TimerTick { now: timeout_now });
 
         // Pending echoes should be expired.
