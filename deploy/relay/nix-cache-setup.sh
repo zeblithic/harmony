@@ -87,6 +87,10 @@ fi
 # This is critical: ProtectHome=yes makes ~/.nix-profile inaccessible to
 # the service process, so ExecStart must point to the store path directly.
 NIX_SERVE_BIN="$(readlink -f "$(command -v nix-serve)")"
+if [ -z "$NIX_SERVE_BIN" ] || [ ! -x "$NIX_SERVE_BIN" ]; then
+    echo "[nix-cache-setup] ERROR: could not resolve nix-serve binary; try re-running to reinstall."
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Create systemd service for nix-serve on port 5000
@@ -105,6 +109,7 @@ fi
 NIX_GROUP=$(stat -c '%G' /nix/var/nix/daemon-socket/socket 2>/dev/null || echo nixbld)
 if ! id -nG nix-serve 2>/dev/null | grep -qw "$NIX_GROUP"; then
     sudo usermod -aG "$NIX_GROUP" nix-serve
+    # Note: group change takes effect on next process start; try-restart below applies it.
     echo "[nix-cache-setup] Added nix-serve to group ${NIX_GROUP}."
 fi
 # Grant nix-serve group read on the signing key

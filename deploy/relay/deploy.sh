@@ -169,6 +169,13 @@ elif command -v nix &>/dev/null; then
         echo "      gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- cat /etc/nix/cache-key.pub > ${SCRIPT_DIR}/cache-key.pub"
         echo "    Then commit cache-key.pub so future deploys can use the binary cache."
         echo ""
+        # Verify the daemon is ready after setup before proceeding
+        if ! gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" \
+            --command="${NIX_SSH_PREFIX} nix-store --version" &>/dev/null; then
+            echo "ERROR: Nix daemon on ${VM_NAME} is not responding after setup."
+            echo "  gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- sudo journalctl -u nix-daemon -n 20"
+            exit 1
+        fi
     fi
 
     # Configure the VM's binary cache as a substituter so nix build can
@@ -193,6 +200,7 @@ elif command -v nix &>/dev/null; then
         #   trusted-users = root @wheel <your-username>
         EXTRA_NIX_ARGS+=(
             --extra-substituters "http://${RELAY_HOSTNAME}:5000"
+            # Note: on first deploy DNS may not resolve yet; the substituter miss is harmless.
             --extra-trusted-public-keys "$CACHE_PUB_KEY"
         )
         echo "    Binary cache configured (requires trusted-users for cache hits)"
