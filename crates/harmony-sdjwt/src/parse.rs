@@ -74,10 +74,10 @@ pub fn signing_input(compact: &str) -> Result<(&str, &str), SdJwtError> {
 /// # Security
 ///
 /// This function verifies structure and decodes components, but does **not**
-/// verify that each disclosure's hash appears in `payload.sd_digests`.
+/// verify that each disclosure's hash appears in `payload.sd`.
 /// Callers MUST hash each `Disclosure::raw` value (using `payload.sd_alg`,
 /// defaulting to `sha-256`) and confirm the digest is present in
-/// `payload.sd_digests` before treating any disclosed claim as
+/// `payload.sd` before treating any disclosed claim as
 /// issuer-attested. Without this check, an attacker could append forged
 /// disclosures that were never signed by the issuer.
 #[cfg(feature = "std")]
@@ -217,7 +217,11 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
 
         // KB-JWT detection: disclosures are base64url strings (no dots),
         // while a KB-JWT is a compact JWS (header.payload.signature).
+        // RFC 9901 §11.6: at most one KB-JWT, always the final non-empty segment.
         if segment.contains('.') {
+            if key_binding_jwt.is_some() {
+                return Err(SdJwtError::MalformedCompact);
+            }
             key_binding_jwt = Some((*segment).to_string());
             continue;
         }
@@ -499,6 +503,21 @@ mod tests {
         let sd_jwt = parse(&compact).unwrap();
         assert_eq!(sd_jwt.disclosures.len(), 1);
         assert_eq!(sd_jwt.key_binding_jwt.as_deref(), Some(kb_jwt));
+    }
+
+    #[test]
+    fn parse_rejects_multiple_key_binding_jwts() {
+        let header = serde_json::json!({"alg": "EdDSA"});
+        let payload = serde_json::json!({"_sd": []});
+        let kb1 = "eyJhbGciOiJFZERTQSJ9.eyJub25jZSI6IjEifQ.c2ln";
+        let kb2 = "eyJhbGciOiJFZERTQSJ9.eyJub25jZSI6IjIifQ.c2ln";
+        let compact = format!(
+            "{}~{}~{}~",
+            build_jws(&header, &payload, b"sig"),
+            kb1,
+            kb2
+        );
+        assert!(matches!(parse(&compact), Err(SdJwtError::MalformedCompact)));
     }
 
     #[test]
