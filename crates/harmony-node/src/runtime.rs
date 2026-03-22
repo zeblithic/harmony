@@ -183,6 +183,11 @@ pub enum RuntimeEvent {
         cid: [u8; 32],
         data: Vec<u8>,
     },
+    /// A peer's ML-DSA public key was learned (from handshake or discovery).
+    PeerPublicKeyLearned {
+        identity_hash: [u8; 16],
+        dsa_pubkey: Vec<u8>,
+    },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -415,6 +420,9 @@ pub struct NodeRuntime<B: BookStore> {
     replica_store: MemoryReplicaStore,
     // Replication: ticks since last replication scan
     ticks_since_replica_scan: u32,
+    // Cache of ML-DSA public keys by identity hash.
+    // Populated from HandshakeComplete and AnnounceRecord events.
+    pubkey_cache: HashMap<[u8; 16], Vec<u8>>,
 }
 
 impl<B: BookStore> NodeRuntime<B> {
@@ -528,6 +536,7 @@ impl<B: BookStore> NodeRuntime<B> {
             last_now: 0,
             replica_store: MemoryReplicaStore::new(),
             ticks_since_replica_scan: 0,
+            pubkey_cache: HashMap::new(),
         };
 
         (rt, actions)
@@ -591,6 +600,11 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Mutable access to the contact store.
     pub fn contact_store_mut(&mut self) -> &mut ContactStore {
         &mut self.contact_store
+    }
+
+    /// Look up a cached ML-DSA public key by identity hash.
+    pub fn get_peer_pubkey(&self, identity_hash: &[u8; 16]) -> Option<&[u8]> {
+        self.pubkey_cache.get(identity_hash).map(|v| v.as_slice())
     }
 
     /// Number of malformed filter payloads that failed deserialization.
@@ -845,6 +859,12 @@ impl<B: BookStore> NodeRuntime<B> {
                 if quota > 0 {
                     let _ = self.replica_store.store(peer_identity, cid, data, quota);
                 }
+            }
+            RuntimeEvent::PeerPublicKeyLearned {
+                identity_hash,
+                dsa_pubkey,
+            } => {
+                self.pubkey_cache.insert(identity_hash, dsa_pubkey);
             }
         }
     }
@@ -1145,6 +1165,12 @@ impl<B: BookStore> NodeRuntime<B> {
         use harmony_discovery::RoutingHint;
 
         let identity_hash = record.identity_ref.hash;
+
+        // Cache the peer's public key for token signature verification.
+        if !record.public_key.is_empty() {
+            self.pubkey_cache
+                .insert(identity_hash, record.public_key.clone());
+        }
 
         let tunnel_hints: Vec<_> = record
             .routing_hints

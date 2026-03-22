@@ -526,7 +526,7 @@ pub async fn run(
                     TunnelBridgeEvent::HandshakeComplete {
                         interface_name,
                         peer_node_id,
-                        peer_dsa_pubkey: _, // TODO(harmony-h6k): store in contact registry
+                        peer_dsa_pubkey,
                         connection_id,
                     } => {
                         // Guard against stale handshake completions: only register the
@@ -542,6 +542,15 @@ pub async fn run(
                             // Used with find_by_tunnel_node_id() to resolve the contact's
                             // canonical identity_hash for quota lookup.
                             tunnel_identities.insert(interface_name.clone(), peer_node_id);
+
+                            // Cache the peer's ML-DSA public key for token verification.
+                            if let Some(contact) = runtime.contact_store().find_by_tunnel_node_id(&peer_node_id) {
+                                runtime.push_event(RuntimeEvent::PeerPublicKeyLearned {
+                                    identity_hash: contact.identity_hash,
+                                    dsa_pubkey: peer_dsa_pubkey,
+                                });
+                            }
+
                             runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
                                 interface_name,
                                 peer_node_id,
