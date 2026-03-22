@@ -204,6 +204,17 @@ pub mod filters {
     pub fn flatpack_key(node_addr: &str) -> String {
         format!("{FLATPACK_PREFIX}/{node_addr}")
     }
+
+    /// Memo filter prefix: `harmony/filters/memo`
+    pub const MEMO_PREFIX: &str = "harmony/filters/memo";
+
+    /// Subscribe to all memo filters: `harmony/filters/memo/**`
+    pub const MEMO_SUB: &str = "harmony/filters/memo/**";
+
+    /// Memo filter key: `harmony/filters/memo/{node_addr}`
+    pub fn memo_key(node_addr: &str) -> String {
+        format!("{MEMO_PREFIX}/{node_addr}")
+    }
 }
 
 /// Flatpack reverse-lookup query key expressions.
@@ -438,6 +449,45 @@ pub mod endorsement {
     /// of the 16-byte `IdentityHash`.
     pub fn key(endorser_hex: &str, endorsee_hex: &str) -> String {
         format!("{PREFIX}/{endorser_hex}/{endorsee_hex}")
+    }
+}
+
+/// Signed memo attestations for deterministic computation results.
+///
+/// Namespace: `harmony/memo/<input_cid_hex>/<output_cid_hex>/sign/<signer_id_hex>`
+///
+/// Each path level encodes the attestation: input (computation recipe),
+/// output (result), signer (who verified). Multiple outputs under the same
+/// input means disagreement — structurally visible in the path topology.
+pub mod memo {
+    use alloc::{format, string::String};
+
+    pub const PREFIX: &str = "harmony/memo";
+    pub const SUB: &str = "harmony/memo/**";
+
+    /// Full attestation key: `harmony/memo/{input}/{output}/sign/{signer}`
+    pub fn sign_key(input_hex: &str, output_hex: &str, signer_hex: &str) -> String {
+        format!("{PREFIX}/{input_hex}/{output_hex}/sign/{signer_hex}")
+    }
+
+    /// All memos for an input: `harmony/memo/{input}/**`
+    pub fn input_query(input_hex: &str) -> String {
+        format!("{PREFIX}/{input_hex}/**")
+    }
+
+    /// All signers for a specific input→output: `harmony/memo/{input}/{output}/sign/**`
+    pub fn output_query(input_hex: &str, output_hex: &str) -> String {
+        format!("{PREFIX}/{input_hex}/{output_hex}/sign/**")
+    }
+
+    /// What does a specific signer say about this input: `harmony/memo/{input}/*/sign/{signer}`
+    ///
+    /// This pattern uses `*` in a non-terminal position, which works for
+    /// Zenoh `session.get()` queries but may not be registerable as a
+    /// subscriber in Zenoh 1.x. For subscription use cases, subscribe to
+    /// `harmony/memo/{input}/**` and filter at the application layer.
+    pub fn signer_query(input_hex: &str, signer_hex: &str) -> String {
+        format!("{PREFIX}/{input_hex}/*/sign/{signer_hex}")
     }
 }
 
@@ -793,6 +843,58 @@ mod tests {
         );
     }
 
+    // ── Memo ──────────────────────────────────────────────────────
+
+    #[test]
+    fn memo_sign_key() {
+        assert_eq!(
+            memo::sign_key("aabbccdd", "11223344", "deadbeef"),
+            "harmony/memo/aabbccdd/11223344/sign/deadbeef"
+        );
+    }
+
+    #[test]
+    fn memo_input_query() {
+        assert_eq!(
+            memo::input_query("aabbccdd"),
+            "harmony/memo/aabbccdd/**"
+        );
+    }
+
+    #[test]
+    fn memo_output_query() {
+        assert_eq!(
+            memo::output_query("aabbccdd", "11223344"),
+            "harmony/memo/aabbccdd/11223344/sign/**"
+        );
+    }
+
+    #[test]
+    fn memo_signer_query() {
+        assert_eq!(
+            memo::signer_query("aabbccdd", "deadbeef"),
+            "harmony/memo/aabbccdd/*/sign/deadbeef"
+        );
+    }
+
+    #[test]
+    fn memo_subscription_pattern() {
+        assert_eq!(memo::SUB, "harmony/memo/**");
+    }
+
+    #[test]
+    fn filters_memo_key() {
+        assert_eq!(
+            filters::memo_key("node42"),
+            "harmony/filters/memo/node42"
+        );
+    }
+
+    #[test]
+    fn filters_memo_subscription_pattern() {
+        assert_eq!(filters::MEMO_SUB, "harmony/filters/memo/**");
+    }
+
     // ── Cross-tier consistency ───────────────────────────────────
 
     #[test]
@@ -811,6 +913,7 @@ mod tests {
             profile::PREFIX,
             identity::PREFIX,
             endorsement::PREFIX,
+            memo::PREFIX,
         ];
         for prefix in prefixes {
             assert!(
