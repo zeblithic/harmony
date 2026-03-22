@@ -33,7 +33,7 @@ impl ReplicationOp {
             0x03 => Ok(Self::PullResponse),
             0x04 => Ok(Self::Status),
             0x05 => Ok(Self::StatusResponse),
-            other => Err(TunnelError::MalformedHandshake {
+            other => Err(TunnelError::MalformedReplication {
                 reason: if other == 0 {
                     "unknown replication op: 0x00"
                 } else {

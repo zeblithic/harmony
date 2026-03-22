@@ -413,8 +413,6 @@ pub struct NodeRuntime<B: BookStore> {
     last_now: u64,
     // Replication: stores encrypted books on behalf of other peers
     replica_store: MemoryReplicaStore,
-    // Replication: (peer, cid) pairs already pushed to avoid duplicate sends
-    replicated_set: HashSet<([u8; 16], [u8; 32])>,
     // Replication: ticks since last replication scan
     ticks_since_replica_scan: u32,
 }
@@ -529,7 +527,6 @@ impl<B: BookStore> NodeRuntime<B> {
             local_tunnel_hint: None,
             last_now: 0,
             replica_store: MemoryReplicaStore::new(),
-            replicated_set: HashSet::new(),
             ticks_since_replica_scan: 0,
         };
 
@@ -1037,8 +1034,9 @@ impl<B: BookStore> NodeRuntime<B> {
     ///
     /// Currently a no-op: the `BookStore` trait doesn't expose content iteration
     /// yet. When `BookStore::iter()` is added (future bead), this method will
-    /// walk local encrypted-durable books, skip any already in `replicated_set`,
-    /// and emit one `ReplicaPush` per peer per scan cycle.
+    /// walk local encrypted-durable books and emit one `ReplicaPush` per peer
+    /// per scan cycle. A `replicated_set` dedup structure should be re-added
+    /// at that point with proper cleanup logic.
     fn scan_unreplicated_books(&mut self, _out: &mut Vec<RuntimeAction>) {
         // Collect replication-eligible peers — used to gate the scan.
         let has_replication_peers = self
@@ -1053,18 +1051,6 @@ impl<B: BookStore> NodeRuntime<B> {
         // TODO: When BookStore gains an iter() method, iterate local
         // encrypted-durable books and emit ReplicaPush for each peer
         // with an active replication policy.
-        //
-        // Pseudocode:
-        //   for cid in self.storage.iter_content_ids() {
-        //       if cid.flags().encrypted && !cid.flags().ephemeral {
-        //           for peer in peers_with_replication {
-        //               if !self.replicated_set.contains(&(peer, cid.hash())) {
-        //                   out.push(ReplicaPush { peer, cid, data });
-        //                   self.replicated_set.insert((peer, cid.hash()));
-        //               }
-        //           }
-        //       }
-        //   }
     }
 
     fn dispatch_router_actions(

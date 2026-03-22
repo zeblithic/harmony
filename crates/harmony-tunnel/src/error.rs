@@ -22,6 +22,9 @@ pub enum TunnelError {
     #[error("handshake message malformed: {reason}")]
     MalformedHandshake { reason: &'static str },
 
+    #[error("replication message malformed: {reason}")]
+    MalformedReplication { reason: &'static str },
+
     #[error("keepalive timeout: peer unresponsive")]
     KeepaliveTimeout,
 

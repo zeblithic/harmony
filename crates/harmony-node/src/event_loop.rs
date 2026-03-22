@@ -228,6 +228,11 @@ pub async fn run(
     const MAX_TUNNEL_CONNECTIONS: usize = 64;
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<TunnelBridgeEvent>(256);
     let mut tunnel_senders: HashMap<String, TunnelSender> = HashMap::new();
+    // Maps interface_name → peer identity hash (first 16 bytes of peer_node_id,
+    // which is BLAKE3(ML-DSA pubkey)). Used to route replication frames to the
+    // correct peer in RuntimeEvent::ReplicaReceived. Populated at HandshakeComplete,
+    // removed at TunnelClosed.
+    let mut tunnel_identities: HashMap<String, [u8; 16]> = HashMap::new();
     let mut next_connection_id: u64 = 0;
 
     // ── Ready-connection channel: QUIC handshake tasks → select loop ──────
@@ -531,6 +536,13 @@ pub async fn run(
                             .map(|s| s.connection_id == connection_id)
                             .unwrap_or(false);
                         if is_current {
+                            // Record identity hash proxy for replication routing.
+                            // peer_node_id is BLAKE3(ML-DSA pubkey); we take the first
+                            // 16 bytes as a stable peer identifier until the full
+                            // identity_hash (SHA256(KEM||DSA)[:16]) is available here.
+                            let mut id_hash = [0u8; 16];
+                            id_hash.copy_from_slice(&peer_node_id[..16]);
+                            tunnel_identities.insert(interface_name.clone(), id_hash);
                             runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
                                 interface_name,
                                 peer_node_id,
@@ -558,6 +570,34 @@ pub async fn run(
                         // TODO(harmony-h6k): Zenoh over tunnel
                         let _ = connection_id; // will be guarded like ReticulumReceived
                     }
+                    TunnelBridgeEvent::ReplicationReceived {
+                        interface_name,
+                        message,
+                        connection_id,
+                    } => {
+                        let is_current = tunnel_senders
+                            .get(&interface_name)
+                            .map(|s| s.connection_id == connection_id)
+                            .unwrap_or(false);
+                        if is_current {
+                            // Parse the replication message to extract CID and data.
+                            if let Ok(rep_msg) =
+                                harmony_tunnel::replication::ReplicationMessage::decode(&message)
+                            {
+                                if rep_msg.op == harmony_tunnel::replication::ReplicationOp::Push {
+                                    if let Some(&identity_hash) =
+                                        tunnel_identities.get(&interface_name)
+                                    {
+                                        runtime.push_event(RuntimeEvent::ReplicaReceived {
+                                            peer_identity: identity_hash,
+                                            cid: rep_msg.cid,
+                                            data: rep_msg.payload,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                     TunnelBridgeEvent::TunnelClosed {
                         interface_name,
                         reason,
@@ -573,6 +613,7 @@ pub async fn run(
                             .unwrap_or(false);
                         if is_current {
                             tunnel_senders.remove(&interface_name);
+                            tunnel_identities.remove(&interface_name);
                             runtime.push_event(RuntimeEvent::TunnelClosed { interface_name });
                         }
                         // else: stale close from old connection — ignore
