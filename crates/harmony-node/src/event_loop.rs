@@ -973,6 +973,21 @@ async fn dispatch_action(
                 "CloseTunnel (stub)"
             );
         }
+        RuntimeAction::ReplicaPush {
+            peer_identity,
+            cid,
+            data,
+        } => {
+            // TODO: look up tunnel_sender by peer_identity (via tunnel_identities map)
+            // and send a ReplicationMessage::push(cid, data) as a FrameTag::Replication
+            // frame. Requires identity_hash → TunnelSender mapping.
+            tracing::debug!(
+                peer = %hex::encode(peer_identity),
+                cid = %hex::encode(cid),
+                size = data.len(),
+                "ReplicaPush (stub — tunnel routing not yet wired)"
+            );
+        }
     }
 }
 
