@@ -64,4 +64,8 @@ pub struct SdJwt {
     pub signing_input: String,
     /// Decoded selective disclosures.
     pub disclosures: Vec<Disclosure>,
+    /// Raw Key Binding JWT string, if present (the trailing compact JWS
+    /// after the last disclosure). Parsing/verification of the KB-JWT
+    /// itself is deferred to harmony-lth.
+    pub key_binding_jwt: Option<String>,
 }

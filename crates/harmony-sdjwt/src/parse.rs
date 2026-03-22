@@ -205,9 +205,20 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
         .map_err(|_| SdJwtError::Base64Error)?;
 
     // Parse disclosures (segments 1..N, skipping empty trailing segments).
+    // A KB-JWT (Key Binding JWT) may appear as the last non-empty segment —
+    // it's a compact JWS (contains '.') and is NOT a disclosure. We detect
+    // it by checking for '.' and capture it separately.
     let mut disclosures = Vec::new();
+    let mut key_binding_jwt: Option<String> = None;
     for segment in &segments[1..] {
         if segment.is_empty() {
+            continue;
+        }
+
+        // KB-JWT detection: disclosures are base64url strings (no dots),
+        // while a KB-JWT is a compact JWS (header.payload.signature).
+        if segment.contains('.') {
+            key_binding_jwt = Some((*segment).to_string());
             continue;
         }
 
@@ -274,6 +285,7 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
         signature,
         signing_input: raw_signing_input,
         disclosures,
+        key_binding_jwt,
     })
 }
 
@@ -468,6 +480,35 @@ mod tests {
 
         let result = parse(&compact);
         assert!(matches!(result, Err(SdJwtError::InvalidDisclosure)));
+    }
+
+    #[test]
+    fn parse_with_key_binding_jwt() {
+        let header = serde_json::json!({"alg": "EdDSA"});
+        let payload = serde_json::json!({"_sd": []});
+        let disc = build_disclosure(&serde_json::json!(["salt1", "name", "value"]));
+        // KB-JWT is a compact JWS (contains dots)
+        let kb_jwt = "eyJhbGciOiJFZERTQSJ9.eyJub25jZSI6InRlc3QifQ.c2lnbmF0dXJl";
+        let compact = format!(
+            "{}~{}~{}~",
+            build_jws(&header, &payload, b"sig"),
+            disc,
+            kb_jwt
+        );
+
+        let sd_jwt = parse(&compact).unwrap();
+        assert_eq!(sd_jwt.disclosures.len(), 1);
+        assert_eq!(sd_jwt.key_binding_jwt.as_deref(), Some(kb_jwt));
+    }
+
+    #[test]
+    fn parse_without_key_binding_jwt() {
+        let header = serde_json::json!({"alg": "EdDSA"});
+        let payload = serde_json::json!({"iss": "test"});
+        let compact = build_jws(&header, &payload, b"sig");
+
+        let sd_jwt = parse(&compact).unwrap();
+        assert!(sd_jwt.key_binding_jwt.is_none());
     }
 
     // --- signing_input tests (no_std compatible) ---
