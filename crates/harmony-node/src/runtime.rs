@@ -3505,4 +3505,30 @@ mod tests {
             "token with corrupted signature should be rejected"
         );
     }
+
+    #[test]
+    fn pull_with_token_not_yet_valid_rejected() {
+        use rand::rngs::OsRng;
+
+        let (rt, owner, cid) = setup_pull_with_token_runtime();
+        let requester_hash = [0x42; 16];
+        // not_before is far in the future — token is not yet valid.
+        let token = owner
+            .issue_pq_root_token(
+                &mut OsRng,
+                &requester_hash,
+                harmony_identity::CapabilityType::Content,
+                &cid,
+                u64::MAX, // not_before — will never be valid
+                0,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+        let result =
+            rt.handle_pull_with_token(requester_hash, cid, &token_bytes, 1_700_000_000);
+        assert!(
+            result.is_none(),
+            "token with future not_before should be rejected"
+        );
+    }
 }
