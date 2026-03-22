@@ -215,7 +215,12 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| alloc::format!("{:02x}", b)).collect()
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use core::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
 }
 
 #[cfg(test)]
@@ -490,5 +495,30 @@ mod tests {
             "mldsa65-2025"
         );
         assert!(json["issuer"].as_str().unwrap().starts_with("did:key:z"));
+    }
+
+    #[test]
+    fn credential_export_ml_dsa65_rotatable_lossy() {
+        // MlDsa65Rotatable shares multicodec 0x1211 with MlDsa65.
+        // Export intentionally loses the "rotatable" distinction —
+        // the did:key and cryptosuite are identical to MlDsa65.
+        // This matches crypto_suite.rs::multicodec_round_trip_lossy_for_rotatable.
+        let issuer = IdentityRef::new([0xAA; 16], CryptoSuite::MlDsa65Rotatable);
+        let subject = IdentityRef::new([0xBB; 16], CryptoSuite::MlDsa65Rotatable);
+
+        let builder = CredentialBuilder::new(issuer, subject, 1000, 5000, [0x01; 16]);
+        let _payload = builder.signable_payload();
+        let (cred, _) = builder.build(alloc::vec![0xDE; 3309]);
+
+        let json = credential_to_jsonld(&cred, &[0x55; 1952], &[0x66; 1952]).unwrap();
+
+        // Same cryptosuite as static MlDsa65 — rotatable semantics are lost
+        assert_eq!(
+            json["proof"]["cryptosuite"].as_str().unwrap(),
+            "mldsa65-2025"
+        );
+        // did:key uses same multicodec (0x1211) — indistinguishable
+        let did = json["issuer"].as_str().unwrap();
+        assert!(did.starts_with("did:key:z"));
     }
 }
