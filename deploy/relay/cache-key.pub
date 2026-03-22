@@ -1,0 +1,2 @@
+# Run nix-cache-setup.sh on the relay VM to generate this key.
+# Then replace this file with the actual public key.
