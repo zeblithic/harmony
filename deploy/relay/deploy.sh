@@ -164,6 +164,11 @@ elif command -v nix &>/dev/null; then
         fi
         gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" -- "bash -s" < "$SETUP_SCRIPT"
         echo "    Nix setup complete."
+        echo ""
+        echo "    ACTION REQUIRED: Copy the generated public key into the repo:"
+        echo "      gcloud compute ssh ${VM_NAME} --zone=${GCP_ZONE} -- cat /etc/nix/cache-key.pub > ${SCRIPT_DIR}/cache-key.pub"
+        echo "    Then commit cache-key.pub so future deploys can use the binary cache."
+        echo ""
     fi
 
     # Configure the VM's binary cache as a substituter so nix build can

@@ -13,6 +13,12 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 if ! command -v nix &>/dev/null; then
   echo "[nix-cache-setup] Installing multi-user Nix..."
+  # Ensure curl is available (not guaranteed on minimal Debian images).
+  if ! command -v curl &>/dev/null; then
+    echo "[nix-cache-setup] Installing curl..."
+    sudo apt-get update -qq > /dev/null
+    sudo apt-get install -y -qq curl > /dev/null
+  fi
   # Multi-user Nix installer requires root for daemon setup.
   # NOTE: For production hardening, pin the installer version and verify
   # its SHA-256 before executing. See https://nixos.org/download/ for
