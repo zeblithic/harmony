@@ -203,6 +203,10 @@ impl TunnelSession {
                 self.last_sent_ms = now_ms;
                 self.handle_send(FrameTag::Zenoh, message)
             }
+            TunnelEvent::SendReplication { message, now_ms } => {
+                self.last_sent_ms = now_ms;
+                self.handle_send(FrameTag::Replication, message)
+            }
             TunnelEvent::Tick { now_ms } => self.handle_tick(now_ms),
             TunnelEvent::Close => self.handle_close(),
         }
@@ -269,6 +273,9 @@ impl TunnelSession {
                 packet: frame.payload,
             }]),
             FrameTag::Zenoh => Ok(vec![TunnelAction::ZenohReceived {
+                message: frame.payload,
+            }]),
+            FrameTag::Replication => Ok(vec![TunnelAction::ReplicationReceived {
                 message: frame.payload,
             }]),
         }

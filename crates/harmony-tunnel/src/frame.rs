@@ -11,6 +11,7 @@ pub enum FrameTag {
     Keepalive = 0x00,
     Reticulum = 0x01,
     Zenoh = 0x02,
+    Replication = 0x03,
 }
 
 impl FrameTag {
@@ -19,6 +20,7 @@ impl FrameTag {
             0x00 => Ok(Self::Keepalive),
             0x01 => Ok(Self::Reticulum),
             0x02 => Ok(Self::Zenoh),
+            0x03 => Ok(Self::Replication),
             other => Err(TunnelError::UnknownFrameTag { tag: other }),
         }
     }
