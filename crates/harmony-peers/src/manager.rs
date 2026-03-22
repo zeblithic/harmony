@@ -332,7 +332,7 @@ impl PeerManager {
     /// single max-cap is applied afterwards. This preserves the full ±25%
     /// jitter range at max backoff instead of silently losing upward jitter
     /// (which would happen if we capped twice).
-    pub fn probe_interval_jittered(
+    pub(crate) fn probe_interval_jittered(
         priority: PeeringPriority,
         retry_count: u32,
         local_hash: &IdentityHash,

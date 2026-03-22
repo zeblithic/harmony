@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(initiator.state(), TunnelState::Closed);
         assert!(
             actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
-            "must timeout at 155001ms"
+            "must timeout at 160001ms"
         );
     }
 }
