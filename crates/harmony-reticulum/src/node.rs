@@ -530,13 +530,16 @@ impl Node {
         // Broadcast on all interfaces — separate borrow of self.interfaces.
         let actions = self.broadcast_on_all_interfaces(&raw);
 
-        // Record pending echo entries ONLY for guaranteed-delivery interfaces
-        // (weight >= 1.0 or None). An interface that was probabilistically dropped
-        // by the event loop can't produce an echo, so recording it would create a
-        // false negative timeout → score death spiral.
+        // Record pending echo entries for ALL interfaces. These serve as
+        // once-per-cycle credit tokens: when an echo arrives on an interface,
+        // we remove its entry and credit it. Duplicate echoes find no entry
+        // and get no credit, preventing inflation.
         //
-        // The timeout negative signal only applies to interfaces we know actually
-        // sent. Other interfaces can still earn positive signals when echoes arrive.
+        // Timeout negatives only fire for guaranteed-delivery interfaces
+        // (weight >= 1.0). Non-guaranteed interfaces may have been probabilistically
+        // dropped by the event loop, so a missing echo isn't evidence of a bad
+        // neighbor — it's evidence we didn't send. We mark non-guaranteed entries
+        // with timestamp 0 as a sentinel to skip them during timeout processing.
         let dest = *dest_hash;
         for action in &actions {
             if let NodeAction::SendOnInterface {
@@ -549,10 +552,11 @@ impl Node {
                     None => true,
                     Some(w) => *w >= 1.0,
                 };
-                if guaranteed {
-                    self.pending_echoes
-                        .insert((Arc::clone(interface_name), dest), now);
-                }
+                // Guaranteed interfaces get real timestamps (timeout-eligible).
+                // Non-guaranteed get u64::MAX sentinel (credit-only, never times out).
+                let ts = if guaranteed { now } else { u64::MAX };
+                self.pending_echoes
+                    .insert((Arc::clone(interface_name), dest), ts);
             }
         }
 
@@ -656,16 +660,39 @@ impl Node {
                 }
 
                 // Expire pending echo entries that timed out without an echo.
-                // Each expired entry is a negative cooperation signal: the
-                // interface's neighbor did not forward our announce.
-                let expired_echoes: Vec<(Arc<str>, DestinationHash)> = self
+                // Only fire negative observations for guaranteed-delivery entries
+                // (ts > 0). Sentinel entries (ts == 0) are credit-only tokens for
+                // non-guaranteed interfaces — remove them silently since a missing
+                // echo may be because we didn't actually send.
+                // Collect expired entries. Guaranteed interfaces (real timestamps)
+                // get negative observations. Non-guaranteed (u64::MAX sentinel)
+                // are cleaned up without penalty — they never actually sent.
+                let expired_echoes: Vec<(Arc<str>, DestinationHash, bool)> = self
                     .pending_echoes
                     .iter()
-                    .filter(|(_, &ts)| now.saturating_sub(ts) > ECHO_TIMEOUT)
+                    .filter(|(_, &ts)| ts != u64::MAX && now.saturating_sub(ts) > ECHO_TIMEOUT)
+                    .map(|(key, _)| (key.0.clone(), key.1, true))
+                    .collect();
+                for (iface, dest, _) in &expired_echoes {
+                    self.cooperation.observe_announce_timeout(iface, now);
+                    self.pending_echoes.remove(&(Arc::clone(iface), *dest));
+                }
+                // Also clean up stale sentinel entries (non-guaranteed that were
+                // never credited). These have ts=u64::MAX and can't timeout, so
+                // remove any whose dest_hash has no remaining guaranteed entries.
+                let stale_sentinels: Vec<(Arc<str>, DestinationHash)> = self
+                    .pending_echoes
+                    .iter()
+                    .filter(|(_, &ts)| ts == u64::MAX)
+                    .filter(|((_, dh), _)| {
+                        // Remove if no guaranteed entries remain for this dest
+                        !self.pending_echoes.iter().any(|((_, dh2), &ts2)| {
+                            dh2 == dh && ts2 != u64::MAX
+                        })
+                    })
                     .map(|(key, _)| key.clone())
                     .collect();
-                for (iface, dest) in &expired_echoes {
-                    self.cooperation.observe_announce_timeout(iface, now);
+                for (iface, dest) in &stale_sentinels {
                     self.pending_echoes.remove(&(Arc::clone(iface), *dest));
                 }
 
@@ -1164,20 +1191,13 @@ impl Node {
         // interface means that interface's neighbor forwarded it. No need to check
         // which interface we sent on — we sent on all of them.
         if self.announcing_destinations.contains_key(&destination_hash) {
-            // Confirm we actually originated an announce recently (pending echo exists)
-            let has_pending = self
-                .pending_echoes
-                .keys()
-                .any(|(_, dh)| *dh == destination_hash);
-            if has_pending {
+            // Credit this interface exactly once per announce cycle. The pending
+            // entry acts as a "credit token" — remove() atomically checks and
+            // consumes it. Duplicate echoes find no entry and get no credit.
+            let key = (Arc::clone(&interface_name), destination_hash);
+            if self.pending_echoes.remove(&key).is_some() {
                 self.cooperation
                     .observe_announce_forwarded(&interface_name, now);
-                // Only remove the echoing interface's entry — leave other interfaces'
-                // entries so they can independently earn credit or timeout. This prevents
-                // first-echo-wins bias where the fastest neighbor monopolizes positive
-                // observations while equally-cooperative neighbors get nothing.
-                self.pending_echoes
-                    .remove(&(Arc::clone(&interface_name), destination_hash));
             }
         }
 
@@ -1692,17 +1712,9 @@ impl Node {
             }
         };
 
-        // Mark proof received and record positive cooperation observation.
-        // Only credit the first proof — duplicate proofs from redundant mesh paths
-        // should not inflate the score.
         let already_received = entry.proof_received;
-        entry.proof_received = true;
         let outbound_iface = entry.outbound_interface.clone();
         let received_iface = entry.received_interface.clone();
-
-        if !already_received {
-            self.cooperation.observe_proof_delivered(&outbound_iface, now);
-        }
 
         // Forward proof with current hops (already incremented in inbound pipeline)
         let forwarded = Packet {
@@ -1722,6 +1734,15 @@ impl Node {
 
         match forwarded.to_bytes() {
             Ok(raw) => {
+                // Mark proof received and credit cooperation ONLY after
+                // successful serialization. If to_bytes() fails, we don't
+                // want stale proof_received=true preventing timeout penalties.
+                if let Some(entry) = self.reverse_table.get_mut(&proof_dest) {
+                    entry.proof_received = true;
+                }
+                if !already_received {
+                    self.cooperation.observe_proof_delivered(&outbound_iface, now);
+                }
                 let mut actions = self.send_on_interface(&received_iface, &raw);
                 if !actions
                     .iter()
@@ -5182,12 +5203,12 @@ mod tests {
 
     #[test]
     fn test_announce_echo_positive_observation() {
-        // Set up: Node with 1 interface (eth0) and an announcing destination.
-        // We announce (only on eth0), then add a second interface (wlan0).
-        // When the echoed announce arrives on wlan0, wlan0 should get a
-        // positive cooperation score because we did NOT send on wlan0.
+        // Set up: Node with 2 interfaces and an announcing destination.
+        // Announce broadcasts on both, then an echo arrives on wlan0.
+        // wlan0's pending entry is consumed (credited), eth0's remains.
         let mut node = Node::new();
         node.register_interface("eth0".into(), InterfaceMode::Full, None);
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
 
         let identity = PrivateIdentity::generate(&mut OsRng);
         let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
@@ -5199,33 +5220,28 @@ mod tests {
             1000,
         );
 
-        // Emit announce — only eth0 is registered, so pending_echoes only has (eth0, dh).
+        // Emit announce — both interfaces get pending echo entries.
         let actions = node.announce(&dh, &mut OsRng, 1_700_000_000);
-        assert_eq!(actions.len(), 1, "should send on eth0 only");
-        assert_eq!(node.pending_echoes_len(), 1);
+        assert_eq!(actions.len(), 2, "should send on both interfaces");
+        assert_eq!(node.pending_echoes_len(), 2);
 
-        // Capture the raw announce bytes from the SendOnInterface action.
+        // Capture the raw announce bytes from any SendOnInterface action.
         let raw = match &actions[0] {
             NodeAction::SendOnInterface { raw, .. } => raw.clone(),
             _ => panic!("expected SendOnInterface"),
         };
 
-        // Now register wlan0 (simulating a second interface appearing, or
-        // equivalently, a neighbor forwarding our announce to a different segment).
-        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
-
-        // Verify initial cooperation score for wlan0 is 0.5 (default initial).
-        // Note: with 2 interfaces, get_weight returns actual score, not forced 1.0.
+        // Verify initial cooperation score for wlan0.
         let initial_weight = node.cooperation().get_weight("wlan0");
         assert!(
             (initial_weight - 0.5).abs() < 1e-6,
             "wlan0 initial weight should be 0.5, got {initial_weight}"
         );
 
-        // Feed the echoed announce on wlan0 — a neighbor forwarded our announce back.
+        // Feed the echoed announce on wlan0 — neighbor forwarded our announce back.
         node.handle_event(NodeEvent::InboundPacket {
             interface_name: "wlan0".into(),
-            raw,
+            raw: raw.clone(),
             now: 1_700_000_001,
         });
 
@@ -5237,13 +5253,24 @@ mod tests {
              positive echo observation, got {weight_after}"
         );
 
-        // Only the echoing interface's entry is removed (wlan0 had no entry since
-        // it was registered after the announce). eth0's entry remains for independent
-        // timeout tracking.
+        // wlan0's pending entry consumed; eth0's remains.
         assert_eq!(
             node.pending_echoes_len(),
             1,
-            "eth0's pending echo should remain (wlan0 had no entry to remove)"
+            "eth0's pending echo should remain, wlan0's consumed"
+        );
+
+        // Duplicate echo on wlan0 should NOT credit again (no pending entry).
+        let weight_before_dup = node.cooperation().get_weight("wlan0");
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw,
+            now: 1_700_000_002,
+        });
+        let weight_after_dup = node.cooperation().get_weight("wlan0");
+        assert!(
+            (weight_after_dup - weight_before_dup).abs() < 1e-6,
+            "duplicate echo should NOT change score: before={weight_before_dup}, after={weight_after_dup}"
         );
     }
 
