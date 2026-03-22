@@ -434,6 +434,10 @@ pub struct NodeRuntime<B: BookStore> {
     ticks_since_replica_scan: u32,
     // Cache of ML-DSA public keys by identity hash.
     // Populated from HandshakeComplete and AnnounceRecord events.
+    // Capped at MAX_PUBKEY_CACHE_SIZE entries — evicts oldest on overflow.
+    // SECURITY(V1): Announce records don't verify pubkey→hash binding.
+    // Until address re-derivation is implemented, a forged announce can
+    // poison this cache. See harmony-discovery crate Security docs.
     pubkey_cache: HashMap<[u8; 16], Vec<u8>>,
 }
 
@@ -617,6 +621,23 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Look up a cached ML-DSA public key by identity hash.
     pub fn get_peer_pubkey(&self, identity_hash: &[u8; 16]) -> Option<&[u8]> {
         self.pubkey_cache.get(identity_hash).map(|v| v.as_slice())
+    }
+
+    /// Maximum number of cached public keys. Each ML-DSA-65 pubkey is ~1952 bytes,
+    /// so 4096 entries ≈ 8 MB — acceptable for long-running nodes.
+    const MAX_PUBKEY_CACHE_SIZE: usize = 4096;
+
+    /// Insert a public key into the cache, evicting a random entry if at capacity.
+    fn insert_pubkey_capped(&mut self, identity_hash: [u8; 16], pubkey: Vec<u8>) {
+        if self.pubkey_cache.len() >= Self::MAX_PUBKEY_CACHE_SIZE
+            && !self.pubkey_cache.contains_key(&identity_hash)
+        {
+            // Evict one entry — take the first key from the iterator (arbitrary).
+            if let Some(&evict_key) = self.pubkey_cache.keys().next() {
+                self.pubkey_cache.remove(&evict_key);
+            }
+        }
+        self.pubkey_cache.insert(identity_hash, pubkey);
     }
 
     /// Number of malformed filter payloads that failed deserialization.
@@ -891,7 +912,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 // Guard against empty keys from degraded handshakes —
                 // don't overwrite a valid cached key with an empty one.
                 if !dsa_pubkey.is_empty() {
-                    self.pubkey_cache.insert(identity_hash, dsa_pubkey);
+                    self.insert_pubkey_capped(identity_hash, dsa_pubkey);
                 }
             }
         }
@@ -1210,6 +1231,15 @@ impl<B: BookStore> NodeRuntime<B> {
             }
         };
 
+        // 0. Reject oversized payloads before allocating for deserialization.
+        //    A PqUcanToken with a 32-byte resource + ML-DSA-65 signature (3309B)
+        //    serializes to ~3.4 KB. 8 KB is generous headroom.
+        const MAX_TOKEN_BYTES: usize = 8 * 1024;
+        if token_bytes.len() > MAX_TOKEN_BYTES {
+            tracing::debug!(len = token_bytes.len(), "token payload too large");
+            return None;
+        }
+
         // 1. Deserialize token
         let token = match harmony_identity::PqUcanToken::from_bytes(&token_bytes) {
             Ok(t) => t,
@@ -1306,8 +1336,7 @@ impl<B: BookStore> NodeRuntime<B> {
         // binding) is documented in harmony-discovery crate docs. When address
         // re-derivation is implemented, a binding check should be added here.
         if !record.public_key.is_empty() {
-            self.pubkey_cache
-                .insert(identity_hash, record.public_key.clone());
+            self.insert_pubkey_capped(identity_hash, record.public_key.clone());
         }
 
         let tunnel_hints: Vec<_> = record
