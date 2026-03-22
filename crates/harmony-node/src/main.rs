@@ -282,7 +282,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                    .map_err(|_| "system clock is before Unix epoch")?;
                 let expires_at = now + expires_in;
 
                 let memo = harmony_memo::create::create_memo(

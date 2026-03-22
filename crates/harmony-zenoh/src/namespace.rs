@@ -481,6 +481,11 @@ pub mod memo {
     }
 
     /// What does a specific signer say about this input: `harmony/memo/{input}/*/sign/{signer}`
+    ///
+    /// This pattern uses `*` in a non-terminal position, which works for
+    /// Zenoh `session.get()` queries but may not be registerable as a
+    /// subscriber in Zenoh 1.x. For subscription use cases, subscribe to
+    /// `harmony/memo/{input}/**` and filter at the application layer.
     pub fn signer_query(input_hex: &str, signer_hex: &str) -> String {
         format!("{PREFIX}/{input_hex}/*/sign/{signer_hex}")
     }

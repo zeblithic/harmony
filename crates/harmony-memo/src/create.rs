@@ -32,6 +32,11 @@ pub fn create_memo(
     now: u64,
     expires_at: u64,
 ) -> Result<Memo, MemoError> {
+    if expires_at <= now {
+        return Err(MemoError::Credential(
+            harmony_credential::CredentialError::Expired,
+        ));
+    }
     let id_ref = IdentityRef::from(identity.public_identity());
 
     // Build claim value: input || output (64 bytes)

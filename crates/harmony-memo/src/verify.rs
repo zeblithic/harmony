@@ -33,7 +33,14 @@ pub fn verify_memo(
     // 1. Verify credential signature + time bounds
     verify_credential(&memo.credential, now, keys, &NoOpStatusList)?;
 
-    // 2. Verify input/output binding against the signed claim digest
+    // 2. Enforce self-attestation: issuer must equal subject
+    if memo.credential.issuer != memo.credential.subject {
+        return Err(MemoError::Credential(
+            harmony_credential::CredentialError::SignatureInvalid,
+        ));
+    }
+
+    // 3. Verify input/output binding against the signed claim digest
     if memo.credential.claim_digests.is_empty() {
         return Err(MemoError::ClaimDecodingFailed);
     }
