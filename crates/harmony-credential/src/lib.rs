@@ -29,3 +29,5 @@ pub mod jsonld;
 
 #[cfg(feature = "jsonld")]
 pub use jsonld::identity_to_did_key;
+#[cfg(feature = "jsonld")]
+pub use jsonld::credential_to_jsonld;
