@@ -37,6 +37,10 @@ const LOCAL_REBROADCASTS_MAX: u8 = 2;
 /// Matches the shortest path expiry (Roaming = 6 hours).
 const RATE_TABLE_EXPIRY: u64 = 21_600;
 
+/// Milliseconds to wait for an announce echo before recording a negative
+/// cooperation observation. Conservative at 90s (3x a typical 30s interval).
+const ECHO_TIMEOUT_MS: u64 = 90_000;
+
 /// Reverse table entries older than this are expired (8 minutes).
 /// Matches Python `Transport.REVERSE_TIMEOUT`.
 const REVERSE_TIMEOUT: u64 = 480;
@@ -310,6 +314,9 @@ pub struct Node {
     reverse_table: HashMap<DestinationHash, ReverseTableEntry>,
     link_table: HashMap<DestinationHash, LinkTableEntry>,
     cooperation: CooperationTable,
+    /// Tracks announce echoes: (interface, dest_hash) -> tick when announce was sent.
+    /// Used to detect whether neighbors forwarded our announces.
+    pending_echoes: HashMap<(Arc<str>, DestinationHash), u64>,
 }
 
 impl Node {
@@ -327,6 +334,7 @@ impl Node {
             reverse_table: HashMap::new(),
             link_table: HashMap::new(),
             cooperation: CooperationTable::default(),
+            pending_echoes: HashMap::new(),
         }
     }
 
@@ -344,6 +352,7 @@ impl Node {
             reverse_table: HashMap::new(),
             link_table: HashMap::new(),
             cooperation: CooperationTable::default(),
+            pending_echoes: HashMap::new(),
         }
     }
 
@@ -383,6 +392,16 @@ impl Node {
     /// Number of entries in the link table.
     pub fn link_table_len(&self) -> usize {
         self.link_table.len()
+    }
+
+    /// Number of pending announce echo entries.
+    pub fn pending_echoes_len(&self) -> usize {
+        self.pending_echoes.len()
+    }
+
+    /// Read-only access to the cooperation table for diagnostics and testing.
+    pub fn cooperation(&self) -> &CooperationTable {
+        &self.cooperation
     }
 
     /// Register an interface by name and configuration.
@@ -464,8 +483,11 @@ impl Node {
     /// Two-phase design: `handle_event(TimerTick)` emits `AnnounceNeeded`, then
     /// the caller invokes this with their own RNG. This keeps the scheduler
     /// deterministic and the node fully sans-I/O.
+    ///
+    /// Records pending echo entries for each interface so that echoed announces
+    /// from neighbors can be detected and credited via the cooperation table.
     pub fn announce(
-        &self,
+        &mut self,
         dest_hash: &DestinationHash,
         rng: &mut impl CryptoRngCore,
         now: u64,
@@ -503,7 +525,20 @@ impl Node {
         };
 
         // Broadcast on all interfaces — separate borrow of self.interfaces.
-        self.broadcast_on_all_interfaces(&raw)
+        let actions = self.broadcast_on_all_interfaces(&raw);
+
+        // Record pending echo entries for each interface we successfully sent on.
+        // When we later hear this announce come back via a *different* interface,
+        // we credit the echoing interface as a positive cooperation signal.
+        let dest = *dest_hash;
+        for action in &actions {
+            if let NodeAction::SendOnInterface { interface_name, .. } = action {
+                self.pending_echoes
+                    .insert((Arc::clone(interface_name), dest), now);
+            }
+        }
+
+        actions
     }
 
     /// Route a pre-built raw packet to the appropriate interface(s).
@@ -588,6 +623,23 @@ impl Node {
                         });
                     }
                 }
+
+                // Expire pending echo entries that timed out without an echo.
+                // Each expired entry is a negative cooperation signal: the
+                // interface's neighbor did not forward our announce.
+                let expired_echoes: Vec<(Arc<str>, DestinationHash)> = self
+                    .pending_echoes
+                    .iter()
+                    .filter(|(_, &ts)| now.saturating_sub(ts) > ECHO_TIMEOUT_MS)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for (iface, _dest) in &expired_echoes {
+                    self.cooperation.observe_announce_timeout(iface, now);
+                    self.pending_echoes.remove(&(Arc::clone(iface), *_dest));
+                }
+
+                // Decay scores for interfaces that haven't been observed recently.
+                self.cooperation.decay_stale(now);
 
                 actions
             }
@@ -1074,6 +1126,35 @@ impl Node {
             interface_mode,
             now,
         );
+
+        // Announce echo detection: if this announce is for a destination we own,
+        // a neighbor forwarded our announce back to us. Credit the *receiving*
+        // interface (the neighbor's interface) as a positive cooperation signal,
+        // but only if we originally sent the announce on a *different* interface.
+        if self.announcing_destinations.contains_key(&destination_hash) {
+            // Check if we sent this announce on some interface (i.e. pending echo exists)
+            let sent_on_this_iface = self
+                .pending_echoes
+                .contains_key(&(Arc::clone(&interface_name), destination_hash));
+
+            // Only credit if the echo arrived on an interface we did NOT send on
+            if !sent_on_this_iface {
+                // Check that at least one pending echo exists for this dest_hash
+                // (confirming we did originate an announce for it recently)
+                let has_pending = self
+                    .pending_echoes
+                    .keys()
+                    .any(|(_, dh)| *dh == destination_hash);
+                if has_pending {
+                    self.cooperation
+                        .observe_announce_forwarded(&interface_name, now);
+                    // Remove all pending echo entries for this dest_hash since
+                    // we got confirmation that the announce is propagating
+                    self.pending_echoes
+                        .retain(|(_iface, dh), _| *dh != destination_hash);
+                }
+            }
+        }
 
         // Announce table insertion (transport mode only)
         if self.is_transport()
@@ -2340,7 +2421,7 @@ mod tests {
 
     #[test]
     fn announce_unknown_dest_returns_drop() {
-        let node = Node::new();
+        let mut node = Node::new();
         let actions = node.announce(&dest(99), &mut OsRng, 1_700_000_000);
 
         assert_eq!(actions.len(), 1);
@@ -2354,7 +2435,7 @@ mod tests {
 
     #[test]
     fn announce_with_ifac_produces_masked_output() {
-        let (node, dh) = make_announcing_node_with_ifac();
+        let (mut node, dh) = make_announcing_node_with_ifac();
 
         let actions = node.announce(&dh, &mut OsRng, 1_700_000_000);
         assert_eq!(actions.len(), 1);
@@ -5050,5 +5131,138 @@ mod tests {
             now: 2000,
         });
         assert_eq!(node.link_table_len(), 1);
+    }
+
+    // ── Announce echo observation ───────────────────────────────────
+
+    #[test]
+    fn test_announce_echo_positive_observation() {
+        // Set up: Node with 1 interface (eth0) and an announcing destination.
+        // We announce (only on eth0), then add a second interface (wlan0).
+        // When the echoed announce arrives on wlan0, wlan0 should get a
+        // positive cooperation score because we did NOT send on wlan0.
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
+        let dh = node.register_announcing_destination(
+            identity,
+            name,
+            vec![],
+            Some(300),
+            1000,
+        );
+
+        // Emit announce — only eth0 is registered, so pending_echoes only has (eth0, dh).
+        let actions = node.announce(&dh, &mut OsRng, 1_700_000_000);
+        assert_eq!(actions.len(), 1, "should send on eth0 only");
+        assert_eq!(node.pending_echoes_len(), 1);
+
+        // Capture the raw announce bytes from the SendOnInterface action.
+        let raw = match &actions[0] {
+            NodeAction::SendOnInterface { raw, .. } => raw.clone(),
+            _ => panic!("expected SendOnInterface"),
+        };
+
+        // Now register wlan0 (simulating a second interface appearing, or
+        // equivalently, a neighbor forwarding our announce to a different segment).
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+
+        // Verify initial cooperation score for wlan0 is 0.5 (default initial).
+        // Note: with 2 interfaces, get_weight returns actual score, not forced 1.0.
+        let initial_weight = node.cooperation().get_weight("wlan0");
+        assert!(
+            (initial_weight - 0.5).abs() < 1e-6,
+            "wlan0 initial weight should be 0.5, got {initial_weight}"
+        );
+
+        // Feed the echoed announce on wlan0 — a neighbor forwarded our announce back.
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw,
+            now: 1_700_000_001,
+        });
+
+        // Verify: wlan0's cooperation score increased above the initial 0.5.
+        let weight_after = node.cooperation().get_weight("wlan0");
+        assert!(
+            weight_after > 0.5,
+            "wlan0 cooperation score should have increased above 0.5 after \
+             positive echo observation, got {weight_after}"
+        );
+
+        // Pending echoes should be cleared for this destination.
+        assert_eq!(
+            node.pending_echoes_len(),
+            0,
+            "pending echoes should be cleared after echo received"
+        );
+    }
+
+    #[test]
+    fn test_announce_echo_timeout_negative_observation() {
+        // Set up: Node with 1 interface (eth0) and an announcing destination.
+        // We send an announce but no echo arrives. After the timeout, the
+        // cooperation score for eth0 should decrease below the initial 0.5.
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+        // Register a second interface so get_weight returns actual scores
+        // (single-interface always returns 1.0).
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
+        let dh = node.register_announcing_destination(
+            identity,
+            name,
+            vec![],
+            Some(300),
+            1000,
+        );
+
+        let now = 1_700_000_000_u64;
+
+        // Emit announce — broadcasts on both eth0 and wlan0.
+        let actions = node.announce(&dh, &mut OsRng, now);
+        assert_eq!(actions.len(), 2, "should send on both interfaces");
+        assert_eq!(node.pending_echoes_len(), 2);
+
+        // Verify initial scores.
+        let eth0_before = node.cooperation().get_weight("eth0");
+        let wlan0_before = node.cooperation().get_weight("wlan0");
+        assert!(
+            (eth0_before - 0.5).abs() < 1e-6,
+            "eth0 initial weight should be 0.5"
+        );
+        assert!(
+            (wlan0_before - 0.5).abs() < 1e-6,
+            "wlan0 initial weight should be 0.5"
+        );
+
+        // Tick past the echo timeout without any echo arriving.
+        let timeout_now = now + ECHO_TIMEOUT_MS + 1;
+        node.handle_event(NodeEvent::TimerTick { now: timeout_now });
+
+        // Pending echoes should be expired.
+        assert_eq!(
+            node.pending_echoes_len(),
+            0,
+            "pending echoes should be cleared after timeout"
+        );
+
+        // Both interfaces should have decreased cooperation scores.
+        let eth0_after = node.cooperation().get_weight("eth0");
+        let wlan0_after = node.cooperation().get_weight("wlan0");
+        assert!(
+            eth0_after < 0.5,
+            "eth0 cooperation score should have decreased below 0.5 after \
+             timeout, got {eth0_after}"
+        );
+        assert!(
+            wlan0_after < 0.5,
+            "wlan0 cooperation score should have decreased below 0.5 after \
+             timeout, got {wlan0_after}"
+        );
     }
 }
