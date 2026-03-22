@@ -34,10 +34,6 @@ pub fn signing_input(compact: &str) -> Result<(&str, &str), SdJwtError> {
     let first_dot = first_dot.ok_or(SdJwtError::MalformedCompact)?;
     let second_dot = second_dot.ok_or(SdJwtError::MalformedCompact)?;
 
-    if dots != 2 {
-        return Err(SdJwtError::MalformedCompact);
-    }
-
     let signing_input_str = &jws[..second_dot];
     let signature_b64 = &jws[second_dot + 1..];
 

@@ -4,6 +4,7 @@ extern crate alloc;
 pub mod error;
 pub mod parse;
 pub mod types;
+#[cfg(feature = "std")]
 pub mod verify;
 
 pub use error::SdJwtError;

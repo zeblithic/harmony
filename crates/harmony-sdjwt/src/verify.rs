@@ -42,7 +42,7 @@ pub fn verify_from_header(
     verify(sd_jwt, suite, public_key)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use base64::Engine;
