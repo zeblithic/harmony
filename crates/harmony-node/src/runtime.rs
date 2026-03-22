@@ -1188,9 +1188,9 @@ impl<B: BookStore> NodeRuntime<B> {
 
     /// Validate a PullWithToken request and emit a PullResponse if authorized.
     ///
-    /// 7-step validation: deserialize token, check capability==Content,
-    /// check resource==cid, check expiry, check not-before, check owner
-    /// (replica exists from issuer), verify ML-DSA signature.
+    /// 8-step validation: deserialize token, check capability==Content,
+    /// check resource==cid, check expiry, check not-before, verify
+    /// ML-DSA-65 signature, check audience==peer_identity, retrieve replica.
     fn handle_pull_with_token(
         &self,
         peer_identity: [u8; 16],
@@ -1199,10 +1199,16 @@ impl<B: BookStore> NodeRuntime<B> {
     ) -> Option<RuntimeAction> {
         use harmony_content::replica::ReplicaStore;
 
-        let unix_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // Fail-closed: if the system clock is before the UNIX epoch
+        // (RTC not initialized, container clock drift), reject the token
+        // rather than silently bypassing expiry checks with unix_now=0.
+        let unix_now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => {
+                tracing::warn!("system clock before UNIX epoch; rejecting token for safety");
+                return None;
+            }
+        };
 
         // 1. Deserialize token
         let token = match harmony_identity::PqUcanToken::from_bytes(&token_bytes) {
