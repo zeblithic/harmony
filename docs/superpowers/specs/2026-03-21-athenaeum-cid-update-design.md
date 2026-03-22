@@ -1,9 +1,11 @@
 # Athenaeum CID Format Update Design
 
 **Date:** 2026-03-21
-**Status:** Draft
+**Status:** Implemented (with deviations — see note below)
 **Scope:** `harmony-athenaeum` crate — update for new 256-bit ContentId format
 **Bead:** harmony-7rq
+
+**Implementation note:** The original design proposed changing `route_page()` to `&[u8; 28]` and reducing `MAX_PARTITION_DEPTH` to 223. During implementation, we discovered that internal partition routing uses SHA-256 page content hashes (full 32 bytes), not CIDs — so `route_page()` and `MAX_PARTITION_DEPTH` are unaffected. Instead, a new `route_hash()` method was added that extracts bits directly from the 28-byte CID hash portion without zero-padding.
 
 ## Overview
 
