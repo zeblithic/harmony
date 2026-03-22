@@ -26,12 +26,17 @@ heavyweight JSON-LD/RDF processing.
 ## Crate: `harmony-sdjwt`
 
 Location: `crates/harmony-sdjwt/`
-Features: `no_std + alloc` core, `std` feature for convenience.
+Features: `no_std + alloc` core. `serde_json` gated behind `std`
+feature (same pattern as `harmony-credential`'s `jsonld` feature).
+
+Must be added to `[workspace] members` and `[workspace.dependencies]`
+in the root `Cargo.toml`.
 
 ### Dependencies
 
-- `serde` + `serde_json` — JSON deserialization of header/payload
-- `base64` — base64url decoding
+- `serde` — serialization (no_std compatible)
+- `serde_json` (optional, behind `std` feature) — JSON deserialization
+- `base64` — base64url decoding (no_std with `default-features = false`)
 - `harmony-identity` — `verify_signature` for JWS verification
 
 ### Compact Serialization Format
@@ -76,10 +81,11 @@ pub struct JwtPayload {
 }
 ```
 
-`sd_digests` contains the `_sd` array entries (base64url-encoded
-hash digests). `sd_alg` is the hash algorithm (defaults to
-`sha-256` per spec). `extra` captures all other claims as
-key-value pairs.
+`sd_digests` contains the **top-level** `_sd` array entries only
+(base64url-encoded hash digests). Nested `_sd` arrays within
+sub-objects are captured in `extra` — harmony-b3m can walk them
+if needed. `sd_alg` is the hash algorithm (defaults to `sha-256`
+per spec). `extra` captures all other claims as key-value pairs.
 
 ### Disclosure
 
@@ -104,6 +110,10 @@ pub struct SdJwt {
     pub payload: JwtPayload,
     pub signature: Vec<u8>,
     pub disclosures: Vec<Disclosure>,
+    /// Raw `base64url(header).base64url(payload)` string preserved
+    /// from parsing. Used for signature verification — avoids lossy
+    /// re-encoding of deserialized JSON.
+    pub signing_input: String,
 }
 ```
 
@@ -115,13 +125,17 @@ pub struct SdJwt {
 pub fn parse(compact: &str) -> Result<SdJwt, SdJwtError>
 ```
 
-1. Split on first `~` to separate JWS from disclosures
-2. Split JWS on `.` into header, payload, signature (3 segments)
-3. Base64url-decode each segment
-4. Deserialize header and payload as JSON
-5. Extract `_sd` and `_sd_alg` from payload
-6. Split remainder on `~`, decode each disclosure as JSON array
-7. Return `SdJwt` with all components
+1. Split the entire input on `~` into segments
+2. Take segment 0 as the JWS compact serialization
+3. Split the JWS on `.` into header, payload, signature (3 parts)
+4. Store the raw `header.payload` substring as `signing_input`
+   (before base64url decoding — needed for signature verification)
+5. Base64url-decode header, payload, and signature
+6. Deserialize header and payload as JSON
+7. Extract `_sd` and `_sd_alg` from payload (top-level only)
+8. Take segments 1..N, filter empty strings (trailing `~`),
+   base64url-decode each as a JSON array → `Disclosure`
+9. Return `SdJwt` with all components
 
 ### verify
 
@@ -133,10 +147,11 @@ pub fn verify(
 ) -> Result<(), SdJwtError>
 ```
 
-Reconstructs the JWS signing input (`base64url(header).base64url(payload)`),
-then calls `harmony_identity::verify_signature` with the provided
-suite and key. The caller is responsible for resolving the correct
-public key (via DID resolution — harmony-95u).
+Uses `sd_jwt.signing_input` (the raw `base64url(header).base64url(payload)`
+string preserved during parsing) as the message, then calls
+`harmony_identity::verify_signature` with the provided suite and key.
+The caller is responsible for resolving the correct public key
+(via DID resolution — harmony-95u).
 
 ### signing_input
 
@@ -159,7 +174,7 @@ pub enum SdJwtError {
     MissingAlgorithm,
     UnsupportedAlgorithm(String),
     InvalidDisclosure,
-    SignatureInvalid,
+    SignatureInvalid(harmony_identity::IdentityError),
 }
 ```
 
@@ -173,7 +188,10 @@ JWS `alg` header → `CryptoSuite` for verification:
 | `MLDSA65` | `MlDsa65` | Draft, NIST FIPS 204 |
 | `ES256` | — | Not natively supported (future) |
 
-Unsupported algorithms return `UnsupportedAlgorithm`.
+`MLDSA65` maps to `MlDsa65` (not `MlDsa65Rotatable`). Rotation
+awareness is out of scope for this crate — the caller can override
+the suite if needed. Unsupported algorithms return
+`UnsupportedAlgorithm`.
 
 ## What's NOT in Scope
 
