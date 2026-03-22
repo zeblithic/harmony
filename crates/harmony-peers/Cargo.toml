@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harmony-crypto = { workspace = true }
 harmony-identity = { workspace = true }
 harmony-contacts = { workspace = true }
 hashbrown = { workspace = true }
@@ -15,6 +16,7 @@ hashbrown = { workspace = true }
 [features]
 default = ["std"]
 std = [
+    "harmony-crypto/std",
     "harmony-identity/std",
     "harmony-contacts/std",
 ]

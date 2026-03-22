@@ -26,10 +26,8 @@ fn active_session_pair() -> (Session, Session) {
     let alice_pub = alice_priv.public_identity().clone();
     let bob_pub = bob_priv.public_identity().clone();
 
-    let (mut alice, alice_actions) =
-        Session::new(alice_priv, bob_pub, SessionConfig::default(), 0);
-    let (mut bob, bob_actions) =
-        Session::new(bob_priv, alice_pub, SessionConfig::default(), 0);
+    let (mut alice, alice_actions) = Session::new(alice_priv, bob_pub, SessionConfig::default(), 0);
+    let (mut bob, bob_actions) = Session::new(bob_priv, alice_pub, SessionConfig::default(), 0);
 
     let alice_proof = match &alice_actions[0] {
         SessionAction::SendHandshake { proof } => proof.clone(),

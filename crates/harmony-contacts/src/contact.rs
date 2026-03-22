@@ -104,6 +104,28 @@ mod tests {
     }
 
     #[test]
+    fn contact_with_tunnel_address() {
+        let contact = Contact {
+            identity_hash: [0xCC; 16],
+            display_name: None,
+            peering: PeeringPolicy::default(),
+            added_at: 1710000000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![ContactAddress::Tunnel {
+                node_id: [0xEE; 32],
+                relay_url: Some("https://iroh.q8.fyi".into()),
+                direct_addrs: vec!["192.168.1.10:4242".into()],
+            }],
+        };
+        assert_eq!(contact.addresses.len(), 1);
+        assert!(matches!(
+            &contact.addresses[0],
+            ContactAddress::Tunnel { node_id, .. } if *node_id == [0xEE; 32]
+        ));
+    }
+
+    #[test]
     fn contact_address_serde_round_trip() {
         let reticulum_addr = ContactAddress::Reticulum {
             destination_hash: [0x11; 16],

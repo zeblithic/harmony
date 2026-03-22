@@ -17,7 +17,10 @@ impl std::fmt::Debug for NodeIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeIdentity")
             .field("pq_address", &self.pq.public_identity().address_hash)
-            .field("ed25519_address", &self.ed25519.public_identity().address_hash)
+            .field(
+                "ed25519_address",
+                &self.ed25519.public_identity().address_hash,
+            )
             .finish()
     }
 }
@@ -26,8 +29,9 @@ pub fn resolve_path(cli_override: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(p) = cli_override {
         return Ok(p.to_path_buf());
     }
-    let home = std::env::var("HOME")
-        .map_err(|_| "Cannot determine identity file path: $HOME not set. Use --identity-file.".to_string())?;
+    let home = std::env::var("HOME").map_err(|_| {
+        "Cannot determine identity file path: $HOME not set. Use --identity-file.".to_string()
+    })?;
     Ok(PathBuf::from(home).join(".harmony").join("identity.key"))
 }
 
@@ -36,10 +40,16 @@ pub fn load(path: &Path) -> Result<NodeIdentity, String> {
         std::fs::read(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?,
     );
     if buf.len() != FILE_LEN {
-        return Err(format!("Corrupt identity file: expected {FILE_LEN} bytes, got {}", buf.len()));
+        return Err(format!(
+            "Corrupt identity file: expected {FILE_LEN} bytes, got {}",
+            buf.len()
+        ));
     }
     if buf[0] != VERSION {
-        return Err(format!("Unsupported identity file version: {:#04x}", buf[0]));
+        return Err(format!(
+            "Unsupported identity file version: {:#04x}",
+            buf[0]
+        ));
     }
     let pq = PqPrivateIdentity::from_private_bytes(&buf[1..1 + PQ_KEY_LEN])
         .map_err(|e| format!("Corrupt PQ identity in key file: {e}"))?;
@@ -114,8 +124,13 @@ pub fn save(path: &Path, identity: &NodeIdentity) -> Result<(), String> {
         f.sync_all()
             .map_err(|e| format!("Failed to fsync {}: {e}", tmp_path.display()))?;
     }
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| format!("Failed to rename {} → {}: {e}", tmp_path.display(), path.display()))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        format!(
+            "Failed to rename {} → {}: {e}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     // Rename succeeded — disarm the guard (file is now at `path`, not `tmp_path`).
     std::mem::forget(guard);
     Ok(())
@@ -145,7 +160,11 @@ fn warn_permissions(path: &Path) {
     if let Ok(meta) = std::fs::metadata(path) {
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
-            eprintln!("Warning: {} has open permissions ({:#05o}), should be 0600", path.display(), mode);
+            eprintln!(
+                "Warning: {} has open permissions ({:#05o}), should be 0600",
+                path.display(),
+                mode
+            );
         }
     }
 }
@@ -178,7 +197,10 @@ mod tests {
         data.extend_from_slice(&[0u8; PQ_KEY_LEN + ED25519_KEY_LEN]);
         std::fs::write(&path, &data).unwrap();
         let err = load(&path).unwrap_err();
-        assert!(err.contains("version"), "expected version error, got: {err}");
+        assert!(
+            err.contains("version"),
+            "expected version error, got: {err}"
+        );
     }
 
     #[test]
@@ -216,8 +238,14 @@ mod tests {
         let identity = load_or_generate(&path).unwrap();
         assert!(path.exists());
         let reloaded = load(&path).unwrap();
-        assert_eq!(identity.pq.public_identity().address_hash, reloaded.pq.public_identity().address_hash);
-        assert_eq!(identity.ed25519.public_identity().address_hash, reloaded.ed25519.public_identity().address_hash);
+        assert_eq!(
+            identity.pq.public_identity().address_hash,
+            reloaded.pq.public_identity().address_hash
+        );
+        assert_eq!(
+            identity.ed25519.public_identity().address_hash,
+            reloaded.ed25519.public_identity().address_hash
+        );
     }
 
     #[test]
@@ -271,7 +299,11 @@ mod tests {
             ed25519: PrivateIdentity::generate(&mut rand::rngs::OsRng),
         };
         save(&path, &identity).unwrap();
-        let dir_perms = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        let dir_perms = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(dir_perms, 0o700, "directory should be 0700");
         let file_perms = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_perms, 0o600, "file should be 0600");

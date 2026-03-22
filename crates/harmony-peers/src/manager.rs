@@ -13,12 +13,21 @@ const CONNECTING_TIMEOUT: u64 = 60;
 
 pub struct PeerManager {
     pub(crate) peers: HashMap<IdentityHash, PeerState>,
+    local_identity_hash: IdentityHash,
 }
 
 impl PeerManager {
     pub fn new() -> Self {
         Self {
             peers: HashMap::new(),
+            local_identity_hash: [0u8; 16],
+        }
+    }
+
+    pub fn with_local_identity(local_identity_hash: IdentityHash) -> Self {
+        Self {
+            peers: HashMap::new(),
+            local_identity_hash,
         }
     }
 
@@ -271,10 +280,16 @@ impl PeerManager {
     }
 
     fn handle_tick(&mut self, now: u64, actions: &mut Vec<PeerAction>) {
+        let local_hash = self.local_identity_hash;
         for (id, peer) in self.peers.iter_mut() {
             match peer.status {
                 PeerStatus::Searching => {
-                    let interval = Self::probe_interval(peer.priority, peer.retry_count);
+                    let interval = Self::probe_interval_jittered(
+                        peer.priority,
+                        peer.retry_count,
+                        &local_hash,
+                        id,
+                    );
                     if interval == 0 {
                         continue;
                     }
@@ -306,14 +321,44 @@ impl PeerManager {
         }
     }
 
-    fn probe_interval(priority: PeeringPriority, retry_count: u32) -> u64 {
+    /// Compute a jittered probe interval for a specific peer.
+    ///
+    /// Uses BLAKE3(local_hash || peer_hash) to derive a deterministic
+    /// but unique jitter factor (0.75-1.25x) for each peer relationship.
+    /// This makes exponential backoff curves uncorrelatable between
+    /// different observers — they can't match reconnection patterns.
+    ///
+    /// Jitter is applied to the uncapped exponential backoff value, and the
+    /// single max-cap is applied afterwards. This preserves the full ±25%
+    /// jitter range at max backoff instead of silently losing upward jitter
+    /// (which would happen if we capped twice).
+    pub(crate) fn probe_interval_jittered(
+        priority: PeeringPriority,
+        retry_count: u32,
+        local_hash: &IdentityHash,
+        peer_hash: &IdentityHash,
+    ) -> u64 {
+        // Compute the uncapped base interval (no min() here).
         let base = match priority {
             PeeringPriority::Low => return 0,
             PeeringPriority::Normal => PROBE_INTERVAL_NORMAL,
             PeeringPriority::High => PROBE_INTERVAL_HIGH,
         };
-        let backoff = base.saturating_mul(1u64 << retry_count.min(20));
-        backoff.min(PROBE_INTERVAL_MAX)
+        let uncapped = base.saturating_mul(1u64 << retry_count.min(20));
+
+        // Derive jitter from identity pair
+        let mut seed_input = [0u8; 32];
+        seed_input[..16].copy_from_slice(local_hash);
+        seed_input[16..].copy_from_slice(peer_hash);
+        let hash = harmony_crypto::hash::blake3_hash(&seed_input);
+        let jitter_raw = u64::from_le_bytes(hash[..8].try_into().unwrap());
+
+        // jitter_factor: 0.75 to ~1.25 (768/1024 to 1279/1024)
+        let jitter_factor_num = 768 + (jitter_raw % 512); // 768-1279
+        let jittered = uncapped * jitter_factor_num / 1024;
+
+        // Single cap applied after jitter so upward jitter is not lost at max backoff.
+        jittered.min(PROBE_INTERVAL_MAX)
     }
 }
 
@@ -409,13 +454,13 @@ mod tests {
         assert!(actions.contains(&PeerAction::SendPathRequest {
             identity_hash: [0xA1; 16]
         }));
-        // 60s later — too soon for Normal (120s base)
+        // 60s later — too soon for Normal (120s base, min jittered ≈ 90s)
         let actions = mgr.on_event(PeerEvent::Tick { now: 1060 }, &store);
         assert!(!actions
             .iter()
             .any(|a| matches!(a, PeerAction::SendPathRequest { .. })));
-        // 121s later — past 120s interval
-        let actions = mgr.on_event(PeerEvent::Tick { now: 1121 }, &store);
+        // 151s later — past max jittered interval (120 * 1279/1024 ≈ 149s)
+        let actions = mgr.on_event(PeerEvent::Tick { now: 1151 }, &store);
         assert!(actions.contains(&PeerAction::SendPathRequest {
             identity_hash: [0xA1; 16]
         }));
@@ -612,7 +657,8 @@ mod tests {
             },
             &store,
         );
-        let actions = mgr.on_event(PeerEvent::Tick { now: 1031 }, &store);
+        // 38s later — past max jittered High interval (30 * 1279/1024 ≈ 37s)
+        let actions = mgr.on_event(PeerEvent::Tick { now: 1038 }, &store);
         assert!(actions.contains(&PeerAction::SendPathRequest {
             identity_hash: [0xA2; 16]
         }));
@@ -678,15 +724,18 @@ mod tests {
             },
             &store,
         );
+        // First probe always fires (last_probe=None)
         let actions = mgr.on_event(PeerEvent::Tick { now: 1000 }, &store);
         assert!(actions.contains(&PeerAction::SendPathRequest {
             identity_hash: [0x55; 16]
         }));
+        // 10s later — too soon even with minimum jitter (High base=30, min factor=0.75 → 22s)
         let actions = mgr.on_event(PeerEvent::Tick { now: 1010 }, &store);
         assert!(!actions
             .iter()
             .any(|a| matches!(a, PeerAction::SendPathRequest { .. })));
-        let actions = mgr.on_event(PeerEvent::Tick { now: 1031 }, &store);
+        // 38s later — past max jittered interval (30 * 1279/1024 ≈ 37s)
+        let actions = mgr.on_event(PeerEvent::Tick { now: 1038 }, &store);
         assert!(actions.contains(&PeerAction::SendPathRequest {
             identity_hash: [0x55; 16]
         }));
@@ -717,13 +766,14 @@ mod tests {
             );
         }
         assert_eq!(mgr.peers.get(&[0x66; 16]).unwrap().retry_count, 3);
-        // interval = min(30 * 2^3, 600) = 240s
+        // interval = min(30 * 2^3, 600) = 240s base, jittered ≈ 180-300s
         mgr.on_event(PeerEvent::Tick { now: 10000 }, &store);
         let actions = mgr.on_event(PeerEvent::Tick { now: 10100 }, &store);
         assert!(!actions
             .iter()
             .any(|a| matches!(a, PeerAction::SendPathRequest { .. })));
-        let actions = mgr.on_event(PeerEvent::Tick { now: 10241 }, &store);
+        // 301s later — past max jittered interval (240 * 1279/1024 ≈ 299s)
+        let actions = mgr.on_event(PeerEvent::Tick { now: 10301 }, &store);
         assert!(actions.contains(&PeerAction::SendPathRequest {
             identity_hash: [0x66; 16]
         }));
@@ -862,22 +912,23 @@ mod tests {
             },
             &store,
         );
-        // retry_count=1, interval = min(30*2^1, 600) = 60s
+        // retry_count=1, base interval = min(30*2^1, 600) = 60s
+        // Jittered range: 60 * 768/1024 = 45s to 60 * 1279/1024 ≈ 74s
         // Backoff should be from connecting_since (t=1020), not original probe (t=1000)
-        // So next probe should be at t=1020+60 = t=1080
         let actions = mgr.on_event(PeerEvent::Tick { now: 1055 }, &store);
         assert!(
             !actions
                 .iter()
                 .any(|a| matches!(a, PeerAction::SendPathRequest { .. })),
-            "Should NOT probe at t=1055 — backoff from t=1020 requires 60s"
+            "Should NOT probe at t=1055 — backoff from t=1020 requires at least 45s (jittered)"
         );
-        let actions = mgr.on_event(PeerEvent::Tick { now: 1081 }, &store);
+        // 75s after t=1020 — past max jittered interval
+        let actions = mgr.on_event(PeerEvent::Tick { now: 1095 }, &store);
         assert!(
             actions.contains(&PeerAction::SendPathRequest {
                 identity_hash: [0xE1; 16]
             }),
-            "Should probe at t=1081 — past 60s backoff from t=1020"
+            "Should probe at t=1095 — past 75s backoff from t=1020 (max jittered ≈ 74s)"
         );
     }
 
@@ -1086,5 +1137,63 @@ mod tests {
             !actions.iter().any(|a| matches!(a, PeerAction::InitiateLink { .. })),
             "should NOT emit InitiateLink when there is no Reticulum address"
         );
+    }
+
+    #[test]
+    fn probe_interval_varies_by_local_identity() {
+        // Same peer, different local identities → different intervals
+        let interval1 = PeerManager::probe_interval_jittered(
+            PeeringPriority::High,
+            3,
+            &[0x11; 16],
+            &[0xAA; 16],
+        );
+        let interval2 = PeerManager::probe_interval_jittered(
+            PeeringPriority::High,
+            3,
+            &[0x22; 16],
+            &[0xAA; 16],
+        );
+
+        // Both should be in a valid range but differ
+        assert!(interval1 > 0 && interval1 <= PROBE_INTERVAL_MAX);
+        assert!(interval2 > 0 && interval2 <= PROBE_INTERVAL_MAX);
+        assert_ne!(interval1, interval2);
+    }
+
+    #[test]
+    fn probe_interval_varies_by_peer_identity() {
+        // Same local identity, different peers → different intervals
+        let interval1 = PeerManager::probe_interval_jittered(
+            PeeringPriority::High,
+            3,
+            &[0x11; 16],
+            &[0xAA; 16],
+        );
+        let interval2 = PeerManager::probe_interval_jittered(
+            PeeringPriority::High,
+            3,
+            &[0x11; 16],
+            &[0xBB; 16],
+        );
+        assert_ne!(interval1, interval2);
+    }
+
+    #[test]
+    fn probe_interval_jittered_is_deterministic() {
+        // Same inputs → same output (reproducible for testing)
+        let a = PeerManager::probe_interval_jittered(
+            PeeringPriority::Normal,
+            2,
+            &[0x11; 16],
+            &[0xAA; 16],
+        );
+        let b = PeerManager::probe_interval_jittered(
+            PeeringPriority::Normal,
+            2,
+            &[0x11; 16],
+            &[0xAA; 16],
+        );
+        assert_eq!(a, b);
     }
 }

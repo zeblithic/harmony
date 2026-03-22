@@ -23,3 +23,9 @@ pub use status_list::MemoryStatusListResolver;
 pub use verify::MemoryCredentialResolver;
 #[cfg(any(test, feature = "test-utils"))]
 pub use verify::MemoryKeyResolver;
+
+#[cfg(feature = "jsonld")]
+pub mod jsonld;
+
+#[cfg(feature = "jsonld")]
+pub use jsonld::{credential_to_jsonld, identity_to_did_key, presentation_to_jsonld};

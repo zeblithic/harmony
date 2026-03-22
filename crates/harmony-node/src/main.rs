@@ -1,4 +1,5 @@
 mod compute;
+mod config;
 mod discovery;
 mod event_loop;
 mod identity_file;
@@ -10,6 +11,11 @@ mod tunnel_bridge;
 mod tunnel_task;
 
 use clap::{Parser, Subcommand};
+
+type LogReloadHandle = tracing_subscriber::reload::Handle<
+    tracing_subscriber::EnvFilter,
+    tracing_subscriber::Registry,
+>;
 
 #[derive(Parser)]
 #[command(name = "harmony", about = "Harmony decentralized network tools")]
@@ -27,39 +33,42 @@ enum Commands {
     },
     /// Start the Harmony node runtime
     Run {
+        /// Path to config file (default: ~/.harmony/node.toml)
+        #[arg(long, value_name = "PATH")]
+        config: Option<std::path::PathBuf>,
         /// W-TinyLFU cache capacity (number of items)
-        #[arg(long, default_value_t = 1024)]
-        cache_capacity: usize,
+        #[arg(long)]
+        cache_capacity: Option<usize>,
         /// WASM compute fuel budget per tick
-        #[arg(long, default_value_t = 100_000)]
-        compute_budget: u64,
+        #[arg(long)]
+        compute_budget: Option<u64>,
         /// Accept encrypted durable (10) content for storage
-        #[arg(long)]
-        encrypted_durable_persist: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        encrypted_durable_persist: Option<bool>,
         /// Announce encrypted durable (10) content on Zenoh
-        #[arg(long)]
-        encrypted_durable_announce: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        encrypted_durable_announce: Option<bool>,
         /// Disable announcing public ephemeral (01) content on Zenoh
-        #[arg(long)]
-        no_public_ephemeral_announce: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        no_public_ephemeral_announce: Option<bool>,
         /// Bloom filter broadcast interval in ticks
-        #[arg(long, default_value_t = 30)]
-        filter_broadcast_ticks: u32,
+        #[arg(long)]
+        filter_broadcast_ticks: Option<u32>,
         /// Bloom filter broadcast mutation threshold
-        #[arg(long, default_value_t = 100)]
-        filter_mutation_threshold: u32,
+        #[arg(long)]
+        filter_mutation_threshold: Option<u32>,
         /// Path to the identity key file
         #[arg(long, value_name = "PATH")]
         identity_file: Option<std::path::PathBuf>,
         /// UDP listen address for Reticulum mesh packets
-        #[arg(long, default_value = "0.0.0.0:4242")]
-        listen_address: String,
-        /// Disable mDNS peer discovery (broadcast-only mode)
         #[arg(long)]
-        no_mdns: bool,
+        listen_address: Option<String>,
+        /// Disable mDNS peer discovery (broadcast-only mode)
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        no_mdns: Option<bool>,
         /// Seconds before evicting a silent mDNS peer (default: 60)
-        #[arg(long, default_value_t = 60)]
-        mdns_stale_timeout: u64,
+        #[arg(long)]
+        mdns_stale_timeout: Option<u64>,
         /// iroh relay URL for NAT-traversal tunnels (enables tunnel accept)
         #[arg(long, value_name = "URL")]
         relay_url: Option<String>,
@@ -111,27 +120,34 @@ enum IdentityAction {
 async fn main() {
     // Initialize structured logging. Output goes to stderr (procd captures
     // it for syslog on OpenWRT). Filter via RUST_LOG env var, default info.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|e| {
-                    // Only warn if RUST_LOG is set but malformed — missing is the normal case.
-                    if std::env::var("RUST_LOG").is_ok() {
-                        eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
-                    }
-                    tracing_subscriber::EnvFilter::new("info")
-                }),
+    // Uses reload::Handle so [logging].level from config file can reconfigure
+    // the filter after loading.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|e| {
+            // Only warn if RUST_LOG is set but malformed — missing is the normal case.
+            if std::env::var("RUST_LOG").is_ok() {
+                eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
+            }
+            tracing_subscriber::EnvFilter::new("info")
+        });
+    let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(std::io::stderr),
         )
-        .with_target(false)
-        .with_ansi(false)
-        .without_time()
-        .with_writer(std::io::stderr)
         .init();
     // Tip: use RUST_LOG=harmony_node=debug for harmony-only debug output.
     // Plain RUST_LOG=debug includes Zenoh's verbose internal traces.
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+    if let Err(e) = run(cli, reload_handle).await {
         // Use eprintln for the top-level error — tracing may not flush to
         // a piped stderr before process::exit, and integration tests check
         // this output for specific error messages.
@@ -156,7 +172,7 @@ fn decode_hex_key(
     Ok(bytes)
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Identity { action } => match action {
             IdentityAction::New => {
@@ -209,6 +225,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Commands::Run {
+            config,
             cache_capacity,
             compute_budget,
             encrypted_durable_persist,
@@ -229,6 +246,72 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             use harmony_content::book::MemoryBookStore;
             use harmony_content::storage_tier::{
                 ContentPolicy, FilterBroadcastConfig, StorageBudget,
+            };
+
+            // ── Load config file ────────────────────────────────────────
+            let (config_path, explicit) = crate::config::resolve_config_path(config.as_deref())?;
+            let config_file = crate::config::load(&config_path, explicit)
+                .map_err(|e| format!("{e}"))?;
+
+            // Apply config file log level if RUST_LOG is not set.
+            if std::env::var("RUST_LOG").is_err() {
+                if let Some(ref logging) = config_file.logging {
+                    if let Some(ref level) = logging.level {
+                        match tracing_subscriber::EnvFilter::try_new(level) {
+                            Ok(new_filter) => {
+                                let _ = reload_handle.reload(new_filter);
+                                tracing::debug!(level = %level, "applied log level from config file");
+                            }
+                            Err(e) => {
+                                tracing::warn!(level = %level, err = %e, "invalid log level in config file — keeping default");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Merge CLI > file > defaults ─────────────────────────────
+            use crate::config::resolve;
+            let cache_capacity = resolve(cache_capacity, config_file.cache_capacity, 1024);
+            let compute_budget = resolve(compute_budget, config_file.compute_budget, 100_000);
+            let filter_broadcast_ticks = resolve(filter_broadcast_ticks, config_file.filter_broadcast_ticks, 30);
+            let filter_mutation_threshold = resolve(filter_mutation_threshold, config_file.filter_mutation_threshold, 100);
+            let mdns_stale_timeout = resolve(mdns_stale_timeout, config_file.mdns_stale_timeout, 60);
+            let listen_address = resolve(listen_address, config_file.listen_address, "0.0.0.0:4242".to_string());
+            let identity_file = identity_file.or(config_file.identity_file);
+            let relay_url = relay_url.or(config_file.relay_url);
+            let no_mdns = resolve(no_mdns, config_file.no_mdns, false);
+            let encrypted_durable_persist = resolve(encrypted_durable_persist, config_file.encrypted_durable_persist, false);
+            let encrypted_durable_announce = resolve(encrypted_durable_announce, config_file.encrypted_durable_announce, false);
+            let no_public_ephemeral_announce = resolve(no_public_ephemeral_announce, config_file.no_public_ephemeral_announce, false);
+
+            // ── Parse config-only sections ───────────────────────────────
+            let bootstrap_peers: Vec<std::net::SocketAddr> = config_file.peers
+                .unwrap_or_default()
+                .iter()
+                .map(|p| p.address.parse::<std::net::SocketAddr>())
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("invalid peer address in config file: {e}"))?;
+
+            let tunnel_entries: Vec<crate::config::TunnelEntry> = {
+                let mut entries = config_file.tunnels.unwrap_or_default();
+                if let Some(ref peer) = tunnel_peer {
+                    entries.push(crate::config::TunnelEntry {
+                        node_id: peer.clone(),
+                        name: None,
+                    });
+                }
+                for entry in &entries {
+                    let decoded = hex::decode(&entry.node_id)
+                        .map_err(|e| format!("invalid tunnel node_id '{}': {e}", entry.node_id))?;
+                    if decoded.len() != 32 {
+                        return Err(format!(
+                            "invalid tunnel node_id '{}': expected 32 bytes (64 hex chars), got {}",
+                            entry.node_id, decoded.len()
+                        ).into());
+                    }
+                }
+                entries
             };
 
             if cache_capacity == 0 {
@@ -287,7 +370,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Build tunnel config if --relay-url was provided.
             // The PQ identity is wrapped in Arc because tunnel tasks need
             // references and PqPrivateIdentity is not Clone.
-            let tunnel_config = if relay_url.is_some() || tunnel_peer.is_some() {
+            let tunnel_config = if relay_url.is_some() || tunnel_peer.is_some() || !tunnel_entries.is_empty() {
                 if tunnel_peer.is_some() {
                     tracing::warn!("--tunnel-peer: outbound connections not yet wired (needs contact store, Bead #3)");
                 }
@@ -325,6 +408,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     fp_rate: 0.001,
                 },
                 node_addr,
+                local_identity_hash: our_addr_bytes,
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -372,6 +456,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if no_mdns { None } else { Some(our_addr_bytes) },
                 std::time::Duration::from_secs(mdns_stale_timeout),
                 tunnel_config,
+                bootstrap_peers,
+                tunnel_entries,
             ).await
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
@@ -429,6 +515,13 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// Create a dummy `LogReloadHandle` for tests that call `run()`.
+    fn dummy_reload_handle() -> LogReloadHandle {
+        let filter = tracing_subscriber::EnvFilter::new("info");
+        let (_layer, handle) = tracing_subscriber::reload::Layer::new(filter);
+        handle
+    }
+
     #[test]
     fn cli_parses_run_command() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
@@ -439,7 +532,7 @@ mod tests {
     fn cli_parses_run_with_compute_budget() {
         let cli = Cli::try_parse_from(["harmony", "run", "--compute-budget", "50000"]).unwrap();
         if let Commands::Run { compute_budget, .. } = cli.command {
-            assert_eq!(compute_budget, 50000);
+            assert_eq!(compute_budget, Some(50000));
         } else {
             panic!("expected Run command");
         }
@@ -449,7 +542,7 @@ mod tests {
     fn cli_parses_run_with_cache_capacity() {
         let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "2048"]).unwrap();
         if let Commands::Run { cache_capacity, .. } = cli.command {
-            assert_eq!(cache_capacity, 2048);
+            assert_eq!(cache_capacity, Some(2048));
         } else {
             panic!("expected Run command");
         }
@@ -472,9 +565,9 @@ mod tests {
             ..
         } = cli.command
         {
-            assert!(encrypted_durable_persist);
-            assert!(encrypted_durable_announce);
-            assert!(no_public_ephemeral_announce);
+            assert_eq!(encrypted_durable_persist, Some(true));
+            assert_eq!(encrypted_durable_announce, Some(true));
+            assert_eq!(no_public_ephemeral_announce, Some(true));
         } else {
             panic!("expected Run command");
         }
@@ -490,9 +583,9 @@ mod tests {
             ..
         } = cli.command
         {
-            assert!(!encrypted_durable_persist);
-            assert!(!encrypted_durable_announce);
-            assert!(!no_public_ephemeral_announce);
+            assert_eq!(encrypted_durable_persist, None);
+            assert_eq!(encrypted_durable_announce, None);
+            assert_eq!(no_public_ephemeral_announce, None);
         } else {
             panic!("expected Run command");
         }
@@ -500,8 +593,8 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_announce_without_persist() {
-        let cli = Cli::try_parse_from(["harmony", "run", "--encrypted-durable-announce"]).unwrap();
-        let result = run(cli).await;
+        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--encrypted-durable-announce"]).unwrap();
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -512,8 +605,8 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_zero_cache_capacity() {
-        let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "0"]).unwrap();
-        let result = run(cli).await;
+        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--cache-capacity", "0"]).unwrap();
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -525,8 +618,8 @@ mod tests {
     #[tokio::test]
     async fn cli_rejects_oversized_cache_capacity() {
         // 200_000_001 exceeds MAX_CACHE_CAPACITY (200M).
-        let cli = Cli::try_parse_from(["harmony", "run", "--cache-capacity", "200000001"]).unwrap();
-        let result = run(cli).await;
+        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--cache-capacity", "200000001"]).unwrap();
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("exceeds maximum"), "unexpected error: {msg}");
@@ -549,8 +642,8 @@ mod tests {
             ..
         } = cli.command
         {
-            assert_eq!(filter_broadcast_ticks, 60);
-            assert_eq!(filter_mutation_threshold, 200);
+            assert_eq!(filter_broadcast_ticks, Some(60));
+            assert_eq!(filter_mutation_threshold, Some(200));
         } else {
             panic!("expected Run command");
         }
@@ -558,8 +651,8 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_filter_broadcast_ticks_below_two() {
-        let cli = Cli::try_parse_from(["harmony", "run", "--filter-broadcast-ticks", "1"]).unwrap();
-        let result = run(cli).await;
+        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--filter-broadcast-ticks", "1"]).unwrap();
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -570,15 +663,10 @@ mod tests {
 
     #[test]
     fn cli_parses_listen_address() {
-        let cli = Cli::try_parse_from([
-            "harmony",
-            "run",
-            "--listen-address",
-            "127.0.0.1:9999",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["harmony", "run", "--listen-address", "127.0.0.1:9999"]).unwrap();
         if let Commands::Run { listen_address, .. } = cli.command {
-            assert_eq!(listen_address, "127.0.0.1:9999");
+            assert_eq!(listen_address.as_deref(), Some("127.0.0.1:9999"));
         } else {
             panic!("expected Run command");
         }
@@ -588,7 +676,7 @@ mod tests {
     fn cli_listen_address_default() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
         if let Commands::Run { listen_address, .. } = cli.command {
-            assert_eq!(listen_address, "0.0.0.0:4242");
+            assert!(listen_address.is_none());
         } else {
             panic!("expected Run command");
         }
@@ -597,8 +685,8 @@ mod tests {
     #[tokio::test]
     async fn cli_rejects_invalid_listen_address() {
         let cli =
-            Cli::try_parse_from(["harmony", "run", "--listen-address", "not-an-addr"]).unwrap();
-        let result = run(cli).await;
+            Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--listen-address", "not-an-addr"]).unwrap();
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -687,7 +775,7 @@ mod tests {
     fn cli_parses_no_mdns_flag() {
         let cli = Cli::try_parse_from(["harmony", "run", "--no-mdns"]).unwrap();
         if let Commands::Run { no_mdns, .. } = cli.command {
-            assert!(no_mdns);
+            assert_eq!(no_mdns, Some(true));
         } else {
             panic!("expected Run command");
         }
@@ -717,7 +805,7 @@ mod tests {
     fn cli_no_mdns_default_false() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
         if let Commands::Run { no_mdns, .. } = cli.command {
-            assert!(!no_mdns);
+            assert_eq!(no_mdns, None);
         } else {
             panic!("expected Run command");
         }
@@ -727,7 +815,7 @@ mod tests {
     fn cli_parses_mdns_stale_timeout() {
         let cli = Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "120"]).unwrap();
         if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
-            assert_eq!(mdns_stale_timeout, 120);
+            assert_eq!(mdns_stale_timeout, Some(120));
         } else {
             panic!("expected Run command");
         }
@@ -737,7 +825,7 @@ mod tests {
     fn cli_mdns_stale_timeout_default() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
         if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
-            assert_eq!(mdns_stale_timeout, 60);
+            assert!(mdns_stale_timeout.is_none());
         } else {
             panic!("expected Run command");
         }
@@ -746,13 +834,33 @@ mod tests {
     #[tokio::test]
     async fn cli_rejects_zero_mdns_stale_timeout() {
         let cli =
-            Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "0"]).unwrap();
-        let result = run(cli).await;
+            Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--mdns-stale-timeout", "0"]).unwrap();
+        let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("--mdns-stale-timeout must be > 0"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn cli_parses_config_flag() {
+        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/tmp/test.toml"]).unwrap();
+        if let Commands::Run { config, .. } = cli.command {
+            assert_eq!(config, Some(std::path::PathBuf::from("/tmp/test.toml")));
+        } else {
+            panic!("expected Run command");
+        }
+    }
+
+    #[test]
+    fn cli_config_default_none() {
+        let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
+        if let Commands::Run { config, .. } = cli.command {
+            assert!(config.is_none());
+        } else {
+            panic!("expected Run command");
+        }
     }
 }

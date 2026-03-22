@@ -83,9 +83,7 @@ impl ProfileRecord {
             return Err(ProfileError::DeserializeError("empty data"));
         }
         if data[0] != FORMAT_VERSION {
-            return Err(ProfileError::DeserializeError(
-                "unsupported format version",
-            ));
+            return Err(ProfileError::DeserializeError("unsupported format version"));
         }
         postcard::from_bytes(&data[1..])
             .map_err(|_| ProfileError::DeserializeError("postcard decode failed"))

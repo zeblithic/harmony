@@ -244,7 +244,8 @@ mod tests {
 
         let (bytes, cid) = builder.build().unwrap();
         assert_eq!(cid.cid_type(), CidType::Bundle(1));
-        assert_eq!(cid.payload_size(), 64); // 2 * 32
+        // Bundle size is float-encoded; small bundles encode as 0 (sentinel).
+        assert_eq!(cid.raw_size_field(), 0);
         assert_eq!(bytes.len(), 64);
 
         // Parse back and verify
@@ -267,7 +268,7 @@ mod tests {
 
         let parsed = parse_bundle(&bytes).unwrap();
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].cid_type(), CidType::InlineMetadata);
+        assert_eq!(parsed[0].cid_type(), CidType::InlineData);
         assert_eq!(parsed[1], book);
     }
 
@@ -314,16 +315,19 @@ mod tests {
 
     #[test]
     fn builder_rejects_depth_overflow() {
-        // Build up to depth 7 then try to wrap
+        // Build up to MAX_BUNDLE_DEPTH then try to wrap
         let book = ContentId::for_book(b"leaf", ContentFlags::default()).unwrap();
         let mut current = book;
-        for _ in 0..7 {
+        for _ in 0..crate::cid::MAX_BUNDLE_DEPTH {
             let mut b = BundleBuilder::new();
             b.add(current);
             let (_, cid) = b.build().unwrap();
             current = cid;
         }
-        assert_eq!(current.cid_type(), CidType::Bundle(7));
+        assert_eq!(
+            current.cid_type(),
+            CidType::Bundle(crate::cid::MAX_BUNDLE_DEPTH)
+        );
 
         let mut b = BundleBuilder::new();
         b.add(current);
@@ -381,7 +385,7 @@ mod tests {
         let entries = parse_bundle(retrieved).unwrap();
 
         // First entry is inline metadata
-        assert_eq!(entries[0].cid_type(), CidType::InlineMetadata);
+        assert_eq!(entries[0].cid_type(), CidType::InlineData);
         let (total_size, chunk_count, ts, mime) = entries[0].parse_inline_metadata().unwrap();
         assert_eq!(total_size, 12);
         assert_eq!(chunk_count, 2);

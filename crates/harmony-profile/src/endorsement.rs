@@ -85,9 +85,7 @@ impl EndorsementRecord {
             return Err(ProfileError::DeserializeError("empty data"));
         }
         if data[0] != FORMAT_VERSION {
-            return Err(ProfileError::DeserializeError(
-                "unsupported format version",
-            ));
+            return Err(ProfileError::DeserializeError("unsupported format version"));
         }
         postcard::from_bytes(&data[1..])
             .map_err(|_| ProfileError::DeserializeError("postcard decode failed"))
@@ -190,14 +188,8 @@ mod tests {
 
     #[test]
     fn builder_produces_correct_fields() {
-        let mut builder = EndorsementBuilder::new(
-            test_endorser(),
-            test_endorsee(),
-            42,
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            EndorsementBuilder::new(test_endorser(), test_endorsee(), 42, 1000, 2000, [0x01; 16]);
         builder.reason(alloc::string::String::from("Verified in person"));
 
         let payload = builder.signable_payload();
@@ -214,14 +206,8 @@ mod tests {
 
     #[test]
     fn signable_payload_is_deterministic() {
-        let builder = EndorsementBuilder::new(
-            test_endorser(),
-            test_endorsee(),
-            42,
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let builder =
+            EndorsementBuilder::new(test_endorser(), test_endorsee(), 42, 1000, 2000, [0x01; 16]);
         let p1 = builder.signable_payload();
         let p2 = builder.signable_payload();
         assert_eq!(p1, p2);
@@ -248,28 +234,16 @@ mod tests {
 
     #[test]
     fn endorsement_without_reason() {
-        let builder = EndorsementBuilder::new(
-            test_endorser(),
-            test_endorsee(),
-            99,
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let builder =
+            EndorsementBuilder::new(test_endorser(), test_endorsee(), 99, 1000, 2000, [0x01; 16]);
         let record = builder.build(alloc::vec![0xDE, 0xAD]);
         assert!(record.reason.is_none());
     }
 
     #[test]
     fn serde_round_trip() {
-        let mut builder = EndorsementBuilder::new(
-            test_endorser(),
-            test_endorsee(),
-            42,
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            EndorsementBuilder::new(test_endorser(), test_endorsee(), 42, 1000, 2000, [0x01; 16]);
         builder.reason(alloc::string::String::from("Verified"));
 
         let record = builder.build(alloc::vec![0xDE, 0xAD]);

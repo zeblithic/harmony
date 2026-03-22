@@ -14,162 +14,214 @@
     };
   };
 
-  outputs = { self, nixpkgs, crane, flake-utils, iroh-src }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
+  outputs = {
+    self,
+    nixpkgs,
+    crane,
+    flake-utils,
+    iroh-src,
+    ...
+  }:
+    flake-utils.lib.eachDefaultSystem (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
 
-        # --- Native builds (host == target) ---
-        craneLib = crane.mkLib pkgs;
+      # --- Native builds (host == target) ---
+      craneLib = crane.mkLib pkgs;
 
-        # Common source filtering
-        harmonySrc = craneLib.cleanCargoSource ./.;
+      # Common source filtering for harmony workspace
+      harmonySrc = pkgs.lib.fileset.toSource {
+        root = ./.;
+        # Only include Cargo manifests + Rust source. Avoids
+        # fileset.toml which picks up non-Cargo TOML files and
+        # widens the cache invalidation boundary.
+        fileset = pkgs.lib.fileset.unions [
+          (craneLib.fileset.cargoTomlAndLock ./.)
+          (craneLib.fileset.rust ./.)
+          # Include .cargo/config.toml so cross-build rustflags
+          # (e.g., link-self-contained=yes for aarch64 musl) are visible.
+          (pkgs.lib.fileset.maybeMissing ./.cargo/config.toml)
+        ];
+      };
 
-        # Common native build inputs
-        commonNativeBuildInputs = with pkgs; [
+      harmonyCommonArgs = {
+        src = harmonySrc;
+        strictDeps = true;
+        doCheck = false;
+        pname = "harmony-node";
+        version = "0.1.0";
+
+        nativeBuildInputs = with pkgs; [
           pkg-config
+          cmake
         ];
-        commonBuildInputs = with pkgs; [
-          openssl
-        ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
-          pkgs.apple-sdk_15
-          pkgs.libiconv
-        ];
+        buildInputs = with pkgs;
+          [
+            openssl
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.darwin.apple_sdk.frameworks.Security
+            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            pkgs.libiconv
+          ];
 
-        # harmony-node (native)
-        harmonyCommonArgs = {
-          src = harmonySrc;
-          pname = "harmony-node";
-          version = "0.1.0";
-          cargoExtraArgs = "-p harmony-node";
-          nativeBuildInputs = commonNativeBuildInputs;
-          buildInputs = commonBuildInputs;
-        };
+        cargoExtraArgs = "-p harmony-node";
+      };
 
-        harmonyDeps = craneLib.buildDepsOnly harmonyCommonArgs;
+      harmonyCargoArtifacts = craneLib.buildDepsOnly harmonyCommonArgs;
 
-        harmony-node = craneLib.buildPackage (harmonyCommonArgs // {
-          cargoArtifacts = harmonyDeps;
+      harmony-node = craneLib.buildPackage (harmonyCommonArgs
+        // {
+          cargoArtifacts = harmonyCargoArtifacts;
         });
 
-        # iroh-relay (native)
-        irohSrcCleaned = craneLib.cleanCargoSource iroh-src;
+      # iroh-relay from pinned upstream source
+      irohSrc = craneLib.cleanCargoSource iroh-src;
 
-        irohRelayCommonArgs = {
-          src = irohSrcCleaned;
-          pname = "iroh-relay";
-          version = "0.91.2";
-          cargoExtraArgs = "-p iroh-relay --features server";
-          nativeBuildInputs = commonNativeBuildInputs;
-          buildInputs = commonBuildInputs;
-        };
+      irohCommonArgs = {
+        src = irohSrc;
+        strictDeps = true;
+        doCheck = false;
+        pname = "iroh-relay";
+        version = "0.91.2";
 
-        irohRelayDeps = craneLib.buildDepsOnly irohRelayCommonArgs;
+        nativeBuildInputs = with pkgs; [
+          pkg-config
+          cmake
+        ];
+        buildInputs = with pkgs;
+          [
+            openssl
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.darwin.apple_sdk.frameworks.Security
+            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            pkgs.libiconv
+          ];
 
-        iroh-relay = craneLib.buildPackage (irohRelayCommonArgs // {
-          cargoArtifacts = irohRelayDeps;
-          cargoExtraArgs = "-p iroh-relay --features server --bin iroh-relay";
+        cargoExtraArgs = "-p iroh-relay --features server --bin iroh-relay";
+      };
+
+      irohCargoArtifacts = craneLib.buildDepsOnly irohCommonArgs;
+
+      # Native build — dynamically links glibc/openssl. For local
+      # development and testing only. For VM deployment, use the
+      # cross-compiled static musl packages below:
+      #   iroh-relay-x86_64-linux   (e2-micro GCP VMs)
+      #   iroh-relay-aarch64-linux  (ARM VMs)
+      iroh-relay = craneLib.buildPackage (irohCommonArgs
+        // {
+          cargoArtifacts = irohCargoArtifacts;
         });
 
-        # --- Cross-compilation helpers ---
-        # Only define cross targets when building on macOS or Linux
-        mkCrossPackages = crossSystem:
-          let
-            crossPkgs = import nixpkgs {
-              inherit system;
-              crossSystem = {
-                config = crossSystem;
-              };
-            };
-            crossCraneLib = crane.mkLib crossPkgs;
-            crossSrc = crossCraneLib.cleanCargoSource ./.;
-            crossIrohSrc = crossCraneLib.cleanCargoSource iroh-src;
+      # --- Cross-compilation helper ---
+      # Build a cross-compiled package given crossPkgs and a target triple.
+      mkCross = {
+        crossPkgs,
+        cargoTarget,
+      }: let
+        crossCraneLib = crane.mkLib crossPkgs;
 
-            crossOpenssl = crossPkgs.openssl;
+        # Common cross-compilation environment
+        crossEnv = {
+          strictDeps = true;
+          doCheck = false;
+          CARGO_BUILD_TARGET = cargoTarget;
 
-            crossNativeBuildInputs = [
-              crossPkgs.stdenv.cc
-              crossPkgs.buildPackages.pkg-config
-            ];
-            crossBuildInputs = [
-              crossOpenssl
-            ];
+          # Tell cargo/cc which linker and C compiler to use for the target
+          "CARGO_TARGET_${builtins.replaceStrings ["-"] ["_"] (pkgs.lib.toUpper cargoTarget)}_LINKER" =
+            "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
+          "CC_${builtins.replaceStrings ["-"] ["_"] cargoTarget}" =
+            "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
 
-            # Override .cargo/config.toml linker settings — Nix provides
-            # the correct cross-linker via crossPkgs.stdenv.cc. The env var
-            # CARGO_TARGET_<TRIPLE>_LINKER takes precedence over config.toml.
-            targetUpper = builtins.replaceStrings ["-"] ["_"]
-              (pkgs.lib.toUpper crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec);
-            # Override .cargo/config.toml's target-specific linker AND rustflags.
-            # config.toml sets linker=rust-lld and rustflags=["-C","link-self-contained=yes"]
-            # for aarch64-unknown-linux-musl, which bypasses the Nix cross-linker
-            # and discards our -C target-feature=+crt-static. Target-specific env
-            # vars take precedence over config.toml.
-            linkerEnv = {
-              "CARGO_TARGET_${targetUpper}_LINKER" = "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
-              "CARGO_TARGET_${targetUpper}_RUSTFLAGS" = "-C target-feature=+crt-static";
-            };
+          # Ensure fully static binaries for musl targets. harmony-node
+          # gets this from .cargo/config.toml, but iroh-relay uses its own
+          # source tree, so set it explicitly for both.
+          "CARGO_TARGET_${builtins.replaceStrings ["-"] ["_"] (pkgs.lib.toUpper cargoTarget)}_RUSTFLAGS" =
+            "-C link-self-contained=yes";
 
-            crossHarmonyCommonArgs = {
-              src = crossSrc;
-              pname = "harmony-node";
-              version = "0.1.0";
-              cargoExtraArgs = "-p harmony-node";
-              nativeBuildInputs = crossNativeBuildInputs;
-              buildInputs = crossBuildInputs;
-              CARGO_BUILD_TARGET = crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
-              HOST_CC = "${pkgs.stdenv.cc}/bin/cc";
-            } // linkerEnv;
+          nativeBuildInputs = with crossPkgs; [
+            buildPackages.pkg-config
+            buildPackages.cmake
+          ];
+          buildInputs = with crossPkgs; [
+            openssl
+          ];
 
-            crossHarmonyDeps = crossCraneLib.buildDepsOnly crossHarmonyCommonArgs;
+          # Tell pkg-config where to find cross-compiled libraries
+          PKG_CONFIG_PATH = "${crossPkgs.openssl.dev}/lib/pkgconfig";
+        };
 
-            crossHarmonyNode = crossCraneLib.buildPackage (crossHarmonyCommonArgs // {
-              cargoArtifacts = crossHarmonyDeps;
-            });
-
-            crossIrohRelayCommonArgs = {
-              src = crossIrohSrc;
-              pname = "iroh-relay";
-              version = "0.91.2";
-              cargoExtraArgs = "-p iroh-relay --features server";
-              nativeBuildInputs = crossNativeBuildInputs;
-              buildInputs = crossBuildInputs;
-              CARGO_BUILD_TARGET = crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
-              HOST_CC = "${pkgs.stdenv.cc}/bin/cc";
-            } // linkerEnv;
-
-            crossIrohRelayDeps = crossCraneLib.buildDepsOnly crossIrohRelayCommonArgs;
-
-            crossIrohRelay = crossCraneLib.buildPackage (crossIrohRelayCommonArgs // {
-              cargoArtifacts = crossIrohRelayDeps;
-              cargoExtraArgs = "-p iroh-relay --features server --bin iroh-relay";
-            });
-          in {
-            harmony-node = crossHarmonyNode;
-            iroh-relay = crossIrohRelay;
+        harmonyCrossArgs =
+          crossEnv
+          // {
+            src = harmonySrc;
+            pname = "harmony-node";
+            version = "0.1.0";
+            cargoExtraArgs = "-p harmony-node";
           };
 
-        # Cross-compiled packages for Linux targets
-        x86_64LinuxMusl = mkCrossPackages "x86_64-unknown-linux-musl";
-        aarch64LinuxMusl = mkCrossPackages "aarch64-unknown-linux-musl";
+        harmonyCrossArtifacts = crossCraneLib.buildDepsOnly harmonyCrossArgs;
 
+        harmonyCross = crossCraneLib.buildPackage (harmonyCrossArgs
+          // {
+            cargoArtifacts = harmonyCrossArtifacts;
+          });
+
+        irohCrossSrc = crossCraneLib.cleanCargoSource iroh-src;
+
+        irohCrossArgs =
+          crossEnv
+          // {
+            src = irohCrossSrc;
+            pname = "iroh-relay";
+            version = "0.91.2";
+            cargoExtraArgs = "-p iroh-relay --features server --bin iroh-relay";
+          };
+
+        irohCrossArtifacts = crossCraneLib.buildDepsOnly irohCrossArgs;
+
+        irohCross = crossCraneLib.buildPackage (irohCrossArgs
+          // {
+            cargoArtifacts = irohCrossArtifacts;
+          });
       in {
-        packages = {
-          # Native builds
-          inherit harmony-node iroh-relay;
-          default = harmony-node;
+        harmony-node = harmonyCross;
+        iroh-relay = irohCross;
+      };
 
-          # Cross-compiled Linux builds
-          harmony-node-x86_64-linux = x86_64LinuxMusl.harmony-node;
-          harmony-node-aarch64-linux = aarch64LinuxMusl.harmony-node;
-          iroh-relay-x86_64-linux = x86_64LinuxMusl.iroh-relay;
-          iroh-relay-aarch64-linux = aarch64LinuxMusl.iroh-relay;
-        };
+      # Cross-compiled variants (musl for static linking, avoids glibc cross issues)
+      crossX86_64 = mkCross {
+        crossPkgs = pkgs.pkgsCross.musl64;
+        cargoTarget = "x86_64-unknown-linux-musl";
+      };
 
-        # Checks: nix flake check exercises native builds
-        checks = {
-          inherit harmony-node iroh-relay;
-        };
-      }
-    );
+      crossAarch64 = mkCross {
+        crossPkgs = pkgs.pkgsCross.aarch64-multiplatform-musl;
+        cargoTarget = "aarch64-unknown-linux-musl";
+      };
+    in {
+      packages = {
+        inherit harmony-node iroh-relay;
+        default = harmony-node;
+
+        # Cross-compiled Linux binaries
+        harmony-node-x86_64-linux = crossX86_64.harmony-node;
+        harmony-node-aarch64-linux = crossAarch64.harmony-node;
+        iroh-relay-x86_64-linux = crossX86_64.iroh-relay;
+        iroh-relay-aarch64-linux = crossAarch64.iroh-relay;
+      };
+
+      # Checks: nix flake check exercises native builds
+      checks = {
+        inherit harmony-node iroh-relay;
+      };
+
+      devShells.default = craneLib.devShell {
+        packages = with pkgs; [
+          pkg-config
+          cmake
+          openssl
+        ];
+      };
+    });
 }

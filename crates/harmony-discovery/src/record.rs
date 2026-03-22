@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DiscoveryError;
 
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 
 /// Internal struct for the signable portion of an announce record.
 /// Everything except the signature.
@@ -26,6 +26,15 @@ pub enum RoutingHint {
     Reticulum { destination_hash: [u8; 16] },
     /// Zenoh locator (e.g. `"tcp/192.168.1.1:7447"`).
     Zenoh { locator: alloc::string::String },
+    /// iroh-net tunnel: NodeId + optional relay + optional direct addresses.
+    Tunnel {
+        /// BLAKE3(ML-DSA-65 public key) — the iroh NodeId seed.
+        node_id: [u8; 32],
+        /// Preferred relay server URL (e.g., "https://iroh.q8.fyi").
+        relay_url: Option<alloc::string::String>,
+        /// Known direct socket addresses (ephemeral, may be stale).
+        direct_addrs: alloc::vec::Vec<alloc::string::String>,
+    },
 }
 
 /// A signed announce record that advertises an identity's presence and
@@ -95,9 +104,13 @@ impl AnnounceRecord {
         if data.is_empty() {
             return Err(DiscoveryError::DeserializeError("empty data"));
         }
+        // Strict version check. V1 records would fail signature verification
+        // because signable_bytes() uses the compile-time FORMAT_VERSION (2),
+        // producing different payload bytes than the v1 signer used. Rejecting
+        // v1 upfront gives a clear error instead of a cryptic signature failure.
         if data[0] != FORMAT_VERSION {
             return Err(DiscoveryError::DeserializeError(
-                "unsupported format version",
+                "unsupported announce format version",
             ));
         }
         postcard::from_bytes(&data[1..])
@@ -210,13 +223,8 @@ mod tests {
         let hint = RoutingHint::Reticulum {
             destination_hash: [0xDE; 16],
         };
-        let mut builder = AnnounceBuilder::new(
-            test_identity(),
-            test_public_key(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
         builder.add_routing_hint(hint.clone());
         let record = builder.build(alloc::vec![0x51, 0x67]);
 
@@ -231,13 +239,8 @@ mod tests {
 
     #[test]
     fn signable_payload_is_deterministic() {
-        let builder = AnnounceBuilder::new(
-            test_identity(),
-            test_public_key(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let builder =
+            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
         let p1 = builder.signable_payload();
         let p2 = builder.signable_payload();
         assert_eq!(p1, p2);
@@ -257,13 +260,8 @@ mod tests {
 
     #[test]
     fn multiple_routing_hints() {
-        let mut builder = AnnounceBuilder::new(
-            test_identity(),
-            test_public_key(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
         builder.add_routing_hint(RoutingHint::Reticulum {
             destination_hash: [0xAA; 16],
         });
@@ -276,13 +274,8 @@ mod tests {
 
     #[test]
     fn serde_round_trip() {
-        let mut builder = AnnounceBuilder::new(
-            test_identity(),
-            test_public_key(),
-            1000,
-            2000,
-            [0x01; 16],
-        );
+        let mut builder =
+            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
         builder.add_routing_hint(RoutingHint::Reticulum {
             destination_hash: [0xBB; 16],
         });
@@ -309,8 +302,44 @@ mod tests {
         assert!(matches!(
             AnnounceRecord::deserialize(&[0xFF]),
             Err(DiscoveryError::DeserializeError(
-                "unsupported format version"
+                "unsupported announce format version"
             ))
         ));
+    }
+
+    #[test]
+    fn tunnel_routing_hint_roundtrip() {
+        let hint = RoutingHint::Tunnel {
+            node_id: [0xAA; 32],
+            relay_url: Some("https://iroh.q8.fyi".into()),
+            direct_addrs: vec!["192.168.1.10:4242".into()],
+        };
+        let bytes = postcard::to_allocvec(&hint).unwrap();
+        let decoded: RoutingHint = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(hint, decoded);
+    }
+
+    #[test]
+    fn announce_record_with_tunnel_hint_roundtrip() {
+        let hint = RoutingHint::Tunnel {
+            node_id: [0xBB; 32],
+            relay_url: Some("https://relay.example.com".into()),
+            direct_addrs: vec!["10.0.0.1:7777".into(), "203.0.113.5:7777".into()],
+        };
+        let mut builder =
+            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x42; 16]);
+        builder.add_routing_hint(hint.clone());
+        let record = builder.build(alloc::vec![0xCA, 0xFE]);
+
+        let bytes = record.serialize().unwrap();
+        let restored = AnnounceRecord::deserialize(&bytes).unwrap();
+
+        assert_eq!(restored.routing_hints.len(), 1);
+        assert_eq!(restored.routing_hints[0], hint);
+        assert_eq!(restored.identity_ref, record.identity_ref);
+        assert_eq!(restored.published_at, record.published_at);
+        assert_eq!(restored.expires_at, record.expires_at);
+        assert_eq!(restored.nonce, record.nonce);
+        assert_eq!(restored.signature, record.signature);
     }
 }

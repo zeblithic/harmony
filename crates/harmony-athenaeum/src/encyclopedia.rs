@@ -42,11 +42,14 @@ struct PageInfo {
 impl Encyclopedia {
     /// Build an Encyclopedia from a collection of books.
     ///
-    /// Each book is identified by its CID (content hash) and raw data.
-    /// All pages across all books are deduplicated by content hash and
-    /// assigned unique 32-bit addresses via power-of-choice. When the
-    /// address space fills up, the system recursively partitions by
-    /// content-hash bits.
+    /// Each entry is `(cid, data)` where:
+    /// - `cid` is the full 32-byte ContentId (stored as-is in `Book.cid`)
+    /// - `data` is the raw book content
+    ///
+    /// **CID vs page hash:** Internally, pages are deduplicated and partitioned
+    /// by SHA-256 of page data (full 32 bytes, uniformly distributed), NOT by
+    /// the CID. The CID is stored opaquely in `Book.cid`. For external routing
+    /// lookups, use `route_hash()` with the 28-byte hash portion of the CID.
     pub fn build(entries: &[([u8; 32], &[u8])]) -> Result<Self, BookError> {
         for &(_, data) in entries {
             if data.len() > BOOK_MAX_SIZE {
@@ -289,6 +292,35 @@ impl Encyclopedia {
         path
     }
 
+    /// Determine which partition a CID's hash maps to.
+    ///
+    /// `hash` is the 28-byte hash portion of a ContentId (bytes 4-31).
+    /// Routes directly on hash bits starting at bit 0, so all routing
+    /// depths produce meaningful decisions from the first bit.
+    ///
+    /// **Note:** The return type is `u32`, so routing is capped at 32
+    /// decisions regardless of the `depth` argument. Depths > 32 are
+    /// silently treated as 32.
+    ///
+    /// Unlike `route()` (which operates on full 32-byte page content hashes
+    /// and skips `PARTITION_START_BIT` bits for PageAddr), this method
+    /// extracts bits starting at bit 0 of the hash.
+    ///
+    /// For callers with a full 32-byte CID:
+    /// `Encyclopedia::route_hash(&cid[4..].try_into().unwrap(), depth)`
+    pub fn route_hash(hash: &[u8; 28], depth: u8) -> u32 {
+        let mut path = 0u32;
+        for d in 0..depth.min(32) {
+            let byte_idx = (d / 8) as usize;
+            let bit_offset = 7 - (d % 8);
+            // byte_idx = d/8 ≤ 31/8 = 3, always < 28.
+            if (hash[byte_idx] >> bit_offset) & 1 == 1 {
+                path |= 1 << d;
+            }
+        }
+        path
+    }
+
     /// Serialize the Encyclopedia root metadata.
     ///
     /// Format: magic "ENCY" (4) + version u8 (1) + total_books u32 LE (4)
@@ -450,6 +482,34 @@ mod tests {
         let path = Encyclopedia::route(&hash, 100);
         // path is capped at 32 bits — should not panic
         let _ = path;
+    }
+
+    #[test]
+    fn route_hash_first_bit() {
+        // route_hash extracts bits directly from the 28-byte hash.
+        // Bit 0 = MSB of hash[0]. No dead padding bits.
+        let mut hash = [0u8; 28];
+        hash[0] = 0b1000_0000; // bit 0 = 1
+        let path = Encyclopedia::route_hash(&hash, 1);
+        assert_eq!(path & 1, 1); // depth 0 routing decision should be 1
+    }
+
+    #[test]
+    fn route_hash_multiple_bits() {
+        let mut hash = [0u8; 28];
+        hash[0] = 0b1010_0000; // bits 0=1, 1=0, 2=1
+        hash[1] = 0xFF;        // bits 8-15 all 1
+        let path = Encyclopedia::route_hash(&hash, 16);
+        // bit 0 = 1, bit 1 = 0, bit 2 = 1, bits 3-7 = 0
+        assert_eq!(path & 0b111, 0b101); // first 3 bits: 1,0,1
+        // bits 8-15 all set
+        assert_eq!((path >> 8) & 0xFF, 0xFF);
+    }
+
+    #[test]
+    fn route_hash_zero_depth_returns_zero() {
+        let hash = [0xFF; 28]; // all bits set
+        assert_eq!(Encyclopedia::route_hash(&hash, 0), 0);
     }
 
     #[test]

@@ -3,17 +3,18 @@
 //! `NodeRuntime` is `!Send`; it lives entirely on the select loop task.
 //! Zenoh objects that need spawning are cloned (Session is internally Arc'd).
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use harmony_content::book::MemoryBookStore;
 use harmony_identity::PqPrivateIdentity;
-use zeroize::Zeroize;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
+use zeroize::Zeroize;
 
 use crate::discovery::{self, PeerTable};
 use crate::runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
@@ -28,23 +29,96 @@ pub struct TunnelConfig {
     pub local_identity: Arc<PqPrivateIdentity>,
 }
 
+/// Tracks tunnel peers from the config file for persistent reconnection.
+/// Fields are populated now but actual reconnection is deferred to Bead harmony-h6k.
+#[allow(dead_code)]
+struct ConfigTunnelPeers {
+    peers: Vec<ConfigTunnelPeer>,
+}
+
+#[allow(dead_code)]
+struct ConfigTunnelPeer {
+    node_id: String,
+    name: Option<String>,
+    interface_name: String,
+    next_retry: Option<tokio::time::Instant>,
+    backoff: std::time::Duration,
+    connected: bool,
+}
+
+#[allow(dead_code)]
+const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+#[allow(dead_code)]
+const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[allow(dead_code)]
+impl ConfigTunnelPeers {
+    fn new(entries: Vec<crate::config::TunnelEntry>) -> Self {
+        Self {
+            peers: entries
+                .into_iter()
+                .map(|entry| ConfigTunnelPeer {
+                    interface_name: entry.name.clone()
+                        .map(|n| {
+                            // Clamp to IFNAMSIZ (15 bytes). Find the last valid
+                            // char boundary at or before byte 15 to avoid panic
+                            // on multi-byte UTF-8.
+                            if n.len() <= 15 {
+                                n
+                            } else {
+                                let mut end = 15;
+                                while end > 0 && !n.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                n[..end].to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            // "tc-" + 8 hex chars = 11 chars, within IFNAMSIZ (15)
+                            format!("tc-{}", &entry.node_id[..8.min(entry.node_id.len())])
+                        }),
+                    node_id: entry.node_id,
+                    name: entry.name,
+                    next_retry: Some(tokio::time::Instant::now()), // connect immediately
+                    backoff: INITIAL_BACKOFF,
+                    connected: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn mark_disconnected(&mut self, interface_name: &str) {
+        if let Some(peer) = self.peers.iter_mut().find(|p| p.interface_name == interface_name) {
+            peer.connected = false;
+            // Schedule retry at current backoff, THEN double for next time.
+            let retry_delay = peer.backoff;
+            peer.next_retry = Some(tokio::time::Instant::now() + retry_delay);
+            peer.backoff = (peer.backoff * 2).min(MAX_BACKOFF);
+            tracing::info!(
+                %interface_name,
+                retry_in_secs = retry_delay.as_secs(),
+                "config tunnel disconnected — scheduling reconnect"
+            );
+        }
+    }
+
+    fn mark_connected(&mut self, interface_name: &str) {
+        if let Some(peer) = self.peers.iter_mut().find(|p| p.interface_name == interface_name) {
+            peer.connected = true;
+            peer.backoff = INITIAL_BACKOFF;
+            peer.next_retry = None;
+        }
+    }
+}
+
 /// Internal bridge events from spawned Zenoh tasks to the select loop.
 enum ZenohEvent {
     /// Inbound Zenoh query (non-compute).
-    Query {
-        key_expr: String,
-        payload: Vec<u8>,
-    },
+    Query { key_expr: String, payload: Vec<u8> },
     /// Inbound Zenoh query on a compute key expression.
-    ComputeQuery {
-        key_expr: String,
-        payload: Vec<u8>,
-    },
+    ComputeQuery { key_expr: String, payload: Vec<u8> },
     /// Inbound Zenoh subscription sample.
-    Subscription {
-        key_expr: String,
-        payload: Vec<u8>,
-    },
+    Subscription { key_expr: String, payload: Vec<u8> },
     /// Response to a FetchContent / FetchModule get() call.
     FetchResponse {
         cid: [u8; 32],
@@ -52,6 +126,40 @@ enum ZenohEvent {
         result: Result<Vec<u8>, String>,
     },
 }
+
+/// A tunnel dial request waiting for its scheduled fire time.
+///
+/// Introduces a random 500-4000ms delay between the PeerManager emitting
+/// `InitiateTunnel` and the event loop actually dialing the relay, breaking
+/// the timing correlation between Zenoh discovery queries and QUIC
+/// connection attempts.
+#[derive(Debug)]
+struct DeferredDial {
+    fire_at_ms: u64,
+    identity_hash: [u8; 16],
+    node_id: [u8; 32],
+    relay_url: Option<String>,
+}
+
+impl Ord for DeferredDial {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.fire_at_ms.cmp(&other.fire_at_ms)
+    }
+}
+
+impl PartialOrd for DeferredDial {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for DeferredDial {
+    fn eq(&self, other: &Self) -> bool {
+        self.fire_at_ms == other.fire_at_ms
+    }
+}
+
+impl Eq for DeferredDial {}
 
 /// Run the async event loop.
 ///
@@ -62,6 +170,9 @@ enum ZenohEvent {
 /// - `mdns_addr`: optional 16-byte Reticulum address for mDNS discovery (None = disabled).
 /// - `mdns_stale_timeout`: duration after which silent mDNS peers are evicted.
 /// - `tunnel_config`: optional iroh tunnel configuration (enables tunnel accept/connect).
+/// - `bootstrap_peers`: static peers from the config `[peers]` section; added to PeerTable
+///   at startup so they receive unicast traffic even when not reachable via mDNS.
+/// - `tunnel_entries`: config-sourced tunnel peers to track for reconnection.
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -69,6 +180,8 @@ pub async fn run(
     mdns_addr: Option<[u8; 16]>,
     mdns_stale_timeout: Duration,
     tunnel_config: Option<TunnelConfig>,
+    bootstrap_peers: Vec<SocketAddr>,
+    tunnel_entries: Vec<crate::config::TunnelEntry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -78,10 +191,7 @@ pub async fn run(
         .expect("static broadcast addr");
 
     // ── mDNS peer discovery (optional) ──────────────────────────────────────
-    let mut peer_table = PeerTable::new(
-        mdns_addr.unwrap_or([0; 16]),
-        mdns_stale_timeout,
-    );
+    let mut peer_table = PeerTable::new(mdns_addr.unwrap_or([0; 16]), mdns_stale_timeout);
     let mut mdns_state = match mdns_addr {
         Some(addr) => match discovery::start_mdns(listen_addr.port(), &addr) {
             Ok((daemon, rx)) => {
@@ -98,6 +208,15 @@ pub async fn run(
             None
         }
     };
+
+    // ── Bootstrap peers from config file ────────────────────────────────────
+    // Add each as a pinned peer — exempt from stale eviction so cross-subnet
+    // peers that never send us traffic are retained indefinitely. Each gets a
+    // unique placeholder Reticulum address derived from its socket address.
+    for peer_addr in &bootstrap_peers {
+        tracing::info!(peer = %peer_addr, "adding pinned bootstrap peer");
+        peer_table.add_pinned_peer(*peer_addr);
+    }
 
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
@@ -138,25 +257,48 @@ pub async fn run(
             .secret_key(secret_key);
 
         if let Some(ref url) = config.relay_url {
-            let relay_url: iroh::RelayUrl = url
-                .parse()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("invalid relay URL '{url}': {e}").into()
-                })?;
+            let relay_url: iroh::RelayUrl =
+                url.parse()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("invalid relay URL '{url}': {e}").into()
+                    })?;
             let relay_map = iroh::RelayMap::from_iter([relay_url]);
             builder = builder.relay_mode(iroh::RelayMode::Custom(relay_map));
         } else {
             builder = builder.relay_mode(iroh::RelayMode::Disabled);
         }
 
-        let ep = builder.bind().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("iroh endpoint bind failed: {e}").into()
-        })?;
+        let ep = builder
+            .bind()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("iroh endpoint bind failed: {e}").into()
+            })?;
         tracing::info!(node_id = %ep.node_id(), "iroh tunnel endpoint ready");
         Some(ep)
     } else {
         None
     };
+
+    // ── Push local tunnel info into the runtime ──────────────────────────────
+    if let Some(ref ep) = iroh_endpoint {
+        let node_id_bytes = *ep.node_id().as_bytes();
+        let relay_url = tunnel_config.as_ref().and_then(|c| c.relay_url.clone());
+        runtime.push_event(RuntimeEvent::LocalTunnelInfo {
+            node_id: node_id_bytes,
+            relay_url,
+        });
+    }
+
+    // ConfigTunnelPeers tracks config-sourced tunnels and drives backoff reconnection.
+    // Actual outbound connection initiation is deferred to Bead harmony-h6k.
+    #[allow(unused_variables, unused_mut)]
+    let mut config_tunnels = ConfigTunnelPeers::new(tunnel_entries);
+
+    // ── Deferred dial queue (stochastic delay for tunnel privacy) ───────────
+    // BinaryHeap<Reverse<...>> is a min-heap by fire_at_ms, ensuring earlier
+    // fire times are always drained first regardless of insertion order.
+    let mut deferred_dials: BinaryHeap<Reverse<DeferredDial>> = BinaryHeap::new();
 
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
@@ -168,6 +310,7 @@ pub async fn run(
             &broadcast_addr,
             None,
             &tunnel_senders,
+            &mut deferred_dials,
         )
         .await;
     }
@@ -194,10 +337,11 @@ pub async fn run(
     #[cfg(unix)]
     let mut sigterm = {
         use tokio::signal::unix::{signal, SignalKind};
-        signal(SignalKind::terminate())
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        signal(SignalKind::terminate()).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("failed to register SIGTERM handler: {e}").into()
-            })?
+            },
+        )?
     };
 
     let shutdown = async {
@@ -561,7 +705,37 @@ pub async fn run(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
-                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, Some(&peer_table), &tunnel_senders).await;
+                dispatch_action(
+                    action,
+                    &session,
+                    &zenoh_tx,
+                    &udp,
+                    &broadcast_addr,
+                    Some(&peer_table),
+                    &tunnel_senders,
+                    &mut deferred_dials,
+                )
+                .await;
+            }
+
+            // Drain deferred dials that have reached their fire time.
+            // Because the heap is ordered by fire_at_ms (min-heap via Reverse),
+            // we stop as soon as the earliest entry hasn't fired yet.
+            let current_ms = now_ms();
+            while let Some(Reverse(front)) = deferred_dials.peek() {
+                if front.fire_at_ms <= current_ms {
+                    let Reverse(dial) = deferred_dials.pop().unwrap();
+                    tracing::info!(
+                        identity = %hex::encode(dial.identity_hash),
+                        node_id = %hex::encode(&dial.node_id[..8]),
+                        relay = ?dial.relay_url,
+                        "InitiateTunnel fired (stub — iroh-net not yet wired)"
+                    );
+                    // TODO(harmony-h6k): execute actual iroh Endpoint.connect()
+                    // using dial.node_id and dial.relay_url here.
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -583,6 +757,7 @@ pub async fn run(
 }
 
 /// Dispatch a single `RuntimeAction` to the appropriate I/O mechanism.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_action(
     action: RuntimeAction,
     session: &zenoh::Session,
@@ -591,6 +766,7 @@ async fn dispatch_action(
     broadcast_addr: &SocketAddr,
     peer_table: Option<&PeerTable>,
     tunnel_senders: &HashMap<String, TunnelSender>,
+    deferred_dials: &mut BinaryHeap<Reverse<DeferredDial>>,
 ) {
     match action {
         // ── Tier 1: Send on interface (UDP broadcast + unicast, or tunnel) ────
@@ -601,21 +777,29 @@ async fn dispatch_action(
         RuntimeAction::SendOnInterface {
             ref interface_name,
             ref raw,
+            weight,
         } => {
-            if interface_name.starts_with("tunnel-") {
-                if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {
-                    if sender.try_send_reticulum(raw.clone()).is_err() {
-                        tracing::warn!(%interface_name, "tunnel send queue full — dropping packet");
+            let should_send = match weight {
+                None => true,                          // directed: always send
+                Some(w) if w >= 1.0 => true,           // best interface: always send
+                Some(w) => rand::random::<f32>() < w,  // probabilistic
+            };
+            if should_send {
+                if interface_name.starts_with("tunnel-") {
+                    if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {
+                        if sender.try_send_reticulum(raw.clone()).is_err() {
+                            tracing::warn!(%interface_name, "tunnel send queue full — dropping packet");
+                        }
                     }
-                }
-            } else {
-                if let Err(e) = udp.send_to(raw, broadcast_addr).await {
-                    tracing::warn!(err = %e, "UDP broadcast send error");
-                }
-                if let Some(peers) = peer_table {
-                    for addr in peers.peer_addrs() {
-                        if let Err(e) = udp.send_to(raw, addr).await {
-                            tracing::warn!(peer = %addr, err = %e, "UDP unicast send error");
+                } else {
+                    if let Err(e) = udp.send_to(raw, broadcast_addr).await {
+                        tracing::warn!(err = %e, "UDP broadcast send error");
+                    }
+                    if let Some(peers) = peer_table {
+                        for addr in peers.peer_addrs() {
+                            if let Err(e) = udp.send_to(raw, addr).await {
+                                tracing::warn!(peer = %addr, err = %e, "UDP unicast send error");
+                            }
                         }
                     }
                 }
@@ -649,7 +833,11 @@ async fn dispatch_action(
             tokio::spawn(async move {
                 let result = fetch_via_zenoh(&session, &key_expr).await;
                 let _ = tx
-                    .send(ZenohEvent::FetchResponse { cid, is_module: false, result })
+                    .send(ZenohEvent::FetchResponse {
+                        cid,
+                        is_module: false,
+                        result,
+                    })
                     .await;
             });
         }
@@ -666,7 +854,11 @@ async fn dispatch_action(
             tokio::spawn(async move {
                 let result = fetch_via_zenoh(&session, &key_expr).await;
                 let _ = tx
-                    .send(ZenohEvent::FetchResponse { cid, is_module: true, result })
+                    .send(ZenohEvent::FetchResponse {
+                        cid,
+                        is_module: true,
+                        result,
+                    })
                     .await;
             });
         }
@@ -688,9 +880,15 @@ async fn dispatch_action(
                                 .map(|p| p.to_bytes().to_vec())
                                 .unwrap_or_default();
                             let ev = if is_compute {
-                                ZenohEvent::ComputeQuery { key_expr: qkey, payload }
+                                ZenohEvent::ComputeQuery {
+                                    key_expr: qkey,
+                                    payload,
+                                }
                             } else {
-                                ZenohEvent::Query { key_expr: qkey, payload }
+                                ZenohEvent::Query {
+                                    key_expr: qkey,
+                                    payload,
+                                }
                             };
                             if tx.send(ev).await.is_err() {
                                 break;
@@ -714,7 +912,10 @@ async fn dispatch_action(
                             let skey = sample.key_expr().to_string();
                             let payload = sample.payload().to_bytes().to_vec();
                             if tx
-                                .send(ZenohEvent::Subscription { key_expr: skey, payload })
+                                .send(ZenohEvent::Subscription {
+                                    key_expr: skey,
+                                    payload,
+                                })
                                 .await
                                 .is_err()
                             {
@@ -730,18 +931,26 @@ async fn dispatch_action(
         }
 
         // ── Peer lifecycle: Tunnel initiation ─────────────────────────────────
-        // Stub — actual iroh-net Endpoint.connect() wiring deferred until
-        // tunnel infrastructure (tunnel_task.rs, tunnel_bridge.rs) is integrated.
+        // Deferred by a random 500-4000ms delay for privacy — breaks timing
+        // correlation between Zenoh discovery queries and QUIC connection attempts.
+        // The actual dial (stub) fires when the deferred queue drains.
         RuntimeAction::InitiateTunnel {
             identity_hash,
             node_id,
             relay_url,
         } => {
-            tracing::info!(
+            let delay_ms = 500 + (rand::random::<u64>() % 3500);
+            let fire_at = tunnel_task::millis_since_start() + delay_ms;
+            deferred_dials.push(Reverse(DeferredDial {
+                fire_at_ms: fire_at,
+                identity_hash,
+                node_id,
+                relay_url,
+            }));
+            tracing::debug!(
                 identity = %hex::encode(identity_hash),
-                node_id = %hex::encode(&node_id[..8]),
-                relay = ?relay_url,
-                "InitiateTunnel requested (stub — iroh-net not yet wired)"
+                delay_ms,
+                "tunnel dial deferred for privacy"
             );
         }
 
@@ -772,10 +981,7 @@ async fn dispatch_action(
 /// The entire fetch (including all reply iterations) is bounded by a 30-second
 /// wall-clock deadline. This prevents spawned tasks from accumulating
 /// indefinitely — even if a peer sends repeated error replies.
-async fn fetch_via_zenoh(
-    session: &zenoh::Session,
-    key_expr: &str,
-) -> Result<Vec<u8>, String> {
+async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec<u8>, String> {
     let replies = session
         .get(key_expr)
         .await
@@ -797,5 +1003,9 @@ async fn fetch_via_zenoh(
         Err(format!("no successful reply for '{key_expr}'"))
     })
     .await
-    .unwrap_or_else(|_| Err(format!("no successful reply for '{key_expr}' (timed out after 30s)")))
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "no successful reply for '{key_expr}' (timed out after 30s)"
+        ))
+    })
 }

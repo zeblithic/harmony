@@ -49,7 +49,11 @@ pub enum BookError {
 /// `[Sha256Msb, Sha256Lsb, Sha224Msb, Sha224Lsb]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Book {
-    /// 256-bit content identifier (CID).
+    /// Full 32-byte ContentId, stored as opaque bytes.
+    ///
+    /// The CID format is `[4-byte header][28-byte hash]` (see harmony-content).
+    /// The athenaeum does not parse the header — it stores the CID as-is and
+    /// uses SHA-256 of page data (not the CID hash) for internal routing.
     pub cid: [u8; 32],
     /// Page addresses — up to 256 entries, each with all 4 algorithm variants.
     pub pages: Vec<[PageAddr; ALGO_COUNT]>,

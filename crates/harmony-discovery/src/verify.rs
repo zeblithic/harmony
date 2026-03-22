@@ -180,17 +180,11 @@ mod tests {
                 let (sign_pk, sign_sk) = harmony_crypto::ml_dsa::generate(&mut OsRng);
                 let (enc_pk, _) = harmony_crypto::ml_kem::generate(&mut OsRng);
 
-                let pq_id =
-                    harmony_identity::PqIdentity::from_public_keys(enc_pk, sign_pk.clone());
+                let pq_id = harmony_identity::PqIdentity::from_public_keys(enc_pk, sign_pk.clone());
                 let identity_ref = IdentityRef::from(&pq_id);
 
-                let mut builder = AnnounceBuilder::new(
-                    identity_ref,
-                    sign_pk.as_bytes(),
-                    1000,
-                    2000,
-                    [0x05; 16],
-                );
+                let mut builder =
+                    AnnounceBuilder::new(identity_ref, sign_pk.as_bytes(), 1000, 2000, [0x05; 16]);
                 builder.add_routing_hint(RoutingHint::Reticulum {
                     destination_hash: [0xDD; 16],
                 });

@@ -11,6 +11,7 @@ use rand_core::CryptoRngCore;
 
 use crate::announce::{build_announce, validate_announce, ValidatedAnnounce};
 use crate::context::PacketContext;
+use crate::cooperation::CooperationTable;
 use crate::destination::DestinationName;
 use crate::ifac::IfacAuthenticator;
 use crate::interface::InterfaceMode;
@@ -35,6 +36,11 @@ const LOCAL_REBROADCASTS_MAX: u8 = 2;
 /// Announce rate table entries unseen for this many seconds are evicted.
 /// Matches the shortest path expiry (Roaming = 6 hours).
 const RATE_TABLE_EXPIRY: u64 = 21_600;
+
+/// Announce echo timeout in seconds. If we don't hear our own announce
+/// echo back within this window, record a negative observation.
+/// 90 seconds ≈ 3× a typical 30-second announce interval.
+const ECHO_TIMEOUT: u64 = 90;
 
 /// Reverse table entries older than this are expired (8 minutes).
 /// Matches Python `Transport.REVERSE_TIMEOUT`.
@@ -123,10 +129,11 @@ struct ReverseTableEntry {
     /// Interface the data packet was received on (proof goes back here).
     received_interface: Arc<str>,
     /// Interface the data packet was forwarded to.
-    #[allow(dead_code)] // Retained for diagnostics; used by link table routing (b83.6)
     outbound_interface: Arc<str>,
     /// Monotonic timestamp when this entry was created.
     timestamp: u64,
+    /// Whether a proof was received for this relayed packet.
+    proof_received: bool,
 }
 
 /// A link table entry tracking a link request passing through this transport node.
@@ -244,6 +251,10 @@ pub enum NodeAction {
     SendOnInterface {
         interface_name: Arc<str>,
         raw: Vec<u8>,
+        /// Cooperation weight for probabilistic broadcast selection.
+        /// `None` = directed send (always deliver).
+        /// `Some(score)` = broadcast send (caller may drop if random > score).
+        weight: Option<f32>,
     },
     /// Transport node rebroadcast an announce on interfaces (excluding source).
     AnnounceRebroadcast {
@@ -304,6 +315,10 @@ pub struct Node {
     announce_rate_table: HashMap<DestinationHash, AnnounceRateEntry>,
     reverse_table: HashMap<DestinationHash, ReverseTableEntry>,
     link_table: HashMap<DestinationHash, LinkTableEntry>,
+    cooperation: CooperationTable,
+    /// Tracks announce echoes: (interface, dest_hash) -> tick when announce was sent.
+    /// Used to detect whether neighbors forwarded our announces.
+    pending_echoes: HashMap<(Arc<str>, DestinationHash), u64>,
 }
 
 impl Node {
@@ -320,6 +335,8 @@ impl Node {
             announce_rate_table: HashMap::new(),
             reverse_table: HashMap::new(),
             link_table: HashMap::new(),
+            cooperation: CooperationTable::default(),
+            pending_echoes: HashMap::new(),
         }
     }
 
@@ -336,6 +353,8 @@ impl Node {
             announce_rate_table: HashMap::new(),
             reverse_table: HashMap::new(),
             link_table: HashMap::new(),
+            cooperation: CooperationTable::default(),
+            pending_echoes: HashMap::new(),
         }
     }
 
@@ -377,6 +396,16 @@ impl Node {
         self.link_table.len()
     }
 
+    /// Number of pending announce echo entries.
+    pub fn pending_echoes_len(&self) -> usize {
+        self.pending_echoes.len()
+    }
+
+    /// Read-only access to the cooperation table for diagnostics and testing.
+    pub fn cooperation(&self) -> &CooperationTable {
+        &self.cooperation
+    }
+
     /// Register an interface by name and configuration.
     ///
     /// Takes ownership of the optional IFAC authenticator.
@@ -386,8 +415,10 @@ impl Node {
         mode: InterfaceMode,
         ifac: Option<IfacAuthenticator>,
     ) {
+        let arc_name: Arc<str> = Arc::from(name);
+        self.cooperation.register_interface(Arc::clone(&arc_name));
         self.interfaces.insert(
-            Arc::from(name),
+            arc_name,
             InterfaceConfig {
                 mode,
                 ifac,
@@ -398,6 +429,7 @@ impl Node {
 
     /// Unregister an interface. Returns `true` if it was registered.
     pub fn unregister_interface(&mut self, name: &str) -> bool {
+        self.cooperation.remove_interface(name);
         self.interfaces.remove(name).is_some()
     }
 
@@ -454,8 +486,11 @@ impl Node {
     /// Two-phase design: `handle_event(TimerTick)` emits `AnnounceNeeded`, then
     /// the caller invokes this with their own RNG. This keeps the scheduler
     /// deterministic and the node fully sans-I/O.
+    ///
+    /// Records pending echo entries for each interface so that echoed announces
+    /// from neighbors can be detected and credited via the cooperation table.
     pub fn announce(
-        &self,
+        &mut self,
         dest_hash: &DestinationHash,
         rng: &mut impl CryptoRngCore,
         now: u64,
@@ -493,7 +528,39 @@ impl Node {
         };
 
         // Broadcast on all interfaces — separate borrow of self.interfaces.
-        self.broadcast_on_all_interfaces(&raw)
+        let actions = self.broadcast_on_all_interfaces(&raw);
+
+        // Record pending echo entries for ALL interfaces. These serve as
+        // once-per-cycle credit tokens: when an echo arrives on an interface,
+        // we remove its entry and credit it. Duplicate echoes find no entry
+        // and get no credit, preventing inflation.
+        //
+        // Timeout negatives only fire for guaranteed-delivery interfaces
+        // (weight >= 1.0). Non-guaranteed interfaces may have been probabilistically
+        // dropped by the event loop, so a missing echo isn't evidence of a bad
+        // neighbor — it's evidence we didn't send. We mark non-guaranteed entries
+        // with u64::MAX as a sentinel to skip them during timeout processing.
+        let dest = *dest_hash;
+        for action in &actions {
+            if let NodeAction::SendOnInterface {
+                interface_name,
+                weight,
+                ..
+            } = action
+            {
+                let guaranteed = match weight {
+                    None => true,
+                    Some(w) => *w >= 1.0,
+                };
+                // Guaranteed interfaces get real timestamps (timeout-eligible).
+                // Non-guaranteed get u64::MAX sentinel (credit-only, never times out).
+                let ts = if guaranteed { now } else { u64::MAX };
+                self.pending_echoes
+                    .insert((Arc::clone(interface_name), dest), ts);
+            }
+        }
+
+        actions
     }
 
     /// Route a pre-built raw packet to the appropriate interface(s).
@@ -551,13 +618,28 @@ impl Node {
                     actions.extend(self.process_announce_table(now));
                     self.expire_rate_table(now);
 
-                    // Expire stale reverse table entries
-                    let before = self.reverse_table.len();
+                    // Expire stale reverse table entries and emit negative
+                    // cooperation signals for entries that never received a proof.
+                    let expired_entries: Vec<_> = self
+                        .reverse_table
+                        .iter()
+                        .filter(|(_, e)| now.saturating_sub(e.timestamp) >= REVERSE_TIMEOUT)
+                        .map(|(hash, e)| (*hash, e.outbound_interface.clone(), e.proof_received))
+                        .collect();
+                    for (_hash, outbound, proof_received) in &expired_entries {
+                        if !proof_received {
+                            self.cooperation.observe_proof_timeout(outbound, now);
+                        }
+                    }
+                    let expired_count = expired_entries.len();
+                    let expired_hashes: HashSet<DestinationHash> =
+                        expired_entries.iter().map(|(h, _, _)| *h).collect();
                     self.reverse_table
-                        .retain(|_, entry| now.saturating_sub(entry.timestamp) < REVERSE_TIMEOUT);
-                    let expired = before - self.reverse_table.len();
-                    if expired > 0 {
-                        actions.push(NodeAction::ReverseTableExpired { count: expired });
+                        .retain(|hash, _| !expired_hashes.contains(hash));
+                    if expired_count > 0 {
+                        actions.push(NodeAction::ReverseTableExpired {
+                            count: expired_count,
+                        });
                     }
 
                     // Expire stale link table entries
@@ -578,6 +660,46 @@ impl Node {
                         });
                     }
                 }
+
+                // Expire pending echo entries that timed out without an echo.
+                // Only fire negative observations for guaranteed-delivery entries
+                // (ts != u64::MAX). Sentinel entries (ts == u64::MAX) are credit-only tokens for
+                // non-guaranteed interfaces — remove them silently since a missing
+                // echo may be because we didn't actually send.
+                // Collect expired entries. Guaranteed interfaces (real timestamps)
+                // get negative observations. Non-guaranteed (u64::MAX sentinel)
+                // are cleaned up without penalty — they never actually sent.
+                let expired_echoes: Vec<(Arc<str>, DestinationHash, bool)> = self
+                    .pending_echoes
+                    .iter()
+                    .filter(|(_, &ts)| ts != u64::MAX && now.saturating_sub(ts) > ECHO_TIMEOUT)
+                    .map(|(key, _)| (key.0.clone(), key.1, true))
+                    .collect();
+                for (iface, dest, _) in &expired_echoes {
+                    self.cooperation.observe_announce_timeout(iface, now);
+                    self.pending_echoes.remove(&(Arc::clone(iface), *dest));
+                }
+                // Also clean up stale sentinel entries (non-guaranteed that were
+                // never credited). These have ts=u64::MAX and can't timeout, so
+                // remove any whose dest_hash has no remaining guaranteed entries.
+                let stale_sentinels: Vec<(Arc<str>, DestinationHash)> = self
+                    .pending_echoes
+                    .iter()
+                    .filter(|(_, &ts)| ts == u64::MAX)
+                    .filter(|((_, dh), _)| {
+                        // Remove if no guaranteed entries remain for this dest
+                        !self.pending_echoes.iter().any(|((_, dh2), &ts2)| {
+                            dh2 == dh && ts2 != u64::MAX
+                        })
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for (iface, dest) in &stale_sentinels {
+                    self.pending_echoes.remove(&(Arc::clone(iface), *dest));
+                }
+
+                // Decay scores for interfaces that haven't been observed recently.
+                self.cooperation.decay_stale(now);
 
                 actions
             }
@@ -628,23 +750,83 @@ impl Node {
         vec![NodeAction::SendOnInterface {
             interface_name: Arc::clone(interface_name),
             raw: outbound,
+            weight: None,
         }]
     }
 
     /// Broadcast raw bytes on all registered interfaces, IFAC-masking each.
+    ///
+    /// Each interface gets a cooperation weight via `get_broadcast_weights()`.
+    /// The highest-scored interface is forced to 1.0 to guarantee delivery.
     fn broadcast_on_all_interfaces(&self, raw: &[u8]) -> Vec<NodeAction> {
-        let mut actions = Vec::with_capacity(self.interfaces.len());
-        for name in self.interfaces.keys() {
-            actions.extend(self.send_on_interface(name, raw));
-        }
-        actions
+        let weights = self.cooperation.get_broadcast_weights();
+        self.send_weighted(raw, &weights, None)
     }
 
     /// Broadcast on all interfaces except the named one (source exclusion).
+    ///
+    /// Computes cooperation weights AFTER excluding the source interface, so the
+    /// "force highest to 1.0" guarantee applies to the actual sending set.
     fn broadcast_except(&self, exclude: &str, raw: &[u8]) -> Vec<NodeAction> {
+        let all_weights = self.cooperation.get_broadcast_weights();
+        // Filter out excluded interface, then re-apply "highest = 1.0" invariant.
+        let filtered: Vec<_> = all_weights
+            .into_iter()
+            .filter(|(n, _)| n.as_ref() != exclude)
+            .collect();
+        let max_w = filtered.iter().map(|(_, w)| *w).fold(f32::NEG_INFINITY, f32::max);
+        let weights: Vec<(Arc<str>, f32)> = filtered
+            .into_iter()
+            .map(|(n, w)| if w >= max_w { (n, 1.0) } else { (n, w) })
+            .collect();
+        self.send_weighted(raw, &weights, Some(exclude))
+    }
+
+    /// Apply IFAC masking and cooperation weights to a set of interfaces.
+    ///
+    /// Shared implementation for `broadcast_on_all_interfaces` and `broadcast_except`.
+    /// Any interface in `self.interfaces` not present in `weights` is included
+    /// as a directed send (weight: None) for safety.
+    fn send_weighted(
+        &self,
+        raw: &[u8],
+        weights: &[(Arc<str>, f32)],
+        exclude: Option<&str>,
+    ) -> Vec<NodeAction> {
         let mut actions = Vec::with_capacity(self.interfaces.len());
+        for (name, weight) in weights {
+            if let Some(iface) = self.interfaces.get(&**name) {
+                let outbound = if let Some(ref auth) = iface.ifac {
+                    match auth.mask(raw) {
+                        Ok(masked) => masked,
+                        Err(_) => {
+                            actions.push(NodeAction::PacketDropped {
+                                reason: DropReason::OutboundIfacFailed,
+                                interface_name: Arc::clone(name),
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    raw.to_vec()
+                };
+                actions.push(NodeAction::SendOnInterface {
+                    interface_name: Arc::clone(name),
+                    raw: outbound,
+                    weight: Some(*weight),
+                });
+            }
+        }
+        // Include any interfaces not yet in the cooperation table.
+        // Safety net: send unweighted on any interface missing from the cooperation
+        // table. Should not happen in practice (register_interface adds to both maps).
         for name in self.interfaces.keys() {
-            if &**name != exclude {
+            let excluded = exclude.map_or(false, |e| &**name == e);
+            if !excluded && !weights.iter().any(|(n, _)| n == name) {
+                debug_assert!(
+                    false,
+                    "interface {name} missing from cooperation table — sending unweighted"
+                );
                 actions.extend(self.send_on_interface(name, raw));
             }
         }
@@ -1003,6 +1185,24 @@ impl Node {
             now,
         );
 
+        // Announce echo detection: if this announce is for a destination we own,
+        // a neighbor forwarded our announce back to us. Credit the *receiving*
+        // interface — the neighbor on that interface cooperated by forwarding.
+        //
+        // We broadcast announces on ALL interfaces, so any echo arriving on any
+        // interface means that interface's neighbor forwarded it. No need to check
+        // which interface we sent on — we sent on all of them.
+        if self.announcing_destinations.contains_key(&destination_hash) {
+            // Credit this interface exactly once per announce cycle. The pending
+            // entry acts as a "credit token" — remove() atomically checks and
+            // consumes it. Duplicate echoes find no entry and get no credit.
+            let key = (Arc::clone(&interface_name), destination_hash);
+            if self.pending_echoes.remove(&key).is_some() {
+                self.cooperation
+                    .observe_announce_forwarded(&interface_name, now);
+            }
+        }
+
         // Announce table insertion (transport mode only)
         if self.is_transport()
             && !self.local_destinations.contains(&destination_hash)
@@ -1075,7 +1275,7 @@ impl Node {
 
         // 4. Regular proof routing via reverse table
         if packet.header.flags.packet_type == PacketType::Proof {
-            return self.route_proof(&packet, &interface_name);
+            return self.route_proof(&packet, &interface_name, now);
         }
 
         // 5. Only relay Type2 packets addressed to our transport_id
@@ -1128,6 +1328,7 @@ impl Node {
                     received_interface: interface_name,
                     outbound_interface: Arc::clone(&path_iface),
                     timestamp: now,
+                    proof_received: false,
                 },
             );
         }
@@ -1495,10 +1696,15 @@ impl Node {
     }
 
     /// Route a proof packet back toward the originator via the reverse table.
-    fn route_proof(&self, packet: &Packet, interface_name: &Arc<str>) -> Vec<NodeAction> {
+    fn route_proof(
+        &mut self,
+        packet: &Packet,
+        interface_name: &Arc<str>,
+        now: u64,
+    ) -> Vec<NodeAction> {
         let proof_dest = packet.header.destination_hash;
 
-        let entry = match self.reverse_table.get(&proof_dest) {
+        let entry = match self.reverse_table.get_mut(&proof_dest) {
             Some(e) => e,
             None => {
                 return vec![NodeAction::PacketDropped {
@@ -1507,6 +1713,10 @@ impl Node {
                 }];
             }
         };
+
+        let already_received = entry.proof_received;
+        let outbound_iface = entry.outbound_interface.clone();
+        let received_iface = entry.received_interface.clone();
 
         // Forward proof with current hops (already incremented in inbound pipeline)
         let forwarded = Packet {
@@ -1526,14 +1736,23 @@ impl Node {
 
         match forwarded.to_bytes() {
             Ok(raw) => {
-                let mut actions = self.send_on_interface(&entry.received_interface, &raw);
+                // Mark proof received and credit cooperation ONLY after
+                // successful serialization. If to_bytes() fails, we don't
+                // want stale proof_received=true preventing timeout penalties.
+                if let Some(entry) = self.reverse_table.get_mut(&proof_dest) {
+                    entry.proof_received = true;
+                }
+                if !already_received {
+                    self.cooperation.observe_proof_delivered(&outbound_iface, now);
+                }
+                let mut actions = self.send_on_interface(&received_iface, &raw);
                 if !actions
                     .iter()
                     .any(|a| matches!(a, NodeAction::PacketDropped { .. }))
                 {
                     actions.push(NodeAction::ProofRelayed {
                         proof_destination: proof_dest,
-                        interface_name: entry.received_interface.clone(),
+                        interface_name: received_iface,
                     });
                 }
                 actions
@@ -1541,7 +1760,7 @@ impl Node {
             Err(_) => {
                 vec![NodeAction::PacketDropped {
                     reason: DropReason::RelaySerializeFailed,
-                    interface_name: entry.received_interface.clone(),
+                    interface_name: received_iface,
                 }]
             }
         }
@@ -2268,7 +2487,7 @@ mod tests {
 
     #[test]
     fn announce_unknown_dest_returns_drop() {
-        let node = Node::new();
+        let mut node = Node::new();
         let actions = node.announce(&dest(99), &mut OsRng, 1_700_000_000);
 
         assert_eq!(actions.len(), 1);
@@ -2282,7 +2501,7 @@ mod tests {
 
     #[test]
     fn announce_with_ifac_produces_masked_output() {
-        let (node, dh) = make_announcing_node_with_ifac();
+        let (mut node, dh) = make_announcing_node_with_ifac();
 
         let actions = node.announce(&dh, &mut OsRng, 1_700_000_000);
         assert_eq!(actions.len(), 1);
@@ -2314,6 +2533,7 @@ mod tests {
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
+                    ..
                 } => {
                     if &**interface_name == "eth0" {
                         // IFAC interface → flag set
@@ -2406,6 +2626,7 @@ mod tests {
             NodeAction::SendOnInterface {
                 interface_name,
                 raw,
+                ..
             } => {
                 assert_eq!(&**interface_name, "eth0");
                 assert_eq!(*raw, data);
@@ -2470,6 +2691,7 @@ mod tests {
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
+                    ..
                 } => {
                     if &**interface_name == "eth0" {
                         assert_ne!(raw[0] & 0x80, 0, "eth0 should have IFAC");
@@ -2674,6 +2896,7 @@ mod tests {
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
+                    ..
                 } => Some((&**interface_name, raw.clone())),
                 _ => None,
             })
@@ -4069,6 +4292,7 @@ mod tests {
                 received_interface: "no_such_iface".into(),
                 outbound_interface: "wlan0".into(),
                 timestamp: 1000,
+                proof_received: false,
             },
         );
 
@@ -4090,7 +4314,7 @@ mod tests {
             data: vec![0xCC; 10].into(),
         };
         let eth0: Arc<str> = Arc::from("eth0");
-        let actions = node.route_proof(&proof_pkt, &eth0);
+        let actions = node.route_proof(&proof_pkt, &eth0, 2000);
 
         // Should get PacketDropped but NOT ProofRelayed
         assert!(actions
@@ -4112,6 +4336,7 @@ mod tests {
                 received_interface: "eth0".into(),
                 outbound_interface: "wlan0".into(),
                 timestamp: 1000,
+                proof_received: false,
             },
         );
         assert_eq!(node.reverse_table_len(), 1);
@@ -4562,6 +4787,7 @@ mod tests {
             NodeAction::SendOnInterface {
                 interface_name,
                 raw,
+                ..
             } => Some((&**interface_name, raw.clone())),
             _ => None,
         });
@@ -4618,6 +4844,7 @@ mod tests {
             NodeAction::SendOnInterface {
                 interface_name,
                 raw,
+                ..
             } => Some((&**interface_name, raw.clone())),
             _ => None,
         });
@@ -4972,5 +5199,257 @@ mod tests {
             now: 2000,
         });
         assert_eq!(node.link_table_len(), 1);
+    }
+
+    // ── Announce echo observation ───────────────────────────────────
+
+    #[test]
+    fn test_announce_echo_positive_observation() {
+        // Set up: Node with 2 interfaces and an announcing destination.
+        // Announce broadcasts on both, then an echo arrives on wlan0.
+        // wlan0's pending entry is consumed (credited), eth0's remains.
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
+        let dh = node.register_announcing_destination(
+            identity,
+            name,
+            vec![],
+            Some(300),
+            1000,
+        );
+
+        // Emit announce — both interfaces get pending echo entries.
+        let actions = node.announce(&dh, &mut OsRng, 1_700_000_000);
+        assert_eq!(actions.len(), 2, "should send on both interfaces");
+        assert_eq!(node.pending_echoes_len(), 2);
+
+        // Capture the raw announce bytes from any SendOnInterface action.
+        let raw = match &actions[0] {
+            NodeAction::SendOnInterface { raw, .. } => raw.clone(),
+            _ => panic!("expected SendOnInterface"),
+        };
+
+        // Verify initial cooperation score for wlan0.
+        let initial_weight = node.cooperation().get_weight("wlan0");
+        assert!(
+            (initial_weight - 0.5).abs() < 1e-6,
+            "wlan0 initial weight should be 0.5, got {initial_weight}"
+        );
+
+        // Feed the echoed announce on wlan0 — neighbor forwarded our announce back.
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw: raw.clone(),
+            now: 1_700_000_001,
+        });
+
+        // Verify: wlan0's cooperation score increased above the initial 0.5.
+        let weight_after = node.cooperation().get_weight("wlan0");
+        assert!(
+            weight_after > 0.5,
+            "wlan0 cooperation score should have increased above 0.5 after \
+             positive echo observation, got {weight_after}"
+        );
+
+        // wlan0's pending entry consumed; eth0's remains.
+        assert_eq!(
+            node.pending_echoes_len(),
+            1,
+            "eth0's pending echo should remain, wlan0's consumed"
+        );
+
+        // Duplicate echo on wlan0 should NOT credit again (no pending entry).
+        let weight_before_dup = node.cooperation().get_weight("wlan0");
+        node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "wlan0".into(),
+            raw,
+            now: 1_700_000_002,
+        });
+        let weight_after_dup = node.cooperation().get_weight("wlan0");
+        assert!(
+            (weight_after_dup - weight_before_dup).abs() < 1e-6,
+            "duplicate echo should NOT change score: before={weight_before_dup}, after={weight_after_dup}"
+        );
+    }
+
+    #[test]
+    fn test_announce_echo_timeout_negative_observation() {
+        // Set up: Node with 1 interface (eth0) and an announcing destination.
+        // We send an announce but no echo arrives. After the timeout, the
+        // cooperation score for eth0 should decrease below the initial 0.5.
+        let mut node = Node::new();
+        node.register_interface("eth0".into(), InterfaceMode::Full, None);
+        // Register a second interface so get_weight returns actual scores
+        // (single-interface always returns 1.0).
+        node.register_interface("wlan0".into(), InterfaceMode::Full, None);
+
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
+        let dh = node.register_announcing_destination(
+            identity,
+            name,
+            vec![],
+            Some(300),
+            1000,
+        );
+
+        let now = 1_700_000_000_u64;
+
+        // Emit announce — broadcasts on both eth0 and wlan0.
+        let actions = node.announce(&dh, &mut OsRng, now);
+        assert_eq!(actions.len(), 2, "should send on both interfaces");
+        assert_eq!(node.pending_echoes_len(), 2);
+
+        // Verify initial scores.
+        let eth0_before = node.cooperation().get_weight("eth0");
+        let wlan0_before = node.cooperation().get_weight("wlan0");
+        assert!(
+            (eth0_before - 0.5).abs() < 1e-6,
+            "eth0 initial weight should be 0.5"
+        );
+        assert!(
+            (wlan0_before - 0.5).abs() < 1e-6,
+            "wlan0 initial weight should be 0.5"
+        );
+
+        // Tick past the echo timeout without any echo arriving.
+        let timeout_now = now + ECHO_TIMEOUT + 1;
+        node.handle_event(NodeEvent::TimerTick { now: timeout_now });
+
+        // Pending echoes should be expired.
+        assert_eq!(
+            node.pending_echoes_len(),
+            0,
+            "pending echoes should be cleared after timeout"
+        );
+
+        // Both interfaces should have decreased cooperation scores.
+        let eth0_after = node.cooperation().get_weight("eth0");
+        let wlan0_after = node.cooperation().get_weight("wlan0");
+        assert!(
+            eth0_after < 0.5,
+            "eth0 cooperation score should have decreased below 0.5 after \
+             timeout, got {eth0_after}"
+        );
+        assert!(
+            wlan0_after < 0.5,
+            "wlan0 cooperation score should have decreased below 0.5 after \
+             timeout, got {wlan0_after}"
+        );
+    }
+
+    // ── Proof delivery cooperation observation tests ────────────────
+
+    #[test]
+    fn proof_delivered_increases_cooperation_score() {
+        // Build a transport node with two interfaces so get_weight
+        // returns actual scores (not the forced 1.0 for single-interface).
+        let (mut node, _th) = make_transport_node();
+        let now = 1000_u64;
+
+        let initial = node.cooperation().get_weight("wlan0");
+        assert!(
+            (initial - 0.5).abs() < f32::EPSILON,
+            "initial wlan0 weight should be 0.5, got {initial}"
+        );
+
+        // Simulate a proof arriving for a packet we forwarded on wlan0.
+        // Insert a reverse table entry, then route a proof through it.
+        let proof_key = dest(99);
+        node.reverse_table.insert(
+            proof_key,
+            ReverseTableEntry {
+                received_interface: "eth0".into(),
+                outbound_interface: "wlan0".into(),
+                timestamp: now,
+                proof_received: false,
+            },
+        );
+
+        let proof_pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Proof,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: proof_key,
+                context: PacketContext::None,
+            },
+            data: vec![0xAA; 10].into(),
+        };
+
+        let eth0: Arc<str> = Arc::from("eth0");
+        let _actions = node.route_proof(&proof_pkt, &eth0, now + 100);
+
+        // wlan0 should have an increased cooperation score.
+        let after = node.cooperation().get_weight("wlan0");
+        assert!(
+            after > 0.5,
+            "wlan0 cooperation score should have increased above 0.5 after \
+             proof delivery, got {after}"
+        );
+
+        // The reverse table entry should be marked as proof_received.
+        assert!(
+            node.reverse_table
+                .get(&proof_key)
+                .expect("entry should still exist")
+                .proof_received,
+            "proof_received flag should be set to true"
+        );
+    }
+
+    #[test]
+    fn proof_timeout_decreases_cooperation_score() {
+        // Build a transport node with two interfaces.
+        let (mut node, _th) = make_transport_node();
+        let now = 1000_u64;
+
+        let initial = node.cooperation().get_weight("wlan0");
+        assert!(
+            (initial - 0.5).abs() < f32::EPSILON,
+            "initial wlan0 weight should be 0.5, got {initial}"
+        );
+
+        // Insert a reverse table entry for a packet forwarded on wlan0,
+        // but never deliver a proof.
+        node.reverse_table.insert(
+            dest(88),
+            ReverseTableEntry {
+                received_interface: "eth0".into(),
+                outbound_interface: "wlan0".into(),
+                timestamp: now,
+                proof_received: false,
+            },
+        );
+
+        // Advance past REVERSE_TIMEOUT to trigger expiry.
+        let timeout_now = now + REVERSE_TIMEOUT + 1;
+        node.handle_event(NodeEvent::TimerTick { now: timeout_now });
+
+        // The entry should be expired.
+        assert_eq!(
+            node.reverse_table_len(),
+            0,
+            "reverse table should be empty after timeout"
+        );
+
+        // wlan0 should have a decreased cooperation score.
+        let after = node.cooperation().get_weight("wlan0");
+        assert!(
+            after < 0.5,
+            "wlan0 cooperation score should have decreased below 0.5 after \
+             proof timeout, got {after}"
+        );
     }
 }

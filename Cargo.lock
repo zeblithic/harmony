@@ -1922,6 +1922,7 @@ dependencies = [
  "harmony-contacts",
  "harmony-content",
  "harmony-crypto",
+ "harmony-discovery",
  "harmony-identity",
  "harmony-peers",
  "harmony-reticulum",
@@ -1932,9 +1933,11 @@ dependencies = [
  "iroh",
  "mdns-sd",
  "rand 0.8.5",
+ "serde",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "zenoh",
@@ -1955,6 +1958,7 @@ name = "harmony-peers"
 version = "0.1.0"
 dependencies = [
  "harmony-contacts",
+ "harmony-crypto",
  "harmony-identity",
  "hashbrown 0.15.5",
 ]
