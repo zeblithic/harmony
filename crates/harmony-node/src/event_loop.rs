@@ -232,7 +232,9 @@ pub async fn run(
     // which is BLAKE3(ML-DSA pubkey)). Used to route replication frames to the
     // correct peer in RuntimeEvent::ReplicaReceived. Populated at HandshakeComplete,
     // removed at TunnelClosed.
-    let mut tunnel_identities: HashMap<String, [u8; 16]> = HashMap::new();
+    // Maps interface_name → full 32-byte peer_node_id (BLAKE3 of ML-DSA pubkey).
+    // Used to resolve contacts via find_by_tunnel_node_id() for replication routing.
+    let mut tunnel_identities: HashMap<String, [u8; 32]> = HashMap::new();
     let mut next_connection_id: u64 = 0;
 
     // ── Ready-connection channel: QUIC handshake tasks → select loop ──────
@@ -536,13 +538,10 @@ pub async fn run(
                             .map(|s| s.connection_id == connection_id)
                             .unwrap_or(false);
                         if is_current {
-                            // Record identity hash proxy for replication routing.
-                            // peer_node_id is BLAKE3(ML-DSA pubkey); we take the first
-                            // 16 bytes as a stable peer identifier until the full
-                            // identity_hash (SHA256(KEM||DSA)[:16]) is available here.
-                            let mut id_hash = [0u8; 16];
-                            id_hash.copy_from_slice(&peer_node_id[..16]);
-                            tunnel_identities.insert(interface_name.clone(), id_hash);
+                            // Store full 32-byte peer_node_id for replication routing.
+                            // Used with find_by_tunnel_node_id() to resolve the contact's
+                            // canonical identity_hash for quota lookup.
+                            tunnel_identities.insert(interface_name.clone(), peer_node_id);
                             runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
                                 interface_name,
                                 peer_node_id,
@@ -585,14 +584,16 @@ pub async fn run(
                                 harmony_tunnel::replication::ReplicationMessage::decode(&message)
                             {
                                 if rep_msg.op == harmony_tunnel::replication::ReplicationOp::Push {
-                                    if let Some(&identity_hash) =
-                                        tunnel_identities.get(&interface_name)
-                                    {
-                                        runtime.push_event(RuntimeEvent::ReplicaReceived {
-                                            peer_identity: identity_hash,
-                                            cid: rep_msg.cid,
-                                            data: rep_msg.payload,
-                                        });
+                                    // Resolve the contact's canonical identity_hash from
+                                    // the tunnel's node_id via the contact store.
+                                    if let Some(node_id) = tunnel_identities.get(&interface_name) {
+                                        if let Some(contact) = runtime.contact_store().find_by_tunnel_node_id(node_id) {
+                                            runtime.push_event(RuntimeEvent::ReplicaReceived {
+                                                peer_identity: contact.identity_hash,
+                                                cid: rep_msg.cid,
+                                                data: rep_msg.payload,
+                                            });
+                                        }
                                     }
                                 }
                             }
