@@ -37,8 +37,6 @@ const LOCAL_REBROADCASTS_MAX: u8 = 2;
 /// Matches the shortest path expiry (Roaming = 6 hours).
 const RATE_TABLE_EXPIRY: u64 = 21_600;
 
-/// Milliseconds to wait for an announce echo before recording a negative
-/// cooperation observation. Conservative at 90s (3x a typical 30s interval).
 /// Announce echo timeout in seconds. If we don't hear our own announce
 /// echo back within this window, record a negative observation.
 /// 90 seconds ≈ 3× a typical 30-second announce interval.
@@ -717,39 +715,7 @@ impl Node {
     /// The highest-scored interface is forced to 1.0 to guarantee delivery.
     fn broadcast_on_all_interfaces(&self, raw: &[u8]) -> Vec<NodeAction> {
         let weights = self.cooperation.get_broadcast_weights();
-        let mut actions = Vec::with_capacity(self.interfaces.len());
-        for (name, weight) in &weights {
-            if let Some(iface) = self.interfaces.get(&**name) {
-                let outbound = if let Some(ref auth) = iface.ifac {
-                    match auth.mask(raw) {
-                        Ok(masked) => masked,
-                        Err(_) => {
-                            actions.push(NodeAction::PacketDropped {
-                                reason: DropReason::OutboundIfacFailed,
-                                interface_name: Arc::clone(name),
-                            });
-                            continue;
-                        }
-                    }
-                } else {
-                    raw.to_vec()
-                };
-                actions.push(NodeAction::SendOnInterface {
-                    interface_name: Arc::clone(name),
-                    raw: outbound,
-                    weight: Some(*weight),
-                });
-            }
-        }
-        // Include any interfaces not yet in the cooperation table (shouldn't
-        // happen in normal use, but keeps the invariant that all interfaces
-        // participate in broadcasts).
-        for name in self.interfaces.keys() {
-            if !weights.iter().any(|(n, _)| n == name) {
-                actions.extend(self.send_on_interface(name, raw));
-            }
-        }
-        actions
+        self.send_weighted(raw, &weights, None)
     }
 
     /// Broadcast on all interfaces except the named one (source exclusion).
@@ -768,8 +734,22 @@ impl Node {
             .into_iter()
             .map(|(n, w)| if w >= max_w { (n, 1.0) } else { (n, w) })
             .collect();
+        self.send_weighted(raw, &weights, Some(exclude))
+    }
+
+    /// Apply IFAC masking and cooperation weights to a set of interfaces.
+    ///
+    /// Shared implementation for `broadcast_on_all_interfaces` and `broadcast_except`.
+    /// Any interface in `self.interfaces` not present in `weights` is included
+    /// as a directed send (weight: None) for safety.
+    fn send_weighted(
+        &self,
+        raw: &[u8],
+        weights: &[(Arc<str>, f32)],
+        exclude: Option<&str>,
+    ) -> Vec<NodeAction> {
         let mut actions = Vec::with_capacity(self.interfaces.len());
-        for (name, weight) in &weights {
+        for (name, weight) in weights {
             if let Some(iface) = self.interfaces.get(&**name) {
                 let outbound = if let Some(ref auth) = iface.ifac {
                     match auth.mask(raw) {
@@ -794,7 +774,8 @@ impl Node {
         }
         // Include any interfaces not yet in the cooperation table.
         for name in self.interfaces.keys() {
-            if &**name != exclude && !weights.iter().any(|(n, _)| n == name) {
+            let excluded = exclude.map_or(false, |e| &**name == e);
+            if !excluded && !weights.iter().any(|(n, _)| n == name) {
                 actions.extend(self.send_on_interface(name, raw));
             }
         }
