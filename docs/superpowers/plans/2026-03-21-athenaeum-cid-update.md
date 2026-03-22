@@ -62,6 +62,8 @@ Expected: FAIL — `route_hash` not defined.
 
 - [ ] **Step 3: Implement route_hash()**
 
+**Implementation note:** The code below shows the original zero-padding approach, which was replaced with direct bit extraction from the 28-byte hash to avoid 4 dead routing bits at depths 0-3. See spec implementation note for details.
+
 Add to `Encyclopedia` impl in `encyclopedia.rs`:
 
 ```rust

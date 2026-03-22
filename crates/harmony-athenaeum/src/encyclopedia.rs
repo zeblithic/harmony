@@ -309,7 +309,8 @@ impl Encyclopedia {
         for d in 0..depth.min(32) {
             let byte_idx = (d / 8) as usize;
             let bit_offset = 7 - (d % 8);
-            if byte_idx < 28 && (hash[byte_idx] >> bit_offset) & 1 == 1 {
+            // byte_idx = d/8 ≤ 31/8 = 3, always < 28.
+            if (hash[byte_idx] >> bit_offset) & 1 == 1 {
                 path |= 1 << d;
             }
         }
