@@ -295,8 +295,12 @@ impl Encyclopedia {
     /// Determine which partition a CID's hash maps to.
     ///
     /// `hash` is the 28-byte hash portion of a ContentId (bytes 4-31).
-    /// Routes directly on hash bits 0-223 without zero-padding, so all
-    /// routing depths produce meaningful decisions from the first bit.
+    /// Routes directly on hash bits starting at bit 0, so all routing
+    /// depths produce meaningful decisions from the first bit.
+    ///
+    /// **Note:** The return type is `u32`, so routing is capped at 32
+    /// decisions regardless of the `depth` argument. Depths > 32 are
+    /// silently treated as 32.
     ///
     /// Unlike `route()` (which operates on full 32-byte page content hashes
     /// and skips `PARTITION_START_BIT` bits for PageAddr), this method
