@@ -117,6 +117,12 @@ pub mod page {
     /// Query by mode-00 + mode-01 addresses.
     pub fn query_by_addr00_01(addr_00: &str, addr_01: &str) -> String;
 
+    /// Query by all 4 address variants.
+    pub fn query_by_all_addrs(addr_00: &str, addr_01: &str, addr_10: &str, addr_11: &str) -> String;
+
+    /// Query by all 4 addresses + book CID.
+    pub fn query_by_all_addrs_and_book(addr_00: &str, addr_01: &str, addr_10: &str, addr_11: &str, book_cid: &str) -> String;
+
     /// Query all pages of a specific book (non-terminal wildcard caveat).
     pub fn query_by_book(book_cid: &str) -> String;
 
@@ -147,6 +153,8 @@ All addresses are canonical lowercase hex via `hex::encode()`.
 - `page_key_format` — full path with all 6 segments
 - `query_by_addr00` — 5 trailing wildcards
 - `query_by_addr00_01` — 4 trailing wildcards
+- `query_by_all_addrs` — 2 wildcards (all 4 addr variants known)
+- `query_by_all_addrs_and_book` — 1 wildcard (tightest query short of exact key)
 - `query_by_book` — 4 leading wildcards + 1 trailing
 - `query_by_book_and_pos` — 4 leading wildcards
 - `page_subscription_pattern` — SUB constant
