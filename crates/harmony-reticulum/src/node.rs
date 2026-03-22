@@ -539,7 +539,7 @@ impl Node {
         // (weight >= 1.0). Non-guaranteed interfaces may have been probabilistically
         // dropped by the event loop, so a missing echo isn't evidence of a bad
         // neighbor — it's evidence we didn't send. We mark non-guaranteed entries
-        // with timestamp 0 as a sentinel to skip them during timeout processing.
+        // with u64::MAX as a sentinel to skip them during timeout processing.
         let dest = *dest_hash;
         for action in &actions {
             if let NodeAction::SendOnInterface {
@@ -663,7 +663,7 @@ impl Node {
 
                 // Expire pending echo entries that timed out without an echo.
                 // Only fire negative observations for guaranteed-delivery entries
-                // (ts > 0). Sentinel entries (ts == 0) are credit-only tokens for
+                // (ts != u64::MAX). Sentinel entries (ts == u64::MAX) are credit-only tokens for
                 // non-guaranteed interfaces — remove them silently since a missing
                 // echo may be because we didn't actually send.
                 // Collect expired entries. Guaranteed interfaces (real timestamps)
