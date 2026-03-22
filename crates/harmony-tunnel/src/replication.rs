@@ -23,6 +23,8 @@ pub enum ReplicationOp {
     Status = 0x04,
     /// Response to a Status request with usage and quota.
     StatusResponse = 0x05,
+    /// Pull request with a bearer token for authorization.
+    PullWithToken = 0x06,
 }
 
 impl ReplicationOp {
@@ -33,6 +35,7 @@ impl ReplicationOp {
             0x03 => Ok(Self::PullResponse),
             0x04 => Ok(Self::Status),
             0x05 => Ok(Self::StatusResponse),
+            0x06 => Ok(Self::PullWithToken),
             other => Err(TunnelError::MalformedReplication {
                 reason: if other == 0 {
                     "unknown replication op: 0x00"
@@ -122,6 +125,15 @@ impl ReplicationMessage {
         }
     }
 
+    /// Create a PullWithToken request carrying a bearer token.
+    pub fn pull_with_token(cid: [u8; 32], token: Vec<u8>) -> Self {
+        Self {
+            op: ReplicationOp::PullWithToken,
+            cid,
+            payload: token,
+        }
+    }
+
     /// Create a StatusResponse with usage and quota.
     pub fn status_response(used: u64, quota: u64) -> Self {
         let mut payload = Vec::with_capacity(16);
@@ -197,6 +209,22 @@ mod tests {
         let decoded_quota = u64::from_le_bytes(decoded.payload[8..16].try_into().unwrap());
         assert_eq!(decoded_used, used);
         assert_eq!(decoded_quota, quota);
+    }
+
+    #[test]
+    fn pull_with_token_roundtrip() {
+        let cid = [0xAA; 32];
+        let token_bytes = vec![1, 2, 3, 4, 5];
+        let msg = ReplicationMessage::pull_with_token(cid, token_bytes.clone());
+        assert_eq!(msg.op, ReplicationOp::PullWithToken);
+        assert_eq!(msg.cid, cid);
+        assert_eq!(msg.payload, token_bytes);
+
+        let encoded = msg.encode();
+        let decoded = ReplicationMessage::decode(&encoded).unwrap();
+        assert_eq!(decoded.op, ReplicationOp::PullWithToken);
+        assert_eq!(decoded.cid, cid);
+        assert_eq!(decoded.payload, token_bytes);
     }
 
     #[test]
