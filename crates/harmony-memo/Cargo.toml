@@ -1,0 +1,22 @@
+[package]
+name = "harmony-memo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+std = ["harmony-credential/std", "harmony-identity/std", "harmony-content/std"]
+
+[dependencies]
+harmony-credential = { workspace = true }
+harmony-identity = { workspace = true }
+harmony-content = { workspace = true }
+rand_core = { workspace = true }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+postcard = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

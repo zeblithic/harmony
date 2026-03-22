@@ -379,6 +379,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "102dbef1187b1893e6dfe05a774e79fd52265f49f214f6879c8ff49f52c8188b"
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "btparse"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1799,12 +1808,15 @@ dependencies = [
 name = "harmony-credential"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "bs58",
  "harmony-crypto",
  "harmony-identity",
  "hashbrown 0.15.5",
  "postcard",
  "rand 0.8.5",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1910,6 +1922,19 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "toml",
+]
+
+[[package]]
+name = "harmony-memo"
+version = "0.1.0"
+dependencies = [
+ "harmony-content",
+ "harmony-credential",
+ "harmony-identity",
+ "postcard",
+ "rand 0.8.5",
+ "rand_core 0.6.4",
+ "serde",
 ]
 
 [[package]]
