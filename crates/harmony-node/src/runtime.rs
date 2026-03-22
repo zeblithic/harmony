@@ -899,7 +899,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 unix_now,
             } => {
                 if let Some(action) =
-                    self.handle_pull_with_token(peer_identity, cid, token_bytes, unix_now)
+                    self.handle_pull_with_token(peer_identity, cid, &token_bytes, unix_now)
                 {
                     self.pending_direct_actions.push(action);
                 }
@@ -1217,7 +1217,7 @@ impl<B: BookStore> NodeRuntime<B> {
         &self,
         peer_identity: [u8; 16],
         cid: [u8; 32],
-        token_bytes: Vec<u8>,
+        token_bytes: &[u8],
         unix_now: u64,
     ) -> Option<RuntimeAction> {
         use harmony_content::replica::ReplicaStore;
@@ -1320,12 +1320,16 @@ impl<B: BookStore> NodeRuntime<B> {
 
         let identity_hash = record.identity_ref.hash;
 
-        // Cache the peer's public key for token signature verification.
-        // SAFETY: AnnounceRecords are signature-verified by verify_announce()
-        // before reaching this point (see DiscoveryAnnounceReceived handler).
-        // The V1 security caveat (announce records don't yet verify pubkey→hash
-        // binding) is documented in harmony-discovery crate docs. When address
-        // re-derivation is implemented, a binding check should be added here.
+        // Cache the peer's signing public key for token verification.
+        // For MlDsa65 suites, record.public_key is the ML-DSA-65 verifying key
+        // (1952 bytes), NOT the combined PQ key (3136 bytes). This matches the
+        // format expected by MlDsaPublicKey::from_bytes() in handle_pull_with_token.
+        // verify_announce() in the discovery crate uses the same key format.
+        //
+        // SECURITY(V1): Announce records don't verify pubkey→hash binding.
+        // Until address re-derivation is implemented, a forged announce can
+        // poison this cache. See harmony-discovery crate Security docs and
+        // bead harmony-3bu.
         if !record.public_key.is_empty() {
             self.insert_pubkey_capped(identity_hash, record.public_key.clone());
         }
@@ -3320,7 +3324,7 @@ mod tests {
             .unwrap();
         let token_bytes = token.to_bytes();
 
-        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
+        let result = rt.handle_pull_with_token(requester_hash, cid, &token_bytes, 1_700_000_000);
         assert!(result.is_some(), "valid token should produce a response");
         match result.unwrap() {
             RuntimeAction::ReplicaPullResponse {
@@ -3356,7 +3360,7 @@ mod tests {
             .unwrap();
         let token_bytes = token.to_bytes();
 
-        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
+        let result = rt.handle_pull_with_token(requester_hash, cid, &token_bytes, 1_700_000_000);
         assert!(result.is_none(), "expired token should be rejected");
     }
 
@@ -3382,7 +3386,7 @@ mod tests {
         let token_bytes = token.to_bytes();
 
         // Request with the actual CID, but token says different CID.
-        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
+        let result = rt.handle_pull_with_token(requester_hash, cid, &token_bytes, 1_700_000_000);
         assert!(result.is_none(), "wrong CID should be rejected");
     }
 
@@ -3411,7 +3415,7 @@ mod tests {
 
         // The stranger's pubkey was never cached (only the owner's was).
         // The token issuer is the stranger → unknown issuer → rejection.
-        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
+        let result = rt.handle_pull_with_token(requester_hash, cid, &token_bytes, 1_700_000_000);
         assert!(result.is_none(), "unknown issuer should be rejected");
     }
 
@@ -3438,7 +3442,7 @@ mod tests {
         let token_bytes = token.to_bytes();
 
         // Even though the owner is known and pubkey is cached, no replica for this CID.
-        let result = rt.handle_pull_with_token(requester_hash, missing_cid, token_bytes, 1_700_000_000);
+        let result = rt.handle_pull_with_token(requester_hash, missing_cid, &token_bytes, 1_700_000_000);
         assert!(result.is_none(), "missing replica should be rejected");
     }
 
@@ -3463,7 +3467,7 @@ mod tests {
             .unwrap();
         let token_bytes = token.to_bytes();
 
-        let result = rt.handle_pull_with_token(actual_requester, cid, token_bytes, 1_700_000_000);
+        let result = rt.handle_pull_with_token(actual_requester, cid, &token_bytes, 1_700_000_000);
         assert!(
             result.is_none(),
             "token with wrong audience should be rejected"
@@ -3495,7 +3499,7 @@ mod tests {
         let len = token_bytes.len();
         token_bytes[len - 1] ^= 0xFF;
 
-        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
+        let result = rt.handle_pull_with_token(requester_hash, cid, &token_bytes, 1_700_000_000);
         assert!(
             result.is_none(),
             "token with corrupted signature should be rejected"

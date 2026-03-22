@@ -544,6 +544,9 @@ pub async fn run(
                             tunnel_identities.insert(interface_name.clone(), peer_node_id);
 
                             // Cache the peer's ML-DSA public key for token verification.
+                            // If the contact isn't registered yet, the pubkey is intentionally
+                            // dropped — it will be cached via the discovery announce path
+                            // (process_discovered_tunnel_hints) when the contact is created.
                             if let Some(contact) = runtime.contact_store().find_by_tunnel_node_id(&peer_node_id) {
                                 runtime.push_event(RuntimeEvent::PeerPublicKeyLearned {
                                     identity_hash: contact.identity_hash,
