@@ -15,7 +15,20 @@ use crate::error::CredentialError;
 const HARMONY_CONTEXT: &str = "https://harmony.id/ns/credentials/v1";
 
 /// Encode an IdentityRef + public key bytes as a `did:key` string.
-pub fn identity_to_did_key(identity: &IdentityRef, public_key: &[u8]) -> String {
+///
+/// Returns `Err(SignatureInvalid)` if the key length doesn't match the suite
+/// (32 bytes for Ed25519, 1952 bytes for ML-DSA-65).
+pub fn identity_to_did_key(
+    identity: &IdentityRef,
+    public_key: &[u8],
+) -> Result<String, CredentialError> {
+    let expected_len = match identity.suite {
+        CryptoSuite::Ed25519 => 32,
+        CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => 1952,
+    };
+    if public_key.len() != expected_len {
+        return Err(CredentialError::SignatureInvalid);
+    }
     let multicodec = identity.suite.signing_multicodec();
 
     // Encode multicodec as unsigned varint (LEB128)
@@ -38,7 +51,7 @@ pub fn identity_to_did_key(identity: &IdentityRef, public_key: &[u8]) -> String 
     payload.extend_from_slice(public_key);
 
     let encoded = bs58::encode(&payload).into_string();
-    alloc::format!("did:key:z{encoded}")
+    Ok(alloc::format!("did:key:z{encoded}"))
 }
 
 /// Export a Credential to W3C VC Data Model 2.0 JSON-LD.
@@ -51,8 +64,8 @@ pub fn credential_to_jsonld(
     issuer_key: &[u8],
     subject_key: &[u8],
 ) -> Result<Value, CredentialError> {
-    let issuer_did = identity_to_did_key(&credential.issuer, issuer_key);
-    let subject_did = identity_to_did_key(&credential.subject, subject_key);
+    let issuer_did = identity_to_did_key(&credential.issuer, issuer_key)?;
+    let subject_did = identity_to_did_key(&credential.subject, subject_key)?;
 
     let claims: Vec<Value> = credential
         .claim_digests
@@ -75,8 +88,8 @@ pub fn presentation_to_jsonld(
     subject_key: &[u8],
 ) -> Result<Value, CredentialError> {
     let credential = &presentation.credential;
-    let issuer_did = identity_to_did_key(&credential.issuer, issuer_key);
-    let subject_did = identity_to_did_key(&credential.subject, subject_key);
+    let issuer_did = identity_to_did_key(&credential.issuer, issuer_key)?;
+    let subject_did = identity_to_did_key(&credential.subject, subject_key)?;
 
     // Disclosed claims get typeId + value + digest; undisclosed get digest only.
     let claims: Vec<Value> = credential
@@ -149,6 +162,7 @@ fn build_vc_json(
     if let Some(idx) = credential.status_list_index {
         vc["credentialStatus"] = json!({
             "type": "BitstringStatusListEntry",
+            "statusPurpose": "revocation",
             "statusListIndex": idx.to_string(),
             "statusListCredential": alloc::format!(
                 "harmony:status-list:{}",
@@ -231,7 +245,7 @@ mod tests {
     fn did_key_ed25519_format() {
         let id = IdentityRef::new([0xAA; 16], CryptoSuite::Ed25519);
         let key = [0x42u8; 32];
-        let did = identity_to_did_key(&id, &key);
+        let did = identity_to_did_key(&id, &key).unwrap();
         assert!(did.starts_with("did:key:z"));
         let encoded = &did["did:key:z".len()..];
         let decoded = bs58::decode(encoded).into_vec().unwrap();
@@ -244,7 +258,7 @@ mod tests {
     fn did_key_ml_dsa65_format() {
         let id = IdentityRef::new([0xBB; 16], CryptoSuite::MlDsa65);
         let key = [0x55u8; 1952];
-        let did = identity_to_did_key(&id, &key);
+        let did = identity_to_did_key(&id, &key).unwrap();
         assert!(did.starts_with("did:key:z"));
         let encoded = &did["did:key:z".len()..];
         let decoded = bs58::decode(encoded).into_vec().unwrap();
@@ -258,9 +272,19 @@ mod tests {
         let id = IdentityRef::new([0xAA; 16], CryptoSuite::Ed25519);
         let key = [0x42u8; 32];
         assert_eq!(
-            identity_to_did_key(&id, &key),
-            identity_to_did_key(&id, &key)
+            identity_to_did_key(&id, &key).unwrap(),
+            identity_to_did_key(&id, &key).unwrap()
         );
+    }
+
+    #[test]
+    fn did_key_wrong_length_rejected() {
+        let id = IdentityRef::new([0xAA; 16], CryptoSuite::Ed25519);
+        assert!(identity_to_did_key(&id, &[0x42; 16]).is_err()); // too short
+        assert!(identity_to_did_key(&id, &[0x42; 64]).is_err()); // too long
+
+        let id_pq = IdentityRef::new([0xBB; 16], CryptoSuite::MlDsa65);
+        assert!(identity_to_did_key(&id_pq, &[0x55; 32]).is_err()); // Ed25519 size for PQ suite
     }
 
     #[test]
@@ -312,6 +336,12 @@ mod tests {
                 .as_str()
                 .unwrap(),
             "42"
+        );
+        assert_eq!(
+            json["credentialStatus"]["statusPurpose"]
+                .as_str()
+                .unwrap(),
+            "revocation"
         );
     }
 
