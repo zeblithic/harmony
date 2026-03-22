@@ -3280,12 +3280,14 @@ mod tests {
         };
         rt.contact_store_mut().add(contact).unwrap();
 
-        // Store a replica as the owner.
+        // Store a replica via the event-driven path (exercises quota check).
         let cid = [0xCC; 32];
         let content = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        rt.replica_store
-            .store(issuer_hash, cid, content, 100_000)
-            .unwrap();
+        rt.push_event(RuntimeEvent::ReplicaPushReceived {
+            peer_identity: issuer_hash,
+            cid,
+            data: content,
+        });
 
         // Cache the owner's ML-DSA public key via the event-driven path,
         // exercising insert_pubkey_capped the same way production code does.
@@ -3465,6 +3467,38 @@ mod tests {
         assert!(
             result.is_none(),
             "token with wrong audience should be rejected"
+        );
+    }
+
+    #[test]
+    fn pull_with_token_bad_signature_rejected() {
+        use rand::rngs::OsRng;
+
+        let (rt, owner, cid) = setup_pull_with_token_runtime();
+
+        let requester_hash = [0x42; 16];
+        let token = owner
+            .issue_pq_root_token(
+                &mut OsRng,
+                &requester_hash,
+                harmony_identity::CapabilityType::Content,
+                &cid,
+                0,
+                0,
+            )
+            .unwrap();
+        let mut token_bytes = token.to_bytes();
+
+        // Corrupt a byte in the signature portion (last bytes of the token).
+        // ML-DSA-65 signatures are 3309 bytes — flipping a bit in the
+        // signature makes it invalid without affecting deserialization.
+        let len = token_bytes.len();
+        token_bytes[len - 1] ^= 0xFF;
+
+        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
+        assert!(
+            result.is_none(),
+            "token with corrupted signature should be rejected"
         );
     }
 }
