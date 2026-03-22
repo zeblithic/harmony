@@ -132,7 +132,7 @@ feature flag (requires `std`).
 
 ```toml
 [features]
-jsonld = ["dep:serde_json", "dep:base64", "dep:multibase", "std"]
+jsonld = ["dep:serde_json", "dep:base64", "dep:bs58", "std"]
 ```
 
 The `jsonld` feature implies `std` since `serde_json` requires it.
@@ -141,7 +141,7 @@ The `jsonld` feature implies `std` since `serde_json` requires it.
 
 - `serde_json` — JSON serialization
 - `base64` — base64url encoding for signatures and digests
-- `multibase` — base58btc encoding for did:key
+- `bs58` — base58btc encoding for did:key (simpler than full `multibase` crate)
 
 ## Public API
 
