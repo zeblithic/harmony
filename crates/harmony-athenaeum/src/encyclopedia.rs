@@ -42,11 +42,14 @@ struct PageInfo {
 impl Encyclopedia {
     /// Build an Encyclopedia from a collection of books.
     ///
-    /// Each book is identified by its CID (content hash) and raw data.
-    /// All pages across all books are deduplicated by content hash and
-    /// assigned unique 32-bit addresses via power-of-choice. When the
-    /// address space fills up, the system recursively partitions by
-    /// content-hash bits.
+    /// Each entry is `(cid, data)` where:
+    /// - `cid` is the full 32-byte ContentId (stored as-is in `Book.cid`)
+    /// - `data` is the raw book content
+    ///
+    /// **CID vs page hash:** Internally, pages are deduplicated and partitioned
+    /// by SHA-256 of page data (full 32 bytes, uniformly distributed), NOT by
+    /// the CID. The CID is stored opaquely in `Book.cid`. For external routing
+    /// lookups, use `route_hash()` with the 28-byte hash portion of the CID.
     pub fn build(entries: &[([u8; 32], &[u8])]) -> Result<Self, BookError> {
         for &(_, data) in entries {
             if data.len() > BOOK_MAX_SIZE {
