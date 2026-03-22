@@ -61,16 +61,18 @@ impl MemoStore {
         }
     }
 
-    /// Return the single memo from `signer` about `input`, if any.
+    /// Return all memos from `signer` about `input`.
+    /// A signer may have multiple memos for the same input with different outputs
+    /// (e.g., if they recomputed and got a different result).
     pub fn get_by_input_and_signer(
         &self,
         input: &ContentId,
         signer: &[u8; 16],
-    ) -> Option<&Memo> {
-        self.by_input
-            .get(input)?
-            .iter()
-            .find(|m| &m.credential.issuer.hash == signer)
+    ) -> Vec<&Memo> {
+        match self.by_input.get(input) {
+            Some(memos) => memos.iter().filter(|m| &m.credential.issuer.hash == signer).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Group memos for `input` by output CID, returning each distinct output
@@ -107,9 +109,9 @@ impl MemoStore {
         self.by_input.values().map(Vec::len).sum()
     }
 
-    /// Return `true` if the store contains no memos.
+    /// Return `true` if the store contains no memos. O(1).
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.by_input.is_empty()
     }
 }
 
@@ -250,9 +252,9 @@ mod tests {
 
         store.insert(memo_alice);
 
-        assert!(store.get_by_input_and_signer(&input, &alice_hash).is_some(), "alice's memo should be found");
-        assert!(store.get_by_input_and_signer(&input, &bob_hash).is_none(), "bob has no memo");
-        assert!(store.get_by_input_and_signer(&make_cid(0xFF), &alice_hash).is_none(), "unknown input");
+        assert!(!store.get_by_input_and_signer(&input, &alice_hash).is_empty(), "alice's memo should be found");
+        assert!(store.get_by_input_and_signer(&input, &bob_hash).is_empty(), "bob has no memo");
+        assert!(store.get_by_input_and_signer(&make_cid(0xFF), &alice_hash).is_empty(), "unknown input");
     }
 
     #[test]

@@ -63,6 +63,7 @@ pub fn create_memo(
         input,
         output,
         credential,
+        claim_salt: salt,
     })
 }
 

@@ -300,8 +300,12 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
 
                 let signer_hex =
                     hex::encode(identity.pq.public_identity().address_hash);
+                // Use canonical lowercase hex from parsed bytes, not raw user input.
+                // Upper/lower case differences would produce different Zenoh keys.
+                let input_hex = hex::encode(input_cid.to_bytes());
+                let output_hex = hex::encode(output_cid.to_bytes());
                 let key_expr =
-                    harmony_zenoh::namespace::memo::sign_key(&input, &output, &signer_hex);
+                    harmony_zenoh::namespace::memo::sign_key(&input_hex, &output_hex, &signer_hex);
 
                 println!("Key:    {key_expr}");
                 println!("Memo:   {}", hex::encode(&memo_bytes));

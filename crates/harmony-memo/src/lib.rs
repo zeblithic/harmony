@@ -23,11 +23,16 @@ pub const FORMAT_VERSION: u8 = 1;
 /// The `credential` field carries the cryptographic proof (issuer = subject
 /// for self-attestation). The claim value inside the credential is
 /// `input.to_bytes() || output.to_bytes()` (64 bytes), salted and hashed.
+/// The `claim_salt` is stored so receivers can re-derive the claim digest
+/// and verify the input/output binding is authentic (not tampered after signing).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memo {
     pub input: ContentId,
     pub output: ContentId,
     pub credential: Credential,
+    /// Salt used for the memo claim's selective disclosure hash.
+    /// Required for receivers to verify the input/output binding.
+    pub claim_salt: [u8; 16],
 }
 
 /// Errors from memo operations.
@@ -107,6 +112,7 @@ mod tests {
             input,
             output,
             credential,
+            claim_salt: [0x33; 16],
         }
     }
 

@@ -1,7 +1,9 @@
+use alloc::vec::Vec;
 use harmony_credential::{verify_credential, CredentialKeyResolver, StatusListResolver};
+use harmony_credential::claim::{Claim, SaltedClaim};
 use harmony_identity::IdentityRef;
 
-use crate::{Memo, MemoError};
+use crate::{Memo, MemoError, MEMO_CLAIM_TYPE};
 
 /// A no-op status list resolver that reports no revocations.
 ///
@@ -15,25 +17,46 @@ impl StatusListResolver for NoOpStatusList {
     }
 }
 
-/// Verify a memo's credential: time bounds, signature, and issuer resolution.
+/// Verify a memo's credential and input/output binding.
+///
+/// 1. Verifies credential signature, time bounds, and issuer resolution.
+/// 2. Re-derives the claim digest from `memo.input`, `memo.output`, and
+///    `memo.claim_salt`, then checks it matches `credential.claim_digests[0]`.
+///    This prevents tampering with input/output fields after signing.
 ///
 /// Uses a no-op status list resolver since memos do not support revocation.
-///
-/// # Parameters
-///
-/// - `memo`: the memo to verify
-/// - `now`: current timestamp as Unix seconds (sans-I/O: caller provides)
-/// - `keys`: resolver for the issuer's public key
-///
-/// # Errors
-///
-/// Returns `MemoError::Credential(...)` if the credential fails verification.
 pub fn verify_memo(
     memo: &Memo,
     now: u64,
     keys: &impl CredentialKeyResolver,
 ) -> Result<(), MemoError> {
+    // 1. Verify credential signature + time bounds
     verify_credential(&memo.credential, now, keys, &NoOpStatusList)?;
+
+    // 2. Verify input/output binding against the signed claim digest
+    if memo.credential.claim_digests.is_empty() {
+        return Err(MemoError::ClaimDecodingFailed);
+    }
+
+    // Reconstruct the claim value: input || output (64 bytes)
+    let mut claim_value = Vec::with_capacity(64);
+    claim_value.extend_from_slice(&memo.input.to_bytes());
+    claim_value.extend_from_slice(&memo.output.to_bytes());
+
+    // Re-derive the digest using the stored salt
+    let salted = SaltedClaim {
+        claim: Claim {
+            type_id: MEMO_CLAIM_TYPE,
+            value: claim_value,
+        },
+        salt: memo.claim_salt,
+    };
+    let expected_digest = salted.digest();
+
+    if memo.credential.claim_digests[0] != expected_digest {
+        return Err(MemoError::InputOutputMismatch);
+    }
+
     Ok(())
 }
 
@@ -122,6 +145,48 @@ mod tests {
         match result.unwrap_err() {
             MemoError::Credential(harmony_credential::CredentialError::NotYetValid) => {}
             other => panic!("expected NotYetValid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_tampered_input_fails() {
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let input = dummy_content_id(0x11);
+        let output = dummy_content_id(0x22);
+
+        let mut memo = create_memo(input, output, &identity, &mut OsRng, 1000, 2000)
+            .expect("create_memo should succeed");
+
+        // Tamper with the input field
+        memo.input = dummy_content_id(0xFF);
+
+        let keys = SingleKeyResolver::from_identity(&identity);
+        let result = verify_memo(&memo, 1500, &keys);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MemoError::InputOutputMismatch => {}
+            other => panic!("expected InputOutputMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_tampered_output_fails() {
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let input = dummy_content_id(0x11);
+        let output = dummy_content_id(0x22);
+
+        let mut memo = create_memo(input, output, &identity, &mut OsRng, 1000, 2000)
+            .expect("create_memo should succeed");
+
+        // Tamper with the output field
+        memo.output = dummy_content_id(0xFF);
+
+        let keys = SingleKeyResolver::from_identity(&identity);
+        let result = verify_memo(&memo, 1500, &keys);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MemoError::InputOutputMismatch => {}
+            other => panic!("expected InputOutputMismatch, got: {other:?}"),
         }
     }
 
