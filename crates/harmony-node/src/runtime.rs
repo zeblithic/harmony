@@ -621,11 +621,6 @@ impl<B: BookStore> NodeRuntime<B> {
         &mut self.contact_store
     }
 
-    /// Look up a cached ML-DSA public key by identity hash.
-    pub fn get_peer_pubkey(&self, identity_hash: &[u8; 16]) -> Option<&[u8]> {
-        self.pubkey_cache.get(identity_hash).map(|v| v.as_slice())
-    }
-
     /// Maximum number of cached public keys. Each ML-DSA-65 pubkey is ~1952 bytes,
     /// so 4096 entries ≈ 8 MB — acceptable for long-running nodes.
     const MAX_PUBKEY_CACHE_SIZE: usize = 4096;
@@ -3292,9 +3287,13 @@ mod tests {
             .store(issuer_hash, cid, content, 100_000)
             .unwrap();
 
-        // Cache the owner's ML-DSA public key.
+        // Cache the owner's ML-DSA public key via the event-driven path,
+        // exercising insert_pubkey_capped the same way production code does.
         let pubkey_bytes = owner_identity.verifying_key.as_bytes();
-        rt.pubkey_cache.insert(issuer_hash, pubkey_bytes);
+        rt.push_event(RuntimeEvent::PeerPublicKeyLearned {
+            identity_hash: issuer_hash,
+            dsa_pubkey: pubkey_bytes,
+        });
 
         (rt, owner, cid)
     }
@@ -3408,10 +3407,8 @@ mod tests {
             .unwrap();
         let token_bytes = token.to_bytes();
 
-        // Remove the stranger's pubkey from cache (it was never added).
-        // The owner's pubkey is cached, but the token issuer is the stranger.
-        rt.pubkey_cache.remove(&stranger_hash);
-
+        // The stranger's pubkey was never cached (only the owner's was).
+        // The token issuer is the stranger → unknown issuer → rejection.
         let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes, 1_700_000_000);
         assert!(result.is_none(), "unknown issuer should be rejected");
     }

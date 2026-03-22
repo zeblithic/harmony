@@ -606,10 +606,18 @@ pub async fn run(
                                                 });
                                             }
                                             ReplicationOp::PullWithToken => {
-                                                let unix_now = std::time::SystemTime::now()
+                                                // Fail-closed: reject if system clock is broken
+                                                // rather than passing unix_now=0 which bypasses
+                                                // expiry checks in the runtime.
+                                                let unix_now = match std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
-                                                    .map(|d| d.as_secs())
-                                                    .unwrap_or(0); // fail-closed handled in runtime
+                                                {
+                                                    Ok(d) => d.as_secs(),
+                                                    Err(_) => {
+                                                        tracing::warn!("system clock error; rejecting PullWithToken");
+                                                        continue;
+                                                    }
+                                                };
                                                 runtime.push_event(RuntimeEvent::ReplicaPullWithTokenReceived {
                                                     peer_identity: peer_id,
                                                     cid: rep_msg.cid,
