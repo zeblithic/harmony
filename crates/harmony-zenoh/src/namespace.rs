@@ -536,6 +536,27 @@ pub mod page {
         format!("{PREFIX}/{addr_00}/{addr_01}/*/*/*/*")
     }
 
+    /// Query by all 4 address variants: `harmony/page/{00}/{01}/{10}/{11}/*/*`
+    pub fn query_by_all_addrs(
+        addr_00: &str,
+        addr_01: &str,
+        addr_10: &str,
+        addr_11: &str,
+    ) -> String {
+        format!("{PREFIX}/{addr_00}/{addr_01}/{addr_10}/{addr_11}/*/*")
+    }
+
+    /// Query by all 4 addresses + book: `harmony/page/{00}/{01}/{10}/{11}/{book_cid}/*`
+    pub fn query_by_all_addrs_and_book(
+        addr_00: &str,
+        addr_01: &str,
+        addr_10: &str,
+        addr_11: &str,
+        book_cid: &str,
+    ) -> String {
+        format!("{PREFIX}/{addr_00}/{addr_01}/{addr_10}/{addr_11}/{book_cid}/*")
+    }
+
     /// Query all pages of a book: `harmony/page/*/*/*/*/{book_cid}/*`
     ///
     /// Uses `*` in non-terminal positions — works for Zenoh `session.get()`
@@ -989,6 +1010,21 @@ mod tests {
         let q = page::query_by_addr00_01("aabb0011", "ccdd2233");
         assert_eq!(q, "harmony/page/aabb0011/ccdd2233/*/*/*/*");
         assert_eq!(q.matches('*').count(), 4);
+    }
+
+    #[test]
+    fn page_query_by_all_addrs() {
+        let q = page::query_by_all_addrs("aabb0011", "ccdd2233", "eeff4455", "00116677");
+        assert_eq!(q, "harmony/page/aabb0011/ccdd2233/eeff4455/00116677/*/*");
+        assert_eq!(q.matches('*').count(), 2);
+    }
+
+    #[test]
+    fn page_query_by_all_addrs_and_book() {
+        let cid = "dd".repeat(32);
+        let q = page::query_by_all_addrs_and_book("aabb0011", "ccdd2233", "eeff4455", "00116677", &cid);
+        assert_eq!(q, format!("harmony/page/aabb0011/ccdd2233/eeff4455/00116677/{cid}/*"));
+        assert_eq!(q.matches('*').count(), 1);
     }
 
     #[test]
