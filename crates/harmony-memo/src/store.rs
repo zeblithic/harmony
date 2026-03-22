@@ -109,9 +109,9 @@ impl MemoStore {
         self.by_input.values().map(Vec::len).sum()
     }
 
-    /// Return `true` if the store contains no memos. O(1).
+    /// Return `true` if the store contains no memos.
     pub fn is_empty(&self) -> bool {
-        self.by_input.is_empty()
+        self.len() == 0
     }
 }
 

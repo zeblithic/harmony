@@ -138,11 +138,13 @@ enum MemoAction {
     /// List known memos for an input CID
     List {
         /// Input CID (hex, 64 chars)
+        #[arg(long)]
         input: String,
     },
     /// Show memo verification status for an input CID
     Verify {
         /// Input CID (hex, 64 chars)
+        #[arg(long)]
         input: String,
     },
 }
@@ -283,7 +285,8 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .map_err(|_| "system clock is before Unix epoch")?;
-                let expires_at = now + expires_in;
+                let expires_at = now.checked_add(expires_in)
+                    .ok_or("--expires-in value causes timestamp overflow")?;
 
                 let memo = harmony_memo::create::create_memo(
                     input_cid,
@@ -978,13 +981,13 @@ mod tests {
 
     #[test]
     fn cli_parses_memo_list() {
-        let cli = Cli::try_parse_from(["harmony", "memo", "list", &"cc".repeat(32)]).unwrap();
+        let cli = Cli::try_parse_from(["harmony", "memo", "list", "--input", &"cc".repeat(32)]).unwrap();
         assert!(matches!(cli.command, Commands::Memo { .. }));
     }
 
     #[test]
     fn cli_parses_memo_verify() {
-        let cli = Cli::try_parse_from(["harmony", "memo", "verify", &"dd".repeat(32)]).unwrap();
+        let cli = Cli::try_parse_from(["harmony", "memo", "verify", "--input", &"dd".repeat(32)]).unwrap();
         assert!(matches!(cli.command, Commands::Memo { .. }));
     }
 }
