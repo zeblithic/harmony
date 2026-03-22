@@ -62,7 +62,7 @@ No Docker, no QEMU — Nix provides the complete cross toolchain
 
 ```nix
 {
-  nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
   crane.url = "github:ipetkov/crane";
   iroh-src = {
     url = "github:n0-computer/iroh/v0.91.2";

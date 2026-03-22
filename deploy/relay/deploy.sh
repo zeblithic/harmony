@@ -29,8 +29,6 @@ GCP_REGION="${GCP_ZONE%-*}"
 VM_NAME="${VM_NAME:-harmony-relay}"
 MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
 CONTACT_EMAIL="${CONTACT_EMAIL:-admin@${RELAY_HOSTNAME}}"
-# iroh-relay version is pinned in flake.nix/flake.lock (not a CLI variable).
-# To update: edit flake.nix iroh-src input, run `nix flake update iroh-src`.
 LOCAL_BINARY="${LOCAL_BINARY:-}"
 
 # Rate limits (bytes/sec). Defaults: 100 KB/s sustained, 500 KB burst.
@@ -134,18 +132,10 @@ fi
 # ── Step 4: Build iroh-relay ──────────────────────────────────────
 # Two strategies, in order of preference:
 #   1. Use a pre-built binary (LOCAL_BINARY env var)
-<<<<<<< HEAD
-#   2. Nix cross-compile (works from any host, ~5 min)
-# If neither is available the script exits with install instructions.
-=======
 #   2. Nix build locally, push closure to VM
->>>>>>> origin/main
 
 BINARY_PATH=""
 BUILD_STRATEGY=""
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 if [ -n "$LOCAL_BINARY" ] && [ -f "$LOCAL_BINARY" ]; then
     echo "--- Step 4: Using pre-built binary: ${LOCAL_BINARY}"
@@ -153,26 +143,6 @@ if [ -n "$LOCAL_BINARY" ] && [ -f "$LOCAL_BINARY" ]; then
     BUILD_STRATEGY="prebuilt"
 
 elif command -v nix &>/dev/null; then
-<<<<<<< HEAD
-    echo "--- Step 4: Cross-compiling iroh-relay via Nix..."
-    STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux" \
-        --extra-experimental-features "nix-command flakes" \
-        --print-out-paths --no-link | head -1)
-    if [ -z "$STORE_PATH" ]; then
-        echo "ERROR: nix build returned empty store path"
-        exit 1
-    fi
-    BINARY_PATH="${STORE_PATH}/bin/iroh-relay"
-    BUILD_STRATEGY="nix"
-    echo "    Nix build complete: ${STORE_PATH}"
-
-else
-    echo "ERROR: Nix is required to build iroh-relay. Install Nix:"
-    echo "  curl --proto '=https' --tlsv1.2 -sSf https://install.determinate.systems/nix | sh"
-    echo ""
-    echo "Or provide a pre-built binary:"
-    echo "  LOCAL_BINARY=/path/to/iroh-relay ./deploy/relay/deploy.sh"
-=======
     echo "--- Step 4: Building iroh-relay via Nix..."
 
     # gcloud compute ssh runs a non-login, non-interactive shell where
@@ -287,22 +257,12 @@ else
 
 else
     echo "ERROR: Nix is not installed. Install Nix or set LOCAL_BINARY."
->>>>>>> origin/main
     exit 1
 fi
 
 # ── Step 5: Upload binary and install service ─────────────────────
 echo "--- Step 5: Installing iroh-relay service..."
 
-<<<<<<< HEAD
-# Upload binary to VM (BINARY_PATH is always set — from LOCAL_BINARY or Nix)
-echo "    Uploading binary to VM..."
-gcloud compute scp "$BINARY_PATH" "$VM_NAME:/tmp/iroh-relay" --zone="$GCP_ZONE"
-gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
-    sudo mv -f /tmp/iroh-relay /usr/local/bin/iroh-relay
-    sudo chmod +x /usr/local/bin/iroh-relay
-"
-=======
 # Install binary on the VM
 if [ -n "$BINARY_PATH" ]; then
     # Prebuilt: SCP + mv
@@ -320,7 +280,6 @@ elif [ "$BUILD_STRATEGY" = "nix" ]; then
         sudo chmod +x /usr/local/bin/iroh-relay
     "
 fi
->>>>>>> origin/main
 
 gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
     set -euo pipefail
