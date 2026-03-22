@@ -31,6 +31,11 @@ enum Commands {
         #[command(subcommand)]
         action: IdentityAction,
     },
+    /// Memo attestation commands
+    Memo {
+        #[command(subcommand)]
+        action: MemoAction,
+    },
     /// Start the Harmony node runtime
     Run {
         /// Path to config file (default: ~/.harmony/node.toml)
@@ -110,6 +115,35 @@ enum IdentityAction {
         message: String,
         /// Hex-encoded signature (128 hex chars)
         signature: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoAction {
+    /// Sign a memo attesting that input CID produces output CID
+    Sign {
+        /// Input CID (hex, 64 chars)
+        #[arg(long)]
+        input: String,
+        /// Output CID (hex, 64 chars)
+        #[arg(long)]
+        output: String,
+        /// Path to identity key file
+        #[arg(long, value_name = "PATH")]
+        identity_file: Option<std::path::PathBuf>,
+        /// Expiry in seconds from now (default: 365 days)
+        #[arg(long, default_value_t = 31_536_000)]
+        expires_in: u64,
+    },
+    /// List known memos for an input CID
+    List {
+        /// Input CID (hex, 64 chars)
+        input: String,
+    },
+    /// Show memo verification status for an input CID
+    Verify {
+        /// Input CID (hex, 64 chars)
+        input: String,
     },
 }
 
@@ -222,6 +256,68 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                         std::process::exit(1);
                     }
                 }
+            }
+        },
+        Commands::Memo { action } => match action {
+            MemoAction::Sign {
+                input,
+                output,
+                identity_file,
+                expires_in,
+            } => {
+                let input_bytes: [u8; 32] = decode_hex_key(&input, 32, "input CID")?
+                    .try_into()
+                    .map_err(|_| "input CID: internal length mismatch")?;
+                let output_bytes: [u8; 32] = decode_hex_key(&output, 32, "output CID")?
+                    .try_into()
+                    .map_err(|_| "output CID: internal length mismatch")?;
+
+                let input_cid = harmony_content::ContentId::from_bytes(input_bytes);
+                let output_cid = harmony_content::ContentId::from_bytes(output_bytes);
+
+                let id_path =
+                    crate::identity_file::resolve_path(identity_file.as_deref())?;
+                let identity = crate::identity_file::load_or_generate(&id_path)?;
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let expires_at = now + expires_in;
+
+                let memo = harmony_memo::create::create_memo(
+                    input_cid,
+                    output_cid,
+                    &identity.pq,
+                    &mut rand::rngs::OsRng,
+                    now,
+                    expires_at,
+                )
+                .map_err(|e| format!("failed to create memo: {e}"))?;
+
+                let memo_bytes =
+                    harmony_memo::serialize(&memo).map_err(|e| format!("serialize: {e}"))?;
+
+                let signer_hex =
+                    hex::encode(identity.pq.public_identity().address_hash);
+                let key_expr =
+                    harmony_zenoh::namespace::memo::sign_key(&input, &output, &signer_hex);
+
+                println!("Key:    {key_expr}");
+                println!("Memo:   {}", hex::encode(&memo_bytes));
+                println!("Signer: {signer_hex}");
+
+                // Zeroize identity on drop.
+                drop(identity);
+                Ok(())
+            }
+            MemoAction::List { input: _ } => {
+                eprintln!("MemoStore not yet connected to runtime");
+                Ok(())
+            }
+            MemoAction::Verify { input: _ } => {
+                eprintln!("MemoStore not yet connected to runtime");
+                Ok(())
             }
         },
         Commands::Run {
@@ -862,5 +958,29 @@ mod tests {
         } else {
             panic!("expected Run command");
         }
+    }
+
+    #[test]
+    fn cli_parses_memo_sign() {
+        let input_hex = "aa".repeat(32);
+        let output_hex = "bb".repeat(32);
+        let cli = Cli::try_parse_from([
+            "harmony", "memo", "sign",
+            "--input", &input_hex,
+            "--output", &output_hex,
+        ]).unwrap();
+        assert!(matches!(cli.command, Commands::Memo { .. }));
+    }
+
+    #[test]
+    fn cli_parses_memo_list() {
+        let cli = Cli::try_parse_from(["harmony", "memo", "list", &"cc".repeat(32)]).unwrap();
+        assert!(matches!(cli.command, Commands::Memo { .. }));
+    }
+
+    #[test]
+    fn cli_parses_memo_verify() {
+        let cli = Cli::try_parse_from(["harmony", "memo", "verify", &"dd".repeat(32)]).unwrap();
+        assert!(matches!(cli.command, Commands::Memo { .. }));
     }
 }
