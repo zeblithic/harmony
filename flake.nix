@@ -2,9 +2,8 @@
   description = "Harmony — decentralized internet stack";
 
   inputs = {
-    # nixos-unstable for latest musl/Rust toolchain. Consider pinning to
-    # a stable release (e.g. nixos-24.11) once cross-compilation is validated.
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Stable channel for reproducible builds.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
     crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
 
