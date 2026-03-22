@@ -70,7 +70,6 @@ pub fn signing_input(compact: &str) -> Result<(&str, &str), SdJwtError> {
 ///
 /// This function requires the `std` feature because it uses `serde_json` for
 /// JSON deserialization.
-/// Parse an SD-JWT compact serialization string.
 ///
 /// # Security
 ///
@@ -162,9 +161,14 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
+                .map(|v| {
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .ok_or(SdJwtError::MalformedCompact)
+                })
+                .collect::<Result<Vec<_>, _>>()
         })
+        .transpose()?
         .unwrap_or_default();
 
     let sd_alg = payload_json

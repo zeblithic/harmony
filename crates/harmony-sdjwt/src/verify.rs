@@ -7,7 +7,8 @@ use crate::types::SdJwt;
 fn alg_to_suite(alg: &str) -> Result<CryptoSuite, SdJwtError> {
     match alg {
         "EdDSA" => Ok(CryptoSuite::Ed25519),
-        "MLDSA65" => Ok(CryptoSuite::MlDsa65),
+        // IETF draft-ietf-cose-dilithium uses "ML-DSA-65" (with hyphens)
+        "ML-DSA-65" => Ok(CryptoSuite::MlDsa65),
         other => Err(SdJwtError::UnsupportedAlgorithm(
             alloc::string::String::from(other),
         )),
@@ -18,7 +19,7 @@ fn alg_to_suite(alg: &str) -> Result<CryptoSuite, SdJwtError> {
 ///
 /// Uses `sd_jwt.signing_input` as the message for lossless verification.
 /// The caller resolves the correct public key via DID resolution.
-/// `MLDSA65` maps to `CryptoSuite::MlDsa65` (not Rotatable).
+/// `ML-DSA-65` maps to `CryptoSuite::MlDsa65` (not Rotatable).
 pub fn verify(
     sd_jwt: &SdJwt,
     suite: CryptoSuite,
