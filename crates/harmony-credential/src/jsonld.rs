@@ -16,7 +16,7 @@ const HARMONY_CONTEXT: &str = "https://harmony.id/ns/credentials/v1";
 
 /// Encode an IdentityRef + public key bytes as a `did:key` string.
 ///
-/// Returns `Err(SignatureInvalid)` if the key length doesn't match the suite
+/// Returns `Err(InvalidKeyLength)` if the key length doesn't match the suite
 /// (32 bytes for Ed25519, 1952 bytes for ML-DSA-65).
 pub fn identity_to_did_key(
     identity: &IdentityRef,
