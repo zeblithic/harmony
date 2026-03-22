@@ -713,21 +713,29 @@ async fn dispatch_action(
         RuntimeAction::SendOnInterface {
             ref interface_name,
             ref raw,
+            weight,
         } => {
-            if interface_name.starts_with("tunnel-") {
-                if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {
-                    if sender.try_send_reticulum(raw.clone()).is_err() {
-                        tracing::warn!(%interface_name, "tunnel send queue full — dropping packet");
+            let should_send = match weight {
+                None => true,                          // directed: always send
+                Some(w) if w >= 1.0 => true,           // best interface: always send
+                Some(w) => rand::random::<f32>() < w,  // probabilistic
+            };
+            if should_send {
+                if interface_name.starts_with("tunnel-") {
+                    if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {
+                        if sender.try_send_reticulum(raw.clone()).is_err() {
+                            tracing::warn!(%interface_name, "tunnel send queue full — dropping packet");
+                        }
                     }
-                }
-            } else {
-                if let Err(e) = udp.send_to(raw, broadcast_addr).await {
-                    tracing::warn!(err = %e, "UDP broadcast send error");
-                }
-                if let Some(peers) = peer_table {
-                    for addr in peers.peer_addrs() {
-                        if let Err(e) = udp.send_to(raw, addr).await {
-                            tracing::warn!(peer = %addr, err = %e, "UDP unicast send error");
+                } else {
+                    if let Err(e) = udp.send_to(raw, broadcast_addr).await {
+                        tracing::warn!(err = %e, "UDP broadcast send error");
+                    }
+                    if let Some(peers) = peer_table {
+                        for addr in peers.peer_addrs() {
+                            if let Err(e) = udp.send_to(raw, addr).await {
+                                tracing::warn!(peer = %addr, err = %e, "UDP unicast send error");
+                            }
                         }
                     }
                 }
