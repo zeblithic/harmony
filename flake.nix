@@ -2,6 +2,8 @@
   description = "Harmony — decentralized internet stack";
 
   inputs = {
+    # nixos-unstable for latest musl/Rust toolchain. Consider pinning to
+    # a stable release (e.g. nixos-24.11) once cross-compilation is validated.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
@@ -94,6 +96,15 @@
               crossOpenssl
             ];
 
+            # Override .cargo/config.toml linker settings — Nix provides
+            # the correct cross-linker via crossPkgs.stdenv.cc. The env var
+            # CARGO_TARGET_<TRIPLE>_LINKER takes precedence over config.toml.
+            targetUpper = builtins.replaceStrings ["-"] ["_"]
+              (pkgs.lib.toUpper crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec);
+            linkerEnv = {
+              "CARGO_TARGET_${targetUpper}_LINKER" = "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
+            };
+
             crossHarmonyCommonArgs = {
               src = crossSrc;
               pname = "harmony-node";
@@ -104,7 +115,7 @@
               CARGO_BUILD_TARGET = crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
               CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
               HOST_CC = "${pkgs.stdenv.cc}/bin/cc";
-            };
+            } // linkerEnv;
 
             crossHarmonyDeps = crossCraneLib.buildDepsOnly crossHarmonyCommonArgs;
 
@@ -122,7 +133,7 @@
               CARGO_BUILD_TARGET = crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
               CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
               HOST_CC = "${pkgs.stdenv.cc}/bin/cc";
-            };
+            } // linkerEnv;
 
             crossIrohRelayDeps = crossCraneLib.buildDepsOnly crossIrohRelayCommonArgs;
 
@@ -150,6 +161,11 @@
           harmony-node-aarch64-linux = aarch64LinuxMusl.harmony-node;
           iroh-relay-x86_64-linux = x86_64LinuxMusl.iroh-relay;
           iroh-relay-aarch64-linux = aarch64LinuxMusl.iroh-relay;
+        };
+
+        # Checks: nix flake check exercises native builds
+        checks = {
+          inherit harmony-node iroh-relay;
         };
       }
     );

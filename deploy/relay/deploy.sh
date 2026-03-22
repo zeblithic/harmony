@@ -111,41 +111,35 @@ fi
 # ── Step 4: Build iroh-relay ──────────────────────────────────────
 # Three strategies, in order of preference:
 #   1. Use a pre-built binary (LOCAL_BINARY env var)
-#   2. Build locally and SCP (if host is x86_64-linux and cargo available)
-#   3. Build on the VM (slow, ~15 min on e2-micro)
+#   2. Nix cross-compile (works from any host, ~5 min)
+#   3. Build on the VM (slow fallback, ~15 min on e2-micro)
 
 BINARY_PATH=""
 BUILD_STRATEGY=""
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 if [ -n "$LOCAL_BINARY" ] && [ -f "$LOCAL_BINARY" ]; then
     echo "--- Step 4: Using pre-built binary: ${LOCAL_BINARY}"
     BINARY_PATH="$LOCAL_BINARY"
     BUILD_STRATEGY="prebuilt"
 
-elif command -v cargo &>/dev/null && [ "$(uname -sm)" = "Linux x86_64" ]; then
-    echo "--- Step 4: Building iroh-relay locally (faster than remote build)..."
-    BUILD_DIR="/tmp/iroh-relay-build"
-    if [ ! -d "$BUILD_DIR" ]; then
-        git clone --depth=1 --branch "$IROH_VERSION" "$IROH_REPO" "$BUILD_DIR"
-    else
-        cd "$BUILD_DIR"
-        git fetch --depth=1 origin "$IROH_VERSION"
-        git checkout FETCH_HEAD
-        cd - > /dev/null
+elif command -v nix &>/dev/null; then
+    echo "--- Step 4: Cross-compiling iroh-relay via Nix..."
+    STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux" \
+        --extra-experimental-features "nix-command flakes" \
+        --print-out-paths --no-link)
+    if [ -z "$STORE_PATH" ]; then
+        echo "ERROR: nix build returned empty store path"
+        exit 1
     fi
-    echo "    Building (this takes ~2 min locally)..."
-    cargo build --release --manifest-path "$BUILD_DIR/Cargo.toml" \
-        -p iroh-relay --features server --bin iroh-relay
-    BINARY_PATH="$BUILD_DIR/target/release/iroh-relay"
-    BUILD_STRATEGY="local"
-    echo "    Local build complete."
+    BINARY_PATH="${STORE_PATH}/bin/iroh-relay"
+    BUILD_STRATEGY="nix"
+    echo "    Nix build complete: ${STORE_PATH}"
 
 else
-    if command -v cargo &>/dev/null; then
-        echo "--- Step 4: Local Rust found but host arch ($(uname -sm)) != VM (Linux x86_64)."
-        echo "    Falling back to remote build..."
-    fi
-    echo "--- Step 4: No local Rust — building on VM (slow, ~15 min on e2-micro)..."
+    echo "--- Step 4: No Nix found — building on VM (slow, ~15 min on e2-micro)..."
 
     BUILD_STRATEGY="remote"
 
