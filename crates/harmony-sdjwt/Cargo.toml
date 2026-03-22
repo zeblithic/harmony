@@ -1,0 +1,22 @@
+[package]
+name = "harmony-sdjwt"
+description = "SD-JWT (RFC 9901) parser and JWS signature verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harmony-identity = { workspace = true }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+serde_json = { workspace = true, optional = true }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+[features]
+default = ["std"]
+std = ["dep:serde_json", "serde_json?/std", "harmony-identity/std", "serde/std", "base64/std"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
+rand = { workspace = true }
