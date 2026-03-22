@@ -429,6 +429,7 @@ impl Node {
 
     /// Unregister an interface. Returns `true` if it was registered.
     pub fn unregister_interface(&mut self, name: &str) -> bool {
+        self.cooperation.remove_interface(name);
         self.interfaces.remove(name).is_some()
     }
 
@@ -529,14 +530,29 @@ impl Node {
         // Broadcast on all interfaces — separate borrow of self.interfaces.
         let actions = self.broadcast_on_all_interfaces(&raw);
 
-        // Record pending echo entries for each interface we successfully sent on.
-        // When we later hear this announce come back via a *different* interface,
-        // we credit the echoing interface as a positive cooperation signal.
+        // Record pending echo entries ONLY for guaranteed-delivery interfaces
+        // (weight >= 1.0 or None). An interface that was probabilistically dropped
+        // by the event loop can't produce an echo, so recording it would create a
+        // false negative timeout → score death spiral.
+        //
+        // The timeout negative signal only applies to interfaces we know actually
+        // sent. Other interfaces can still earn positive signals when echoes arrive.
         let dest = *dest_hash;
         for action in &actions {
-            if let NodeAction::SendOnInterface { interface_name, .. } = action {
-                self.pending_echoes
-                    .insert((Arc::clone(interface_name), dest), now);
+            if let NodeAction::SendOnInterface {
+                interface_name,
+                weight,
+                ..
+            } = action
+            {
+                let guaranteed = match weight {
+                    None => true,
+                    Some(w) => *w >= 1.0,
+                };
+                if guaranteed {
+                    self.pending_echoes
+                        .insert((Arc::clone(interface_name), dest), now);
+                }
             }
         }
 
@@ -773,9 +789,15 @@ impl Node {
             }
         }
         // Include any interfaces not yet in the cooperation table.
+        // Safety net: send unweighted on any interface missing from the cooperation
+        // table. Should not happen in practice (register_interface adds to both maps).
         for name in self.interfaces.keys() {
             let excluded = exclude.map_or(false, |e| &**name == e);
             if !excluded && !weights.iter().any(|(n, _)| n == name) {
+                debug_assert!(
+                    false,
+                    "interface {name} missing from cooperation table — sending unweighted"
+                );
                 actions.extend(self.send_on_interface(name, raw));
             }
         }

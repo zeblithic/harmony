@@ -17,7 +17,7 @@ pub struct CooperationScore {
     pub combined: f32,
     /// Total number of observations recorded.
     pub observation_count: u64,
-    /// Monotonic timestamp (ms) of the last observation.
+    /// Monotonic timestamp (seconds) of the last observation.
     pub last_observed: u64,
 }
 
@@ -399,7 +399,7 @@ mod tests {
         }
         let before = table.scores["eth0"].announce_score;
 
-        // Decay at staleness_window + 2 ms (well past the window since last_observed=1).
+        // Decay at staleness_window + 2 seconds (well past the window since last_observed=1).
         let now = table.staleness_window + 2;
         table.decay_stale(now);
 
