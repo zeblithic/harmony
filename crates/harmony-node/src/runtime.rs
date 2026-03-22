@@ -180,8 +180,7 @@ pub enum RuntimeEvent {
     /// Replication: encrypted book data received from a peer.
     ReplicaReceived {
         peer_identity: [u8; 16],
-        /// ReplicationOp discriminant (0x01 = Push, 0x06 = PullWithToken).
-        op: u8,
+        op: harmony_tunnel::replication::ReplicationOp,
         cid: [u8; 32],
         data: Vec<u8>,
     },
@@ -859,8 +858,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 cid,
                 data,
             } => {
+                use harmony_tunnel::replication::ReplicationOp;
                 match op {
-                    0x01 => {
+                    ReplicationOp::Push => {
                         // Push: store the replica if the peer has quota.
                         let quota = self
                             .contact_store
@@ -873,7 +873,7 @@ impl<B: BookStore> NodeRuntime<B> {
                                 self.replica_store.store(peer_identity, cid, data, quota);
                         }
                     }
-                    0x06 => {
+                    ReplicationOp::PullWithToken => {
                         // PullWithToken: validate token and serve content.
                         if let Some(action) =
                             self.handle_pull_with_token(peer_identity, cid, data)
@@ -1233,13 +1233,10 @@ impl<B: BookStore> NodeRuntime<B> {
             return None;
         }
 
-        // 6. Check owner — the replica must have been pushed by the token issuer
-        if self.replica_store.retrieve(&token.issuer, &cid).is_none() {
-            tracing::debug!("no replica from token issuer for this CID");
-            return None;
-        }
-
-        // 7. Verify ML-DSA signature
+        // 6. Verify ML-DSA signature BEFORE any state-dependent lookups.
+        //    Checking the replica store first would create a timing oracle:
+        //    an attacker could probe which (issuer, cid) pairs exist by
+        //    observing fast-reject (no replica) vs slow-reject (sig verify).
         let pubkey_bytes = match self.pubkey_cache.get(&token.issuer) {
             Some(pk) => pk,
             None => {
@@ -1259,8 +1256,15 @@ impl<B: BookStore> NodeRuntime<B> {
             return None;
         }
 
-        // All checks passed — serve the content
-        let data = self.replica_store.retrieve(&token.issuer, &cid)?;
+        // 7. Signature verified — now safe to probe replica store.
+        //    Single retrieve() call serves both existence check and data fetch.
+        let data = match self.replica_store.retrieve(&token.issuer, &cid) {
+            Some(d) => d,
+            None => {
+                tracing::debug!("no replica from token issuer for this CID");
+                return None;
+            }
+        };
         Some(RuntimeAction::ReplicaPullResponse {
             peer_identity,
             cid,
@@ -1277,6 +1281,11 @@ impl<B: BookStore> NodeRuntime<B> {
         let identity_hash = record.identity_ref.hash;
 
         // Cache the peer's public key for token signature verification.
+        // SAFETY: AnnounceRecords are signature-verified by verify_announce()
+        // before reaching this point (see DiscoveryAnnounceReceived handler).
+        // The V1 security caveat (announce records don't yet verify pubkey→hash
+        // binding) is documented in harmony-discovery crate docs. When address
+        // re-derivation is implemented, a binding check should be added here.
         if !record.public_key.is_empty() {
             self.pubkey_cache
                 .insert(identity_hash, record.public_key.clone());
@@ -3114,7 +3123,7 @@ mod tests {
 
         rt.push_event(RuntimeEvent::ReplicaReceived {
             peer_identity: [0xAA; 16],
-            op: 0x01,
+            op: harmony_tunnel::replication::ReplicationOp::Push,
             cid: [0xBB; 32],
             data: vec![1, 2, 3, 4, 5],
         });
@@ -3148,7 +3157,7 @@ mod tests {
 
         rt.push_event(RuntimeEvent::ReplicaReceived {
             peer_identity: [0xAA; 16],
-            op: 0x01,
+            op: harmony_tunnel::replication::ReplicationOp::Push,
             cid: [0xBB; 32],
             data: vec![1, 2, 3, 4, 5],
         });
@@ -3164,7 +3173,7 @@ mod tests {
         // No contact at all for this peer
         rt.push_event(RuntimeEvent::ReplicaReceived {
             peer_identity: [0xFF; 16],
-            op: 0x01,
+            op: harmony_tunnel::replication::ReplicationOp::Push,
             cid: [0xBB; 32],
             data: vec![1, 2, 3],
         });
@@ -3175,7 +3184,7 @@ mod tests {
     fn runtime_event_replica_variant_exists() {
         let _e = RuntimeEvent::ReplicaReceived {
             peer_identity: [0xAA; 16],
-            op: 0x01,
+            op: harmony_tunnel::replication::ReplicationOp::Push,
             cid: [0xBB; 32],
             data: vec![1, 2, 3],
         };

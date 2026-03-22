@@ -604,7 +604,7 @@ pub async fn run(
                                         if let Some(contact) = runtime.contact_store().find_by_tunnel_node_id(node_id) {
                                             runtime.push_event(RuntimeEvent::ReplicaReceived {
                                                 peer_identity: contact.identity_hash,
-                                                op: rep_msg.op as u8,
+                                                op: rep_msg.op,
                                                 cid: rep_msg.cid,
                                                 data: rep_msg.payload,
                                             });
