@@ -283,6 +283,11 @@ impl<B: BookStore> StorageTier<B> {
         &self.flatpack
     }
 
+    /// Retrieve raw book data by CID from the underlying content store.
+    pub fn get(&self, cid: &ContentId) -> Option<&[u8]> {
+        self.cache.get(cid)
+    }
+
     /// Mutable access to the underlying content store (crate-internal).
     #[allow(dead_code)]
     pub(crate) fn cache_mut(&mut self) -> &mut ContentStore<B> {
