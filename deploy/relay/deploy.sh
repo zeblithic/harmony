@@ -129,7 +129,7 @@ elif command -v nix &>/dev/null; then
     echo "--- Step 4: Cross-compiling iroh-relay via Nix..."
     STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux" \
         --extra-experimental-features "nix-command flakes" \
-        --print-out-paths --no-link)
+        --print-out-paths --no-link | head -1)
     if [ -z "$STORE_PATH" ]; then
         echo "ERROR: nix build returned empty store path"
         exit 1
