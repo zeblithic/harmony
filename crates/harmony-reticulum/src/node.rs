@@ -751,33 +751,42 @@ impl Node {
 
     /// Broadcast on all interfaces except the named one (source exclusion).
     ///
-    /// Each interface gets a cooperation weight via `get_broadcast_weights()`.
+    /// Computes cooperation weights AFTER excluding the source interface, so the
+    /// "force highest to 1.0" guarantee applies to the actual sending set.
     fn broadcast_except(&self, exclude: &str, raw: &[u8]) -> Vec<NodeAction> {
-        let weights = self.cooperation.get_broadcast_weights();
+        let all_weights = self.cooperation.get_broadcast_weights();
+        // Filter out excluded interface, then re-apply "highest = 1.0" invariant.
+        let filtered: Vec<_> = all_weights
+            .into_iter()
+            .filter(|(n, _)| n.as_ref() != exclude)
+            .collect();
+        let max_w = filtered.iter().map(|(_, w)| *w).fold(f32::NEG_INFINITY, f32::max);
+        let weights: Vec<(Arc<str>, f32)> = filtered
+            .into_iter()
+            .map(|(n, w)| if w >= max_w { (n, 1.0) } else { (n, w) })
+            .collect();
         let mut actions = Vec::with_capacity(self.interfaces.len());
         for (name, weight) in &weights {
-            if &**name != exclude {
-                if let Some(iface) = self.interfaces.get(&**name) {
-                    let outbound = if let Some(ref auth) = iface.ifac {
-                        match auth.mask(raw) {
-                            Ok(masked) => masked,
-                            Err(_) => {
-                                actions.push(NodeAction::PacketDropped {
-                                    reason: DropReason::OutboundIfacFailed,
-                                    interface_name: Arc::clone(name),
-                                });
-                                continue;
-                            }
+            if let Some(iface) = self.interfaces.get(&**name) {
+                let outbound = if let Some(ref auth) = iface.ifac {
+                    match auth.mask(raw) {
+                        Ok(masked) => masked,
+                        Err(_) => {
+                            actions.push(NodeAction::PacketDropped {
+                                reason: DropReason::OutboundIfacFailed,
+                                interface_name: Arc::clone(name),
+                            });
+                            continue;
                         }
-                    } else {
-                        raw.to_vec()
-                    };
-                    actions.push(NodeAction::SendOnInterface {
-                        interface_name: Arc::clone(name),
-                        raw: outbound,
-                        weight: Some(*weight),
-                    });
-                }
+                    }
+                } else {
+                    raw.to_vec()
+                };
+                actions.push(NodeAction::SendOnInterface {
+                    interface_name: Arc::clone(name),
+                    raw: outbound,
+                    weight: Some(*weight),
+                });
             }
         }
         // Include any interfaces not yet in the cooperation table.
@@ -1143,30 +1152,24 @@ impl Node {
 
         // Announce echo detection: if this announce is for a destination we own,
         // a neighbor forwarded our announce back to us. Credit the *receiving*
-        // interface (the neighbor's interface) as a positive cooperation signal,
-        // but only if we originally sent the announce on a *different* interface.
+        // interface — the neighbor on that interface cooperated by forwarding.
+        //
+        // We broadcast announces on ALL interfaces, so any echo arriving on any
+        // interface means that interface's neighbor forwarded it. No need to check
+        // which interface we sent on — we sent on all of them.
         if self.announcing_destinations.contains_key(&destination_hash) {
-            // Check if we sent this announce on some interface (i.e. pending echo exists)
-            let sent_on_this_iface = self
+            // Confirm we actually originated an announce recently (pending echo exists)
+            let has_pending = self
                 .pending_echoes
-                .contains_key(&(Arc::clone(&interface_name), destination_hash));
-
-            // Only credit if the echo arrived on an interface we did NOT send on
-            if !sent_on_this_iface {
-                // Check that at least one pending echo exists for this dest_hash
-                // (confirming we did originate an announce for it recently)
-                let has_pending = self
-                    .pending_echoes
-                    .keys()
-                    .any(|(_, dh)| *dh == destination_hash);
-                if has_pending {
-                    self.cooperation
-                        .observe_announce_forwarded(&interface_name, now);
-                    // Remove all pending echo entries for this dest_hash since
-                    // we got confirmation that the announce is propagating
-                    self.pending_echoes
-                        .retain(|(_iface, dh), _| *dh != destination_hash);
-                }
+                .keys()
+                .any(|(_, dh)| *dh == destination_hash);
+            if has_pending {
+                self.cooperation
+                    .observe_announce_forwarded(&interface_name, now);
+                // Clear pending echoes for this dest — announce is propagating.
+                // New echoes will be tracked from the next announce cycle.
+                self.pending_echoes
+                    .retain(|(_, dh), _| *dh != destination_hash);
             }
         }
 

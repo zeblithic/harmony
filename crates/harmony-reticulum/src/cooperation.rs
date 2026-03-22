@@ -186,6 +186,9 @@ impl CooperationTable {
                 score.proof_score =
                     (score.proof_score + 0.1 * (initial - score.proof_score)).max(floor);
                 Self::recombine(score);
+                // Reset last_observed so decay fires once per staleness window,
+                // not on every tick after the window passes.
+                score.last_observed = now;
             }
         }
     }
