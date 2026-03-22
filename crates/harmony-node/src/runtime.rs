@@ -180,6 +180,8 @@ pub enum RuntimeEvent {
     /// Replication: encrypted book data received from a peer.
     ReplicaReceived {
         peer_identity: [u8; 16],
+        /// ReplicationOp discriminant (0x01 = Push, 0x06 = PullWithToken).
+        op: u8,
         cid: [u8; 32],
         data: Vec<u8>,
     },
@@ -227,6 +229,12 @@ pub enum RuntimeAction {
     CloseTunnel { identity_hash: [u8; 16] },
     /// Replication: push encrypted book data to a peer for storage.
     ReplicaPush {
+        peer_identity: [u8; 16],
+        cid: [u8; 32],
+        data: Vec<u8>,
+    },
+    /// Replication: serve replicated content in response to a validated PullWithToken.
+    ReplicaPullResponse {
         peer_identity: [u8; 16],
         cid: [u8; 32],
         data: Vec<u8>,
@@ -847,17 +855,33 @@ impl<B: BookStore> NodeRuntime<B> {
             }
             RuntimeEvent::ReplicaReceived {
                 peer_identity,
+                op,
                 cid,
                 data,
             } => {
-                let quota = self
-                    .contact_store
-                    .get(&peer_identity)
-                    .and_then(|c| c.replication.as_ref())
-                    .map(|r| r.quota_bytes)
-                    .unwrap_or(0);
-                if quota > 0 {
-                    let _ = self.replica_store.store(peer_identity, cid, data, quota);
+                match op {
+                    0x01 => {
+                        // Push: store the replica if the peer has quota.
+                        let quota = self
+                            .contact_store
+                            .get(&peer_identity)
+                            .and_then(|c| c.replication.as_ref())
+                            .map(|r| r.quota_bytes)
+                            .unwrap_or(0);
+                        if quota > 0 {
+                            let _ =
+                                self.replica_store.store(peer_identity, cid, data, quota);
+                        }
+                    }
+                    0x06 => {
+                        // PullWithToken: validate token and serve content.
+                        if let Some(action) =
+                            self.handle_pull_with_token(peer_identity, cid, data)
+                        {
+                            self.pending_direct_actions.push(action);
+                        }
+                    }
+                    _ => {}
                 }
             }
             RuntimeEvent::PeerPublicKeyLearned {
@@ -1156,6 +1180,92 @@ impl<B: BookStore> NodeRuntime<B> {
         // IdentityDiscovered requires Zenoh liveliness tokens (not wired).
         // Other actions (PublishAnnounce, SetLiveliness, etc.) deferred to
         // full Zenoh wiring.
+    }
+
+    /// Validate a PullWithToken request and emit a PullResponse if authorized.
+    ///
+    /// 7-step validation: deserialize token, check capability==Content,
+    /// check resource==cid, check expiry, check not-before, check owner
+    /// (replica exists from issuer), verify ML-DSA signature.
+    fn handle_pull_with_token(
+        &self,
+        peer_identity: [u8; 16],
+        cid: [u8; 32],
+        token_bytes: Vec<u8>,
+    ) -> Option<RuntimeAction> {
+        use harmony_content::replica::ReplicaStore;
+
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // 1. Deserialize token
+        let token = match harmony_identity::PqUcanToken::from_bytes(&token_bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!("token parse failed: {e:?}");
+                return None;
+            }
+        };
+
+        // 2. Check capability
+        if token.capability != harmony_identity::CapabilityType::Content {
+            tracing::debug!("token capability is not Content");
+            return None;
+        }
+
+        // 3. Check resource matches CID
+        if token.resource.len() != 32 || token.resource[..] != cid[..] {
+            tracing::debug!("token resource doesn't match requested CID");
+            return None;
+        }
+
+        // 4. Check expiry
+        if token.expires_at != 0 && token.expires_at <= unix_now {
+            tracing::debug!("token expired");
+            return None;
+        }
+
+        // 5. Check not-before
+        if token.not_before > unix_now {
+            tracing::debug!("token not yet valid");
+            return None;
+        }
+
+        // 6. Check owner — the replica must have been pushed by the token issuer
+        if self.replica_store.retrieve(&token.issuer, &cid).is_none() {
+            tracing::debug!("no replica from token issuer for this CID");
+            return None;
+        }
+
+        // 7. Verify ML-DSA signature
+        let pubkey_bytes = match self.pubkey_cache.get(&token.issuer) {
+            Some(pk) => pk,
+            None => {
+                tracing::debug!("issuer public key not cached");
+                return None;
+            }
+        };
+        let pubkey = match harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(pubkey_bytes) {
+            Ok(pk) => pk,
+            Err(_) => {
+                tracing::debug!("cached pubkey invalid");
+                return None;
+            }
+        };
+        if token.verify_signature(&pubkey).is_err() {
+            tracing::debug!("token signature verification failed");
+            return None;
+        }
+
+        // All checks passed — serve the content
+        let data = self.replica_store.retrieve(&token.issuer, &cid)?;
+        Some(RuntimeAction::ReplicaPullResponse {
+            peer_identity,
+            cid,
+            data,
+        })
     }
 
     /// Extract `RoutingHint::Tunnel` from a discovery record and auto-populate
@@ -3004,6 +3114,7 @@ mod tests {
 
         rt.push_event(RuntimeEvent::ReplicaReceived {
             peer_identity: [0xAA; 16],
+            op: 0x01,
             cid: [0xBB; 32],
             data: vec![1, 2, 3, 4, 5],
         });
@@ -3037,6 +3148,7 @@ mod tests {
 
         rt.push_event(RuntimeEvent::ReplicaReceived {
             peer_identity: [0xAA; 16],
+            op: 0x01,
             cid: [0xBB; 32],
             data: vec![1, 2, 3, 4, 5],
         });
@@ -3052,6 +3164,7 @@ mod tests {
         // No contact at all for this peer
         rt.push_event(RuntimeEvent::ReplicaReceived {
             peer_identity: [0xFF; 16],
+            op: 0x01,
             cid: [0xBB; 32],
             data: vec![1, 2, 3],
         });
@@ -3062,6 +3175,7 @@ mod tests {
     fn runtime_event_replica_variant_exists() {
         let _e = RuntimeEvent::ReplicaReceived {
             peer_identity: [0xAA; 16],
+            op: 0x01,
             cid: [0xBB; 32],
             data: vec![1, 2, 3],
         };
@@ -3074,5 +3188,209 @@ mod tests {
             cid: [0xBB; 32],
             data: vec![1, 2, 3],
         };
+    }
+
+    #[test]
+    fn runtime_action_replica_pull_response_variant_exists() {
+        let _a = RuntimeAction::ReplicaPullResponse {
+            peer_identity: [0xAA; 16],
+            cid: [0xBB; 32],
+            data: vec![1, 2, 3],
+        };
+    }
+
+    // ── PullWithToken tests ─────────────────────────────────────────────
+
+    /// Helper: set up a runtime with a contact, replica, and cached pubkey
+    /// for PullWithToken testing. Returns (runtime, identity, cid).
+    fn setup_pull_with_token_runtime() -> (
+        NodeRuntime<MemoryBookStore>,
+        harmony_identity::PqPrivateIdentity,
+        [u8; 32],
+    ) {
+        use harmony_content::replica::ReplicaStore;
+        use rand::rngs::OsRng;
+
+        let (mut rt, _) = make_runtime();
+
+        // Generate a PQ identity for the content owner (issuer).
+        let owner = harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
+        let owner_identity = owner.public_identity();
+        let issuer_hash = owner_identity.address_hash;
+
+        // Add contact with replication quota so we can store a replica.
+        let contact = harmony_contacts::Contact {
+            identity_hash: issuer_hash,
+            display_name: None,
+            peering: harmony_contacts::PeeringPolicy {
+                enabled: true,
+                priority: harmony_contacts::PeeringPriority::Normal,
+            },
+            added_at: 1000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![],
+            replication: Some(harmony_contacts::ReplicationPolicy {
+                quota_bytes: 100_000,
+            }),
+        };
+        rt.contact_store_mut().add(contact).unwrap();
+
+        // Store a replica as the owner.
+        let cid = [0xCC; 32];
+        let content = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        rt.replica_store
+            .store(issuer_hash, cid, content, 100_000)
+            .unwrap();
+
+        // Cache the owner's ML-DSA public key.
+        let pubkey_bytes = owner_identity.verifying_key.as_bytes();
+        rt.pubkey_cache.insert(issuer_hash, pubkey_bytes);
+
+        (rt, owner, cid)
+    }
+
+    #[test]
+    fn pull_with_token_valid_serves_content() {
+        use rand::rngs::OsRng;
+
+        let (rt, owner, cid) = setup_pull_with_token_runtime();
+
+        // Issue a valid token granting Content access to this CID.
+        let requester_hash = [0x42; 16];
+        let token = owner
+            .issue_pq_root_token(
+                &mut OsRng,
+                &requester_hash,
+                harmony_identity::CapabilityType::Content,
+                &cid,
+                0,        // not_before
+                0,        // expires_at (0 = no expiry)
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes);
+        assert!(result.is_some(), "valid token should produce a response");
+        match result.unwrap() {
+            RuntimeAction::ReplicaPullResponse {
+                peer_identity,
+                cid: resp_cid,
+                data,
+            } => {
+                assert_eq!(peer_identity, requester_hash);
+                assert_eq!(resp_cid, cid);
+                assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            other => panic!("expected ReplicaPullResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pull_with_token_expired_rejected() {
+        use rand::rngs::OsRng;
+
+        let (rt, owner, cid) = setup_pull_with_token_runtime();
+
+        let requester_hash = [0x42; 16];
+        // Token that expired in the past.
+        let token = owner
+            .issue_pq_root_token(
+                &mut OsRng,
+                &requester_hash,
+                harmony_identity::CapabilityType::Content,
+                &cid,
+                0,  // not_before
+                1,  // expires_at = 1 second after epoch (long expired)
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes);
+        assert!(result.is_none(), "expired token should be rejected");
+    }
+
+    #[test]
+    fn pull_with_token_wrong_cid_rejected() {
+        use rand::rngs::OsRng;
+
+        let (rt, owner, cid) = setup_pull_with_token_runtime();
+
+        let requester_hash = [0x42; 16];
+        // Token for a different CID.
+        let wrong_cid = [0xFF; 32];
+        let token = owner
+            .issue_pq_root_token(
+                &mut OsRng,
+                &requester_hash,
+                harmony_identity::CapabilityType::Content,
+                &wrong_cid,
+                0,
+                0,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        // Request with the actual CID, but token says different CID.
+        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes);
+        assert!(result.is_none(), "wrong CID should be rejected");
+    }
+
+    #[test]
+    fn pull_with_token_unknown_issuer_rejected() {
+        use rand::rngs::OsRng;
+
+        let (mut rt, _owner, cid) = setup_pull_with_token_runtime();
+
+        // Create a different identity not known to the runtime.
+        let stranger = harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
+        let stranger_hash = stranger.public_identity().address_hash;
+
+        let requester_hash = [0x42; 16];
+        let token = stranger
+            .issue_pq_root_token(
+                &mut OsRng,
+                &requester_hash,
+                harmony_identity::CapabilityType::Content,
+                &cid,
+                0,
+                0,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        // Remove the stranger's pubkey from cache (it was never added).
+        // The owner's pubkey is cached, but the token issuer is the stranger.
+        rt.pubkey_cache.remove(&stranger_hash);
+
+        let result = rt.handle_pull_with_token(requester_hash, cid, token_bytes);
+        assert!(result.is_none(), "unknown issuer should be rejected");
+    }
+
+    #[test]
+    fn pull_with_token_no_replica_rejected() {
+        use rand::rngs::OsRng;
+
+        let (rt, owner, _cid) = setup_pull_with_token_runtime();
+
+        // Use a CID that has no replica stored.
+        let missing_cid = [0xDD; 32];
+
+        let requester_hash = [0x42; 16];
+        let token = owner
+            .issue_pq_root_token(
+                &mut OsRng,
+                &requester_hash,
+                harmony_identity::CapabilityType::Content,
+                &missing_cid,
+                0,
+                0,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        // Even though the owner is known and pubkey is cached, no replica for this CID.
+        let result = rt.handle_pull_with_token(requester_hash, missing_cid, token_bytes);
+        assert!(result.is_none(), "missing replica should be rejected");
     }
 }

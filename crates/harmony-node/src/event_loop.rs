@@ -592,13 +592,19 @@ pub async fn run(
                             if let Ok(rep_msg) =
                                 harmony_tunnel::replication::ReplicationMessage::decode(&message)
                             {
-                                if rep_msg.op == harmony_tunnel::replication::ReplicationOp::Push {
+                                let forward = matches!(
+                                    rep_msg.op,
+                                    harmony_tunnel::replication::ReplicationOp::Push
+                                        | harmony_tunnel::replication::ReplicationOp::PullWithToken
+                                );
+                                if forward {
                                     // Resolve the contact's canonical identity_hash from
                                     // the tunnel's node_id via the contact store.
                                     if let Some(node_id) = tunnel_identities.get(&interface_name) {
                                         if let Some(contact) = runtime.contact_store().find_by_tunnel_node_id(node_id) {
                                             runtime.push_event(RuntimeEvent::ReplicaReceived {
                                                 peer_identity: contact.identity_hash,
+                                                op: rep_msg.op as u8,
                                                 cid: rep_msg.cid,
                                                 data: rep_msg.payload,
                                             });
@@ -1037,6 +1043,19 @@ async fn dispatch_action(
                 cid = %hex::encode(cid),
                 size = data.len(),
                 "ReplicaPush (stub — tunnel routing not yet wired)"
+            );
+        }
+        RuntimeAction::ReplicaPullResponse {
+            peer_identity,
+            cid,
+            data,
+        } => {
+            // TODO: route to tunnel sender (same pattern as ReplicaPush)
+            tracing::debug!(
+                identity = %hex::encode(peer_identity),
+                cid = %hex::encode(&cid[..8]),
+                size = data.len(),
+                "serving replicated content via token (stub — tunnel routing not yet wired)"
             );
         }
     }
