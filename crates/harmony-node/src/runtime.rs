@@ -22,6 +22,7 @@ use harmony_discovery::DiscoveryManager;
 use harmony_peers::{PeerAction, PeerEvent, PeerManager};
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
+use harmony_memo::store::MemoStore;
 use harmony_zenoh::namespace::content as content_ns;
 use harmony_zenoh::queryable::{QueryableAction, QueryableEvent, QueryableId, QueryableRouter};
 
@@ -235,8 +236,10 @@ pub enum RuntimeAction {
 struct PeerFilter {
     content_filter: Option<BloomFilter>,
     flatpack_filter: Option<CuckooFilter>,
+    memo_filter: Option<BloomFilter>,
     content_received_tick: u64,
     flatpack_received_tick: u64,
+    memo_received_tick: u64,
 }
 
 /// Per-peer Bloom filter table for content query routing.
@@ -268,8 +271,10 @@ impl PeerFilterTable {
         let entry = self.filters.entry(peer_addr).or_insert(PeerFilter {
             content_filter: None,
             flatpack_filter: None,
+            memo_filter: None,
             content_received_tick: tick,
             flatpack_received_tick: 0,
+            memo_received_tick: 0,
         });
         entry.content_filter = Some(filter);
         entry.content_received_tick = tick;
@@ -279,11 +284,26 @@ impl PeerFilterTable {
         let entry = self.filters.entry(peer_addr).or_insert(PeerFilter {
             content_filter: None,
             flatpack_filter: None,
+            memo_filter: None,
             content_received_tick: 0,
             flatpack_received_tick: tick,
+            memo_received_tick: 0,
         });
         entry.flatpack_filter = Some(filter);
         entry.flatpack_received_tick = tick;
+    }
+
+    fn upsert_memo(&mut self, peer_addr: String, filter: BloomFilter, tick: u64) {
+        let entry = self.filters.entry(peer_addr).or_insert(PeerFilter {
+            content_filter: None,
+            flatpack_filter: None,
+            memo_filter: None,
+            content_received_tick: 0,
+            flatpack_received_tick: 0,
+            memo_received_tick: tick,
+        });
+        entry.memo_filter = Some(filter);
+        entry.memo_received_tick = tick;
     }
 
     /// Returns true if the peer should be queried (no filter, stale filter, or filter says "maybe").
@@ -326,14 +346,38 @@ impl PeerFilterTable {
         }
     }
 
-    /// Evict peers where both filters are stale.
+    /// Returns true if the peer should be queried for memo input CIDs.
+    fn should_query_memo(
+        &self,
+        peer_addr: &str,
+        input_cid: &ContentId,
+        current_tick: u64,
+    ) -> bool {
+        match self.filters.get(peer_addr) {
+            None => true,
+            Some(pf) => {
+                if current_tick.saturating_sub(pf.memo_received_tick) > self.staleness_ticks {
+                    true
+                } else {
+                    match &pf.memo_filter {
+                        Some(bf) => bf.may_contain(input_cid),
+                        None => true,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Evict peers where all filters are stale.
     fn evict_stale(&mut self, current_tick: u64) {
         self.filters.retain(|_, pf| {
             let content_fresh =
                 current_tick.saturating_sub(pf.content_received_tick) <= self.staleness_ticks;
             let flatpack_fresh =
                 current_tick.saturating_sub(pf.flatpack_received_tick) <= self.staleness_ticks;
-            content_fresh || flatpack_fresh
+            let memo_fresh =
+                current_tick.saturating_sub(pf.memo_received_tick) <= self.staleness_ticks;
+            content_fresh || flatpack_fresh || memo_fresh
         });
     }
 }
@@ -399,10 +443,16 @@ pub struct NodeRuntime<B: BookStore> {
     ticks_since_filter_broadcast: u64,
     // How many ticks between filter broadcasts
     filter_broadcast_interval_ticks: u64,
+    // Filter broadcast configuration (expected_items, fp_rate) for memo Bloom filter sizing.
+    filter_broadcast_config: FilterBroadcastConfig,
     // Coalesces multiple BroadcastFilter actions within a single tick into one publish.
     pending_filter_broadcast: Option<Vec<u8>>,
     // Coalesces cuckoo filter broadcasts (flatpack reverse-index) within a single tick.
     pending_cuckoo_broadcast: Option<Vec<u8>>,
+    // Coalesces memo Bloom filter broadcasts within a single tick.
+    pending_memo_broadcast: Option<Vec<u8>>,
+    // Memo attestation store (input CID → signed memos)
+    memo_store: MemoStore,
     // Identity discovery manager (sans-I/O)
     discovery: DiscoveryManager,
     // Local tunnel routing hint (populated when iroh endpoint binds).
@@ -441,6 +491,7 @@ impl<B: BookStore> NodeRuntime<B> {
              with interval=1 the timer fires every tick"
         );
 
+        let filter_broadcast_config = config.filter_broadcast_config.clone();
         let (storage, storage_startup) = StorageTier::new(
             store,
             config.storage_budget,
@@ -496,6 +547,9 @@ impl<B: BookStore> NodeRuntime<B> {
         actions.push(RuntimeAction::Subscribe {
             key_expr: harmony_zenoh::namespace::filters::FLATPACK_SUB.to_string(),
         });
+        actions.push(RuntimeAction::Subscribe {
+            key_expr: harmony_zenoh::namespace::filters::MEMO_SUB.to_string(),
+        });
 
         let rt = Self {
             router,
@@ -521,8 +575,11 @@ impl<B: BookStore> NodeRuntime<B> {
             node_addr: config.node_addr,
             ticks_since_filter_broadcast: 0,
             filter_broadcast_interval_ticks,
+            filter_broadcast_config,
             pending_filter_broadcast: None,
             pending_cuckoo_broadcast: None,
+            pending_memo_broadcast: None,
+            memo_store: MemoStore::new(),
             discovery: DiscoveryManager::new(),
             local_tunnel_hint: None,
             last_now: 0,
@@ -583,6 +640,16 @@ impl<B: BookStore> NodeRuntime<B> {
             .should_query_flatpack(peer_addr, child_cid, self.tick_count)
     }
 
+    /// Check if a peer should be queried for memo attestations about an input CID.
+    ///
+    /// Returns `false` only if the peer's memo Bloom filter definitively says
+    /// the input CID is absent. Returns `true` for unknown peers, stale filters,
+    /// or filter matches.
+    pub fn should_query_memo_peer(&self, peer_addr: &str, input_cid: &ContentId) -> bool {
+        self.peer_filters
+            .should_query_memo(peer_addr, input_cid, self.tick_count)
+    }
+
     /// Read-only access to the contact store.
     pub fn contact_store(&self) -> &ContactStore {
         &self.contact_store
@@ -591,6 +658,16 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Mutable access to the contact store.
     pub fn contact_store_mut(&mut self) -> &mut ContactStore {
         &mut self.contact_store
+    }
+
+    /// Read-only access to the memo store.
+    pub fn memo_store(&self) -> &MemoStore {
+        &self.memo_store
+    }
+
+    /// Mutable access to the memo store.
+    pub fn memo_store_mut(&mut self) -> &mut MemoStore {
+        &mut self.memo_store
     }
 
     /// Number of malformed filter payloads that failed deserialization.
@@ -950,6 +1027,18 @@ impl<B: BookStore> NodeRuntime<B> {
                         self.ticks_since_filter_broadcast = 0;
                         let timer_actions = self.storage.handle(StorageTierEvent::FilterTimerTick);
                         self.dispatch_storage_actions(timer_actions, &mut actions);
+
+                        // Rebuild memo Bloom filter from MemoStore input CIDs.
+                        if !self.memo_store.is_empty() {
+                            let mut memo_filter = BloomFilter::new(
+                                self.filter_broadcast_config.expected_items,
+                                self.filter_broadcast_config.fp_rate,
+                            );
+                            for cid in self.memo_store.input_cids() {
+                                memo_filter.insert(cid);
+                            }
+                            self.pending_memo_broadcast = Some(memo_filter.to_bytes());
+                        }
                     }
 
                     // Flush coalesced filter broadcast — multiple threshold crossings
@@ -962,6 +1051,11 @@ impl<B: BookStore> NodeRuntime<B> {
                     if let Some(payload) = self.pending_cuckoo_broadcast.take() {
                         let key_expr =
                             harmony_zenoh::namespace::filters::flatpack_key(&self.node_addr);
+                        actions.push(RuntimeAction::Publish { key_expr, payload });
+                    }
+                    if let Some(payload) = self.pending_memo_broadcast.take() {
+                        let key_expr =
+                            harmony_zenoh::namespace::filters::memo_key(&self.node_addr);
                         actions.push(RuntimeAction::Publish { key_expr, payload });
                     }
                     if processed > 0 {
@@ -1497,6 +1591,28 @@ impl<B: BookStore> NodeRuntime<B> {
             return;
         }
 
+        // Check if this is a memo filter broadcast.
+        if let Some(peer_addr) = key_expr
+            .strip_prefix(harmony_zenoh::namespace::filters::MEMO_PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            if peer_addr != self.node_addr {
+                match BloomFilter::from_bytes(&payload) {
+                    Ok(filter) => {
+                        self.peer_filters.upsert_memo(
+                            peer_addr.to_string(),
+                            filter,
+                            self.tick_count,
+                        );
+                    }
+                    Err(_) => {
+                        self.peer_filters.record_parse_error();
+                    }
+                }
+            }
+            return;
+        }
+
         if let Some(event) = self.parse_subscription_event(&key_expr, payload) {
             self.storage_queue.push_back(event);
         }
@@ -1668,8 +1784,8 @@ mod tests {
 
         // 16 shard queryables + 1 stats queryable + 1 compute activity queryable = 18
         assert_eq!(queryable_count, 18);
-        // transit + publish + content filter + flatpack filter subscriptions = 4
-        assert_eq!(subscribe_count, 4);
+        // transit + publish + content filter + flatpack filter + memo filter subscriptions = 5
+        assert_eq!(subscribe_count, 5);
     }
 
     #[test]
@@ -3048,5 +3164,48 @@ mod tests {
             cid: [0xBB; 32],
             data: vec![1, 2, 3],
         };
+    }
+
+    // ── Memo filter tests ───────────────────────────────────────────────
+
+    #[test]
+    fn peer_memo_filter_upsert_and_query() {
+        let mut table = PeerFilterTable::new(100);
+        let mut filter = BloomFilter::new(1000, 0.01);
+        let cid_in = ContentId::for_book(b"memo-present", ContentFlags::default()).unwrap();
+        let cid_out = ContentId::for_book(b"memo-absent", ContentFlags::default()).unwrap();
+        filter.insert(&cid_in);
+        table.upsert_memo("peer-m".into(), filter, 10);
+
+        assert!(
+            table.should_query_memo("peer-m", &cid_in, 10),
+            "filter should say 'maybe' for inserted CID"
+        );
+        assert!(
+            !table.should_query_memo("peer-m", &cid_out, 10),
+            "filter should say 'definitely not' for absent CID"
+        );
+    }
+
+    #[test]
+    fn peer_memo_filter_staleness() {
+        let mut table = PeerFilterTable::new(10);
+        let filter = BloomFilter::new(1000, 0.01);
+        // Insert an empty filter at tick 5.
+        table.upsert_memo("peer-s".into(), filter, 5);
+
+        let cid = ContentId::for_book(b"stale-test", ContentFlags::default()).unwrap();
+
+        // Fresh filter with no items => definite miss, should NOT query.
+        assert!(
+            !table.should_query_memo("peer-s", &cid, 5),
+            "fresh empty memo filter should say 'definitely not'"
+        );
+
+        // Stale filter (current_tick - received_tick > staleness_ticks) => should query.
+        assert!(
+            table.should_query_memo("peer-s", &cid, 20),
+            "stale memo filter should fall back to querying"
+        );
     }
 }
