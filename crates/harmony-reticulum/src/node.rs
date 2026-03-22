@@ -632,8 +632,10 @@ impl Node {
                         }
                     }
                     let expired_count = expired_entries.len();
+                    let expired_hashes: HashSet<DestinationHash> =
+                        expired_entries.iter().map(|(h, _, _)| *h).collect();
                     self.reverse_table
-                        .retain(|hash, _| !expired_entries.iter().any(|(h, _, _)| h == hash));
+                        .retain(|hash, _| !expired_hashes.contains(hash));
                     if expired_count > 0 {
                         actions.push(NodeAction::ReverseTableExpired {
                             count: expired_count,
