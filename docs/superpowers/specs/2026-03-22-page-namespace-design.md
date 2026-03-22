@@ -151,6 +151,8 @@ All addresses are canonical lowercase hex via `hex::encode()`.
 ## Testing
 
 - `page_key_format` — full path with all 6 segments
+- `page_key_page_zero` — page number 0 serialises as `/0`
+- `page_key_page_255` — page number 255 serialises as `/255`
 - `query_by_addr00` — 5 trailing wildcards
 - `query_by_addr00_01` — 4 trailing wildcards
 - `query_by_all_addrs` — 2 wildcards (all 4 addr variants known)
