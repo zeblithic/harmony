@@ -337,16 +337,24 @@ impl PeerManager {
     /// but unique jitter factor (0.75-1.25x) for each peer relationship.
     /// This makes exponential backoff curves uncorrelatable between
     /// different observers — they can't match reconnection patterns.
+    ///
+    /// Jitter is applied to the uncapped exponential backoff value, and the
+    /// single max-cap is applied afterwards. This preserves the full ±25%
+    /// jitter range at max backoff instead of silently losing upward jitter
+    /// (which would happen if we capped twice).
     pub fn probe_interval_jittered(
         priority: PeeringPriority,
         retry_count: u32,
         local_hash: &IdentityHash,
         peer_hash: &IdentityHash,
     ) -> u64 {
-        let base_interval = Self::probe_interval(priority, retry_count);
-        if base_interval == 0 {
-            return 0;
-        }
+        // Compute the uncapped base interval (no min() here).
+        let base = match priority {
+            PeeringPriority::Low => return 0,
+            PeeringPriority::Normal => PROBE_INTERVAL_NORMAL,
+            PeeringPriority::High => PROBE_INTERVAL_HIGH,
+        };
+        let uncapped = base.saturating_mul(1u64 << retry_count.min(20));
 
         // Derive jitter from identity pair
         let mut seed_input = [0u8; 32];
@@ -357,8 +365,9 @@ impl PeerManager {
 
         // jitter_factor: 0.75 to ~1.25 (768/1024 to 1279/1024)
         let jitter_factor_num = 768 + (jitter_raw % 512); // 768-1279
-        let jittered = base_interval * jitter_factor_num / 1024;
+        let jittered = uncapped * jitter_factor_num / 1024;
 
+        // Single cap applied after jitter so upward jitter is not lost at max backoff.
         jittered.min(PROBE_INTERVAL_MAX)
     }
 }

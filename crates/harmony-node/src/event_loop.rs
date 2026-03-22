@@ -3,7 +3,8 @@
 //! `NodeRuntime` is `!Send`; it lives entirely on the select loop task.
 //! Zenoh objects that need spawning are cloned (Session is internally Arc'd).
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,12 +133,33 @@ enum ZenohEvent {
 /// `InitiateTunnel` and the event loop actually dialing the relay, breaking
 /// the timing correlation between Zenoh discovery queries and QUIC
 /// connection attempts.
+#[derive(Debug)]
 struct DeferredDial {
+    fire_at_ms: u64,
     identity_hash: [u8; 16],
     node_id: [u8; 32],
     relay_url: Option<String>,
-    fire_at_ms: u64,
 }
+
+impl Ord for DeferredDial {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.fire_at_ms.cmp(&other.fire_at_ms)
+    }
+}
+
+impl PartialOrd for DeferredDial {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for DeferredDial {
+    fn eq(&self, other: &Self) -> bool {
+        self.fire_at_ms == other.fire_at_ms
+    }
+}
+
+impl Eq for DeferredDial {}
 
 /// Run the async event loop.
 ///
@@ -274,7 +296,9 @@ pub async fn run(
     let mut config_tunnels = ConfigTunnelPeers::new(tunnel_entries);
 
     // ── Deferred dial queue (stochastic delay for tunnel privacy) ───────────
-    let mut deferred_dials: VecDeque<DeferredDial> = VecDeque::new();
+    // BinaryHeap<Reverse<...>> is a min-heap by fire_at_ms, ensuring earlier
+    // fire times are always drained first regardless of insertion order.
+    let mut deferred_dials: BinaryHeap<Reverse<DeferredDial>> = BinaryHeap::new();
 
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
@@ -695,10 +719,12 @@ pub async fn run(
             }
 
             // Drain deferred dials that have reached their fire time.
+            // Because the heap is ordered by fire_at_ms (min-heap via Reverse),
+            // we stop as soon as the earliest entry hasn't fired yet.
             let current_ms = now_ms();
-            while let Some(front) = deferred_dials.front() {
+            while let Some(Reverse(front)) = deferred_dials.peek() {
                 if front.fire_at_ms <= current_ms {
-                    let dial = deferred_dials.pop_front().unwrap();
+                    let Reverse(dial) = deferred_dials.pop().unwrap();
                     tracing::info!(
                         identity = %hex::encode(dial.identity_hash),
                         node_id = %hex::encode(&dial.node_id[..8]),
@@ -740,7 +766,7 @@ async fn dispatch_action(
     broadcast_addr: &SocketAddr,
     peer_table: Option<&PeerTable>,
     tunnel_senders: &HashMap<String, TunnelSender>,
-    deferred_dials: &mut VecDeque<DeferredDial>,
+    deferred_dials: &mut BinaryHeap<Reverse<DeferredDial>>,
 ) {
     match action {
         // ── Tier 1: Send on interface (UDP broadcast + unicast, or tunnel) ────
@@ -907,12 +933,12 @@ async fn dispatch_action(
         } => {
             let delay_ms = 500 + (rand::random::<u64>() % 3500);
             let fire_at = tunnel_task::millis_since_start() + delay_ms;
-            deferred_dials.push_back(DeferredDial {
+            deferred_dials.push(Reverse(DeferredDial {
+                fire_at_ms: fire_at,
                 identity_hash,
                 node_id,
                 relay_url,
-                fire_at_ms: fire_at,
-            });
+            }));
             tracing::debug!(
                 identity = %hex::encode(identity_hash),
                 delay_ms,

@@ -41,6 +41,10 @@ pub struct NodeConfig {
     /// Must be unique per node — set from identity address_hash at startup.
     /// Defaults to `"local"` as a placeholder until identity is wired.
     pub node_addr: String,
+    /// This node's identity hash (16-byte address), passed to PeerManager so
+    /// probe-interval jitter is unique per local-peer pair rather than zero.
+    /// Defaults to all-zeros; must be set from the loaded identity at startup.
+    pub local_identity_hash: harmony_identity::IdentityHash,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -99,6 +103,7 @@ impl Default for NodeConfig {
             content_policy: ContentPolicy::default(),
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "0000".to_string(),
+            local_identity_hash: [0u8; 16],
         }
     }
 }
@@ -476,7 +481,7 @@ impl<B: BookStore> NodeRuntime<B> {
             queryable_router,
             storage,
             workflow,
-            peer_manager: PeerManager::new(),
+            peer_manager: PeerManager::with_local_identity(config.local_identity_hash),
             contact_store: ContactStore::new(),
             router_queue: VecDeque::new(),
             storage_queue: VecDeque::new(),
@@ -2311,6 +2316,7 @@ mod tests {
             },
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "test".to_string(),
+            local_identity_hash: [0u8; 16],
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
@@ -2376,6 +2382,7 @@ mod tests {
             content_policy: ContentPolicy::default(),
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "self-node".to_string(),
+            local_identity_hash: [0u8; 16],
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -2407,6 +2414,7 @@ mod tests {
                 ..FilterBroadcastConfig::default()
             },
             node_addr: "reject-test".to_string(),
+            local_identity_hash: [0u8; 16],
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
@@ -2435,6 +2443,7 @@ mod tests {
                 ..FilterBroadcastConfig::default()
             },
             node_addr: "skip-timer-test".to_string(),
+            local_identity_hash: [0u8; 16],
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -2490,6 +2499,7 @@ mod tests {
                 ..FilterBroadcastConfig::default()
             },
             node_addr: "coalesce-test".to_string(),
+            local_identity_hash: [0u8; 16],
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -2536,6 +2546,7 @@ mod tests {
             content_policy: ContentPolicy::default(),
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "cuckoo-test".to_string(),
+            local_identity_hash: [0u8; 16],
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -2575,6 +2586,7 @@ mod tests {
             content_policy: ContentPolicy::default(),
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "self-node".to_string(),
+            local_identity_hash: [0u8; 16],
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 

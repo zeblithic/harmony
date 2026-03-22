@@ -15,10 +15,11 @@ use crate::handshake::{derive_session_keys, TunnelAccept, TunnelInit};
 const KEEPALIVE_BASE_MS: u64 = 30_000;
 /// Jitter range: ±5 seconds around the base.
 const KEEPALIVE_JITTER_MS: u64 = 5_000;
-/// Dead peer timeout: 3 missed keepalives at the base interval.
-/// Kept at 3 × 30s = 90s minimum to avoid false positives
-/// (worst case: 3 × 35s = 105s, but 90s is the floor).
-const DEAD_TIMEOUT_MS: u64 = KEEPALIVE_BASE_MS * 3;
+/// Dead peer timeout: 3 missed keepalives at the maximum jittered interval.
+/// With base=30s and jitter=5s, max interval is 35s; 3 × 35s = 105s.
+/// Using the max-jitter value ensures a peer at worst-case jitter is never
+/// declared dead before its third keepalive could have arrived.
+const DEAD_TIMEOUT_MS: u64 = (KEEPALIVE_BASE_MS + KEEPALIVE_JITTER_MS) * 3; // 105_000ms
 
 /// Tunnel session states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,16 +312,22 @@ impl TunnelSession {
         }
 
         // Jittered keepalive interval: 25-35 seconds.
-        // Use a simple hash of the nonce counter as cheap deterministic jitter
-        // (no RNG needed in Tick — sans-I/O purity).
-        let jitter = (self.send_nonce % 11) * 1000; // 0-10s, seeded by nonce counter
+        // Mix remote_node_id into the nonce seed so each session has a unique
+        // cycle, preventing correlation of keepalive timing across sessions.
+        let seed = self.send_nonce.wrapping_add(
+            u64::from_le_bytes(self.remote_node_id[..8].try_into().unwrap())
+        );
+        let jitter = (seed % 11) * 1_000; // 0-10s, session-unique cycle
         let interval = KEEPALIVE_BASE_MS - KEEPALIVE_JITTER_MS + jitter;
 
         // Send keepalive if jittered interval elapsed
         if now_ms.saturating_sub(self.last_sent_ms) >= interval {
             // Nonce-derived padding: variable-length keepalives without needing RNG.
             // Zeros are fine — the payload is encrypted before transmission.
-            let pad_len = ((self.send_nonce * 7 + 13) % 129) as usize;
+            let pad_seed = self.send_nonce.wrapping_add(
+                u64::from_le_bytes(self.remote_node_id[..8].try_into().unwrap())
+            );
+            let pad_len = (pad_seed.wrapping_mul(7).wrapping_add(13) % 129) as usize;
             let padding = alloc::vec![0u8; pad_len];
             let frame = Frame {
                 tag: FrameTag::Keepalive,
@@ -618,8 +625,8 @@ mod tests {
         let (mut initiator, _responder, _iid, _rid) = complete_handshake();
 
         // Session created with now_ms=0, so last_sent_ms=0.
-        // With send_nonce=0: jitter = (0 % 11) * 1000 = 0
-        // interval = 30000 - 5000 + 0 = 25000ms (minimum jittered interval)
+        // Jitter is session-unique (mixed with remote_node_id), so the exact
+        // interval is unpredictable. The range is always [25_000, 35_000]ms.
 
         // Tick at t=0: 0ms elapsed, no keepalive
         let actions = initiator
@@ -636,20 +643,21 @@ mod tests {
             .unwrap();
         assert!(actions.is_empty(), "tick at 15s should not send keepalive");
 
-        // Tick at t=25001: 25001ms >= jittered interval (25000) → keepalive sent
+        // Tick at t=35001: 35001ms >= max possible jittered interval (35000ms)
+        // → keepalive must be sent regardless of session-specific jitter
         let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 25_001 })
+            .handle_event(TunnelEvent::Tick { now_ms: 35_001 })
             .unwrap();
         assert_eq!(
             actions.len(),
             1,
-            "tick at 25001ms must emit exactly one keepalive"
+            "tick at 35001ms must emit exactly one keepalive (past max jitter)"
         );
         assert!(
             matches!(&actions[0], TunnelAction::OutboundBytes { .. }),
             "keepalive must be OutboundBytes"
         );
-        assert_eq!(initiator.last_sent_ms, 25_001);
+        assert_eq!(initiator.last_sent_ms, 35_001);
     }
 
     #[test]
@@ -657,9 +665,9 @@ mod tests {
         let (mut initiator, _responder, _iid, _rid) = complete_handshake();
 
         // Session created with now_ms=0, so last_received_ms=0
-        // Tick at t=90001: 90001 - 0 = 90001 >= DEAD_TIMEOUT_MS (90000)
+        // Tick at t=105001: 105001 - 0 = 105001 >= DEAD_TIMEOUT_MS (105000)
         let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 90_001 })
+            .handle_event(TunnelEvent::Tick { now_ms: 105_001 })
             .unwrap();
 
         assert_eq!(initiator.state(), TunnelState::Closed);
@@ -713,28 +721,28 @@ mod tests {
             .unwrap();
         assert_eq!(initiator.last_received_ms, 50_000);
 
-        // Tick at 50000 + 89999 = 139999: 89999ms < DEAD_TIMEOUT_MS (90000) — NO timeout
+        // Tick at 50000 + 104999 = 154999: 104999ms < DEAD_TIMEOUT_MS (105000) — NO timeout
         let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 139_999 })
+            .handle_event(TunnelEvent::Tick { now_ms: 154_999 })
             .unwrap();
         assert_ne!(
             initiator.state(),
             TunnelState::Closed,
-            "should not timeout at 139999ms"
+            "should not timeout at 154999ms"
         );
         assert!(
             !actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
-            "must not be closed at 139999ms"
+            "must not be closed at 154999ms"
         );
 
-        // Tick at 50000 + 90001 = 140001: 90001ms >= DEAD_TIMEOUT_MS — timeout
+        // Tick at 50000 + 105001 = 155001: 105001ms >= DEAD_TIMEOUT_MS (105000) — timeout
         let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 140_001 })
+            .handle_event(TunnelEvent::Tick { now_ms: 155_001 })
             .unwrap();
         assert_eq!(initiator.state(), TunnelState::Closed);
         assert!(
             actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
-            "must timeout at 140001ms"
+            "must timeout at 155001ms"
         );
     }
 }

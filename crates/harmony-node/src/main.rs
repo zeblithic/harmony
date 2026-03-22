@@ -408,6 +408,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     fp_rate: 0.001,
                 },
                 node_addr,
+                local_identity_hash: our_addr_bytes,
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 
