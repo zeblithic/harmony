@@ -2,7 +2,8 @@
   description = "Harmony — decentralized internet stack";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Stable channel for reproducible builds.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
     crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
 
@@ -208,6 +209,11 @@
         harmony-node-aarch64-linux = crossAarch64.harmony-node;
         iroh-relay-x86_64-linux = crossX86_64.iroh-relay;
         iroh-relay-aarch64-linux = crossAarch64.iroh-relay;
+      };
+
+      # Checks: nix flake check exercises native builds
+      checks = {
+        inherit harmony-node iroh-relay;
       };
 
       devShells.default = craneLib.devShell {
