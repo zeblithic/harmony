@@ -731,6 +731,7 @@ pub async fn run(
 }
 
 /// Dispatch a single `RuntimeAction` to the appropriate I/O mechanism.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_action(
     action: RuntimeAction,
     session: &zenoh::Session,
