@@ -321,16 +321,6 @@ impl PeerManager {
         }
     }
 
-    fn probe_interval(priority: PeeringPriority, retry_count: u32) -> u64 {
-        let base = match priority {
-            PeeringPriority::Low => return 0,
-            PeeringPriority::Normal => PROBE_INTERVAL_NORMAL,
-            PeeringPriority::High => PROBE_INTERVAL_HIGH,
-        };
-        let backoff = base.saturating_mul(1u64 << retry_count.min(20));
-        backoff.min(PROBE_INTERVAL_MAX)
-    }
-
     /// Compute a jittered probe interval for a specific peer.
     ///
     /// Uses BLAKE3(local_hash || peer_hash) to derive a deterministic

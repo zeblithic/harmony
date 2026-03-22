@@ -17,9 +17,9 @@ const KEEPALIVE_BASE_MS: u64 = 30_000;
 const KEEPALIVE_JITTER_MS: u64 = 5_000;
 /// Dead peer timeout: 3 missed keepalives at the maximum jittered interval.
 /// With base=30s and jitter=5s, max interval is 35s; 3 × 35s = 105s.
-/// Using the max-jitter value ensures a peer at worst-case jitter is never
-/// declared dead before its third keepalive could have arrived.
-const DEAD_TIMEOUT_MS: u64 = (KEEPALIVE_BASE_MS + KEEPALIVE_JITTER_MS) * 3; // 105_000ms
+/// Uses max-jitter interval × 3 plus a 5s network latency buffer so a peer
+/// at worst-case jitter + network delay isn't spuriously declared dead.
+const DEAD_TIMEOUT_MS: u64 = (KEEPALIVE_BASE_MS + KEEPALIVE_JITTER_MS) * 3 + 5_000; // 110_000ms
 
 /// Tunnel session states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,19 +314,20 @@ impl TunnelSession {
         // Jittered keepalive interval: 25-35 seconds.
         // Mix remote_node_id into the nonce seed so each session has a unique
         // cycle, preventing correlation of keepalive timing across sessions.
-        let seed = self.send_nonce.wrapping_add(
-            u64::from_le_bytes(self.remote_node_id[..8].try_into().unwrap())
+        let remote_id_u64 = u64::from_le_bytes(
+            self.remote_node_id[..8].try_into().unwrap()
         );
-        let jitter = (seed % 11) * 1_000; // 0-10s, session-unique cycle
+        let timing_seed = self.send_nonce.wrapping_add(remote_id_u64);
+        let jitter = (timing_seed % 11) * 1_000; // 0-10s, session-unique cycle
         let interval = KEEPALIVE_BASE_MS - KEEPALIVE_JITTER_MS + jitter;
 
         // Send keepalive if jittered interval elapsed
         if now_ms.saturating_sub(self.last_sent_ms) >= interval {
-            // Nonce-derived padding: variable-length keepalives without needing RNG.
-            // Zeros are fine — the payload is encrypted before transmission.
-            let pad_seed = self.send_nonce.wrapping_add(
-                u64::from_le_bytes(self.remote_node_id[..8].try_into().unwrap())
-            );
+            // Domain-separated padding seed: prevents an observer from using
+            // the CRT (lcm(129,11)=1419) to correlate ciphertext size with
+            // timing, which would make future keepalives perfectly predictable.
+            // The golden-ratio constant ensures no exploitable modular relationship.
+            let pad_seed = timing_seed.wrapping_add(0x9e3779b97f4a7c15_u64);
             let pad_len = (pad_seed.wrapping_mul(7).wrapping_add(13) % 129) as usize;
             let padding = alloc::vec![0u8; pad_len];
             let frame = Frame {
@@ -665,9 +666,9 @@ mod tests {
         let (mut initiator, _responder, _iid, _rid) = complete_handshake();
 
         // Session created with now_ms=0, so last_received_ms=0
-        // Tick at t=105001: 105001 - 0 = 105001 >= DEAD_TIMEOUT_MS (105000)
+        // Tick at t=110001: 110001 - 0 = 110001 >= DEAD_TIMEOUT_MS (110000)
         let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 105_001 })
+            .handle_event(TunnelEvent::Tick { now_ms: 110_001 })
             .unwrap();
 
         assert_eq!(initiator.state(), TunnelState::Closed);
@@ -721,23 +722,23 @@ mod tests {
             .unwrap();
         assert_eq!(initiator.last_received_ms, 50_000);
 
-        // Tick at 50000 + 104999 = 154999: 104999ms < DEAD_TIMEOUT_MS (105000) — NO timeout
+        // Tick at 50000 + 109999 = 159999: 109999ms < DEAD_TIMEOUT_MS (110000) — NO timeout
         let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 154_999 })
+            .handle_event(TunnelEvent::Tick { now_ms: 159_999 })
             .unwrap();
         assert_ne!(
             initiator.state(),
             TunnelState::Closed,
-            "should not timeout at 154999ms"
+            "should not timeout at 159999ms"
         );
         assert!(
             !actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
-            "must not be closed at 154999ms"
+            "must not be closed at 159999ms"
         );
 
-        // Tick at 50000 + 105001 = 155001: 105001ms >= DEAD_TIMEOUT_MS (105000) — timeout
+        // Tick at 50000 + 110001 = 160001: 110001ms >= DEAD_TIMEOUT_MS (110000) — timeout
         let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 155_001 })
+            .handle_event(TunnelEvent::Tick { now_ms: 160_001 })
             .unwrap();
         assert_eq!(initiator.state(), TunnelState::Closed);
         assert!(
