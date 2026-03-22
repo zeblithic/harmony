@@ -77,20 +77,20 @@ No Docker, no QEMU — Nix provides the complete cross toolchain
 
 ### Deploy Script Changes
 
-The build strategy in `deploy/relay/deploy.sh` becomes four tiers:
+The build strategy in `deploy/relay/deploy.sh` becomes two tiers:
 
 1. **Pre-built binary** (`LOCAL_BINARY`) — unchanged
-2. **Nix build** — `nix build .#iroh-relay`, cross-compiles for
-   x86_64-linux from any host. Result at `./result/bin/iroh-relay`.
-   Replaces the old "local cargo build" path.
-3. **Nix cache** (`NIX_CACHE_URL`) — placeholder for future binary
-   cache integration (harmony-m5y). Not wired up in this bead.
-4. **Remote build on VM** — unchanged fallback for hosts without Nix
+2. **Nix build** — `nix build .#iroh-relay-x86_64-linux --no-link
+   --print-out-paths | head -1`, cross-compiles for x86_64-linux
+   from any host. Binary at `${STORE_PATH}/bin/iroh-relay`.
 
-The architecture check (`uname -sm == Linux x86_64`) is removed —
-Nix cross-compiles correctly regardless of host platform. The
-fallback echo message is updated to say "No Nix found" instead
-of referencing the old arch check.
+Nix is required. The old cargo remote build on the VM is removed
+(it took 30+ minutes and OOM'd on e2-micro). Without Nix, the
+script exits with an error suggesting `LOCAL_BINARY`.
+
+The iroh-relay version is pinned in `flake.nix`/`flake.lock`, not
+via a CLI variable. To update: edit the `iroh-src` input in
+`flake.nix` and run `nix flake update iroh-src`.
 
 ### Updated Detection Logic
 
@@ -98,13 +98,13 @@ of referencing the old arch check.
 if [ -n "$LOCAL_BINARY" ] && [ -f "$LOCAL_BINARY" ]; then
     # Tier 1: pre-built binary
 elif command -v nix &>/dev/null; then
-    # Tier 2: nix build (cross-compiles for target)
-    nix build .#iroh-relay
-    BINARY_PATH="./result/bin/iroh-relay"
-# Tier 3 (reserved for harmony-m5y): fetch from Nix/Zenoh cache
+    # Tier 2: nix cross-compile
+    STORE_PATH=$(nix build .#iroh-relay-x86_64-linux \
+        --print-out-paths --no-link | head -1)
+    BINARY_PATH="${STORE_PATH}/bin/iroh-relay"
 else
-    # Tier 3 (current): remote build on VM — no Nix available
-    echo "No Nix found — building on VM (slow, ~15 min on e2-micro)..."
+    echo "ERROR: Nix is required. Install Nix or set LOCAL_BINARY."
+    exit 1
 fi
 ```
 

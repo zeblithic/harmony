@@ -25,9 +25,9 @@ GCP_ZONE="${GCP_ZONE:-us-west1-b}"
 GCP_REGION="${GCP_ZONE%-*}"
 VM_NAME="${VM_NAME:-harmony-relay}"
 MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
-IROH_REPO="${IROH_REPO:-https://github.com/n0-computer/iroh.git}"
-IROH_VERSION="${IROH_VERSION:-v0.91.2}"
 CONTACT_EMAIL="${CONTACT_EMAIL:-admin@${RELAY_HOSTNAME}}"
+# iroh-relay version is pinned in flake.nix/flake.lock (not a CLI variable).
+# To update: edit flake.nix iroh-src input, run `nix flake update iroh-src`.
 LOCAL_BINARY="${LOCAL_BINARY:-}"
 
 # Rate limits (bytes/sec). Defaults: 100 KB/s sustained, 500 KB burst.
@@ -39,7 +39,6 @@ echo "  Hostname:     ${RELAY_HOSTNAME}"
 echo "  Project:      ${GCP_PROJECT}"
 echo "  Zone:         ${GCP_ZONE} (region: ${GCP_REGION})"
 echo "  VM:           ${VM_NAME} (${MACHINE_TYPE})"
-echo "  iroh version: ${IROH_VERSION}"
 echo ""
 
 gcloud config set project "$GCP_PROJECT" --quiet
@@ -139,59 +138,24 @@ elif command -v nix &>/dev/null; then
     echo "    Nix build complete: ${STORE_PATH}"
 
 else
-    echo "--- Step 4: No Nix found — building on VM (slow, ~15 min on e2-micro)..."
-
-    BUILD_STRATEGY="remote"
-
-    # Install build deps on VM
-    echo "    Installing build dependencies..."
-    gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
-        set -euo pipefail
-        if [ ! -f \"\$HOME/.cargo/bin/cargo\" ]; then
-            sudo apt-get update -qq > /dev/null
-            sudo apt-get install -y -qq build-essential pkg-config libssl-dev curl git > /dev/null
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y > /dev/null 2>&1
-        fi
-        [ -f \"\$HOME/.cargo/env\" ] && . \"\$HOME/.cargo/env\"
-        cargo --version
-    "
-
-    # Build on VM
-    echo "    Building iroh-relay on VM..."
-    gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
-        set -euo pipefail
-        [ -f \"\$HOME/.cargo/env\" ] && . \"\$HOME/.cargo/env\"
-        if [ ! -d /tmp/iroh-build ]; then
-            git clone --depth=1 --branch '${IROH_VERSION}' '${IROH_REPO}' /tmp/iroh-build
-        else
-            cd /tmp/iroh-build
-            git fetch --depth=1 origin '${IROH_VERSION}'
-            git checkout FETCH_HEAD
-        fi
-        cd /tmp/iroh-build
-        cargo build --release -p iroh-relay --features server --bin iroh-relay 2>&1 | tail -3
-        echo 'Remote build complete.'
-    "
+    echo "ERROR: Nix is required to build iroh-relay. Install Nix:"
+    echo "  curl --proto '=https' --tlsv1.2 -sSf https://install.determinate.systems/nix | sh"
+    echo ""
+    echo "Or provide a pre-built binary:"
+    echo "  LOCAL_BINARY=/path/to/iroh-relay ./deploy/relay/deploy.sh"
+    exit 1
 fi
 
 # ── Step 5: Upload binary and install service ─────────────────────
 echo "--- Step 5: Installing iroh-relay service..."
 
-# Upload binary if we built locally or have a pre-built one
-if [ -n "$BINARY_PATH" ]; then
-    echo "    Uploading binary to VM..."
-    gcloud compute scp "$BINARY_PATH" "$VM_NAME:/tmp/iroh-relay" --zone="$GCP_ZONE"
-    gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
-        sudo mv -f /tmp/iroh-relay /usr/local/bin/iroh-relay
-        sudo chmod +x /usr/local/bin/iroh-relay
-    "
-elif [ "$BUILD_STRATEGY" = "remote" ]; then
-    # Install from remote build directory
-    gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
-        sudo cp -f /tmp/iroh-build/target/release/iroh-relay /usr/local/bin/iroh-relay
-        sudo chmod +x /usr/local/bin/iroh-relay
-    "
-fi
+# Upload binary to VM (BINARY_PATH is always set — from LOCAL_BINARY or Nix)
+echo "    Uploading binary to VM..."
+gcloud compute scp "$BINARY_PATH" "$VM_NAME:/tmp/iroh-relay" --zone="$GCP_ZONE"
+gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
+    sudo mv -f /tmp/iroh-relay /usr/local/bin/iroh-relay
+    sudo chmod +x /usr/local/bin/iroh-relay
+"
 
 gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" --command="
     set -euo pipefail
