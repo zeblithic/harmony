@@ -128,10 +128,11 @@ struct ReverseTableEntry {
     /// Interface the data packet was received on (proof goes back here).
     received_interface: Arc<str>,
     /// Interface the data packet was forwarded to.
-    #[allow(dead_code)] // Retained for diagnostics; used by link table routing (b83.6)
     outbound_interface: Arc<str>,
     /// Monotonic timestamp when this entry was created.
     timestamp: u64,
+    /// Whether a proof was received for this relayed packet.
+    proof_received: bool,
 }
 
 /// A link table entry tracking a link request passing through this transport node.
@@ -596,13 +597,26 @@ impl Node {
                     actions.extend(self.process_announce_table(now));
                     self.expire_rate_table(now);
 
-                    // Expire stale reverse table entries
-                    let before = self.reverse_table.len();
+                    // Expire stale reverse table entries and emit negative
+                    // cooperation signals for entries that never received a proof.
+                    let expired_entries: Vec<_> = self
+                        .reverse_table
+                        .iter()
+                        .filter(|(_, e)| now.saturating_sub(e.timestamp) >= REVERSE_TIMEOUT)
+                        .map(|(hash, e)| (*hash, e.outbound_interface.clone(), e.proof_received))
+                        .collect();
+                    for (_hash, outbound, proof_received) in &expired_entries {
+                        if !proof_received {
+                            self.cooperation.observe_proof_timeout(outbound, now);
+                        }
+                    }
+                    let expired_count = expired_entries.len();
                     self.reverse_table
-                        .retain(|_, entry| now.saturating_sub(entry.timestamp) < REVERSE_TIMEOUT);
-                    let expired = before - self.reverse_table.len();
-                    if expired > 0 {
-                        actions.push(NodeAction::ReverseTableExpired { count: expired });
+                        .retain(|hash, _| !expired_entries.iter().any(|(h, _, _)| h == hash));
+                    if expired_count > 0 {
+                        actions.push(NodeAction::ReverseTableExpired {
+                            count: expired_count,
+                        });
                     }
 
                     // Expire stale link table entries
@@ -1228,7 +1242,7 @@ impl Node {
 
         // 4. Regular proof routing via reverse table
         if packet.header.flags.packet_type == PacketType::Proof {
-            return self.route_proof(&packet, &interface_name);
+            return self.route_proof(&packet, &interface_name, now);
         }
 
         // 5. Only relay Type2 packets addressed to our transport_id
@@ -1281,6 +1295,7 @@ impl Node {
                     received_interface: interface_name,
                     outbound_interface: Arc::clone(&path_iface),
                     timestamp: now,
+                    proof_received: false,
                 },
             );
         }
@@ -1648,10 +1663,15 @@ impl Node {
     }
 
     /// Route a proof packet back toward the originator via the reverse table.
-    fn route_proof(&self, packet: &Packet, interface_name: &Arc<str>) -> Vec<NodeAction> {
+    fn route_proof(
+        &mut self,
+        packet: &Packet,
+        interface_name: &Arc<str>,
+        now: u64,
+    ) -> Vec<NodeAction> {
         let proof_dest = packet.header.destination_hash;
 
-        let entry = match self.reverse_table.get(&proof_dest) {
+        let entry = match self.reverse_table.get_mut(&proof_dest) {
             Some(e) => e,
             None => {
                 return vec![NodeAction::PacketDropped {
@@ -1660,6 +1680,13 @@ impl Node {
                 }];
             }
         };
+
+        // Mark proof received and record positive cooperation observation.
+        entry.proof_received = true;
+        let outbound_iface = entry.outbound_interface.clone();
+        let received_iface = entry.received_interface.clone();
+
+        self.cooperation.observe_proof_delivered(&outbound_iface, now);
 
         // Forward proof with current hops (already incremented in inbound pipeline)
         let forwarded = Packet {
@@ -1679,14 +1706,14 @@ impl Node {
 
         match forwarded.to_bytes() {
             Ok(raw) => {
-                let mut actions = self.send_on_interface(&entry.received_interface, &raw);
+                let mut actions = self.send_on_interface(&received_iface, &raw);
                 if !actions
                     .iter()
                     .any(|a| matches!(a, NodeAction::PacketDropped { .. }))
                 {
                     actions.push(NodeAction::ProofRelayed {
                         proof_destination: proof_dest,
-                        interface_name: entry.received_interface.clone(),
+                        interface_name: received_iface,
                     });
                 }
                 actions
@@ -1694,7 +1721,7 @@ impl Node {
             Err(_) => {
                 vec![NodeAction::PacketDropped {
                     reason: DropReason::RelaySerializeFailed,
-                    interface_name: entry.received_interface.clone(),
+                    interface_name: received_iface,
                 }]
             }
         }
@@ -4226,6 +4253,7 @@ mod tests {
                 received_interface: "no_such_iface".into(),
                 outbound_interface: "wlan0".into(),
                 timestamp: 1000,
+                proof_received: false,
             },
         );
 
@@ -4247,7 +4275,7 @@ mod tests {
             data: vec![0xCC; 10].into(),
         };
         let eth0: Arc<str> = Arc::from("eth0");
-        let actions = node.route_proof(&proof_pkt, &eth0);
+        let actions = node.route_proof(&proof_pkt, &eth0, 2000);
 
         // Should get PacketDropped but NOT ProofRelayed
         assert!(actions
@@ -4269,6 +4297,7 @@ mod tests {
                 received_interface: "eth0".into(),
                 outbound_interface: "wlan0".into(),
                 timestamp: 1000,
+                proof_received: false,
             },
         );
         assert_eq!(node.reverse_table_len(), 1);
@@ -5263,6 +5292,117 @@ mod tests {
             wlan0_after < 0.5,
             "wlan0 cooperation score should have decreased below 0.5 after \
              timeout, got {wlan0_after}"
+        );
+    }
+
+    // ── Proof delivery cooperation observation tests ────────────────
+
+    #[test]
+    fn proof_delivered_increases_cooperation_score() {
+        // Build a transport node with two interfaces so get_weight
+        // returns actual scores (not the forced 1.0 for single-interface).
+        let (mut node, _th) = make_transport_node();
+        let now = 1000_u64;
+
+        let initial = node.cooperation().get_weight("wlan0");
+        assert!(
+            (initial - 0.5).abs() < f32::EPSILON,
+            "initial wlan0 weight should be 0.5, got {initial}"
+        );
+
+        // Simulate a proof arriving for a packet we forwarded on wlan0.
+        // Insert a reverse table entry, then route a proof through it.
+        let proof_key = dest(99);
+        node.reverse_table.insert(
+            proof_key,
+            ReverseTableEntry {
+                received_interface: "eth0".into(),
+                outbound_interface: "wlan0".into(),
+                timestamp: now,
+                proof_received: false,
+            },
+        );
+
+        let proof_pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Proof,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: proof_key,
+                context: PacketContext::None,
+            },
+            data: vec![0xAA; 10].into(),
+        };
+
+        let eth0: Arc<str> = Arc::from("eth0");
+        let _actions = node.route_proof(&proof_pkt, &eth0, now + 100);
+
+        // wlan0 should have an increased cooperation score.
+        let after = node.cooperation().get_weight("wlan0");
+        assert!(
+            after > 0.5,
+            "wlan0 cooperation score should have increased above 0.5 after \
+             proof delivery, got {after}"
+        );
+
+        // The reverse table entry should be marked as proof_received.
+        assert!(
+            node.reverse_table
+                .get(&proof_key)
+                .expect("entry should still exist")
+                .proof_received,
+            "proof_received flag should be set to true"
+        );
+    }
+
+    #[test]
+    fn proof_timeout_decreases_cooperation_score() {
+        // Build a transport node with two interfaces.
+        let (mut node, _th) = make_transport_node();
+        let now = 1000_u64;
+
+        let initial = node.cooperation().get_weight("wlan0");
+        assert!(
+            (initial - 0.5).abs() < f32::EPSILON,
+            "initial wlan0 weight should be 0.5, got {initial}"
+        );
+
+        // Insert a reverse table entry for a packet forwarded on wlan0,
+        // but never deliver a proof.
+        node.reverse_table.insert(
+            dest(88),
+            ReverseTableEntry {
+                received_interface: "eth0".into(),
+                outbound_interface: "wlan0".into(),
+                timestamp: now,
+                proof_received: false,
+            },
+        );
+
+        // Advance past REVERSE_TIMEOUT to trigger expiry.
+        let timeout_now = now + REVERSE_TIMEOUT + 1;
+        node.handle_event(NodeEvent::TimerTick { now: timeout_now });
+
+        // The entry should be expired.
+        assert_eq!(
+            node.reverse_table_len(),
+            0,
+            "reverse table should be empty after timeout"
+        );
+
+        // wlan0 should have a decreased cooperation score.
+        let after = node.cooperation().get_weight("wlan0");
+        assert!(
+            after < 0.5,
+            "wlan0 cooperation score should have decreased below 0.5 after \
+             proof timeout, got {after}"
         );
     }
 }
