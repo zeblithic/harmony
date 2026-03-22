@@ -39,7 +39,7 @@ only stores the 16-byte hash, not the full key.
 {
   "@context": [
     "https://www.w3.org/ns/credentials/v2",
-    "https://w3id.org/security/suites/ed25519-2020/v1"
+    "https://w3id.org/security/data-integrity/v2"
   ],
   "type": ["VerifiableCredential"],
   "issuer": "did:key:z6Mk...",
@@ -67,9 +67,29 @@ only stores the 16-byte hash, not the full key.
 ### Presentation (with disclosed claims)
 
 Same structure, wrapped in a Verifiable Presentation envelope.
-Disclosed claims appear as plaintext key-value pairs in
-`credentialSubject`. Undisclosed claims remain as digest-only
-entries.
+
+Disclosed `SaltedClaim` entries appear in `credentialSubject.claims`
+with their full content:
+
+```json
+{
+  "claims": [
+    { "typeId": 1, "value": "base64url-encoded-value", "digest": "base64url-hash" },
+    { "digest": "base64url-hash-only" }
+  ]
+}
+```
+
+- Disclosed claims include `typeId` (claim type_id as integer),
+  `value` (base64url-encoded claim value), and `digest`
+- Undisclosed claims include only `digest`
+- `salt` is NOT included — it's a privacy primitive for the holder,
+  not meaningful to the verifier (who recomputes the digest from
+  typeId + value + salt if needed for selective disclosure proofs)
+
+The `nonce` field is always present (Harmony credentials always
+have a 16-byte nonce). It is emitted as lowercase hex in
+`proof.nonce`.
 
 ### Field Mapping
 
@@ -99,7 +119,7 @@ credential's content hash). In the JSON-LD export:
 
 | CryptoSuite | W3C cryptosuite | Context URL |
 |---|---|---|
-| Ed25519 | `eddsa-2022` | `https://w3id.org/security/suites/ed25519-2020/v1` |
+| Ed25519 | `eddsa-2022` | `https://w3id.org/security/data-integrity/v2` |
 | MlDsa65 | `mldsa65-2025` (draft) | TBD — use a Harmony-specific context for now |
 | MlDsa65Rotatable | `mldsa65-2025` | Same as MlDsa65 |
 
