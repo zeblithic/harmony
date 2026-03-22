@@ -177,12 +177,17 @@ pub enum RuntimeEvent {
     TunnelPeerDropped { identity_hash: [u8; 16] },
     /// Peer lifecycle: a contact was added or modified.
     ContactChanged { identity_hash: [u8; 16] },
-    /// Replication: encrypted book data received from a peer.
-    ReplicaReceived {
+    /// Replication: encrypted book pushed by a peer for backup storage.
+    ReplicaPushReceived {
         peer_identity: [u8; 16],
-        op: harmony_tunnel::replication::ReplicationOp,
         cid: [u8; 32],
         data: Vec<u8>,
+    },
+    /// Replication: a peer requests content with a bearer token.
+    ReplicaPullWithTokenReceived {
+        peer_identity: [u8; 16],
+        cid: [u8; 32],
+        token_bytes: Vec<u8>,
     },
     /// A peer's ML-DSA public key was learned (from handshake or discovery).
     PeerPublicKeyLearned {
@@ -852,43 +857,42 @@ impl<B: BookStore> NodeRuntime<B> {
                 );
                 self.translate_peer_actions(peer_actions);
             }
-            RuntimeEvent::ReplicaReceived {
+            RuntimeEvent::ReplicaPushReceived {
                 peer_identity,
-                op,
                 cid,
                 data,
             } => {
-                use harmony_tunnel::replication::ReplicationOp;
-                match op {
-                    ReplicationOp::Push => {
-                        // Push: store the replica if the peer has quota.
-                        let quota = self
-                            .contact_store
-                            .get(&peer_identity)
-                            .and_then(|c| c.replication.as_ref())
-                            .map(|r| r.quota_bytes)
-                            .unwrap_or(0);
-                        if quota > 0 {
-                            let _ =
-                                self.replica_store.store(peer_identity, cid, data, quota);
-                        }
-                    }
-                    ReplicationOp::PullWithToken => {
-                        // PullWithToken: validate token and serve content.
-                        if let Some(action) =
-                            self.handle_pull_with_token(peer_identity, cid, data)
-                        {
-                            self.pending_direct_actions.push(action);
-                        }
-                    }
-                    _ => {}
+                // Store the replica if the peer has quota.
+                let quota = self
+                    .contact_store
+                    .get(&peer_identity)
+                    .and_then(|c| c.replication.as_ref())
+                    .map(|r| r.quota_bytes)
+                    .unwrap_or(0);
+                if quota > 0 {
+                    let _ = self.replica_store.store(peer_identity, cid, data, quota);
+                }
+            }
+            RuntimeEvent::ReplicaPullWithTokenReceived {
+                peer_identity,
+                cid,
+                token_bytes,
+            } => {
+                if let Some(action) =
+                    self.handle_pull_with_token(peer_identity, cid, token_bytes)
+                {
+                    self.pending_direct_actions.push(action);
                 }
             }
             RuntimeEvent::PeerPublicKeyLearned {
                 identity_hash,
                 dsa_pubkey,
             } => {
-                self.pubkey_cache.insert(identity_hash, dsa_pubkey);
+                // Guard against empty keys from degraded handshakes —
+                // don't overwrite a valid cached key with an empty one.
+                if !dsa_pubkey.is_empty() {
+                    self.pubkey_cache.insert(identity_hash, dsa_pubkey);
+                }
             }
         }
     }
@@ -1256,7 +1260,15 @@ impl<B: BookStore> NodeRuntime<B> {
             return None;
         }
 
-        // 7. Signature verified — now safe to probe replica store.
+        // 7. Check audience — token must be scoped to this requester.
+        //    The audience is part of the signed payload, so signature
+        //    verification already authenticated it — we just enforce it.
+        if token.audience != peer_identity {
+            tracing::debug!("token audience mismatch");
+            return None;
+        }
+
+        // 8. Signature verified, audience matched — now safe to probe replica store.
         //    Single retrieve() call serves both existence check and data fetch.
         let data = match self.replica_store.retrieve(&token.issuer, &cid) {
             Some(d) => d,
@@ -3121,9 +3133,8 @@ mod tests {
         };
         rt.contact_store_mut().add(contact).unwrap();
 
-        rt.push_event(RuntimeEvent::ReplicaReceived {
+        rt.push_event(RuntimeEvent::ReplicaPushReceived {
             peer_identity: [0xAA; 16],
-            op: harmony_tunnel::replication::ReplicationOp::Push,
             cid: [0xBB; 32],
             data: vec![1, 2, 3, 4, 5],
         });
@@ -3155,9 +3166,8 @@ mod tests {
         };
         rt.contact_store_mut().add(contact).unwrap();
 
-        rt.push_event(RuntimeEvent::ReplicaReceived {
+        rt.push_event(RuntimeEvent::ReplicaPushReceived {
             peer_identity: [0xAA; 16],
-            op: harmony_tunnel::replication::ReplicationOp::Push,
             cid: [0xBB; 32],
             data: vec![1, 2, 3, 4, 5],
         });
@@ -3171,9 +3181,8 @@ mod tests {
     fn replica_received_rejected_unknown_peer() {
         let (mut rt, _) = make_runtime();
         // No contact at all for this peer
-        rt.push_event(RuntimeEvent::ReplicaReceived {
+        rt.push_event(RuntimeEvent::ReplicaPushReceived {
             peer_identity: [0xFF; 16],
-            op: harmony_tunnel::replication::ReplicationOp::Push,
             cid: [0xBB; 32],
             data: vec![1, 2, 3],
         });
@@ -3182,9 +3191,8 @@ mod tests {
 
     #[test]
     fn runtime_event_replica_variant_exists() {
-        let _e = RuntimeEvent::ReplicaReceived {
+        let _e = RuntimeEvent::ReplicaPushReceived {
             peer_identity: [0xAA; 16],
-            op: harmony_tunnel::replication::ReplicationOp::Push,
             cid: [0xBB; 32],
             data: vec![1, 2, 3],
         };

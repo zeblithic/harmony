@@ -592,22 +592,27 @@ pub async fn run(
                             if let Ok(rep_msg) =
                                 harmony_tunnel::replication::ReplicationMessage::decode(&message)
                             {
-                                let forward = matches!(
-                                    rep_msg.op,
-                                    harmony_tunnel::replication::ReplicationOp::Push
-                                        | harmony_tunnel::replication::ReplicationOp::PullWithToken
-                                );
-                                if forward {
-                                    // Resolve the contact's canonical identity_hash from
-                                    // the tunnel's node_id via the contact store.
-                                    if let Some(node_id) = tunnel_identities.get(&interface_name) {
-                                        if let Some(contact) = runtime.contact_store().find_by_tunnel_node_id(node_id) {
-                                            runtime.push_event(RuntimeEvent::ReplicaReceived {
-                                                peer_identity: contact.identity_hash,
-                                                op: rep_msg.op,
-                                                cid: rep_msg.cid,
-                                                data: rep_msg.payload,
-                                            });
+                                use harmony_tunnel::replication::ReplicationOp;
+                                // Resolve the contact's canonical identity_hash.
+                                if let Some(node_id) = tunnel_identities.get(&interface_name) {
+                                    if let Some(contact) = runtime.contact_store().find_by_tunnel_node_id(node_id) {
+                                        let peer_id = contact.identity_hash;
+                                        match rep_msg.op {
+                                            ReplicationOp::Push => {
+                                                runtime.push_event(RuntimeEvent::ReplicaPushReceived {
+                                                    peer_identity: peer_id,
+                                                    cid: rep_msg.cid,
+                                                    data: rep_msg.payload,
+                                                });
+                                            }
+                                            ReplicationOp::PullWithToken => {
+                                                runtime.push_event(RuntimeEvent::ReplicaPullWithTokenReceived {
+                                                    peer_identity: peer_id,
+                                                    cid: rep_msg.cid,
+                                                    token_bytes: rep_msg.payload,
+                                                });
+                                            }
+                                            _ => {} // Other ops (Pull, Status, etc.) not yet handled
                                         }
                                     }
                                 }
