@@ -179,12 +179,16 @@ pub enum RuntimeEvent {
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeAction {
     /// Tier 1: Send raw packet on a network interface.
     SendOnInterface {
         interface_name: Arc<str>,
         raw: Vec<u8>,
+        /// Cooperation weight for probabilistic broadcast selection.
+        /// `None` = directed send (always deliver).
+        /// `Some(score)` = broadcast send (caller may drop if random > score).
+        weight: Option<f32>,
     },
     /// Tier 2: Reply to a content or stats query.
     SendReply { query_id: u64, payload: Vec<u8> },
@@ -993,10 +997,12 @@ impl<B: BookStore> NodeRuntime<B> {
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
+                    weight,
                 } => {
                     out.push(RuntimeAction::SendOnInterface {
                         interface_name,
                         raw,
+                        weight,
                     });
                 }
                 NodeAction::AnnounceReceived {
@@ -1536,6 +1542,7 @@ mod tests {
         let _a1 = RuntimeAction::SendOnInterface {
             interface_name: "lo".into(),
             raw: vec![0u8; 20],
+            weight: None,
         };
         let _a2 = RuntimeAction::SendReply {
             query_id: 1,
