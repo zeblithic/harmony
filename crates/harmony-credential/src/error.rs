@@ -15,6 +15,7 @@ pub enum CredentialError {
     ProofNotFound,
     ChainBroken,
     ChainLoop,
+    InvalidKeyLength,
     SerializeError(&'static str),
     DeserializeError(&'static str),
 }
@@ -38,6 +39,7 @@ impl core::fmt::Display for CredentialError {
             }
             Self::ChainBroken => write!(f, "parent subject does not match child issuer"),
             Self::ChainLoop => write!(f, "delegation chain contains a loop"),
+            Self::InvalidKeyLength => write!(f, "public key length does not match crypto suite"),
             Self::SerializeError(msg) => write!(f, "serialize error: {msg}"),
             Self::DeserializeError(msg) => write!(f, "deserialize error: {msg}"),
         }
