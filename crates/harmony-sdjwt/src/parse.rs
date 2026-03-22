@@ -217,11 +217,15 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
 
         // KB-JWT detection: disclosures are base64url strings (no dots),
         // while a KB-JWT is a compact JWS (header.payload.signature).
-        // RFC 9901 §11.6: at most one KB-JWT, always the final non-empty segment.
+        // RFC 9901 §11.6: KB-JWT must be the final non-empty segment.
+        // Reject any segment after the KB-JWT has been seen.
+        if key_binding_jwt.is_some() {
+            return Err(SdJwtError::MalformedCompact);
+        }
+
+        // KB-JWT detection: disclosures are base64url (no dots),
+        // KB-JWT is a compact JWS (header.payload.signature).
         if segment.contains('.') {
-            if key_binding_jwt.is_some() {
-                return Err(SdJwtError::MalformedCompact);
-            }
             key_binding_jwt = Some((*segment).to_string());
             continue;
         }
@@ -516,6 +520,22 @@ mod tests {
             build_jws(&header, &payload, b"sig"),
             kb1,
             kb2
+        );
+        assert!(matches!(parse(&compact), Err(SdJwtError::MalformedCompact)));
+    }
+
+    #[test]
+    fn parse_rejects_disclosure_after_kb_jwt() {
+        let header = serde_json::json!({"alg": "EdDSA"});
+        let payload = serde_json::json!({"_sd": []});
+        let kb_jwt = "eyJhbGciOiJFZERTQSJ9.eyJub25jZSI6InRlc3QifQ.c2ln";
+        let disc = build_disclosure(&serde_json::json!(["salt1", "name", "value"]));
+        // KB-JWT must be last — disclosure after it is invalid
+        let compact = format!(
+            "{}~{}~{}~",
+            build_jws(&header, &payload, b"sig"),
+            kb_jwt,
+            disc
         );
         assert!(matches!(parse(&compact), Err(SdJwtError::MalformedCompact)));
     }
