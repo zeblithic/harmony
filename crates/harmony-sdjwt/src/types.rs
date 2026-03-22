@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Parsed JWS header (JOSE header).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JwsHeader {
     /// Signing algorithm, e.g. "EdDSA", "ES256".
     pub alg: String,
@@ -13,7 +13,7 @@ pub struct JwsHeader {
 }
 
 /// Parsed JWT payload claims.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JwtPayload {
     /// Issuer (`iss` claim).
     pub iss: Option<String>,
@@ -35,7 +35,7 @@ pub struct JwtPayload {
 }
 
 /// A decoded selective disclosure.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Disclosure {
     /// Raw base64url-encoded disclosure string (for hashing).
     pub raw: String,
@@ -52,7 +52,7 @@ pub struct Disclosure {
 }
 
 /// A fully parsed SD-JWT.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SdJwt {
     /// The JWS header.
     pub header: JwsHeader,

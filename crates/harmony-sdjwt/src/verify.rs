@@ -7,7 +7,7 @@ use crate::types::SdJwt;
 fn alg_to_suite(alg: &str) -> Result<CryptoSuite, SdJwtError> {
     match alg {
         "EdDSA" => Ok(CryptoSuite::Ed25519),
-        // IETF draft-ietf-cose-dilithium uses "ML-DSA-65" (with hyphens)
+        // IETF draft-ietf-jose-post-quantum-algs uses "ML-DSA-65" (with hyphens)
         "ML-DSA-65" => Ok(CryptoSuite::MlDsa65),
         other => Err(SdJwtError::UnsupportedAlgorithm(
             alloc::string::String::from(other),
@@ -20,6 +20,13 @@ fn alg_to_suite(alg: &str) -> Result<CryptoSuite, SdJwtError> {
 /// Uses `sd_jwt.signing_input` as the message for lossless verification.
 /// The caller resolves the correct public key via DID resolution.
 /// `ML-DSA-65` maps to `CryptoSuite::MlDsa65` (not Rotatable).
+///
+/// # Note
+///
+/// This function only verifies the cryptographic signature over the JWS
+/// signing input. It does **not** validate time-based claims (`exp`, `nbf`,
+/// `iat`). Callers MUST separately check that the token is not expired and
+/// is past its not-before time before accepting the disclosed claims.
 pub fn verify(
     sd_jwt: &SdJwt,
     suite: CryptoSuite,
