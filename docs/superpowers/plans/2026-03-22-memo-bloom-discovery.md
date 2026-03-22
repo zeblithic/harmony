@@ -27,7 +27,7 @@
 
 Add memo filter fields to PeerFilter and methods to PeerFilterTable, following the existing content/flatpack pattern.
 
-- [ ] **Step 1: Add memo fields to PeerFilter struct**
+- [x] **Step 1: Add memo fields to PeerFilter struct**
 
 In the `PeerFilter` struct (around line 235), add:
 
@@ -46,7 +46,7 @@ Update ALL places that construct `PeerFilter { ... }` to include the new fields:
 - `upsert_content()` — add `memo_filter: None, memo_received_tick: 0`
 - `upsert_flatpack()` — add `memo_filter: None, memo_received_tick: 0`
 
-- [ ] **Step 2: Add upsert_memo method**
+- [x] **Step 2: Add upsert_memo method**
 
 Following the pattern of `upsert_content()` and `upsert_flatpack()`:
 
@@ -65,7 +65,7 @@ fn upsert_memo(&mut self, peer_addr: String, filter: BloomFilter, tick: u64) {
 }
 ```
 
-- [ ] **Step 3: Add should_query_memo method**
+- [x] **Step 3: Add should_query_memo method**
 
 Following the pattern of `should_query()` and `should_query_flatpack()`:
 
@@ -94,7 +94,7 @@ fn should_query_memo(
 }
 ```
 
-- [ ] **Step 4: Add tests**
+- [x] **Step 4: Add tests**
 
 Add to the existing PeerFilterTable test section:
 
@@ -132,12 +132,12 @@ fn peer_memo_filter_staleness() {
 }
 ```
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run: `cargo test -p harmony-node -- peer_memo`
 Expected: both new tests pass
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/harmony-node/src/runtime.rs
@@ -159,7 +159,7 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 
 Add memo filter rebuild and publish alongside existing content/flatpack filter broadcasts.
 
-- [ ] **Step 1: Add memo filter broadcast after content/flatpack broadcasts**
+- [x] **Step 1: Add memo filter broadcast after content/flatpack broadcasts**
 
 In the timer tick handler, after the existing `pending_cuckoo_broadcast` flush (around line 966), add:
 
@@ -190,7 +190,7 @@ Note: `timer_due` is already computed earlier in the tick handler. The memo broa
 
 IMPORTANT: The `filter_config` field may be named differently. Check the actual struct field name (it's likely `self.filter_broadcast_config` or similar). Also check if `BloomFilter` is imported — it should be via `harmony_content::bloom::BloomFilter`.
 
-- [ ] **Step 2: Add test**
+- [x] **Step 2: Add test**
 
 ```rust
 #[test]
@@ -220,12 +220,12 @@ fn memo_filter_contains_inserted_inputs() {
 }
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p harmony-node -v`
 Expected: all tests pass
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/harmony-node/src/runtime.rs
@@ -247,7 +247,7 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 
 Add subscription routing for `harmony/filters/memo/` and startup subscription.
 
-- [ ] **Step 1: Add startup subscription**
+- [x] **Step 1: Add startup subscription**
 
 In the `new()` constructor, where the startup actions are built (around line 494), add alongside the existing CONTENT_SUB and FLATPACK_SUB:
 
@@ -257,7 +257,7 @@ In the `new()` constructor, where the startup actions are built (around line 494
         },
 ```
 
-- [ ] **Step 2: Add memo filter routing in route_subscription**
+- [x] **Step 2: Add memo filter routing in route_subscription**
 
 In the `route_subscription()` method, add a branch for memo filters. Find where content and flatpack filters are routed (look for `strip_prefix` on `CONTENT_PREFIX` and `FLATPACK_PREFIX`). Add a similar branch:
 
@@ -282,7 +282,7 @@ In the `route_subscription()` method, add a branch for memo filters. Find where 
 
 Place this AFTER the existing content and flatpack filter routing, following the same pattern exactly.
 
-- [ ] **Step 3: Add test**
+- [x] **Step 3: Add test**
 
 ```rust
 #[test]
@@ -309,7 +309,7 @@ fn memo_filter_subscription_routed() {
 
 Note: Testing the full `route_subscription` path requires a NodeRuntime, which may be complex. The PeerFilterTable-level test above verifies the key logic. If you can test route_subscription directly, add a test that feeds a `SubscriptionMessage` with `harmony/filters/memo/peer1` key and verifies the filter is stored.
 
-- [ ] **Step 4: Add a public accessor for memo queries**
+- [x] **Step 4: Add a public accessor for memo queries**
 
 Expose `should_query_memo` through the runtime's public API:
 
@@ -320,12 +320,12 @@ pub fn should_query_memo_peer(&self, peer_addr: &str, input_cid: &ContentId) -> 
 }
 ```
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run: `cargo test -p harmony-node -v`
 Expected: all tests pass
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/harmony-node/src/runtime.rs
@@ -344,17 +344,17 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 
 **Files:** None (verification only)
 
-- [ ] **Step 1: Run full workspace tests**
+- [x] **Step 1: Run full workspace tests**
 
 Run: `cargo test --workspace`
 Expected: all tests pass
 
-- [ ] **Step 2: Run clippy**
+- [x] **Step 2: Run clippy**
 
 Run: `cargo clippy -p harmony-node`
 Expected: no new warnings
 
-- [ ] **Step 3: Run fmt**
+- [x] **Step 3: Run fmt**
 
 Run: `cargo fmt --all -- --check`
 Expected: clean
