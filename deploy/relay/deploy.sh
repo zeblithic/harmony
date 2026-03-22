@@ -108,10 +108,10 @@ else
 fi
 
 # ── Step 4: Build iroh-relay ──────────────────────────────────────
-# Three strategies, in order of preference:
+# Two strategies, in order of preference:
 #   1. Use a pre-built binary (LOCAL_BINARY env var)
 #   2. Nix cross-compile (works from any host, ~5 min)
-#   3. Build on the VM (slow fallback, ~15 min on e2-micro)
+# If neither is available the script exits with install instructions.
 
 BINARY_PATH=""
 BUILD_STRATEGY=""
