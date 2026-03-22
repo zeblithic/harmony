@@ -67,7 +67,7 @@ mod tests {
         private: &harmony_identity::PrivateIdentity,
         payload_json: &str,
     ) -> alloc::string::String {
-        let header_b64 = b64(r#"{"alg":"EdDSA","typ":"sd-jwt"}"#);
+        let header_b64 = b64(r#"{"alg":"EdDSA","typ":"sd+jwt"}"#);
         let payload_b64 = b64(payload_json);
         let signing_input = alloc::format!("{}.{}", header_b64, payload_b64);
         let signature = private.sign(signing_input.as_bytes());
