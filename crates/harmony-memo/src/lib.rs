@@ -42,6 +42,8 @@ pub enum MemoError {
     Credential(CredentialError),
     /// Could not decode the claim inside the credential.
     ClaimDecodingFailed,
+    /// Memo violates self-attestation: issuer != subject.
+    SelfAttestationViolated,
     /// The input/output in the memo do not match the claim payload.
     InputOutputMismatch,
     /// Serialization or deserialization failed.
@@ -52,6 +54,7 @@ impl core::fmt::Display for MemoError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Credential(e) => write!(f, "credential error: {e}"),
+            Self::SelfAttestationViolated => write!(f, "memo issuer != subject (not self-attested)"),
             Self::ClaimDecodingFailed => write!(f, "memo claim decoding failed"),
             Self::InputOutputMismatch => write!(f, "memo input/output does not match claim"),
             Self::SerializationError => write!(f, "memo serialization error"),
@@ -107,6 +110,8 @@ mod tests {
         claim_value.extend_from_slice(&output.to_bytes());
         builder.add_claim(MEMO_CLAIM_TYPE, claim_value, [0x33; 16]);
         let payload = builder.signable_payload();
+        // NB: payload used as stand-in for a real signature. This credential
+        // is NOT cryptographically valid — use only for serialization tests.
         let (credential, _claims) = builder.build(payload);
         Memo {
             input,

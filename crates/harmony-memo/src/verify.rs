@@ -35,13 +35,11 @@ pub fn verify_memo(
 
     // 2. Enforce self-attestation: issuer must equal subject
     if memo.credential.issuer != memo.credential.subject {
-        return Err(MemoError::Credential(
-            harmony_credential::CredentialError::SignatureInvalid,
-        ));
+        return Err(MemoError::SelfAttestationViolated);
     }
 
     // 3. Verify input/output binding against the signed claim digest
-    if memo.credential.claim_digests.is_empty() {
+    if memo.credential.claim_digests.len() != 1 {
         return Err(MemoError::ClaimDecodingFailed);
     }
 
