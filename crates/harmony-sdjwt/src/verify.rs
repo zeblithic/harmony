@@ -41,11 +41,20 @@ pub fn verify(
     .map_err(SdJwtError::SignatureInvalid)
 }
 
-/// Verify using the algorithm from the JWS header.
+/// Verify using the algorithm and type from the JWS header.
+///
+/// Checks that `typ` is `"sd+jwt"` per RFC 9901 §3.3 before verifying
+/// the signature. This prevents cross-format token confusion where a
+/// plain JWT with a valid signature passes as an SD-JWT.
 pub fn verify_from_header(
     sd_jwt: &SdJwt,
     public_key: &[u8],
 ) -> Result<(), SdJwtError> {
+    // RFC 9901 §3.3: typ MUST be "sd+jwt" for issuer-signed SD-JWTs.
+    match sd_jwt.header.typ.as_deref() {
+        Some("sd+jwt") => {}
+        _ => return Err(SdJwtError::MalformedCompact),
+    }
     let suite = alg_to_suite(&sd_jwt.header.alg)?;
     verify(sd_jwt, suite, public_key)
 }

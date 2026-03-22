@@ -14,7 +14,8 @@ pub fn signing_input(compact: &str) -> Result<(&str, &str), SdJwtError> {
 
     // The input may be an SD-JWT with disclosures appended after `~`.
     // The JWS is always the first segment before any `~`.
-    let jws = compact.split('~').next().unwrap_or(compact);
+    // split always yields at least one element for non-empty input (checked above)
+    let jws = compact.split('~').next().unwrap();
 
     // A JWS compact serialization has exactly 3 dot-separated parts.
     let mut dots = 0usize;
