@@ -13,7 +13,10 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 if ! command -v nix &>/dev/null; then
   echo "[nix-cache-setup] Installing multi-user Nix..."
-  # Multi-user Nix installer requires root for daemon setup
+  # Multi-user Nix installer requires root for daemon setup.
+  # NOTE: For production hardening, pin the installer version and verify
+  # its SHA-256 before executing. See https://nixos.org/download/ for
+  # current checksums. The --yes flag silences all prompts.
   curl -fsSL https://nixos.org/nix/install | sudo sh -s -- --daemon --yes
 else
   echo "[nix-cache-setup] Nix already installed — skipping."
@@ -116,9 +119,10 @@ ExecStart=${NIX_SERVE_BIN} --listen 0.0.0.0:5000
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
-# ProtectSystem=full (not strict) — nix-serve needs access to the Nix
-# daemon socket at /nix/var/nix/daemon-socket/socket for store queries.
-# strict would mount / read-only and block the socket connect().
+# ProtectSystem=full — nix-serve reads /nix/store (world-readable) and
+# writes nothing itself. 'strict' would also make /nix read-only; while
+# nix-serve doesn't write to /nix directly, we use 'full' to avoid any
+# /nix/var write surprises if nix-serve behavior changes.
 ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
