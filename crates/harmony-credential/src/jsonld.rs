@@ -118,6 +118,7 @@ pub fn presentation_to_jsonld(
     Ok(json!({
         "@context": ["https://www.w3.org/ns/credentials/v2"],
         "type": ["VerifiablePresentation"],
+        "holder": subject_did,
         "verifiableCredential": [vc]
     }))
 }
@@ -134,6 +135,10 @@ fn build_vc_json(
         CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => "mldsa65-2025",
     };
 
+    // proofValue uses multibase base58btc encoding (prefix 'z') per
+    // W3C Data Integrity EdDSA Cryptosuites 1.0 spec.
+    let proof_value = alloc::format!("z{}", bs58::encode(&credential.signature).into_string());
+
     let mut vc = json!({
         "@context": [
             "https://www.w3.org/ns/credentials/v2",
@@ -141,6 +146,7 @@ fn build_vc_json(
             HARMONY_CONTEXT
         ],
         "type": ["VerifiableCredential"],
+        "id": alloc::format!("urn:harmony:{}", hex_encode(&credential.content_hash())),
         "issuer": issuer_did,
         "validFrom": epoch_to_iso8601(credential.not_before),
         "validUntil": epoch_to_iso8601(credential.expires_at),
@@ -154,7 +160,7 @@ fn build_vc_json(
             "created": epoch_to_iso8601(credential.issued_at),
             "verificationMethod": alloc::format!("{}#key-1", issuer_did),
             "proofPurpose": "assertionMethod",
-            "proofValue": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&credential.signature),
+            "proofValue": proof_value,
             "nonce": hex_encode(&credential.nonce)
         }
     });
@@ -368,13 +374,23 @@ mod tests {
         assert_eq!(proof["type"].as_str().unwrap(), "DataIntegrityProof");
         assert_eq!(proof["cryptosuite"].as_str().unwrap(), "eddsa-2022");
         assert_eq!(proof["proofPurpose"].as_str().unwrap(), "assertionMethod");
-        assert!(proof["proofValue"].is_string());
+        // proofValue must be multibase base58btc (prefix 'z')
+        let pv = proof["proofValue"].as_str().unwrap();
+        assert!(pv.starts_with('z'), "proofValue must use multibase base58btc prefix 'z'");
         assert!(proof["nonce"].is_string());
         // W3C required: created and verificationMethod
         assert!(proof["created"].as_str().unwrap().ends_with("Z"));
         let vm = proof["verificationMethod"].as_str().unwrap();
         assert!(vm.starts_with("did:key:z"));
         assert!(vm.ends_with("#key-1"));
+    }
+
+    #[test]
+    fn credential_export_has_id() {
+        let cred = build_test_credential();
+        let json = credential_to_jsonld(&cred, &[0x42; 32], &[0x43; 32]).unwrap();
+        let id = json["id"].as_str().unwrap();
+        assert!(id.starts_with("urn:harmony:"));
     }
 
     #[test]
@@ -437,6 +453,8 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert!(types.contains(&"VerifiablePresentation"));
+        // holder binds presentation to the subject
+        assert!(json["holder"].as_str().unwrap().starts_with("did:key:z"));
 
         // Inner VC
         let vc = &json["verifiableCredential"][0];
