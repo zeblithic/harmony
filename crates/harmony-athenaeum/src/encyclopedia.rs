@@ -289,6 +289,19 @@ impl Encyclopedia {
         path
     }
 
+    /// Determine which partition a CID's hash maps to.
+    ///
+    /// `hash` is the 28-byte hash portion of a ContentId (bytes 4-31).
+    /// Routing starts at `PARTITION_START_BIT` (28) because bits 0-27
+    /// are used for PageAddr addressing.
+    ///
+    /// For callers with a full 32-byte CID: `Encyclopedia::route_hash(&cid[4..].try_into().unwrap(), depth)`
+    pub fn route_hash(hash: &[u8; 28], depth: u8) -> u32 {
+        let mut padded = [0u8; 32];
+        padded[4..].copy_from_slice(hash);
+        Self::route(&padded, depth)
+    }
+
     /// Serialize the Encyclopedia root metadata.
     ///
     /// Format: magic "ENCY" (4) + version u8 (1) + total_books u32 LE (4)
@@ -450,6 +463,38 @@ mod tests {
         let path = Encyclopedia::route(&hash, 100);
         // path is capped at 32 bits — should not panic
         let _ = path;
+    }
+
+    #[test]
+    fn route_hash_matches_route_with_padding() {
+        // A full 32-byte value where bytes 0-3 are header, 4-31 are hash
+        let mut full = [0u8; 32];
+        full[7] = 0xFF; // set some bits in the hash portion
+        full[15] = 0xAA;
+
+        // Extract the 28-byte hash portion
+        let hash: [u8; 28] = full[4..].try_into().unwrap();
+
+        // route_hash with the hash portion should match route with the full value
+        // (since route uses PARTITION_START_BIT=28 which skips the first 28 bits,
+        // and the header in bytes 0-3 is within those first 32 bits)
+        let path_full = Encyclopedia::route(&full, 10);
+        let path_hash = Encyclopedia::route_hash(&hash, 10);
+        assert_eq!(path_full, path_hash);
+    }
+
+    #[test]
+    fn route_with_hash_portion() {
+        // The hash portion is 28 bytes (bytes 4-31 of a CID).
+        // route_hash pads 4 zero bytes before the hash, so PARTITION_START_BIT=28
+        // falls in the zero-padded region (padded bytes 0-3). The first
+        // routing bit sourced from actual hash data is at depth d=4
+        // (padded bit 32 = hash[0] MSB).
+        let mut hash = [0u8; 28];
+        hash[0] = 0b1000_0000; // bit 32 of padded = MSB of hash[0] = 1
+        // depth=5 checks routing bits d=0..4; d=4 checks padded bit 32
+        let path = Encyclopedia::route_hash(&hash, 5);
+        assert_eq!((path >> 4) & 1, 1); // routing bit 4 should be 1
     }
 
     #[test]

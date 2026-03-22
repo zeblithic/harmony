@@ -5,7 +5,12 @@ use crate::addr::{PageAddr, ALGO_COUNT};
 use crate::athenaeum::{Book, BookError, BookType};
 use alloc::vec::Vec;
 
-/// Maximum partition depth (SHA-256 bits 28-255 = 228 usable bits).
+/// Maximum partition depth.
+///
+/// Partition routing uses bits PARTITION_START_BIT..PARTITION_START_BIT+MAX_PARTITION_DEPTH
+/// from the content hash. For page content hashes (SHA-256, 32 bytes), this gives
+/// 228 usable bits (28..255). For CID hash portions (28 bytes from ContentId),
+/// the same bit indices apply after zero-padding the 4-byte header position.
 pub const MAX_PARTITION_DEPTH: u8 = 228;
 
 /// A partition node in the Encyclopedia tree.
