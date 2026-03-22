@@ -102,6 +102,7 @@
               nativeBuildInputs = crossNativeBuildInputs;
               buildInputs = crossBuildInputs;
               CARGO_BUILD_TARGET = crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
+              CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
               HOST_CC = "${pkgs.stdenv.cc}/bin/cc";
             };
 
@@ -119,6 +120,7 @@
               nativeBuildInputs = crossNativeBuildInputs;
               buildInputs = crossBuildInputs;
               CARGO_BUILD_TARGET = crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
+              CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
               HOST_CC = "${pkgs.stdenv.cc}/bin/cc";
             };
 
