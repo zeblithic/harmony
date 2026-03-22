@@ -3,7 +3,7 @@
 //! `NodeRuntime` is `!Send`; it lives entirely on the select loop task.
 //! Zenoh objects that need spawning are cloned (Session is internally Arc'd).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,6 +124,19 @@ enum ZenohEvent {
         is_module: bool,
         result: Result<Vec<u8>, String>,
     },
+}
+
+/// A tunnel dial request waiting for its scheduled fire time.
+///
+/// Introduces a random 500-4000ms delay between the PeerManager emitting
+/// `InitiateTunnel` and the event loop actually dialing the relay, breaking
+/// the timing correlation between Zenoh discovery queries and QUIC
+/// connection attempts.
+struct DeferredDial {
+    identity_hash: [u8; 16],
+    node_id: [u8; 32],
+    relay_url: Option<String>,
+    fire_at_ms: u64,
 }
 
 /// Run the async event loop.
@@ -260,6 +273,9 @@ pub async fn run(
     #[allow(unused_variables, unused_mut)]
     let mut config_tunnels = ConfigTunnelPeers::new(tunnel_entries);
 
+    // ── Deferred dial queue (stochastic delay for tunnel privacy) ───────────
+    let mut deferred_dials: VecDeque<DeferredDial> = VecDeque::new();
+
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
         dispatch_action(
@@ -270,6 +286,7 @@ pub async fn run(
             &broadcast_addr,
             None,
             &tunnel_senders,
+            &mut deferred_dials,
         )
         .await;
     }
@@ -672,8 +689,27 @@ pub async fn run(
                     &broadcast_addr,
                     Some(&peer_table),
                     &tunnel_senders,
+                    &mut deferred_dials,
                 )
                 .await;
+            }
+
+            // Drain deferred dials that have reached their fire time.
+            let current_ms = now_ms();
+            while let Some(front) = deferred_dials.front() {
+                if front.fire_at_ms <= current_ms {
+                    let dial = deferred_dials.pop_front().unwrap();
+                    tracing::info!(
+                        identity = %hex::encode(dial.identity_hash),
+                        node_id = %hex::encode(&dial.node_id[..8]),
+                        relay = ?dial.relay_url,
+                        "InitiateTunnel fired (stub — iroh-net not yet wired)"
+                    );
+                    // TODO(harmony-h6k): execute actual iroh Endpoint.connect()
+                    // using dial.node_id and dial.relay_url here.
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -703,6 +739,7 @@ async fn dispatch_action(
     broadcast_addr: &SocketAddr,
     peer_table: Option<&PeerTable>,
     tunnel_senders: &HashMap<String, TunnelSender>,
+    deferred_dials: &mut VecDeque<DeferredDial>,
 ) {
     match action {
         // ── Tier 1: Send on interface (UDP broadcast + unicast, or tunnel) ────
@@ -859,18 +896,26 @@ async fn dispatch_action(
         }
 
         // ── Peer lifecycle: Tunnel initiation ─────────────────────────────────
-        // Stub — actual iroh-net Endpoint.connect() wiring deferred until
-        // tunnel infrastructure (tunnel_task.rs, tunnel_bridge.rs) is integrated.
+        // Deferred by a random 500-4000ms delay for privacy — breaks timing
+        // correlation between Zenoh discovery queries and QUIC connection attempts.
+        // The actual dial (stub) fires when the deferred queue drains.
         RuntimeAction::InitiateTunnel {
             identity_hash,
             node_id,
             relay_url,
         } => {
-            tracing::info!(
+            let delay_ms = 500 + (rand::random::<u64>() % 3500);
+            let fire_at = tunnel_task::millis_since_start() + delay_ms;
+            deferred_dials.push_back(DeferredDial {
+                identity_hash,
+                node_id,
+                relay_url,
+                fire_at_ms: fire_at,
+            });
+            tracing::debug!(
                 identity = %hex::encode(identity_hash),
-                node_id = %hex::encode(&node_id[..8]),
-                relay = ?relay_url,
-                "InitiateTunnel requested (stub — iroh-net not yet wired)"
+                delay_ms,
+                "tunnel dial deferred for privacy"
             );
         }
 
