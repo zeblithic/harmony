@@ -89,7 +89,7 @@
 
             crossNativeBuildInputs = [
               crossPkgs.stdenv.cc
-              crossPkgs.pkg-config
+              crossPkgs.buildPackages.pkg-config
             ];
             crossBuildInputs = [
               crossOpenssl
@@ -100,8 +100,14 @@
             # CARGO_TARGET_<TRIPLE>_LINKER takes precedence over config.toml.
             targetUpper = builtins.replaceStrings ["-"] ["_"]
               (pkgs.lib.toUpper crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec);
+            # Override .cargo/config.toml's target-specific linker AND rustflags.
+            # config.toml sets linker=rust-lld and rustflags=["-C","link-self-contained=yes"]
+            # for aarch64-unknown-linux-musl, which bypasses the Nix cross-linker
+            # and discards our -C target-feature=+crt-static. Target-specific env
+            # vars take precedence over config.toml.
             linkerEnv = {
               "CARGO_TARGET_${targetUpper}_LINKER" = "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
+              "CARGO_TARGET_${targetUpper}_RUSTFLAGS" = "-C target-feature=+crt-static";
             };
 
             crossHarmonyCommonArgs = {
@@ -112,7 +118,6 @@
               nativeBuildInputs = crossNativeBuildInputs;
               buildInputs = crossBuildInputs;
               CARGO_BUILD_TARGET = crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
-              CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
               HOST_CC = "${pkgs.stdenv.cc}/bin/cc";
             } // linkerEnv;
 
@@ -130,7 +135,6 @@
               nativeBuildInputs = crossNativeBuildInputs;
               buildInputs = crossBuildInputs;
               CARGO_BUILD_TARGET = crossPkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
-              CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
               HOST_CC = "${pkgs.stdenv.cc}/bin/cc";
             } // linkerEnv;
 
