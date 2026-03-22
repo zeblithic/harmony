@@ -1,14 +1,104 @@
-use crate::error::SdJwtError;
-use crate::types::SdJwt;
 use harmony_identity::CryptoSuite;
 
-pub fn verify(_sd_jwt: &SdJwt, _suite: CryptoSuite, _public_key: &[u8]) -> Result<(), SdJwtError> {
-    todo!()
+use crate::error::SdJwtError;
+use crate::types::SdJwt;
+
+/// Map JWS algorithm name to Harmony CryptoSuite.
+fn alg_to_suite(alg: &str) -> Result<CryptoSuite, SdJwtError> {
+    match alg {
+        "EdDSA" => Ok(CryptoSuite::Ed25519),
+        "MLDSA65" => Ok(CryptoSuite::MlDsa65),
+        other => Err(SdJwtError::UnsupportedAlgorithm(
+            alloc::string::String::from(other),
+        )),
+    }
 }
 
-pub fn verify_from_header(
-    _sd_jwt: &SdJwt,
-    _public_key: &[u8],
+/// Verify the JWS signature of a parsed SD-JWT.
+///
+/// Uses `sd_jwt.signing_input` as the message for lossless verification.
+/// The caller resolves the correct public key via DID resolution.
+/// `MLDSA65` maps to `CryptoSuite::MlDsa65` (not Rotatable).
+pub fn verify(
+    sd_jwt: &SdJwt,
+    suite: CryptoSuite,
+    public_key: &[u8],
 ) -> Result<(), SdJwtError> {
-    todo!()
+    harmony_identity::verify_signature(
+        suite,
+        public_key,
+        sd_jwt.signing_input.as_bytes(),
+        &sd_jwt.signature,
+    )
+    .map_err(SdJwtError::SignatureInvalid)
+}
+
+/// Verify using the algorithm from the JWS header.
+pub fn verify_from_header(
+    sd_jwt: &SdJwt,
+    public_key: &[u8],
+) -> Result<(), SdJwtError> {
+    let suite = alg_to_suite(&sd_jwt.header.alg)?;
+    verify(sd_jwt, suite, public_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use rand::rngs::OsRng;
+
+    const B64: base64::engine::GeneralPurpose =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    fn b64(json: &str) -> alloc::string::String {
+        B64.encode(json.as_bytes())
+    }
+
+    fn make_signed_sdjwt(
+        private: &harmony_identity::PrivateIdentity,
+        payload_json: &str,
+    ) -> alloc::string::String {
+        let header_b64 = b64(r#"{"alg":"EdDSA","typ":"sd-jwt"}"#);
+        let payload_b64 = b64(payload_json);
+        let signing_input = alloc::format!("{}.{}", header_b64, payload_b64);
+        let signature = private.sign(signing_input.as_bytes());
+        let sig_b64 = B64.encode(&signature);
+        alloc::format!("{}.{}", signing_input, sig_b64)
+    }
+
+    #[test]
+    fn verify_valid_ed25519() {
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let identity = private.public_identity();
+        let compact = make_signed_sdjwt(&private, r#"{"iss":"alice"}"#);
+
+        let sd_jwt = crate::parse::parse(&compact).unwrap();
+        assert!(verify(&sd_jwt, CryptoSuite::Ed25519, &identity.verifying_key.to_bytes()).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_wrong_key() {
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let other = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let compact = make_signed_sdjwt(&private, r#"{"iss":"alice"}"#);
+
+        let sd_jwt = crate::parse::parse(&compact).unwrap();
+        assert!(verify(&sd_jwt, CryptoSuite::Ed25519, &other.public_identity().verifying_key.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn verify_from_header_works() {
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let identity = private.public_identity();
+        let compact = make_signed_sdjwt(&private, r#"{"iss":"alice"}"#);
+
+        let sd_jwt = crate::parse::parse(&compact).unwrap();
+        assert!(verify_from_header(&sd_jwt, &identity.verifying_key.to_bytes()).is_ok());
+    }
+
+    #[test]
+    fn unsupported_algorithm() {
+        assert!(matches!(alg_to_suite("RS256"), Err(SdJwtError::UnsupportedAlgorithm(_))));
+    }
 }
