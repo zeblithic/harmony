@@ -11,6 +11,7 @@ use rand_core::CryptoRngCore;
 
 use crate::announce::{build_announce, validate_announce, ValidatedAnnounce};
 use crate::context::PacketContext;
+use crate::cooperation::CooperationTable;
 use crate::destination::DestinationName;
 use crate::ifac::IfacAuthenticator;
 use crate::interface::InterfaceMode;
@@ -244,6 +245,10 @@ pub enum NodeAction {
     SendOnInterface {
         interface_name: Arc<str>,
         raw: Vec<u8>,
+        /// Cooperation weight for probabilistic broadcast selection.
+        /// `None` = directed send (always deliver).
+        /// `Some(score)` = broadcast send (caller may drop if random > score).
+        weight: Option<f32>,
     },
     /// Transport node rebroadcast an announce on interfaces (excluding source).
     AnnounceRebroadcast {
@@ -304,6 +309,7 @@ pub struct Node {
     announce_rate_table: HashMap<DestinationHash, AnnounceRateEntry>,
     reverse_table: HashMap<DestinationHash, ReverseTableEntry>,
     link_table: HashMap<DestinationHash, LinkTableEntry>,
+    cooperation: CooperationTable,
 }
 
 impl Node {
@@ -320,6 +326,7 @@ impl Node {
             announce_rate_table: HashMap::new(),
             reverse_table: HashMap::new(),
             link_table: HashMap::new(),
+            cooperation: CooperationTable::default(),
         }
     }
 
@@ -336,6 +343,7 @@ impl Node {
             announce_rate_table: HashMap::new(),
             reverse_table: HashMap::new(),
             link_table: HashMap::new(),
+            cooperation: CooperationTable::default(),
         }
     }
 
@@ -386,8 +394,10 @@ impl Node {
         mode: InterfaceMode,
         ifac: Option<IfacAuthenticator>,
     ) {
+        let arc_name: Arc<str> = Arc::from(name);
+        self.cooperation.register_interface(Arc::clone(&arc_name));
         self.interfaces.insert(
-            Arc::from(name),
+            arc_name,
             InterfaceConfig {
                 mode,
                 ifac,
@@ -628,23 +638,85 @@ impl Node {
         vec![NodeAction::SendOnInterface {
             interface_name: Arc::clone(interface_name),
             raw: outbound,
+            weight: None,
         }]
     }
 
     /// Broadcast raw bytes on all registered interfaces, IFAC-masking each.
+    ///
+    /// Each interface gets a cooperation weight via `get_broadcast_weights()`.
+    /// The highest-scored interface is forced to 1.0 to guarantee delivery.
     fn broadcast_on_all_interfaces(&self, raw: &[u8]) -> Vec<NodeAction> {
+        let weights = self.cooperation.get_broadcast_weights();
         let mut actions = Vec::with_capacity(self.interfaces.len());
+        for (name, weight) in &weights {
+            if let Some(iface) = self.interfaces.get(&**name) {
+                let outbound = if let Some(ref auth) = iface.ifac {
+                    match auth.mask(raw) {
+                        Ok(masked) => masked,
+                        Err(_) => {
+                            actions.push(NodeAction::PacketDropped {
+                                reason: DropReason::OutboundIfacFailed,
+                                interface_name: Arc::clone(name),
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    raw.to_vec()
+                };
+                actions.push(NodeAction::SendOnInterface {
+                    interface_name: Arc::clone(name),
+                    raw: outbound,
+                    weight: Some(*weight),
+                });
+            }
+        }
+        // Include any interfaces not yet in the cooperation table (shouldn't
+        // happen in normal use, but keeps the invariant that all interfaces
+        // participate in broadcasts).
         for name in self.interfaces.keys() {
-            actions.extend(self.send_on_interface(name, raw));
+            if !weights.iter().any(|(n, _)| n == name) {
+                actions.extend(self.send_on_interface(name, raw));
+            }
         }
         actions
     }
 
     /// Broadcast on all interfaces except the named one (source exclusion).
+    ///
+    /// Each interface gets a cooperation weight via `get_broadcast_weights()`.
     fn broadcast_except(&self, exclude: &str, raw: &[u8]) -> Vec<NodeAction> {
+        let weights = self.cooperation.get_broadcast_weights();
         let mut actions = Vec::with_capacity(self.interfaces.len());
-        for name in self.interfaces.keys() {
+        for (name, weight) in &weights {
             if &**name != exclude {
+                if let Some(iface) = self.interfaces.get(&**name) {
+                    let outbound = if let Some(ref auth) = iface.ifac {
+                        match auth.mask(raw) {
+                            Ok(masked) => masked,
+                            Err(_) => {
+                                actions.push(NodeAction::PacketDropped {
+                                    reason: DropReason::OutboundIfacFailed,
+                                    interface_name: Arc::clone(name),
+                                });
+                                continue;
+                            }
+                        }
+                    } else {
+                        raw.to_vec()
+                    };
+                    actions.push(NodeAction::SendOnInterface {
+                        interface_name: Arc::clone(name),
+                        raw: outbound,
+                        weight: Some(*weight),
+                    });
+                }
+            }
+        }
+        // Include any interfaces not yet in the cooperation table.
+        for name in self.interfaces.keys() {
+            if &**name != exclude && !weights.iter().any(|(n, _)| n == name) {
                 actions.extend(self.send_on_interface(name, raw));
             }
         }
@@ -2314,6 +2386,7 @@ mod tests {
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
+                    ..
                 } => {
                     if &**interface_name == "eth0" {
                         // IFAC interface → flag set
@@ -2406,6 +2479,7 @@ mod tests {
             NodeAction::SendOnInterface {
                 interface_name,
                 raw,
+                ..
             } => {
                 assert_eq!(&**interface_name, "eth0");
                 assert_eq!(*raw, data);
@@ -2470,6 +2544,7 @@ mod tests {
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
+                    ..
                 } => {
                     if &**interface_name == "eth0" {
                         assert_ne!(raw[0] & 0x80, 0, "eth0 should have IFAC");
@@ -2674,6 +2749,7 @@ mod tests {
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
+                    ..
                 } => Some((&**interface_name, raw.clone())),
                 _ => None,
             })
@@ -4562,6 +4638,7 @@ mod tests {
             NodeAction::SendOnInterface {
                 interface_name,
                 raw,
+                ..
             } => Some((&**interface_name, raw.clone())),
             _ => None,
         });
@@ -4618,6 +4695,7 @@ mod tests {
             NodeAction::SendOnInterface {
                 interface_name,
                 raw,
+                ..
             } => Some((&**interface_name, raw.clone())),
             _ => None,
         });

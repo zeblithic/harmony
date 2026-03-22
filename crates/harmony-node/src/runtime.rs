@@ -988,6 +988,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 NodeAction::SendOnInterface {
                     interface_name,
                     raw,
+                    ..
                 } => {
                     out.push(RuntimeAction::SendOnInterface {
                         interface_name,
