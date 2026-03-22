@@ -7,6 +7,7 @@ use harmony_identity::{CryptoSuite, IdentityRef};
 use serde_json::{json, Value};
 
 use crate::credential::Credential;
+use crate::disclosure::Presentation;
 use crate::error::CredentialError;
 
 /// Encode an IdentityRef + public key bytes as a `did:key` string.
@@ -97,6 +98,86 @@ pub fn credential_to_jsonld(
     }
 
     Ok(vc)
+}
+
+/// Export a Presentation to W3C Verifiable Presentation JSON-LD.
+///
+/// Disclosed claims include `typeId`, `value` (base64url), and `digest`.
+/// Undisclosed claims include only `digest`.
+pub fn presentation_to_jsonld(
+    presentation: &Presentation,
+    issuer_key: &[u8],
+    subject_key: &[u8],
+) -> Result<Value, CredentialError> {
+    let credential = &presentation.credential;
+    let issuer_did = identity_to_did_key(&credential.issuer, issuer_key);
+    let subject_did = identity_to_did_key(&credential.subject, subject_key);
+
+    let cryptosuite = match credential.issuer.suite {
+        CryptoSuite::Ed25519 => "eddsa-2022",
+        CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => "mldsa65-2025",
+    };
+
+    // Disclosed claims get typeId + value + digest; undisclosed get digest only.
+    let claims: Vec<Value> = credential
+        .claim_digests
+        .iter()
+        .map(|digest| {
+            let digest_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+            if let Some(sc) = presentation.disclosed_claims.iter().find(|sc| &sc.digest() == digest) {
+                json!({
+                    "typeId": sc.claim.type_id,
+                    "value": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sc.claim.value),
+                    "digest": digest_b64
+                })
+            } else {
+                json!({ "digest": digest_b64 })
+            }
+        })
+        .collect();
+
+    let mut vc = json!({
+        "@context": [
+            "https://www.w3.org/ns/credentials/v2",
+            "https://w3id.org/security/data-integrity/v2"
+        ],
+        "type": ["VerifiableCredential"],
+        "issuer": issuer_did,
+        "validFrom": epoch_to_iso8601(credential.not_before),
+        "validUntil": epoch_to_iso8601(credential.expires_at),
+        "credentialSubject": {
+            "id": subject_did,
+            "claims": claims
+        },
+        "proof": {
+            "type": "DataIntegrityProof",
+            "cryptosuite": cryptosuite,
+            "proofValue": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&credential.signature),
+            "nonce": hex_encode(&credential.nonce)
+        }
+    });
+
+    if let Some(idx) = credential.status_list_index {
+        vc["credentialStatus"] = json!({
+            "type": "BitstringStatusListEntry",
+            "statusListIndex": idx.to_string(),
+            "statusListCredential": alloc::format!(
+                "harmony:status-list:{}", hex_encode(&credential.issuer.hash)
+            )
+        });
+    }
+
+    if let Some(ref proof_hash) = credential.proof {
+        vc["delegationProof"] = json!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(proof_hash)
+        );
+    }
+
+    Ok(json!({
+        "@context": ["https://www.w3.org/ns/credentials/v2"],
+        "type": ["VerifiablePresentation"],
+        "verifiableCredential": [vc]
+    }))
 }
 
 fn epoch_to_iso8601(epoch: u64) -> String {
@@ -294,5 +375,59 @@ mod tests {
         for claim in claims {
             assert!(claim["digest"].is_string());
         }
+    }
+
+    #[test]
+    fn presentation_export_disclosed_claims() {
+        use crate::disclosure::Presentation;
+        let mut builder = CredentialBuilder::new(
+            test_issuer_ref(), test_subject_ref(), 1000, 5000, [0x01; 16],
+        );
+        builder.add_claim(1, alloc::vec![0xAA, 0xBB], [0x11; 16]);
+        builder.add_claim(2, alloc::vec![0xCC], [0x22; 16]);
+        let payload = builder.signable_payload();
+        let (cred, salted_claims) = builder.build(alloc::vec![0xDE, 0xAD]);
+
+        let presentation = Presentation {
+            credential: cred,
+            disclosed_claims: vec![salted_claims[0].clone()],
+        };
+
+        let json = presentation_to_jsonld(&presentation, &[0x42; 32], &[0x43; 32]).unwrap();
+
+        // VP envelope
+        assert!(json["@context"].is_array());
+        let types: Vec<&str> = json["type"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(types.contains(&"VerifiablePresentation"));
+
+        // Inner VC
+        let vc = &json["verifiableCredential"][0];
+        let claims = vc["credentialSubject"]["claims"].as_array().unwrap();
+        assert_eq!(claims.len(), 2);
+
+        // One disclosed (has typeId), one undisclosed (digest only)
+        let disclosed = claims.iter().find(|c| c.get("typeId").is_some()).unwrap();
+        assert_eq!(disclosed["typeId"].as_u64().unwrap(), 1);
+        assert!(disclosed["value"].is_string());
+        assert!(disclosed["digest"].is_string());
+
+        let undisclosed_count = claims.iter().filter(|c| c.get("typeId").is_none()).count();
+        assert_eq!(undisclosed_count, 1);
+    }
+
+    #[test]
+    fn credential_export_ml_dsa65() {
+        let issuer = IdentityRef::new([0xAA; 16], CryptoSuite::MlDsa65);
+        let subject = IdentityRef::new([0xBB; 16], CryptoSuite::MlDsa65);
+
+        let builder = CredentialBuilder::new(issuer, subject, 1000, 5000, [0x01; 16]);
+        let payload = builder.signable_payload();
+        let (cred, _) = builder.build(alloc::vec![0xDE; 3309]);
+
+        let json = credential_to_jsonld(&cred, &[0x55; 1952], &[0x66; 1952]).unwrap();
+
+        assert_eq!(json["proof"]["cryptosuite"].as_str().unwrap(), "mldsa65-2025");
+        assert!(json["issuer"].as_str().unwrap().starts_with("did:key:z"));
     }
 }
