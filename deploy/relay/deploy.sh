@@ -167,7 +167,9 @@ elif command -v nix &>/dev/null; then
     # Extract the actual key line (strip comments and blank lines)
     CACHE_PUB_KEY=""
     if [ -f "$CACHE_KEY_FILE" ] && [ -s "$CACHE_KEY_FILE" ]; then
-        CACHE_PUB_KEY=$(grep -v '^#' "$CACHE_KEY_FILE" | grep -v '^$' | head -1)
+        # || true: grep exits 1 when no lines match (e.g. comment-only placeholder).
+        # Under set -euo pipefail, this would abort the script.
+        CACHE_PUB_KEY=$(grep -v '^#' "$CACHE_KEY_FILE" | grep -v '^$' | head -1 || true)
     fi
     if [ -n "$CACHE_PUB_KEY" ]; then
         # Best-effort: ask nix build to check the relay's binary cache.
@@ -186,8 +188,17 @@ elif command -v nix &>/dev/null; then
 
     # Build locally (cross-compiles to x86_64-linux-musl on any host).
     # If the binary cache has this derivation, nix build fetches instead of compiling.
+    # --extra-experimental-features ensures flakes work even if the developer hasn't
+    # enabled them globally in ~/.config/nix/nix.conf.
     echo "    Running: nix build .#iroh-relay-x86_64-linux (from ${REPO_ROOT})"
-    STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux" ${EXTRA_NIX_ARGS[@]+"${EXTRA_NIX_ARGS[@]}"} --print-out-paths --no-link)
+    STORE_PATH=$(nix build "${REPO_ROOT}#iroh-relay-x86_64-linux" \
+        ${EXTRA_NIX_ARGS[@]+"${EXTRA_NIX_ARGS[@]}"} \
+        --extra-experimental-features "nix-command flakes" \
+        --print-out-paths --no-link)
+    if [ -z "$STORE_PATH" ]; then
+        echo "ERROR: nix build returned empty store path; check that the flake target exists"
+        exit 1
+    fi
     echo "    Store path: ${STORE_PATH}"
 
     # Check if VM already has this exact store path (fast path).
