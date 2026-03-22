@@ -35,7 +35,7 @@ pub struct Frame {
 const FRAME_HEADER_LEN: usize = 5;
 
 impl Frame {
-    /// Create a keepalive frame.
+    /// Create a keepalive frame (empty payload, for deterministic tests).
     pub fn keepalive() -> Self {
         Self {
             tag: FrameTag::Keepalive,

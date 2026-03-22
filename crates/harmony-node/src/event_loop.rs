@@ -3,7 +3,8 @@
 //! `NodeRuntime` is `!Send`; it lives entirely on the select loop task.
 //! Zenoh objects that need spawning are cloned (Session is internally Arc'd).
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -125,6 +126,40 @@ enum ZenohEvent {
         result: Result<Vec<u8>, String>,
     },
 }
+
+/// A tunnel dial request waiting for its scheduled fire time.
+///
+/// Introduces a random 500-4000ms delay between the PeerManager emitting
+/// `InitiateTunnel` and the event loop actually dialing the relay, breaking
+/// the timing correlation between Zenoh discovery queries and QUIC
+/// connection attempts.
+#[derive(Debug)]
+struct DeferredDial {
+    fire_at_ms: u64,
+    identity_hash: [u8; 16],
+    node_id: [u8; 32],
+    relay_url: Option<String>,
+}
+
+impl Ord for DeferredDial {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.fire_at_ms.cmp(&other.fire_at_ms)
+    }
+}
+
+impl PartialOrd for DeferredDial {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for DeferredDial {
+    fn eq(&self, other: &Self) -> bool {
+        self.fire_at_ms == other.fire_at_ms
+    }
+}
+
+impl Eq for DeferredDial {}
 
 /// Run the async event loop.
 ///
@@ -260,6 +295,11 @@ pub async fn run(
     #[allow(unused_variables, unused_mut)]
     let mut config_tunnels = ConfigTunnelPeers::new(tunnel_entries);
 
+    // ── Deferred dial queue (stochastic delay for tunnel privacy) ───────────
+    // BinaryHeap<Reverse<...>> is a min-heap by fire_at_ms, ensuring earlier
+    // fire times are always drained first regardless of insertion order.
+    let mut deferred_dials: BinaryHeap<Reverse<DeferredDial>> = BinaryHeap::new();
+
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
         dispatch_action(
@@ -270,6 +310,7 @@ pub async fn run(
             &broadcast_addr,
             None,
             &tunnel_senders,
+            &mut deferred_dials,
         )
         .await;
     }
@@ -672,8 +713,29 @@ pub async fn run(
                     &broadcast_addr,
                     Some(&peer_table),
                     &tunnel_senders,
+                    &mut deferred_dials,
                 )
                 .await;
+            }
+
+            // Drain deferred dials that have reached their fire time.
+            // Because the heap is ordered by fire_at_ms (min-heap via Reverse),
+            // we stop as soon as the earliest entry hasn't fired yet.
+            let current_ms = now_ms();
+            while let Some(Reverse(front)) = deferred_dials.peek() {
+                if front.fire_at_ms <= current_ms {
+                    let Reverse(dial) = deferred_dials.pop().unwrap();
+                    tracing::info!(
+                        identity = %hex::encode(dial.identity_hash),
+                        node_id = %hex::encode(&dial.node_id[..8]),
+                        relay = ?dial.relay_url,
+                        "InitiateTunnel fired (stub — iroh-net not yet wired)"
+                    );
+                    // TODO(harmony-h6k): execute actual iroh Endpoint.connect()
+                    // using dial.node_id and dial.relay_url here.
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -695,6 +757,7 @@ pub async fn run(
 }
 
 /// Dispatch a single `RuntimeAction` to the appropriate I/O mechanism.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_action(
     action: RuntimeAction,
     session: &zenoh::Session,
@@ -703,6 +766,7 @@ async fn dispatch_action(
     broadcast_addr: &SocketAddr,
     peer_table: Option<&PeerTable>,
     tunnel_senders: &HashMap<String, TunnelSender>,
+    deferred_dials: &mut BinaryHeap<Reverse<DeferredDial>>,
 ) {
     match action {
         // ── Tier 1: Send on interface (UDP broadcast + unicast, or tunnel) ────
@@ -859,18 +923,26 @@ async fn dispatch_action(
         }
 
         // ── Peer lifecycle: Tunnel initiation ─────────────────────────────────
-        // Stub — actual iroh-net Endpoint.connect() wiring deferred until
-        // tunnel infrastructure (tunnel_task.rs, tunnel_bridge.rs) is integrated.
+        // Deferred by a random 500-4000ms delay for privacy — breaks timing
+        // correlation between Zenoh discovery queries and QUIC connection attempts.
+        // The actual dial (stub) fires when the deferred queue drains.
         RuntimeAction::InitiateTunnel {
             identity_hash,
             node_id,
             relay_url,
         } => {
-            tracing::info!(
+            let delay_ms = 500 + (rand::random::<u64>() % 3500);
+            let fire_at = tunnel_task::millis_since_start() + delay_ms;
+            deferred_dials.push(Reverse(DeferredDial {
+                fire_at_ms: fire_at,
+                identity_hash,
+                node_id,
+                relay_url,
+            }));
+            tracing::debug!(
                 identity = %hex::encode(identity_hash),
-                node_id = %hex::encode(&node_id[..8]),
-                relay = ?relay_url,
-                "InitiateTunnel requested (stub — iroh-net not yet wired)"
+                delay_ms,
+                "tunnel dial deferred for privacy"
             );
         }
 
