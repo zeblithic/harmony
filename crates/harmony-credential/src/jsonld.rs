@@ -1,0 +1,298 @@
+//! W3C JSON-LD export for Harmony verifiable credentials.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use base64::Engine;
+use harmony_identity::{CryptoSuite, IdentityRef};
+use serde_json::{json, Value};
+
+use crate::credential::Credential;
+use crate::error::CredentialError;
+
+/// Encode an IdentityRef + public key bytes as a `did:key` string.
+pub fn identity_to_did_key(identity: &IdentityRef, public_key: &[u8]) -> String {
+    let multicodec = identity.suite.signing_multicodec();
+
+    // Encode multicodec as unsigned varint (LEB128)
+    let mut varint = Vec::with_capacity(3);
+    let mut value = multicodec as u32;
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        varint.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+
+    let mut payload = Vec::with_capacity(varint.len() + public_key.len());
+    payload.extend_from_slice(&varint);
+    payload.extend_from_slice(public_key);
+
+    let encoded = bs58::encode(&payload).into_string();
+    alloc::format!("did:key:z{encoded}")
+}
+
+/// Export a Credential to W3C VC Data Model 2.0 JSON-LD.
+pub fn credential_to_jsonld(
+    credential: &Credential,
+    issuer_key: &[u8],
+    subject_key: &[u8],
+) -> Result<Value, CredentialError> {
+    let issuer_did = identity_to_did_key(&credential.issuer, issuer_key);
+    let subject_did = identity_to_did_key(&credential.subject, subject_key);
+
+    let cryptosuite = match credential.issuer.suite {
+        CryptoSuite::Ed25519 => "eddsa-2022",
+        CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => "mldsa65-2025",
+    };
+
+    let claims: Vec<Value> = credential
+        .claim_digests
+        .iter()
+        .map(|d| {
+            json!({ "digest": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(d) })
+        })
+        .collect();
+
+    let mut vc = json!({
+        "@context": [
+            "https://www.w3.org/ns/credentials/v2",
+            "https://w3id.org/security/data-integrity/v2"
+        ],
+        "type": ["VerifiableCredential"],
+        "issuer": issuer_did,
+        "validFrom": epoch_to_iso8601(credential.not_before),
+        "validUntil": epoch_to_iso8601(credential.expires_at),
+        "credentialSubject": {
+            "id": subject_did,
+            "claims": claims
+        },
+        "proof": {
+            "type": "DataIntegrityProof",
+            "cryptosuite": cryptosuite,
+            "proofValue": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&credential.signature),
+            "nonce": hex_encode(&credential.nonce)
+        }
+    });
+
+    if let Some(idx) = credential.status_list_index {
+        vc["credentialStatus"] = json!({
+            "type": "BitstringStatusListEntry",
+            "statusListIndex": idx.to_string(),
+            "statusListCredential": alloc::format!(
+                "harmony:status-list:{}",
+                hex_encode(&credential.issuer.hash)
+            )
+        });
+    }
+
+    if let Some(ref proof_hash) = credential.proof {
+        vc["delegationProof"] = json!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(proof_hash)
+        );
+    }
+
+    Ok(vc)
+}
+
+fn epoch_to_iso8601(epoch: u64) -> String {
+    let secs = epoch;
+    let days = secs / 86400;
+    let time_secs = secs % 86400;
+    let hours = time_secs / 3600;
+    let minutes = (time_secs % 3600) / 60;
+    let seconds = time_secs % 60;
+    let (year, month, day) = days_to_ymd(days);
+    alloc::format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hours, minutes, seconds
+    )
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| alloc::format!("{:02x}", b)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credential::CredentialBuilder;
+
+    fn test_issuer_ref() -> IdentityRef {
+        IdentityRef::new([0xAA; 16], CryptoSuite::Ed25519)
+    }
+
+    fn test_subject_ref() -> IdentityRef {
+        IdentityRef::new([0xBB; 16], CryptoSuite::Ed25519)
+    }
+
+    fn build_test_credential() -> crate::Credential {
+        let mut builder = CredentialBuilder::new(
+            test_issuer_ref(),
+            test_subject_ref(),
+            1000,
+            5000,
+            [0x01; 16],
+        );
+        builder.add_claim(1, alloc::vec![0xAA, 0xBB], [0x11; 16]);
+        builder.add_claim(2, alloc::vec![0xCC], [0x22; 16]);
+        builder.status_list_index(42);
+        let _payload = builder.signable_payload();
+        let (cred, _) = builder.build(alloc::vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        cred
+    }
+
+    #[test]
+    fn did_key_ed25519_format() {
+        let id = IdentityRef::new([0xAA; 16], CryptoSuite::Ed25519);
+        let key = [0x42u8; 32];
+        let did = identity_to_did_key(&id, &key);
+        assert!(did.starts_with("did:key:z"));
+        let encoded = &did["did:key:z".len()..];
+        let decoded = bs58::decode(encoded).into_vec().unwrap();
+        assert_eq!(decoded[0], 0xed);
+        assert_eq!(decoded[1], 0x01);
+        assert_eq!(&decoded[2..], &key);
+    }
+
+    #[test]
+    fn did_key_ml_dsa65_format() {
+        let id = IdentityRef::new([0xBB; 16], CryptoSuite::MlDsa65);
+        let key = [0x55u8; 1952];
+        let did = identity_to_did_key(&id, &key);
+        assert!(did.starts_with("did:key:z"));
+        let encoded = &did["did:key:z".len()..];
+        let decoded = bs58::decode(encoded).into_vec().unwrap();
+        assert_eq!(decoded[0], 0x91);
+        assert_eq!(decoded[1], 0x24);
+        assert_eq!(&decoded[2..], &key);
+    }
+
+    #[test]
+    fn did_key_deterministic() {
+        let id = IdentityRef::new([0xAA; 16], CryptoSuite::Ed25519);
+        let key = [0x42u8; 32];
+        assert_eq!(identity_to_did_key(&id, &key), identity_to_did_key(&id, &key));
+    }
+
+    #[test]
+    fn credential_export_has_required_fields() {
+        let cred = build_test_credential();
+        let json = credential_to_jsonld(&cred, &[0x42; 32], &[0x43; 32]).unwrap();
+        assert!(json["@context"].is_array());
+        assert!(json["type"].is_array());
+        assert!(json["issuer"].is_string());
+        assert!(json["credentialSubject"].is_object());
+        assert!(json["proof"].is_object());
+        let contexts: Vec<&str> = json["@context"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(contexts.contains(&"https://www.w3.org/ns/credentials/v2"));
+        assert!(contexts.contains(&"https://w3id.org/security/data-integrity/v2"));
+    }
+
+    #[test]
+    fn credential_export_issuer_is_did_key() {
+        let cred = build_test_credential();
+        let json = credential_to_jsonld(&cred, &[0x42; 32], &[0x43; 32]).unwrap();
+        assert!(json["issuer"].as_str().unwrap().starts_with("did:key:z"));
+        assert!(json["credentialSubject"]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("did:key:z"));
+    }
+
+    #[test]
+    fn credential_export_timestamps_iso8601() {
+        let cred = build_test_credential();
+        let json = credential_to_jsonld(&cred, &[0x42; 32], &[0x43; 32]).unwrap();
+        assert!(json["validFrom"].as_str().unwrap().ends_with("Z"));
+        assert!(json["validUntil"].as_str().unwrap().ends_with("Z"));
+    }
+
+    #[test]
+    fn credential_export_status_list_present() {
+        let cred = build_test_credential();
+        let json = credential_to_jsonld(&cred, &[0x42; 32], &[0x43; 32]).unwrap();
+        assert!(json["credentialStatus"].is_object());
+        assert_eq!(
+            json["credentialStatus"]["statusListIndex"].as_str().unwrap(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn credential_export_status_list_absent_when_none() {
+        let builder = CredentialBuilder::new(
+            test_issuer_ref(),
+            test_subject_ref(),
+            1000,
+            5000,
+            [0x01; 16],
+        );
+        let _payload = builder.signable_payload();
+        let (cred, _) = builder.build(alloc::vec![0xDE, 0xAD]);
+        let json = credential_to_jsonld(&cred, &[0x42; 32], &[0x43; 32]).unwrap();
+        assert!(json.get("credentialStatus").is_none() || json["credentialStatus"].is_null());
+    }
+
+    #[test]
+    fn credential_export_proof_fields() {
+        let cred = build_test_credential();
+        let json = credential_to_jsonld(&cred, &[0x42; 32], &[0x43; 32]).unwrap();
+        let proof = &json["proof"];
+        assert_eq!(proof["type"].as_str().unwrap(), "DataIntegrityProof");
+        assert_eq!(proof["cryptosuite"].as_str().unwrap(), "eddsa-2022");
+        assert!(proof["proofValue"].is_string());
+        assert!(proof["nonce"].is_string());
+    }
+
+    #[test]
+    fn credential_export_delegation_proof() {
+        let mut builder = CredentialBuilder::new(
+            test_issuer_ref(),
+            test_subject_ref(),
+            1000,
+            5000,
+            [0x01; 16],
+        );
+        builder.proof([0xFF; 32]);
+        let _payload = builder.signable_payload();
+        let (cred, _) = builder.build(alloc::vec![0xDE, 0xAD]);
+        let json = credential_to_jsonld(&cred, &[0x42; 32], &[0x43; 32]).unwrap();
+        assert!(json["delegationProof"].is_string());
+        assert!(json["proof"].is_object());
+    }
+
+    #[test]
+    fn credential_export_claims_as_digests() {
+        let cred = build_test_credential();
+        let json = credential_to_jsonld(&cred, &[0x42; 32], &[0x43; 32]).unwrap();
+        let claims = json["credentialSubject"]["claims"].as_array().unwrap();
+        assert_eq!(claims.len(), 2);
+        for claim in claims {
+            assert!(claim["digest"].is_string());
+        }
+    }
+}
