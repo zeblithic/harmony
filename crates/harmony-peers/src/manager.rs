@@ -388,6 +388,7 @@ mod tests {
                 last_seen: None,
                 notes: None,
                 addresses: vec![],
+                replication: None,
             })
             .unwrap();
         store
@@ -418,6 +419,7 @@ mod tests {
             last_seen: None,
             notes: None,
             addresses: addrs,
+            replication: None,
         };
         let mut store = ContactStore::new();
         store.add(contact.clone()).unwrap();

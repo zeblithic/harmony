@@ -1133,6 +1133,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 last_seen: None,
                 notes: None,
                 addresses: tunnel_hints,
+                replication: None,
             };
             if self.contact_store.add(contact).is_ok() {
                 let peer_actions = self.peer_manager.on_event(
@@ -2692,6 +2693,7 @@ mod tests {
                 relay_url: None,
                 direct_addrs: vec![],
             }],
+            replication: None,
         };
         rt.contact_store_mut().add(contact).unwrap();
 
@@ -2809,6 +2811,7 @@ mod tests {
             last_seen: None,
             notes: None,
             addresses: vec![],
+            replication: None,
         };
         rt.contact_store_mut().add(contact).unwrap();
         assert_eq!(rt.contact_store().len(), 1);
@@ -2828,6 +2831,7 @@ mod tests {
             last_seen: None,
             notes: None,
             addresses: vec![],
+            replication: None,
         };
         rt.contact_store_mut().add(contact).unwrap();
         rt.push_event(RuntimeEvent::ContactChanged {
@@ -2865,6 +2869,7 @@ mod tests {
                 relay_url: None,
                 direct_addrs: vec![],
             }],
+            replication: None,
         };
         rt.contact_store_mut().add(contact).unwrap();
         rt.push_event(RuntimeEvent::ContactChanged {
