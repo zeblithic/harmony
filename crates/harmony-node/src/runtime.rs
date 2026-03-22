@@ -10,6 +10,7 @@ use std::sync::Arc;
 use harmony_compute::InstructionBudget;
 use harmony_contacts::ContactStore;
 use harmony_content::bloom::BloomFilter;
+use harmony_content::replica::{MemoryReplicaStore, ReplicaStore};
 use harmony_content::book::BookStore;
 use harmony_content::cid::ContentId;
 use harmony_content::cuckoo::CuckooFilter;
@@ -176,6 +177,12 @@ pub enum RuntimeEvent {
     TunnelPeerDropped { identity_hash: [u8; 16] },
     /// Peer lifecycle: a contact was added or modified.
     ContactChanged { identity_hash: [u8; 16] },
+    /// Replication: encrypted book data received from a peer.
+    ReplicaReceived {
+        peer_identity: [u8; 16],
+        cid: [u8; 32],
+        data: Vec<u8>,
+    },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -213,6 +220,12 @@ pub enum RuntimeAction {
     SendPathRequest { identity_hash: [u8; 16] },
     /// Peer lifecycle: close an active tunnel connection for a peer.
     CloseTunnel { identity_hash: [u8; 16] },
+    /// Replication: push encrypted book data to a peer for storage.
+    ReplicaPush {
+        peer_identity: [u8; 16],
+        cid: [u8; 32],
+        data: Vec<u8>,
+    },
 }
 
 /// Filter state received from a peer, with metadata.
@@ -398,6 +411,10 @@ pub struct NodeRuntime<B: BookStore> {
     local_tunnel_hint: Option<harmony_discovery::RoutingHint>,
     // Most recent monotonic timestamp from TimerTick (used for PeerManager ticks).
     last_now: u64,
+    // Replication: stores encrypted books on behalf of other peers
+    replica_store: MemoryReplicaStore,
+    // Replication: ticks since last replication scan
+    ticks_since_replica_scan: u32,
 }
 
 impl<B: BookStore> NodeRuntime<B> {
@@ -509,6 +526,8 @@ impl<B: BookStore> NodeRuntime<B> {
             discovery: DiscoveryManager::new(),
             local_tunnel_hint: None,
             last_now: 0,
+            replica_store: MemoryReplicaStore::new(),
+            ticks_since_replica_scan: 0,
         };
 
         (rt, actions)
@@ -812,6 +831,21 @@ impl<B: BookStore> NodeRuntime<B> {
                 );
                 self.translate_peer_actions(peer_actions);
             }
+            RuntimeEvent::ReplicaReceived {
+                peer_identity,
+                cid,
+                data,
+            } => {
+                let quota = self
+                    .contact_store
+                    .get(&peer_identity)
+                    .and_then(|c| c.replication.as_ref())
+                    .map(|r| r.quota_bytes)
+                    .unwrap_or(0);
+                if quota > 0 {
+                    let _ = self.replica_store.store(peer_identity, cid, data, quota);
+                }
+            }
         }
     }
 
@@ -984,7 +1018,39 @@ impl<B: BookStore> NodeRuntime<B> {
         );
         self.translate_peer_actions_out(peer_actions, &mut actions);
 
+        // Replication scan: every 240 ticks (~60s at 250ms tick interval),
+        // scan for encrypted-durable books not yet replicated to peers.
+        self.ticks_since_replica_scan += 1;
+        if self.ticks_since_replica_scan >= 240 {
+            self.ticks_since_replica_scan = 0;
+            self.scan_unreplicated_books(&mut actions);
+        }
+
         actions
+    }
+
+    /// Scan for encrypted-durable books that haven't been replicated to peers
+    /// and emit `ReplicaPush` actions.
+    ///
+    /// Currently a no-op: the `BookStore` trait doesn't expose content iteration
+    /// yet. When `BookStore::iter()` is added (future bead), this method will
+    /// walk local encrypted-durable books and emit one `ReplicaPush` per peer
+    /// per scan cycle. A `replicated_set` dedup structure should be re-added
+    /// at that point with proper cleanup logic.
+    fn scan_unreplicated_books(&mut self, _out: &mut Vec<RuntimeAction>) {
+        // Collect replication-eligible peers — used to gate the scan.
+        let has_replication_peers = self
+            .contact_store
+            .iter()
+            .any(|(_, c)| c.replication.is_some() && c.peering.enabled);
+
+        if !has_replication_peers {
+            return;
+        }
+
+        // TODO: When BookStore gains an iter() method, iterate local
+        // encrypted-durable books and emit ReplicaPush for each peer
+        // with an active replication policy.
     }
 
     fn dispatch_router_actions(
@@ -1133,6 +1199,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 last_seen: None,
                 notes: None,
                 addresses: tunnel_hints,
+                replication: None,
             };
             if self.contact_store.add(contact).is_ok() {
                 let peer_actions = self.peer_manager.on_event(
@@ -2692,6 +2759,7 @@ mod tests {
                 relay_url: None,
                 direct_addrs: vec![],
             }],
+            replication: None,
         };
         rt.contact_store_mut().add(contact).unwrap();
 
@@ -2809,6 +2877,7 @@ mod tests {
             last_seen: None,
             notes: None,
             addresses: vec![],
+            replication: None,
         };
         rt.contact_store_mut().add(contact).unwrap();
         assert_eq!(rt.contact_store().len(), 1);
@@ -2828,6 +2897,7 @@ mod tests {
             last_seen: None,
             notes: None,
             addresses: vec![],
+            replication: None,
         };
         rt.contact_store_mut().add(contact).unwrap();
         rt.push_event(RuntimeEvent::ContactChanged {
@@ -2865,6 +2935,7 @@ mod tests {
                 relay_url: None,
                 direct_addrs: vec![],
             }],
+            replication: None,
         };
         rt.contact_store_mut().add(contact).unwrap();
         rt.push_event(RuntimeEvent::ContactChanged {
@@ -2881,5 +2952,101 @@ mod tests {
         assert!(last_seen.is_some());
         // Should be a plausible Unix timestamp (after 2024-01-01).
         assert!(last_seen.unwrap() > 1_700_000_000);
+    }
+
+    // ── Replication tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn replica_received_stores_within_quota() {
+        let (mut rt, _) = make_runtime();
+        let contact = harmony_contacts::Contact {
+            identity_hash: [0xAA; 16],
+            display_name: None,
+            peering: harmony_contacts::PeeringPolicy {
+                enabled: true,
+                priority: harmony_contacts::PeeringPriority::Normal,
+            },
+            added_at: 1000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![],
+            replication: Some(harmony_contacts::ReplicationPolicy {
+                quota_bytes: 10_000,
+            }),
+        };
+        rt.contact_store_mut().add(contact).unwrap();
+
+        rt.push_event(RuntimeEvent::ReplicaReceived {
+            peer_identity: [0xAA; 16],
+            cid: [0xBB; 32],
+            data: vec![1, 2, 3, 4, 5],
+        });
+
+        // Verify replica store has the data.
+        assert_eq!(rt.replica_store.usage(&[0xAA; 16]), 5);
+        assert_eq!(
+            rt.replica_store.retrieve(&[0xAA; 16], &[0xBB; 32]),
+            Some(vec![1, 2, 3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn replica_received_rejected_without_policy() {
+        let (mut rt, _) = make_runtime();
+        // Add contact WITHOUT replication policy
+        let contact = harmony_contacts::Contact {
+            identity_hash: [0xAA; 16],
+            display_name: None,
+            peering: harmony_contacts::PeeringPolicy {
+                enabled: true,
+                priority: harmony_contacts::PeeringPriority::Normal,
+            },
+            added_at: 1000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![],
+            replication: None,
+        };
+        rt.contact_store_mut().add(contact).unwrap();
+
+        rt.push_event(RuntimeEvent::ReplicaReceived {
+            peer_identity: [0xAA; 16],
+            cid: [0xBB; 32],
+            data: vec![1, 2, 3, 4, 5],
+        });
+
+        // Nothing stored — no replication policy.
+        assert_eq!(rt.replica_store.usage(&[0xAA; 16]), 0);
+        assert_eq!(rt.replica_store.retrieve(&[0xAA; 16], &[0xBB; 32]), None);
+    }
+
+    #[test]
+    fn replica_received_rejected_unknown_peer() {
+        let (mut rt, _) = make_runtime();
+        // No contact at all for this peer
+        rt.push_event(RuntimeEvent::ReplicaReceived {
+            peer_identity: [0xFF; 16],
+            cid: [0xBB; 32],
+            data: vec![1, 2, 3],
+        });
+        assert_eq!(rt.replica_store.usage(&[0xFF; 16]), 0);
+    }
+
+    #[test]
+    fn runtime_event_replica_variant_exists() {
+        let _e = RuntimeEvent::ReplicaReceived {
+            peer_identity: [0xAA; 16],
+            cid: [0xBB; 32],
+            data: vec![1, 2, 3],
+        };
+    }
+
+    #[test]
+    fn runtime_action_replica_push_variant_exists() {
+        let _a = RuntimeAction::ReplicaPush {
+            peer_identity: [0xAA; 16],
+            cid: [0xBB; 32],
+            data: vec![1, 2, 3],
+        };
     }
 }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::contact::{Contact, ContactAddress, PeeringPriority};
 use crate::error::ContactError;
 
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactStore {
@@ -106,7 +106,7 @@ impl ContactStore {
         // CLI args or discovery on each startup.
         if data[0] != FORMAT_VERSION {
             return Err(ContactError::DeserializeError(
-                "unsupported contact store format version (expected v2)",
+                "unsupported contact store format version (expected v3)",
             ));
         }
         postcard::from_bytes(&data[1..])
@@ -134,6 +134,7 @@ mod tests {
             last_seen: None,
             notes: None,
             addresses: vec![],
+            replication: None,
         }
     }
 

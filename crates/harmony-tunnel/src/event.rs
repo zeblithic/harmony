@@ -9,6 +9,8 @@ pub enum TunnelEvent {
     SendReticulum { packet: Vec<u8>, now_ms: u64 },
     /// Send a Zenoh message through this tunnel.
     SendZenoh { message: Vec<u8>, now_ms: u64 },
+    /// Send a replication message through this tunnel.
+    SendReplication { message: Vec<u8>, now_ms: u64 },
     /// Periodic timer tick for keepalive management.
     Tick { now_ms: u64 },
     /// Request graceful tunnel shutdown.
@@ -24,6 +26,8 @@ pub enum TunnelAction {
     ReticulumReceived { packet: Vec<u8> },
     /// A decrypted Zenoh message received from the tunnel peer.
     ZenohReceived { message: Vec<u8> },
+    /// A decrypted replication message received from the tunnel peer.
+    ReplicationReceived { message: Vec<u8> },
     /// Handshake completed — the peer's PQ identity has been authenticated.
     HandshakeComplete {
         peer_dsa_pubkey: Vec<u8>,

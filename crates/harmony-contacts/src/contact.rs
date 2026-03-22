@@ -13,6 +13,18 @@ pub enum ContactAddress {
     },
 }
 
+/// Replication policy: symmetric encrypted backup delegation.
+///
+/// When set on a `Contact`, both peers provision the specified storage quota
+/// for each other's encrypted-durable content. The quota is enforced by the
+/// local `ReplicaStore` — content exceeding it is evicted oldest-first.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationPolicy {
+    /// Symmetric storage quota in bytes. Both peers provision this
+    /// amount for each other's encrypted-durable content.
+    pub quota_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
     pub identity_hash: IdentityHash,
@@ -22,6 +34,9 @@ pub struct Contact {
     pub last_seen: Option<u64>,
     pub notes: Option<String>,
     pub addresses: Vec<ContactAddress>,
+    /// Replication policy: encrypted backup delegation.
+    /// None = no replication. Some = active with specified quota.
+    pub replication: Option<ReplicationPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +91,7 @@ mod tests {
             last_seen: None,
             notes: None,
             addresses: vec![],
+            replication: None,
         };
         assert_eq!(contact.identity_hash, [0xAB; 16]);
         assert!(contact.peering.enabled);
@@ -94,6 +110,7 @@ mod tests {
             last_seen: Some(1710001000),
             notes: Some("My friend".into()),
             addresses: vec![],
+            replication: None,
         };
         let bytes = postcard::to_allocvec(&contact).unwrap();
         let decoded: Contact = postcard::from_bytes(&bytes).unwrap();
@@ -117,6 +134,7 @@ mod tests {
                 relay_url: Some("https://iroh.q8.fyi".into()),
                 direct_addrs: vec!["192.168.1.10:4242".into()],
             }],
+            replication: None,
         };
         assert_eq!(contact.addresses.len(), 1);
         assert!(matches!(
@@ -175,6 +193,7 @@ mod tests {
                     direct_addrs: vec!["127.0.0.1:1234".into()],
                 },
             ],
+            replication: None,
         };
         let bytes = postcard::to_allocvec(&contact).unwrap();
         let decoded: Contact = postcard::from_bytes(&bytes).unwrap();
@@ -185,5 +204,34 @@ mod tests {
                 destination_hash: [0xAA; 16]
             }
         );
+    }
+
+    #[test]
+    fn replication_policy_roundtrip() {
+        let policy = ReplicationPolicy {
+            quota_bytes: 50 * 1024 * 1024 * 1024,
+        };
+        let bytes = postcard::to_allocvec(&policy).unwrap();
+        let decoded: ReplicationPolicy = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.quota_bytes, 50 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn contact_with_replication_serde_round_trip() {
+        let contact = Contact {
+            identity_hash: [0x77; 16],
+            display_name: Some("Replicated".into()),
+            peering: PeeringPolicy::default(),
+            added_at: 1710000000,
+            last_seen: None,
+            notes: None,
+            addresses: vec![],
+            replication: Some(ReplicationPolicy {
+                quota_bytes: 10 * 1024 * 1024 * 1024,
+            }),
+        };
+        let bytes = postcard::to_allocvec(&contact).unwrap();
+        let decoded: Contact = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.replication, Some(ReplicationPolicy { quota_bytes: 10 * 1024 * 1024 * 1024 }));
     }
 }

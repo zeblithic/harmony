@@ -15,6 +15,7 @@ pub mod flatpack;
 pub mod lru;
 pub mod sketch;
 
+pub mod replica;
 pub mod vine;
 
 pub mod reticulum_bridge;

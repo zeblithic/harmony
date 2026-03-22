@@ -32,6 +32,12 @@ pub enum TunnelBridgeEvent {
         message: Vec<u8>,
         connection_id: u64,
     },
+    /// A replication message arrived from a tunnel peer.
+    ReplicationReceived {
+        interface_name: String,
+        message: Vec<u8>,
+        connection_id: u64,
+    },
     /// A tunnel connection was closed or errored.
     TunnelClosed {
         interface_name: String,

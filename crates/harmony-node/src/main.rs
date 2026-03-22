@@ -433,6 +433,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                         relay_url,
                         direct_addrs: vec![],
                     }],
+                    replication: None,
                 };
                 rt.contact_store_mut()
                     .add(contact)

@@ -528,6 +528,15 @@ async fn dispatch_tunnel_actions(
                     })
                     .await;
             }
+            TunnelAction::ReplicationReceived { message } => {
+                let _ = bridge_tx
+                    .send(TunnelBridgeEvent::ReplicationReceived {
+                        interface_name: interface_name.to_string(),
+                        message: message.clone(),
+                        connection_id,
+                    })
+                    .await;
+            }
             // OutboundBytes, Error, Closed handled in pass 1
             _ => {}
         }

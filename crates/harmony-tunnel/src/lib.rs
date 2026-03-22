@@ -5,6 +5,7 @@ pub mod error;
 pub mod event;
 pub mod frame;
 pub mod handshake;
+pub mod replication;
 pub mod session;
 
 pub use error::TunnelError;
