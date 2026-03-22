@@ -20,6 +20,8 @@ use crate::Memo;
 /// a memo whose tuple already exists is a no-op (returns `false`).
 pub struct MemoStore {
     by_input: HashMap<ContentId, Vec<Memo>>,
+    /// Total memo count across all inputs. Maintained on insert for O(1) len/is_empty.
+    total: usize,
 }
 
 impl MemoStore {
@@ -27,6 +29,7 @@ impl MemoStore {
     pub fn new() -> Self {
         Self {
             by_input: HashMap::new(),
+            total: 0,
         }
     }
 
@@ -48,6 +51,7 @@ impl MemoStore {
         }
 
         entry.push(memo);
+        self.total += 1;
         true
     }
 
@@ -104,14 +108,14 @@ impl MemoStore {
         self.by_input.keys()
     }
 
-    /// Total number of memos held in the store.
+    /// Total number of memos held in the store. O(1).
     pub fn len(&self) -> usize {
-        self.by_input.values().map(Vec::len).sum()
+        self.total
     }
 
-    /// Return `true` if the store contains no memos.
+    /// Return `true` if the store contains no memos. O(1).
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.total == 0
     }
 }
 
