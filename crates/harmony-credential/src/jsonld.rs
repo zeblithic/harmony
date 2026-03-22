@@ -130,9 +130,17 @@ fn build_vc_json(
     subject_did: &str,
     claims: Vec<Value>,
 ) -> Value {
+    // Harmony-specific cryptosuite names: the proofValue covers the
+    // postcard-serialized SignablePayload, NOT the RDFC-2022 canonicalized
+    // JSON-LD document. Standard eddsa-2022/mldsa65-2025 verifiers would
+    // fail because they expect RDFC-2022 canonicalization. Using distinct
+    // names makes this transparent — a Harmony verifier knows to check
+    // the postcard payload, while external tools see an unrecognized suite
+    // and can fall back to treating the credential as unverified rather
+    // than silently failing verification.
     let cryptosuite = match credential.issuer.suite {
-        CryptoSuite::Ed25519 => "eddsa-2022",
-        CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => "mldsa65-2025",
+        CryptoSuite::Ed25519 => "harmony-eddsa-2022",
+        CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => "harmony-mldsa65-2025",
     };
 
     // proofValue uses multibase base58btc encoding (prefix 'z') per
@@ -166,14 +174,16 @@ fn build_vc_json(
     });
 
     if let Some(idx) = credential.status_list_index {
+        let status_list_url = alloc::format!(
+            "harmony:status-list:{}",
+            hex_encode(&credential.issuer.hash)
+        );
         vc["credentialStatus"] = json!({
+            "id": alloc::format!("{}#{}", status_list_url, idx),
             "type": "BitstringStatusListEntry",
             "statusPurpose": "revocation",
             "statusListIndex": idx.to_string(),
-            "statusListCredential": alloc::format!(
-                "harmony:status-list:{}",
-                hex_encode(&credential.issuer.hash)
-            )
+            "statusListCredential": status_list_url
         });
     }
 
@@ -354,6 +364,9 @@ mod tests {
                 .unwrap(),
             "revocation"
         );
+        // W3C required: id must be a URL, distinct from statusListCredential
+        let status_id = json["credentialStatus"]["id"].as_str().unwrap();
+        assert!(status_id.contains("#42"));
     }
 
     #[test]
@@ -377,7 +390,7 @@ mod tests {
         let json = credential_to_jsonld(&cred, &[0x42; 32], &[0x43; 32]).unwrap();
         let proof = &json["proof"];
         assert_eq!(proof["type"].as_str().unwrap(), "DataIntegrityProof");
-        assert_eq!(proof["cryptosuite"].as_str().unwrap(), "eddsa-2022");
+        assert_eq!(proof["cryptosuite"].as_str().unwrap(), "harmony-eddsa-2022");
         assert_eq!(proof["proofPurpose"].as_str().unwrap(), "assertionMethod");
         // proofValue must be multibase base58btc (prefix 'z')
         let pv = proof["proofValue"].as_str().unwrap();
@@ -492,7 +505,7 @@ mod tests {
 
         assert_eq!(
             json["proof"]["cryptosuite"].as_str().unwrap(),
-            "mldsa65-2025"
+            "harmony-mldsa65-2025"
         );
         assert!(json["issuer"].as_str().unwrap().starts_with("did:key:z"));
     }
@@ -515,7 +528,7 @@ mod tests {
         // Same cryptosuite as static MlDsa65 — rotatable semantics are lost
         assert_eq!(
             json["proof"]["cryptosuite"].as_str().unwrap(),
-            "mldsa65-2025"
+            "harmony-mldsa65-2025"
         );
         // did:key uses same multicodec (0x1211) — indistinguishable
         let did = json["issuer"].as_str().unwrap();
