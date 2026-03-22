@@ -2,6 +2,7 @@
 extern crate alloc;
 
 pub mod create;
+pub mod store;
 pub mod verify;
 
 use alloc::vec::Vec;

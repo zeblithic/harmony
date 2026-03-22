@@ -17,6 +17,7 @@ harmony-content = { workspace = true }
 rand_core = { workspace = true }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 postcard = { workspace = true }
+hashbrown = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
