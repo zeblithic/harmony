@@ -27,7 +27,7 @@ pub fn identity_to_did_key(
         CryptoSuite::MlDsa65 | CryptoSuite::MlDsa65Rotatable => 1952,
     };
     if public_key.len() != expected_len {
-        return Err(CredentialError::SignatureInvalid);
+        return Err(CredentialError::InvalidKeyLength);
     }
     let multicodec = identity.suite.signing_multicodec();
 
@@ -82,6 +82,12 @@ pub fn credential_to_jsonld(
 ///
 /// Disclosed claims include `typeId`, `value` (base64url), and `digest`.
 /// Undisclosed claims include only `digest`.
+///
+/// **Limitation:** The VP envelope has no `proof` — holder binding is
+/// informational only. Without RDFC-2022 canonicalization (not implemented),
+/// a W3C-conformant VP proof cannot be generated. The `holder` field
+/// identifies the presenter but any party with the VP bytes could
+/// re-present them. Use Harmony-native verification for holder binding.
 pub fn presentation_to_jsonld(
     presentation: &Presentation,
     issuer_key: &[u8],
@@ -197,9 +203,8 @@ fn build_vc_json(
 }
 
 fn epoch_to_iso8601(epoch: u64) -> String {
-    let secs = epoch;
-    let days = secs / 86400;
-    let time_secs = secs % 86400;
+    let days = epoch / 86400;
+    let time_secs = epoch % 86400;
     let hours = time_secs / 3600;
     let minutes = (time_secs % 3600) / 60;
     let seconds = time_secs % 60;
