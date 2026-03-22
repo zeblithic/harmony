@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 
 use harmony_crypto::aead::{self, KEY_LENGTH, NONCE_LENGTH};
+use rand_core::CryptoRngCore;
 
 use crate::error::TunnelError;
 
@@ -35,11 +36,29 @@ pub struct Frame {
 const FRAME_HEADER_LEN: usize = 5;
 
 impl Frame {
-    /// Create a keepalive frame.
+    /// Create a keepalive frame (empty payload, for deterministic tests).
     pub fn keepalive() -> Self {
         Self {
             tag: FrameTag::Keepalive,
             payload: Vec::new(),
+        }
+    }
+
+    /// Create a keepalive frame with random-length padding.
+    ///
+    /// The padding makes keepalive ciphertexts indistinguishable from
+    /// small Reticulum packets (19-500 bytes), defeating Statistical
+    /// Disclosure Attacks based on fixed packet sizes.
+    /// The receiver ignores keepalive payloads regardless of length.
+    pub fn keepalive_padded(rng: &mut impl CryptoRngCore) -> Self {
+        let mut len_byte = [0u8; 1];
+        rng.fill_bytes(&mut len_byte);
+        let pad_len = (len_byte[0] as usize) % 129; // 0-128 bytes
+        let mut payload = alloc::vec![0u8; pad_len];
+        rng.fill_bytes(&mut payload);
+        Self {
+            tag: FrameTag::Keepalive,
+            payload,
         }
     }
 
@@ -173,6 +192,18 @@ mod tests {
 
         assert_eq!(decrypted.tag, FrameTag::Zenoh);
         assert_eq!(decrypted.payload, b"hello zenoh");
+    }
+
+    #[test]
+    fn keepalive_padded_has_variable_length() {
+        use rand::rngs::OsRng;
+        let frame1 = Frame::keepalive_padded(&mut OsRng);
+        let frame2 = Frame::keepalive_padded(&mut OsRng);
+        assert_eq!(frame1.tag, FrameTag::Keepalive);
+        assert_eq!(frame2.tag, FrameTag::Keepalive);
+        // Payload lengths should be within range
+        assert!(frame1.payload.len() <= 128);
+        assert!(frame2.payload.len() <= 128);
     }
 
     #[test]

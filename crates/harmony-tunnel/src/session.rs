@@ -11,10 +11,14 @@ use crate::event::{TunnelAction, TunnelEvent};
 use crate::frame::{decrypt_frame, encrypt_frame, Frame, FrameTag};
 use crate::handshake::{derive_session_keys, TunnelAccept, TunnelInit};
 
-/// Keepalive interval in milliseconds.
-const KEEPALIVE_INTERVAL_MS: u64 = 30_000;
-/// Dead peer timeout: 3 missed keepalives.
-const DEAD_TIMEOUT_MS: u64 = KEEPALIVE_INTERVAL_MS * 3;
+/// Base keepalive interval in milliseconds.
+const KEEPALIVE_BASE_MS: u64 = 30_000;
+/// Jitter range: ±5 seconds around the base.
+const KEEPALIVE_JITTER_MS: u64 = 5_000;
+/// Dead peer timeout: 3 missed keepalives at the base interval.
+/// Kept at 3 × 30s = 90s minimum to avoid false positives
+/// (worst case: 3 × 35s = 105s, but 90s is the floor).
+const DEAD_TIMEOUT_MS: u64 = KEEPALIVE_BASE_MS * 3;
 
 /// Tunnel session states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,9 +310,22 @@ impl TunnelSession {
             return Ok(actions);
         }
 
-        // Send keepalive if interval elapsed
-        if now_ms.saturating_sub(self.last_sent_ms) >= KEEPALIVE_INTERVAL_MS {
-            let frame = Frame::keepalive();
+        // Jittered keepalive interval: 25-35 seconds.
+        // Use a simple hash of the nonce counter as cheap deterministic jitter
+        // (no RNG needed in Tick — sans-I/O purity).
+        let jitter = (self.send_nonce % 11) * 1000; // 0-10s, seeded by nonce counter
+        let interval = KEEPALIVE_BASE_MS - KEEPALIVE_JITTER_MS + jitter;
+
+        // Send keepalive if jittered interval elapsed
+        if now_ms.saturating_sub(self.last_sent_ms) >= interval {
+            // Nonce-derived padding: variable-length keepalives without needing RNG.
+            // Zeros are fine — the payload is encrypted before transmission.
+            let pad_len = ((self.send_nonce * 7 + 13) % 129) as usize;
+            let padding = alloc::vec![0u8; pad_len];
+            let frame = Frame {
+                tag: FrameTag::Keepalive,
+                payload: padding,
+            };
             let encrypted = encrypt_frame(
                 &frame,
                 &self.send_key,
@@ -597,10 +614,12 @@ mod tests {
     // ── Task 7: Keepalive and Timeout Tests ──────────────────────────────────
 
     #[test]
-    fn keepalive_sent_after_interval() {
+    fn keepalive_sent_after_jittered_interval() {
         let (mut initiator, _responder, _iid, _rid) = complete_handshake();
 
-        // Session created with now_ms=0, so last_sent_ms=0
+        // Session created with now_ms=0, so last_sent_ms=0.
+        // With send_nonce=0: jitter = (0 % 11) * 1000 = 0
+        // interval = 30000 - 5000 + 0 = 25000ms (minimum jittered interval)
 
         // Tick at t=0: 0ms elapsed, no keepalive
         let actions = initiator
@@ -611,26 +630,26 @@ mod tests {
             "tick at t=0 with last_sent=0 should NOT send keepalive (0ms elapsed)"
         );
 
-        // Tick at t=15000: only 15s elapsed → no keepalive
+        // Tick at t=15000: only 15s elapsed → no keepalive (below minimum 25s)
         let actions = initiator
             .handle_event(TunnelEvent::Tick { now_ms: 15_000 })
             .unwrap();
         assert!(actions.is_empty(), "tick at 15s should not send keepalive");
 
-        // Tick at t=30001: 30001ms >= KEEPALIVE_INTERVAL_MS (30000) → keepalive sent
+        // Tick at t=25001: 25001ms >= jittered interval (25000) → keepalive sent
         let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 30_001 })
+            .handle_event(TunnelEvent::Tick { now_ms: 25_001 })
             .unwrap();
         assert_eq!(
             actions.len(),
             1,
-            "tick at 30001ms must emit exactly one keepalive"
+            "tick at 25001ms must emit exactly one keepalive"
         );
         assert!(
             matches!(&actions[0], TunnelAction::OutboundBytes { .. }),
             "keepalive must be OutboundBytes"
         );
-        assert_eq!(initiator.last_sent_ms, 30_001);
+        assert_eq!(initiator.last_sent_ms, 25_001);
     }
 
     #[test]
