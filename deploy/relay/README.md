@@ -159,7 +159,7 @@ gcloud compute ssh harmony-relay --zone=us-west1-b --command="
 # Activate an older store path directly
 gcloud compute ssh harmony-relay --zone=us-west1-b --command="
     sudo systemctl stop iroh-relay &&
-    sudo cp /nix/store/<old-path>/bin/iroh-relay /usr/local/bin/iroh-relay &&
+    sudo cp -f /nix/store/<old-path>/bin/iroh-relay /usr/local/bin/iroh-relay &&
     sudo systemctl start iroh-relay
 "
 ```

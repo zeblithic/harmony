@@ -224,6 +224,10 @@ elif command -v nix &>/dev/null; then
         while IFS= read -r path; do
             CLOSURE+=("$path")
         done < <(nix-store -qR "$STORE_PATH")
+        if [ ${#CLOSURE[@]} -eq 0 ]; then
+            echo "ERROR: nix-store -qR returned no paths for ${STORE_PATH}"
+            exit 1
+        fi
         nix-store --export "${CLOSURE[@]}" | \
             gcloud compute ssh "$VM_NAME" --zone="$GCP_ZONE" -- \
             "sudo ${NIX_STORE_BIN} --import"
