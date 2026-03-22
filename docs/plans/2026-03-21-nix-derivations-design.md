@@ -125,11 +125,13 @@ fi
 
 ## Testing
 
-- `nix build .#harmony-node` produces a working ELF binary
-- `nix build .#iroh-relay` produces a working ELF binary
-- `nix flake check` passes
-- `file result/bin/harmony` confirms ELF x86_64 (not Mach-O)
-  (binary is named `harmony`, not `harmony-node`)
+- `nix build .#harmony-node` produces a working binary (native arch)
+- `nix build .#iroh-relay` produces a working binary (native arch)
+- `nix flake check` passes (exercises native builds)
+- `nix build .#harmony-node-x86_64-linux && file result/bin/harmony`
+  confirms ELF x86_64, static-pie (binary is named `harmony`, not
+  `harmony-node`). On macOS, the native build produces Mach-O —
+  use the `-x86_64-linux` variant to verify cross-compilation.
 - Deploy script uses Nix-built binary successfully
 
 ## Future: Connection to harmony-m5y
