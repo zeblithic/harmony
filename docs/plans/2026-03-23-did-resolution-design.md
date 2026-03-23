@@ -40,8 +40,8 @@ pub struct ResolvedDid {
 pub enum DidError {
     UnsupportedMethod(String),
     MalformedDid(String),
-    DecodingError,
-    UnknownMulticodec(u16),
+    DecodingError(String),
+    UnknownMulticodec(u32),
 }
 ```
 

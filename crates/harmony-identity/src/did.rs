@@ -73,6 +73,12 @@ impl DidResolver for DefaultDidResolver {
 /// - `did:jwk:` — JSON Web Key (std only)
 /// - `did:web:` — not supported
 pub fn resolve_did(did: &str) -> Result<ResolvedDid, DidError> {
+    // Strip DID URL fragment (#...) and query (?...) components before
+    // dispatch. JWS kid headers commonly include fragments like
+    // "did:key:z6Mk...#z6Mk..." to identify the verification method.
+    let did = did.split('#').next().unwrap_or(did);
+    let did = did.split('?').next().unwrap_or(did);
+
     if let Some(encoded) = did.strip_prefix("did:key:") {
         resolve_did_key(encoded)
     } else if let Some(encoded) = did.strip_prefix("did:jwk:") {
@@ -349,6 +355,32 @@ mod tests {
         let resolved = resolve_did(&did).unwrap();
         assert_eq!(resolved.suite, CryptoSuite::Ed25519);
         assert_eq!(resolved.public_key, key);
+    }
+
+    #[test]
+    fn resolve_did_strips_fragment() {
+        let key = [0x42u8; 32];
+        let mut payload = encode_varint(0x00ed);
+        payload.extend_from_slice(&key);
+        let encoded = format!("z{}", bs58::encode(&payload).into_string());
+        // JWS kid headers often include fragments like did:key:z6Mk...#z6Mk...
+        let did = format!("did:key:{encoded}#{encoded}");
+
+        let resolved = resolve_did(&did).unwrap();
+        assert_eq!(resolved.suite, CryptoSuite::Ed25519);
+        assert_eq!(resolved.public_key, key);
+    }
+
+    #[test]
+    fn resolve_did_strips_query() {
+        let key = [0x42u8; 32];
+        let mut payload = encode_varint(0x00ed);
+        payload.extend_from_slice(&key);
+        let encoded = format!("z{}", bs58::encode(&payload).into_string());
+        let did = format!("did:key:{encoded}?service=files");
+
+        let resolved = resolve_did(&did).unwrap();
+        assert_eq!(resolved.suite, CryptoSuite::Ed25519);
     }
 
     #[test]
