@@ -11,6 +11,7 @@ members = [
     "crates/harmony-crypto",
     "crates/harmony-identity",
     "crates/harmony-jain",
+    "crates/harmony-jcs",
     "crates/harmony-kel",
     "crates/harmony-kitri",
     "crates/harmony-mail",
@@ -111,6 +112,7 @@ harmony-content = { path = "crates/harmony-content", default-features = false }
 harmony-crypto = { path = "crates/harmony-crypto", default-features = false }
 harmony-identity = { path = "crates/harmony-identity", default-features = false }
 harmony-jain = { path = "crates/harmony-jain", default-features = false }
+harmony-jcs = { path = "crates/harmony-jcs", default-features = false }
 harmony-kel = { path = "crates/harmony-kel", default-features = false }
 harmony-kitri = { path = "crates/harmony-kitri", default-features = false }
 harmony-memo = { path = "crates/harmony-memo", default-features = false }
