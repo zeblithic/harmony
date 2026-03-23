@@ -102,8 +102,9 @@ fn disclosure_digest(raw: &str) -> String {
 /// - **type_id**: looked up from a static vocabulary, or derived via
 ///   `BLAKE3(name)[0..2] | 0x8000` for unknown claims. Array elements
 ///   (no name) get `0x0000`.
-/// - **salt**: base64url-decoded from the disclosure salt string, zero-padded
-///   or truncated to 16 bytes.
+/// - **salt**: base64url-decoded from the disclosure salt string, truncated
+///   to 16 bytes. Returns `Err` if decoded salt is shorter than 16 bytes
+///   or not valid base64url.
 /// - **value**: the `claim_value` bytes from the disclosure.
 pub fn map_claims(disclosures: &VerifiedDisclosures<'_>) -> Result<Vec<SaltedClaim>, SdJwtError> {
     disclosures
@@ -149,18 +150,17 @@ fn vocabulary_type_id(name: &str) -> u16 {
 
 /// Decode the salt string from base64url into a fixed `[u8; 16]` buffer.
 ///
-/// Base64url-decode the salt string, zero-pad or truncate to 16 bytes.
-///
-/// Returns `Err(Base64Error)` if the salt is not valid base64url or
-/// if the decoded salt is shorter than 16 bytes (RFC 9901 §5.2.1
-/// requires at least 128 bits of entropy).
+/// Returns `Err(Base64Error)` if the salt is not valid base64url.
+/// Returns `Err(DisclosureHashMismatch)` if the decoded salt is shorter
+/// than 16 bytes (RFC 9901 §5.2.1 requires at least 128 bits of entropy).
+/// Truncates to 16 bytes if longer.
 fn decode_salt(salt_str: &str) -> Result<[u8; 16], SdJwtError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(salt_str)
         .map_err(|_| SdJwtError::Base64Error)?;
 
     if bytes.len() < 16 {
-        return Err(SdJwtError::Base64Error);
+        return Err(SdJwtError::DisclosureHashMismatch);
     }
 
     let mut buf = [0u8; 16];
