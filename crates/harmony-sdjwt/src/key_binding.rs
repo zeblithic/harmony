@@ -80,14 +80,31 @@ pub fn verify_key_binding(
         )));
     }
 
-    // 5. Decode and parse payload JSON.
+    // 5. Verify KB-JWT signature BEFORE processing claims.
+    //    This prevents error-message oracles on forged KB-JWTs and
+    //    avoids wasted computation on unauthenticated data.
+    let kb_signing_input = format!("{}.{}", kb_header_b64, kb_payload_b64);
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(kb_sig_b64)
+        .map_err(|_| SdJwtError::Base64Error)?;
+    harmony_identity::verify_signature(
+        holder_suite,
+        holder_key,
+        kb_signing_input.as_bytes(),
+        &sig_bytes,
+    )
+    .map_err(SdJwtError::SignatureInvalid)?;
+
+    // --- Signature is valid. Now check authenticated claims. ---
+
+    // 6. Decode and parse payload JSON.
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(kb_payload_b64)
         .map_err(|_| SdJwtError::Base64Error)?;
     let payload_json: serde_json::Value = serde_json::from_slice(&payload_bytes)
         .map_err(|e| SdJwtError::JsonError(e.to_string()))?;
 
-    // 6. Verify nonce.
+    // 7. Verify nonce.
     let nonce = payload_json
         .get("nonce")
         .and_then(|v| v.as_str())
@@ -100,30 +117,44 @@ pub fn verify_key_binding(
         )));
     }
 
-    // 7. Verify aud.
-    let aud = payload_json
+    // 8. Verify aud (RFC 7519 §4.1.3: string or array of strings).
+    let aud_val = payload_json
         .get("aud")
-        .and_then(|v| v.as_str())
         .ok_or_else(|| SdJwtError::KeyBindingInvalid(String::from("KB-JWT aud claim missing")))?;
-    if aud != expected_aud {
+    let aud_match = if let Some(s) = aud_val.as_str() {
+        s == expected_aud
+    } else if let Some(arr) = aud_val.as_array() {
+        arr.iter().any(|v| v.as_str() == Some(expected_aud))
+    } else {
+        return Err(SdJwtError::KeyBindingInvalid(String::from(
+            "KB-JWT aud claim is not a string or array",
+        )));
+    };
+    if !aud_match {
         return Err(SdJwtError::KeyBindingInvalid(format!(
-            "KB-JWT aud mismatch: expected \"{expected_aud}\", got \"{aud}\""
+            "KB-JWT aud does not contain expected audience \"{expected_aud}\""
         )));
     }
 
-    // 8. Verify iat is not in the future (with 60-second clock skew tolerance).
+    // 9. Verify iat: not in the future AND not too old.
+    const MAX_CLOCK_SKEW: u64 = 60;
+    const MAX_AGE_SECS: u64 = 300; // 5 minutes
     let iat = payload_json
         .get("iat")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| SdJwtError::KeyBindingInvalid(String::from("KB-JWT iat claim missing")))?;
-    if iat > now + 60 {
+    if iat > now + MAX_CLOCK_SKEW {
         return Err(SdJwtError::KeyBindingInvalid(format!(
             "KB-JWT iat is in the future: iat={iat}, now={now}"
         )));
     }
+    if now > iat + MAX_AGE_SECS {
+        return Err(SdJwtError::KeyBindingInvalid(format!(
+            "KB-JWT iat is too old: iat={iat}, now={now}, max_age={MAX_AGE_SECS}s"
+        )));
+    }
 
-    // 9. Reconstruct SD-JWT without KB-JWT and verify sd_hash.
-    //    Format: {signing_input}.{base64url(signature)}~{disc1.raw}~...~{discN.raw}~
+    // 10. Reconstruct SD-JWT without KB-JWT and verify sd_hash.
     let sig_b64 = URL_SAFE_NO_PAD.encode(&sd_jwt.signature);
     let mut sd_jwt_without_kb = format!("{}.{}", sd_jwt.signing_input, sig_b64);
     for disc in &sd_jwt.disclosures {
@@ -146,19 +177,6 @@ pub fn verify_key_binding(
             "KB-JWT sd_hash does not match the SD-JWT presentation",
         )));
     }
-
-    // 10. Verify KB-JWT signature.
-    let kb_signing_input = format!("{}.{}", kb_header_b64, kb_payload_b64);
-    let sig_bytes = URL_SAFE_NO_PAD
-        .decode(kb_sig_b64)
-        .map_err(|_| SdJwtError::Base64Error)?;
-    harmony_identity::verify_signature(
-        holder_suite,
-        holder_key,
-        kb_signing_input.as_bytes(),
-        &sig_bytes,
-    )
-    .map_err(SdJwtError::SignatureInvalid)?;
 
     Ok(())
 }
@@ -436,5 +454,76 @@ mod tests {
             }
             other => panic!("expected KeyBindingInvalid with typ, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn aud_as_array_accepted() {
+        let issuer = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let holder = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let holder_pub = holder.public_identity();
+        let now = 1000u64;
+
+        // Build SD-JWT with KB-JWT where aud is an array
+        let header_b64 = B64.encode(r#"{"alg":"EdDSA","typ":"sd+jwt"}"#.as_bytes());
+        let payload_b64 = B64.encode(r#"{"iss":"issuer","sub":"holder"}"#.as_bytes());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let issuer_sig = issuer.sign(signing_input.as_bytes());
+        let sig_b64 = B64.encode(&issuer_sig);
+        let sd_jwt_without_kb = format!("{signing_input}.{sig_b64}~");
+        let sd_hash = B64.encode(Sha256::digest(sd_jwt_without_kb.as_bytes()));
+
+        // KB-JWT with aud as array
+        let kb_header_b64 = B64.encode(r#"{"alg":"EdDSA","typ":"kb+jwt"}"#.as_bytes());
+        let kb_payload = serde_json::json!({
+            "nonce": "n",
+            "aud": ["https://verifier.example"],
+            "iat": now,
+            "sd_hash": sd_hash
+        });
+        let kb_payload_b64 = B64.encode(serde_json::to_vec(&kb_payload).unwrap());
+        let kb_si = format!("{kb_header_b64}.{kb_payload_b64}");
+        let kb_sig = holder.sign(kb_si.as_bytes());
+        let kb_jwt = format!("{kb_si}.{}", B64.encode(&kb_sig));
+
+        let sd_jwt = SdJwt {
+            header: JwsHeader { alg: "EdDSA".into(), typ: Some("sd+jwt".into()), kid: None },
+            payload: JwtPayload {
+                iss: Some("issuer".into()), sub: Some("holder".into()),
+                iat: None, exp: None, nbf: None, sd: vec![], sd_alg: None,
+                #[cfg(feature = "std")] extra: vec![],
+            },
+            signature: issuer_sig.to_vec(),
+            signing_input,
+            disclosures: vec![],
+            key_binding_jwt: Some(kb_jwt),
+        };
+
+        assert!(verify_key_binding(
+            &sd_jwt,
+            &holder_pub.verifying_key.to_bytes(),
+            CryptoSuite::Ed25519,
+            "n",
+            "https://verifier.example",
+            now,
+        ).is_ok());
+    }
+
+    #[test]
+    fn too_old_iat() {
+        // iat = 1000, now = 2000 — 1000 seconds old (> 300s max age)
+        let (sd_jwt, holder_key) = make_sd_jwt_with_kb("n", "a", 1000);
+
+        let result = verify_key_binding(
+            &sd_jwt,
+            &holder_key,
+            CryptoSuite::Ed25519,
+            "n",
+            "a",
+            2000,
+        );
+        assert!(matches!(
+            result,
+            Err(SdJwtError::KeyBindingInvalid(msg)) if msg.contains("too old")
+        ));
     }
 }
