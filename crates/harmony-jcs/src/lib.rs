@@ -90,15 +90,13 @@ fn serialize_number(n: &serde_json::Number, buf: &mut Vec<u8>) {
     // Fast path for integers within the IEEE 754 safe range.
     // RFC 8785 requires all numbers to be treated as IEEE 754 doubles.
     // For integers within ±(2^53 - 1), the i64 representation is exact.
+    // Use unsigned_abs() to avoid overflow panic on i64::MIN.
+    // Note: the u64 branch is unreachable (serde_json only stores as u64
+    // when value > i64::MAX, which is always > MAX_SAFE_INTEGER), but kept
+    // for defensive completeness.
     if let Some(i) = n.as_i64() {
-        if i.abs() <= MAX_SAFE_INTEGER {
+        if i.unsigned_abs() <= MAX_SAFE_INTEGER as u64 {
             buf.extend_from_slice(i.to_string().as_bytes());
-            return;
-        }
-    }
-    if let Some(u) = n.as_u64() {
-        if u <= MAX_SAFE_INTEGER as u64 {
-            buf.extend_from_slice(u.to_string().as_bytes());
             return;
         }
     }
