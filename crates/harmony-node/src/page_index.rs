@@ -82,11 +82,11 @@ impl PageIndex {
         };
 
         candidates
-            .filter(|e| addr_01.map_or(true, |a| e.addrs[1] == *a))
-            .filter(|e| addr_10.map_or(true, |a| e.addrs[2] == *a))
-            .filter(|e| addr_11.map_or(true, |a| e.addrs[3] == *a))
-            .filter(|e| book_cid.map_or(true, |c| e.book_cid == *c))
-            .filter(|e| page_num.map_or(true, |n| e.page_num == n))
+            .filter(|e| addr_01.is_none_or(|a| e.addrs[1] == *a))
+            .filter(|e| addr_10.is_none_or(|a| e.addrs[2] == *a))
+            .filter(|e| addr_11.is_none_or(|a| e.addrs[3] == *a))
+            .filter(|e| book_cid.is_none_or(|c| e.book_cid == *c))
+            .filter(|e| page_num.is_none_or(|n| e.page_num == n))
             .collect()
     }
 

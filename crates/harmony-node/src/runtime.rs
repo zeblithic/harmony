@@ -1535,9 +1535,7 @@ impl<B: BookStore> NodeRuntime<B> {
             .iter()
             .any(|(_, c)| c.replication.is_some() && c.peering.enabled);
 
-        if !has_replication_peers {
-            return;
-        }
+        if !has_replication_peers {}
 
         // TODO: When BookStore gains an iter() method, iterate local
         // encrypted-durable books and emit ReplicaPush for each peer
@@ -2290,17 +2288,16 @@ impl<B: BookStore> NodeRuntime<B> {
         }
 
         // Verify ML-DSA signature with LOCAL key (we issued this token)
-        let pubkey = match harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(
-            &self.local_dsa_pubkey,
-        ) {
-            Ok(pk) => pk,
-            Err(_) => {
-                return vec![RuntimeAction::SendReply {
-                    query_id,
-                    payload: public_bytes.clone(),
-                }];
-            }
-        };
+        let pubkey =
+            match harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(&self.local_dsa_pubkey) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    return vec![RuntimeAction::SendReply {
+                        query_id,
+                        payload: public_bytes.clone(),
+                    }];
+                }
+            };
         if token.verify_signature(&pubkey).is_err() {
             return vec![RuntimeAction::SendReply {
                 query_id,
@@ -2612,7 +2609,10 @@ mod tests {
             raw: vec![0u8; 20],
             now: 1000,
         };
-        let _e2 = RuntimeEvent::TimerTick { now: 1000, unix_now: 0 };
+        let _e2 = RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        };
         let _e3 = RuntimeEvent::QueryReceived {
             query_id: 1,
             key_expr: "harmony/content/a/abc".into(),
@@ -2744,7 +2744,10 @@ mod tests {
             raw: vec![0u8; 20],
             now: 1000,
         });
-        rt.push_event(RuntimeEvent::TimerTick { now: 1001, unix_now: 0 });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1001,
+            unix_now: 0,
+        });
         assert_eq!(rt.router_queue_len(), 2);
         assert_eq!(rt.storage_queue_len(), 0);
     }
@@ -2773,7 +2776,10 @@ mod tests {
         let (mut rt, _) = make_runtime();
 
         for i in 0..3 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         rt.push_event(RuntimeEvent::QueryReceived {
             query_id: 10,
@@ -3008,7 +3014,10 @@ mod tests {
         let (mut rt, _) = make_runtime();
 
         // Queue a router event, a storage event, and a compute event
-        rt.push_event(RuntimeEvent::TimerTick { now: 1000, unix_now: 0 });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        });
         rt.push_event(RuntimeEvent::QueryReceived {
             query_id: 10,
             key_expr: "harmony/content/stats".into(),
@@ -3194,7 +3203,10 @@ mod tests {
 
         // Push 5 router events (half of high_water=10)
         for i in 0..5 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         // load_factor = 5/10 = 0.5
         // effective = 1000 * (1.0 - 0.5 * 0.9) = 1000 * 0.55 = 550
@@ -3202,7 +3214,10 @@ mod tests {
 
         // Push 5 more (at high_water)
         for i in 5..10 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         // load_factor = 10/10 = 1.0 → floor
         // effective = 1000 * 0.1 = 100
@@ -3210,7 +3225,10 @@ mod tests {
 
         // Push beyond high_water — stays at floor
         for i in 10..20 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         assert_eq!(rt.effective_fuel(), 100);
     }
@@ -3223,7 +3241,10 @@ mod tests {
 
         // Push 5 router events
         for i in 0..5 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         assert_eq!(rt.router_queue_len(), 5);
 
@@ -3279,7 +3300,10 @@ mod tests {
         assert_eq!(rt.starvation_counters(), (1, 1, 1));
 
         // Push router event only
-        rt.push_event(RuntimeEvent::TimerTick { now: 1000, unix_now: 0 });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        });
         rt.tick();
         // Router processed → reset to 0. Storage/compute still idle → increment.
         assert_eq!(rt.starvation_counters(), (0, 2, 2));
@@ -3304,7 +3328,10 @@ mod tests {
 
         // Push many router events but no storage events
         for i in 0..10 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
 
         // Also push 1 storage event
@@ -3348,7 +3375,10 @@ mod tests {
             key_expr: "harmony/content/stats".into(),
             payload: vec![],
         });
-        rt.push_event(RuntimeEvent::TimerTick { now: 2000, unix_now: 0 });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 2000,
+            unix_now: 0,
+        });
 
         // Tick 5: storage promoted → its actions should appear before router actions in output
         let actions = rt.tick();
@@ -3411,7 +3441,10 @@ mod tests {
 
         // Push 10 router events (= high_water) → fuel at floor
         for i in 0..10 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         assert_eq!(rt.effective_fuel(), 100);
 
@@ -3965,7 +3998,10 @@ mod tests {
         });
         // Tick with a timer to trigger PeerManager tick, which should produce
         // a SendPathRequest for the High-priority peer.
-        rt.push_event(RuntimeEvent::TimerTick { now: 1000, unix_now: 0 });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        });
         let actions = rt.tick();
         assert!(
             actions.iter().any(|a| matches!(
@@ -4729,7 +4765,10 @@ mod tests {
 
         // Advance past timeout
         for _ in 0..MEMO_FETCH_TIMEOUT_TICKS {
-            rt.push_event(RuntimeEvent::TimerTick { now: 0, unix_now: 0 });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 0,
+                unix_now: 0,
+            });
             rt.tick();
         }
 
