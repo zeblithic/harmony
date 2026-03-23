@@ -121,7 +121,7 @@ Per the did:jwk spec (requires `std` for JSON parsing):
 3. Parse as JWK object
 4. Extract `kty` and `crv`:
    - `kty: "OKP"`, `crv: "Ed25519"` → Ed25519
-   - Other combinations → `UnsupportedMethod` for now
+   - Other combinations → `MalformedDid("unsupported JWK key type: …")`
 5. Base64url-decode the `x` field → raw public key bytes
 6. Validate key length
 
