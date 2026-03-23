@@ -585,6 +585,7 @@ struct PubkeyCacheKeyResolver<'a> {
 
 impl<'a> harmony_credential::CredentialKeyResolver for PubkeyCacheKeyResolver<'a> {
     fn resolve(&self, issuer: &harmony_identity::IdentityRef, _issued_at: u64) -> Option<Vec<u8>> {
+        // Key rotation is not supported; each identity has a single lifetime key.
         self.cache.get(&issuer.hash).cloned()
     }
 }
