@@ -2,12 +2,14 @@ use crate::error::SdJwtError;
 
 /// Extract the raw base64url header and payload strings from a JWS compact serialization.
 ///
+/// Split a JWS compact serialization into its signing input and signature.
+///
 /// Returns `(signing_input, signature_b64)` where `signing_input` is the raw
 /// `header.payload` string suitable for signature verification, and `signature_b64`
 /// is the base64url-encoded signature.
 ///
 /// This function does NOT require `serde_json` and works in `no_std` environments.
-pub fn signing_input(compact: &str) -> Result<(&str, &str), SdJwtError> {
+pub fn split_jws(compact: &str) -> Result<(&str, &str), SdJwtError> {
     if compact.is_empty() {
         return Err(SdJwtError::EmptyInput);
     }
@@ -430,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_signing_input() {
+    fn preserves_split_jws() {
         let header = serde_json::json!({"alg": "EdDSA"});
         let payload = serde_json::json!({"iss": "test"});
         let jws = build_jws(&header, &payload, b"sig");
@@ -487,6 +489,30 @@ mod tests {
 
         let result = parse(&compact);
         assert!(matches!(result, Err(SdJwtError::MissingAlgorithm)));
+    }
+
+    #[test]
+    fn error_sd_not_array() {
+        let header = serde_json::json!({"alg": "EdDSA"});
+        let payload = serde_json::json!({"_sd": "not_an_array"});
+        let compact = build_jws(&header, &payload, b"sig");
+        assert!(matches!(parse(&compact), Err(SdJwtError::MalformedCompact)));
+    }
+
+    #[test]
+    fn error_sd_alg_not_string() {
+        let header = serde_json::json!({"alg": "EdDSA"});
+        let payload = serde_json::json!({"_sd": [], "_sd_alg": 42});
+        let compact = build_jws(&header, &payload, b"sig");
+        assert!(matches!(parse(&compact), Err(SdJwtError::MalformedCompact)));
+    }
+
+    #[test]
+    fn error_sd_contains_non_string_element() {
+        let header = serde_json::json!({"alg": "EdDSA"});
+        let payload = serde_json::json!({"_sd": ["valid_hash", 99]});
+        let compact = build_jws(&header, &payload, b"sig");
+        assert!(matches!(parse(&compact), Err(SdJwtError::MalformedCompact)));
     }
 
     #[test]
@@ -568,12 +594,12 @@ mod tests {
     // --- signing_input tests (no_std compatible) ---
 
     #[test]
-    fn signing_input_extracts_correctly() {
+    fn split_jws_extracts_correctly() {
         let header = serde_json::json!({"alg": "EdDSA"});
         let payload = serde_json::json!({"iss": "test"});
         let jws = build_jws(&header, &payload, b"sig");
 
-        let (si, sig) = signing_input(&jws).unwrap();
+        let (si, sig) = split_jws(&jws).unwrap();
         // signing_input is header.payload
         assert!(si.contains('.'));
         assert_eq!(si.matches('.').count(), 1);
@@ -581,34 +607,34 @@ mod tests {
     }
 
     #[test]
-    fn signing_input_with_disclosures() {
+    fn split_jws_with_disclosures() {
         let header = serde_json::json!({"alg": "EdDSA"});
         let payload = serde_json::json!({"iss": "test"});
         let jws = build_jws(&header, &payload, b"sig");
         let compact = format!("{jws}~disclosure1~disclosure2~");
 
-        let (si, sig) = signing_input(&compact).unwrap();
+        let (si, sig) = split_jws(&compact).unwrap();
         // signing_input should only contain the header.payload portion.
         assert!(!si.contains('~'));
         assert_eq!(sig, URL_SAFE_NO_PAD.encode(b"sig"));
     }
 
     #[test]
-    fn signing_input_error_empty() {
-        let result = signing_input("");
+    fn split_jws_error_empty() {
+        let result = split_jws("");
         assert!(matches!(result, Err(SdJwtError::EmptyInput)));
     }
 
     #[test]
-    fn signing_input_error_no_dots() {
-        let result = signing_input("nodots");
+    fn split_jws_error_no_dots() {
+        let result = split_jws("nodots");
         assert!(matches!(result, Err(SdJwtError::MalformedCompact)));
     }
 
     #[test]
-    fn signing_input_error_missing_signature() {
+    fn split_jws_error_missing_signature() {
         // header.payload but no signature part
-        let result = signing_input("header.payload");
+        let result = split_jws("header.payload");
         assert!(matches!(result, Err(SdJwtError::MalformedCompact)));
     }
 

@@ -8,7 +8,7 @@ pub mod types;
 pub mod verify;
 
 pub use error::SdJwtError;
-pub use parse::signing_input;
+pub use parse::split_jws;
 #[cfg(feature = "std")]
 pub use parse::parse;
 pub use types::{Disclosure, JwsHeader, JwtPayload, SdJwt};
