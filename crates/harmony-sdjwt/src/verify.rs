@@ -53,7 +53,7 @@ pub fn verify_from_header(
     // RFC 9901 §3.3: typ MUST be "sd+jwt" for issuer-signed SD-JWTs.
     match sd_jwt.header.typ.as_deref() {
         Some("sd+jwt") => {}
-        _ => return Err(SdJwtError::MalformedCompact),
+        _ => return Err(SdJwtError::WrongTokenType),
     }
     let suite = alg_to_suite(&sd_jwt.header.alg)?;
     verify(sd_jwt, suite, public_key)

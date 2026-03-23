@@ -157,20 +157,20 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
     let exp = payload_json.get("exp").and_then(|v| v.as_i64());
     let nbf = payload_json.get("nbf").and_then(|v| v.as_i64());
 
-    let sd: Vec<String> = payload_json
-        .get("_sd")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(|s| s.to_string())
-                        .ok_or(SdJwtError::MalformedCompact)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
+    // RFC 9901 §5.2: _sd MUST be an array if present.
+    let sd: Vec<String> = match payload_json.get("_sd") {
+        None => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .ok_or(SdJwtError::MalformedCompact)?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .ok_or(SdJwtError::MalformedCompact)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
 
     let sd_alg = payload_json
         .get("_sd_alg")

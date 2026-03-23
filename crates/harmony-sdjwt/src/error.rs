@@ -9,6 +9,8 @@ pub enum SdJwtError {
     MissingAlgorithm,
     UnsupportedAlgorithm(String),
     InvalidDisclosure,
+    /// The `typ` header is missing or not `"sd+jwt"` (RFC 9901 §3.3).
+    WrongTokenType,
     SignatureInvalid(harmony_identity::IdentityError),
 }
 
@@ -27,10 +29,18 @@ impl core::fmt::Display for SdJwtError {
                     "disclosure is not a valid [salt, name?, value] array"
                 )
             }
+            Self::WrongTokenType => write!(f, "typ header must be \"sd+jwt\" (RFC 9901 §3.3)"),
             Self::SignatureInvalid(e) => write!(f, "signature verification failed: {e}"),
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for SdJwtError {}
+impl std::error::Error for SdJwtError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SignatureInvalid(e) => Some(e),
+            _ => None,
+        }
+    }
+}

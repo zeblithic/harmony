@@ -9,13 +9,12 @@ rust-version.workspace = true
 
 [dependencies]
 harmony-identity = { workspace = true }
-serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 serde_json = { workspace = true, optional = true }
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { workspace = true, features = ["alloc"] }
 
 [features]
 default = ["std"]
-std = ["dep:serde_json", "serde_json?/std", "harmony-identity/std", "serde/std", "base64/std"]
+std = ["dep:serde_json", "serde_json?/std", "harmony-identity/std", "base64/std"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

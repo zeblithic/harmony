@@ -94,6 +94,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CLI and config
 serde = { version = "1", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
+base64 = { version = "0.22", default-features = false }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 
