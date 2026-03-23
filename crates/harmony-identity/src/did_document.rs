@@ -3,6 +3,8 @@
 //! This module provides:
 //! - [`did_web_to_url`] — pure, no-I/O conversion from a `did:web` DID to its
 //!   canonical HTTPS fetch URL (W3C did:web spec).
+//! - [`parse_did_document`] — parses W3C DID Document JSON and extracts all
+//!   supported verification methods (Ed25519, ML-DSA-65). Requires `std`.
 
 use alloc::format;
 use alloc::string::String;
@@ -93,6 +95,66 @@ fn hex_to_byte(hi: u8, lo: u8) -> u8 {
     (digit(hi) << 4) | digit(lo)
 }
 
+/// Parse a W3C DID Document JSON and extract all supported verification methods.
+///
+/// Verification methods with unsupported key types are silently skipped.
+/// Returns [`DidError::NoSupportedKeys`] if no methods use a supported suite
+/// (Ed25519, ML-DSA-65).
+///
+/// Requires the `std` feature (uses `serde_json`).
+#[cfg(feature = "std")]
+pub fn parse_did_document(
+    did: &str,
+    json_bytes: &[u8],
+) -> Result<crate::did::ResolvedDidDocument, DidError> {
+    let doc: serde_json::Value = serde_json::from_slice(json_bytes)
+        .map_err(|e| DidError::DecodingError(format!("invalid DID Document JSON: {e}")))?;
+
+    let doc_id = doc
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| DidError::MalformedDid(String::from("DID Document missing id field")))?;
+
+    if doc_id != did {
+        return Err(DidError::MalformedDid(format!(
+            "DID Document id mismatch: expected \"{did}\", got \"{doc_id}\""
+        )));
+    }
+
+    let methods = doc
+        .get("verificationMethod")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            DidError::MalformedDid(String::from(
+                "DID Document missing verificationMethod array",
+            ))
+        })?;
+
+    let mut resolved = alloc::vec::Vec::new();
+    for method in methods {
+        if let Some(jwk) = method.get("publicKeyJwk") {
+            if let Ok(r) = crate::did::parse_jwk_value(jwk) {
+                resolved.push(r);
+                continue;
+            }
+        }
+        if let Some(mb) = method.get("publicKeyMultibase").and_then(|v| v.as_str()) {
+            if let Ok(r) = crate::did::parse_multibase_key(mb) {
+                resolved.push(r);
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        return Err(DidError::NoSupportedKeys);
+    }
+
+    Ok(crate::did::ResolvedDidDocument {
+        id: String::from(did),
+        verification_methods: resolved,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +191,150 @@ mod tests {
     #[test]
     fn did_web_empty_identifier() {
         assert!(did_web_to_url("did:web:").is_err());
+    }
+
+    #[cfg(feature = "std")]
+    mod parse_tests {
+        use super::super::*;
+        use base64::Engine as _;
+        use crate::crypto_suite::CryptoSuite;
+
+        fn ed25519_jwk_document(did: &str, key_b64: &str) -> String {
+            format!(
+                r#"{{
+                "@context": "https://www.w3.org/ns/did/v1",
+                "id": "{did}",
+                "verificationMethod": [{{
+                    "id": "{did}#key-1",
+                    "type": "JsonWebKey2020",
+                    "controller": "{did}",
+                    "publicKeyJwk": {{
+                        "kty": "OKP",
+                        "crv": "Ed25519",
+                        "x": "{key_b64}"
+                    }}
+                }}]
+            }}"#
+            )
+        }
+
+        #[test]
+        fn parse_ed25519_jwk_document() {
+            let key_bytes = [42u8; 32];
+            let key_b64 =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key_bytes);
+            let did = "did:web:example.com";
+            let json = ed25519_jwk_document(did, &key_b64);
+            let doc = parse_did_document(did, json.as_bytes()).unwrap();
+            assert_eq!(doc.id, did);
+            assert_eq!(doc.verification_methods.len(), 1);
+            assert_eq!(doc.verification_methods[0].suite, CryptoSuite::Ed25519);
+            assert_eq!(doc.verification_methods[0].public_key, key_bytes.to_vec());
+        }
+
+        #[test]
+        fn parse_multibase_document() {
+            // Ed25519 multicodec 0x00ed = LEB128 [0xed, 0x01]
+            let key = [0xABu8; 32];
+            let mut payload = alloc::vec![0xed, 0x01];
+            payload.extend_from_slice(&key);
+            let multibase = format!("z{}", bs58::encode(&payload).into_string());
+            let did = "did:web:example.com";
+            let json = format!(
+                r#"{{
+                "@context": "https://www.w3.org/ns/did/v1",
+                "id": "{did}",
+                "verificationMethod": [{{
+                    "id": "{did}#key-1",
+                    "type": "Multikey",
+                    "controller": "{did}",
+                    "publicKeyMultibase": "{multibase}"
+                }}]
+            }}"#
+            );
+            let doc = parse_did_document(did, json.as_bytes()).unwrap();
+            assert_eq!(doc.verification_methods.len(), 1);
+            assert_eq!(doc.verification_methods[0].suite, CryptoSuite::Ed25519);
+        }
+
+        #[test]
+        fn parse_skips_unsupported_keys() {
+            let did = "did:web:example.com";
+            let json = format!(
+                r#"{{
+                "@context": "https://www.w3.org/ns/did/v1",
+                "id": "{did}",
+                "verificationMethod": [{{
+                    "id": "{did}#key-1",
+                    "type": "JsonWebKey2020",
+                    "controller": "{did}",
+                    "publicKeyJwk": {{
+                        "kty": "EC",
+                        "crv": "P-256",
+                        "x": "AAAA",
+                        "y": "BBBB"
+                    }}
+                }}, {{
+                    "id": "{did}#key-2",
+                    "type": "JsonWebKey2020",
+                    "controller": "{did}",
+                    "publicKeyJwk": {{
+                        "kty": "OKP",
+                        "crv": "Ed25519",
+                        "x": "{}"
+                    }}
+                }}]
+            }}"#,
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([99u8; 32])
+            );
+            let doc = parse_did_document(did, json.as_bytes()).unwrap();
+            assert_eq!(doc.verification_methods.len(), 1);
+            assert_eq!(doc.verification_methods[0].suite, CryptoSuite::Ed25519);
+        }
+
+        #[test]
+        fn parse_id_mismatch_rejected() {
+            let json = r#"{
+                "@context": "https://www.w3.org/ns/did/v1",
+                "id": "did:web:evil.com",
+                "verificationMethod": []
+            }"#;
+            let err =
+                parse_did_document("did:web:example.com", json.as_bytes()).unwrap_err();
+            assert!(
+                matches!(err, crate::did::DidError::MalformedDid(ref msg) if msg.contains("mismatch"))
+            );
+        }
+
+        #[test]
+        fn parse_no_supported_keys_error() {
+            let did = "did:web:example.com";
+            let json = format!(
+                r#"{{
+                "@context": "https://www.w3.org/ns/did/v1",
+                "id": "{did}",
+                "verificationMethod": [{{
+                    "id": "{did}#key-1",
+                    "type": "JsonWebKey2020",
+                    "controller": "{did}",
+                    "publicKeyJwk": {{ "kty": "EC", "crv": "P-256", "x": "AA", "y": "BB" }}
+                }}]
+            }}"#
+            );
+            let err = parse_did_document(did, json.as_bytes()).unwrap_err();
+            assert!(matches!(err, crate::did::DidError::NoSupportedKeys));
+        }
+
+        #[test]
+        fn parse_missing_verification_method() {
+            let did = "did:web:example.com";
+            let json = format!(
+                r#"{{
+                "@context": "https://www.w3.org/ns/did/v1",
+                "id": "{did}"
+            }}"#
+            );
+            assert!(parse_did_document(did, json.as_bytes()).is_err());
+        }
     }
 }
