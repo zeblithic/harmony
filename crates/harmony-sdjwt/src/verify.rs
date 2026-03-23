@@ -51,8 +51,10 @@ pub fn verify_from_header(
     public_key: &[u8],
 ) -> Result<(), SdJwtError> {
     // RFC 9901 §3.3: typ MUST be "sd+jwt" for issuer-signed SD-JWTs.
+    // RFC 7515 §4.1.9: typ comparisons SHOULD be case-insensitive.
+    // Accept both short form ("sd+jwt") and full media type ("application/sd+jwt").
     match sd_jwt.header.typ.as_deref() {
-        Some("sd+jwt") => {}
+        Some(t) if t.eq_ignore_ascii_case("sd+jwt") || t.eq_ignore_ascii_case("application/sd+jwt") => {}
         _ => return Err(SdJwtError::WrongTokenType),
     }
     let suite = alg_to_suite(&sd_jwt.header.alg)?;
