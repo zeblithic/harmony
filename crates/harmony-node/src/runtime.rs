@@ -57,6 +57,10 @@ pub struct NodeConfig {
     /// probe-interval jitter is unique per local-peer pair rather than zero.
     /// Defaults to all-zeros; must be set from the loaded identity at startup.
     pub local_identity_hash: harmony_identity::IdentityHash,
+    /// This node's ML-DSA-65 public verifying key bytes.
+    /// Used to verify Discovery UCAN tokens (which are issued by this node).
+    /// Defaults to empty; must be set from the loaded identity at startup.
+    pub local_dsa_pubkey: Vec<u8>,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -116,6 +120,7 @@ impl Default for NodeConfig {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "0000".to_string(),
             local_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         }
     }
 }
@@ -130,7 +135,8 @@ pub enum RuntimeEvent {
         now: u64,
     },
     /// Tier 1: Periodic timer tick for path expiry, announce scheduling.
-    TimerTick { now: u64 },
+    /// `now` is monotonic millis-since-start. `unix_now` is Unix epoch seconds.
+    TimerTick { now: u64, unix_now: u64 },
     /// Tier 2: Zenoh query received (content fetch or stats request).
     QueryReceived {
         query_id: u64,
@@ -575,6 +581,18 @@ pub struct NodeRuntime<B: BookStore> {
     // In-flight memo fetches: input CID → tick when fetch was started.
     // Prevents re-querying for the same input while a fetch is in-flight.
     pending_memo_fetches: HashMap<ContentId, u64>,
+    // This node's identity hash (copied from config for direct access).
+    local_identity_hash: harmony_identity::IdentityHash,
+    // Queryable ID for the discover namespace (harmony/discover/**)
+    discover_queryable_id: QueryableId,
+    // Pre-serialized public announce record (Reticulum-only hints).
+    local_public_announce: Option<Vec<u8>>,
+    // Pre-serialized full announce record (all hints including tunnel).
+    local_full_announce: Option<Vec<u8>>,
+    // Unix epoch seconds, updated on each TimerTick for token time-bound checks.
+    last_unix_now: u64,
+    // This node's ML-DSA-65 public key for verifying self-issued Discovery tokens.
+    local_dsa_pubkey: Vec<u8>,
 }
 
 /// Adapts the runtime's pubkey_cache to the CredentialKeyResolver trait
@@ -679,6 +697,14 @@ impl<B: BookStore> NodeRuntime<B> {
             key_expr: harmony_zenoh::namespace::memo::SUB.to_string(),
         });
 
+        // Discover namespace: register queryable for authenticated routing hint queries.
+        let (discover_qid, _) = queryable_router
+            .declare(harmony_zenoh::namespace::discover::SUB)
+            .expect("static key expression must be valid");
+        actions.push(RuntimeAction::DeclareQueryable {
+            key_expr: harmony_zenoh::namespace::discover::SUB.to_string(),
+        });
+
         // Subscribe to peer filter broadcasts.
         actions.push(RuntimeAction::Subscribe {
             key_expr: harmony_zenoh::namespace::filters::CONTENT_SUB.to_string(),
@@ -734,6 +760,12 @@ impl<B: BookStore> NodeRuntime<B> {
             pubkey_cache: HashMap::new(),
             memo_queryable_id: memo_qid,
             pending_memo_fetches: HashMap::new(),
+            local_identity_hash: config.local_identity_hash,
+            discover_queryable_id: discover_qid,
+            local_public_announce: None,
+            local_full_announce: None,
+            last_unix_now: 0,
+            local_dsa_pubkey: config.local_dsa_pubkey,
         };
 
         (rt, actions)
@@ -954,6 +986,21 @@ impl<B: BookStore> NodeRuntime<B> {
         &mut self.memo_store
     }
 
+    /// This node's identity hash.
+    pub fn local_identity_hash(&self) -> [u8; 16] {
+        self.local_identity_hash
+    }
+
+    /// Set the pre-serialized public announce record (Reticulum-only hints).
+    pub fn set_local_public_announce(&mut self, data: Vec<u8>) {
+        self.local_public_announce = Some(data);
+    }
+
+    /// Set the pre-serialized full announce record (all hints including tunnel).
+    pub fn set_local_full_announce(&mut self, data: Vec<u8>) {
+        self.local_full_announce = Some(data);
+    }
+
     /// Read-only access to the page index.
     pub fn page_index(&self) -> &crate::page_index::PageIndex {
         &self.page_index
@@ -999,8 +1046,9 @@ impl<B: BookStore> NodeRuntime<B> {
                     now,
                 });
             }
-            RuntimeEvent::TimerTick { now } => {
+            RuntimeEvent::TimerTick { now, unix_now } => {
                 self.last_now = now;
+                self.last_unix_now = unix_now;
                 self.router_queue.push_back(NodeEvent::TimerTick { now });
             }
             RuntimeEvent::QueryReceived {
@@ -2061,6 +2109,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 } else if queryable_id == self.memo_queryable_id {
                     let memo_actions = self.handle_memo_query(query_id, &key_expr);
                     self.pending_direct_actions.extend(memo_actions);
+                } else if queryable_id == self.discover_queryable_id {
+                    let actions = self.handle_discover_query(query_id, &key_expr, &payload);
+                    self.pending_direct_actions.extend(actions);
                 }
             }
         }
@@ -2126,6 +2177,23 @@ impl<B: BookStore> NodeRuntime<B> {
         payload.extend_from_slice(&memo_buf);
 
         vec![RuntimeAction::SendReply { query_id, payload }]
+    }
+
+    /// Handle an authenticated discover query for routing hints.
+    ///
+    /// Key expression: `harmony/discover/{identity_hash_hex}`
+    /// Payload: serialized Discovery UCAN token (or empty for public-only response).
+    ///
+    /// Returns routing hint actions (or empty if query is malformed).
+    fn handle_discover_query(
+        &self,
+        query_id: u64,
+        _key_expr: &str,
+        _payload: &[u8],
+    ) -> Vec<RuntimeAction> {
+        // TODO: implement in Task 4
+        let _ = query_id;
+        Vec::new()
     }
 
     /// Handle a page query against the page index.
@@ -2417,7 +2485,7 @@ mod tests {
             raw: vec![0u8; 20],
             now: 1000,
         };
-        let _e2 = RuntimeEvent::TimerTick { now: 1000 };
+        let _e2 = RuntimeEvent::TimerTick { now: 1000, unix_now: 0 };
         let _e3 = RuntimeEvent::QueryReceived {
             query_id: 1,
             key_expr: "harmony/content/a/abc".into(),
@@ -2519,8 +2587,8 @@ mod tests {
             .filter(|a| matches!(a, RuntimeAction::Subscribe { .. }))
             .count();
 
-        // 16 shard queryables + 1 stats queryable + 1 compute activity queryable + 1 page queryable + 1 memo queryable = 20
-        assert_eq!(queryable_count, 20);
+        // 16 shard + 1 stats + 1 compute + 1 page + 1 memo + 1 discover = 21
+        assert_eq!(queryable_count, 21);
         // transit + publish + content filter + flatpack filter + memo filter + page filter subscriptions = 6
         assert_eq!(subscribe_count, 6);
     }
@@ -2549,7 +2617,7 @@ mod tests {
             raw: vec![0u8; 20],
             now: 1000,
         });
-        rt.push_event(RuntimeEvent::TimerTick { now: 1001 });
+        rt.push_event(RuntimeEvent::TimerTick { now: 1001, unix_now: 0 });
         assert_eq!(rt.router_queue_len(), 2);
         assert_eq!(rt.storage_queue_len(), 0);
     }
@@ -2578,7 +2646,7 @@ mod tests {
         let (mut rt, _) = make_runtime();
 
         for i in 0..3 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
         }
         rt.push_event(RuntimeEvent::QueryReceived {
             query_id: 10,
@@ -2813,7 +2881,7 @@ mod tests {
         let (mut rt, _) = make_runtime();
 
         // Queue a router event, a storage event, and a compute event
-        rt.push_event(RuntimeEvent::TimerTick { now: 1000 });
+        rt.push_event(RuntimeEvent::TimerTick { now: 1000, unix_now: 0 });
         rt.push_event(RuntimeEvent::QueryReceived {
             query_id: 10,
             key_expr: "harmony/content/stats".into(),
@@ -2999,7 +3067,7 @@ mod tests {
 
         // Push 5 router events (half of high_water=10)
         for i in 0..5 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
         }
         // load_factor = 5/10 = 0.5
         // effective = 1000 * (1.0 - 0.5 * 0.9) = 1000 * 0.55 = 550
@@ -3007,7 +3075,7 @@ mod tests {
 
         // Push 5 more (at high_water)
         for i in 5..10 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
         }
         // load_factor = 10/10 = 1.0 → floor
         // effective = 1000 * 0.1 = 100
@@ -3015,7 +3083,7 @@ mod tests {
 
         // Push beyond high_water — stays at floor
         for i in 10..20 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
         }
         assert_eq!(rt.effective_fuel(), 100);
     }
@@ -3028,7 +3096,7 @@ mod tests {
 
         // Push 5 router events
         for i in 0..5 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
         }
         assert_eq!(rt.router_queue_len(), 5);
 
@@ -3084,7 +3152,7 @@ mod tests {
         assert_eq!(rt.starvation_counters(), (1, 1, 1));
 
         // Push router event only
-        rt.push_event(RuntimeEvent::TimerTick { now: 1000 });
+        rt.push_event(RuntimeEvent::TimerTick { now: 1000, unix_now: 0 });
         rt.tick();
         // Router processed → reset to 0. Storage/compute still idle → increment.
         assert_eq!(rt.starvation_counters(), (0, 2, 2));
@@ -3109,7 +3177,7 @@ mod tests {
 
         // Push many router events but no storage events
         for i in 0..10 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
         }
 
         // Also push 1 storage event
@@ -3153,7 +3221,7 @@ mod tests {
             key_expr: "harmony/content/stats".into(),
             payload: vec![],
         });
-        rt.push_event(RuntimeEvent::TimerTick { now: 2000 });
+        rt.push_event(RuntimeEvent::TimerTick { now: 2000, unix_now: 0 });
 
         // Tick 5: storage promoted → its actions should appear before router actions in output
         let actions = rt.tick();
@@ -3216,7 +3284,7 @@ mod tests {
 
         // Push 10 router events (= high_water) → fuel at floor
         for i in 0..10 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i, unix_now: 0 });
         }
         assert_eq!(rt.effective_fuel(), 100);
 
@@ -3244,6 +3312,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
@@ -3310,6 +3379,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "self-node".to_string(),
             local_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3342,6 +3412,7 @@ mod tests {
             },
             node_addr: "reject-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
@@ -3371,6 +3442,7 @@ mod tests {
             },
             node_addr: "skip-timer-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3429,6 +3501,7 @@ mod tests {
             },
             node_addr: "coalesce-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3476,6 +3549,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "cuckoo-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3516,6 +3590,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "self-node".to_string(),
             local_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3763,7 +3838,7 @@ mod tests {
         });
         // Tick with a timer to trigger PeerManager tick, which should produce
         // a SendPathRequest for the High-priority peer.
-        rt.push_event(RuntimeEvent::TimerTick { now: 1000 });
+        rt.push_event(RuntimeEvent::TimerTick { now: 1000, unix_now: 0 });
         let actions = rt.tick();
         assert!(
             actions.iter().any(|a| matches!(
@@ -4409,6 +4484,7 @@ mod tests {
             },
             node_addr: "page-filter-timer-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4526,7 +4602,7 @@ mod tests {
 
         // Advance past timeout
         for _ in 0..MEMO_FETCH_TIMEOUT_TICKS {
-            rt.push_event(RuntimeEvent::TimerTick { now: 0 });
+            rt.push_event(RuntimeEvent::TimerTick { now: 0, unix_now: 0 });
             rt.tick();
         }
 

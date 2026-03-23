@@ -7,7 +7,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use harmony_content::book::MemoryBookStore;
 use harmony_identity::PqPrivateIdentity;
@@ -421,7 +421,11 @@ pub async fn run(
 
             // Arm 2: 250 ms timer tick — push TimerTick AND trigger tick().
             _ = timer.tick() => {
-                runtime.push_event(RuntimeEvent::TimerTick { now: now_ms() });
+                let unix_now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                runtime.push_event(RuntimeEvent::TimerTick { now: now_ms(), unix_now });
                 should_tick = true;
                 for addr in peer_table.evict_stale() {
                     tracing::info!(peer = %addr, "evicted stale mDNS peer");
