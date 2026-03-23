@@ -97,25 +97,13 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
     // Split on `~` to separate JWS from disclosures.
     let segments: Vec<&str> = compact.split('~').collect();
 
-    // First segment is the JWS compact serialization.
+    // Delegate JWS structure validation to split_jws (single source of truth).
     let jws = segments[0];
-
-    // Split JWS into header, payload, signature.
-    let jws_parts: Vec<&str> = jws.split('.').collect();
-    if jws_parts.len() != 3 {
-        return Err(SdJwtError::MalformedCompact);
-    }
-
-    let header_b64 = jws_parts[0];
-    let payload_b64 = jws_parts[1];
-    let signature_b64 = jws_parts[2];
-
-    if header_b64.is_empty() || payload_b64.is_empty() || signature_b64.is_empty() {
-        return Err(SdJwtError::MalformedCompact);
-    }
-
-    // Store the raw signing input for verification.
-    let raw_signing_input = format!("{}.{}", header_b64, payload_b64);
+    let (signing_input_ref, signature_b64) = split_jws(jws)?;
+    let raw_signing_input = signing_input_ref.to_string();
+    let (header_b64, payload_b64) = signing_input_ref
+        .split_once('.')
+        .expect("split_jws guarantees exactly one '.' in signing_input");
 
     // Decode header.
     let header_bytes = URL_SAFE_NO_PAD
@@ -135,14 +123,22 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
         .as_str()
         .ok_or(SdJwtError::MalformedCompact)?
         .to_string();
-    let typ = header_json
-        .get("typ")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let kid = header_json
-        .get("kid")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let typ: Option<String> = match header_json.get("typ") {
+        None => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or(SdJwtError::MalformedCompact)?
+                .to_string(),
+        ),
+    };
+    let kid: Option<String> = match header_json.get("kid") {
+        None => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or(SdJwtError::MalformedCompact)?
+                .to_string(),
+        ),
+    };
 
     let header = crate::types::JwsHeader { alg, typ, kid };
 
