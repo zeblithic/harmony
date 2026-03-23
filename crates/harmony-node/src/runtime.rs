@@ -1944,9 +1944,69 @@ impl<B: BookStore> NodeRuntime<B> {
                 } else if queryable_id == self.page_queryable_id {
                     let page_actions = self.handle_page_query(query_id, &key_expr);
                     self.pending_direct_actions.extend(page_actions);
+                } else if queryable_id == self.memo_queryable_id {
+                    let memo_actions = self.handle_memo_query(query_id, &key_expr);
+                    self.pending_direct_actions.extend(memo_actions);
                 }
             }
         }
+    }
+
+    /// Handle a memo query: look up MemoStore by input CID from key expression.
+    ///
+    /// Key expression: `harmony/memo/{input_hex}/**`
+    /// Response: `[u16 LE count][u32 LE len][memo_bytes]...`
+    /// Returns empty vec (no reply) if no memos found or key malformed.
+    fn handle_memo_query(&self, query_id: u64, key_expr: &str) -> Vec<RuntimeAction> {
+        // Strip prefix and trailing wildcard to extract input_hex.
+        let input_hex = match key_expr
+            .strip_prefix(harmony_zenoh::namespace::memo::PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            Some(rest) => {
+                // rest is e.g. "aabb.../**" — strip trailing /**
+                rest.split('/').next().unwrap_or("")
+            }
+            None => return Vec::new(),
+        };
+
+        // Decode hex to ContentId
+        let cid_bytes = match hex::decode(input_hex) {
+            Ok(b) if b.len() == 32 => b,
+            _ => return Vec::new(),
+        };
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&cid_bytes);
+        let input_cid = ContentId::from_bytes(arr);
+
+        let memos = self.memo_store.get_by_input(&input_cid);
+        if memos.is_empty() {
+            return Vec::new();
+        }
+
+        // Serialize up to MAX_MEMO_RESPONSE_COUNT memos into a temp buffer,
+        // then write the actual count. This avoids a count mismatch if any
+        // serialize() call fails.
+        let mut memo_buf = Vec::new();
+        let mut actual_count: u16 = 0;
+
+        for memo in memos.iter().take(MAX_MEMO_RESPONSE_COUNT) {
+            if let Ok(bytes) = harmony_memo::serialize(memo) {
+                memo_buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                memo_buf.extend_from_slice(&bytes);
+                actual_count += 1;
+            }
+        }
+
+        if actual_count == 0 {
+            return Vec::new();
+        }
+
+        let mut payload = Vec::with_capacity(2 + memo_buf.len());
+        payload.extend_from_slice(&actual_count.to_le_bytes());
+        payload.extend_from_slice(&memo_buf);
+
+        vec![RuntimeAction::SendReply { query_id, payload }]
     }
 
     /// Handle a page query against the page index.
@@ -4103,6 +4163,109 @@ mod tests {
         let absent =
             harmony_athenaeum::PageAddr::new(0x00000000, harmony_athenaeum::Algorithm::Sha256Msb);
         assert!(table.should_query_page("peer-a", &absent, 111));
+    }
+
+    #[test]
+    fn memo_queryable_serves_local_memos() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let (mut rt, _) = make_runtime();
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let input = ContentId::from_bytes([0x11; 32]);
+        let output = ContentId::from_bytes([0x22; 32]);
+
+        let memo = harmony_memo::create::create_memo(
+            input, output, &identity, &mut OsRng, 1000, 2000,
+        )
+        .unwrap();
+        rt.memo_store_mut().insert(memo);
+
+        // Simulate a query for this input
+        let input_hex = hex::encode(input.to_bytes());
+        let key_expr = format!("harmony/memo/{input_hex}/**");
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 42,
+            key_expr,
+            payload: vec![],
+        });
+
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 42, .. }));
+        assert!(reply.is_some(), "should reply to memo query");
+
+        // Parse response format: [u16 LE count][u32 LE len][bytes]...
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert!(payload.len() >= 2, "response too short");
+            let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+            assert_eq!(count, 1, "should have 1 memo");
+            // Verify the memo can be deserialized
+            let memo_len = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]) as usize;
+            let memo_bytes = &payload[6..6 + memo_len];
+            let restored = harmony_memo::deserialize(memo_bytes).expect("should deserialize");
+            assert_eq!(restored.input, input);
+            assert_eq!(restored.output, output);
+        }
+    }
+
+    #[test]
+    fn memo_queryable_empty_no_reply() {
+        let (mut rt, _) = make_runtime();
+
+        let input_hex = hex::encode([0xFF; 32]);
+        let key_expr = format!("harmony/memo/{input_hex}/**");
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 99,
+            key_expr,
+            payload: vec![],
+        });
+
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 99, .. }));
+        assert!(reply.is_none(), "should not reply when no memos exist");
+    }
+
+    #[test]
+    fn memo_queryable_caps_response_count() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let (mut rt, _) = make_runtime();
+        let input = ContentId::from_bytes([0x11; 32]);
+
+        // Insert MAX_MEMO_RESPONSE_COUNT + 10 memos with different signers
+        for _ in 0..(MAX_MEMO_RESPONSE_COUNT + 10) {
+            let identity = PqPrivateIdentity::generate(&mut OsRng);
+            let output = ContentId::from_bytes([0x22; 32]);
+            let memo = harmony_memo::create::create_memo(
+                input, output, &identity, &mut OsRng, 1000, 2000,
+            )
+            .unwrap();
+            rt.memo_store_mut().insert(memo);
+        }
+
+        let input_hex = hex::encode(input.to_bytes());
+        let key_expr = format!("harmony/memo/{input_hex}/**");
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 50,
+            key_expr,
+            payload: vec![],
+        });
+
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. }));
+        assert!(reply.is_some(), "should reply");
+
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+            assert_eq!(count, MAX_MEMO_RESPONSE_COUNT, "should cap at MAX_MEMO_RESPONSE_COUNT");
+        }
     }
 
     #[test]
