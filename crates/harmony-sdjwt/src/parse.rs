@@ -452,6 +452,21 @@ mod tests {
     }
 
     #[test]
+    fn preserves_signing_input_with_disclosures() {
+        let header = serde_json::json!({"alg": "EdDSA"});
+        let payload = serde_json::json!({"iss": "test"});
+        let jws = build_jws(&header, &payload, b"sig");
+        let disc = build_disclosure(&serde_json::json!(["s1", "name", "Alice"]));
+        let compact = format!("{jws}~{disc}~");
+
+        let expected_si: String = jws.rsplitn(2, '.').last().unwrap().to_string();
+        let sd_jwt = parse(&compact).unwrap();
+        assert_eq!(sd_jwt.signing_input, expected_si);
+        // signing_input must NOT include the tilde segments
+        assert!(!sd_jwt.signing_input.contains('~'));
+    }
+
+    #[test]
     fn error_empty_input() {
         let result = parse("");
         assert!(matches!(result, Err(SdJwtError::EmptyInput)));
