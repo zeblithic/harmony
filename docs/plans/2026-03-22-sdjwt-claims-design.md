@@ -35,9 +35,12 @@ pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<Vec<&Disclosure>, SdJwtError
 ```
 
 For each disclosure in `sd_jwt.disclosures`:
-1. Compute `base64url_no_pad(SHA-256(disclosure.raw))` (or the
-   algorithm specified by `sd_jwt.payload.sd_alg`, defaulting to
-   `sha-256`)
+1. Compute `base64url_no_pad(SHA-256(ASCII_bytes(disclosure.raw)))`
+   where `disclosure.raw` is the base64url-encoded disclosure string
+   as it appeared in the SD-JWT token (the segment between `~`
+   separators, per RFC 9901 §4.2.3). The hash input is the ASCII
+   bytes of this encoded string, NOT the decoded JSON.
+   Uses `sd_jwt.payload.sd_alg` if present, defaulting to `sha-256`.
 2. Check that the resulting digest string appears in `sd_jwt.payload.sd`
 3. If ALL disclosures match: return them
 4. If ANY disclosure does NOT match: return error
@@ -95,15 +98,17 @@ Hash-derived range: `0x8000–0xFFFF`.
 
 ### Salt Conversion
 
-SD-JWT salts are variable-length strings. Harmony's `SaltedClaim`
-requires `[u8; 16]`:
+SD-JWT salts are base64url-encoded random bytes (typically 16 bytes
+encoded as ~22 characters). Harmony's `SaltedClaim` requires
+`[u8; 16]`:
 
-- Take the salt string's UTF-8 bytes (NOT base64-decoded — the raw
-  string bytes are used in SD-JWT digest computation)
+- Base64url-decode the salt string to get raw bytes
 - ≤ 16 bytes: zero-pad
 - \> 16 bytes: truncate to 16
 
-This is lossy. The original salt is preserved in `Disclosure::raw`.
+This is lossy. The original salt string is preserved in
+`Disclosure::salt` (and `Disclosure::raw` contains the full
+base64url-encoded disclosure for digest recomputation).
 
 ### Value
 
@@ -142,3 +147,4 @@ API for this specific operation.
 - Static EUDI PID / OpenID4VP vocabulary dictionary
 - ~150 lines production code, ~200 lines tests
 - No changes to existing types or API
+- `harmony-sdjwt` already in `[workspace.members]` (added by harmony-yfk)
