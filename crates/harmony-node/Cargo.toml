@@ -20,6 +20,7 @@ path = "src/main.rs"
 harmony-athenaeum = { workspace = true, features = ["std"] }
 harmony-compute.workspace = true
 harmony-contacts = { workspace = true, features = ["std"] }
+harmony-credential.workspace = true
 harmony-content = { workspace = true, features = ["std"] }
 harmony-discovery = { workspace = true, features = ["std"] }
 harmony-memo = { workspace = true, features = ["std"] }

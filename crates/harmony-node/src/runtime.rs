@@ -577,6 +577,22 @@ pub struct NodeRuntime<B: BookStore> {
     pending_memo_fetches: HashMap<ContentId, u64>,
 }
 
+/// Adapts the runtime's pubkey_cache to the CredentialKeyResolver trait
+/// for memo signature verification.
+struct PubkeyCacheKeyResolver<'a> {
+    cache: &'a HashMap<[u8; 16], Vec<u8>>,
+}
+
+impl<'a> harmony_credential::CredentialKeyResolver for PubkeyCacheKeyResolver<'a> {
+    fn resolve(
+        &self,
+        issuer: &harmony_identity::IdentityRef,
+        _issued_at: u64,
+    ) -> Option<Vec<u8>> {
+        self.cache.get(&issuer.hash).cloned()
+    }
+}
+
 impl<B: BookStore> NodeRuntime<B> {
     /// Construct a new node runtime, returning startup actions the caller
     /// must execute (queryable declarations, subscriptions).
@@ -836,8 +852,76 @@ impl<B: BookStore> NodeRuntime<B> {
         self.pending_memo_fetches.insert(input, self.tick_count);
     }
 
-    fn handle_memo_fetch_response(&mut self, _key_expr: &str, _payload: &[u8], _unix_now: u64) {
-        // TODO: implement in Task 3
+    /// Handle a memo fetch response: parse, verify, insert into MemoStore.
+    ///
+    /// Each Zenoh reply becomes a separate MemoFetchResponse event.
+    /// Multiple peers may respond — all are processed independently.
+    fn handle_memo_fetch_response(&mut self, key_expr: &str, payload: &[u8], unix_now: u64) {
+        // 1. Parse input_cid from key_expr
+        let input_hex = match key_expr
+            .strip_prefix(harmony_zenoh::namespace::memo::PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            Some(rest) => rest.split('/').next().unwrap_or(""),
+            None => return,
+        };
+
+        let cid_bytes = match hex::decode(input_hex) {
+            Ok(b) if b.len() == 32 => b,
+            _ => return,
+        };
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&cid_bytes);
+        let _input_cid = ContentId::from_bytes(arr);
+
+        // 2. Size guard
+        if payload.len() > MAX_MEMO_RESPONSE_BYTES {
+            return;
+        }
+
+        // 3. Decode response: [u16 LE count][u32 LE len][bytes]...
+        if payload.len() < 2 {
+            return;
+        }
+        let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+        let mut offset = 2;
+
+        let resolver = PubkeyCacheKeyResolver {
+            cache: &self.pubkey_cache,
+        };
+
+        for _ in 0..count {
+            if offset + 4 > payload.len() {
+                break;
+            }
+            let memo_len = u32::from_le_bytes([
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3],
+            ]) as usize;
+            offset += 4;
+
+            if offset + memo_len > payload.len() {
+                break;
+            }
+            let memo_bytes = &payload[offset..offset + memo_len];
+            offset += memo_len;
+
+            // Deserialize
+            let memo = match harmony_memo::deserialize(memo_bytes) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            // Verify
+            if harmony_memo::verify::verify_memo(&memo, unix_now, &resolver).is_err() {
+                continue;
+            }
+
+            // Insert
+            self.memo_store.insert(memo);
+        }
     }
 
     /// Insert a public key into the cache, evicting a random entry if at capacity.
@@ -4433,5 +4517,169 @@ mod tests {
             actions.iter().any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
             "should re-emit query after timeout"
         );
+    }
+
+    // ── Memo fetch response tests ─────────────────────────────────────
+
+    #[test]
+    fn memo_fetch_response_inserts_verified_memos() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let (mut rt, _) = make_runtime();
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let pub_id = identity.public_identity();
+        let input = ContentId::from_bytes([0x11; 32]);
+        let output = ContentId::from_bytes([0x22; 32]);
+
+        // Cache the signer's public key via the production code path
+        let id_ref = harmony_identity::IdentityRef::from(pub_id);
+        rt.push_event(RuntimeEvent::PeerPublicKeyLearned {
+            identity_hash: id_ref.hash,
+            dsa_pubkey: pub_id.verifying_key.as_bytes().to_vec(),
+        });
+
+        // Build a valid response payload
+        let memo = harmony_memo::create::create_memo(
+            input, output, &identity, &mut OsRng, 1000, 2000,
+        )
+        .unwrap();
+        let memo_bytes = harmony_memo::serialize(&memo).unwrap();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+        payload.extend_from_slice(&(memo_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&memo_bytes);
+
+        let input_hex = hex::encode(input.to_bytes());
+        let key_expr = format!("harmony/memo/{input_hex}/**");
+        rt.push_event(RuntimeEvent::MemoFetchResponse {
+            key_expr,
+            payload,
+            unix_now: 1500,
+        });
+        rt.tick();
+
+        // Memo should now be in the store
+        let stored = rt.memo_store().get_by_input(&input);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].output, output);
+    }
+
+    #[test]
+    fn memo_fetch_response_rejects_invalid_memos() {
+        let (mut rt, _) = make_runtime();
+        let input = ContentId::from_bytes([0x11; 32]);
+
+        // Build a payload with garbage memo bytes
+        let garbage = vec![0xFF; 100];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+        payload.extend_from_slice(&(garbage.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&garbage);
+
+        let input_hex = hex::encode(input.to_bytes());
+        let key_expr = format!("harmony/memo/{input_hex}/**");
+        rt.push_event(RuntimeEvent::MemoFetchResponse {
+            key_expr,
+            payload,
+            unix_now: 1500,
+        });
+        rt.tick();
+
+        // No memo should be stored
+        assert!(rt.memo_store().get_by_input(&input).is_empty());
+    }
+
+    #[test]
+    fn memo_fetch_response_oversized_rejected() {
+        let (mut rt, _) = make_runtime();
+        let input = ContentId::from_bytes([0x11; 32]);
+
+        // Build a payload that exceeds MAX_MEMO_RESPONSE_BYTES
+        let payload = vec![0u8; MAX_MEMO_RESPONSE_BYTES + 1];
+
+        let input_hex = hex::encode(input.to_bytes());
+        let key_expr = format!("harmony/memo/{input_hex}/**");
+        rt.push_event(RuntimeEvent::MemoFetchResponse {
+            key_expr,
+            payload,
+            unix_now: 1500,
+        });
+        rt.tick();
+
+        assert!(rt.memo_store().get_by_input(&input).is_empty());
+    }
+
+    #[test]
+    fn memo_fetch_multiple_responses_all_inserted() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let (mut rt, _) = make_runtime();
+        let input = ContentId::from_bytes([0x11; 32]);
+
+        // Two different signers
+        let alice = PqPrivateIdentity::generate(&mut OsRng);
+        let bob = PqPrivateIdentity::generate(&mut OsRng);
+
+        let alice_pub = alice.public_identity();
+        let bob_pub = bob.public_identity();
+
+        // Cache both public keys via the production code path
+        let alice_ref = harmony_identity::IdentityRef::from(alice_pub);
+        rt.push_event(RuntimeEvent::PeerPublicKeyLearned {
+            identity_hash: alice_ref.hash,
+            dsa_pubkey: alice_pub.verifying_key.as_bytes().to_vec(),
+        });
+        let bob_ref = harmony_identity::IdentityRef::from(bob_pub);
+        rt.push_event(RuntimeEvent::PeerPublicKeyLearned {
+            identity_hash: bob_ref.hash,
+            dsa_pubkey: bob_pub.verifying_key.as_bytes().to_vec(),
+        });
+
+        let output = ContentId::from_bytes([0x22; 32]);
+        let input_hex = hex::encode(input.to_bytes());
+        let key_expr = format!("harmony/memo/{input_hex}/**");
+
+        // First response: Alice's memo
+        let memo_alice = harmony_memo::create::create_memo(
+            input, output, &alice, &mut OsRng, 1000, 2000,
+        )
+        .unwrap();
+        let alice_bytes = harmony_memo::serialize(&memo_alice).unwrap();
+        let mut payload1 = Vec::new();
+        payload1.extend_from_slice(&1u16.to_le_bytes());
+        payload1.extend_from_slice(&(alice_bytes.len() as u32).to_le_bytes());
+        payload1.extend_from_slice(&alice_bytes);
+
+        rt.push_event(RuntimeEvent::MemoFetchResponse {
+            key_expr: key_expr.clone(),
+            payload: payload1,
+            unix_now: 1500,
+        });
+        rt.tick();
+
+        // Second response: Bob's memo
+        let memo_bob = harmony_memo::create::create_memo(
+            input, output, &bob, &mut OsRng, 1000, 2000,
+        )
+        .unwrap();
+        let bob_bytes = harmony_memo::serialize(&memo_bob).unwrap();
+        let mut payload2 = Vec::new();
+        payload2.extend_from_slice(&1u16.to_le_bytes());
+        payload2.extend_from_slice(&(bob_bytes.len() as u32).to_le_bytes());
+        payload2.extend_from_slice(&bob_bytes);
+
+        rt.push_event(RuntimeEvent::MemoFetchResponse {
+            key_expr,
+            payload: payload2,
+            unix_now: 1500,
+        });
+        rt.tick();
+
+        // Both memos should be in the store
+        let stored = rt.memo_store().get_by_input(&input);
+        assert_eq!(stored.len(), 2, "both Alice's and Bob's memos should be stored");
     }
 }
