@@ -169,7 +169,12 @@ pub fn verify_key_binding(
     }
 
     // 10. Check exp if present (RFC 7519 §4.1.4).
-    if let Some(exp) = payload_json.get("exp").and_then(|v| v.as_u64()) {
+    if let Some(exp_val) = payload_json.get("exp") {
+        let exp = exp_val.as_u64().ok_or_else(|| {
+            SdJwtError::KeyBindingInvalid(String::from(
+                "KB-JWT exp claim is not a valid non-negative integer",
+            ))
+        })?;
         if now >= exp {
             return Err(SdJwtError::KeyBindingInvalid(format!(
                 "KB-JWT has expired: exp={exp}, now={now}"
