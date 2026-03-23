@@ -1535,7 +1535,9 @@ impl<B: BookStore> NodeRuntime<B> {
             .iter()
             .any(|(_, c)| c.replication.is_some() && c.peering.enabled);
 
-        if !has_replication_peers {}
+        if !has_replication_peers {
+            return;
+        }
 
         // TODO: When BookStore gains an iter() method, iterate local
         // encrypted-durable books and emit ReplicaPush for each peer
@@ -2287,6 +2289,15 @@ impl<B: BookStore> NodeRuntime<B> {
             }];
         }
 
+        // Check issuer matches our identity (token was issued by us).
+        // Cheap byte comparison before expensive signature verification.
+        if token.issuer != local_hash {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
         // Verify ML-DSA signature with LOCAL key (we issued this token)
         let pubkey =
             match harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(&self.local_dsa_pubkey) {
@@ -2299,14 +2310,6 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
             };
         if token.verify_signature(&pubkey).is_err() {
-            return vec![RuntimeAction::SendReply {
-                query_id,
-                payload: public_bytes.clone(),
-            }];
-        }
-
-        // Check issuer matches our identity (token was issued by us)
-        if token.issuer != local_hash {
             return vec![RuntimeAction::SendReply {
                 query_id,
                 payload: public_bytes.clone(),
