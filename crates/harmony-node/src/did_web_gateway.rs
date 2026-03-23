@@ -16,12 +16,23 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
+/// Maximum DID Document response size (1 MiB). DID Documents are small JSON
+/// files; anything larger is malicious or misconfigured.
+const MAX_DOC_BYTES: u64 = 1 << 20;
+
+/// Maximum number of cached DID Documents. When exceeded, all expired entries
+/// are pruned; if still over capacity, the entire cache is cleared.
+const MAX_CACHE_ENTRIES: usize = 1_000;
+
 /// Run the did:web gateway loop.
 pub async fn run(
     queryable: zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<zenoh::query::Query>>,
     cache_ttl_secs: u64,
 ) {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
     let ttl = Duration::from_secs(cache_ttl_secs);
     let mut cache: HashMap<String, CacheEntry> = HashMap::new();
 
@@ -72,6 +83,11 @@ pub async fn run(
                     reply_empty(&query).await;
                     continue;
                 }
+                if resp.content_length().unwrap_or(0) > MAX_DOC_BYTES {
+                    tracing::warn!(%did, "did:web document too large");
+                    reply_empty(&query).await;
+                    continue;
+                }
                 match resp.bytes().await {
                     Ok(bytes) => match parse_did_document(&did, &bytes) {
                         Ok(doc) => {
@@ -84,6 +100,13 @@ pub async fn run(
                                     expires_at: now + ttl,
                                 },
                             );
+                            if cache.len() > MAX_CACHE_ENTRIES {
+                                cache.retain(|_, e| e.expires_at > now);
+                                if cache.len() > MAX_CACHE_ENTRIES {
+                                    tracing::warn!("did:web cache overflow, clearing");
+                                    cache.clear();
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(%did, err = ?e, "did:web document parse failed");

@@ -56,8 +56,11 @@ pub fn did_web_to_url(did: &str) -> Result<String, DidError> {
 
 /// Decode percent-encoded ASCII sequences (e.g. `%3A` → `:`) in a string.
 ///
-/// Only two-hex-digit sequences following `%` are decoded. A bare `%` not
-/// followed by exactly two hex digits is returned as-is (lenient decoding).
+/// Only single-byte ASCII code points (0x00–0x7F) are decoded. Non-ASCII
+/// decoded bytes (≥ 0x80) are rejected — the W3C did:web spec uses punycode
+/// for internationalized domain names, so multi-byte UTF-8 percent sequences
+/// indicate a malformed DID. A bare `%` not followed by exactly two hex
+/// digits is returned as-is (lenient decoding).
 fn percent_decode(input: &str) -> Result<String, DidError> {
     let mut output = String::with_capacity(input.len());
     let bytes = input.as_bytes();
@@ -69,7 +72,11 @@ fn percent_decode(input: &str) -> Result<String, DidError> {
             let lo = bytes[i + 2];
             if hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit() {
                 let decoded = hex_to_byte(hi, lo);
-                // Only decode single-byte ASCII code points
+                if decoded > 0x7F {
+                    return Err(DidError::MalformedDid(String::from(
+                        "non-ASCII percent-encoded byte in did:web domain (use punycode)",
+                    )));
+                }
                 output.push(decoded as char);
                 i += 3;
                 continue;
@@ -239,6 +246,13 @@ mod tests {
     #[test]
     fn did_web_empty_identifier() {
         assert!(did_web_to_url("did:web:").is_err());
+    }
+
+    #[test]
+    fn did_web_non_ascii_percent_rejected() {
+        // %C3%A9 is UTF-8 for 'é' — did:web domains must use punycode
+        let err = did_web_to_url("did:web:caf%C3%A9.example").unwrap_err();
+        assert!(matches!(err, DidError::MalformedDid(ref msg) if msg.contains("punycode")));
     }
 
     #[cfg(feature = "std")]
