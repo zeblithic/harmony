@@ -332,9 +332,18 @@ fn extract_claims(subject: &Value) -> Result<Vec<SaltedClaim>, ImportError> {
         ImportError::MalformedVc(String::from("credentialSubject must be an object"))
     })?;
 
-    // Harmony format: has a `claims` array
+    // Harmony format: has a `claims` array where elements contain `digest` fields.
+    // Check both the array presence AND that the first element has a `digest` key,
+    // to avoid false positives on external VCs that happen to have a `claims` field
+    // with a different schema.
     if let Some(Value::Array(claims_arr)) = subj_obj.get("claims") {
-        return extract_harmony_claims(claims_arr);
+        let looks_like_harmony = claims_arr
+            .first()
+            .and_then(|item| item.get("digest"))
+            .is_some();
+        if looks_like_harmony {
+            return extract_harmony_claims(claims_arr);
+        }
     }
 
     // External format: arbitrary fields
@@ -357,7 +366,8 @@ fn extract_harmony_claims(claims_arr: &[Value]) -> Result<Vec<SaltedClaim>, Impo
             .and_then(|v| v.as_str())
             .ok_or_else(|| ImportError::MalformedVc(String::from("claim item missing 'digest'")))?;
 
-        let _digest_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        // Validate digest is decodable (even if we don't use it for disclosed claims)
+        let _ = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(digest_b64)
             .map_err(|e| ImportError::EncodingError(alloc::format!("claim digest decode: {e}")))?;
 
@@ -381,22 +391,25 @@ fn extract_harmony_claims(claims_arr: &[Value]) -> Result<Vec<SaltedClaim>, Impo
             IMPORT_SENTINEL_SALT
         };
 
-        // typeId + value (optional)
-        let type_id = obj
-            .get("typeId")
-            .and_then(|v| v.as_u64())
-            .and_then(|n| u16::try_from(n).ok())
-            .unwrap_or(0x8000);
+        // Only include disclosed claims (those with both typeId and value).
+        // Undisclosed claims (digest-only) cannot be reconstructed into
+        // SaltedClaims whose digest() matches the original — including them
+        // would violate the contract that claims correspond to claim_digests.
+        let type_id = match obj.get("typeId").and_then(|v| v.as_u64()) {
+            Some(n) => match u16::try_from(n) {
+                Ok(id) => id,
+                Err(_) => continue, // type_id > 65535, skip
+            },
+            None => continue, // undisclosed claim, skip
+        };
 
-        let value: Vec<u8> = if let Some(val_str) = obj.get("value").and_then(|v| v.as_str()) {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
+        let value: Vec<u8> = match obj.get("value").and_then(|v| v.as_str()) {
+            Some(val_str) => base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(val_str)
                 .map_err(|e| {
                     ImportError::EncodingError(alloc::format!("claim value decode: {e}"))
-                })?
-        } else {
-            // No value: store the digest bytes as the value (opaque)
-            _digest_bytes
+                })?,
+            None => continue, // undisclosed claim, skip
         };
 
         out.push(SaltedClaim {
