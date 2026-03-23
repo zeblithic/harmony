@@ -1893,6 +1893,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-jcs"
+version = "0.1.0"
+dependencies = [
+ "ryu",
+ "serde_json",
+]
+
+[[package]]
 name = "harmony-kel"
 version = "0.1.0"
 dependencies = [
