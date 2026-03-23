@@ -526,7 +526,7 @@ pub async fn run(
                     TunnelBridgeEvent::HandshakeComplete {
                         interface_name,
                         peer_node_id,
-                        peer_dsa_pubkey: _, // TODO(harmony-h6k): store in contact registry
+                        peer_dsa_pubkey,
                         connection_id,
                     } => {
                         // Guard against stale handshake completions: only register the
@@ -542,6 +542,18 @@ pub async fn run(
                             // Used with find_by_tunnel_node_id() to resolve the contact's
                             // canonical identity_hash for quota lookup.
                             tunnel_identities.insert(interface_name.clone(), peer_node_id);
+
+                            // Cache the peer's ML-DSA public key for token verification.
+                            // If the contact isn't registered yet, the pubkey is intentionally
+                            // dropped — it will be cached via the discovery announce path
+                            // (process_discovered_tunnel_hints) when the contact is created.
+                            if let Some(contact) = runtime.contact_store().find_by_tunnel_node_id(&peer_node_id) {
+                                runtime.push_event(RuntimeEvent::PeerPublicKeyLearned {
+                                    identity_hash: contact.identity_hash,
+                                    dsa_pubkey: peer_dsa_pubkey,
+                                });
+                            }
+
                             runtime.push_event(RuntimeEvent::TunnelHandshakeComplete {
                                 interface_name,
                                 peer_node_id,
@@ -583,16 +595,46 @@ pub async fn run(
                             if let Ok(rep_msg) =
                                 harmony_tunnel::replication::ReplicationMessage::decode(&message)
                             {
-                                if rep_msg.op == harmony_tunnel::replication::ReplicationOp::Push {
-                                    // Resolve the contact's canonical identity_hash from
-                                    // the tunnel's node_id via the contact store.
-                                    if let Some(node_id) = tunnel_identities.get(&interface_name) {
-                                        if let Some(contact) = runtime.contact_store().find_by_tunnel_node_id(node_id) {
-                                            runtime.push_event(RuntimeEvent::ReplicaReceived {
-                                                peer_identity: contact.identity_hash,
-                                                cid: rep_msg.cid,
-                                                data: rep_msg.payload,
-                                            });
+                                use harmony_tunnel::replication::ReplicationOp;
+                                // Resolve the contact's canonical identity_hash.
+                                if let Some(node_id) = tunnel_identities.get(&interface_name) {
+                                    if let Some(contact) = runtime.contact_store().find_by_tunnel_node_id(node_id) {
+                                        let peer_id = contact.identity_hash;
+                                        match rep_msg.op {
+                                            ReplicationOp::Push => {
+                                                runtime.push_event(RuntimeEvent::ReplicaPushReceived {
+                                                    peer_identity: peer_id,
+                                                    cid: rep_msg.cid,
+                                                    data: rep_msg.payload,
+                                                });
+                                            }
+                                            ReplicationOp::PullWithToken => {
+                                                // Fail-closed: reject if system clock is broken
+                                                // rather than passing unix_now=0 which bypasses
+                                                // expiry checks in the runtime.
+                                                let unix_now = match std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                {
+                                                    Ok(d) => d.as_secs(),
+                                                    Err(_) => {
+                                                        tracing::warn!("system clock error; rejecting PullWithToken");
+                                                        continue;
+                                                    }
+                                                };
+                                                runtime.push_event(RuntimeEvent::ReplicaPullWithTokenReceived {
+                                                    peer_identity: peer_id,
+                                                    cid: rep_msg.cid,
+                                                    token_bytes: rep_msg.payload,
+                                                    unix_now,
+                                                });
+                                            }
+                                            _ => {
+                                                tracing::trace!(
+                                                    op = ?rep_msg.op,
+                                                    cid = %hex::encode(&rep_msg.cid[..8]),
+                                                    "unhandled replication op — ignored"
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1028,6 +1070,19 @@ async fn dispatch_action(
                 cid = %hex::encode(cid),
                 size = data.len(),
                 "ReplicaPush (stub — tunnel routing not yet wired)"
+            );
+        }
+        RuntimeAction::ReplicaPullResponse {
+            peer_identity,
+            cid,
+            data,
+        } => {
+            // TODO: route to tunnel sender (same pattern as ReplicaPush)
+            tracing::debug!(
+                identity = %hex::encode(peer_identity),
+                cid = %hex::encode(&cid[..8]),
+                size = data.len(),
+                "serving replicated content via token (stub — tunnel routing not yet wired)"
             );
         }
     }

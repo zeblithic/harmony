@@ -75,4 +75,5 @@ This cache is ephemeral (rebuilt on restart from announces). No persistence need
 - **Token issuance CLI** — Alice creates tokens programmatically (future bead for UI)
 - **Token distribution** — out-of-band for v1 (Zenoh queryable for refresh is future work)
 - **Delegation chains** — UCAN `proof` field supports this, but v1 validates root tokens only
-- **Audience verification** — v1 doesn't check `token.audience == carol_identity_hash` because Bob doesn't know Carol's identity from the tunnel connection. The token is a bearer token — possession is proof of authorization.
+
+**Implementation note:** The original design deferred audience verification, treating tokens as pure bearer tokens. During review, audience enforcement was added (step 7: `token.audience == peer_identity`) to prevent token forwarding attacks. The `peer_identity` is resolved from the tunnel connection's contact lookup. Tokens are now audience-scoped, not bearer — issuers must specify the correct audience hash.
