@@ -72,8 +72,23 @@ fn disclosure_digest(raw: &str) -> String {
 /// - **salt**: base64url-decoded from the disclosure salt string, zero-padded
 ///   or truncated to 16 bytes.
 /// - **value**: the `claim_value` bytes from the disclosure.
-pub fn map_claims(_disclosures: &[&Disclosure]) -> Vec<SaltedClaim> {
-    todo!("implement in task 3")
+pub fn map_claims(disclosures: &[&Disclosure]) -> Vec<SaltedClaim> {
+    disclosures
+        .iter()
+        .map(|d| {
+            let type_id = match &d.claim_name {
+                Some(name) => vocabulary_type_id(name),
+                None => 0x0000, // array element
+            };
+            SaltedClaim {
+                claim: Claim {
+                    type_id,
+                    value: d.claim_value.clone(),
+                },
+                salt: decode_salt(&d.salt),
+            }
+        })
+        .collect()
 }
 
 /// Look up a claim name in the static vocabulary.
@@ -230,5 +245,70 @@ mod tests {
         let d = disclosure_from_raw(&raw, "s", Some("name"), r#""val""#);
         let sd_jwt = make_test_sdjwt(vec![digest], vec![d]);
         assert!(verify_disclosures(&sd_jwt).is_ok());
+    }
+
+    // -- map_claims tests ---------------------------------------------------
+
+    #[test]
+    fn map_known_vocabulary_claims() {
+        let d = disclosure_from_raw("raw", "c2FsdA", Some("given_name"), r#""Alice""#);
+        let refs: Vec<&Disclosure> = vec![&d];
+        let claims = map_claims(&refs);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].claim.type_id, 0x0100);
+        assert_eq!(claims[0].claim.value, br#""Alice""#);
+    }
+
+    #[test]
+    fn map_unknown_claim_gets_hash_derived_id() {
+        let d = disclosure_from_raw("raw", "c2FsdA", Some("custom_field"), r#""value""#);
+        let refs: Vec<&Disclosure> = vec![&d];
+        let claims = map_claims(&refs);
+        assert_eq!(claims.len(), 1);
+        // High bit must be set for unknown claims.
+        assert_ne!(claims[0].claim.type_id & 0x8000, 0);
+    }
+
+    #[test]
+    fn map_array_element_gets_zero_type_id() {
+        // Array element disclosures have no claim_name.
+        let d = disclosure_from_raw("raw", "c2FsdA", None, r#""item""#);
+        let refs: Vec<&Disclosure> = vec![&d];
+        let claims = map_claims(&refs);
+        assert_eq!(claims[0].claim.type_id, 0x0000);
+    }
+
+    #[test]
+    fn map_salt_base64_decoded() {
+        // "c2FsdA" is base64url for "salt" = [115, 97, 108, 116]
+        let d = disclosure_from_raw("raw", "c2FsdA", Some("email"), r#""a@b""#);
+        let refs: Vec<&Disclosure> = vec![&d];
+        let claims = map_claims(&refs);
+        let expected: [u8; 16] = [115, 97, 108, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(claims[0].salt, expected);
+    }
+
+    #[test]
+    fn map_salt_truncates_long_salt() {
+        // 24 raw bytes → base64url encodes to 32 chars. After decode we get
+        // 24 bytes back, but only first 16 should be kept.
+        let long_bytes: Vec<u8> = (0u8..24).collect();
+        let salt_str = URL_SAFE_NO_PAD.encode(&long_bytes);
+        let d = disclosure_from_raw("raw", &salt_str, Some("email"), r#""x""#);
+        let refs: Vec<&Disclosure> = vec![&d];
+        let claims = map_claims(&refs);
+        let expected: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        assert_eq!(claims[0].salt, expected);
+    }
+
+    #[test]
+    fn map_hash_derived_deterministic() {
+        // Same unknown name must always produce the same type_id.
+        let d1 = disclosure_from_raw("r1", "s", Some("foo_bar"), r#""a""#);
+        let d2 = disclosure_from_raw("r2", "s", Some("foo_bar"), r#""b""#);
+        let refs: Vec<&Disclosure> = vec![&d1, &d2];
+        let claims = map_claims(&refs);
+        assert_eq!(claims[0].claim.type_id, claims[1].claim.type_id);
+        assert_ne!(claims[0].claim.type_id & 0x8000, 0);
     }
 }
