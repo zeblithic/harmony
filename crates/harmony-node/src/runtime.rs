@@ -868,7 +868,7 @@ impl<B: BookStore> NodeRuntime<B> {
         };
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&cid_bytes);
-        let _input_cid = ContentId::from_bytes(arr);
+        let input_cid = ContentId::from_bytes(arr);
 
         // 2. Size guard
         if payload.len() > MAX_MEMO_RESPONSE_BYTES {
@@ -910,7 +910,12 @@ impl<B: BookStore> NodeRuntime<B> {
                 Err(_) => continue,
             };
 
-            // Verify
+            // Verify input CID matches the requested input
+            if memo.input != input_cid {
+                continue;
+            }
+
+            // Verify credential signature and time bounds
             if harmony_memo::verify::verify_memo(&memo, unix_now, &resolver).is_err() {
                 continue;
             }
@@ -2095,6 +2100,11 @@ impl<B: BookStore> NodeRuntime<B> {
 
         for memo in memos.iter().take(MAX_MEMO_RESPONSE_COUNT) {
             if let Ok(bytes) = harmony_memo::serialize(memo) {
+                let entry_len = 4 + bytes.len();
+                // Stop before exceeding the byte limit (leave room for the 2-byte count header).
+                if 2 + memo_buf.len() + entry_len > MAX_MEMO_RESPONSE_BYTES {
+                    break;
+                }
                 memo_buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 memo_buf.extend_from_slice(&bytes);
                 actual_count += 1;
