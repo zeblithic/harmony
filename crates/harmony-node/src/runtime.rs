@@ -814,8 +814,26 @@ impl<B: BookStore> NodeRuntime<B> {
     /// so 4096 entries ≈ 8 MB — acceptable for long-running nodes.
     const MAX_PUBKEY_CACHE_SIZE: usize = 4096;
 
-    fn handle_memo_fetch_request(&mut self, _input: ContentId) {
-        // TODO: implement in Task 3
+    /// Handle a memo fetch request: check local store, dedup, issue Zenoh query.
+    fn handle_memo_fetch_request(&mut self, input: ContentId) {
+        // 1. Local check — short-circuit if we already have memos
+        if !self.memo_store.get_by_input(&input).is_empty() {
+            return;
+        }
+
+        // 2. Dedup check — skip if already in-flight
+        if self.pending_memo_fetches.contains_key(&input) {
+            return;
+        }
+
+        // 3. Issue Zenoh query
+        let input_hex = hex::encode(input.to_bytes());
+        let key_expr = harmony_zenoh::namespace::memo::input_query(&input_hex);
+        self.pending_direct_actions
+            .push(RuntimeAction::QueryMemo { key_expr });
+
+        // 4. Track in-flight
+        self.pending_memo_fetches.insert(input, self.tick_count);
     }
 
     fn handle_memo_fetch_response(&mut self, _key_expr: &str, _payload: &[u8], _unix_now: u64) {
@@ -1164,6 +1182,10 @@ impl<B: BookStore> NodeRuntime<B> {
 
         // Evict stale peer filters.
         self.peer_filters.evict_stale(self.tick_count);
+
+        // Expire in-flight memo fetches that have timed out.
+        self.pending_memo_fetches
+            .retain(|_, started| self.tick_count.saturating_sub(*started) <= MEMO_FETCH_TIMEOUT_TICKS);
 
         let mut actions = Vec::new();
         // Note: fuel is captured once before any tier executes. When Compute is
@@ -4316,6 +4338,100 @@ mod tests {
             page_publishes.len(),
             1,
             "expected one page filter broadcast"
+        );
+    }
+
+    // ── Memo fetch request tests ──────────────────────────────────────
+
+    #[test]
+    fn memo_fetch_request_local_short_circuit() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let (mut rt, _) = make_runtime();
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let input = ContentId::from_bytes([0x11; 32]);
+        let output = ContentId::from_bytes([0x22; 32]);
+
+        let memo = harmony_memo::create::create_memo(
+            input, output, &identity, &mut OsRng, 1000, 2000,
+        )
+        .unwrap();
+        rt.memo_store_mut().insert(memo);
+
+        // Request memos for an input we already have locally
+        rt.push_event(RuntimeEvent::MemoFetchRequest { input });
+        let actions = rt.tick();
+
+        // Should NOT emit QueryMemo — local data is sufficient
+        assert!(
+            !actions.iter().any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
+            "should not query when memos exist locally"
+        );
+    }
+
+    #[test]
+    fn memo_fetch_request_emits_query() {
+        let (mut rt, _) = make_runtime();
+        let input = ContentId::from_bytes([0x11; 32]);
+
+        rt.push_event(RuntimeEvent::MemoFetchRequest { input });
+        let actions = rt.tick();
+
+        let query = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::QueryMemo { .. }));
+        assert!(query.is_some(), "should emit QueryMemo for unknown input");
+
+        if let Some(RuntimeAction::QueryMemo { key_expr }) = query {
+            let expected = format!("harmony/memo/{}/**", hex::encode(input.to_bytes()));
+            assert_eq!(key_expr, &expected);
+        }
+    }
+
+    #[test]
+    fn memo_fetch_request_dedup() {
+        let (mut rt, _) = make_runtime();
+        let input = ContentId::from_bytes([0x11; 32]);
+
+        // First request → should emit query
+        rt.push_event(RuntimeEvent::MemoFetchRequest { input });
+        let actions1 = rt.tick();
+        assert!(
+            actions1.iter().any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
+            "first request should emit query"
+        );
+
+        // Second request for same input → should NOT emit query (in-flight)
+        rt.push_event(RuntimeEvent::MemoFetchRequest { input });
+        let actions2 = rt.tick();
+        assert!(
+            !actions2.iter().any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
+            "duplicate request should be suppressed"
+        );
+    }
+
+    #[test]
+    fn memo_fetch_timeout_clears_pending() {
+        let (mut rt, _) = make_runtime();
+        let input = ContentId::from_bytes([0x11; 32]);
+
+        // Issue a fetch
+        rt.push_event(RuntimeEvent::MemoFetchRequest { input });
+        rt.tick();
+
+        // Advance past timeout
+        for _ in 0..=MEMO_FETCH_TIMEOUT_TICKS {
+            rt.push_event(RuntimeEvent::TimerTick { now: 0 });
+            rt.tick();
+        }
+
+        // Should be able to re-fetch now
+        rt.push_event(RuntimeEvent::MemoFetchRequest { input });
+        let actions = rt.tick();
+        assert!(
+            actions.iter().any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
+            "should re-emit query after timeout"
         );
     }
 }
