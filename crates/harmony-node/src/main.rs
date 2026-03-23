@@ -1,5 +1,6 @@
 mod compute;
 mod config;
+mod did_web_gateway;
 mod discovery;
 mod event_loop;
 mod identity_file;
@@ -417,6 +418,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 config_file.no_public_ephemeral_announce,
                 false,
             );
+            let did_web_cache_ttl = config_file.did_web_cache_ttl.unwrap_or(300);
 
             // ── Parse config-only sections ───────────────────────────────
             let bootstrap_peers: Vec<std::net::SocketAddr> = config_file
@@ -608,6 +610,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 tunnel_config,
                 bootstrap_peers,
                 tunnel_entries,
+                did_web_cache_ttl,
             )
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
