@@ -22,6 +22,9 @@ pub enum SdJwtError {
     #[cfg(feature = "credential")]
     SaltTooShort,
     SignatureInvalid(harmony_identity::IdentityError),
+    /// Key Binding JWT verification failed.
+    #[cfg(feature = "std")]
+    KeyBindingInvalid(String),
 }
 
 impl core::fmt::Display for SdJwtError {
@@ -49,6 +52,8 @@ impl core::fmt::Display for SdJwtError {
             #[cfg(feature = "credential")]
             Self::SaltTooShort => write!(f, "decoded salt shorter than 16 bytes (RFC 9901 §5.2.1)"),
             Self::SignatureInvalid(e) => write!(f, "signature verification failed: {e}"),
+            #[cfg(feature = "std")]
+            Self::KeyBindingInvalid(msg) => write!(f, "key binding verification failed: {msg}"),
         }
     }
 }
