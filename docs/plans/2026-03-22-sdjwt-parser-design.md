@@ -75,13 +75,13 @@ pub struct JwtPayload {
     pub iat: Option<u64>,
     pub exp: Option<u64>,
     pub nbf: Option<u64>,
-    pub sd_digests: Vec<String>,
+    pub sd: Vec<String>,
     pub sd_alg: Option<String>,
     pub extra: Vec<(String, serde_json::Value)>,
 }
 ```
 
-`sd_digests` contains the **top-level** `_sd` array entries only
+`sd` contains the **top-level** `_sd` array entries only
 (base64url-encoded hash digests). Nested `_sd` arrays within
 sub-objects are captured in `extra` — harmony-b3m can walk them
 if needed. `sd_alg` is the hash algorithm (defaults to `sha-256`

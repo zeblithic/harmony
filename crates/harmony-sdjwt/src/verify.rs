@@ -53,6 +53,12 @@ pub fn verify(
 /// header. It does **not** validate time-based claims (`exp`, `nbf`,
 /// `iat`). Callers MUST separately check that the token is not expired
 /// and is past its not-before time before accepting the disclosed claims.
+///
+/// If the presentation includes a Key Binding JWT
+/// (`sd_jwt.key_binding_jwt.is_some()`), this function does **not**
+/// verify it. Callers MUST separately verify the KB-JWT to confirm
+/// holder binding (required by many EUDI issuance flows).
+/// See harmony-lth for KB-JWT verification.
 pub fn verify_from_header(
     sd_jwt: &SdJwt,
     public_key: &[u8],
@@ -162,5 +168,19 @@ mod tests {
             verify_from_header(&sd_jwt, &identity.verifying_key.to_bytes()),
             Err(SdJwtError::WrongTokenType)
         ));
+    }
+
+    #[test]
+    fn verify_from_header_accepts_application_media_type() {
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let identity = private.public_identity();
+        let header_b64 = B64.encode(r#"{"alg":"EdDSA","typ":"application/sd+jwt"}"#.as_bytes());
+        let payload_b64 = B64.encode(r#"{"iss":"alice"}"#.as_bytes());
+        let signing_input = alloc::format!("{}.{}", header_b64, payload_b64);
+        let sig_b64 = B64.encode(&private.sign(signing_input.as_bytes()));
+        let compact = alloc::format!("{}.{}", signing_input, sig_b64);
+
+        let sd_jwt = crate::parse::parse(&compact).unwrap();
+        assert!(verify_from_header(&sd_jwt, &identity.verifying_key.to_bytes()).is_ok());
     }
 }
