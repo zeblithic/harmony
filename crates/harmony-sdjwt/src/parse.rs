@@ -242,16 +242,12 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
             continue;
         }
 
-        // KB-JWT detection: disclosures are base64url strings (no dots),
-        // while a KB-JWT is a compact JWS (header.payload.signature).
-        // RFC 9901 §11.6: KB-JWT must be the final non-empty segment.
-        // Reject any segment after the KB-JWT has been seen.
+        // RFC 9901 §11.6: KB-JWT is a compact JWS (contains '.') and MUST be
+        // the final non-empty segment. Reject any segment after it has been seen.
         if key_binding_jwt.is_some() {
             return Err(SdJwtError::MalformedCompact);
         }
 
-        // KB-JWT detection: disclosures are base64url (no dots),
-        // KB-JWT is a compact JWS (header.payload.signature).
         if segment.contains('.') {
             key_binding_jwt = Some((*segment).to_string());
             continue;
