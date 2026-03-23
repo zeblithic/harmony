@@ -160,7 +160,7 @@ fn format_es6_double(f: f64, buf: &mut Vec<u8>) {
 /// - `"1.5e20"` → `("15", 21)`
 fn parse_ryu_output(s: &str) -> (String, i32) {
     // Split on 'e' / 'E' to get mantissa and optional exponent.
-    let (mantissa, exp_part) = if let Some(pos) = s.find(|c: char| c == 'e' || c == 'E') {
+    let (mantissa, exp_part) = if let Some(pos) = s.find(['e', 'E']) {
         (&s[..pos], s[pos + 1..].parse::<i32>().unwrap())
     } else {
         (s, 0)
@@ -368,10 +368,7 @@ mod tests {
         });
         let result = String::from_utf8(canonicalize(&val)).unwrap();
         // UTF-16 order: "" (empty) < "\r" (000D) < "1" (0031)
-        assert_eq!(
-            result,
-            r#"{"":"Empty","\r":"Carriage Return","1":"One"}"#
-        );
+        assert_eq!(result, r#"{"":"Empty","\r":"Carriage Return","1":"One"}"#);
     }
 
     /// Verify Unicode key ordering above BMP
@@ -386,7 +383,10 @@ mod tests {
         // UTF-16 order: U+00F6 (00F6) < U+20AC (20AC)
         let f6_pos = result.find('\u{00f6}').unwrap();
         let euro_pos = result.find('\u{20ac}').unwrap();
-        assert!(f6_pos < euro_pos, "U+00F6 should sort before U+20AC in UTF-16");
+        assert!(
+            f6_pos < euro_pos,
+            "U+00F6 should sort before U+20AC in UTF-16"
+        );
     }
 
     /// Batch number vector tests from RFC 8785 Appendix B
@@ -437,9 +437,8 @@ mod tests {
     /// Deeply nested structure
     #[test]
     fn deeply_nested() {
-        let val: serde_json::Value = serde_json::from_str(
-            r#"{"a":{"b":{"c":{"d":"deep"}}}}"#
-        ).unwrap();
+        let val: serde_json::Value =
+            serde_json::from_str(r#"{"a":{"b":{"c":{"d":"deep"}}}}"#).unwrap();
         assert_eq!(
             canonicalize(&val),
             b"{\"a\":{\"b\":{\"c\":{\"d\":\"deep\"}}}}"
@@ -449,13 +448,9 @@ mod tests {
     /// Mixed types in array
     #[test]
     fn mixed_array() {
-        let val: serde_json::Value = serde_json::from_str(
-            r#"[null, true, false, 42, "hello", {}, []]"#
-        ).unwrap();
-        assert_eq!(
-            canonicalize(&val),
-            b"[null,true,false,42,\"hello\",{},[]]"
-        );
+        let val: serde_json::Value =
+            serde_json::from_str(r#"[null, true, false, 42, "hello", {}, []]"#).unwrap();
+        assert_eq!(canonicalize(&val), b"[null,true,false,42,\"hello\",{},[]]");
     }
 
     /// String with all control characters U+0000 through U+001F
@@ -470,11 +465,11 @@ mod tests {
         let result = String::from_utf8(canonicalize(&val)).unwrap();
 
         // Verify shorthand escapes are used where applicable
-        assert!(result.contains("\\b"));   // U+0008
-        assert!(result.contains("\\t"));   // U+0009
-        assert!(result.contains("\\n"));   // U+000A
-        assert!(result.contains("\\f"));   // U+000C
-        assert!(result.contains("\\r"));   // U+000D
+        assert!(result.contains("\\b")); // U+0008
+        assert!(result.contains("\\t")); // U+0009
+        assert!(result.contains("\\n")); // U+000A
+        assert!(result.contains("\\f")); // U+000C
+        assert!(result.contains("\\r")); // U+000D
 
         // Verify hex escapes for others
         assert!(result.contains("\\u0000")); // U+0000
