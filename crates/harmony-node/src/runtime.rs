@@ -2179,21 +2179,148 @@ impl<B: BookStore> NodeRuntime<B> {
         vec![RuntimeAction::SendReply { query_id, payload }]
     }
 
-    /// Handle an authenticated discover query for routing hints.
+    /// Handle a discover query: validate Discovery UCAN token, respond with
+    /// full or public announce record.
     ///
     /// Key expression: `harmony/discover/{identity_hash_hex}`
-    /// Payload: serialized Discovery UCAN token (or empty for public-only response).
-    ///
-    /// Returns routing hint actions (or empty if query is malformed).
+    /// Payload: serialized PqUcanToken (or empty for public hints)
+    /// Response: serialized AnnounceRecord bytes
     fn handle_discover_query(
         &self,
         query_id: u64,
-        _key_expr: &str,
-        _payload: &[u8],
+        key_expr: &str,
+        payload: &[u8],
     ) -> Vec<RuntimeAction> {
-        // TODO: implement in Task 4
-        let _ = query_id;
-        Vec::new()
+        // 1. Parse identity_hash from key expression
+        let identity_hex = match key_expr
+            .strip_prefix(harmony_zenoh::namespace::discover::PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            Some(hex) => hex.split('/').next().unwrap_or(""),
+            None => return Vec::new(),
+        };
+
+        let id_bytes = match hex::decode(identity_hex) {
+            Ok(b) if b.len() == 16 => b,
+            _ => return Vec::new(),
+        };
+        let mut queried_hash = [0u8; 16];
+        queried_hash.copy_from_slice(&id_bytes);
+
+        // 2. Check if this is our identity
+        let local_hash = self.local_identity_hash;
+        if queried_hash != local_hash {
+            return Vec::new(); // Not our identity — no reply
+        }
+
+        // 3. If no records available, no reply
+        let public_bytes = match &self.local_public_announce {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
+
+        // 4. Empty payload → public hints
+        if payload.is_empty() {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // 5. Parse and validate Discovery UCAN token
+        let full_bytes = match &self.local_full_announce {
+            Some(b) => b,
+            None => {
+                return vec![RuntimeAction::SendReply {
+                    query_id,
+                    payload: public_bytes.clone(),
+                }];
+            }
+        };
+
+        // Size guard
+        const MAX_TOKEN_BYTES: usize = 8 * 1024;
+        if payload.len() > MAX_TOKEN_BYTES {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        let token = match harmony_identity::PqUcanToken::from_bytes(payload) {
+            Ok(t) => t,
+            Err(_) => {
+                return vec![RuntimeAction::SendReply {
+                    query_id,
+                    payload: public_bytes.clone(),
+                }];
+            }
+        };
+
+        // Check capability
+        if token.capability != harmony_identity::CapabilityType::Discovery {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Check resource matches our identity hash
+        if token.resource.len() != 16 || token.resource[..] != local_hash[..] {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Check expiry
+        if token.expires_at != 0 && self.last_unix_now > token.expires_at {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Check not-before
+        if token.not_before > self.last_unix_now {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Verify ML-DSA signature with LOCAL key (we issued this token)
+        let pubkey = match harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(
+            &self.local_dsa_pubkey,
+        ) {
+            Ok(pk) => pk,
+            Err(_) => {
+                return vec![RuntimeAction::SendReply {
+                    query_id,
+                    payload: public_bytes.clone(),
+                }];
+            }
+        };
+        if token.verify_signature(&pubkey).is_err() {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Check issuer matches our identity (token was issued by us)
+        if token.issuer != local_hash {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // All checks passed — serve full record
+        vec![RuntimeAction::SendReply {
+            query_id,
+            payload: full_bytes.clone(),
+        }]
     }
 
     /// Handle a page query against the page index.
@@ -4779,5 +4906,240 @@ mod tests {
             2,
             "both Alice's and Bob's memos should be stored"
         );
+    }
+
+    #[test]
+    fn discover_query_missing_token_returns_public_hints() {
+        let (mut rt, _) = make_runtime();
+        let public_data = b"public-announce-record".to_vec();
+        let full_data = b"full-announce-record-with-tunnel".to_vec();
+        rt.set_local_public_announce(public_data.clone());
+        rt.set_local_full_announce(full_data.clone());
+
+        let identity_hex = hex::encode(rt.local_identity_hash());
+        let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 42,
+            key_expr,
+            payload: vec![],
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 42, .. }));
+        assert!(reply.is_some(), "should reply with public hints");
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload, &public_data, "should return public record");
+        }
+    }
+
+    #[test]
+    fn discover_query_valid_token_returns_full_hints() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let pub_id = identity.public_identity();
+        let id_ref = harmony_identity::IdentityRef::from(pub_id);
+
+        let mut config = NodeConfig::default();
+        config.local_identity_hash = id_ref.hash;
+        config.local_dsa_pubkey = pub_id.verifying_key.as_bytes();
+        config.node_addr = hex::encode(id_ref.hash);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        let public_data = b"public-only".to_vec();
+        let full_data = b"full-with-tunnel".to_vec();
+        rt.set_local_public_announce(public_data.clone());
+        rt.set_local_full_announce(full_data.clone());
+
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 1500,
+        });
+        rt.tick();
+
+        let peer_hash = [0xBBu8; 16];
+        let token = identity
+            .issue_pq_root_token(
+                &mut OsRng,
+                &peer_hash,
+                harmony_identity::CapabilityType::Discovery,
+                &id_ref.hash,
+                1000,
+                2000,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        let identity_hex = hex::encode(id_ref.hash);
+        let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 43,
+            key_expr,
+            payload: token_bytes,
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 43, .. }));
+        assert!(reply.is_some(), "should reply with full hints");
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload, &full_data, "should return full record");
+        }
+    }
+
+    #[test]
+    fn discover_query_expired_token_returns_public_hints() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let pub_id = identity.public_identity();
+        let id_ref = harmony_identity::IdentityRef::from(pub_id);
+
+        let mut config = NodeConfig::default();
+        config.local_identity_hash = id_ref.hash;
+        config.local_dsa_pubkey = pub_id.verifying_key.as_bytes();
+        config.node_addr = hex::encode(id_ref.hash);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        let public_data = b"public-only".to_vec();
+        rt.set_local_public_announce(public_data.clone());
+        rt.set_local_full_announce(b"full".to_vec());
+
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 3000,
+        });
+        rt.tick();
+
+        let peer_hash = [0xBBu8; 16];
+        let token = identity
+            .issue_pq_root_token(
+                &mut OsRng,
+                &peer_hash,
+                harmony_identity::CapabilityType::Discovery,
+                &id_ref.hash,
+                1000,
+                2000,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        let identity_hex = hex::encode(id_ref.hash);
+        let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 44,
+            key_expr,
+            payload: token_bytes,
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 44, .. }));
+        assert!(reply.is_some());
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload, &public_data, "expired token → public record");
+        }
+    }
+
+    #[test]
+    fn discover_query_wrong_capability_returns_public_hints() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let pub_id = identity.public_identity();
+        let id_ref = harmony_identity::IdentityRef::from(pub_id);
+
+        let mut config = NodeConfig::default();
+        config.local_identity_hash = id_ref.hash;
+        config.local_dsa_pubkey = pub_id.verifying_key.as_bytes();
+        config.node_addr = hex::encode(id_ref.hash);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        let public_data = b"public-only".to_vec();
+        rt.set_local_public_announce(public_data.clone());
+        rt.set_local_full_announce(b"full".to_vec());
+
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 1500,
+        });
+        rt.tick();
+
+        let peer_hash = [0xBBu8; 16];
+        let token = identity
+            .issue_pq_root_token(
+                &mut OsRng,
+                &peer_hash,
+                harmony_identity::CapabilityType::Content, // WRONG
+                &id_ref.hash,
+                1000,
+                2000,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        let identity_hex = hex::encode(id_ref.hash);
+        let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 45,
+            key_expr,
+            payload: token_bytes,
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 45, .. }));
+        assert!(reply.is_some());
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload, &public_data, "wrong capability → public record");
+        }
+    }
+
+    #[test]
+    fn discover_query_wrong_identity_no_reply() {
+        let (mut rt, _) = make_runtime();
+        rt.set_local_public_announce(b"public".to_vec());
+        rt.set_local_full_announce(b"full".to_vec());
+
+        let wrong_hex = hex::encode([0xFFu8; 16]);
+        let key_expr = harmony_zenoh::namespace::discover::key(&wrong_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 46,
+            key_expr,
+            payload: vec![],
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 46, .. }));
+        assert!(reply.is_none(), "should not reply for unknown identity");
+    }
+
+    #[test]
+    fn discover_query_invalid_token_returns_public_hints() {
+        let (mut rt, _) = make_runtime();
+        let public_data = b"public-announce-record".to_vec();
+        rt.set_local_public_announce(public_data.clone());
+        rt.set_local_full_announce(b"full".to_vec());
+
+        let identity_hex = hex::encode(rt.local_identity_hash());
+        let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 47,
+            key_expr,
+            payload: vec![0xFF; 100], // garbage
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 47, .. }));
+        assert!(reply.is_some());
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload, &public_data, "invalid token → public record");
+        }
     }
 }
