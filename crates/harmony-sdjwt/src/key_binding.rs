@@ -30,14 +30,17 @@ use crate::types::SdJwt;
 /// # Verification steps (RFC 9901 §11.6)
 ///
 /// 1. KB-JWT is present
-/// 2. Signature over KB-JWT signing input verifies against `holder_key`
-/// 3. `typ` header is `kb+jwt` (or `application/kb+jwt`)
-/// 4. `nonce` matches `expected_nonce`
-/// 5. `aud` matches `expected_aud` (string or array)
-/// 6. `iat` is not in the future (60s skew) and not too old (`max_age_secs`)
-/// 7. `exp` is not exceeded (if present)
-/// 8. `_sd_alg` is `sha-256` or absent (only SHA-256 supported)
-/// 9. `sd_hash` matches SHA-256 of the SD-JWT without the KB-JWT
+/// 2. Split KB-JWT into header, payload, signature
+/// 3. Decode and parse header JSON
+/// 4. Verify KB-JWT signature against `holder_key` (before claims checks)
+/// 5. `typ` header is `kb+jwt` (or `application/kb+jwt`)
+/// 6. Decode and parse payload JSON
+/// 7. `nonce` matches `expected_nonce`
+/// 8. `aud` matches `expected_aud` (string or array per RFC 7519 §4.1.3)
+/// 9. `iat` is not in the future (60s skew) and not too old (`max_age_secs`)
+/// 10. `exp` is not exceeded (if present)
+/// 11. `_sd_alg` is `sha-256` or absent (only SHA-256 supported)
+/// 12. `sd_hash` matches SHA-256 of the SD-JWT without the KB-JWT
 ///
 /// # Security
 ///
@@ -182,14 +185,14 @@ pub fn verify_key_binding(
         }
     }
 
-    // 10. Check _sd_alg — only sha-256 supported for sd_hash computation.
+    // 11. Check _sd_alg — only sha-256 supported for sd_hash computation.
     if let Some(ref alg) = sd_jwt.payload.sd_alg {
         if alg != "sha-256" {
             return Err(SdJwtError::UnsupportedAlgorithm(alg.clone()));
         }
     }
 
-    // 11. Reconstruct SD-JWT without KB-JWT and verify sd_hash.
+    // 12. Reconstruct SD-JWT without KB-JWT and verify sd_hash.
     let sig_b64 = URL_SAFE_NO_PAD.encode(&sd_jwt.signature);
     let mut sd_jwt_without_kb = format!("{}.{}", sd_jwt.signing_input, sig_b64);
     for disc in &sd_jwt.disclosures {
