@@ -362,8 +362,8 @@ fn extract_harmony_claims(claims_arr: &[Value]) -> Result<Vec<SaltedClaim>, Impo
             ImportError::MalformedVc(String::from("claim array item must be object"))
         })?;
 
-        // digest is required
-        let digest_b64 = obj
+        // digest is required (validates the field exists; value not used for disclosed claims)
+        let _digest_b64 = obj
             .get("digest")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ImportError::MalformedVc(String::from("claim item missing 'digest'")))?;
