@@ -586,6 +586,9 @@ pub struct NodeRuntime<B: BookStore> {
     // Queryable ID for the discover namespace (harmony/discover/**)
     discover_queryable_id: QueryableId,
     // Pre-serialized public announce record (Reticulum-only hints).
+    // Populated when outbound announce publishing is wired (existing TODO).
+    // Until then, the discover queryable returns no reply (harmless — the
+    // feature becomes active once announce building is implemented).
     local_public_announce: Option<Vec<u8>>,
     // Pre-serialized full announce record (all hints including tunnel).
     local_full_announce: Option<Vec<u8>>,
@@ -764,7 +767,10 @@ impl<B: BookStore> NodeRuntime<B> {
             discover_queryable_id: discover_qid,
             local_public_announce: None,
             local_full_announce: None,
-            last_unix_now: 0,
+            last_unix_now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             local_dsa_pubkey: config.local_dsa_pubkey,
         };
 

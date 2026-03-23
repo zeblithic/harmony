@@ -505,7 +505,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
 
             // Extract DSA public key bytes before pq is moved into TunnelConfig or dropped.
             // Used by the discover queryable to verify self-issued Discovery tokens.
-            let local_dsa_pubkey = pq.public_identity().verifying_key.as_bytes().to_vec();
+            let local_dsa_pubkey = pq.public_identity().verifying_key.as_bytes();
 
             // Build tunnel config if --relay-url was provided.
             // The PQ identity is wrapped in Arc because tunnel tasks need
