@@ -204,6 +204,17 @@ pub mod filters {
     pub fn flatpack_key(node_addr: &str) -> String {
         format!("{FLATPACK_PREFIX}/{node_addr}")
     }
+
+    /// Memo filter prefix: `harmony/filters/memo`
+    pub const MEMO_PREFIX: &str = "harmony/filters/memo";
+
+    /// Subscribe to all memo filters: `harmony/filters/memo/**`
+    pub const MEMO_SUB: &str = "harmony/filters/memo/**";
+
+    /// Memo filter key: `harmony/filters/memo/{node_addr}`
+    pub fn memo_key(node_addr: &str) -> String {
+        format!("{MEMO_PREFIX}/{node_addr}")
+    }
 }
 
 /// Flatpack reverse-lookup query key expressions.
@@ -438,6 +449,128 @@ pub mod endorsement {
     /// of the 16-byte `IdentityHash`.
     pub fn key(endorser_hex: &str, endorsee_hex: &str) -> String {
         format!("{PREFIX}/{endorser_hex}/{endorsee_hex}")
+    }
+}
+
+/// Signed memo attestations for deterministic computation results.
+///
+/// Namespace: `harmony/memo/<input_cid_hex>/<output_cid_hex>/sign/<signer_id_hex>`
+///
+/// Each path level encodes the attestation: input (computation recipe),
+/// output (result), signer (who verified). Multiple outputs under the same
+/// input means disagreement — structurally visible in the path topology.
+pub mod memo {
+    use alloc::{format, string::String};
+
+    pub const PREFIX: &str = "harmony/memo";
+    pub const SUB: &str = "harmony/memo/**";
+
+    /// Full attestation key: `harmony/memo/{input}/{output}/sign/{signer}`
+    pub fn sign_key(input_hex: &str, output_hex: &str, signer_hex: &str) -> String {
+        format!("{PREFIX}/{input_hex}/{output_hex}/sign/{signer_hex}")
+    }
+
+    /// All memos for an input: `harmony/memo/{input}/**`
+    pub fn input_query(input_hex: &str) -> String {
+        format!("{PREFIX}/{input_hex}/**")
+    }
+
+    /// All signers for a specific input→output: `harmony/memo/{input}/{output}/sign/**`
+    pub fn output_query(input_hex: &str, output_hex: &str) -> String {
+        format!("{PREFIX}/{input_hex}/{output_hex}/sign/**")
+    }
+
+    /// What does a specific signer say about this input: `harmony/memo/{input}/*/sign/{signer}`
+    ///
+    /// This pattern uses `*` in a non-terminal position, which works for
+    /// Zenoh `session.get()` queries but may not be registerable as a
+    /// subscriber in Zenoh 1.x. For subscription use cases, subscribe to
+    /// `harmony/memo/{input}/**` and filter at the application layer.
+    pub fn signer_query(input_hex: &str, signer_hex: &str) -> String {
+        format!("{PREFIX}/{input_hex}/*/sign/{signer_hex}")
+    }
+}
+
+/// Page-first content addressing namespace.
+///
+/// Path: `harmony/page/<addr_00>/<addr_01>/<addr_10>/<addr_11>/<book_cid>/<page_num>`
+///
+/// Each page has 4 algorithm-variant PageAddr values (32-bit each, 8 hex chars):
+/// - `addr_00`: MSB SHA-256 (mode bits = 00)
+/// - `addr_01`: LSB SHA-256 (mode bits = 01)
+/// - `addr_10`: SHA-224 MSB (mode bits = 10)
+/// - `addr_11`: SHA-224 LSB (mode bits = 11)
+///
+/// The `book_cid` is the 256-bit ContentId of the containing book (64 hex chars).
+/// The `page_num` is the page's position within the book (0-255, decimal).
+///
+/// Coexists with `harmony/book/{cid}/page/{page_addr}` (book-first access in keyspace.rs).
+/// This namespace enables page-first discovery: "who has this page address?"
+///
+/// All addresses are canonical lowercase hex.
+pub mod page {
+    use alloc::{format, string::String};
+
+    pub const PREFIX: &str = "harmony/page";
+    pub const SUB: &str = "harmony/page/**";
+
+    /// Full page key: `harmony/page/{00}/{01}/{10}/{11}/{book_cid}/{page_num}`
+    pub fn page_key(
+        addr_00: &str,
+        addr_01: &str,
+        addr_10: &str,
+        addr_11: &str,
+        book_cid: &str,
+        page_num: u8,
+    ) -> String {
+        format!("{PREFIX}/{addr_00}/{addr_01}/{addr_10}/{addr_11}/{book_cid}/{page_num}")
+    }
+
+    /// Query by mode-00 address only (MSB SHA-256): `harmony/page/{addr}/*/*/*/*/*`
+    pub fn query_by_addr00(addr_00: &str) -> String {
+        format!("{PREFIX}/{addr_00}/*/*/*/*/*")
+    }
+
+    /// Query by mode-00 + mode-01: `harmony/page/{00}/{01}/*/*/*/*`
+    pub fn query_by_addr00_01(addr_00: &str, addr_01: &str) -> String {
+        format!("{PREFIX}/{addr_00}/{addr_01}/*/*/*/*")
+    }
+
+    /// Query by all 4 address variants: `harmony/page/{00}/{01}/{10}/{11}/*/*`
+    pub fn query_by_all_addrs(
+        addr_00: &str,
+        addr_01: &str,
+        addr_10: &str,
+        addr_11: &str,
+    ) -> String {
+        format!("{PREFIX}/{addr_00}/{addr_01}/{addr_10}/{addr_11}/*/*")
+    }
+
+    /// Query by all 4 addresses + book: `harmony/page/{00}/{01}/{10}/{11}/{book_cid}/*`
+    pub fn query_by_all_addrs_and_book(
+        addr_00: &str,
+        addr_01: &str,
+        addr_10: &str,
+        addr_11: &str,
+        book_cid: &str,
+    ) -> String {
+        format!("{PREFIX}/{addr_00}/{addr_01}/{addr_10}/{addr_11}/{book_cid}/*")
+    }
+
+    /// Query all pages of a book: `harmony/page/*/*/*/*/{book_cid}/*`
+    ///
+    /// Uses `*` in non-terminal positions — works for Zenoh `session.get()`
+    /// queries but may not be registerable as a subscriber in Zenoh 1.x.
+    pub fn query_by_book(book_cid: &str) -> String {
+        format!("{PREFIX}/*/*/*/*/{book_cid}/*")
+    }
+
+    /// Query specific page by book + position: `harmony/page/*/*/*/*/{book_cid}/{page_num}`
+    ///
+    /// Uses `*` in non-terminal positions — works for Zenoh `session.get()`
+    /// queries but may not be registerable as a subscriber in Zenoh 1.x.
+    pub fn query_by_book_and_pos(book_cid: &str, page_num: u8) -> String {
+        format!("{PREFIX}/*/*/*/*/{book_cid}/{page_num}")
     }
 }
 
@@ -793,6 +926,128 @@ mod tests {
         );
     }
 
+    // ── Memo ──────────────────────────────────────────────────────
+
+    #[test]
+    fn memo_sign_key() {
+        assert_eq!(
+            memo::sign_key("aabbccdd", "11223344", "deadbeef"),
+            "harmony/memo/aabbccdd/11223344/sign/deadbeef"
+        );
+    }
+
+    #[test]
+    fn memo_input_query() {
+        assert_eq!(
+            memo::input_query("aabbccdd"),
+            "harmony/memo/aabbccdd/**"
+        );
+    }
+
+    #[test]
+    fn memo_output_query() {
+        assert_eq!(
+            memo::output_query("aabbccdd", "11223344"),
+            "harmony/memo/aabbccdd/11223344/sign/**"
+        );
+    }
+
+    #[test]
+    fn memo_signer_query() {
+        assert_eq!(
+            memo::signer_query("aabbccdd", "deadbeef"),
+            "harmony/memo/aabbccdd/*/sign/deadbeef"
+        );
+    }
+
+    #[test]
+    fn memo_subscription_pattern() {
+        assert_eq!(memo::SUB, "harmony/memo/**");
+    }
+
+    #[test]
+    fn filters_memo_key() {
+        assert_eq!(
+            filters::memo_key("node42"),
+            "harmony/filters/memo/node42"
+        );
+    }
+
+    #[test]
+    fn filters_memo_subscription_pattern() {
+        assert_eq!(filters::MEMO_SUB, "harmony/filters/memo/**");
+    }
+
+    // ── Page namespace ──
+
+    #[test]
+    fn page_key_format() {
+        let key = page::page_key("aabb0011", "ccdd2233", "eeff4455", "00116677", &"ff".repeat(32), 42);
+        assert_eq!(key, format!("harmony/page/aabb0011/ccdd2233/eeff4455/00116677/{}/42", "ff".repeat(32)));
+    }
+
+    #[test]
+    fn page_key_page_zero() {
+        let key = page::page_key("00000000", "11111111", "22222222", "33333333", &"aa".repeat(32), 0);
+        assert!(key.ends_with("/0"));
+    }
+
+    #[test]
+    fn page_key_page_255() {
+        let key = page::page_key("00000000", "11111111", "22222222", "33333333", &"aa".repeat(32), 255);
+        assert!(key.ends_with("/255"));
+    }
+
+    #[test]
+    fn page_query_by_addr00() {
+        let q = page::query_by_addr00("aabb0011");
+        assert_eq!(q, "harmony/page/aabb0011/*/*/*/*/*");
+        assert_eq!(q.matches('*').count(), 5);
+    }
+
+    #[test]
+    fn page_query_by_addr00_01() {
+        let q = page::query_by_addr00_01("aabb0011", "ccdd2233");
+        assert_eq!(q, "harmony/page/aabb0011/ccdd2233/*/*/*/*");
+        assert_eq!(q.matches('*').count(), 4);
+    }
+
+    #[test]
+    fn page_query_by_all_addrs() {
+        let q = page::query_by_all_addrs("aabb0011", "ccdd2233", "eeff4455", "00116677");
+        assert_eq!(q, "harmony/page/aabb0011/ccdd2233/eeff4455/00116677/*/*");
+        assert_eq!(q.matches('*').count(), 2);
+    }
+
+    #[test]
+    fn page_query_by_all_addrs_and_book() {
+        let cid = "dd".repeat(32);
+        let q = page::query_by_all_addrs_and_book("aabb0011", "ccdd2233", "eeff4455", "00116677", &cid);
+        assert_eq!(q, format!("harmony/page/aabb0011/ccdd2233/eeff4455/00116677/{cid}/*"));
+        assert_eq!(q.matches('*').count(), 1);
+    }
+
+    #[test]
+    fn page_query_by_book() {
+        let cid = "bb".repeat(32);
+        let q = page::query_by_book(&cid);
+        assert_eq!(q, format!("harmony/page/*/*/*/*/{cid}/*"));
+        assert_eq!(q.matches('*').count(), 5);
+    }
+
+    #[test]
+    fn page_query_by_book_and_pos() {
+        let cid = "cc".repeat(32);
+        let q = page::query_by_book_and_pos(&cid, 100);
+        assert_eq!(q, format!("harmony/page/*/*/*/*/{cid}/100"));
+        assert_eq!(q.matches('*').count(), 4);
+    }
+
+    #[test]
+    fn page_subscription_pattern() {
+        assert_eq!(page::SUB, "harmony/page/**");
+    }
+
     // ── Cross-tier consistency ───────────────────────────────────
 
     #[test]
@@ -811,6 +1066,8 @@ mod tests {
             profile::PREFIX,
             identity::PREFIX,
             endorsement::PREFIX,
+            memo::PREFIX,
+            page::PREFIX,
         ];
         for prefix in prefixes {
             assert!(

@@ -21,6 +21,7 @@ harmony-compute.workspace = true
 harmony-contacts = { workspace = true, features = ["std"] }
 harmony-content = { workspace = true, features = ["std"] }
 harmony-discovery = { workspace = true, features = ["std"] }
+harmony-memo = { workspace = true, features = ["std"] }
 harmony-peers = { workspace = true, features = ["std"] }
 harmony-tunnel = { workspace = true, features = ["std"] }
 iroh = { workspace = true }
