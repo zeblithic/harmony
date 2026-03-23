@@ -2,6 +2,7 @@
 extern crate alloc;
 
 pub mod crypto_suite;
+pub mod did;
 pub mod error;
 pub mod identity;
 pub mod identity_ref;
@@ -10,6 +11,7 @@ pub mod ucan;
 pub mod verify;
 
 pub use crypto_suite::CryptoSuite;
+pub use did::{resolve_did, DefaultDidResolver, DidError, DidResolver, ResolvedDid};
 pub use error::IdentityError;
 pub use identity::{Identity, IdentityHash, PrivateIdentity};
 pub use identity_ref::IdentityRef;

@@ -1861,6 +1861,8 @@ dependencies = [
 name = "harmony-identity"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "bs58",
  "ed25519-dalek",
  "harmony-crypto",
  "harmony-platform",
@@ -1870,6 +1872,7 @@ dependencies = [
  "rand 0.8.5",
  "rand_core 0.6.4",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "x25519-dalek",
  "zeroize",
@@ -2054,9 +2057,12 @@ name = "harmony-sdjwt"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "harmony-credential",
+ "harmony-crypto",
  "harmony-identity",
  "rand 0.8.5",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
