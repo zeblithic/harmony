@@ -215,6 +215,17 @@ pub mod filters {
     pub fn memo_key(node_addr: &str) -> String {
         format!("{MEMO_PREFIX}/{node_addr}")
     }
+
+    /// Page filter prefix: `harmony/filters/page`
+    pub const PAGE_PREFIX: &str = "harmony/filters/page";
+
+    /// Subscribe to all page filters: `harmony/filters/page/**`
+    pub const PAGE_SUB: &str = "harmony/filters/page/**";
+
+    /// Page filter key: `harmony/filters/page/{node_addr}`
+    pub fn page_key(node_addr: &str) -> String {
+        format!("{PAGE_PREFIX}/{node_addr}")
+    }
 }
 
 /// Flatpack reverse-lookup query key expressions.
