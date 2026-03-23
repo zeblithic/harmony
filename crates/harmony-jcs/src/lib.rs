@@ -57,7 +57,15 @@ fn serialize_string(s: &str, buf: &mut Vec<u8>) {
             '"' => buf.extend_from_slice(b"\\\""),
             '\\' => buf.extend_from_slice(b"\\\\"),
             '\x00'..='\x1F' => {
-                buf.extend_from_slice(format!("\\u{:04x}", ch as u32).as_bytes());
+                // Zero-allocation hex escape. Control chars are U+0000–U+001F,
+                // so the upper two hex digits are always '0','0'.
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let b = ch as u8;
+                buf.extend_from_slice(&[
+                    b'\\', b'u', b'0', b'0',
+                    HEX[(b >> 4) as usize],
+                    HEX[(b & 0xF) as usize],
+                ]);
             }
             _ => {
                 let mut tmp = [0u8; 4];
@@ -73,15 +81,26 @@ fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     a.encode_utf16().cmp(b.encode_utf16())
 }
 
+/// Maximum safe integer for IEEE 754 double (2^53 - 1).
+/// Beyond this, i64/u64 values may not round-trip through f64 exactly,
+/// so they must go through the f64 formatting path per RFC 8785 §3.2.2.3.
+const MAX_SAFE_INTEGER: i64 = (1i64 << 53) - 1;
+
 fn serialize_number(n: &serde_json::Number, buf: &mut Vec<u8>) {
-    // Fast path for integers stored as i64 or u64 — no decimal, no exponential.
+    // Fast path for integers within the IEEE 754 safe range.
+    // RFC 8785 requires all numbers to be treated as IEEE 754 doubles.
+    // For integers within ±(2^53 - 1), the i64 representation is exact.
     if let Some(i) = n.as_i64() {
-        buf.extend_from_slice(i.to_string().as_bytes());
-        return;
+        if i.abs() <= MAX_SAFE_INTEGER {
+            buf.extend_from_slice(i.to_string().as_bytes());
+            return;
+        }
     }
     if let Some(u) = n.as_u64() {
-        buf.extend_from_slice(u.to_string().as_bytes());
-        return;
+        if u <= MAX_SAFE_INTEGER as u64 {
+            buf.extend_from_slice(u.to_string().as_bytes());
+            return;
+        }
     }
 
     let f = n.as_f64().expect("serde_json::Number is i64, u64, or f64");
