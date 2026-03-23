@@ -88,6 +88,10 @@ pub(crate) struct VcEnvelope {
     pub proof_obj: Value,
     /// The full VC JSON, minus the proof, for JCS canonicalization.
     pub vc_without_proof: Value,
+    /// Status list index (from credentialStatus.statusListIndex), if present.
+    pub status_list_index: Option<u32>,
+    /// Delegation proof hash (from delegationProof, base64url), if present.
+    pub delegation_proof: Option<[u8; 32]>,
 }
 
 // ─── Public helpers (also exposed for tests) ────────────────────────────────
@@ -128,7 +132,21 @@ pub fn parse_iso8601(s: &str) -> Result<u64, ImportError> {
     let day: u64 = date_parts[2].parse().map_err(|_| err())?;
 
     // Validate ranges
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
+    if !(1..=12).contains(&month) || year < 1970 {
+        return Err(err());
+    }
+
+    // Validate day against actual month length (including leap year)
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if is_leap { 29 } else { 28 }
+        }
+        _ => return Err(err()),
+    };
+    if day < 1 || day > max_day {
         return Err(err());
     }
 
@@ -141,7 +159,7 @@ pub fn parse_iso8601(s: &str) -> Result<u64, ImportError> {
     let minutes: u64 = time_parts[1].parse().map_err(|_| err())?;
     let seconds: u64 = time_parts[2].parse().map_err(|_| err())?;
 
-    if hours > 23 || minutes > 59 || seconds > 60 {
+    if hours > 23 || minutes > 59 || seconds > 59 {
         return Err(err());
     }
 
@@ -237,12 +255,12 @@ fn verify_harmony_proof(
         issuer: *issuer_ref,
         subject: *subject_ref,
         claim_digests: claim_digests.to_vec(),
-        status_list_index: None,
+        status_list_index: env.status_list_index,
         not_before: env.not_before,
         expires_at: env.expires_at,
         issued_at: env.issued_at,
         nonce: env.nonce,
-        proof: None,
+        proof: env.delegation_proof,
         signature: env.proof_value.clone(),
     };
 
@@ -401,7 +419,12 @@ fn extract_external_claims(
             continue;
         }
         let type_id = vocabulary_type_id(key);
-        let value = val.to_string().into_bytes();
+        // For strings, store raw bytes (no JSON quotes) to match native claims.
+        // For other types (numbers, booleans, objects, arrays), use JSON encoding.
+        let value = match val {
+            Value::String(s) => s.as_bytes().to_vec(),
+            _ => val.to_string().into_bytes(),
+        };
         out.push(SaltedClaim {
             claim: crate::claim::Claim { type_id, value },
             salt: IMPORT_SENTINEL_SALT,
@@ -544,6 +567,31 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
         obj.remove("proof");
     }
 
+    // Extract optional status list index (from credentialStatus.statusListIndex)
+    let status_list_index = vc
+        .get("credentialStatus")
+        .and_then(|cs| cs.get("statusListIndex"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u32>().ok());
+
+    // Extract optional delegation proof hash (from delegationProof, base64url)
+    let delegation_proof = vc
+        .get("delegationProof")
+        .and_then(Value::as_str)
+        .and_then(|b64| {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(b64)
+                .ok()?;
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Some(arr)
+            } else {
+                None
+            }
+        });
+
     Ok(VcEnvelope {
         issuer_did,
         subject_did,
@@ -556,6 +604,8 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
         nonce,
         proof_obj: proof_val.clone(),
         vc_without_proof,
+        status_list_index,
+        delegation_proof,
     })
 }
 
@@ -616,12 +666,12 @@ pub fn import_jsonld_vc(
                 issuer: issuer_ref,
                 subject: subject_ref,
                 claim_digests,
-                status_list_index: None,
+                status_list_index: env.status_list_index,
                 not_before: env.not_before,
                 expires_at: env.expires_at,
                 issued_at: env.issued_at,
                 nonce: env.nonce,
-                proof: None,
+                proof: env.delegation_proof,
                 signature: env.proof_value.clone(),
             };
 
