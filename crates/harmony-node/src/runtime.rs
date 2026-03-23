@@ -1002,9 +1002,15 @@ impl<B: BookStore> NodeRuntime<B> {
         &mut self.memo_store
     }
 
-    /// This node's identity hash.
+    /// This node's Ed25519 identity hash (Reticulum-compatible).
     pub fn local_identity_hash(&self) -> [u8; 16] {
         self.local_identity_hash
+    }
+
+    /// This node's PQ identity hash (ML-KEM + ML-DSA derived).
+    /// Used for discover query key expressions and Discovery token validation.
+    pub fn local_pq_identity_hash(&self) -> [u8; 16] {
+        self.local_pq_identity_hash
     }
 
     /// Set the pre-serialized public announce record (Reticulum-only hints).
@@ -2332,6 +2338,12 @@ impl<B: BookStore> NodeRuntime<B> {
                 payload: public_bytes.clone(),
             }];
         }
+
+        // Note: `audience` is intentionally not checked. Zenoh queries carry no
+        // authenticated sender identity, so audience enforcement would require an
+        // extra round-trip. Discovery tokens operate as bearer credentials —
+        // issuers should distribute them only through encrypted channels (e.g.,
+        // tunnel-encrypted messages or out-of-band secure transfer).
 
         // All checks passed — serve full record
         vec![RuntimeAction::SendReply {
@@ -4983,7 +4995,7 @@ mod tests {
         rt.set_local_public_announce(public_data.clone());
         rt.set_local_full_announce(full_data.clone());
 
-        let identity_hex = hex::encode(rt.local_identity_hash());
+        let identity_hex = hex::encode(rt.local_pq_identity_hash());
         let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
         rt.push_event(RuntimeEvent::QueryReceived {
             query_id: 42,
@@ -5196,7 +5208,7 @@ mod tests {
         rt.set_local_public_announce(public_data.clone());
         rt.set_local_full_announce(b"full".to_vec());
 
-        let identity_hex = hex::encode(rt.local_identity_hash());
+        let identity_hex = hex::encode(rt.local_pq_identity_hash());
         let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
         rt.push_event(RuntimeEvent::QueryReceived {
             query_id: 47,
