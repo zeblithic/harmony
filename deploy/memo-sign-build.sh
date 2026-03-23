@@ -27,7 +27,10 @@ EXPIRES_IN="${EXPIRES_IN:-31536000}"
 NIX_FLAGS=(--extra-experimental-features "nix-command flakes")
 
 echo "Building ${PACKAGE}..." >&2
-STORE_PATH=$(nix build ".#${PACKAGE}" --print-out-paths --no-link "${NIX_FLAGS[@]}" | head -1)
+# Capture all output paths first to avoid SIGPIPE under pipefail
+# when head -1 exits early on multi-output packages.
+ALL_PATHS=$(nix build ".#${PACKAGE}" --print-out-paths --no-link "${NIX_FLAGS[@]}")
+STORE_PATH=$(printf '%s\n' "${ALL_PATHS}" | head -1)
 BINARY="${STORE_PATH}/bin/${BINARY_NAME}"
 
 if [ ! -f "${BINARY}" ]; then
