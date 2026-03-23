@@ -13,5 +13,6 @@ std = ["serde_json/std"]
 
 [dependencies]
 serde_json = { workspace = true, default-features = false, features = ["alloc"] }
+ryu = { workspace = true }
 
 [dev-dependencies]

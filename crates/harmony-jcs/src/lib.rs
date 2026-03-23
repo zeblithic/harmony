@@ -74,7 +74,119 @@ fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 fn serialize_number(n: &serde_json::Number, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(n.to_string().as_bytes());
+    // Fast path for integers stored as i64 or u64 — no decimal, no exponential.
+    if let Some(i) = n.as_i64() {
+        buf.extend_from_slice(i.to_string().as_bytes());
+        return;
+    }
+    if let Some(u) = n.as_u64() {
+        buf.extend_from_slice(u.to_string().as_bytes());
+        return;
+    }
+
+    let f = n.as_f64().expect("serde_json::Number is i64, u64, or f64");
+
+    // Negative zero and positive zero both serialize as "0".
+    if f == 0.0 {
+        buf.push(b'0');
+        return;
+    }
+
+    format_es6_double(f, buf);
+}
+
+/// Format an f64 as ES6 `Number.prototype.toString()` (ECMA-262 §7.1.12.1).
+fn format_es6_double(f: f64, buf: &mut Vec<u8>) {
+    let negative = f < 0.0;
+    if negative {
+        buf.push(b'-');
+    }
+
+    let mut ryu_buf = ryu::Buffer::new();
+    let ryu_str = ryu_buf.format_finite(f.abs());
+
+    let (digits, n) = parse_ryu_output(ryu_str);
+    let k = digits.len() as i32;
+
+    if k <= n && n <= 21 {
+        // Integer with trailing zeros: e.g., 100, 100000000000000000000
+        buf.extend_from_slice(digits.as_bytes());
+        for _ in 0..(n - k) {
+            buf.push(b'0');
+        }
+    } else if 0 < n && n <= 21 {
+        // Decimal notation: e.g., 1.5, 123.456
+        buf.extend_from_slice(&digits.as_bytes()[..n as usize]);
+        buf.push(b'.');
+        buf.extend_from_slice(&digits.as_bytes()[n as usize..]);
+    } else if -6 < n && n <= 0 {
+        // Leading zeros: e.g., 0.001, 0.000001
+        buf.extend_from_slice(b"0.");
+        for _ in 0..(-n) {
+            buf.push(b'0');
+        }
+        buf.extend_from_slice(digits.as_bytes());
+    } else if k == 1 {
+        // Single-digit exponential: e.g., 1e+21, 5e-7
+        buf.push(digits.as_bytes()[0]);
+        buf.push(b'e');
+        let e = n - 1;
+        if e > 0 {
+            buf.push(b'+');
+        }
+        buf.extend_from_slice(e.to_string().as_bytes());
+    } else {
+        // Multi-digit exponential: e.g., 1.5e+20
+        buf.push(digits.as_bytes()[0]);
+        buf.push(b'.');
+        buf.extend_from_slice(&digits.as_bytes()[1..]);
+        buf.push(b'e');
+        let e = n - 1;
+        if e > 0 {
+            buf.push(b'+');
+        }
+        buf.extend_from_slice(e.to_string().as_bytes());
+    }
+}
+
+/// Parse a ryu-formatted finite float string into `(significant_digits, n)`.
+///
+/// `n` is the decimal point position such that `value = digits × 10^(n−k)`,
+/// where `k = digits.len()`.  Examples:
+/// - `"1.5"`   → `("15", 1)`
+/// - `"100.0"` → `("1", 3)` (trailing zeros removed)
+/// - `"1e20"`  → `("1", 21)`
+/// - `"1e-7"`  → `("1", -6)`
+/// - `"1.5e20"` → `("15", 21)`
+fn parse_ryu_output(s: &str) -> (String, i32) {
+    // Split on 'e' / 'E' to get mantissa and optional exponent.
+    let (mantissa, exp_part) = if let Some(pos) = s.find(|c: char| c == 'e' || c == 'E') {
+        (&s[..pos], s[pos + 1..].parse::<i32>().unwrap())
+    } else {
+        (s, 0)
+    };
+
+    if let Some(dot_pos) = mantissa.find('.') {
+        // Mantissa has a decimal point, e.g. "1.5" or "100.0".
+        let digits: String = mantissa.chars().filter(|&c| c != '.').collect();
+        // n = number of digits before the decimal + exponent
+        let n = exp_part + dot_pos as i32;
+        let trimmed = digits.trim_end_matches('0');
+        if trimmed.is_empty() {
+            ("0".to_string(), 1)
+        } else {
+            (trimmed.to_string(), n)
+        }
+    } else {
+        // No decimal point, e.g. "1", "100", "1e20".
+        let trimmed = mantissa.trim_end_matches('0');
+        if trimmed.is_empty() {
+            ("0".to_string(), 1)
+        } else {
+            // n = total digits in mantissa + exponent
+            (trimmed.to_string(), exp_part + mantissa.len() as i32)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +273,75 @@ mod tests {
             canonicalize(&val),
             b"{\"a\":[3,1,2],\"z\":{\"a\":1,\"b\":2}}"
         );
+    }
+
+    #[test]
+    fn number_integer() {
+        let val: serde_json::Value = serde_json::from_str("1").unwrap();
+        assert_eq!(canonicalize(&val), b"1");
+    }
+
+    #[test]
+    fn number_negative() {
+        let val: serde_json::Value = serde_json::from_str("-1").unwrap();
+        assert_eq!(canonicalize(&val), b"-1");
+    }
+
+    #[test]
+    fn number_decimal() {
+        let val: serde_json::Value = serde_json::from_str("1.5").unwrap();
+        assert_eq!(canonicalize(&val), b"1.5");
+    }
+
+    #[test]
+    fn number_negative_zero() {
+        let val: serde_json::Value = serde_json::from_str("-0").unwrap();
+        assert_eq!(canonicalize(&val), b"0");
+    }
+
+    #[test]
+    fn number_large_no_exponential() {
+        // 10^20 should NOT use exponential (threshold is 10^21)
+        let val: serde_json::Value = serde_json::from_str("1e20").unwrap();
+        assert_eq!(canonicalize(&val), b"100000000000000000000");
+    }
+
+    #[test]
+    fn number_large_exponential() {
+        // 10^21 SHOULD use exponential
+        let val: serde_json::Value = serde_json::from_str("1e21").unwrap();
+        assert_eq!(canonicalize(&val), b"1e+21");
+    }
+
+    #[test]
+    fn number_small_no_exponential() {
+        let val: serde_json::Value = serde_json::from_str("0.000001").unwrap();
+        assert_eq!(canonicalize(&val), b"0.000001");
+    }
+
+    #[test]
+    fn number_small_exponential() {
+        let val: serde_json::Value = serde_json::from_str("1e-7").unwrap();
+        assert_eq!(canonicalize(&val), b"1e-7");
+    }
+
+    #[test]
+    fn number_float_integer_value() {
+        // A float that is an exact integer should have no decimal point
+        let val: serde_json::Value = serde_json::from_str("1.0").unwrap();
+        assert_eq!(canonicalize(&val), b"1");
+    }
+
+    #[test]
+    fn number_max_safe_integer() {
+        let val: serde_json::Value = serde_json::from_str("9007199254740991").unwrap();
+        assert_eq!(canonicalize(&val), b"9007199254740991");
+    }
+
+    #[test]
+    fn number_pi() {
+        let val: serde_json::Value = serde_json::from_str("3.141592653589793").unwrap();
+        assert_eq!(canonicalize(&val), b"3.141592653589793");
     }
 
     #[test]
