@@ -388,7 +388,7 @@ mod tests {
         assert_eq!(result, r#"{"":"Empty","\r":"Carriage Return","1":"One"}"#);
     }
 
-    /// Verify Unicode key ordering above BMP
+    /// Verify Unicode key ordering for non-ASCII BMP characters
     #[test]
     fn rfc8785_structure_unicode_keys() {
         use serde_json::json;
