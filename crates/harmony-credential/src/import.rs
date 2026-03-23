@@ -272,12 +272,9 @@ fn verify_jcs_proof(
         obj.remove("proofValue");
     }
 
-    let proof_hash = harmony_crypto::hash::full_hash(
-        &harmony_jcs::canonicalize(&proof_options),
-    );
-    let doc_hash = harmony_crypto::hash::full_hash(
-        &harmony_jcs::canonicalize(&env.vc_without_proof),
-    );
+    let proof_hash = harmony_crypto::hash::full_hash(&harmony_jcs::canonicalize(&proof_options));
+    let doc_hash =
+        harmony_crypto::hash::full_hash(&harmony_jcs::canonicalize(&env.vc_without_proof));
 
     let mut verify_bytes = Vec::with_capacity(64);
     verify_bytes.extend_from_slice(&proof_hash);
@@ -313,9 +310,9 @@ fn vocabulary_type_id(name: &str) -> u16 {
 /// - **Harmony format**: `credentialSubject.claims` array with `digest`/`typeId`/`value`/`salt`
 /// - **External format**: arbitrary key-value pairs (skip `id`, `type`, `@context`)
 fn extract_claims(subject: &Value) -> Result<Vec<SaltedClaim>, ImportError> {
-    let subj_obj = subject
-        .as_object()
-        .ok_or_else(|| ImportError::MalformedVc(String::from("credentialSubject must be an object")))?;
+    let subj_obj = subject.as_object().ok_or_else(|| {
+        ImportError::MalformedVc(String::from("credentialSubject must be an object"))
+    })?;
 
     // Harmony format: has a `claims` array
     if let Some(Value::Array(claims_arr)) = subj_obj.get("claims") {
@@ -332,9 +329,9 @@ fn extract_harmony_claims(claims_arr: &[Value]) -> Result<Vec<SaltedClaim>, Impo
 
     let mut out = Vec::with_capacity(claims_arr.len());
     for item in claims_arr {
-        let obj = item
-            .as_object()
-            .ok_or_else(|| ImportError::MalformedVc(String::from("claim array item must be object")))?;
+        let obj = item.as_object().ok_or_else(|| {
+            ImportError::MalformedVc(String::from("claim array item must be object"))
+        })?;
 
         // digest is required
         let digest_b64 = obj
@@ -350,7 +347,9 @@ fn extract_harmony_claims(claims_arr: &[Value]) -> Result<Vec<SaltedClaim>, Impo
         let salt: [u8; 16] = if let Some(salt_str) = obj.get("salt").and_then(|v| v.as_str()) {
             let salt_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(salt_str)
-                .map_err(|e| ImportError::EncodingError(alloc::format!("claim salt decode: {e}")))?;
+                .map_err(|e| {
+                    ImportError::EncodingError(alloc::format!("claim salt decode: {e}"))
+                })?;
             if salt_bytes.len() != 16 {
                 return Err(ImportError::MalformedVc(alloc::format!(
                     "claim salt must be 16 bytes, got {}",
@@ -374,7 +373,9 @@ fn extract_harmony_claims(claims_arr: &[Value]) -> Result<Vec<SaltedClaim>, Impo
         let value: Vec<u8> = if let Some(val_str) = obj.get("value").and_then(|v| v.as_str()) {
             base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(val_str)
-                .map_err(|e| ImportError::EncodingError(alloc::format!("claim value decode: {e}")))?
+                .map_err(|e| {
+                    ImportError::EncodingError(alloc::format!("claim value decode: {e}"))
+                })?
         } else {
             // No value: store the digest bytes as the value (opaque)
             _digest_bytes
@@ -439,9 +440,7 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
         .get("credentialSubject")
         .and_then(|v| v.as_object())
         .ok_or_else(|| {
-            ImportError::MalformedVc(String::from(
-                "missing or invalid 'credentialSubject' field",
-            ))
+            ImportError::MalformedVc(String::from("missing or invalid 'credentialSubject' field"))
         })?;
 
     let subject_did = subject_obj
@@ -487,11 +486,7 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
     let cryptosuite = proof_obj_map
         .get("cryptosuite")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            ImportError::MalformedVc(String::from(
-                "proof missing 'cryptosuite' field",
-            ))
-        })?
+        .ok_or_else(|| ImportError::MalformedVc(String::from("proof missing 'cryptosuite' field")))?
         .to_owned();
 
     let proof_value_str = proof_obj_map
@@ -515,26 +510,21 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
         .get("verificationMethod")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            ImportError::MalformedVc(String::from(
-                "proof missing 'verificationMethod' field",
-            ))
+            ImportError::MalformedVc(String::from("proof missing 'verificationMethod' field"))
         })?
         .to_owned();
 
     let created_str = proof_obj_map
         .get("created")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            ImportError::MalformedVc(String::from("proof missing 'created' field"))
-        })?;
+        .ok_or_else(|| ImportError::MalformedVc(String::from("proof missing 'created' field")))?;
     let issued_at = parse_iso8601(created_str)?;
 
     // Nonce: hex-encoded in Harmony export; all-zeros if absent
     let nonce = match proof_obj_map.get("nonce").and_then(|v| v.as_str()) {
         Some(hex_str) => {
-            let bytes = hex::decode(hex_str).map_err(|e| {
-                ImportError::EncodingError(alloc::format!("nonce hex decode: {e}"))
-            })?;
+            let bytes = hex::decode(hex_str)
+                .map_err(|e| ImportError::EncodingError(alloc::format!("nonce hex decode: {e}")))?;
             if bytes.len() != 16 {
                 return Err(ImportError::MalformedVc(alloc::format!(
                     "nonce must be 16 bytes, got {}",
@@ -607,11 +597,9 @@ pub fn import_jsonld_vc(
         "harmony-eddsa-2022" | "harmony-mldsa65-2025" => {
             // The credentialSubject is present in the full vc_json (and also in
             // vc_without_proof, since credentialSubject is not the proof field).
-            let credential_subject = vc_json
-                .get("credentialSubject")
-                .ok_or_else(|| {
-                    ImportError::MalformedVc(String::from("missing credentialSubject in VC"))
-                })?;
+            let credential_subject = vc_json.get("credentialSubject").ok_or_else(|| {
+                ImportError::MalformedVc(String::from("missing credentialSubject in VC"))
+            })?;
 
             let claim_digests = extract_harmony_digests(credential_subject)?;
             let claims = extract_claims(credential_subject)?;
@@ -648,12 +636,12 @@ pub fn import_jsonld_vc(
             verify_jcs_proof(&env, &issuer_resolved.public_key, issuer_resolved.suite)?;
 
             // Extract claims from credentialSubject
-            let credential_subject = env
-                .vc_without_proof
-                .get("credentialSubject")
-                .ok_or_else(|| {
-                    ImportError::MalformedVc(String::from("missing credentialSubject in VC"))
-                })?;
+            let credential_subject =
+                env.vc_without_proof
+                    .get("credentialSubject")
+                    .ok_or_else(|| {
+                        ImportError::MalformedVc(String::from("missing credentialSubject in VC"))
+                    })?;
             let claims = extract_claims(credential_subject)?;
             let claim_digests = claims.iter().map(|sc| sc.digest()).collect();
 
@@ -724,7 +712,10 @@ mod tests {
             }
         });
         let result = import_jsonld_vc(&vc, &resolver);
-        assert!(matches!(result, Err(ImportError::UnsupportedCryptosuite(_))));
+        assert!(matches!(
+            result,
+            Err(ImportError::UnsupportedCryptosuite(_))
+        ));
     }
 
     #[test]
@@ -1019,12 +1010,9 @@ mod tests {
         });
 
         // JCS Data Integrity signing
-        let proof_hash = harmony_crypto::hash::full_hash(
-            &harmony_jcs::canonicalize(&proof_options),
-        );
-        let doc_hash = harmony_crypto::hash::full_hash(
-            &harmony_jcs::canonicalize(&vc),
-        );
+        let proof_hash =
+            harmony_crypto::hash::full_hash(&harmony_jcs::canonicalize(&proof_options));
+        let doc_hash = harmony_crypto::hash::full_hash(&harmony_jcs::canonicalize(&vc));
         let mut verify_bytes = Vec::with_capacity(64);
         verify_bytes.extend_from_slice(&proof_hash);
         verify_bytes.extend_from_slice(&doc_hash);
@@ -1034,10 +1022,10 @@ mod tests {
 
         // Attach proof
         let mut proof = proof_options.clone();
-        proof.as_object_mut().unwrap().insert(
-            "proofValue".into(),
-            serde_json::Value::String(proof_value),
-        );
+        proof
+            .as_object_mut()
+            .unwrap()
+            .insert("proofValue".into(), serde_json::Value::String(proof_value));
         vc.as_object_mut().unwrap().insert("proof".into(), proof);
 
         // Import
@@ -1071,13 +1059,8 @@ mod tests {
         };
 
         // Build credential with a claim
-        let mut builder = crate::CredentialBuilder::new(
-            issuer_ref,
-            issuer_ref,
-            1000,
-            2000,
-            [0u8; 16],
-        );
+        let mut builder =
+            crate::CredentialBuilder::new(issuer_ref, issuer_ref, 1000, 2000, [0u8; 16]);
         builder.add_claim(0x0100, b"Alice".to_vec(), [1u8; 16]);
 
         let payload = builder.signable_payload();
@@ -1085,8 +1068,7 @@ mod tests {
         let (credential, _claims) = builder.build(signature.to_vec());
 
         // Export to JSON-LD using the Ed25519 verifying key for both issuer and subject.
-        let vc_json =
-            crate::jsonld::credential_to_jsonld(&credential, pubkey, pubkey).unwrap();
+        let vc_json = crate::jsonld::credential_to_jsonld(&credential, pubkey, pubkey).unwrap();
 
         // Import back — resolver decodes the did:key and returns the Ed25519 verifying key.
         let resolver = DefaultDidResolver;
