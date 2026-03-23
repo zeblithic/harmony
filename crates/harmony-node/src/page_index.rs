@@ -48,10 +48,7 @@ impl PageIndex {
                 page_num: i as u8,
                 addrs: *addrs,
             };
-            self.by_addr00
-                .entry(addrs[0])
-                .or_default()
-                .push(entry);
+            self.by_addr00.entry(addrs[0]).or_default().push(entry);
             self.total += 1;
         }
     }
@@ -200,14 +197,12 @@ mod tests {
 
         // Filter by book_a's CID — should only return book_a's page
         let addr_00_a = book_a.data_pages()[0][0];
-        let results =
-            idx.match_query(Some(&addr_00_a), None, None, None, Some(&cid_a), None);
+        let results = idx.match_query(Some(&addr_00_a), None, None, None, Some(&cid_a), None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].book_cid, cid_a);
 
         // Filter by book_b's CID against book_a's address — should return nothing
-        let results =
-            idx.match_query(Some(&addr_00_a), None, None, None, Some(&cid_b), None);
+        let results = idx.match_query(Some(&addr_00_a), None, None, None, Some(&cid_b), None);
         assert!(results.is_empty());
     }
 
@@ -242,13 +237,11 @@ mod tests {
         assert_eq!(results.len(), 2);
 
         // Can disambiguate by book CID.
-        let only_a =
-            idx.match_query(Some(&addr_00), None, None, None, Some(&cid_a), None);
+        let only_a = idx.match_query(Some(&addr_00), None, None, None, Some(&cid_a), None);
         assert_eq!(only_a.len(), 1);
         assert_eq!(only_a[0].book_cid, cid_a);
 
-        let only_b =
-            idx.match_query(Some(&addr_00), None, None, None, Some(&cid_b), None);
+        let only_b = idx.match_query(Some(&addr_00), None, None, None, Some(&cid_b), None);
         assert_eq!(only_b.len(), 1);
         assert_eq!(only_b[0].book_cid, cid_b);
     }
@@ -260,7 +253,8 @@ mod tests {
         assert_eq!(idx.len(), 0);
 
         // Arbitrary address lookup should return empty
-        let dummy = harmony_athenaeum::PageAddr::new(0x0000_0000, harmony_athenaeum::Algorithm::Sha256Msb);
+        let dummy =
+            harmony_athenaeum::PageAddr::new(0x0000_0000, harmony_athenaeum::Algorithm::Sha256Msb);
         assert!(idx.lookup(&dummy).is_empty());
     }
 }

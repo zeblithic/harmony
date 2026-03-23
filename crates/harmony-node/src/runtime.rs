@@ -10,19 +10,19 @@ use std::sync::Arc;
 use harmony_compute::InstructionBudget;
 use harmony_contacts::ContactStore;
 use harmony_content::bloom::BloomFilter;
-use harmony_content::replica::{MemoryReplicaStore, ReplicaStore};
 use harmony_content::book::BookStore;
 use harmony_content::cid::ContentId;
 use harmony_content::cuckoo::CuckooFilter;
+use harmony_content::replica::{MemoryReplicaStore, ReplicaStore};
 use harmony_content::storage_tier::{
     ContentPolicy, FilterBroadcastConfig, StorageBudget, StorageMetrics, StorageTier,
     StorageTierAction, StorageTierEvent,
 };
 use harmony_discovery::DiscoveryManager;
+use harmony_memo::store::MemoStore;
 use harmony_peers::{PeerAction, PeerEvent, PeerManager};
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
-use harmony_memo::store::MemoStore;
 use harmony_zenoh::namespace::content as content_ns;
 use harmony_zenoh::namespace::{announce as announce_ns, page as page_ns};
 use harmony_zenoh::queryable::{QueryableAction, QueryableEvent, QueryableId, QueryableRouter};
@@ -161,7 +161,10 @@ pub enum RuntimeEvent {
     TunnelClosed { interface_name: String },
     /// A discovery announce record was received from the network.
     /// `unix_now` is Unix epoch seconds (NOT monotonic millis_since_start).
-    DiscoveryAnnounceReceived { record_bytes: Vec<u8>, unix_now: u64 },
+    DiscoveryAnnounceReceived {
+        record_bytes: Vec<u8>,
+        unix_now: u64,
+    },
     /// Local tunnel endpoint info became available.
     LocalTunnelInfo {
         node_id: [u8; 32],
@@ -390,12 +393,7 @@ impl PeerFilterTable {
     }
 
     /// Returns true if the peer should be queried for memo input CIDs.
-    fn should_query_memo(
-        &self,
-        peer_addr: &str,
-        input_cid: &ContentId,
-        current_tick: u64,
-    ) -> bool {
+    fn should_query_memo(&self, peer_addr: &str, input_cid: &ContentId, current_tick: u64) -> bool {
         match self.filters.get(peer_addr) {
             None => true,
             Some(pf) => {
@@ -931,7 +929,10 @@ impl<B: BookStore> NodeRuntime<B> {
                 tracing::info!(%interface_name, "tunnel closed — interface unregistered");
                 self.router.unregister_interface(&interface_name);
             }
-            RuntimeEvent::DiscoveryAnnounceReceived { record_bytes, unix_now } => {
+            RuntimeEvent::DiscoveryAnnounceReceived {
+                record_bytes,
+                unix_now,
+            } => {
                 // unix_now is Unix epoch seconds, provided by the caller for
                 // sans-I/O testability. Discovery timestamps (published_at,
                 // expires_at) are Unix epoch seconds.
@@ -1000,7 +1001,11 @@ impl<B: BookStore> NodeRuntime<B> {
             } => {
                 // PeerManager uses seconds; event loop provides milliseconds.
                 let peer_actions = self.peer_manager.on_event(
-                    PeerEvent::TunnelEstablished { identity_hash, node_id, now: now / 1000 },
+                    PeerEvent::TunnelEstablished {
+                        identity_hash,
+                        node_id,
+                        now: now / 1000,
+                    },
                     &self.contact_store,
                 );
                 self.translate_peer_actions(peer_actions);
@@ -1207,13 +1212,11 @@ impl<B: BookStore> NodeRuntime<B> {
                         actions.push(RuntimeAction::Publish { key_expr, payload });
                     }
                     if let Some(payload) = self.pending_memo_broadcast.take() {
-                        let key_expr =
-                            harmony_zenoh::namespace::filters::memo_key(&self.node_addr);
+                        let key_expr = harmony_zenoh::namespace::filters::memo_key(&self.node_addr);
                         actions.push(RuntimeAction::Publish { key_expr, payload });
                     }
                     if let Some(payload) = self.pending_page_broadcast.take() {
-                        let key_expr =
-                            harmony_zenoh::namespace::filters::page_key(&self.node_addr);
+                        let key_expr = harmony_zenoh::namespace::filters::page_key(&self.node_addr);
                         actions.push(RuntimeAction::Publish { key_expr, payload });
                     }
                     if processed > 0 {
@@ -1256,16 +1259,16 @@ impl<B: BookStore> NodeRuntime<B> {
             .unwrap_or(0);
         let disc_actions = self
             .discovery
-            .on_event(harmony_discovery::DiscoveryEvent::Tick {
-                now: disc_unix_now,
-            });
+            .on_event(harmony_discovery::DiscoveryEvent::Tick { now: disc_unix_now });
         self.dispatch_discovery_actions(disc_actions);
 
         // Peer lifecycle tick — process probe timers, connecting timeouts.
         // PeerManager constants are in seconds; the event loop provides
         // milliseconds via millis_since_start(). Convert at the boundary.
         let peer_actions = self.peer_manager.on_event(
-            PeerEvent::Tick { now: self.last_now / 1000 },
+            PeerEvent::Tick {
+                now: self.last_now / 1000,
+            },
             &self.contact_store,
         );
         self.translate_peer_actions_out(peer_actions, &mut actions);
@@ -1361,7 +1364,8 @@ impl<B: BookStore> NodeRuntime<B> {
 
                     // If the announced CID is a depth-0 book, index its pages
                     // and publish page metadata to the page namespace.
-                    if let Some(cid_hex) = key_expr.strip_prefix(announce_ns::PREFIX)
+                    if let Some(cid_hex) = key_expr
+                        .strip_prefix(announce_ns::PREFIX)
                         .and_then(|s| s.strip_prefix('/'))
                     {
                         if let Ok(cid_bytes) = hex::decode(cid_hex) {
@@ -1371,7 +1375,9 @@ impl<B: BookStore> NodeRuntime<B> {
                                     && !self.indexed_book_cids.contains(&cid)
                                 {
                                     if let Some(data) = self.storage.get(&cid) {
-                                        if let Ok(book) = harmony_athenaeum::Book::from_book(cid.to_bytes(), data) {
+                                        if let Ok(book) =
+                                            harmony_athenaeum::Book::from_book(cid.to_bytes(), data)
+                                        {
                                             self.indexed_book_cids.insert(cid);
                                             self.page_index.insert_book(cid, &book);
                                             for (i, addrs) in book.data_pages().iter().enumerate() {
@@ -1381,8 +1387,12 @@ impl<B: BookStore> NodeRuntime<B> {
                                                 let a11 = hex::encode(addrs[3].to_bytes());
                                                 let book_cid_hex = hex::encode(cid.to_bytes());
                                                 let pk = page_ns::page_key(
-                                                    &a00, &a01, &a10, &a11,
-                                                    &book_cid_hex, i as u8,
+                                                    &a00,
+                                                    &a01,
+                                                    &a10,
+                                                    &a11,
+                                                    &book_cid_hex,
+                                                    i as u8,
                                                 );
                                                 out.push(RuntimeAction::Publish {
                                                     key_expr: pk,
@@ -1892,15 +1902,14 @@ impl<B: BookStore> NodeRuntime<B> {
 
         // Parse each segment: "*" → Ok(None) (wildcard), concrete → Ok(Some(val)),
         // malformed → Err (reject entire query).
-        let parse_addr =
-            |s: &str| -> Result<Option<harmony_athenaeum::PageAddr>, ()> {
-                if s == "*" {
-                    return Ok(None);
-                }
-                let bytes = hex::decode(s).map_err(|_| ())?;
-                let arr: [u8; 4] = bytes.try_into().map_err(|_| ())?;
-                Ok(Some(harmony_athenaeum::PageAddr::from_bytes(arr)))
-            };
+        let parse_addr = |s: &str| -> Result<Option<harmony_athenaeum::PageAddr>, ()> {
+            if s == "*" {
+                return Ok(None);
+            }
+            let bytes = hex::decode(s).map_err(|_| ())?;
+            let arr: [u8; 4] = bytes.try_into().map_err(|_| ())?;
+            Ok(Some(harmony_athenaeum::PageAddr::from_bytes(arr)))
+        };
 
         let parse_cid = |s: &str| -> Result<Option<ContentId>, ()> {
             if s == "*" {
@@ -1918,12 +1927,24 @@ impl<B: BookStore> NodeRuntime<B> {
             s.parse::<u8>().map(Some).map_err(|_| ())
         };
 
-        let Ok(addr_00) = parse_addr(segments[0]) else { return Vec::new() };
-        let Ok(addr_01) = parse_addr(segments[1]) else { return Vec::new() };
-        let Ok(addr_10) = parse_addr(segments[2]) else { return Vec::new() };
-        let Ok(addr_11) = parse_addr(segments[3]) else { return Vec::new() };
-        let Ok(book_cid) = parse_cid(segments[4]) else { return Vec::new() };
-        let Ok(page_num) = parse_page_num(segments[5]) else { return Vec::new() };
+        let Ok(addr_00) = parse_addr(segments[0]) else {
+            return Vec::new();
+        };
+        let Ok(addr_01) = parse_addr(segments[1]) else {
+            return Vec::new();
+        };
+        let Ok(addr_10) = parse_addr(segments[2]) else {
+            return Vec::new();
+        };
+        let Ok(addr_11) = parse_addr(segments[3]) else {
+            return Vec::new();
+        };
+        let Ok(book_cid) = parse_cid(segments[4]) else {
+            return Vec::new();
+        };
+        let Ok(page_num) = parse_page_num(segments[5]) else {
+            return Vec::new();
+        };
 
         let matches = self.page_index.match_query(
             addr_00.as_ref(),
@@ -3702,8 +3723,8 @@ mod tests {
                 &requester_hash,
                 harmony_identity::CapabilityType::Content,
                 &cid,
-                0,        // not_before
-                0,        // expires_at (0 = no expiry)
+                0, // not_before
+                0, // expires_at (0 = no expiry)
             )
             .unwrap();
         let token_bytes = token.to_bytes();
@@ -3738,8 +3759,8 @@ mod tests {
                 &requester_hash,
                 harmony_identity::CapabilityType::Content,
                 &cid,
-                0,  // not_before
-                1,  // expires_at = 1 second after epoch (long expired)
+                0, // not_before
+                1, // expires_at = 1 second after epoch (long expired)
             )
             .unwrap();
         let token_bytes = token.to_bytes();
@@ -3826,7 +3847,8 @@ mod tests {
         let token_bytes = token.to_bytes();
 
         // Even though the owner is known and pubkey is cached, no replica for this CID.
-        let result = rt.handle_pull_with_token(requester_hash, missing_cid, &token_bytes, 1_700_000_000);
+        let result =
+            rt.handle_pull_with_token(requester_hash, missing_cid, &token_bytes, 1_700_000_000);
         assert!(result.is_none(), "missing replica should be rejected");
     }
 
@@ -3929,8 +3951,7 @@ mod tests {
             )
             .unwrap();
         let token_bytes = token.to_bytes();
-        let result =
-            rt.handle_pull_with_token(requester_hash, cid, &token_bytes, 1_700_000_000);
+        let result = rt.handle_pull_with_token(requester_hash, cid, &token_bytes, 1_700_000_000);
         assert!(
             result.is_none(),
             "token with future not_before should be rejected"
@@ -3966,7 +3987,8 @@ mod tests {
         let mut table = PeerFilterTable::new(100);
         let mut bf = BloomFilter::new(100, 0.01);
         // hash_bits must fit in 28 bits (≤ 0x0FFF_FFFF)
-        let addr = harmony_athenaeum::PageAddr::new(0x0EADBEE, harmony_athenaeum::Algorithm::Sha256Msb);
+        let addr =
+            harmony_athenaeum::PageAddr::new(0x0EADBEE, harmony_athenaeum::Algorithm::Sha256Msb);
         bf.insert_bytes(&addr.to_bytes());
 
         table.upsert_page("peer-a".to_string(), bf, 10);
@@ -3974,7 +3996,8 @@ mod tests {
         // Should find the inserted address
         assert!(table.should_query_page("peer-a", &addr, 10));
         // Should NOT find a different address
-        let other = harmony_athenaeum::PageAddr::new(0x0AFEBAB, harmony_athenaeum::Algorithm::Sha256Msb);
+        let other =
+            harmony_athenaeum::PageAddr::new(0x0AFEBAB, harmony_athenaeum::Algorithm::Sha256Msb);
         assert!(!table.should_query_page("peer-a", &other, 10));
         // Unknown peer → always query
         assert!(table.should_query_page("peer-b", &addr, 10));
@@ -3985,12 +4008,14 @@ mod tests {
         let mut table = PeerFilterTable::new(100);
         let mut bf = BloomFilter::new(100, 0.01);
         // hash_bits must fit in 28 bits (≤ 0x0FFF_FFFF)
-        let addr = harmony_athenaeum::PageAddr::new(0x0EADBEE, harmony_athenaeum::Algorithm::Sha256Msb);
+        let addr =
+            harmony_athenaeum::PageAddr::new(0x0EADBEE, harmony_athenaeum::Algorithm::Sha256Msb);
         bf.insert_bytes(&addr.to_bytes());
         table.upsert_page("peer-a".to_string(), bf, 10);
 
         // At tick 10 + 101 = 111, the filter is stale → should query even for absent items
-        let absent = harmony_athenaeum::PageAddr::new(0x00000000, harmony_athenaeum::Algorithm::Sha256Msb);
+        let absent =
+            harmony_athenaeum::PageAddr::new(0x00000000, harmony_athenaeum::Algorithm::Sha256Msb);
         assert!(table.should_query_page("peer-a", &absent, 111));
     }
 
@@ -4038,6 +4063,10 @@ mod tests {
                     if key_expr.starts_with("harmony/filters/page/"))
             })
             .collect();
-        assert_eq!(page_publishes.len(), 1, "expected one page filter broadcast");
+        assert_eq!(
+            page_publishes.len(),
+            1,
+            "expected one page filter broadcast"
+        );
     }
 }

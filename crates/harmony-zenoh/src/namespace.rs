@@ -949,10 +949,7 @@ mod tests {
 
     #[test]
     fn memo_input_query() {
-        assert_eq!(
-            memo::input_query("aabbccdd"),
-            "harmony/memo/aabbccdd/**"
-        );
+        assert_eq!(memo::input_query("aabbccdd"), "harmony/memo/aabbccdd/**");
     }
 
     #[test]
@@ -978,10 +975,7 @@ mod tests {
 
     #[test]
     fn filters_memo_key() {
-        assert_eq!(
-            filters::memo_key("node42"),
-            "harmony/filters/memo/node42"
-        );
+        assert_eq!(filters::memo_key("node42"), "harmony/filters/memo/node42");
     }
 
     #[test]
@@ -993,19 +987,46 @@ mod tests {
 
     #[test]
     fn page_key_format() {
-        let key = page::page_key("aabb0011", "ccdd2233", "eeff4455", "00116677", &"ff".repeat(32), 42);
-        assert_eq!(key, format!("harmony/page/aabb0011/ccdd2233/eeff4455/00116677/{}/42", "ff".repeat(32)));
+        let key = page::page_key(
+            "aabb0011",
+            "ccdd2233",
+            "eeff4455",
+            "00116677",
+            &"ff".repeat(32),
+            42,
+        );
+        assert_eq!(
+            key,
+            format!(
+                "harmony/page/aabb0011/ccdd2233/eeff4455/00116677/{}/42",
+                "ff".repeat(32)
+            )
+        );
     }
 
     #[test]
     fn page_key_page_zero() {
-        let key = page::page_key("00000000", "11111111", "22222222", "33333333", &"aa".repeat(32), 0);
+        let key = page::page_key(
+            "00000000",
+            "11111111",
+            "22222222",
+            "33333333",
+            &"aa".repeat(32),
+            0,
+        );
         assert!(key.ends_with("/0"));
     }
 
     #[test]
     fn page_key_page_255() {
-        let key = page::page_key("00000000", "11111111", "22222222", "33333333", &"aa".repeat(32), 255);
+        let key = page::page_key(
+            "00000000",
+            "11111111",
+            "22222222",
+            "33333333",
+            &"aa".repeat(32),
+            255,
+        );
         assert!(key.ends_with("/255"));
     }
 
@@ -1033,8 +1054,12 @@ mod tests {
     #[test]
     fn page_query_by_all_addrs_and_book() {
         let cid = "dd".repeat(32);
-        let q = page::query_by_all_addrs_and_book("aabb0011", "ccdd2233", "eeff4455", "00116677", &cid);
-        assert_eq!(q, format!("harmony/page/aabb0011/ccdd2233/eeff4455/00116677/{cid}/*"));
+        let q =
+            page::query_by_all_addrs_and_book("aabb0011", "ccdd2233", "eeff4455", "00116677", &cid);
+        assert_eq!(
+            q,
+            format!("harmony/page/aabb0011/ccdd2233/eeff4455/00116677/{cid}/*")
+        );
         assert_eq!(q.matches('*').count(), 1);
     }
 
