@@ -118,4 +118,22 @@ mod tests {
     fn unsupported_algorithm() {
         assert!(matches!(alg_to_suite("RS256"), Err(SdJwtError::UnsupportedAlgorithm(_))));
     }
+
+    #[test]
+    fn verify_from_header_rejects_missing_typ() {
+        let private = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let identity = private.public_identity();
+        // Build a JWS with no typ field — valid signature but wrong token type
+        let header_b64 = B64.encode(r#"{"alg":"EdDSA"}"#.as_bytes());
+        let payload_b64 = B64.encode(r#"{"iss":"alice"}"#.as_bytes());
+        let signing_input = alloc::format!("{}.{}", header_b64, payload_b64);
+        let sig_b64 = B64.encode(&private.sign(signing_input.as_bytes()));
+        let compact = alloc::format!("{}.{}", signing_input, sig_b64);
+
+        let sd_jwt = crate::parse::parse(&compact).unwrap();
+        assert!(matches!(
+            verify_from_header(&sd_jwt, &identity.verifying_key.to_bytes()),
+            Err(SdJwtError::WrongTokenType)
+        ));
+    }
 }
