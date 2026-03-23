@@ -92,6 +92,12 @@ enum Commands {
         #[arg(long, value_name = "PEER_SPEC")]
         add_tunnel_peer: Vec<String>,
     },
+    /// Compute ContentId for a file or stdin
+    Cid {
+        /// Path to file (reads stdin if omitted)
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -569,6 +575,39 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
         }
+        Commands::Cid { file } => {
+            use harmony_content::cid::{ContentFlags, ContentId, MAX_PAYLOAD_SIZE};
+
+            let data = match file {
+                Some(path) => std::fs::read(&path)
+                    .map_err(|e| format!("Failed to read {}: {e}", path.display()))?,
+                None => {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    std::io::stdin()
+                        .read_to_end(&mut buf)
+                        .map_err(|e| format!("Failed to read stdin: {e}"))?;
+                    buf
+                }
+            };
+
+            if data.is_empty() {
+                return Err("Empty input — cannot compute CID".into());
+            }
+
+            let cid = if data.len() <= MAX_PAYLOAD_SIZE {
+                ContentId::for_book(&data, ContentFlags::default())
+                    .map_err(|e| format!("CID computation failed: {e}"))?
+            } else {
+                // For large files, hash first then wrap in a Book CID.
+                let digest = harmony_crypto::hash::full_hash(&data);
+                ContentId::for_book(&digest, ContentFlags::default())
+                    .map_err(|e| format!("CID computation failed: {e}"))?
+            };
+
+            println!("{}", hex::encode(cid.to_bytes()));
+            Ok(())
+        }
     }
 }
 
@@ -993,5 +1032,25 @@ mod tests {
     fn cli_parses_memo_verify() {
         let cli = Cli::try_parse_from(["harmony", "memo", "verify", "--input", &"dd".repeat(32)]).unwrap();
         assert!(matches!(cli.command, Commands::Memo { .. }));
+    }
+
+    #[test]
+    fn cli_parses_cid_with_file() {
+        let cli = Cli::try_parse_from(["harmony", "cid", "--file", "/tmp/test.bin"]).unwrap();
+        if let Commands::Cid { file } = cli.command {
+            assert_eq!(file, Some(std::path::PathBuf::from("/tmp/test.bin")));
+        } else {
+            panic!("expected Cid command");
+        }
+    }
+
+    #[test]
+    fn cli_parses_cid_stdin_mode() {
+        let cli = Cli::try_parse_from(["harmony", "cid"]).unwrap();
+        if let Commands::Cid { file } = cli.command {
+            assert!(file.is_none());
+        } else {
+            panic!("expected Cid command");
+        }
     }
 }
