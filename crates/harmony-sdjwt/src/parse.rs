@@ -129,8 +129,9 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
 
     let alg = header_json
         .get("alg")
-        .and_then(|v| v.as_str())
         .ok_or(SdJwtError::MissingAlgorithm)?
+        .as_str()
+        .ok_or(SdJwtError::MalformedCompact)?
         .to_string();
     let typ = header_json
         .get("typ")
