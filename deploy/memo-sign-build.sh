@@ -7,26 +7,28 @@
 #
 # Environment variables:
 #   PACKAGE        — Nix package attribute (default: harmony-node)
+#   BINARY_NAME    — Binary name inside store path (default: harmony)
 #   IDENTITY_FILE  — Path to signing identity (optional; defaults to ~/.harmony/identity.key)
-#   HARMONY        — Path to harmony-node binary (default: harmony-node from PATH)
+#   HARMONY        — Path to harmony binary (default: harmony from PATH)
 #   EXPIRES_IN     — Memo expiry in seconds (default: 31536000 = 365 days)
 #
 # Usage:
 #   ./deploy/memo-sign-build.sh
-#   PACKAGE=iroh-relay-x86_64-linux ./deploy/memo-sign-build.sh
+#   PACKAGE=iroh-relay-x86_64-linux BINARY_NAME=iroh-relay ./deploy/memo-sign-build.sh
 #   IDENTITY_FILE=/path/to/key ./deploy/memo-sign-build.sh
 
 set -euo pipefail
 
 PACKAGE="${PACKAGE:-harmony-node}"
-HARMONY="${HARMONY:-harmony-node}"
+BINARY_NAME="${BINARY_NAME:-harmony}"
+HARMONY="${HARMONY:-harmony}"
 IDENTITY_FILE="${IDENTITY_FILE:-}"
 EXPIRES_IN="${EXPIRES_IN:-31536000}"
 NIX_FLAGS=(--extra-experimental-features "nix-command flakes")
 
 echo "Building ${PACKAGE}..." >&2
-STORE_PATH=$(nix build ".#${PACKAGE}" --print-out-paths --no-link "${NIX_FLAGS[@]}")
-BINARY="${STORE_PATH}/bin/${PACKAGE}"
+STORE_PATH=$(nix build ".#${PACKAGE}" --print-out-paths --no-link "${NIX_FLAGS[@]}" | head -1)
+BINARY="${STORE_PATH}/bin/${BINARY_NAME}"
 
 if [ ! -f "${BINARY}" ]; then
     echo "Error: binary not found at ${BINARY}" >&2
