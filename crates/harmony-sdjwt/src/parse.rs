@@ -145,6 +145,11 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
     let payload_json: serde_json::Value = serde_json::from_slice(&payload_bytes)
         .map_err(|e| SdJwtError::JsonError(e.to_string()))?;
 
+    // RFC 7519 §4: the Claims Set MUST be a JSON object.
+    if !payload_json.is_object() {
+        return Err(SdJwtError::MalformedCompact);
+    }
+
     let iss = payload_json
         .get("iss")
         .and_then(|v| v.as_str())

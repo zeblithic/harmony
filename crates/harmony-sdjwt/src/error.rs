@@ -1,5 +1,6 @@
 use alloc::string::String;
 
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum SdJwtError {
     EmptyInput,
