@@ -335,14 +335,15 @@ fn extract_claims(subject: &Value) -> Result<Vec<SaltedClaim>, ImportError> {
     })?;
 
     // Harmony format: has a `claims` array where elements contain `digest` fields.
-    // Check both the array presence AND that the first element has a `digest` key,
-    // to avoid false positives on external VCs that happen to have a `claims` field
-    // with a different schema.
+    // An empty array is also treated as Harmony format (zero claims, not external).
+    // Non-empty arrays without `digest` on the first element fall through to
+    // the external path.
     if let Some(Value::Array(claims_arr)) = subj_obj.get("claims") {
-        let looks_like_harmony = claims_arr
-            .first()
-            .and_then(|item| item.get("digest"))
-            .is_some();
+        let looks_like_harmony = claims_arr.is_empty()
+            || claims_arr
+                .first()
+                .and_then(|item| item.get("digest"))
+                .is_some();
         if looks_like_harmony {
             return extract_harmony_claims(claims_arr);
         }
@@ -432,7 +433,15 @@ fn extract_external_claims(
     // Other credentialSubject fields carry the meaningful data.
     let skip = ["id", "type", "@context", "claims"];
 
-    for (key, val) in subj_obj {
+    // Sort keys alphabetically for deterministic claim_digests ordering.
+    // serde_json::Map may use BTreeMap (sorted) or IndexMap (insertion order)
+    // depending on the `preserve_order` feature — sorting explicitly removes
+    // this dependency so all nodes produce the same digests for the same VC.
+    let mut keys: Vec<&String> = subj_obj.keys().collect();
+    keys.sort();
+
+    for key in keys {
+        let val = &subj_obj[key];
         if skip.contains(&key.as_str()) {
             continue;
         }
