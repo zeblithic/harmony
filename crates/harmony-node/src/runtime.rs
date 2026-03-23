@@ -10,19 +10,19 @@ use std::sync::Arc;
 use harmony_compute::InstructionBudget;
 use harmony_contacts::ContactStore;
 use harmony_content::bloom::BloomFilter;
-use harmony_content::replica::{MemoryReplicaStore, ReplicaStore};
 use harmony_content::book::BookStore;
 use harmony_content::cid::ContentId;
 use harmony_content::cuckoo::CuckooFilter;
+use harmony_content::replica::{MemoryReplicaStore, ReplicaStore};
 use harmony_content::storage_tier::{
     ContentPolicy, FilterBroadcastConfig, StorageBudget, StorageMetrics, StorageTier,
     StorageTierAction, StorageTierEvent,
 };
 use harmony_discovery::DiscoveryManager;
+use harmony_memo::store::MemoStore;
 use harmony_peers::{PeerAction, PeerEvent, PeerManager};
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
-use harmony_memo::store::MemoStore;
 use harmony_zenoh::namespace::content as content_ns;
 use harmony_zenoh::namespace::{announce as announce_ns, page as page_ns};
 use harmony_zenoh::queryable::{QueryableAction, QueryableEvent, QueryableId, QueryableRouter};
@@ -161,7 +161,10 @@ pub enum RuntimeEvent {
     TunnelClosed { interface_name: String },
     /// A discovery announce record was received from the network.
     /// `unix_now` is Unix epoch seconds (NOT monotonic millis_since_start).
-    DiscoveryAnnounceReceived { record_bytes: Vec<u8>, unix_now: u64 },
+    DiscoveryAnnounceReceived {
+        record_bytes: Vec<u8>,
+        unix_now: u64,
+    },
     /// Local tunnel endpoint info became available.
     LocalTunnelInfo {
         node_id: [u8; 32],
@@ -257,9 +260,11 @@ struct PeerFilter {
     content_filter: Option<BloomFilter>,
     flatpack_filter: Option<CuckooFilter>,
     memo_filter: Option<BloomFilter>,
+    page_filter: Option<BloomFilter>,
     content_received_tick: u64,
     flatpack_received_tick: u64,
     memo_received_tick: u64,
+    page_received_tick: u64,
 }
 
 /// Per-peer Bloom filter table for content query routing.
@@ -292,9 +297,11 @@ impl PeerFilterTable {
             content_filter: None,
             flatpack_filter: None,
             memo_filter: None,
+            page_filter: None,
             content_received_tick: tick,
             flatpack_received_tick: 0,
             memo_received_tick: 0,
+            page_received_tick: 0,
         });
         entry.content_filter = Some(filter);
         entry.content_received_tick = tick;
@@ -305,9 +312,11 @@ impl PeerFilterTable {
             content_filter: None,
             flatpack_filter: None,
             memo_filter: None,
+            page_filter: None,
             content_received_tick: 0,
             flatpack_received_tick: tick,
             memo_received_tick: 0,
+            page_received_tick: 0,
         });
         entry.flatpack_filter = Some(filter);
         entry.flatpack_received_tick = tick;
@@ -318,12 +327,29 @@ impl PeerFilterTable {
             content_filter: None,
             flatpack_filter: None,
             memo_filter: None,
+            page_filter: None,
             content_received_tick: 0,
             flatpack_received_tick: 0,
             memo_received_tick: tick,
+            page_received_tick: 0,
         });
         entry.memo_filter = Some(filter);
         entry.memo_received_tick = tick;
+    }
+
+    fn upsert_page(&mut self, peer_addr: String, filter: BloomFilter, tick: u64) {
+        let entry = self.filters.entry(peer_addr).or_insert(PeerFilter {
+            content_filter: None,
+            flatpack_filter: None,
+            memo_filter: None,
+            page_filter: None,
+            content_received_tick: 0,
+            flatpack_received_tick: 0,
+            memo_received_tick: 0,
+            page_received_tick: tick,
+        });
+        entry.page_filter = Some(filter);
+        entry.page_received_tick = tick;
     }
 
     /// Returns true if the peer should be queried (no filter, stale filter, or filter says "maybe").
@@ -367,12 +393,7 @@ impl PeerFilterTable {
     }
 
     /// Returns true if the peer should be queried for memo input CIDs.
-    fn should_query_memo(
-        &self,
-        peer_addr: &str,
-        input_cid: &ContentId,
-        current_tick: u64,
-    ) -> bool {
+    fn should_query_memo(&self, peer_addr: &str, input_cid: &ContentId, current_tick: u64) -> bool {
         match self.filters.get(peer_addr) {
             None => true,
             Some(pf) => {
@@ -381,6 +402,28 @@ impl PeerFilterTable {
                 } else {
                     match &pf.memo_filter {
                         Some(bf) => bf.may_contain(input_cid),
+                        None => true,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns true if the peer should be queried for page addresses.
+    fn should_query_page(
+        &self,
+        peer_addr: &str,
+        page_addr: &harmony_athenaeum::PageAddr,
+        current_tick: u64,
+    ) -> bool {
+        match self.filters.get(peer_addr) {
+            None => true,
+            Some(pf) => {
+                if current_tick.saturating_sub(pf.page_received_tick) > self.staleness_ticks {
+                    true
+                } else {
+                    match &pf.page_filter {
+                        Some(bf) => bf.may_contain_bytes(&page_addr.to_bytes()),
                         None => true,
                     }
                 }
@@ -397,7 +440,9 @@ impl PeerFilterTable {
                 current_tick.saturating_sub(pf.flatpack_received_tick) <= self.staleness_ticks;
             let memo_fresh =
                 current_tick.saturating_sub(pf.memo_received_tick) <= self.staleness_ticks;
-            content_fresh || flatpack_fresh || memo_fresh
+            let page_fresh =
+                current_tick.saturating_sub(pf.page_received_tick) <= self.staleness_ticks;
+            content_fresh || flatpack_fresh || memo_fresh || page_fresh
         });
     }
 }
@@ -471,6 +516,8 @@ pub struct NodeRuntime<B: BookStore> {
     pending_cuckoo_broadcast: Option<Vec<u8>>,
     // Coalesces memo Bloom filter broadcasts within a single tick.
     pending_memo_broadcast: Option<Vec<u8>>,
+    // Coalesces page Bloom filter broadcasts within a single tick.
+    pending_page_broadcast: Option<Vec<u8>>,
     // Memo attestation store (input CID → signed memos)
     memo_store: MemoStore,
     // Identity discovery manager (sans-I/O)
@@ -592,6 +639,9 @@ impl<B: BookStore> NodeRuntime<B> {
         actions.push(RuntimeAction::Subscribe {
             key_expr: harmony_zenoh::namespace::filters::MEMO_SUB.to_string(),
         });
+        actions.push(RuntimeAction::Subscribe {
+            key_expr: harmony_zenoh::namespace::filters::PAGE_SUB.to_string(),
+        });
 
         let rt = Self {
             router,
@@ -621,6 +671,7 @@ impl<B: BookStore> NodeRuntime<B> {
             pending_filter_broadcast: None,
             pending_cuckoo_broadcast: None,
             pending_memo_broadcast: None,
+            pending_page_broadcast: None,
             memo_store: MemoStore::new(),
             discovery: DiscoveryManager::new(),
             local_tunnel_hint: None,
@@ -694,6 +745,20 @@ impl<B: BookStore> NodeRuntime<B> {
     pub fn should_query_memo_peer(&self, peer_addr: &str, input_cid: &ContentId) -> bool {
         self.peer_filters
             .should_query_memo(peer_addr, input_cid, self.tick_count)
+    }
+
+    /// Check if a peer should be queried for page addresses.
+    ///
+    /// Returns `false` only if the peer's page Bloom filter definitively says
+    /// the page address is absent. Returns `true` for unknown peers, stale
+    /// filters, or filter matches.
+    pub fn should_query_page_peer(
+        &self,
+        peer_addr: &str,
+        page_addr: &harmony_athenaeum::PageAddr,
+    ) -> bool {
+        self.peer_filters
+            .should_query_page(peer_addr, page_addr, self.tick_count)
     }
 
     /// Read-only access to the contact store.
@@ -881,7 +946,10 @@ impl<B: BookStore> NodeRuntime<B> {
                 tracing::info!(%interface_name, "tunnel closed — interface unregistered");
                 self.router.unregister_interface(&interface_name);
             }
-            RuntimeEvent::DiscoveryAnnounceReceived { record_bytes, unix_now } => {
+            RuntimeEvent::DiscoveryAnnounceReceived {
+                record_bytes,
+                unix_now,
+            } => {
                 // unix_now is Unix epoch seconds, provided by the caller for
                 // sans-I/O testability. Discovery timestamps (published_at,
                 // expires_at) are Unix epoch seconds.
@@ -950,7 +1018,11 @@ impl<B: BookStore> NodeRuntime<B> {
             } => {
                 // PeerManager uses seconds; event loop provides milliseconds.
                 let peer_actions = self.peer_manager.on_event(
-                    PeerEvent::TunnelEstablished { identity_hash, node_id, now: now / 1000 },
+                    PeerEvent::TunnelEstablished {
+                        identity_hash,
+                        node_id,
+                        now: now / 1000,
+                    },
                     &self.contact_store,
                 );
                 self.translate_peer_actions(peer_actions);
@@ -1130,6 +1202,18 @@ impl<B: BookStore> NodeRuntime<B> {
                             }
                             self.pending_memo_broadcast = Some(memo_filter.to_bytes());
                         }
+
+                        // Rebuild page Bloom filter from PageIndex mode-00 addresses.
+                        if !self.page_index.is_empty() {
+                            let mut page_filter = BloomFilter::new(
+                                self.filter_broadcast_config.expected_items,
+                                self.filter_broadcast_config.fp_rate,
+                            );
+                            for addr in self.page_index.addr00_iter() {
+                                page_filter.insert_bytes(&addr.to_bytes());
+                            }
+                            self.pending_page_broadcast = Some(page_filter.to_bytes());
+                        }
                     }
 
                     // Flush coalesced filter broadcast — multiple threshold crossings
@@ -1145,8 +1229,11 @@ impl<B: BookStore> NodeRuntime<B> {
                         actions.push(RuntimeAction::Publish { key_expr, payload });
                     }
                     if let Some(payload) = self.pending_memo_broadcast.take() {
-                        let key_expr =
-                            harmony_zenoh::namespace::filters::memo_key(&self.node_addr);
+                        let key_expr = harmony_zenoh::namespace::filters::memo_key(&self.node_addr);
+                        actions.push(RuntimeAction::Publish { key_expr, payload });
+                    }
+                    if let Some(payload) = self.pending_page_broadcast.take() {
+                        let key_expr = harmony_zenoh::namespace::filters::page_key(&self.node_addr);
                         actions.push(RuntimeAction::Publish { key_expr, payload });
                     }
                     if processed > 0 {
@@ -1189,16 +1276,16 @@ impl<B: BookStore> NodeRuntime<B> {
             .unwrap_or(0);
         let disc_actions = self
             .discovery
-            .on_event(harmony_discovery::DiscoveryEvent::Tick {
-                now: disc_unix_now,
-            });
+            .on_event(harmony_discovery::DiscoveryEvent::Tick { now: disc_unix_now });
         self.dispatch_discovery_actions(disc_actions);
 
         // Peer lifecycle tick — process probe timers, connecting timeouts.
         // PeerManager constants are in seconds; the event loop provides
         // milliseconds via millis_since_start(). Convert at the boundary.
         let peer_actions = self.peer_manager.on_event(
-            PeerEvent::Tick { now: self.last_now / 1000 },
+            PeerEvent::Tick {
+                now: self.last_now / 1000,
+            },
             &self.contact_store,
         );
         self.translate_peer_actions_out(peer_actions, &mut actions);
@@ -1294,7 +1381,8 @@ impl<B: BookStore> NodeRuntime<B> {
 
                     // If the announced CID is a depth-0 book, index its pages
                     // and publish page metadata to the page namespace.
-                    if let Some(cid_hex) = key_expr.strip_prefix(announce_ns::PREFIX)
+                    if let Some(cid_hex) = key_expr
+                        .strip_prefix(announce_ns::PREFIX)
                         .and_then(|s| s.strip_prefix('/'))
                     {
                         if let Ok(cid_bytes) = hex::decode(cid_hex) {
@@ -1304,7 +1392,9 @@ impl<B: BookStore> NodeRuntime<B> {
                                     && !self.indexed_book_cids.contains(&cid)
                                 {
                                     if let Some(data) = self.storage.get(&cid) {
-                                        if let Ok(book) = harmony_athenaeum::Book::from_book(cid.to_bytes(), data) {
+                                        if let Ok(book) =
+                                            harmony_athenaeum::Book::from_book(cid.to_bytes(), data)
+                                        {
                                             self.indexed_book_cids.insert(cid);
                                             self.page_index.insert_book(cid, &book);
                                             for (i, addrs) in book.data_pages().iter().enumerate() {
@@ -1314,8 +1404,12 @@ impl<B: BookStore> NodeRuntime<B> {
                                                 let a11 = hex::encode(addrs[3].to_bytes());
                                                 let book_cid_hex = hex::encode(cid.to_bytes());
                                                 let pk = page_ns::page_key(
-                                                    &a00, &a01, &a10, &a11,
-                                                    &book_cid_hex, i as u8,
+                                                    &a00,
+                                                    &a01,
+                                                    &a10,
+                                                    &a11,
+                                                    &book_cid_hex,
+                                                    i as u8,
                                                 );
                                                 out.push(RuntimeAction::Publish {
                                                     key_expr: pk,
@@ -1823,15 +1917,14 @@ impl<B: BookStore> NodeRuntime<B> {
 
         // Parse each segment: "*" → Ok(None) (wildcard), concrete → Ok(Some(val)),
         // malformed → Err (reject entire query).
-        let parse_addr =
-            |s: &str| -> Result<Option<harmony_athenaeum::PageAddr>, ()> {
-                if s == "*" {
-                    return Ok(None);
-                }
-                let bytes = hex::decode(s).map_err(|_| ())?;
-                let arr: [u8; 4] = bytes.try_into().map_err(|_| ())?;
-                Ok(Some(harmony_athenaeum::PageAddr::from_bytes(arr)))
-            };
+        let parse_addr = |s: &str| -> Result<Option<harmony_athenaeum::PageAddr>, ()> {
+            if s == "*" {
+                return Ok(None);
+            }
+            let bytes = hex::decode(s).map_err(|_| ())?;
+            let arr: [u8; 4] = bytes.try_into().map_err(|_| ())?;
+            Ok(Some(harmony_athenaeum::PageAddr::from_bytes(arr)))
+        };
 
         let parse_cid = |s: &str| -> Result<Option<ContentId>, ()> {
             if s == "*" {
@@ -1849,12 +1942,24 @@ impl<B: BookStore> NodeRuntime<B> {
             s.parse::<u8>().map(Some).map_err(|_| ())
         };
 
-        let Ok(addr_00) = parse_addr(segments[0]) else { return Vec::new() };
-        let Ok(addr_01) = parse_addr(segments[1]) else { return Vec::new() };
-        let Ok(addr_10) = parse_addr(segments[2]) else { return Vec::new() };
-        let Ok(addr_11) = parse_addr(segments[3]) else { return Vec::new() };
-        let Ok(book_cid) = parse_cid(segments[4]) else { return Vec::new() };
-        let Ok(page_num) = parse_page_num(segments[5]) else { return Vec::new() };
+        let Ok(addr_00) = parse_addr(segments[0]) else {
+            return Vec::new();
+        };
+        let Ok(addr_01) = parse_addr(segments[1]) else {
+            return Vec::new();
+        };
+        let Ok(addr_10) = parse_addr(segments[2]) else {
+            return Vec::new();
+        };
+        let Ok(addr_11) = parse_addr(segments[3]) else {
+            return Vec::new();
+        };
+        let Ok(book_cid) = parse_cid(segments[4]) else {
+            return Vec::new();
+        };
+        let Ok(page_num) = parse_page_num(segments[5]) else {
+            return Vec::new();
+        };
 
         let matches = self.page_index.match_query(
             addr_00.as_ref(),
@@ -1963,6 +2068,28 @@ impl<B: BookStore> NodeRuntime<B> {
                 match BloomFilter::from_bytes(&payload) {
                     Ok(filter) => {
                         self.peer_filters.upsert_memo(
+                            peer_addr.to_string(),
+                            filter,
+                            self.tick_count,
+                        );
+                    }
+                    Err(_) => {
+                        self.peer_filters.record_parse_error();
+                    }
+                }
+            }
+            return;
+        }
+
+        // Check if this is a page filter broadcast.
+        if let Some(peer_addr) = key_expr
+            .strip_prefix(harmony_zenoh::namespace::filters::PAGE_PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            if peer_addr != self.node_addr {
+                match BloomFilter::from_bytes(&payload) {
+                    Ok(filter) => {
+                        self.peer_filters.upsert_page(
                             peer_addr.to_string(),
                             filter,
                             self.tick_count,
@@ -2147,8 +2274,8 @@ mod tests {
 
         // 16 shard queryables + 1 stats queryable + 1 compute activity queryable + 1 page queryable = 19
         assert_eq!(queryable_count, 19);
-        // transit + publish + content filter + flatpack filter + memo filter subscriptions = 5
-        assert_eq!(subscribe_count, 5);
+        // transit + publish + content filter + flatpack filter + memo filter + page filter subscriptions = 6
+        assert_eq!(subscribe_count, 6);
     }
 
     #[test]
@@ -3017,6 +3144,8 @@ mod tests {
 
         // Tick 2: timer interval also fires (tick 2 >= interval 2).
         // Bloom coalesces (threshold + timer → 1 publish), cuckoo adds 1.
+        // The transit data are Book CIDs that get indexed into page_index,
+        // so the timer also produces 1 page filter broadcast.
         let actions = rt.tick();
         let filter_publishes: Vec<_> = actions
             .iter()
@@ -3027,8 +3156,8 @@ mod tests {
             .collect();
         assert_eq!(
             filter_publishes.len(),
-            2,
-            "expected 2 filter broadcasts (1 coalesced bloom + 1 cuckoo)"
+            3,
+            "expected 3 filter broadcasts (1 coalesced bloom + 1 cuckoo + 1 page)"
         );
     }
 
@@ -3612,8 +3741,8 @@ mod tests {
                 &requester_hash,
                 harmony_identity::CapabilityType::Content,
                 &cid,
-                0,        // not_before
-                0,        // expires_at (0 = no expiry)
+                0, // not_before
+                0, // expires_at (0 = no expiry)
             )
             .unwrap();
         let token_bytes = token.to_bytes();
@@ -3648,8 +3777,8 @@ mod tests {
                 &requester_hash,
                 harmony_identity::CapabilityType::Content,
                 &cid,
-                0,  // not_before
-                1,  // expires_at = 1 second after epoch (long expired)
+                0, // not_before
+                1, // expires_at = 1 second after epoch (long expired)
             )
             .unwrap();
         let token_bytes = token.to_bytes();
@@ -3736,7 +3865,8 @@ mod tests {
         let token_bytes = token.to_bytes();
 
         // Even though the owner is known and pubkey is cached, no replica for this CID.
-        let result = rt.handle_pull_with_token(requester_hash, missing_cid, &token_bytes, 1_700_000_000);
+        let result =
+            rt.handle_pull_with_token(requester_hash, missing_cid, &token_bytes, 1_700_000_000);
         assert!(result.is_none(), "missing replica should be rejected");
     }
 
@@ -3839,8 +3969,7 @@ mod tests {
             )
             .unwrap();
         let token_bytes = token.to_bytes();
-        let result =
-            rt.handle_pull_with_token(requester_hash, cid, &token_bytes, 1_700_000_000);
+        let result = rt.handle_pull_with_token(requester_hash, cid, &token_bytes, 1_700_000_000);
         assert!(
             result.is_none(),
             "token with future not_before should be rejected"
@@ -3866,6 +3995,96 @@ mod tests {
         assert!(
             table.should_query_memo("peer-s", &cid, 20),
             "stale memo filter should fall back to querying"
+        );
+    }
+
+    // ── Page filter tests ────────────────────────────────────────────────
+
+    #[test]
+    fn peer_page_filter_upsert_and_query() {
+        let mut table = PeerFilterTable::new(100);
+        let mut bf = BloomFilter::new(100, 0.01);
+        // hash_bits must fit in 28 bits (≤ 0x0FFF_FFFF)
+        let addr =
+            harmony_athenaeum::PageAddr::new(0x0EADBEE, harmony_athenaeum::Algorithm::Sha256Msb);
+        bf.insert_bytes(&addr.to_bytes());
+
+        table.upsert_page("peer-a".to_string(), bf, 10);
+
+        // Should find the inserted address
+        assert!(table.should_query_page("peer-a", &addr, 10));
+        // Should NOT find a different address
+        let other =
+            harmony_athenaeum::PageAddr::new(0x0AFEBAB, harmony_athenaeum::Algorithm::Sha256Msb);
+        assert!(!table.should_query_page("peer-a", &other, 10));
+        // Unknown peer → always query
+        assert!(table.should_query_page("peer-b", &addr, 10));
+    }
+
+    #[test]
+    fn peer_page_filter_staleness() {
+        let mut table = PeerFilterTable::new(100);
+        let mut bf = BloomFilter::new(100, 0.01);
+        // hash_bits must fit in 28 bits (≤ 0x0FFF_FFFF)
+        let addr =
+            harmony_athenaeum::PageAddr::new(0x0EADBEE, harmony_athenaeum::Algorithm::Sha256Msb);
+        bf.insert_bytes(&addr.to_bytes());
+        table.upsert_page("peer-a".to_string(), bf, 10);
+
+        // At tick 10 + 101 = 111, the filter is stale → should query even for absent items
+        let absent =
+            harmony_athenaeum::PageAddr::new(0x00000000, harmony_athenaeum::Algorithm::Sha256Msb);
+        assert!(table.should_query_page("peer-a", &absent, 111));
+    }
+
+    #[test]
+    fn page_filter_broadcast_on_timer() {
+        use harmony_athenaeum::{Book, PAGE_SIZE};
+        use harmony_content::book::MemoryBookStore;
+
+        // Use a small interval so the timer fires on tick 2.
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig {
+                max_interval_ticks: 2,
+                ..FilterBroadcastConfig::default()
+            },
+            node_addr: "page-filter-timer-test".to_string(),
+            local_identity_hash: [0u8; 16],
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        // Build a book and index it into the page index.
+        let data = vec![0xAAu8; PAGE_SIZE];
+        let cid_bytes = [0x11u8; 32];
+        let book = Book::from_book(cid_bytes, &data).unwrap();
+        let cid = harmony_content::ContentId::from_bytes(cid_bytes);
+        rt.page_index.insert_book(cid, &book);
+
+        // Tick 1: timer not yet due.
+        rt.tick();
+
+        // Tick 2: timer fires (ticks_since >= interval 2).
+        let actions = rt.tick();
+
+        // Expect exactly one page filter Publish action.
+        let page_publishes: Vec<_> = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, RuntimeAction::Publish { key_expr, .. }
+                    if key_expr.starts_with("harmony/filters/page/"))
+            })
+            .collect();
+        assert_eq!(
+            page_publishes.len(),
+            1,
+            "expected one page filter broadcast"
         );
     }
 }

@@ -190,12 +190,40 @@ impl BloomFilter {
         self.item_count = self.item_count.saturating_add(1);
     }
 
+    /// Insert an arbitrary byte slice into the filter.
+    ///
+    /// The bytes are SHA-256 hashed internally to derive the Bloom filter
+    /// bit indices. Use this for types other than [`ContentId`].
+    pub fn insert_bytes(&mut self, data: &[u8]) {
+        let (h1, h2) = hash_pair_bytes(data);
+        for i in 0..self.num_hashes {
+            let idx = bit_index(h1, h2, i, self.num_bits);
+            self.set_bit(idx);
+        }
+        self.item_count = self.item_count.saturating_add(1);
+    }
+
     /// Test whether a content ID *may* be in the filter.
     ///
     /// Returns `true` if the item might be present (with some false positive
     /// probability), or `false` if the item is definitely absent.
     pub fn may_contain(&self, cid: &ContentId) -> bool {
         let (h1, h2) = hash_pair(cid);
+        for i in 0..self.num_hashes {
+            let idx = bit_index(h1, h2, i, self.num_bits);
+            if !self.get_bit(idx) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Test whether an arbitrary byte slice *may* be in the filter.
+    ///
+    /// Returns `true` if the item might be present (with some false positive
+    /// probability), or `false` if the item is definitely absent.
+    pub fn may_contain_bytes(&self, data: &[u8]) -> bool {
+        let (h1, h2) = hash_pair_bytes(data);
         for i in 0..self.num_hashes {
             let idx = bit_index(h1, h2, i, self.num_bits);
             if !self.get_bit(idx) {
@@ -340,6 +368,20 @@ impl BloomFilter {
 fn hash_pair(cid: &ContentId) -> (u64, u64) {
     let a = u64::from_le_bytes(cid.hash[0..8].try_into().unwrap());
     let b = u64::from_le_bytes(cid.hash[8..16].try_into().unwrap());
+    let h1 = a.wrapping_mul(SEED_A) ^ b;
+    let h2 = b.wrapping_mul(SEED_B) ^ a;
+    (h1, h2)
+}
+
+/// Extract two base hashes from an arbitrary byte slice.
+///
+/// SHA-256 hashes the input to produce a 32-byte digest, then reads
+/// `digest[0..8]` and `digest[8..16]` as little-endian u64 values
+/// with the same SplitMix64 mixing as [`hash_pair`].
+fn hash_pair_bytes(data: &[u8]) -> (u64, u64) {
+    let digest = harmony_crypto::hash::full_hash(data);
+    let a = u64::from_le_bytes(digest[0..8].try_into().unwrap());
+    let b = u64::from_le_bytes(digest[8..16].try_into().unwrap());
     let h1 = a.wrapping_mul(SEED_A) ^ b;
     let h2 = b.wrapping_mul(SEED_B) ^ a;
     (h1, h2)
@@ -572,5 +614,31 @@ mod tests {
     fn new_panics_on_bit_count_overflow() {
         // 500_000_000 items at 0.001 FP rate needs ~7.2 billion bits > u32::MAX.
         BloomFilter::new(500_000_000, 0.001);
+    }
+
+    #[test]
+    fn insert_bytes_and_may_contain_round_trip() {
+        let mut bf = BloomFilter::new(1000, 0.01);
+        let data = b"hello page addr";
+        bf.insert_bytes(data);
+        assert!(bf.may_contain_bytes(data));
+        assert_eq!(bf.item_count(), 1);
+    }
+
+    #[test]
+    fn bytes_definite_miss() {
+        let mut bf = BloomFilter::new(1000, 0.01);
+        bf.insert_bytes(b"present");
+        assert!(!bf.may_contain_bytes(b"absent"));
+    }
+
+    #[test]
+    fn bytes_serialization_round_trip() {
+        let mut bf = BloomFilter::new(100, 0.01);
+        bf.insert_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let bytes = bf.to_bytes();
+        let bf2 = BloomFilter::from_bytes(&bytes).unwrap();
+        assert!(bf2.may_contain_bytes(&[0xDE, 0xAD, 0xBE, 0xEF]));
+        assert!(!bf2.may_contain_bytes(&[0xCA, 0xFE]));
     }
 }
