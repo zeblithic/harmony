@@ -58,7 +58,9 @@ impl ConfigTunnelPeers {
             peers: entries
                 .into_iter()
                 .map(|entry| ConfigTunnelPeer {
-                    interface_name: entry.name.clone()
+                    interface_name: entry
+                        .name
+                        .clone()
                         .map(|n| {
                             // Clamp to IFNAMSIZ (15 bytes). Find the last valid
                             // char boundary at or before byte 15 to avoid panic
@@ -88,7 +90,11 @@ impl ConfigTunnelPeers {
     }
 
     fn mark_disconnected(&mut self, interface_name: &str) {
-        if let Some(peer) = self.peers.iter_mut().find(|p| p.interface_name == interface_name) {
+        if let Some(peer) = self
+            .peers
+            .iter_mut()
+            .find(|p| p.interface_name == interface_name)
+        {
             peer.connected = false;
             // Schedule retry at current backoff, THEN double for next time.
             let retry_delay = peer.backoff;
@@ -103,7 +109,11 @@ impl ConfigTunnelPeers {
     }
 
     fn mark_connected(&mut self, interface_name: &str) {
-        if let Some(peer) = self.peers.iter_mut().find(|p| p.interface_name == interface_name) {
+        if let Some(peer) = self
+            .peers
+            .iter_mut()
+            .find(|p| p.interface_name == interface_name)
+        {
             peer.connected = true;
             peer.backoff = INITIAL_BACKOFF;
             peer.next_retry = None;
@@ -864,9 +874,9 @@ async fn dispatch_action(
             weight,
         } => {
             let should_send = match weight {
-                None => true,                          // directed: always send
-                Some(w) if w >= 1.0 => true,           // best interface: always send
-                Some(w) => rand::random::<f32>() < w,  // probabilistic
+                None => true,                         // directed: always send
+                Some(w) if w >= 1.0 => true,          // best interface: always send
+                Some(w) => rand::random::<f32>() < w, // probabilistic
             };
             if should_send {
                 if interface_name.starts_with("tunnel-") {

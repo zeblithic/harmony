@@ -584,11 +584,7 @@ struct PubkeyCacheKeyResolver<'a> {
 }
 
 impl<'a> harmony_credential::CredentialKeyResolver for PubkeyCacheKeyResolver<'a> {
-    fn resolve(
-        &self,
-        issuer: &harmony_identity::IdentityRef,
-        _issued_at: u64,
-    ) -> Option<Vec<u8>> {
+    fn resolve(&self, issuer: &harmony_identity::IdentityRef, _issued_at: u64) -> Option<Vec<u8>> {
         self.cache.get(&issuer.hash).cloned()
     }
 }
@@ -1268,8 +1264,9 @@ impl<B: BookStore> NodeRuntime<B> {
         self.peer_filters.evict_stale(self.tick_count);
 
         // Expire in-flight memo fetches that have timed out.
-        self.pending_memo_fetches
-            .retain(|_, started| self.tick_count.saturating_sub(*started) <= MEMO_FETCH_TIMEOUT_TICKS);
+        self.pending_memo_fetches.retain(|_, started| {
+            self.tick_count.saturating_sub(*started) <= MEMO_FETCH_TIMEOUT_TICKS
+        });
 
         let mut actions = Vec::new();
         // Note: fuel is captured once before any tier executes. When Compute is
@@ -4281,10 +4278,9 @@ mod tests {
         let input = ContentId::from_bytes([0x11; 32]);
         let output = ContentId::from_bytes([0x22; 32]);
 
-        let memo = harmony_memo::create::create_memo(
-            input, output, &identity, &mut OsRng, 1000, 2000,
-        )
-        .unwrap();
+        let memo =
+            harmony_memo::create::create_memo(input, output, &identity, &mut OsRng, 1000, 2000)
+                .unwrap();
         rt.memo_store_mut().insert(memo);
 
         // Simulate a query for this input
@@ -4308,7 +4304,8 @@ mod tests {
             let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
             assert_eq!(count, 1, "should have 1 memo");
             // Verify the memo can be deserialized
-            let memo_len = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]) as usize;
+            let memo_len =
+                u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]) as usize;
             let memo_bytes = &payload[6..6 + memo_len];
             let restored = harmony_memo::deserialize(memo_bytes).expect("should deserialize");
             assert_eq!(restored.input, input);
@@ -4347,10 +4344,9 @@ mod tests {
         for _ in 0..(MAX_MEMO_RESPONSE_COUNT + 10) {
             let identity = PqPrivateIdentity::generate(&mut OsRng);
             let output = ContentId::from_bytes([0x22; 32]);
-            let memo = harmony_memo::create::create_memo(
-                input, output, &identity, &mut OsRng, 1000, 2000,
-            )
-            .unwrap();
+            let memo =
+                harmony_memo::create::create_memo(input, output, &identity, &mut OsRng, 1000, 2000)
+                    .unwrap();
             rt.memo_store_mut().insert(memo);
         }
 
@@ -4370,7 +4366,10 @@ mod tests {
 
         if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
             let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-            assert_eq!(count, MAX_MEMO_RESPONSE_COUNT, "should cap at MAX_MEMO_RESPONSE_COUNT");
+            assert_eq!(
+                count, MAX_MEMO_RESPONSE_COUNT,
+                "should cap at MAX_MEMO_RESPONSE_COUNT"
+            );
         }
     }
 
@@ -4437,10 +4436,9 @@ mod tests {
         let input = ContentId::from_bytes([0x11; 32]);
         let output = ContentId::from_bytes([0x22; 32]);
 
-        let memo = harmony_memo::create::create_memo(
-            input, output, &identity, &mut OsRng, 1000, 2000,
-        )
-        .unwrap();
+        let memo =
+            harmony_memo::create::create_memo(input, output, &identity, &mut OsRng, 1000, 2000)
+                .unwrap();
         rt.memo_store_mut().insert(memo);
 
         // Request memos for an input we already have locally
@@ -4449,7 +4447,9 @@ mod tests {
 
         // Should NOT emit QueryMemo — local data is sufficient
         assert!(
-            !actions.iter().any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
+            !actions
+                .iter()
+                .any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
             "should not query when memos exist locally"
         );
     }
@@ -4482,7 +4482,9 @@ mod tests {
         rt.push_event(RuntimeEvent::MemoFetchRequest { input });
         let actions1 = rt.tick();
         assert!(
-            actions1.iter().any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
+            actions1
+                .iter()
+                .any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
             "first request should emit query"
         );
 
@@ -4490,7 +4492,9 @@ mod tests {
         rt.push_event(RuntimeEvent::MemoFetchRequest { input });
         let actions2 = rt.tick();
         assert!(
-            !actions2.iter().any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
+            !actions2
+                .iter()
+                .any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
             "duplicate request should be suppressed"
         );
     }
@@ -4514,7 +4518,9 @@ mod tests {
         rt.push_event(RuntimeEvent::MemoFetchRequest { input });
         let actions = rt.tick();
         assert!(
-            actions.iter().any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
+            actions
+                .iter()
+                .any(|a| matches!(a, RuntimeAction::QueryMemo { .. })),
             "should re-emit query after timeout"
         );
     }
@@ -4540,10 +4546,9 @@ mod tests {
         });
 
         // Build a valid response payload
-        let memo = harmony_memo::create::create_memo(
-            input, output, &identity, &mut OsRng, 1000, 2000,
-        )
-        .unwrap();
+        let memo =
+            harmony_memo::create::create_memo(input, output, &identity, &mut OsRng, 1000, 2000)
+                .unwrap();
         let memo_bytes = harmony_memo::serialize(&memo).unwrap();
 
         let mut payload = Vec::new();
@@ -4643,10 +4648,9 @@ mod tests {
         let key_expr = format!("harmony/memo/{input_hex}/**");
 
         // First response: Alice's memo
-        let memo_alice = harmony_memo::create::create_memo(
-            input, output, &alice, &mut OsRng, 1000, 2000,
-        )
-        .unwrap();
+        let memo_alice =
+            harmony_memo::create::create_memo(input, output, &alice, &mut OsRng, 1000, 2000)
+                .unwrap();
         let alice_bytes = harmony_memo::serialize(&memo_alice).unwrap();
         let mut payload1 = Vec::new();
         payload1.extend_from_slice(&1u16.to_le_bytes());
@@ -4661,10 +4665,8 @@ mod tests {
         rt.tick();
 
         // Second response: Bob's memo
-        let memo_bob = harmony_memo::create::create_memo(
-            input, output, &bob, &mut OsRng, 1000, 2000,
-        )
-        .unwrap();
+        let memo_bob =
+            harmony_memo::create::create_memo(input, output, &bob, &mut OsRng, 1000, 2000).unwrap();
         let bob_bytes = harmony_memo::serialize(&memo_bob).unwrap();
         let mut payload2 = Vec::new();
         payload2.extend_from_slice(&1u16.to_le_bytes());
@@ -4680,6 +4682,10 @@ mod tests {
 
         // Both memos should be in the store
         let stored = rt.memo_store().get_by_input(&input);
-        assert_eq!(stored.len(), 2, "both Alice's and Bob's memos should be stored");
+        assert_eq!(
+            stored.len(),
+            2,
+            "both Alice's and Bob's memos should be stored"
+        );
     }
 }
