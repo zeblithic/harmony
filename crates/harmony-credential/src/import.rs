@@ -385,7 +385,7 @@ fn extract_harmony_claims(claims_arr: &[Value]) -> Result<Vec<SaltedClaim>, Impo
         let type_id = obj
             .get("typeId")
             .and_then(|v| v.as_u64())
-            .map(|n| n as u16)
+            .and_then(|n| u16::try_from(n).ok())
             .unwrap_or(0x8000);
 
         let value: Vec<u8> = if let Some(val_str) = obj.get("value").and_then(|v| v.as_str()) {
