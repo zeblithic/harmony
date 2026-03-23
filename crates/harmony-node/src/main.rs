@@ -629,7 +629,12 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 ContentId::for_book(&data, ContentFlags::default())
                     .map_err(|e| format!("CID computation failed: {e}"))?
             } else {
-                // For large files, hash first then wrap in a Book CID.
+                // For large files (> MAX_PAYLOAD_SIZE), hash first then wrap
+                // in a Book CID. This produces a CID-of-the-hash, not a
+                // CID-of-the-file: payload_size will be 32 and verify_hash()
+                // won't round-trip against the original data. This is
+                // intentional — the CID is used as an opaque fingerprint for
+                // memo attestations, not for content retrieval.
                 let digest = harmony_crypto::hash::full_hash(&data);
                 ContentId::for_book(&digest, ContentFlags::default())
                     .map_err(|e| format!("CID computation failed: {e}"))?

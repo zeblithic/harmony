@@ -57,7 +57,11 @@ fn cid_from_stdin() {
 
     child.stdin.take().unwrap().write_all(data).unwrap();
     let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdin_cid = String::from_utf8(output.stdout).unwrap().trim().to_string();
 
     assert_eq!(
@@ -96,4 +100,32 @@ fn cid_empty_input_fails() {
         .unwrap();
 
     assert!(!output.status.success(), "empty input should fail");
+}
+
+#[test]
+fn cid_large_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.bin");
+    // MAX_PAYLOAD_SIZE is 0xF_FFFF (1,048,575). Write one byte more.
+    let data = vec![0xABu8; 0xF_FFFF + 1];
+    std::fs::write(&path, &data).unwrap();
+
+    let output = harmony_bin()
+        .args(["cid", "--file", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hex_str = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    assert_eq!(
+        hex_str.len(),
+        64,
+        "CID should be 64 hex chars for large files, got {}",
+        hex_str.len()
+    );
+    assert!(hex::decode(&hex_str).is_ok());
 }
