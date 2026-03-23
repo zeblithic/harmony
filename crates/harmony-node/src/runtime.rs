@@ -495,9 +495,9 @@ pub struct NodeRuntime<B: BookStore> {
     // Populated from HandshakeComplete and AnnounceRecord events.
     // Capped at MAX_PUBKEY_CACHE_SIZE entries — evicts an arbitrary entry
     // on overflow (not LRU). A future improvement could use an LRU structure.
-    // SECURITY(V1): Announce records don't verify pubkey→hash binding.
-    // Until address re-derivation is implemented, a forged announce can
-    // poison this cache. See harmony-discovery crate Security docs.
+    // Announce records are verified for pubkey→hash binding by
+    // verify_announce() before reaching this point — forged announces
+    // are rejected with DiscoveryError::AddressMismatch.
     pubkey_cache: HashMap<[u8; 16], Vec<u8>>,
 }
 
@@ -1484,10 +1484,8 @@ impl<B: BookStore> NodeRuntime<B> {
         // format expected by MlDsaPublicKey::from_bytes() in handle_pull_with_token.
         // verify_announce() in the discovery crate uses the same key format.
         //
-        // SECURITY(V1): Announce records don't verify pubkey→hash binding.
-        // Until address re-derivation is implemented, a forged announce can
-        // poison this cache. See harmony-discovery crate Security docs and
-        // bead harmony-3bu.
+        // Pubkey→hash binding is verified by verify_announce() before this
+        // point — forged announces are rejected with AddressMismatch.
         if !record.public_key.is_empty() {
             self.insert_pubkey_capped(identity_hash, record.public_key.clone());
         }
@@ -3202,6 +3200,7 @@ mod tests {
                 suite: harmony_identity::CryptoSuite::Ed25519,
             },
             public_key: vec![0u8; 32],
+            encryption_key: vec![],
             routing_hints: vec![harmony_discovery::RoutingHint::Tunnel {
                 node_id: [0xEE; 32],
                 relay_url: Some("https://iroh.q8.fyi".into()),
@@ -3250,6 +3249,7 @@ mod tests {
                 suite: harmony_identity::CryptoSuite::Ed25519,
             },
             public_key: vec![0u8; 32],
+            encryption_key: vec![],
             routing_hints: vec![harmony_discovery::RoutingHint::Tunnel {
                 node_id: [0x22; 32],
                 relay_url: Some("https://new-relay.example.com".into()),
@@ -3279,6 +3279,7 @@ mod tests {
                 suite: harmony_identity::CryptoSuite::Ed25519,
             },
             public_key: vec![0u8; 32],
+            encryption_key: vec![],
             routing_hints: vec![harmony_discovery::RoutingHint::Reticulum {
                 destination_hash: [0xAA; 16],
             }],

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DiscoveryError;
 
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 
 /// Internal struct for the signable portion of an announce record.
 /// Everything except the signature.
@@ -13,6 +13,7 @@ struct SignablePayload {
     format_version: u8,
     identity_ref: IdentityRef,
     public_key: Vec<u8>,
+    encryption_key: Vec<u8>,
     routing_hints: Vec<RoutingHint>,
     published_at: u64,
     expires_at: u64,
@@ -51,6 +52,7 @@ pub enum RoutingHint {
 pub struct AnnounceRecord {
     pub identity_ref: IdentityRef,
     pub public_key: Vec<u8>,
+    pub encryption_key: Vec<u8>,
     pub routing_hints: Vec<RoutingHint>,
     pub published_at: u64,
     pub expires_at: u64,
@@ -74,6 +76,7 @@ impl AnnounceRecord {
             format_version: FORMAT_VERSION,
             identity_ref: self.identity_ref,
             public_key: self.public_key.clone(),
+            encryption_key: self.encryption_key.clone(),
             routing_hints: self.routing_hints.clone(),
             published_at: self.published_at,
             expires_at: self.expires_at,
@@ -130,6 +133,7 @@ impl AnnounceRecord {
 pub struct AnnounceBuilder {
     identity_ref: IdentityRef,
     public_key: Vec<u8>,
+    encryption_key: Vec<u8>,
     routing_hints: Vec<RoutingHint>,
     published_at: u64,
     expires_at: u64,
@@ -151,6 +155,7 @@ impl AnnounceBuilder {
     pub fn new(
         identity_ref: IdentityRef,
         public_key: Vec<u8>,
+        encryption_key: Vec<u8>,
         published_at: u64,
         expires_at: u64,
         nonce: [u8; 16],
@@ -162,6 +167,7 @@ impl AnnounceBuilder {
         Self {
             identity_ref,
             public_key,
+            encryption_key,
             routing_hints: Vec::new(),
             published_at,
             expires_at,
@@ -183,6 +189,7 @@ impl AnnounceBuilder {
             format_version: FORMAT_VERSION,
             identity_ref: self.identity_ref,
             public_key: self.public_key.clone(),
+            encryption_key: self.encryption_key.clone(),
             routing_hints: self.routing_hints.clone(),
             published_at: self.published_at,
             expires_at: self.expires_at,
@@ -196,6 +203,7 @@ impl AnnounceBuilder {
         AnnounceRecord {
             identity_ref: self.identity_ref,
             public_key: self.public_key,
+            encryption_key: self.encryption_key,
             routing_hints: self.routing_hints,
             published_at: self.published_at,
             expires_at: self.expires_at,
@@ -224,7 +232,7 @@ mod tests {
             destination_hash: [0xDE; 16],
         };
         let mut builder =
-            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
+            AnnounceBuilder::new(test_identity(), test_public_key(), vec![], 1000, 2000, [0x01; 16]);
         builder.add_routing_hint(hint.clone());
         let record = builder.build(alloc::vec![0x51, 0x67]);
 
@@ -240,7 +248,7 @@ mod tests {
     #[test]
     fn signable_payload_is_deterministic() {
         let builder =
-            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
+            AnnounceBuilder::new(test_identity(), test_public_key(), vec![], 1000, 2000, [0x01; 16]);
         let p1 = builder.signable_payload();
         let p2 = builder.signable_payload();
         assert_eq!(p1, p2);
@@ -249,19 +257,19 @@ mod tests {
     #[test]
     #[should_panic(expected = "expires_at")]
     fn rejects_expires_at_before_published_at() {
-        AnnounceBuilder::new(test_identity(), test_public_key(), 2000, 1000, [0x01; 16]);
+        AnnounceBuilder::new(test_identity(), test_public_key(), vec![], 2000, 1000, [0x01; 16]);
     }
 
     #[test]
     #[should_panic(expected = "expires_at")]
     fn rejects_expires_at_equal_to_published_at() {
-        AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 1000, [0x01; 16]);
+        AnnounceBuilder::new(test_identity(), test_public_key(), vec![], 1000, 1000, [0x01; 16]);
     }
 
     #[test]
     fn multiple_routing_hints() {
         let mut builder =
-            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
+            AnnounceBuilder::new(test_identity(), test_public_key(), vec![], 1000, 2000, [0x01; 16]);
         builder.add_routing_hint(RoutingHint::Reticulum {
             destination_hash: [0xAA; 16],
         });
@@ -275,7 +283,7 @@ mod tests {
     #[test]
     fn serde_round_trip() {
         let mut builder =
-            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x01; 16]);
+            AnnounceBuilder::new(test_identity(), test_public_key(), vec![], 1000, 2000, [0x01; 16]);
         builder.add_routing_hint(RoutingHint::Reticulum {
             destination_hash: [0xBB; 16],
         });
@@ -286,6 +294,7 @@ mod tests {
 
         assert_eq!(restored.identity_ref, record.identity_ref);
         assert_eq!(restored.public_key, record.public_key);
+        assert_eq!(restored.encryption_key, record.encryption_key);
         assert_eq!(restored.routing_hints, record.routing_hints);
         assert_eq!(restored.published_at, record.published_at);
         assert_eq!(restored.expires_at, record.expires_at);
@@ -327,7 +336,7 @@ mod tests {
             direct_addrs: vec!["10.0.0.1:7777".into(), "203.0.113.5:7777".into()],
         };
         let mut builder =
-            AnnounceBuilder::new(test_identity(), test_public_key(), 1000, 2000, [0x42; 16]);
+            AnnounceBuilder::new(test_identity(), test_public_key(), vec![], 1000, 2000, [0x42; 16]);
         builder.add_routing_hint(hint.clone());
         let record = builder.build(alloc::vec![0xCA, 0xFE]);
 
