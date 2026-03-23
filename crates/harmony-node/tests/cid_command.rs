@@ -42,6 +42,11 @@ fn cid_from_stdin() {
         .args(["cid", "--file", path.to_str().unwrap()])
         .output()
         .unwrap();
+    assert!(
+        file_output.status.success(),
+        "file CID failed; stderr: {}",
+        String::from_utf8_lossy(&file_output.stderr)
+    );
     let file_cid = String::from_utf8(file_output.stdout)
         .unwrap()
         .trim()
