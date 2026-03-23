@@ -122,6 +122,11 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
     let header_json: serde_json::Value =
         serde_json::from_slice(&header_bytes).map_err(|e| SdJwtError::JsonError(e.to_string()))?;
 
+    // RFC 7515 §4: the JOSE Header MUST be a JSON object.
+    if !header_json.is_object() {
+        return Err(SdJwtError::MalformedCompact);
+    }
+
     let alg = header_json
         .get("alg")
         .and_then(|v| v.as_str())

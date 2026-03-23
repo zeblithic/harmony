@@ -46,6 +46,13 @@ pub fn verify(
 /// Checks that `typ` is `"sd+jwt"` per RFC 9901 §3.3 before verifying
 /// the signature. This prevents cross-format token confusion where a
 /// plain JWT with a valid signature passes as an SD-JWT.
+///
+/// # Note
+///
+/// This function only verifies the cryptographic signature and the `typ`
+/// header. It does **not** validate time-based claims (`exp`, `nbf`,
+/// `iat`). Callers MUST separately check that the token is not expired
+/// and is past its not-before time before accepting the disclosed claims.
 pub fn verify_from_header(
     sd_jwt: &SdJwt,
     public_key: &[u8],
