@@ -40,6 +40,8 @@ pub enum CapabilityType {
     Content = 5,
     /// Right to execute WASM with a fuel budget.
     Compute = 6,
+    /// Right to discover an identity's full routing hints (tunnel addresses).
+    Discovery = 7,
 }
 
 impl TryFrom<u8> for CapabilityType {
@@ -54,6 +56,7 @@ impl TryFrom<u8> for CapabilityType {
             4 => Ok(Self::Identity),
             5 => Ok(Self::Content),
             6 => Ok(Self::Compute),
+            7 => Ok(Self::Discovery),
             _ => Err(UcanError::InvalidEncoding),
         }
     }
@@ -1022,7 +1025,7 @@ mod tests {
 
     #[test]
     fn capability_type_u8_roundtrip() {
-        for val in 0u8..=6 {
+        for val in 0u8..=7 {
             let cap = CapabilityType::try_from(val).unwrap();
             assert_eq!(cap as u8, val);
         }
@@ -1030,8 +1033,16 @@ mod tests {
 
     #[test]
     fn capability_type_invalid_value_rejected() {
-        assert!(CapabilityType::try_from(7u8).is_err());
+        assert!(CapabilityType::try_from(8u8).is_err());
         assert!(CapabilityType::try_from(255u8).is_err());
+    }
+
+    #[test]
+    fn discovery_capability_type_roundtrip() {
+        let val = CapabilityType::Discovery as u8;
+        assert_eq!(val, 7);
+        let restored = CapabilityType::try_from(val).unwrap();
+        assert_eq!(restored, CapabilityType::Discovery);
     }
 
     #[test]

@@ -118,12 +118,15 @@ impl PeerTable {
             return;
         }
         let now = Instant::now();
-        self.peers.insert(addr, PeerInfo {
-            reticulum_addr: placeholder,
-            proto_version: 0,
-            last_seen: now,
-            pinned: true,
-        });
+        self.peers.insert(
+            addr,
+            PeerInfo {
+                reticulum_addr: placeholder,
+                proto_version: 0,
+                last_seen: now,
+                pinned: true,
+            },
+        );
         self.addr_to_sockets
             .entry(placeholder)
             .or_default()

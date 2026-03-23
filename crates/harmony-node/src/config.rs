@@ -21,10 +21,20 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::Io { path, source } => {
-                write!(f, "failed to read config file {}: {}", path.display(), source)
+                write!(
+                    f,
+                    "failed to read config file {}: {}",
+                    path.display(),
+                    source
+                )
             }
             ConfigError::Parse { path, message } => {
-                write!(f, "failed to parse config file {}: {}", path.display(), message)
+                write!(
+                    f,
+                    "failed to parse config file {}: {}",
+                    path.display(),
+                    message
+                )
             }
         }
     }
@@ -127,7 +137,10 @@ pub fn resolve_config_path(cli_override: Option<&Path>) -> Result<(PathBuf, bool
     let Ok(home) = std::env::var("HOME") else {
         return Ok((PathBuf::from("/nonexistent/.harmony/node.toml"), false));
     };
-    Ok((PathBuf::from(home).join(".harmony").join("node.toml"), false))
+    Ok((
+        PathBuf::from(home).join(".harmony").join("node.toml"),
+        false,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -235,9 +248,15 @@ node_id = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
 
         let tunnels = cfg.tunnels.as_ref().expect("tunnels present");
         assert_eq!(tunnels.len(), 2);
-        assert_eq!(tunnels[0].node_id, "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
+        assert_eq!(
+            tunnels[0].node_id,
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+        );
         assert_eq!(tunnels[0].name.as_deref(), Some("my-peer"));
-        assert_eq!(tunnels[1].node_id, "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00");
+        assert_eq!(
+            tunnels[1].node_id,
+            "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
+        );
         assert!(tunnels[1].name.is_none());
     }
 
@@ -247,13 +266,17 @@ node_id = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
         let err = load(&path, false).expect_err("malformed TOML should fail");
         assert!(matches!(err, ConfigError::Parse { .. }));
         let msg = err.to_string();
-        assert!(msg.contains("failed to parse config file"), "unexpected: {msg}");
+        assert!(
+            msg.contains("failed to parse config file"),
+            "unexpected: {msg}"
+        );
     }
 
     #[test]
     fn load_unknown_key_errors() {
         let (_f, path) = write_temp("typo_key = true\n");
-        let err = load(&path, false).expect_err("unknown key should fail due to deny_unknown_fields");
+        let err =
+            load(&path, false).expect_err("unknown key should fail due to deny_unknown_fields");
         assert!(matches!(err, ConfigError::Parse { .. }));
     }
 

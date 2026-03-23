@@ -423,6 +423,28 @@ pub mod identity {
     }
 }
 
+/// Authenticated discovery queryable namespace.
+///
+/// Peers query `harmony/discover/{identity_hash_hex}` with a PQ UCAN token
+/// to retrieve full routing hints (including tunnel addresses). Without a
+/// valid token, the queryable responds with public hints only.
+///
+/// Distinct from `harmony/identity/` which handles DID document resolution.
+pub mod discover {
+    use alloc::{format, string::String};
+
+    /// Base prefix: `harmony/discover`
+    pub const PREFIX: &str = "harmony/discover";
+
+    /// Subscribe/queryable pattern: `harmony/discover/**`
+    pub const SUB: &str = "harmony/discover/**";
+
+    /// Key for a specific identity: `harmony/discover/{identity_hash_hex}`
+    pub fn key(identity_hash_hex: &str) -> String {
+        format!("{PREFIX}/{identity_hash_hex}")
+    }
+}
+
 /// Endorsement record key expressions.
 ///
 /// Endorsements are published at `harmony/endorsement/{endorser_hex}/{endorsee_hex}`.
@@ -903,6 +925,21 @@ mod tests {
         assert_eq!(identity::ALL_ANNOUNCES, "harmony/identity/*/announce");
         assert_eq!(identity::ALL_RESOLVES, "harmony/identity/*/resolve");
         assert_eq!(identity::ALL_ALIVE, "harmony/identity/*/alive");
+    }
+
+    // ── Discover ────────────────────────────────────────────────
+
+    #[test]
+    fn discover_key() {
+        assert_eq!(
+            discover::key("aabbccdd"),
+            "harmony/discover/aabbccdd"
+        );
+    }
+
+    #[test]
+    fn discover_subscription_pattern() {
+        assert_eq!(discover::SUB, "harmony/discover/**");
     }
 
     // ── Endorsement ──

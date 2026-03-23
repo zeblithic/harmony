@@ -57,6 +57,15 @@ pub struct NodeConfig {
     /// probe-interval jitter is unique per local-peer pair rather than zero.
     /// Defaults to all-zeros; must be set from the loaded identity at startup.
     pub local_identity_hash: harmony_identity::IdentityHash,
+    /// This node's PQ identity hash (16-byte address derived from ML-KEM + ML-DSA keys).
+    /// Used as the issuer identity for Discovery UCAN tokens. Distinct from
+    /// `local_identity_hash` (Ed25519-derived, used for Reticulum/PeerManager).
+    /// Defaults to all-zeros; must be set from the PQ identity at startup.
+    pub local_pq_identity_hash: harmony_identity::IdentityHash,
+    /// This node's ML-DSA-65 public verifying key bytes.
+    /// Used to verify Discovery UCAN tokens (which are issued by this node).
+    /// Defaults to empty; must be set from the loaded identity at startup.
+    pub local_dsa_pubkey: Vec<u8>,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -116,6 +125,8 @@ impl Default for NodeConfig {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "0000".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         }
     }
 }
@@ -130,7 +141,8 @@ pub enum RuntimeEvent {
         now: u64,
     },
     /// Tier 1: Periodic timer tick for path expiry, announce scheduling.
-    TimerTick { now: u64 },
+    /// `now` is monotonic millis-since-start. `unix_now` is Unix epoch seconds.
+    TimerTick { now: u64, unix_now: u64 },
     /// Tier 2: Zenoh query received (content fetch or stats request).
     QueryReceived {
         query_id: u64,
@@ -575,6 +587,25 @@ pub struct NodeRuntime<B: BookStore> {
     // In-flight memo fetches: input CID → tick when fetch was started.
     // Prevents re-querying for the same input while a fetch is in-flight.
     pending_memo_fetches: HashMap<ContentId, u64>,
+    // This node's Ed25519 identity hash (copied from config for direct access).
+    local_identity_hash: harmony_identity::IdentityHash,
+    // This node's PQ identity hash (ML-KEM + ML-DSA derived).
+    // Used for Discovery UCAN token validation (issuer check).
+    local_pq_identity_hash: harmony_identity::IdentityHash,
+    // Queryable ID for the discover namespace (harmony/discover/**)
+    discover_queryable_id: QueryableId,
+    // Pre-serialized public announce record (Reticulum-only hints).
+    // Populated when outbound announce publishing is wired (existing TODO).
+    // Until then, the discover queryable returns no reply (harmless — the
+    // feature becomes active once announce building is implemented).
+    local_public_announce: Option<Vec<u8>>,
+    // Pre-serialized full announce record (all hints including tunnel).
+    local_full_announce: Option<Vec<u8>>,
+    // Unix epoch seconds, updated on each TimerTick for token time-bound checks.
+    last_unix_now: u64,
+    // Parsed ML-DSA-65 verifying key for self-issued Discovery tokens.
+    // Parsed once at construction; None if local_dsa_pubkey is empty/invalid.
+    local_dsa_verifying_key: Option<harmony_crypto::ml_dsa::MlDsaPublicKey>,
 }
 
 /// Adapts the runtime's pubkey_cache to the CredentialKeyResolver trait
@@ -679,6 +710,14 @@ impl<B: BookStore> NodeRuntime<B> {
             key_expr: harmony_zenoh::namespace::memo::SUB.to_string(),
         });
 
+        // Discover namespace: register queryable for authenticated routing hint queries.
+        let (discover_qid, _) = queryable_router
+            .declare(harmony_zenoh::namespace::discover::SUB)
+            .expect("static key expression must be valid");
+        actions.push(RuntimeAction::DeclareQueryable {
+            key_expr: harmony_zenoh::namespace::discover::SUB.to_string(),
+        });
+
         // Subscribe to peer filter broadcasts.
         actions.push(RuntimeAction::Subscribe {
             key_expr: harmony_zenoh::namespace::filters::CONTENT_SUB.to_string(),
@@ -734,6 +773,19 @@ impl<B: BookStore> NodeRuntime<B> {
             pubkey_cache: HashMap::new(),
             memo_queryable_id: memo_qid,
             pending_memo_fetches: HashMap::new(),
+            local_identity_hash: config.local_identity_hash,
+            local_pq_identity_hash: config.local_pq_identity_hash,
+            discover_queryable_id: discover_qid,
+            local_public_announce: None,
+            local_full_announce: None,
+            last_unix_now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            local_dsa_verifying_key: harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(
+                &config.local_dsa_pubkey,
+            )
+            .ok(),
         };
 
         (rt, actions)
@@ -954,6 +1006,27 @@ impl<B: BookStore> NodeRuntime<B> {
         &mut self.memo_store
     }
 
+    /// This node's Ed25519 identity hash (Reticulum-compatible).
+    pub fn local_identity_hash(&self) -> [u8; 16] {
+        self.local_identity_hash
+    }
+
+    /// This node's PQ identity hash (ML-KEM + ML-DSA derived).
+    /// Used for discover query key expressions and Discovery token validation.
+    pub fn local_pq_identity_hash(&self) -> [u8; 16] {
+        self.local_pq_identity_hash
+    }
+
+    /// Set the pre-serialized public announce record (Reticulum-only hints).
+    pub fn set_local_public_announce(&mut self, data: Vec<u8>) {
+        self.local_public_announce = Some(data);
+    }
+
+    /// Set the pre-serialized full announce record (all hints including tunnel).
+    pub fn set_local_full_announce(&mut self, data: Vec<u8>) {
+        self.local_full_announce = Some(data);
+    }
+
     /// Read-only access to the page index.
     pub fn page_index(&self) -> &crate::page_index::PageIndex {
         &self.page_index
@@ -999,8 +1072,9 @@ impl<B: BookStore> NodeRuntime<B> {
                     now,
                 });
             }
-            RuntimeEvent::TimerTick { now } => {
+            RuntimeEvent::TimerTick { now, unix_now } => {
                 self.last_now = now;
+                self.last_unix_now = unix_now;
                 self.router_queue.push_back(NodeEvent::TimerTick { now });
             }
             RuntimeEvent::QueryReceived {
@@ -2061,6 +2135,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 } else if queryable_id == self.memo_queryable_id {
                     let memo_actions = self.handle_memo_query(query_id, &key_expr);
                     self.pending_direct_actions.extend(memo_actions);
+                } else if queryable_id == self.discover_queryable_id {
+                    let actions = self.handle_discover_query(query_id, &key_expr, &payload);
+                    self.pending_direct_actions.extend(actions);
                 }
             }
         }
@@ -2126,6 +2203,159 @@ impl<B: BookStore> NodeRuntime<B> {
         payload.extend_from_slice(&memo_buf);
 
         vec![RuntimeAction::SendReply { query_id, payload }]
+    }
+
+    /// Handle a discover query: validate Discovery UCAN token, respond with
+    /// full or public announce record.
+    ///
+    /// Key expression: `harmony/discover/{identity_hash_hex}`
+    /// Payload: serialized PqUcanToken (or empty for public hints)
+    /// Response: serialized AnnounceRecord bytes
+    fn handle_discover_query(
+        &self,
+        query_id: u64,
+        key_expr: &str,
+        payload: &[u8],
+    ) -> Vec<RuntimeAction> {
+        // 1. Parse identity_hash from key expression
+        let identity_hex = match key_expr
+            .strip_prefix(harmony_zenoh::namespace::discover::PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            Some(hex) => hex.split('/').next().unwrap_or(""),
+            None => return Vec::new(),
+        };
+
+        let id_bytes = match hex::decode(identity_hex) {
+            Ok(b) if b.len() == 16 => b,
+            _ => return Vec::new(),
+        };
+        let mut queried_hash = [0u8; 16];
+        queried_hash.copy_from_slice(&id_bytes);
+
+        // 2. Check if this is our PQ identity (Discovery tokens use PQ address hash)
+        let local_hash = self.local_pq_identity_hash;
+        if queried_hash != local_hash {
+            return Vec::new(); // Not our identity — no reply
+        }
+
+        // 3. If no records available, no reply
+        let public_bytes = match &self.local_public_announce {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
+
+        // 4. Empty payload → public hints
+        if payload.is_empty() {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // 5. Parse and validate Discovery UCAN token
+        let full_bytes = match &self.local_full_announce {
+            Some(b) => b,
+            None => {
+                return vec![RuntimeAction::SendReply {
+                    query_id,
+                    payload: public_bytes.clone(),
+                }];
+            }
+        };
+
+        // Size guard
+        const MAX_TOKEN_BYTES: usize = 8 * 1024;
+        if payload.len() > MAX_TOKEN_BYTES {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        let token = match harmony_identity::PqUcanToken::from_bytes(payload) {
+            Ok(t) => t,
+            Err(_) => {
+                return vec![RuntimeAction::SendReply {
+                    query_id,
+                    payload: public_bytes.clone(),
+                }];
+            }
+        };
+
+        // Check capability
+        if token.capability != harmony_identity::CapabilityType::Discovery {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Check resource matches our identity hash
+        if token.resource.len() != 16 || token.resource[..] != local_hash[..] {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Check expiry (expires_at == 0 means no expiry / indefinite grant).
+        if token.expires_at != 0 && self.last_unix_now > token.expires_at {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Check not-before (not_before == 0 means valid immediately / no activation delay).
+        if token.not_before > self.last_unix_now {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Check issuer matches our identity (token was issued by us).
+        // Cheap byte comparison before expensive signature verification.
+        if token.issuer != local_hash {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Verify ML-DSA signature with LOCAL key (we issued this token).
+        // The verifying key is parsed once at construction time.
+        let pubkey = match &self.local_dsa_verifying_key {
+            Some(pk) => pk,
+            None => {
+                tracing::warn!(
+                    "local DSA verifying key not available — discovery token verification skipped"
+                );
+                return vec![RuntimeAction::SendReply {
+                    query_id,
+                    payload: public_bytes.clone(),
+                }];
+            }
+        };
+        if token.verify_signature(pubkey).is_err() {
+            return vec![RuntimeAction::SendReply {
+                query_id,
+                payload: public_bytes.clone(),
+            }];
+        }
+
+        // Note: `audience` is intentionally not checked. Zenoh queries carry no
+        // authenticated sender identity, so audience enforcement would require an
+        // extra round-trip. Discovery tokens operate as bearer credentials —
+        // issuers should distribute them only through encrypted channels (e.g.,
+        // tunnel-encrypted messages or out-of-band secure transfer).
+
+        // All checks passed — serve full record
+        vec![RuntimeAction::SendReply {
+            query_id,
+            payload: full_bytes.clone(),
+        }]
     }
 
     /// Handle a page query against the page index.
@@ -2417,7 +2647,10 @@ mod tests {
             raw: vec![0u8; 20],
             now: 1000,
         };
-        let _e2 = RuntimeEvent::TimerTick { now: 1000 };
+        let _e2 = RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        };
         let _e3 = RuntimeEvent::QueryReceived {
             query_id: 1,
             key_expr: "harmony/content/a/abc".into(),
@@ -2519,8 +2752,8 @@ mod tests {
             .filter(|a| matches!(a, RuntimeAction::Subscribe { .. }))
             .count();
 
-        // 16 shard queryables + 1 stats queryable + 1 compute activity queryable + 1 page queryable + 1 memo queryable = 20
-        assert_eq!(queryable_count, 20);
+        // 16 shard + 1 stats + 1 compute + 1 page + 1 memo + 1 discover = 21
+        assert_eq!(queryable_count, 21);
         // transit + publish + content filter + flatpack filter + memo filter + page filter subscriptions = 6
         assert_eq!(subscribe_count, 6);
     }
@@ -2549,7 +2782,10 @@ mod tests {
             raw: vec![0u8; 20],
             now: 1000,
         });
-        rt.push_event(RuntimeEvent::TimerTick { now: 1001 });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1001,
+            unix_now: 0,
+        });
         assert_eq!(rt.router_queue_len(), 2);
         assert_eq!(rt.storage_queue_len(), 0);
     }
@@ -2578,7 +2814,10 @@ mod tests {
         let (mut rt, _) = make_runtime();
 
         for i in 0..3 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         rt.push_event(RuntimeEvent::QueryReceived {
             query_id: 10,
@@ -2813,7 +3052,10 @@ mod tests {
         let (mut rt, _) = make_runtime();
 
         // Queue a router event, a storage event, and a compute event
-        rt.push_event(RuntimeEvent::TimerTick { now: 1000 });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        });
         rt.push_event(RuntimeEvent::QueryReceived {
             query_id: 10,
             key_expr: "harmony/content/stats".into(),
@@ -2999,7 +3241,10 @@ mod tests {
 
         // Push 5 router events (half of high_water=10)
         for i in 0..5 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         // load_factor = 5/10 = 0.5
         // effective = 1000 * (1.0 - 0.5 * 0.9) = 1000 * 0.55 = 550
@@ -3007,7 +3252,10 @@ mod tests {
 
         // Push 5 more (at high_water)
         for i in 5..10 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         // load_factor = 10/10 = 1.0 → floor
         // effective = 1000 * 0.1 = 100
@@ -3015,7 +3263,10 @@ mod tests {
 
         // Push beyond high_water — stays at floor
         for i in 10..20 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         assert_eq!(rt.effective_fuel(), 100);
     }
@@ -3028,7 +3279,10 @@ mod tests {
 
         // Push 5 router events
         for i in 0..5 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         assert_eq!(rt.router_queue_len(), 5);
 
@@ -3084,7 +3338,10 @@ mod tests {
         assert_eq!(rt.starvation_counters(), (1, 1, 1));
 
         // Push router event only
-        rt.push_event(RuntimeEvent::TimerTick { now: 1000 });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        });
         rt.tick();
         // Router processed → reset to 0. Storage/compute still idle → increment.
         assert_eq!(rt.starvation_counters(), (0, 2, 2));
@@ -3109,7 +3366,10 @@ mod tests {
 
         // Push many router events but no storage events
         for i in 0..10 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
 
         // Also push 1 storage event
@@ -3153,7 +3413,10 @@ mod tests {
             key_expr: "harmony/content/stats".into(),
             payload: vec![],
         });
-        rt.push_event(RuntimeEvent::TimerTick { now: 2000 });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 2000,
+            unix_now: 0,
+        });
 
         // Tick 5: storage promoted → its actions should appear before router actions in output
         let actions = rt.tick();
@@ -3216,7 +3479,10 @@ mod tests {
 
         // Push 10 router events (= high_water) → fuel at floor
         for i in 0..10 {
-            rt.push_event(RuntimeEvent::TimerTick { now: 1000 + i });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 1000 + i,
+                unix_now: 0,
+            });
         }
         assert_eq!(rt.effective_fuel(), 100);
 
@@ -3244,6 +3510,8 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
@@ -3310,6 +3578,8 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "self-node".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3342,6 +3612,8 @@ mod tests {
             },
             node_addr: "reject-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
@@ -3371,6 +3643,8 @@ mod tests {
             },
             node_addr: "skip-timer-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3429,6 +3703,8 @@ mod tests {
             },
             node_addr: "coalesce-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3476,6 +3752,8 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "cuckoo-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3516,6 +3794,8 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "self-node".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3763,7 +4043,10 @@ mod tests {
         });
         // Tick with a timer to trigger PeerManager tick, which should produce
         // a SendPathRequest for the High-priority peer.
-        rt.push_event(RuntimeEvent::TimerTick { now: 1000 });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        });
         let actions = rt.tick();
         assert!(
             actions.iter().any(|a| matches!(
@@ -4409,6 +4692,8 @@ mod tests {
             },
             node_addr: "page-filter-timer-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
+            local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4526,7 +4811,10 @@ mod tests {
 
         // Advance past timeout
         for _ in 0..MEMO_FETCH_TIMEOUT_TICKS {
-            rt.push_event(RuntimeEvent::TimerTick { now: 0 });
+            rt.push_event(RuntimeEvent::TimerTick {
+                now: 0,
+                unix_now: 0,
+            });
             rt.tick();
         }
 
@@ -4703,5 +4991,243 @@ mod tests {
             2,
             "both Alice's and Bob's memos should be stored"
         );
+    }
+
+    #[test]
+    fn discover_query_missing_token_returns_public_hints() {
+        let (mut rt, _) = make_runtime();
+        let public_data = b"public-announce-record".to_vec();
+        let full_data = b"full-announce-record-with-tunnel".to_vec();
+        rt.set_local_public_announce(public_data.clone());
+        rt.set_local_full_announce(full_data.clone());
+
+        let identity_hex = hex::encode(rt.local_pq_identity_hash());
+        let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 42,
+            key_expr,
+            payload: vec![],
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 42, .. }));
+        assert!(reply.is_some(), "should reply with public hints");
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload, &public_data, "should return public record");
+        }
+    }
+
+    #[test]
+    fn discover_query_valid_token_returns_full_hints() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let pub_id = identity.public_identity();
+        let id_ref = harmony_identity::IdentityRef::from(pub_id);
+
+        let mut config = NodeConfig::default();
+        config.local_identity_hash = id_ref.hash;
+        config.local_pq_identity_hash = id_ref.hash;
+        config.local_dsa_pubkey = pub_id.verifying_key.as_bytes();
+        config.node_addr = hex::encode(id_ref.hash);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        let public_data = b"public-only".to_vec();
+        let full_data = b"full-with-tunnel".to_vec();
+        rt.set_local_public_announce(public_data.clone());
+        rt.set_local_full_announce(full_data.clone());
+
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 1500,
+        });
+        rt.tick();
+
+        let peer_hash = [0xBBu8; 16];
+        let token = identity
+            .issue_pq_root_token(
+                &mut OsRng,
+                &peer_hash,
+                harmony_identity::CapabilityType::Discovery,
+                &id_ref.hash,
+                1000,
+                2000,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        let identity_hex = hex::encode(id_ref.hash);
+        let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 43,
+            key_expr,
+            payload: token_bytes,
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 43, .. }));
+        assert!(reply.is_some(), "should reply with full hints");
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload, &full_data, "should return full record");
+        }
+    }
+
+    #[test]
+    fn discover_query_expired_token_returns_public_hints() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let pub_id = identity.public_identity();
+        let id_ref = harmony_identity::IdentityRef::from(pub_id);
+
+        let mut config = NodeConfig::default();
+        config.local_identity_hash = id_ref.hash;
+        config.local_pq_identity_hash = id_ref.hash;
+        config.local_dsa_pubkey = pub_id.verifying_key.as_bytes();
+        config.node_addr = hex::encode(id_ref.hash);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        let public_data = b"public-only".to_vec();
+        rt.set_local_public_announce(public_data.clone());
+        rt.set_local_full_announce(b"full".to_vec());
+
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 3000,
+        });
+        rt.tick();
+
+        let peer_hash = [0xBBu8; 16];
+        let token = identity
+            .issue_pq_root_token(
+                &mut OsRng,
+                &peer_hash,
+                harmony_identity::CapabilityType::Discovery,
+                &id_ref.hash,
+                1000,
+                2000,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        let identity_hex = hex::encode(id_ref.hash);
+        let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 44,
+            key_expr,
+            payload: token_bytes,
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 44, .. }));
+        assert!(reply.is_some());
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload, &public_data, "expired token → public record");
+        }
+    }
+
+    #[test]
+    fn discover_query_wrong_capability_returns_public_hints() {
+        use harmony_identity::PqPrivateIdentity;
+        use rand::rngs::OsRng;
+
+        let identity = PqPrivateIdentity::generate(&mut OsRng);
+        let pub_id = identity.public_identity();
+        let id_ref = harmony_identity::IdentityRef::from(pub_id);
+
+        let mut config = NodeConfig::default();
+        config.local_identity_hash = id_ref.hash;
+        config.local_pq_identity_hash = id_ref.hash;
+        config.local_dsa_pubkey = pub_id.verifying_key.as_bytes();
+        config.node_addr = hex::encode(id_ref.hash);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        let public_data = b"public-only".to_vec();
+        rt.set_local_public_announce(public_data.clone());
+        rt.set_local_full_announce(b"full".to_vec());
+
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 1500,
+        });
+        rt.tick();
+
+        let peer_hash = [0xBBu8; 16];
+        let token = identity
+            .issue_pq_root_token(
+                &mut OsRng,
+                &peer_hash,
+                harmony_identity::CapabilityType::Content, // WRONG
+                &id_ref.hash,
+                1000,
+                2000,
+            )
+            .unwrap();
+        let token_bytes = token.to_bytes();
+
+        let identity_hex = hex::encode(id_ref.hash);
+        let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 45,
+            key_expr,
+            payload: token_bytes,
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 45, .. }));
+        assert!(reply.is_some());
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload, &public_data, "wrong capability → public record");
+        }
+    }
+
+    #[test]
+    fn discover_query_wrong_identity_no_reply() {
+        let (mut rt, _) = make_runtime();
+        rt.set_local_public_announce(b"public".to_vec());
+        rt.set_local_full_announce(b"full".to_vec());
+
+        let wrong_hex = hex::encode([0xFFu8; 16]);
+        let key_expr = harmony_zenoh::namespace::discover::key(&wrong_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 46,
+            key_expr,
+            payload: vec![],
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 46, .. }));
+        assert!(reply.is_none(), "should not reply for unknown identity");
+    }
+
+    #[test]
+    fn discover_query_invalid_token_returns_public_hints() {
+        let (mut rt, _) = make_runtime();
+        let public_data = b"public-announce-record".to_vec();
+        rt.set_local_public_announce(public_data.clone());
+        rt.set_local_full_announce(b"full".to_vec());
+
+        let identity_hex = hex::encode(rt.local_pq_identity_hash());
+        let key_expr = harmony_zenoh::namespace::discover::key(&identity_hex);
+        rt.push_event(RuntimeEvent::QueryReceived {
+            query_id: 47,
+            key_expr,
+            payload: vec![0xFF; 100], // garbage
+        });
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 47, .. }));
+        assert!(reply.is_some());
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload, &public_data, "invalid token → public record");
+        }
     }
 }
