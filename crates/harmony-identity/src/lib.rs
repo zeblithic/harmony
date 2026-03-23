@@ -11,7 +11,7 @@ pub mod ucan;
 pub mod verify;
 
 pub use crypto_suite::CryptoSuite;
-pub use did::{resolve_did, DefaultDidResolver, DidError, DidResolver, ResolvedDid};
+pub use did::{resolve_did, DefaultDidResolver, DidError, DidResolver, ResolvedDid, ResolvedDidDocument};
 pub use error::IdentityError;
 pub use identity::{Identity, IdentityHash, PrivateIdentity};
 pub use identity_ref::IdentityRef;

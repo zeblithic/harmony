@@ -8,15 +8,32 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use serde::{Deserialize, Serialize};
+
 use crate::crypto_suite::CryptoSuite;
 
 /// A resolved DID containing the cryptographic suite and raw public key bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **Wire stability:** postcard encodes fields by declaration order.
+/// Do not reorder or insert fields without a format version bump.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedDid {
     /// The cryptographic suite identified by the DID.
     pub suite: CryptoSuite,
     /// The raw public key bytes.
     pub public_key: Vec<u8>,
+}
+
+/// A resolved DID Document containing all supported verification methods.
+///
+/// **Wire stability:** postcard encodes fields by declaration order.
+/// Do not reorder or insert fields without a format version bump.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedDidDocument {
+    /// The DID this document belongs to.
+    pub id: String,
+    /// All verification methods with supported cryptographic suites.
+    pub verification_methods: Vec<ResolvedDid>,
 }
 
 /// Errors that can occur during DID resolution.
@@ -31,6 +48,8 @@ pub enum DidError {
     DecodingError(String),
     /// The multicodec prefix is not recognized.
     UnknownMulticodec(u32),
+    /// The DID Document contains no verification methods with a supported crypto suite.
+    NoSupportedKeys,
 }
 
 impl core::fmt::Display for DidError {
@@ -44,6 +63,7 @@ impl core::fmt::Display for DidError {
             Self::UnknownMulticodec(code) => {
                 write!(f, "unknown multicodec: 0x{code:04x}")
             }
+            Self::NoSupportedKeys => write!(f, "no supported verification methods found"),
         }
     }
 }
@@ -55,6 +75,19 @@ impl std::error::Error for DidError {}
 pub trait DidResolver {
     /// Resolve a DID string into its public key and crypto suite.
     fn resolve(&self, did: &str) -> Result<ResolvedDid, DidError>;
+
+    /// Resolve a DID string into a full DID Document.
+    ///
+    /// The default implementation wraps the single key returned by [`resolve`](Self::resolve)
+    /// into a [`ResolvedDidDocument`]. Implementors that can fetch real DID Documents
+    /// (e.g. `did:web`) should override this method.
+    fn resolve_document(&self, did: &str) -> Result<ResolvedDidDocument, DidError> {
+        let resolved = self.resolve(did)?;
+        Ok(ResolvedDidDocument {
+            id: did.to_string(),
+            verification_methods: alloc::vec![resolved],
+        })
+    }
 }
 
 /// Default DID resolver supporting `did:key` and `did:jwk` (std only).
@@ -407,6 +440,22 @@ mod tests {
     fn varint_ml_dsa65_encoding() {
         let bytes = encode_varint(0x1211);
         assert_eq!(bytes, vec![0x91, 0x24]);
+    }
+
+    #[test]
+    fn default_resolve_document_wraps_single_key() {
+        let key = [0xABu8; 32];
+        let mut payload = encode_varint(0x00ed);
+        payload.extend_from_slice(&key);
+        let encoded = format!("z{}", bs58::encode(&payload).into_string());
+        let did = format!("did:key:{encoded}");
+
+        let resolver = DefaultDidResolver;
+        let doc = resolver.resolve_document(&did).unwrap();
+        let single = resolver.resolve(&did).unwrap();
+        assert_eq!(doc.id, did);
+        assert_eq!(doc.verification_methods.len(), 1);
+        assert_eq!(doc.verification_methods[0], single);
     }
 }
 
