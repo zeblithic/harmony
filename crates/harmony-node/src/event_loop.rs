@@ -628,7 +628,13 @@ pub async fn run(
                                                     unix_now,
                                                 });
                                             }
-                                            _ => {} // Other ops (Pull, Status, etc.) not yet handled
+                                            _ => {
+                                                tracing::trace!(
+                                                    op = ?rep_msg.op,
+                                                    cid = %hex::encode(&rep_msg.cid[..8]),
+                                                    "unhandled replication op — ignored"
+                                                );
+                                            }
                                         }
                                     }
                                 }
