@@ -136,10 +136,10 @@ pub fn resolve_did(did: &str) -> Result<ResolvedDid, DidError> {
     }
 }
 
-/// Resolve a `did:key` method-specific identifier.
+/// Parse a multibase-encoded public key string (z-prefixed base58btc with multicodec varint).
 ///
 /// Format: `z<base58btc(varint(multicodec) || raw_public_key)>`
-pub fn resolve_did_key(encoded: &str) -> Result<ResolvedDid, DidError> {
+pub fn parse_multibase_key(encoded: &str) -> Result<ResolvedDid, DidError> {
     // Strip multibase prefix 'z' (base58btc)
     let b58_str = encoded
         .strip_prefix('z')
@@ -182,22 +182,21 @@ pub fn resolve_did_key(encoded: &str) -> Result<ResolvedDid, DidError> {
     })
 }
 
-/// Resolve a `did:jwk` method-specific identifier (std only).
+/// Resolve a `did:key` method-specific identifier.
 ///
-/// Format: `<base64url(JWK JSON)>`
+/// Format: `z<base58btc(varint(multicodec) || raw_public_key)>`
+pub fn resolve_did_key(encoded: &str) -> Result<ResolvedDid, DidError> {
+    parse_multibase_key(encoded)
+}
+
+/// Parse a JWK JSON value into a ResolvedDid.
+///
+/// Inspects `kty` and `crv` fields to determine the crypto suite, then extracts
+/// the raw public key from the `x` field.
 #[cfg(feature = "std")]
-pub fn resolve_did_jwk(encoded: &str) -> Result<ResolvedDid, DidError> {
+pub fn parse_jwk_value(jwk: &serde_json::Value) -> Result<ResolvedDid, DidError> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-
-    // base64url decode → JSON bytes
-    let json_bytes = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|e| DidError::DecodingError(format!("base64url decode failed: {e}")))?;
-
-    // Parse JSON
-    let jwk: serde_json::Value = serde_json::from_slice(&json_bytes)
-        .map_err(|e| DidError::MalformedDid(format!("invalid JWK JSON: {e}")))?;
 
     let kty = jwk
         .get("kty")
@@ -233,6 +232,26 @@ pub fn resolve_did_jwk(encoded: &str) -> Result<ResolvedDid, DidError> {
             "unsupported JWK key type: kty={kty}, crv={crv:?}"
         ))),
     }
+}
+
+/// Resolve a `did:jwk` method-specific identifier (std only).
+///
+/// Format: `<base64url(JWK JSON)>`
+#[cfg(feature = "std")]
+pub fn resolve_did_jwk(encoded: &str) -> Result<ResolvedDid, DidError> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    // base64url decode → JSON bytes
+    let json_bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| DidError::DecodingError(format!("base64url decode failed: {e}")))?;
+
+    // Parse JSON
+    let jwk: serde_json::Value = serde_json::from_slice(&json_bytes)
+        .map_err(|e| DidError::MalformedDid(format!("invalid JWK JSON: {e}")))?;
+
+    parse_jwk_value(&jwk)
 }
 
 /// Decode an unsigned LEB128 varint from the front of a byte slice.

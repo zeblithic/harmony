@@ -11,7 +11,12 @@ pub mod ucan;
 pub mod verify;
 
 pub use crypto_suite::CryptoSuite;
-pub use did::{resolve_did, DefaultDidResolver, DidError, DidResolver, ResolvedDid, ResolvedDidDocument};
+pub use did::{
+    parse_multibase_key, resolve_did, resolve_did_key, DefaultDidResolver, DidError, DidResolver,
+    ResolvedDid, ResolvedDidDocument,
+};
+#[cfg(feature = "std")]
+pub use did::{parse_jwk_value, resolve_did_jwk};
 pub use error::IdentityError;
 pub use identity::{Identity, IdentityHash, PrivateIdentity};
 pub use identity_ref::IdentityRef;
