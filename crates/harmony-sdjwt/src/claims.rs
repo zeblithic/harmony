@@ -51,7 +51,7 @@ pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<VerifiedDisclosures<'_>, SdJ
     for disclosure in &sd_jwt.disclosures {
         // Reject duplicate disclosures (holder must present each at most once).
         if !seen.insert(&disclosure.raw) {
-            return Err(SdJwtError::DisclosureHashMismatch);
+            return Err(SdJwtError::DuplicateDisclosure);
         }
 
         let digest = disclosure_digest(&disclosure.raw);
@@ -277,7 +277,7 @@ mod tests {
         let sd_jwt = make_test_sdjwt(vec![digest], vec![disc.clone(), disc]);
         assert!(matches!(
             verify_disclosures(&sd_jwt),
-            Err(SdJwtError::DisclosureHashMismatch)
+            Err(SdJwtError::DuplicateDisclosure)
         ));
     }
 
