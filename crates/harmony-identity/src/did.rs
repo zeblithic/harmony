@@ -75,6 +75,16 @@ impl DidResolver for DefaultDidResolver {
 pub fn resolve_did(did: &str) -> Result<ResolvedDid, DidError> {
     if let Some(encoded) = did.strip_prefix("did:key:") {
         resolve_did_key(encoded)
+    } else if let Some(encoded) = did.strip_prefix("did:jwk:") {
+        #[cfg(feature = "std")]
+        {
+            resolve_did_jwk(encoded)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = encoded;
+            Err(DidError::UnsupportedMethod(String::from("jwk (requires std)")))
+        }
     } else if did.starts_with("did:web:") {
         Err(DidError::UnsupportedMethod(String::from("web")))
     } else {
@@ -129,6 +139,59 @@ pub fn resolve_did_key(encoded: &str) -> Result<ResolvedDid, DidError> {
         suite,
         public_key: key_bytes.to_vec(),
     })
+}
+
+/// Resolve a `did:jwk` method-specific identifier (std only).
+///
+/// Format: `<base64url(JWK JSON)>`
+#[cfg(feature = "std")]
+pub fn resolve_did_jwk(encoded: &str) -> Result<ResolvedDid, DidError> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    // base64url decode → JSON bytes
+    let json_bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| DidError::DecodingError(format!("base64url decode failed: {e}")))?;
+
+    // Parse JSON
+    let jwk: serde_json::Value = serde_json::from_slice(&json_bytes)
+        .map_err(|e| DidError::MalformedDid(format!("invalid JWK JSON: {e}")))?;
+
+    let kty = jwk
+        .get("kty")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| DidError::MalformedDid(String::from("JWK missing 'kty' field")))?;
+
+    let crv = jwk.get("crv").and_then(|v| v.as_str());
+
+    match (kty, crv) {
+        ("OKP", Some("Ed25519")) => {
+            let x = jwk
+                .get("x")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| DidError::MalformedDid(String::from("JWK missing 'x' field")))?;
+
+            let key_bytes = URL_SAFE_NO_PAD
+                .decode(x)
+                .map_err(|e| DidError::DecodingError(format!("base64url decode of 'x' failed: {e}")))?;
+
+            if key_bytes.len() != 32 {
+                return Err(DidError::MalformedDid(format!(
+                    "expected 32 key bytes for Ed25519, got {}",
+                    key_bytes.len()
+                )));
+            }
+
+            Ok(ResolvedDid {
+                suite: CryptoSuite::Ed25519,
+                public_key: key_bytes,
+            })
+        }
+        _ => Err(DidError::UnsupportedMethod(format!(
+            "unsupported JWK key type: kty={kty}, crv={crv:?}"
+        ))),
+    }
 }
 
 /// Decode an unsigned LEB128 varint from the front of a byte slice.
@@ -301,5 +364,62 @@ mod tests {
     fn varint_ml_dsa65_encoding() {
         let bytes = encode_varint(0x1211);
         assert_eq!(bytes, vec![0x91, 0x24]);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod jwk_tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    fn make_ed25519_jwk(key: &[u8; 32]) -> String {
+        let x = URL_SAFE_NO_PAD.encode(key);
+        let jwk_json = format!(r#"{{"kty":"OKP","crv":"Ed25519","x":"{x}"}}"#);
+        URL_SAFE_NO_PAD.encode(jwk_json.as_bytes())
+    }
+
+    #[test]
+    fn did_jwk_ed25519() {
+        let key = [0xABu8; 32];
+        let encoded = make_ed25519_jwk(&key);
+
+        let resolved = resolve_did_jwk(&encoded).unwrap();
+        assert_eq!(resolved.suite, CryptoSuite::Ed25519);
+        assert_eq!(resolved.public_key, key);
+    }
+
+    #[test]
+    fn did_jwk_via_resolve_did() {
+        let key = [0xCDu8; 32];
+        let encoded = make_ed25519_jwk(&key);
+        let did = format!("did:jwk:{encoded}");
+
+        let resolved = resolve_did(&did).unwrap();
+        assert_eq!(resolved.suite, CryptoSuite::Ed25519);
+        assert_eq!(resolved.public_key, key);
+    }
+
+    #[test]
+    fn did_jwk_malformed_json() {
+        let encoded = URL_SAFE_NO_PAD.encode(b"not json at all {{{");
+        let err = resolve_did_jwk(&encoded).unwrap_err();
+        assert!(matches!(err, DidError::MalformedDid(_)));
+    }
+
+    #[test]
+    fn did_jwk_missing_kty() {
+        let jwk_json = r#"{"crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#;
+        let encoded = URL_SAFE_NO_PAD.encode(jwk_json.as_bytes());
+        let err = resolve_did_jwk(&encoded).unwrap_err();
+        assert!(matches!(err, DidError::MalformedDid(ref m) if m.contains("kty")));
+    }
+
+    #[test]
+    fn did_jwk_unsupported_curve() {
+        let jwk_json = r#"{"kty":"EC","crv":"P-256","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#;
+        let encoded = URL_SAFE_NO_PAD.encode(jwk_json.as_bytes());
+        let err = resolve_did_jwk(&encoded).unwrap_err();
+        assert!(matches!(err, DidError::UnsupportedMethod(_)));
     }
 }
