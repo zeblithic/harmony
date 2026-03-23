@@ -518,6 +518,8 @@ pub struct NodeRuntime<B: BookStore> {
     pending_cuckoo_broadcast: Option<Vec<u8>>,
     // Coalesces memo Bloom filter broadcasts within a single tick.
     pending_memo_broadcast: Option<Vec<u8>>,
+    // Coalesces page Bloom filter broadcasts within a single tick.
+    pending_page_broadcast: Option<Vec<u8>>,
     // Memo attestation store (input CID → signed memos)
     memo_store: MemoStore,
     // Identity discovery manager (sans-I/O)
@@ -668,6 +670,7 @@ impl<B: BookStore> NodeRuntime<B> {
             pending_filter_broadcast: None,
             pending_cuckoo_broadcast: None,
             pending_memo_broadcast: None,
+            pending_page_broadcast: None,
             memo_store: MemoStore::new(),
             discovery: DiscoveryManager::new(),
             local_tunnel_hint: None,
@@ -1177,6 +1180,18 @@ impl<B: BookStore> NodeRuntime<B> {
                             }
                             self.pending_memo_broadcast = Some(memo_filter.to_bytes());
                         }
+
+                        // Rebuild page Bloom filter from PageIndex mode-00 addresses.
+                        if !self.page_index.is_empty() {
+                            let mut page_filter = BloomFilter::new(
+                                self.filter_broadcast_config.expected_items,
+                                self.filter_broadcast_config.fp_rate,
+                            );
+                            for addr in self.page_index.addr00_iter() {
+                                page_filter.insert_bytes(&addr.to_bytes());
+                            }
+                            self.pending_page_broadcast = Some(page_filter.to_bytes());
+                        }
                     }
 
                     // Flush coalesced filter broadcast — multiple threshold crossings
@@ -1194,6 +1209,11 @@ impl<B: BookStore> NodeRuntime<B> {
                     if let Some(payload) = self.pending_memo_broadcast.take() {
                         let key_expr =
                             harmony_zenoh::namespace::filters::memo_key(&self.node_addr);
+                        actions.push(RuntimeAction::Publish { key_expr, payload });
+                    }
+                    if let Some(payload) = self.pending_page_broadcast.take() {
+                        let key_expr =
+                            harmony_zenoh::namespace::filters::page_key(&self.node_addr);
                         actions.push(RuntimeAction::Publish { key_expr, payload });
                     }
                     if processed > 0 {
@@ -2012,6 +2032,28 @@ impl<B: BookStore> NodeRuntime<B> {
                 match BloomFilter::from_bytes(&payload) {
                     Ok(filter) => {
                         self.peer_filters.upsert_memo(
+                            peer_addr.to_string(),
+                            filter,
+                            self.tick_count,
+                        );
+                    }
+                    Err(_) => {
+                        self.peer_filters.record_parse_error();
+                    }
+                }
+            }
+            return;
+        }
+
+        // Check if this is a page filter broadcast.
+        if let Some(peer_addr) = key_expr
+            .strip_prefix(harmony_zenoh::namespace::filters::PAGE_PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            if peer_addr != self.node_addr {
+                match BloomFilter::from_bytes(&payload) {
+                    Ok(filter) => {
+                        self.peer_filters.upsert_page(
                             peer_addr.to_string(),
                             filter,
                             self.tick_count,
@@ -3066,6 +3108,8 @@ mod tests {
 
         // Tick 2: timer interval also fires (tick 2 >= interval 2).
         // Bloom coalesces (threshold + timer → 1 publish), cuckoo adds 1.
+        // The transit data are Book CIDs that get indexed into page_index,
+        // so the timer also produces 1 page filter broadcast.
         let actions = rt.tick();
         let filter_publishes: Vec<_> = actions
             .iter()
@@ -3076,8 +3120,8 @@ mod tests {
             .collect();
         assert_eq!(
             filter_publishes.len(),
-            2,
-            "expected 2 filter broadcasts (1 coalesced bloom + 1 cuckoo)"
+            3,
+            "expected 3 filter broadcasts (1 coalesced bloom + 1 cuckoo + 1 page)"
         );
     }
 
@@ -3948,5 +3992,52 @@ mod tests {
         // At tick 10 + 101 = 111, the filter is stale → should query even for absent items
         let absent = harmony_athenaeum::PageAddr::new(0x00000000, harmony_athenaeum::Algorithm::Sha256Msb);
         assert!(table.should_query_page("peer-a", &absent, 111));
+    }
+
+    #[test]
+    fn page_filter_broadcast_on_timer() {
+        use harmony_athenaeum::{Book, PAGE_SIZE};
+        use harmony_content::book::MemoryBookStore;
+
+        // Use a small interval so the timer fires on tick 2.
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 1000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig {
+                max_interval_ticks: 2,
+                ..FilterBroadcastConfig::default()
+            },
+            node_addr: "page-filter-timer-test".to_string(),
+            local_identity_hash: [0u8; 16],
+        };
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        // Build a book and index it into the page index.
+        let data = vec![0xAAu8; PAGE_SIZE];
+        let cid_bytes = [0x11u8; 32];
+        let book = Book::from_book(cid_bytes, &data).unwrap();
+        let cid = harmony_content::ContentId::from_bytes(cid_bytes);
+        rt.page_index.insert_book(cid, &book);
+
+        // Tick 1: timer not yet due.
+        rt.tick();
+
+        // Tick 2: timer fires (ticks_since >= interval 2).
+        let actions = rt.tick();
+
+        // Expect exactly one page filter Publish action.
+        let page_publishes: Vec<_> = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, RuntimeAction::Publish { key_expr, .. }
+                    if key_expr.starts_with("harmony/filters/page/"))
+            })
+            .collect();
+        assert_eq!(page_publishes.len(), 1, "expected one page filter broadcast");
     }
 }
