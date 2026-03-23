@@ -3,6 +3,7 @@ extern crate alloc;
 
 pub mod crypto_suite;
 pub mod did;
+pub mod did_document;
 pub mod error;
 pub mod identity;
 pub mod identity_ref;
