@@ -182,6 +182,16 @@ impl PageAddr {
         }
         result & 0x3
     }
+
+    /// Serialize the raw u32 to 4 big-endian bytes.
+    pub fn to_bytes(self) -> [u8; 4] {
+        self.0.to_be_bytes()
+    }
+
+    /// Deserialize from 4 big-endian bytes.
+    pub fn from_bytes(bytes: [u8; 4]) -> Self {
+        PageAddr(u32::from_be_bytes(bytes))
+    }
 }
 
 impl core::fmt::Debug for PageAddr {

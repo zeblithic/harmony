@@ -1944,6 +1944,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "futures-util",
+ "harmony-athenaeum",
  "harmony-compute",
  "harmony-contacts",
  "harmony-content",

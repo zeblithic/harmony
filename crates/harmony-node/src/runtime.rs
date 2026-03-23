@@ -24,6 +24,7 @@ use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
 use harmony_memo::store::MemoStore;
 use harmony_zenoh::namespace::content as content_ns;
+use harmony_zenoh::namespace::{announce as announce_ns, page as page_ns};
 use harmony_zenoh::queryable::{QueryableAction, QueryableEvent, QueryableId, QueryableRouter};
 
 /// Configuration for a Harmony node runtime.
@@ -484,6 +485,12 @@ pub struct NodeRuntime<B: BookStore> {
     replica_store: MemoryReplicaStore,
     // Replication: ticks since last replication scan
     ticks_since_replica_scan: u32,
+    // Page index: maps page addresses to book pages for queryable lookup
+    page_index: crate::page_index::PageIndex,
+    // CIDs already indexed — prevents duplicate entries on re-announce
+    indexed_book_cids: HashSet<ContentId>,
+    // Queryable ID for the page namespace (harmony/page/**)
+    page_queryable_id: QueryableId,
     // Cache of ML-DSA public keys by identity hash.
     // Populated from HandshakeComplete and AnnounceRecord events.
     // Capped at MAX_PUBKEY_CACHE_SIZE entries — evicts an arbitrary entry
@@ -567,6 +574,14 @@ impl<B: BookStore> NodeRuntime<B> {
             key_expr: harmony_zenoh::namespace::compute::ACTIVITY_SUB.to_string(),
         });
 
+        // Page namespace: register queryable for page lookups.
+        let (page_qid, _) = queryable_router
+            .declare(page_ns::SUB)
+            .expect("static key expression must be valid");
+        actions.push(RuntimeAction::DeclareQueryable {
+            key_expr: page_ns::SUB.to_string(),
+        });
+
         // Subscribe to peer filter broadcasts.
         actions.push(RuntimeAction::Subscribe {
             key_expr: harmony_zenoh::namespace::filters::CONTENT_SUB.to_string(),
@@ -612,6 +627,9 @@ impl<B: BookStore> NodeRuntime<B> {
             last_now: 0,
             replica_store: MemoryReplicaStore::new(),
             ticks_since_replica_scan: 0,
+            page_index: crate::page_index::PageIndex::new(),
+            indexed_book_cids: HashSet::new(),
+            page_queryable_id: page_qid,
             pubkey_cache: HashMap::new(),
         };
 
@@ -713,6 +731,11 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Mutable access to the memo store.
     pub fn memo_store_mut(&mut self) -> &mut MemoStore {
         &mut self.memo_store
+    }
+
+    /// Read-only access to the page index.
+    pub fn page_index(&self) -> &crate::page_index::PageIndex {
+        &self.page_index
     }
 
     /// Number of malformed filter payloads that failed deserialization.
@@ -1264,7 +1287,47 @@ impl<B: BookStore> NodeRuntime<B> {
                     out.push(RuntimeAction::SendReply { query_id, payload });
                 }
                 StorageTierAction::AnnounceContent { key_expr, payload } => {
-                    out.push(RuntimeAction::Publish { key_expr, payload });
+                    out.push(RuntimeAction::Publish {
+                        key_expr: key_expr.clone(),
+                        payload,
+                    });
+
+                    // If the announced CID is a depth-0 book, index its pages
+                    // and publish page metadata to the page namespace.
+                    if let Some(cid_hex) = key_expr.strip_prefix(announce_ns::PREFIX)
+                        .and_then(|s| s.strip_prefix('/'))
+                    {
+                        if let Ok(cid_bytes) = hex::decode(cid_hex) {
+                            if let Ok(cid_arr) = <[u8; 32]>::try_from(cid_bytes) {
+                                let cid = ContentId::from_bytes(cid_arr);
+                                if cid.cid_type() == harmony_content::cid::CidType::Book
+                                    && !self.indexed_book_cids.contains(&cid)
+                                {
+                                    if let Some(data) = self.storage.get(&cid) {
+                                        if let Ok(book) = harmony_athenaeum::Book::from_book(cid.to_bytes(), data) {
+                                            self.indexed_book_cids.insert(cid);
+                                            self.page_index.insert_book(cid, &book);
+                                            for (i, addrs) in book.data_pages().iter().enumerate() {
+                                                let a00 = hex::encode(addrs[0].to_bytes());
+                                                let a01 = hex::encode(addrs[1].to_bytes());
+                                                let a10 = hex::encode(addrs[2].to_bytes());
+                                                let a11 = hex::encode(addrs[3].to_bytes());
+                                                let book_cid_hex = hex::encode(cid.to_bytes());
+                                                let pk = page_ns::page_key(
+                                                    &a00, &a01, &a10, &a11,
+                                                    &book_cid_hex, i as u8,
+                                                );
+                                                out.push(RuntimeAction::Publish {
+                                                    key_expr: pk,
+                                                    payload: vec![i as u8],
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 StorageTierAction::SendStatsReply { query_id, payload } => {
                     out.push(RuntimeAction::SendReply { query_id, payload });
@@ -1729,9 +1792,122 @@ impl<B: BookStore> NodeRuntime<B> {
                 } else if self.compute_queryable_ids.contains(&queryable_id) {
                     let workflow_actions = self.route_compute_query(query_id, key_expr, payload);
                     self.pending_workflow_actions.extend(workflow_actions);
+                } else if queryable_id == self.page_queryable_id {
+                    let page_actions = self.handle_page_query(query_id, &key_expr);
+                    self.pending_direct_actions.extend(page_actions);
                 }
             }
         }
+    }
+
+    /// Handle a page query against the page index.
+    ///
+    /// Key expression: `harmony/page/{addr_00}/{addr_01}/{addr_10}/{addr_11}/{book_cid}/{page_num}`
+    /// Segments that are `*` are treated as wildcards (None).
+    ///
+    /// Response protocol:
+    /// - 0 matches → empty vec (no reply)
+    /// - 1 match → `[0x01] + 4KB_page_data`
+    /// - N matches → one `[0x00] + key_expression_bytes` per match
+    fn handle_page_query(&self, query_id: u64, key_expr: &str) -> Vec<RuntimeAction> {
+        let after_prefix = match key_expr
+            .strip_prefix(page_ns::PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        let segments: Vec<&str> = after_prefix.split('/').collect();
+        if segments.len() != 6 {
+            return Vec::new();
+        }
+
+        // Parse each segment: "*" → Ok(None) (wildcard), concrete → Ok(Some(val)),
+        // malformed → Err (reject entire query).
+        let parse_addr =
+            |s: &str| -> Result<Option<harmony_athenaeum::PageAddr>, ()> {
+                if s == "*" {
+                    return Ok(None);
+                }
+                let bytes = hex::decode(s).map_err(|_| ())?;
+                let arr: [u8; 4] = bytes.try_into().map_err(|_| ())?;
+                Ok(Some(harmony_athenaeum::PageAddr::from_bytes(arr)))
+            };
+
+        let parse_cid = |s: &str| -> Result<Option<ContentId>, ()> {
+            if s == "*" {
+                return Ok(None);
+            }
+            let bytes = hex::decode(s).map_err(|_| ())?;
+            let arr: [u8; 32] = bytes.try_into().map_err(|_| ())?;
+            Ok(Some(ContentId::from_bytes(arr)))
+        };
+
+        let parse_page_num = |s: &str| -> Result<Option<u8>, ()> {
+            if s == "*" {
+                return Ok(None);
+            }
+            s.parse::<u8>().map(Some).map_err(|_| ())
+        };
+
+        let Ok(addr_00) = parse_addr(segments[0]) else { return Vec::new() };
+        let Ok(addr_01) = parse_addr(segments[1]) else { return Vec::new() };
+        let Ok(addr_10) = parse_addr(segments[2]) else { return Vec::new() };
+        let Ok(addr_11) = parse_addr(segments[3]) else { return Vec::new() };
+        let Ok(book_cid) = parse_cid(segments[4]) else { return Vec::new() };
+        let Ok(page_num) = parse_page_num(segments[5]) else { return Vec::new() };
+
+        let matches = self.page_index.match_query(
+            addr_00.as_ref(),
+            addr_01.as_ref(),
+            addr_10.as_ref(),
+            addr_11.as_ref(),
+            book_cid.as_ref(),
+            page_num,
+        );
+
+        if matches.is_empty() {
+            return Vec::new();
+        }
+
+        if matches.len() == 1 {
+            let entry = &matches[0];
+            // Fetch the 4KB page data by direct slice — no Book::from_book needed.
+            // We only index depth-0 (raw) books, so page data is at a fixed offset.
+            const PAGE_SIZE: usize = 4096;
+            if let Some(data) = self.storage.get(&entry.book_cid) {
+                let start = entry.page_num as usize * PAGE_SIZE;
+                if start < data.len() {
+                    let end = (start + PAGE_SIZE).min(data.len());
+                    let mut payload = Vec::with_capacity(1 + PAGE_SIZE);
+                    payload.push(0x01);
+                    payload.extend_from_slice(&data[start..end]);
+                    // Zero-pad if last page is shorter than PAGE_SIZE
+                    if payload.len() < 1 + PAGE_SIZE {
+                        payload.resize(1 + PAGE_SIZE, 0);
+                    }
+                    return vec![RuntimeAction::SendReply { query_id, payload }];
+                }
+            }
+            // Couldn't fetch page data — no reply
+            return Vec::new();
+        }
+
+        // Multiple matches: return metadata for each.
+        let mut actions = Vec::new();
+        for entry in &matches {
+            let a00 = hex::encode(entry.addrs[0].to_bytes());
+            let a01 = hex::encode(entry.addrs[1].to_bytes());
+            let a10 = hex::encode(entry.addrs[2].to_bytes());
+            let a11 = hex::encode(entry.addrs[3].to_bytes());
+            let cid_hex = hex::encode(entry.book_cid.to_bytes());
+            let pk = page_ns::page_key(&a00, &a01, &a10, &a11, &cid_hex, entry.page_num);
+            let mut payload = vec![0x00];
+            payload.extend_from_slice(pk.as_bytes());
+            actions.push(RuntimeAction::SendReply { query_id, payload });
+        }
+        actions
     }
 
     fn route_subscription(&mut self, key_expr: String, payload: Vec<u8>) {
@@ -1971,8 +2147,8 @@ mod tests {
             .filter(|a| matches!(a, RuntimeAction::Subscribe { .. }))
             .count();
 
-        // 16 shard queryables + 1 stats queryable + 1 compute activity queryable = 18
-        assert_eq!(queryable_count, 18);
+        // 16 shard queryables + 1 stats queryable + 1 compute activity queryable + 1 page queryable = 19
+        assert_eq!(queryable_count, 19);
         // transit + publish + content filter + flatpack filter + memo filter subscriptions = 5
         assert_eq!(subscribe_count, 5);
     }
