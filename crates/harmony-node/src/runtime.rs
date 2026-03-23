@@ -603,8 +603,9 @@ pub struct NodeRuntime<B: BookStore> {
     local_full_announce: Option<Vec<u8>>,
     // Unix epoch seconds, updated on each TimerTick for token time-bound checks.
     last_unix_now: u64,
-    // This node's ML-DSA-65 public key for verifying self-issued Discovery tokens.
-    local_dsa_pubkey: Vec<u8>,
+    // Parsed ML-DSA-65 verifying key for self-issued Discovery tokens.
+    // Parsed once at construction; None if local_dsa_pubkey is empty/invalid.
+    local_dsa_verifying_key: Option<harmony_crypto::ml_dsa::MlDsaPublicKey>,
 }
 
 /// Adapts the runtime's pubkey_cache to the CredentialKeyResolver trait
@@ -781,7 +782,10 @@ impl<B: BookStore> NodeRuntime<B> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            local_dsa_pubkey: config.local_dsa_pubkey,
+            local_dsa_verifying_key: harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(
+                &config.local_dsa_pubkey,
+            )
+            .ok(),
         };
 
         (rt, actions)
@@ -2303,7 +2307,7 @@ impl<B: BookStore> NodeRuntime<B> {
             }];
         }
 
-        // Check not-before
+        // Check not-before (not_before == 0 means valid immediately / no activation delay).
         if token.not_before > self.last_unix_now {
             return vec![RuntimeAction::SendReply {
                 query_id,
@@ -2320,19 +2324,21 @@ impl<B: BookStore> NodeRuntime<B> {
             }];
         }
 
-        // Verify ML-DSA signature with LOCAL key (we issued this token)
-        let pubkey =
-            match harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(&self.local_dsa_pubkey) {
-                Ok(pk) => pk,
-                Err(_) => {
-                    tracing::warn!("local DSA pubkey invalid or empty — discovery token verification skipped");
-                    return vec![RuntimeAction::SendReply {
-                        query_id,
-                        payload: public_bytes.clone(),
-                    }];
-                }
-            };
-        if token.verify_signature(&pubkey).is_err() {
+        // Verify ML-DSA signature with LOCAL key (we issued this token).
+        // The verifying key is parsed once at construction time.
+        let pubkey = match &self.local_dsa_verifying_key {
+            Some(pk) => pk,
+            None => {
+                tracing::warn!(
+                    "local DSA verifying key not available — discovery token verification skipped"
+                );
+                return vec![RuntimeAction::SendReply {
+                    query_id,
+                    payload: public_bytes.clone(),
+                }];
+            }
+        };
+        if token.verify_signature(pubkey).is_err() {
             return vec![RuntimeAction::SendReply {
                 query_id,
                 payload: public_bytes.clone(),
