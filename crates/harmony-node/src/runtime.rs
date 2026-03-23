@@ -257,9 +257,11 @@ struct PeerFilter {
     content_filter: Option<BloomFilter>,
     flatpack_filter: Option<CuckooFilter>,
     memo_filter: Option<BloomFilter>,
+    page_filter: Option<BloomFilter>,
     content_received_tick: u64,
     flatpack_received_tick: u64,
     memo_received_tick: u64,
+    page_received_tick: u64,
 }
 
 /// Per-peer Bloom filter table for content query routing.
@@ -292,9 +294,11 @@ impl PeerFilterTable {
             content_filter: None,
             flatpack_filter: None,
             memo_filter: None,
+            page_filter: None,
             content_received_tick: tick,
             flatpack_received_tick: 0,
             memo_received_tick: 0,
+            page_received_tick: 0,
         });
         entry.content_filter = Some(filter);
         entry.content_received_tick = tick;
@@ -305,9 +309,11 @@ impl PeerFilterTable {
             content_filter: None,
             flatpack_filter: None,
             memo_filter: None,
+            page_filter: None,
             content_received_tick: 0,
             flatpack_received_tick: tick,
             memo_received_tick: 0,
+            page_received_tick: 0,
         });
         entry.flatpack_filter = Some(filter);
         entry.flatpack_received_tick = tick;
@@ -318,12 +324,29 @@ impl PeerFilterTable {
             content_filter: None,
             flatpack_filter: None,
             memo_filter: None,
+            page_filter: None,
             content_received_tick: 0,
             flatpack_received_tick: 0,
             memo_received_tick: tick,
+            page_received_tick: 0,
         });
         entry.memo_filter = Some(filter);
         entry.memo_received_tick = tick;
+    }
+
+    fn upsert_page(&mut self, peer_addr: String, filter: BloomFilter, tick: u64) {
+        let entry = self.filters.entry(peer_addr).or_insert(PeerFilter {
+            content_filter: None,
+            flatpack_filter: None,
+            memo_filter: None,
+            page_filter: None,
+            content_received_tick: 0,
+            flatpack_received_tick: 0,
+            memo_received_tick: 0,
+            page_received_tick: tick,
+        });
+        entry.page_filter = Some(filter);
+        entry.page_received_tick = tick;
     }
 
     /// Returns true if the peer should be queried (no filter, stale filter, or filter says "maybe").
@@ -388,6 +411,28 @@ impl PeerFilterTable {
         }
     }
 
+    /// Returns true if the peer should be queried for page addresses.
+    fn should_query_page(
+        &self,
+        peer_addr: &str,
+        page_addr: &harmony_athenaeum::PageAddr,
+        current_tick: u64,
+    ) -> bool {
+        match self.filters.get(peer_addr) {
+            None => true,
+            Some(pf) => {
+                if current_tick.saturating_sub(pf.page_received_tick) > self.staleness_ticks {
+                    true
+                } else {
+                    match &pf.page_filter {
+                        Some(bf) => bf.may_contain_bytes(&page_addr.to_bytes()),
+                        None => true,
+                    }
+                }
+            }
+        }
+    }
+
     /// Evict peers where all filters are stale.
     fn evict_stale(&mut self, current_tick: u64) {
         self.filters.retain(|_, pf| {
@@ -397,7 +442,9 @@ impl PeerFilterTable {
                 current_tick.saturating_sub(pf.flatpack_received_tick) <= self.staleness_ticks;
             let memo_fresh =
                 current_tick.saturating_sub(pf.memo_received_tick) <= self.staleness_ticks;
-            content_fresh || flatpack_fresh || memo_fresh
+            let page_fresh =
+                current_tick.saturating_sub(pf.page_received_tick) <= self.staleness_ticks;
+            content_fresh || flatpack_fresh || memo_fresh || page_fresh
         });
     }
 }
@@ -3866,5 +3913,40 @@ mod tests {
             table.should_query_memo("peer-s", &cid, 20),
             "stale memo filter should fall back to querying"
         );
+    }
+
+    // ── Page filter tests ────────────────────────────────────────────────
+
+    #[test]
+    fn peer_page_filter_upsert_and_query() {
+        let mut table = PeerFilterTable::new(100);
+        let mut bf = BloomFilter::new(100, 0.01);
+        // hash_bits must fit in 28 bits (≤ 0x0FFF_FFFF)
+        let addr = harmony_athenaeum::PageAddr::new(0x0EADBEE, harmony_athenaeum::Algorithm::Sha256Msb);
+        bf.insert_bytes(&addr.to_bytes());
+
+        table.upsert_page("peer-a".to_string(), bf, 10);
+
+        // Should find the inserted address
+        assert!(table.should_query_page("peer-a", &addr, 10));
+        // Should NOT find a different address
+        let other = harmony_athenaeum::PageAddr::new(0x0AFEBAB, harmony_athenaeum::Algorithm::Sha256Msb);
+        assert!(!table.should_query_page("peer-a", &other, 10));
+        // Unknown peer → always query
+        assert!(table.should_query_page("peer-b", &addr, 10));
+    }
+
+    #[test]
+    fn peer_page_filter_staleness() {
+        let mut table = PeerFilterTable::new(100);
+        let mut bf = BloomFilter::new(100, 0.01);
+        // hash_bits must fit in 28 bits (≤ 0x0FFF_FFFF)
+        let addr = harmony_athenaeum::PageAddr::new(0x0EADBEE, harmony_athenaeum::Algorithm::Sha256Msb);
+        bf.insert_bytes(&addr.to_bytes());
+        table.upsert_page("peer-a".to_string(), bf, 10);
+
+        // At tick 10 + 101 = 111, the filter is stale → should query even for absent items
+        let absent = harmony_athenaeum::PageAddr::new(0x00000000, harmony_athenaeum::Algorithm::Sha256Msb);
+        assert!(table.should_query_page("peer-a", &absent, 111));
     }
 }

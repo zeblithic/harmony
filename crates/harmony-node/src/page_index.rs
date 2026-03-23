@@ -102,6 +102,14 @@ impl PageIndex {
     pub fn is_empty(&self) -> bool {
         self.total == 0
     }
+
+    /// Iterate over all indexed mode-00 (Sha256Msb) page addresses.
+    ///
+    /// Used by the page Bloom filter builder to enumerate local page addresses
+    /// without exposing the internal HashMap.
+    pub fn addr00_iter(&self) -> impl Iterator<Item = &PageAddr> {
+        self.by_addr00.keys()
+    }
 }
 
 #[cfg(test)]
