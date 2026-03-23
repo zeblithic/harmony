@@ -281,4 +281,31 @@ mod tests {
             .join()
             .expect("thread panicked");
     }
+
+    #[test]
+    fn forged_ed25519_announce_rejected() {
+        let real_owner = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let attacker = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+
+        let real_pub = real_owner.public_identity();
+        let attacker_pub = attacker.public_identity();
+
+        // Build announce with real_owner's identity_hash but attacker's keys
+        let builder = AnnounceBuilder::new(
+            IdentityRef::from(real_pub),
+            attacker_pub.verifying_key.to_bytes().to_vec(),
+            attacker_pub.encryption_key.as_bytes().to_vec(),
+            1000,
+            2000,
+            [0u8; 16],
+        );
+        let payload = builder.signable_payload();
+        let sig = attacker.sign(&payload);
+        let record = builder.build(sig.to_vec());
+
+        assert_eq!(
+            verify_announce(&record, 1500).unwrap_err(),
+            DiscoveryError::AddressMismatch
+        );
+    }
 }
