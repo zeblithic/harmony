@@ -853,6 +853,11 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Each Zenoh reply becomes a separate MemoFetchResponse event.
     /// Multiple peers may respond — all are processed independently.
     fn handle_memo_fetch_response(&mut self, key_expr: &str, payload: &[u8], unix_now: u64) {
+        // Note: we intentionally do NOT check pending_memo_fetches here.
+        // Responses may arrive after timeout expiry, and accepting any
+        // verified memo is harmless (memos are self-certifying). The dedup
+        // map only prevents re-issuing QueryMemo, not response processing.
+        //
         // 1. Parse input_cid from key_expr
         let input_hex = match key_expr
             .strip_prefix(harmony_zenoh::namespace::memo::PREFIX)
@@ -1270,7 +1275,7 @@ impl<B: BookStore> NodeRuntime<B> {
 
         // Expire in-flight memo fetches that have timed out.
         self.pending_memo_fetches.retain(|_, started| {
-            self.tick_count.saturating_sub(*started) <= MEMO_FETCH_TIMEOUT_TICKS
+            self.tick_count.saturating_sub(*started) < MEMO_FETCH_TIMEOUT_TICKS
         });
 
         let mut actions = Vec::new();
@@ -4519,7 +4524,7 @@ mod tests {
         rt.tick();
 
         // Advance past timeout
-        for _ in 0..=MEMO_FETCH_TIMEOUT_TICKS {
+        for _ in 0..MEMO_FETCH_TIMEOUT_TICKS {
             rt.push_event(RuntimeEvent::TimerTick { now: 0 });
             rt.tick();
         }
