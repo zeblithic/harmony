@@ -89,15 +89,18 @@ Per the did:key spec:
 2. Verify multibase prefix is `z` (base58btc)
 3. Base58-decode the remainder
 4. Read unsigned varint (LEB128) multicodec prefix
-5. Map multicodec → CryptoSuite:
-   - `0x00ed` → Ed25519 (expect 32 remaining bytes)
-   - `0x1211` → MlDsa65 (expect 1952 remaining bytes)
+5. Map the reconstructed multicodec integer → CryptoSuite:
+   - `0x00ed` → Ed25519 (LEB128 wire bytes: `[0xed, 0x01]`)
+   - `0x1211` → MlDsa65 (LEB128 wire bytes: `[0x91, 0x24]`)
    - other → `UnknownMulticodec`
 6. Return remaining bytes as `public_key`
 
 This is the exact inverse of `identity_to_did_key` from
-harmony-credential's JSON-LD bridge. The varint decoding is
-the reverse of the encoding already implemented there.
+harmony-credential's JSON-LD bridge. Uses
+`CryptoSuite::from_signing_multicodec()` which maps `0x1211`
+to `MlDsa65` (not `MlDsa65Rotatable` — the round-trip is
+intentionally lossy, matching `crypto_suite.rs`'s
+`multicodec_round_trip_lossy_for_rotatable` test).
 
 ### Key Length Validation
 
@@ -105,6 +108,7 @@ After extracting the multicodec and key bytes, validate the key
 length matches the expected size for the suite:
 - Ed25519: exactly 32 bytes
 - MlDsa65: exactly 1952 bytes
+- (MlDsa65Rotatable is decoded as MlDsa65 — same multicodec)
 
 Mismatch returns `MalformedDid`.
 
@@ -123,12 +127,13 @@ Per the did:jwk spec (requires `std` for JSON parsing):
 
 ## Dependencies
 
-- `bs58` — base58btc decoding for did:key (already a workspace dep)
+- `bs58` — base58btc decoding for did:key. Must be added to
+  `[workspace.dependencies]` in root `Cargo.toml` (currently
+  only a direct dep in harmony-credential) and to
+  `harmony-identity/Cargo.toml`.
 - `base64` — base64url decoding for did:jwk (already a workspace dep)
 - `serde_json` — JWK parsing for did:jwk (behind `std`, already
   a workspace dep)
-
-No new dependencies needed.
 
 ## Testing
 
