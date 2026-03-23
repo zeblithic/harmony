@@ -14,3 +14,9 @@ pub use parse::parse;
 pub use types::{Disclosure, JwsHeader, JwtPayload, SdJwt};
 #[cfg(feature = "std")]
 pub use verify::{verify, verify_from_header};
+
+#[cfg(feature = "credential")]
+pub mod claims;
+
+#[cfg(feature = "credential")]
+pub use claims::{map_claims, verify_disclosures};
