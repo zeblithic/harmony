@@ -1208,9 +1208,10 @@ impl<B: BookStore> NodeRuntime<B> {
 
     /// Validate a PullWithToken request and emit a PullResponse if authorized.
     ///
-    /// 8-step validation: deserialize token, check capability==Content,
-    /// check resource==cid, check expiry, check not-before, verify
-    /// ML-DSA-65 signature, check audience==peer_identity, retrieve replica.
+    /// 9-step validation: (0) reject oversized payload, (1) deserialize token,
+    /// (2) check capability==Content, (3) check resource==cid, (4) check expiry,
+    /// (5) check not-before, (6) verify ML-DSA-65 signature,
+    /// (7) check audience==peer_identity, (8) retrieve replica.
     /// `unix_now` is Unix epoch seconds, injected by the caller for sans-I/O
     /// testability. The event loop computes this from `SystemTime::now()`.
     fn handle_pull_with_token(
