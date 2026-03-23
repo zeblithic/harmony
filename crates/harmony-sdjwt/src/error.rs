@@ -12,6 +12,15 @@ pub enum SdJwtError {
     InvalidDisclosure,
     /// The `typ` header is missing or not `"sd+jwt"` (RFC 9901 §3.3).
     WrongTokenType,
+    /// A disclosure's hash does not appear in the signed `_sd` list.
+    #[cfg(feature = "credential")]
+    DisclosureHashMismatch,
+    /// The same disclosure was presented more than once.
+    #[cfg(feature = "credential")]
+    DuplicateDisclosure,
+    /// Decoded salt is shorter than 16 bytes (RFC 9901 §5.2.1).
+    #[cfg(feature = "credential")]
+    SaltTooShort,
     SignatureInvalid(harmony_identity::IdentityError),
 }
 
@@ -31,6 +40,14 @@ impl core::fmt::Display for SdJwtError {
                 )
             }
             Self::WrongTokenType => write!(f, "typ header must be \"sd+jwt\" (RFC 9901 §3.3)"),
+            #[cfg(feature = "credential")]
+            Self::DisclosureHashMismatch => {
+                write!(f, "disclosure hash not found in signed _sd list")
+            }
+            #[cfg(feature = "credential")]
+            Self::DuplicateDisclosure => write!(f, "same disclosure presented more than once"),
+            #[cfg(feature = "credential")]
+            Self::SaltTooShort => write!(f, "decoded salt shorter than 16 bytes (RFC 9901 §5.2.1)"),
             Self::SignatureInvalid(e) => write!(f, "signature verification failed: {e}"),
         }
     }
