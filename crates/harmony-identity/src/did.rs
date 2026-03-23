@@ -120,8 +120,10 @@ pub fn resolve_did_key(encoded: &str) -> Result<ResolvedDid, DidError> {
     // Read LEB128 varint multicodec prefix
     let (codec, varint_len) = decode_varint(&bytes)?;
 
-    // Map multicodec to CryptoSuite
-    let suite = CryptoSuite::from_signing_multicodec(codec as u16)
+    // Map multicodec to CryptoSuite (safe u32→u16 conversion)
+    let suite = u16::try_from(codec)
+        .ok()
+        .and_then(CryptoSuite::from_signing_multicodec)
         .ok_or(DidError::UnknownMulticodec(codec))?;
 
     let key_bytes = &bytes[varint_len..];
@@ -188,7 +190,7 @@ pub fn resolve_did_jwk(encoded: &str) -> Result<ResolvedDid, DidError> {
                 public_key: key_bytes,
             })
         }
-        _ => Err(DidError::UnsupportedMethod(format!(
+        _ => Err(DidError::MalformedDid(format!(
             "unsupported JWK key type: kty={kty}, crv={crv:?}"
         ))),
     }
@@ -209,6 +211,15 @@ fn decode_varint(bytes: &[u8]) -> Result<(u32, usize), DidError> {
         }
 
         let value = (byte & 0x7F) as u32;
+
+        // On the 5th byte (shift=28), only 4 bits remain in u32.
+        // Reject if bits 4-6 are set (would overflow).
+        if shift == 28 && value > 0x0F {
+            return Err(DidError::MalformedDid(String::from(
+                "varint too large for u32",
+            )));
+        }
+
         result |= value << shift;
         shift += 7;
 
@@ -420,6 +431,6 @@ mod jwk_tests {
         let jwk_json = r#"{"kty":"EC","crv":"P-256","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#;
         let encoded = URL_SAFE_NO_PAD.encode(jwk_json.as_bytes());
         let err = resolve_did_jwk(&encoded).unwrap_err();
-        assert!(matches!(err, DidError::UnsupportedMethod(_)));
+        assert!(matches!(err, DidError::MalformedDid(_)));
     }
 }
