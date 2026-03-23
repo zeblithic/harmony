@@ -42,8 +42,14 @@ pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<Vec<&Disclosure>, SdJwtError
     }
 
     let sd_set = &sd_jwt.payload.sd;
+    let mut seen = alloc::collections::BTreeSet::new();
 
     for disclosure in &sd_jwt.disclosures {
+        // Reject duplicate disclosures (holder must present each at most once).
+        if !seen.insert(&disclosure.raw) {
+            return Err(SdJwtError::DisclosureHashMismatch);
+        }
+
         let digest = disclosure_digest(&disclosure.raw);
         if !sd_set.contains(&digest) {
             return Err(SdJwtError::DisclosureHashMismatch);
@@ -72,7 +78,7 @@ fn disclosure_digest(raw: &str) -> String {
 /// - **salt**: base64url-decoded from the disclosure salt string, zero-padded
 ///   or truncated to 16 bytes.
 /// - **value**: the `claim_value` bytes from the disclosure.
-pub fn map_claims(disclosures: &[&Disclosure]) -> Vec<SaltedClaim> {
+pub fn map_claims(disclosures: &[&Disclosure]) -> Result<Vec<SaltedClaim>, SdJwtError> {
     disclosures
         .iter()
         .map(|d| {
@@ -80,13 +86,13 @@ pub fn map_claims(disclosures: &[&Disclosure]) -> Vec<SaltedClaim> {
                 Some(name) => vocabulary_type_id(name),
                 None => 0x0000, // array element
             };
-            SaltedClaim {
+            Ok(SaltedClaim {
                 claim: Claim {
                     type_id,
                     value: d.claim_value.clone(),
                 },
-                salt: decode_salt(&d.salt),
-            }
+                salt: decode_salt(&d.salt)?,
+            })
         })
         .collect()
 }
@@ -115,17 +121,18 @@ fn vocabulary_type_id(name: &str) -> u16 {
 
 /// Decode the salt string from base64url into a fixed `[u8; 16]` buffer.
 ///
-/// If the string is not valid base64url, falls back to raw UTF-8 bytes.
-/// The result is zero-padded or truncated to exactly 16 bytes.
-fn decode_salt(salt_str: &str) -> [u8; 16] {
+/// Base64url-decode the salt string, zero-pad or truncate to 16 bytes.
+///
+/// Returns `Err(Base64Error)` if the salt is not valid base64url.
+fn decode_salt(salt_str: &str) -> Result<[u8; 16], SdJwtError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(salt_str)
-        .unwrap_or_else(|_| salt_str.as_bytes().to_vec());
+        .map_err(|_| SdJwtError::Base64Error)?;
 
     let mut buf = [0u8; 16];
     let len = bytes.len().min(16);
     buf[..len].copy_from_slice(&bytes[..len]);
-    buf
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +229,19 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_duplicate_disclosure() {
+        let (raw, digest) = make_disclosure_with_digest(r#"["salt","given_name","Alice"]"#);
+        let disc = disclosure_from_raw(&raw, "salt", Some("given_name"), "\"Alice\"");
+
+        // Same disclosure presented twice
+        let sd_jwt = make_test_sdjwt(vec![digest], vec![disc.clone(), disc]);
+        assert!(matches!(
+            verify_disclosures(&sd_jwt),
+            Err(SdJwtError::DisclosureHashMismatch)
+        ));
+    }
+
+    #[test]
     fn verify_empty_disclosures_ok() {
         let sd_jwt = make_test_sdjwt(vec![], vec![]);
         let result = verify_disclosures(&sd_jwt);
@@ -253,7 +273,7 @@ mod tests {
     fn map_known_vocabulary_claims() {
         let d = disclosure_from_raw("raw", "c2FsdA", Some("given_name"), r#""Alice""#);
         let refs: Vec<&Disclosure> = vec![&d];
-        let claims = map_claims(&refs);
+        let claims = map_claims(&refs).unwrap();
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].claim.type_id, 0x0100);
         assert_eq!(claims[0].claim.value, br#""Alice""#);
@@ -263,7 +283,7 @@ mod tests {
     fn map_unknown_claim_gets_hash_derived_id() {
         let d = disclosure_from_raw("raw", "c2FsdA", Some("custom_field"), r#""value""#);
         let refs: Vec<&Disclosure> = vec![&d];
-        let claims = map_claims(&refs);
+        let claims = map_claims(&refs).unwrap();
         assert_eq!(claims.len(), 1);
         // High bit must be set for unknown claims.
         assert_ne!(claims[0].claim.type_id & 0x8000, 0);
@@ -274,7 +294,7 @@ mod tests {
         // Array element disclosures have no claim_name.
         let d = disclosure_from_raw("raw", "c2FsdA", None, r#""item""#);
         let refs: Vec<&Disclosure> = vec![&d];
-        let claims = map_claims(&refs);
+        let claims = map_claims(&refs).unwrap();
         assert_eq!(claims[0].claim.type_id, 0x0000);
     }
 
@@ -283,7 +303,7 @@ mod tests {
         // "c2FsdA" is base64url for "salt" = [115, 97, 108, 116]
         let d = disclosure_from_raw("raw", "c2FsdA", Some("email"), r#""a@b""#);
         let refs: Vec<&Disclosure> = vec![&d];
-        let claims = map_claims(&refs);
+        let claims = map_claims(&refs).unwrap();
         let expected: [u8; 16] = [115, 97, 108, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(claims[0].salt, expected);
     }
@@ -296,7 +316,7 @@ mod tests {
         let salt_str = URL_SAFE_NO_PAD.encode(&long_bytes);
         let d = disclosure_from_raw("raw", &salt_str, Some("email"), r#""x""#);
         let refs: Vec<&Disclosure> = vec![&d];
-        let claims = map_claims(&refs);
+        let claims = map_claims(&refs).unwrap();
         let expected: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         assert_eq!(claims[0].salt, expected);
     }
@@ -304,10 +324,10 @@ mod tests {
     #[test]
     fn map_hash_derived_deterministic() {
         // Same unknown name must always produce the same type_id.
-        let d1 = disclosure_from_raw("r1", "s", Some("foo_bar"), r#""a""#);
-        let d2 = disclosure_from_raw("r2", "s", Some("foo_bar"), r#""b""#);
+        let d1 = disclosure_from_raw("r1", "c2FsdA", Some("foo_bar"), r#""a""#);
+        let d2 = disclosure_from_raw("r2", "c2FsdA", Some("foo_bar"), r#""b""#);
         let refs: Vec<&Disclosure> = vec![&d1, &d2];
-        let claims = map_claims(&refs);
+        let claims = map_claims(&refs).unwrap();
         assert_eq!(claims[0].claim.type_id, claims[1].claim.type_id);
         assert_ne!(claims[0].claim.type_id & 0x8000, 0);
     }

@@ -12,7 +12,9 @@ pub enum SdJwtError {
     InvalidDisclosure,
     /// The `typ` header is missing or not `"sd+jwt"` (RFC 9901 §3.3).
     WrongTokenType,
-    /// A disclosure's hash does not appear in the signed `_sd` list.
+    /// A disclosure's hash does not appear in the signed `_sd` list,
+    /// or a duplicate disclosure was detected.
+    #[cfg(feature = "credential")]
     DisclosureHashMismatch,
     SignatureInvalid(harmony_identity::IdentityError),
 }
@@ -33,6 +35,7 @@ impl core::fmt::Display for SdJwtError {
                 )
             }
             Self::WrongTokenType => write!(f, "typ header must be \"sd+jwt\" (RFC 9901 §3.3)"),
+            #[cfg(feature = "credential")]
             Self::DisclosureHashMismatch => {
                 write!(f, "disclosure hash not found in signed _sd list")
             }
