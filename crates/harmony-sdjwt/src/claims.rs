@@ -43,7 +43,7 @@ pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<VerifiedDisclosures<'_>, SdJ
         return Ok(VerifiedDisclosures(Vec::new()));
     }
 
-    // Build a BTreeSet for O(k + m) lookup instead of O(k × m) linear scan.
+    // Build a BTreeSet for O((k + m) log m) lookup instead of O(k × m) linear scan.
     let sd_set: alloc::collections::BTreeSet<&String> =
         sd_jwt.payload.sd.iter().collect();
     let mut seen = alloc::collections::BTreeSet::new();
@@ -151,15 +151,20 @@ fn vocabulary_type_id(name: &str) -> u16 {
 ///
 /// Base64url-decode the salt string, zero-pad or truncate to 16 bytes.
 ///
-/// Returns `Err(Base64Error)` if the salt is not valid base64url.
+/// Returns `Err(Base64Error)` if the salt is not valid base64url or
+/// if the decoded salt is shorter than 16 bytes (RFC 9901 §5.2.1
+/// requires at least 128 bits of entropy).
 fn decode_salt(salt_str: &str) -> Result<[u8; 16], SdJwtError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(salt_str)
         .map_err(|_| SdJwtError::Base64Error)?;
 
+    if bytes.len() < 16 {
+        return Err(SdJwtError::Base64Error);
+    }
+
     let mut buf = [0u8; 16];
-    let len = bytes.len().min(16);
-    buf[..len].copy_from_slice(&bytes[..len]);
+    buf.copy_from_slice(&bytes[..16]);
     Ok(buf)
 }
 
@@ -299,7 +304,7 @@ mod tests {
 
     #[test]
     fn map_known_vocabulary_claims() {
-        let d = disclosure_from_raw("raw", "c2FsdA", Some("given_name"), r#""Alice""#);
+        let d = disclosure_from_raw("raw", "MDEyMzQ1Njc4OWFiY2RlZg", Some("given_name"), r#""Alice""#);
         let verified = VerifiedDisclosures(vec![&d]);
         let claims = map_claims(&verified).unwrap();
         assert_eq!(claims.len(), 1);
@@ -309,7 +314,7 @@ mod tests {
 
     #[test]
     fn map_unknown_claim_gets_hash_derived_id() {
-        let d = disclosure_from_raw("raw", "c2FsdA", Some("custom_field"), r#""value""#);
+        let d = disclosure_from_raw("raw", "MDEyMzQ1Njc4OWFiY2RlZg", Some("custom_field"), r#""value""#);
         let verified = VerifiedDisclosures(vec![&d]);
         let claims = map_claims(&verified).unwrap();
         assert_eq!(claims.len(), 1);
@@ -320,7 +325,7 @@ mod tests {
     #[test]
     fn map_array_element_gets_zero_type_id() {
         // Array element disclosures have no claim_name.
-        let d = disclosure_from_raw("raw", "c2FsdA", None, r#""item""#);
+        let d = disclosure_from_raw("raw", "MDEyMzQ1Njc4OWFiY2RlZg", None, r#""item""#);
         let verified = VerifiedDisclosures(vec![&d]);
         let claims = map_claims(&verified).unwrap();
         assert_eq!(claims[0].claim.type_id, 0x0000);
@@ -328,12 +333,11 @@ mod tests {
 
     #[test]
     fn map_salt_base64_decoded() {
-        // "c2FsdA" is base64url for "salt" = [115, 97, 108, 116]
-        let d = disclosure_from_raw("raw", "c2FsdA", Some("email"), r#""a@b""#);
+        // "MDEyMzQ1Njc4OWFiY2RlZg" is base64url for "0123456789abcdef" (16 bytes)
+        let d = disclosure_from_raw("raw", "MDEyMzQ1Njc4OWFiY2RlZg", Some("email"), r#""a@b""#);
         let verified = VerifiedDisclosures(vec![&d]);
         let claims = map_claims(&verified).unwrap();
-        let expected: [u8; 16] = [115, 97, 108, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(claims[0].salt, expected);
+        assert_eq!(&claims[0].salt, b"0123456789abcdef");
     }
 
     #[test]
@@ -352,8 +356,8 @@ mod tests {
     #[test]
     fn map_hash_derived_deterministic() {
         // Same unknown name must always produce the same type_id.
-        let d1 = disclosure_from_raw("r1", "c2FsdA", Some("foo_bar"), r#""a""#);
-        let d2 = disclosure_from_raw("r2", "c2FsdA", Some("foo_bar"), r#""b""#);
+        let d1 = disclosure_from_raw("r1", "MDEyMzQ1Njc4OWFiY2RlZg", Some("foo_bar"), r#""a""#);
+        let d2 = disclosure_from_raw("r2", "MDEyMzQ1Njc4OWFiY2RlZg", Some("foo_bar"), r#""b""#);
         let verified = VerifiedDisclosures(vec![&d1, &d2]);
         let claims = map_claims(&verified).unwrap();
         assert_eq!(claims[0].claim.type_id, claims[1].claim.type_id);
