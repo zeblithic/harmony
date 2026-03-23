@@ -1085,6 +1085,11 @@ async fn dispatch_action(
                 "serving replicated content via token (stub — tunnel routing not yet wired)"
             );
         }
+        RuntimeAction::QueryMemo { key_expr } => {
+            // TODO: implement in Task 3 — issue a Zenoh session.get() for the memo key
+            // and feed each reply back as RuntimeEvent::MemoFetchResponse.
+            tracing::debug!(%key_expr, "QueryMemo (stub — not yet wired)");
+        }
     }
 }
 

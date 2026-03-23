@@ -27,6 +27,15 @@ use harmony_zenoh::namespace::content as content_ns;
 use harmony_zenoh::namespace::{announce as announce_ns, page as page_ns};
 use harmony_zenoh::queryable::{QueryableAction, QueryableEvent, QueryableId, QueryableRouter};
 
+/// Ticks before an in-flight memo fetch expires (20 × 250ms = 5s).
+const MEMO_FETCH_TIMEOUT_TICKS: u64 = 20;
+
+/// Maximum number of memos in a single query response.
+const MAX_MEMO_RESPONSE_COUNT: usize = 256;
+
+/// Maximum total response payload size (1 MiB).
+const MAX_MEMO_RESPONSE_BYTES: usize = 1_048_576;
+
 /// Configuration for a Harmony node runtime.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -201,6 +210,17 @@ pub enum RuntimeEvent {
         identity_hash: [u8; 16],
         dsa_pubkey: Vec<u8>,
     },
+
+    /// Memo fetch: caller requests memos for an input CID.
+    MemoFetchRequest { input: ContentId },
+
+    /// Memo fetch: Zenoh query reply arrived with memo data.
+    /// `unix_now` is Unix epoch seconds — injected by the event loop for sans-I/O testability.
+    MemoFetchResponse {
+        key_expr: String,
+        payload: Vec<u8>,
+        unix_now: u64,
+    },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -250,6 +270,10 @@ pub enum RuntimeAction {
         cid: [u8; 32],
         data: Vec<u8>,
     },
+    /// Memo fetch: emit a Zenoh session.get() query for memos.
+    /// The event loop calls session.get(key_expr) and feeds each reply
+    /// back as RuntimeEvent::MemoFetchResponse.
+    QueryMemo { key_expr: String },
 }
 
 /// Filter state received from a peer, with metadata.
@@ -546,6 +570,11 @@ pub struct NodeRuntime<B: BookStore> {
     // verify_announce() before reaching this point — forged announces
     // are rejected with DiscoveryError::AddressMismatch.
     pubkey_cache: HashMap<[u8; 16], Vec<u8>>,
+    // Queryable ID for the memo namespace (harmony/memo/**)
+    memo_queryable_id: QueryableId,
+    // In-flight memo fetches: input CID → tick when fetch was started.
+    // Prevents re-querying for the same input while a fetch is in-flight.
+    pending_memo_fetches: HashMap<ContentId, u64>,
 }
 
 impl<B: BookStore> NodeRuntime<B> {
@@ -629,6 +658,14 @@ impl<B: BookStore> NodeRuntime<B> {
             key_expr: page_ns::SUB.to_string(),
         });
 
+        // Memo namespace: register queryable for memo lookups.
+        let (memo_qid, _) = queryable_router
+            .declare(harmony_zenoh::namespace::memo::SUB)
+            .expect("static key expression must be valid");
+        actions.push(RuntimeAction::DeclareQueryable {
+            key_expr: harmony_zenoh::namespace::memo::SUB.to_string(),
+        });
+
         // Subscribe to peer filter broadcasts.
         actions.push(RuntimeAction::Subscribe {
             key_expr: harmony_zenoh::namespace::filters::CONTENT_SUB.to_string(),
@@ -682,6 +719,8 @@ impl<B: BookStore> NodeRuntime<B> {
             indexed_book_cids: HashSet::new(),
             page_queryable_id: page_qid,
             pubkey_cache: HashMap::new(),
+            memo_queryable_id: memo_qid,
+            pending_memo_fetches: HashMap::new(),
         };
 
         (rt, actions)
@@ -774,6 +813,14 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Maximum number of cached public keys. Each ML-DSA-65 pubkey is ~1952 bytes,
     /// so 4096 entries ≈ 8 MB — acceptable for long-running nodes.
     const MAX_PUBKEY_CACHE_SIZE: usize = 4096;
+
+    fn handle_memo_fetch_request(&mut self, _input: ContentId) {
+        // TODO: implement in Task 3
+    }
+
+    fn handle_memo_fetch_response(&mut self, _key_expr: &str, _payload: &[u8], _unix_now: u64) {
+        // TODO: implement in Task 3
+    }
 
     /// Insert a public key into the cache, evicting a random entry if at capacity.
     fn insert_pubkey_capped(&mut self, identity_hash: [u8; 16], pubkey: Vec<u8>) {
@@ -1085,6 +1132,16 @@ impl<B: BookStore> NodeRuntime<B> {
                 if !dsa_pubkey.is_empty() {
                     self.insert_pubkey_capped(identity_hash, dsa_pubkey);
                 }
+            }
+            RuntimeEvent::MemoFetchRequest { input } => {
+                self.handle_memo_fetch_request(input);
+            }
+            RuntimeEvent::MemoFetchResponse {
+                key_expr,
+                payload,
+                unix_now,
+            } => {
+                self.handle_memo_fetch_response(&key_expr, &payload, unix_now);
             }
         }
     }
@@ -2208,6 +2265,14 @@ mod tests {
             node_id: [0u8; 32],
             relay_url: Some("https://iroh.q8.fyi".into()),
         };
+        let _e_mfr = RuntimeEvent::MemoFetchRequest {
+            input: ContentId::from_bytes([0u8; 32]),
+        };
+        let _e_mfp = RuntimeEvent::MemoFetchResponse {
+            key_expr: "harmony/memo/aa/**".into(),
+            payload: vec![],
+            unix_now: 1000,
+        };
     }
 
     #[test]
@@ -2232,6 +2297,9 @@ mod tests {
         };
         let _a6 = RuntimeAction::Subscribe {
             key_expr: "harmony/content/transit/**".into(),
+        };
+        let _a_qm = RuntimeAction::QueryMemo {
+            key_expr: "harmony/memo/aa/**".into(),
         };
     }
 
@@ -2272,8 +2340,8 @@ mod tests {
             .filter(|a| matches!(a, RuntimeAction::Subscribe { .. }))
             .count();
 
-        // 16 shard queryables + 1 stats queryable + 1 compute activity queryable + 1 page queryable = 19
-        assert_eq!(queryable_count, 19);
+        // 16 shard queryables + 1 stats queryable + 1 compute activity queryable + 1 page queryable + 1 memo queryable = 20
+        assert_eq!(queryable_count, 20);
         // transit + publish + content filter + flatpack filter + memo filter + page filter subscriptions = 6
         assert_eq!(subscribe_count, 6);
     }
