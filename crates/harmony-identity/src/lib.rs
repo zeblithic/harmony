@@ -18,6 +18,9 @@ pub use did::{
 };
 #[cfg(feature = "std")]
 pub use did::{parse_jwk_value, resolve_did_jwk};
+pub use did_document::did_web_to_url;
+#[cfg(feature = "std")]
+pub use did_document::{parse_did_document, WebDidFetcher, WebDidResolver};
 pub use error::IdentityError;
 pub use identity::{Identity, IdentityHash, PrivateIdentity};
 pub use identity_ref::IdentityRef;

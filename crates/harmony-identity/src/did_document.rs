@@ -155,6 +155,54 @@ pub fn parse_did_document(
     })
 }
 
+/// Trait for fetching HTTP resources. Injected by the caller to preserve sans-I/O.
+#[cfg(feature = "std")]
+pub trait WebDidFetcher {
+    fn fetch(&self, url: &str) -> Result<alloc::vec::Vec<u8>, DidError>;
+}
+
+/// A [`crate::did::DidResolver`] that supports `did:key`, `did:jwk`, and `did:web`.
+#[cfg(feature = "std")]
+pub struct WebDidResolver<F: WebDidFetcher> {
+    fetcher: F,
+}
+
+#[cfg(feature = "std")]
+impl<F: WebDidFetcher> WebDidResolver<F> {
+    pub fn new(fetcher: F) -> Self {
+        Self { fetcher }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<F: WebDidFetcher> crate::did::DidResolver for WebDidResolver<F> {
+    fn resolve(&self, did: &str) -> Result<crate::did::ResolvedDid, DidError> {
+        if did.starts_with("did:web:") {
+            let doc = self.resolve_document(did)?;
+            doc.verification_methods
+                .into_iter()
+                .next()
+                .ok_or(DidError::NoSupportedKeys)
+        } else {
+            crate::did::resolve_did(did)
+        }
+    }
+
+    fn resolve_document(&self, did: &str) -> Result<crate::did::ResolvedDidDocument, DidError> {
+        if did.starts_with("did:web:") {
+            let url = did_web_to_url(did)?;
+            let bytes = self.fetcher.fetch(&url)?;
+            parse_did_document(did, &bytes)
+        } else {
+            let resolved = crate::did::resolve_did(did)?;
+            Ok(crate::did::ResolvedDidDocument {
+                id: alloc::string::String::from(did),
+                verification_methods: alloc::vec![resolved],
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +383,96 @@ mod tests {
             }}"#
             );
             assert!(parse_did_document(did, json.as_bytes()).is_err());
+        }
+    }
+
+    #[cfg(feature = "std")]
+    mod resolver_tests {
+        use super::super::*;
+        use base64::Engine as _;
+        use crate::did::{DidError, DidResolver};
+        use crate::crypto_suite::CryptoSuite;
+
+        struct MockFetcher {
+            response: Result<alloc::vec::Vec<u8>, DidError>,
+        }
+
+        impl WebDidFetcher for MockFetcher {
+            fn fetch(&self, _url: &str) -> Result<alloc::vec::Vec<u8>, DidError> {
+                match &self.response {
+                    Ok(bytes) => Ok(bytes.clone()),
+                    Err(e) => Err(DidError::DecodingError(alloc::format!("{e:?}"))),
+                }
+            }
+        }
+
+        #[test]
+        fn web_resolver_resolves_did_web() {
+            let key_bytes = [42u8; 32];
+            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key_bytes);
+            let did = "did:web:example.com";
+            let json = alloc::format!(r#"{{
+                "@context": "https://www.w3.org/ns/did/v1",
+                "id": "{did}",
+                "verificationMethod": [{{
+                    "id": "{did}#key-1",
+                    "type": "JsonWebKey2020",
+                    "controller": "{did}",
+                    "publicKeyJwk": {{ "kty": "OKP", "crv": "Ed25519", "x": "{key_b64}" }}
+                }}]
+            }}"#);
+            let fetcher = MockFetcher { response: Ok(json.into_bytes()) };
+            let resolver = WebDidResolver::new(fetcher);
+            let resolved = resolver.resolve(did).unwrap();
+            assert_eq!(resolved.suite, CryptoSuite::Ed25519);
+            assert_eq!(resolved.public_key, key_bytes.to_vec());
+        }
+
+        #[test]
+        fn web_resolver_resolve_document_returns_all_keys() {
+            let key1 = [1u8; 32];
+            let key2 = [2u8; 32];
+            let b64_1 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key1);
+            let b64_2 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key2);
+            let did = "did:web:example.com";
+            let json = alloc::format!(r#"{{
+                "@context": "https://www.w3.org/ns/did/v1",
+                "id": "{did}",
+                "verificationMethod": [
+                    {{ "id": "{did}#k1", "type": "JsonWebKey2020", "controller": "{did}",
+                       "publicKeyJwk": {{ "kty": "OKP", "crv": "Ed25519", "x": "{b64_1}" }} }},
+                    {{ "id": "{did}#k2", "type": "JsonWebKey2020", "controller": "{did}",
+                       "publicKeyJwk": {{ "kty": "OKP", "crv": "Ed25519", "x": "{b64_2}" }} }}
+                ]
+            }}"#);
+            let resolver = WebDidResolver::new(MockFetcher { response: Ok(json.into_bytes()) });
+            let doc = resolver.resolve_document(did).unwrap();
+            assert_eq!(doc.verification_methods.len(), 2);
+        }
+
+        #[test]
+        fn web_resolver_falls_back_for_did_key() {
+            // Ed25519 multicodec 0x00ed = LEB128 [0xed, 0x01]
+            let key = [0xABu8; 32];
+            let mut payload = alloc::vec![0xed, 0x01];
+            payload.extend_from_slice(&key);
+            let encoded = alloc::format!("z{}", bs58::encode(&payload).into_string());
+            let did = alloc::format!("did:key:{encoded}");
+            let fetcher = MockFetcher {
+                response: Err(DidError::DecodingError("should not be called".into())),
+            };
+            let resolver = WebDidResolver::new(fetcher);
+            let resolved = resolver.resolve(&did).unwrap();
+            assert_eq!(resolved.suite, CryptoSuite::Ed25519);
+        }
+
+        #[test]
+        fn web_resolver_fetch_failure() {
+            let fetcher = MockFetcher {
+                response: Err(DidError::DecodingError("network error".into())),
+            };
+            let resolver = WebDidResolver::new(fetcher);
+            assert!(resolver.resolve("did:web:unreachable.example").is_err());
         }
     }
 }
