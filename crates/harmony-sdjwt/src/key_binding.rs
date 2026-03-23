@@ -32,8 +32,9 @@ use crate::types::SdJwt;
 /// 2. `typ` header is `kb+jwt` (or `application/kb+jwt`)
 /// 3. `nonce` matches `expected_nonce`
 /// 4. `aud` matches `expected_aud`
-/// 5. `iat` is not in the future (with 60-second skew tolerance)
-/// 6. `sd_hash` matches SHA-256 of the SD-JWT without the KB-JWT
+/// 5. `iat` is not in the future (60s skew) and not too old (300s max age)
+/// 6. `_sd_alg` is `sha-256` or absent (only SHA-256 supported)
+/// 7. `sd_hash` matches SHA-256 of the SD-JWT without the KB-JWT
 /// 7. Signature over the KB-JWT signing input verifies against `holder_key`
 pub fn verify_key_binding(
     sd_jwt: &SdJwt,
@@ -157,7 +158,14 @@ pub fn verify_key_binding(
         )));
     }
 
-    // 10. Reconstruct SD-JWT without KB-JWT and verify sd_hash.
+    // 10. Check _sd_alg — only sha-256 supported for sd_hash computation.
+    if let Some(ref alg) = sd_jwt.payload.sd_alg {
+        if alg != "sha-256" {
+            return Err(SdJwtError::UnsupportedAlgorithm(alg.clone()));
+        }
+    }
+
+    // 11. Reconstruct SD-JWT without KB-JWT and verify sd_hash.
     let sig_b64 = URL_SAFE_NO_PAD.encode(&sd_jwt.signature);
     let mut sd_jwt_without_kb = format!("{}.{}", sd_jwt.signing_input, sig_b64);
     for disc in &sd_jwt.disclosures {
