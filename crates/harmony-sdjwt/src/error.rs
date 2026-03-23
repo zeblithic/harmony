@@ -16,6 +16,9 @@ pub enum SdJwtError {
     /// or a duplicate disclosure was detected.
     #[cfg(feature = "credential")]
     DisclosureHashMismatch,
+    /// Decoded salt is shorter than 16 bytes (RFC 9901 §5.2.1).
+    #[cfg(feature = "credential")]
+    SaltTooShort,
     SignatureInvalid(harmony_identity::IdentityError),
 }
 
@@ -39,6 +42,8 @@ impl core::fmt::Display for SdJwtError {
             Self::DisclosureHashMismatch => {
                 write!(f, "disclosure hash not found in signed _sd list")
             }
+            #[cfg(feature = "credential")]
+            Self::SaltTooShort => write!(f, "decoded salt shorter than 16 bytes (RFC 9901 §5.2.1)"),
             Self::SignatureInvalid(e) => write!(f, "signature verification failed: {e}"),
         }
     }

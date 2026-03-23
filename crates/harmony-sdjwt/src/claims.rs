@@ -67,6 +67,7 @@ pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<VerifiedDisclosures<'_>, SdJ
 ///
 /// Can only be constructed by [`verify_disclosures`], ensuring that
 /// `map_claims` cannot be called on unverified disclosures.
+#[derive(Debug)]
 pub struct VerifiedDisclosures<'a>(Vec<&'a Disclosure>);
 
 impl<'a> VerifiedDisclosures<'a> {
@@ -130,6 +131,12 @@ pub fn map_claims(disclosures: &VerifiedDisclosures<'_>) -> Result<Vec<SaltedCla
 ///
 /// Returns a well-known `type_id` for recognised SD-JWT claim names,
 /// or a hash-derived ID with the high bit set for unknown names.
+///
+/// **Collision risk:** The hash-derived range uses 15 bits (32 768 values).
+/// Collisions become probable around ~181 unique unknown claim names
+/// (birthday paradox). Callers should not rely on hash-derived type_ids
+/// for unique identification — use the original `claim_name` string
+/// from the `Disclosure` when uniqueness matters.
 fn vocabulary_type_id(name: &str) -> u16 {
     match name {
         "given_name" => 0x0100,
@@ -151,8 +158,8 @@ fn vocabulary_type_id(name: &str) -> u16 {
 /// Decode the salt string from base64url into a fixed `[u8; 16]` buffer.
 ///
 /// Returns `Err(Base64Error)` if the salt is not valid base64url.
-/// Returns `Err(DisclosureHashMismatch)` if the decoded salt is shorter
-/// than 16 bytes (RFC 9901 §5.2.1 requires at least 128 bits of entropy).
+/// Returns `Err(SaltTooShort)` if the decoded salt is shorter than
+/// 16 bytes (RFC 9901 §5.2.1 requires at least 128 bits of entropy).
 /// Truncates to 16 bytes if longer.
 fn decode_salt(salt_str: &str) -> Result<[u8; 16], SdJwtError> {
     let bytes = URL_SAFE_NO_PAD
@@ -160,7 +167,7 @@ fn decode_salt(salt_str: &str) -> Result<[u8; 16], SdJwtError> {
         .map_err(|_| SdJwtError::Base64Error)?;
 
     if bytes.len() < 16 {
-        return Err(SdJwtError::DisclosureHashMismatch);
+        return Err(SdJwtError::SaltTooShort);
     }
 
     let mut buf = [0u8; 16];
@@ -362,5 +369,27 @@ mod tests {
         let claims = map_claims(&verified).unwrap();
         assert_eq!(claims[0].claim.type_id, claims[1].claim.type_id);
         assert_ne!(claims[0].claim.type_id & 0x8000, 0);
+    }
+
+    #[test]
+    fn map_salt_short_rejects() {
+        // 8 bytes → too short (minimum 16)
+        let short = URL_SAFE_NO_PAD.encode(&[0u8; 8]);
+        let d = disclosure_from_raw("raw", &short, Some("email"), r#""x""#);
+        let verified = VerifiedDisclosures(vec![&d]);
+        assert!(matches!(
+            map_claims(&verified),
+            Err(SdJwtError::SaltTooShort)
+        ));
+    }
+
+    #[test]
+    fn map_salt_invalid_base64_rejects() {
+        let d = disclosure_from_raw("raw", "not!!base64url!!!", Some("email"), r#""x""#);
+        let verified = VerifiedDisclosures(vec![&d]);
+        assert!(matches!(
+            map_claims(&verified),
+            Err(SdJwtError::Base64Error)
+        ));
     }
 }
