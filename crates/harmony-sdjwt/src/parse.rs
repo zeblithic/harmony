@@ -177,22 +177,25 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
             .collect::<Result<Vec<_>, _>>()?,
     };
 
-    let sd_alg = payload_json
-        .get("_sd_alg")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // RFC 9901 §5.1: _sd_alg MUST be a string when present.
+    let sd_alg: Option<String> = match payload_json.get("_sd_alg") {
+        None => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or(SdJwtError::MalformedCompact)?
+                .to_string(),
+        ),
+    };
 
     // Collect extra claims (everything that isn't a known field).
+    // payload_json is guaranteed to be an object by the is_object() guard above.
     let known_fields = ["iss", "sub", "iat", "exp", "nbf", "_sd", "_sd_alg"];
-    let extra: Vec<(String, serde_json::Value)> = payload_json
-        .as_object()
-        .map(|obj| {
-            obj.iter()
-                .filter(|(k, _)| !known_fields.contains(&k.as_str()))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let obj = payload_json.as_object().expect("guarded by is_object() above");
+    let extra: Vec<(String, serde_json::Value)> = obj
+        .iter()
+        .filter(|(k, _)| !known_fields.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     let payload = crate::types::JwtPayload {
         iss,
