@@ -421,6 +421,24 @@ pub mod identity {
     pub fn alive_key(address_hex: &str) -> String {
         format!("{PREFIX}/{address_hex}/alive")
     }
+
+    /// Zenoh key expressions for the did:web gateway.
+    pub mod web {
+        use alloc::format;
+        use alloc::string::String;
+
+        /// Wildcard matching all did:web gateway queries.
+        pub const ALL: &str = "harmony/identity/web/**";
+
+        /// Build a key expression for a specific did:web DID.
+        pub fn key(domain: &str, path: &str) -> String {
+            if path.is_empty() {
+                format!("{}/web/{}", super::PREFIX, domain)
+            } else {
+                format!("{}/web/{}/{}", super::PREFIX, domain, path)
+            }
+        }
+    }
 }
 
 /// Authenticated discovery queryable namespace.
@@ -925,6 +943,22 @@ mod tests {
         assert_eq!(identity::ALL_ANNOUNCES, "harmony/identity/*/announce");
         assert_eq!(identity::ALL_RESOLVES, "harmony/identity/*/resolve");
         assert_eq!(identity::ALL_ALIVE, "harmony/identity/*/alive");
+    }
+
+    #[test]
+    fn identity_web_key_root() {
+        assert_eq!(
+            identity::web::key("example.com", ""),
+            "harmony/identity/web/example.com"
+        );
+    }
+
+    #[test]
+    fn identity_web_key_with_path() {
+        assert_eq!(
+            identity::web::key("example.com", "issuers/1"),
+            "harmony/identity/web/example.com/issuers/1"
+        );
     }
 
     // ── Discover ────────────────────────────────────────────────
