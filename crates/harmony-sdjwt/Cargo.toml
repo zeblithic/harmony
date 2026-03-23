@@ -18,7 +18,8 @@ base64 = { workspace = true, features = ["alloc"] }
 [features]
 default = ["std"]
 std = ["dep:serde_json", "serde_json?/std", "harmony-identity/std", "base64/std"]
-credential = ["dep:sha2", "dep:harmony-credential", "dep:harmony-crypto", "std"]
+# Does NOT require std — all primitives work with no_std+alloc.
+credential = ["dep:sha2", "dep:harmony-credential", "dep:harmony-crypto"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

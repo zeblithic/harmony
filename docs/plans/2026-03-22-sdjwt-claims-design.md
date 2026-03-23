@@ -23,16 +23,22 @@ an optional dependency.
 
 ```toml
 [features]
-credential = ["dep:harmony-credential", "std"]
+credential = ["dep:sha2", "dep:harmony-credential", "dep:harmony-crypto"]
 ```
+
+Does NOT require `std` — all primitives work with `no_std + alloc`.
 
 ## Disclosure Hash Verification
 
 Per RFC 9901 §6.3:
 
 ```rust
-pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<Vec<&Disclosure>, SdJwtError>
+pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<VerifiedDisclosures<'_>, SdJwtError>
 ```
+
+`VerifiedDisclosures` is a newtype that can only be constructed by
+this function, ensuring `map_claims` cannot be called on unverified
+disclosures (type-level enforcement).
 
 For each disclosure in `sd_jwt.disclosures`:
 1. Compute `base64url_no_pad(SHA-256(ASCII_bytes(disclosure.raw)))`
@@ -64,7 +70,7 @@ algorithm used in practice). If `sd_alg` is present and not
 ## Claim Mapping
 
 ```rust
-pub fn map_claims(disclosures: &[&Disclosure]) -> Vec<harmony_credential::SaltedClaim>
+pub fn map_claims(disclosures: &VerifiedDisclosures<'_>) -> Result<Vec<SaltedClaim>, SdJwtError>
 ```
 
 For each verified disclosure:
@@ -103,7 +109,8 @@ encoded as ~22 characters). Harmony's `SaltedClaim` requires
 `[u8; 16]`:
 
 - Base64url-decode the salt string to get raw bytes
-- ≤ 16 bytes: zero-pad
+- < 16 bytes: return `Err(SaltTooShort)` — RFC 9901 §5.2.1 requires
+  at least 128 bits of entropy
 - \> 16 bytes: truncate to 16
 
 This is lossy. The original salt string is preserved in
