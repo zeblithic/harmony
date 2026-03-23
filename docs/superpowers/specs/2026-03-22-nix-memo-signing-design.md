@@ -58,7 +58,8 @@ harmony-node cid [--file PATH]
 - No `--file`: Read stdin to EOF, compute CID
 - Output: 64-char lowercase hex ContentId to stdout
 - Errors: empty input, file not found, read failure
-- Uses `ContentId::for_book(data, ContentFlags::default())`
+- Files ≤ `MAX_PAYLOAD_SIZE` (~1MB): `ContentId::for_book(data, ContentFlags::default())`
+- Files > `MAX_PAYLOAD_SIZE`: SHA-256 hash the data first, then `ContentId::for_book(&hash, ContentFlags::default())` — wraps the digest in a Book CID
 
 ### `deploy/memo-sign-build.sh`
 
