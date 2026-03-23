@@ -90,6 +90,16 @@ fn cid_deterministic() {
         .output()
         .unwrap();
 
+    assert!(
+        cid1.status.success(),
+        "first run failed; stderr: {}",
+        String::from_utf8_lossy(&cid1.stderr)
+    );
+    assert!(
+        cid2.status.success(),
+        "second run failed; stderr: {}",
+        String::from_utf8_lossy(&cid2.stderr)
+    );
     assert_eq!(cid1.stdout, cid2.stdout, "same input must produce same CID");
 }
 
