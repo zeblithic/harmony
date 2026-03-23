@@ -99,6 +99,9 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
 
     // Delegate JWS structure validation to split_jws (single source of truth).
     let jws = segments[0];
+    if jws.is_empty() {
+        return Err(SdJwtError::MalformedCompact);
+    }
     let (signing_input_ref, signature_b64) = split_jws(jws)?;
     let raw_signing_input = signing_input_ref.to_string();
     let (header_b64, payload_b64) = signing_input_ref
@@ -464,6 +467,13 @@ mod tests {
         assert_eq!(sd_jwt.signing_input, expected_si);
         // signing_input must NOT include the tilde segments
         assert!(!sd_jwt.signing_input.contains('~'));
+    }
+
+    #[test]
+    fn error_missing_jws_segment() {
+        // Compact starts with '~' — JWS part is absent.
+        assert!(matches!(parse("~disclosure"), Err(SdJwtError::MalformedCompact)));
+        assert!(matches!(parse("~"), Err(SdJwtError::MalformedCompact)));
     }
 
     #[test]
