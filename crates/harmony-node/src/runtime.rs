@@ -1634,38 +1634,40 @@ impl<B: BookStore> NodeRuntime<B> {
             return Vec::new();
         }
 
-        // Parse each segment: "*" → None, concrete → Some(parsed)
-        let parse_addr = |s: &str| -> Option<harmony_athenaeum::PageAddr> {
+        // Parse each segment: "*" → Ok(None) (wildcard), concrete → Ok(Some(val)),
+        // malformed → Err (reject entire query).
+        let parse_addr =
+            |s: &str| -> Result<Option<harmony_athenaeum::PageAddr>, ()> {
+                if s == "*" {
+                    return Ok(None);
+                }
+                let bytes = hex::decode(s).map_err(|_| ())?;
+                let arr: [u8; 4] = bytes.try_into().map_err(|_| ())?;
+                Ok(Some(harmony_athenaeum::PageAddr::from_bytes(arr)))
+            };
+
+        let parse_cid = |s: &str| -> Result<Option<ContentId>, ()> {
             if s == "*" {
-                return None;
+                return Ok(None);
             }
-            let bytes = hex::decode(s).ok()?;
-            let arr: [u8; 4] = bytes.try_into().ok()?;
-            Some(harmony_athenaeum::PageAddr::from_bytes(arr))
+            let bytes = hex::decode(s).map_err(|_| ())?;
+            let arr: [u8; 32] = bytes.try_into().map_err(|_| ())?;
+            Ok(Some(ContentId::from_bytes(arr)))
         };
 
-        let parse_cid = |s: &str| -> Option<ContentId> {
+        let parse_page_num = |s: &str| -> Result<Option<u8>, ()> {
             if s == "*" {
-                return None;
+                return Ok(None);
             }
-            let bytes = hex::decode(s).ok()?;
-            let arr: [u8; 32] = bytes.try_into().ok()?;
-            Some(ContentId::from_bytes(arr))
+            s.parse::<u8>().map(Some).map_err(|_| ())
         };
 
-        let parse_page_num = |s: &str| -> Option<u8> {
-            if s == "*" {
-                return None;
-            }
-            s.parse::<u8>().ok()
-        };
-
-        let addr_00 = parse_addr(segments[0]);
-        let addr_01 = parse_addr(segments[1]);
-        let addr_10 = parse_addr(segments[2]);
-        let addr_11 = parse_addr(segments[3]);
-        let book_cid = parse_cid(segments[4]);
-        let page_num = parse_page_num(segments[5]);
+        let Ok(addr_00) = parse_addr(segments[0]) else { return Vec::new() };
+        let Ok(addr_01) = parse_addr(segments[1]) else { return Vec::new() };
+        let Ok(addr_10) = parse_addr(segments[2]) else { return Vec::new() };
+        let Ok(addr_11) = parse_addr(segments[3]) else { return Vec::new() };
+        let Ok(book_cid) = parse_cid(segments[4]) else { return Vec::new() };
+        let Ok(page_num) = parse_page_num(segments[5]) else { return Vec::new() };
 
         let matches = self.page_index.match_query(
             addr_00.as_ref(),

@@ -39,6 +39,10 @@ impl PageIndex {
     /// Each data page is inserted under its mode-00 (Sha256Msb) address.
     pub fn insert_book(&mut self, cid: ContentId, book: &Book) {
         for (i, addrs) in book.data_pages().iter().enumerate() {
+            assert!(
+                i <= u8::MAX as usize,
+                "data page index {i} exceeds u8::MAX — BOOK_MAX_SIZE guarantees at most 256 pages"
+            );
             let entry = PageIndexEntry {
                 book_cid: cid,
                 page_num: i as u8,
@@ -197,6 +201,48 @@ mod tests {
         let results =
             idx.match_query(Some(&addr_00_a), None, None, None, Some(&cid_b), None);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn multiple_books_same_addr() {
+        // Two books with identical data but different CIDs produce the same
+        // page addresses.  Both must appear under the same mode-00 key.
+        let data = vec![0xEE; PAGE_SIZE];
+        let cid_a_bytes = [0x55u8; 32];
+        let cid_b_bytes = [0x66u8; 32];
+        let book_a = Book::from_book(cid_a_bytes, &data).unwrap();
+        let book_b = Book::from_book(cid_b_bytes, &data).unwrap();
+        let cid_a = ContentId::from_bytes(cid_a_bytes);
+        let cid_b = ContentId::from_bytes(cid_b_bytes);
+
+        // Verify the mode-00 addresses actually collide.
+        assert_eq!(
+            book_a.data_pages()[0][0],
+            book_b.data_pages()[0][0],
+            "same data should produce the same page address"
+        );
+
+        let mut idx = PageIndex::new();
+        idx.insert_book(cid_a, &book_a);
+        idx.insert_book(cid_b, &book_b);
+
+        assert_eq!(idx.len(), 2);
+
+        // Both entries live under the same mode-00 address.
+        let addr_00 = book_a.data_pages()[0][0];
+        let results = idx.lookup(&addr_00);
+        assert_eq!(results.len(), 2);
+
+        // Can disambiguate by book CID.
+        let only_a =
+            idx.match_query(Some(&addr_00), None, None, None, Some(&cid_a), None);
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].book_cid, cid_a);
+
+        let only_b =
+            idx.match_query(Some(&addr_00), None, None, None, Some(&cid_b), None);
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].book_cid, cid_b);
     }
 
     #[test]
