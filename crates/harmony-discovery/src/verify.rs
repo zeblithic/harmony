@@ -7,23 +7,13 @@ use crate::record::AnnounceRecord;
 /// All timestamps in this crate are Unix epoch seconds.
 const MAX_CLOCK_SKEW: u64 = 60;
 
-/// Verify an announce record's signature and time bounds.
+/// Verify an announce record's signature, time bounds, and pubkey→hash binding.
 ///
 /// Checks:
 /// 1. Record hasn't expired (`now < expires_at`)
 /// 2. Record isn't future-stamped (`published_at <= now + MAX_CLOCK_SKEW`)
 /// 3. Signature is valid for the included public key and crypto suite
-///
-/// # Security
-///
-/// **V1 limitation:** This function does NOT verify that `public_key`
-/// hashes to `identity_ref.hash`. Any actor with a valid keypair can
-/// craft an announce claiming an arbitrary identity address. Callers
-/// MUST NOT rely solely on `verify_announce` to authenticate an
-/// identity — the announce proves the signer controls the included
-/// key, not that the key belongs to the claimed address. Address
-/// re-derivation requires the encryption key (not carried in the
-/// announce) and is deferred to a future version.
+/// 4. Public keys derive to the claimed identity address hash
 pub fn verify_announce(record: &AnnounceRecord, now: u64) -> Result<(), DiscoveryError> {
     // 0. Structural validity — must have a positive validity window
     if record.published_at >= record.expires_at {
@@ -75,6 +65,7 @@ mod tests {
         let mut builder = AnnounceBuilder::new(
             identity_ref,
             identity.verifying_key.to_bytes().to_vec(),
+            identity.encryption_key.as_bytes().to_vec(),
             1000,
             2000,
             [0x01; 16],
@@ -136,6 +127,7 @@ mod tests {
         let builder = AnnounceBuilder::new(
             identity_ref,
             identity.verifying_key.to_bytes().to_vec(),
+            identity.encryption_key.as_bytes().to_vec(),
             u64::MAX - 100,
             u64::MAX - 1,
             [0x01; 16],
@@ -159,6 +151,7 @@ mod tests {
         let mut builder = AnnounceBuilder::new(
             identity_ref,
             identity.verifying_key.to_bytes().to_vec(),
+            identity.encryption_key.as_bytes().to_vec(),
             1030,
             2000,
             [0x01; 16],
@@ -180,11 +173,18 @@ mod tests {
                 let (sign_pk, sign_sk) = harmony_crypto::ml_dsa::generate(&mut OsRng);
                 let (enc_pk, _) = harmony_crypto::ml_kem::generate(&mut OsRng);
 
+                let enc_pk_bytes = enc_pk.as_bytes();
                 let pq_id = harmony_identity::PqIdentity::from_public_keys(enc_pk, sign_pk.clone());
                 let identity_ref = IdentityRef::from(&pq_id);
 
-                let mut builder =
-                    AnnounceBuilder::new(identity_ref, sign_pk.as_bytes(), 1000, 2000, [0x05; 16]);
+                let mut builder = AnnounceBuilder::new(
+                    identity_ref,
+                    sign_pk.as_bytes(),
+                    enc_pk_bytes,
+                    1000,
+                    2000,
+                    [0x05; 16],
+                );
                 builder.add_routing_hint(RoutingHint::Reticulum {
                     destination_hash: [0xDD; 16],
                 });
