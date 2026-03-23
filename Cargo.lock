@@ -2049,6 +2049,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-sdjwt"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "harmony-identity",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harmony-semantic"
 version = "0.1.0"
 dependencies = [

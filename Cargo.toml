@@ -26,6 +26,7 @@ members = [
     "crates/harmony-oluo",
     "crates/harmony-semantic",
     "crates/harmony-workflow",
+    "crates/harmony-sdjwt",
     "crates/harmony-zenoh",
 ]
 
@@ -93,6 +94,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI and config
 serde = { version = "1", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+base64 = { version = "0.22", default-features = false }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 
@@ -115,6 +118,7 @@ harmony-peers = { path = "crates/harmony-peers", default-features = false }
 harmony-profile = { path = "crates/harmony-profile", default-features = false }
 harmony-platform = { path = "crates/harmony-platform", default-features = false }
 harmony-reticulum = { path = "crates/harmony-reticulum", default-features = false }
+harmony-sdjwt = { path = "crates/harmony-sdjwt", default-features = false }
 harmony-roxy = { path = "crates/harmony-roxy", default-features = false }
 harmony-oluo = { path = "crates/harmony-oluo", default-features = false }
 harmony-semantic = { path = "crates/harmony-semantic", default-features = false }
