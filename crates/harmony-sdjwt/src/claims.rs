@@ -179,7 +179,7 @@ fn decode_salt(salt_str: &str) -> Result<[u8; 16], SdJwtError> {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::types::{JwsHeader, JwtPayload};
