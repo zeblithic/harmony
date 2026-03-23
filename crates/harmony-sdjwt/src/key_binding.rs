@@ -25,17 +25,27 @@ use crate::types::SdJwt;
 /// * `expected_nonce` - The nonce the verifier expects in the KB-JWT
 /// * `expected_aud` - The audience the verifier expects in the KB-JWT
 /// * `now` - Current UNIX timestamp (seconds)
+/// * `max_age_secs` - Maximum allowed age of the KB-JWT in seconds
 ///
-/// # Verification steps (RFC 9901 section 11.6)
+/// # Verification steps (RFC 9901 §11.6)
 ///
 /// 1. KB-JWT is present
-/// 2. `typ` header is `kb+jwt` (or `application/kb+jwt`)
-/// 3. `nonce` matches `expected_nonce`
-/// 4. `aud` matches `expected_aud`
-/// 5. `iat` is not in the future (60s skew) and not too old (300s max age)
-/// 6. `_sd_alg` is `sha-256` or absent (only SHA-256 supported)
-/// 7. `sd_hash` matches SHA-256 of the SD-JWT without the KB-JWT
-/// 7. Signature over the KB-JWT signing input verifies against `holder_key`
+/// 2. Signature over KB-JWT signing input verifies against `holder_key`
+/// 3. `typ` header is `kb+jwt` (or `application/kb+jwt`)
+/// 4. `nonce` matches `expected_nonce`
+/// 5. `aud` matches `expected_aud` (string or array)
+/// 6. `iat` is not in the future (60s skew) and not too old (`max_age_secs`)
+/// 7. `exp` is not exceeded (if present)
+/// 8. `_sd_alg` is `sha-256` or absent (only SHA-256 supported)
+/// 9. `sd_hash` matches SHA-256 of the SD-JWT without the KB-JWT
+///
+/// # Security
+///
+/// The caller is responsible for obtaining `holder_key` from the `cnf`
+/// claim of the Issuer-signed JWT within `sd_jwt`. Passing any other
+/// key bypasses holder-binding entirely. RFC 9901 §11.6 requires the
+/// Verifier to derive the holder public key from the Issuer-signed JWT,
+/// not from an untrusted source.
 pub fn verify_key_binding(
     sd_jwt: &SdJwt,
     holder_key: &[u8],
@@ -43,6 +53,7 @@ pub fn verify_key_binding(
     expected_nonce: &str,
     expected_aud: &str,
     now: u64,
+    max_age_secs: u64,
 ) -> Result<(), SdJwtError> {
     // 1. KB-JWT must be present.
     let kb_jwt = sd_jwt
@@ -139,7 +150,6 @@ pub fn verify_key_binding(
 
     // 9. Verify iat: not in the future AND not too old.
     const MAX_CLOCK_SKEW: u64 = 60;
-    const MAX_AGE_SECS: u64 = 300; // 5 minutes
     let iat = payload_json
         .get("iat")
         .ok_or_else(|| SdJwtError::KeyBindingInvalid(String::from("KB-JWT iat claim missing")))?
@@ -152,10 +162,19 @@ pub fn verify_key_binding(
             "KB-JWT iat is in the future: iat={iat}, now={now}"
         )));
     }
-    if now > iat.saturating_add(MAX_AGE_SECS) {
+    if now > iat.saturating_add(max_age_secs) {
         return Err(SdJwtError::KeyBindingInvalid(format!(
-            "KB-JWT iat is too old: iat={iat}, now={now}, max_age={MAX_AGE_SECS}s"
+            "KB-JWT iat is too old: iat={iat}, now={now}, max_age={max_age_secs}s"
         )));
+    }
+
+    // 10. Check exp if present (RFC 7519 §4.1.4).
+    if let Some(exp) = payload_json.get("exp").and_then(|v| v.as_u64()) {
+        if now >= exp {
+            return Err(SdJwtError::KeyBindingInvalid(format!(
+                "KB-JWT has expired: exp={exp}, now={now}"
+            )));
+        }
     }
 
     // 10. Check _sd_alg — only sha-256 supported for sd_hash computation.
@@ -289,6 +308,7 @@ mod tests {
             "test-nonce",
             "https://verifier.example",
             now,
+            300,
         );
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
     }
@@ -306,6 +326,7 @@ mod tests {
             "nonce",
             "https://verifier.example",
             now,
+            300,
         );
         assert!(matches!(result, Err(SdJwtError::KeyBindingInvalid(_))));
     }
@@ -322,6 +343,7 @@ mod tests {
             "wrong-nonce",
             "https://verifier.example",
             now,
+            300,
         );
         match result {
             Err(SdJwtError::KeyBindingInvalid(msg)) => {
@@ -343,6 +365,7 @@ mod tests {
             "nonce",
             "https://wrong.example",
             now,
+            300,
         );
         match result {
             Err(SdJwtError::KeyBindingInvalid(msg)) => {
@@ -366,6 +389,7 @@ mod tests {
             "nonce",
             "https://verifier.example",
             now,
+            300,
         );
         match result {
             Err(SdJwtError::KeyBindingInvalid(msg)) => {
@@ -394,6 +418,7 @@ mod tests {
             "nonce",
             "https://verifier.example",
             now,
+            300,
         );
         match result {
             Err(SdJwtError::KeyBindingInvalid(msg)) => {
@@ -421,6 +446,7 @@ mod tests {
             "nonce",
             "https://verifier.example",
             now,
+            300,
         );
         assert!(
             matches!(result, Err(SdJwtError::SignatureInvalid(_))),
@@ -472,7 +498,7 @@ mod tests {
             &sd_jwt,
             &holder_pub.verifying_key.to_bytes(),
             CryptoSuite::Ed25519,
-            "n", "a", now,
+            "n", "a", now, 300,
         );
         assert!(matches!(
             result,
@@ -529,6 +555,7 @@ mod tests {
             "n",
             "https://verifier.example",
             now,
+            300,
         ).is_ok());
     }
 
@@ -544,6 +571,7 @@ mod tests {
             "n",
             "a",
             2000,
+            300,
         );
         assert!(matches!(
             result,
