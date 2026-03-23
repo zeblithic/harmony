@@ -19,4 +19,4 @@ pub use verify::{verify, verify_from_header};
 pub mod claims;
 
 #[cfg(feature = "credential")]
-pub use claims::{map_claims, verify_disclosures};
+pub use claims::{map_claims, verify_disclosures, VerifiedDisclosures};

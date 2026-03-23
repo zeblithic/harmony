@@ -26,8 +26,10 @@ use harmony_crypto::hash::blake3_hash;
 /// [`SdJwtError::UnsupportedAlgorithm`].  If any disclosure's digest is
 /// missing from the `_sd` list, returns [`SdJwtError::DisclosureHashMismatch`].
 ///
-/// On success, returns references to all verified disclosures.
-pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<Vec<&Disclosure>, SdJwtError> {
+/// On success, returns a [`VerifiedDisclosures`] newtype that can only
+/// be constructed by this function, ensuring `map_claims` cannot be
+/// called on unverified disclosures.
+pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<VerifiedDisclosures<'_>, SdJwtError> {
     // Check _sd_alg — only sha-256 (or absent, which defaults to sha-256) is
     // supported per RFC 9901 §5.1.2.
     if let Some(ref alg) = sd_jwt.payload.sd_alg {
@@ -38,10 +40,12 @@ pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<Vec<&Disclosure>, SdJwtError
 
     // Empty disclosures is valid (no selective claims).
     if sd_jwt.disclosures.is_empty() {
-        return Ok(Vec::new());
+        return Ok(VerifiedDisclosures(Vec::new()));
     }
 
-    let sd_set = &sd_jwt.payload.sd;
+    // Build a BTreeSet for O(k + m) lookup instead of O(k × m) linear scan.
+    let sd_set: alloc::collections::BTreeSet<&String> =
+        sd_jwt.payload.sd.iter().collect();
     let mut seen = alloc::collections::BTreeSet::new();
 
     for disclosure in &sd_jwt.disclosures {
@@ -56,7 +60,30 @@ pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<Vec<&Disclosure>, SdJwtError
         }
     }
 
-    Ok(sd_jwt.disclosures.iter().collect())
+    Ok(VerifiedDisclosures(sd_jwt.disclosures.iter().collect()))
+}
+
+/// Disclosures that have been verified against the signed `_sd` list.
+///
+/// Can only be constructed by [`verify_disclosures`], ensuring that
+/// `map_claims` cannot be called on unverified disclosures.
+pub struct VerifiedDisclosures<'a>(Vec<&'a Disclosure>);
+
+impl<'a> VerifiedDisclosures<'a> {
+    /// Access the verified disclosures.
+    pub fn as_slice(&self) -> &[&'a Disclosure] {
+        &self.0
+    }
+
+    /// Number of verified disclosures.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there are no verified disclosures.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// Compute `base64url_no_pad(SHA-256(ASCII(raw)))` for a disclosure.
@@ -78,8 +105,9 @@ fn disclosure_digest(raw: &str) -> String {
 /// - **salt**: base64url-decoded from the disclosure salt string, zero-padded
 ///   or truncated to 16 bytes.
 /// - **value**: the `claim_value` bytes from the disclosure.
-pub fn map_claims(disclosures: &[&Disclosure]) -> Result<Vec<SaltedClaim>, SdJwtError> {
+pub fn map_claims(disclosures: &VerifiedDisclosures<'_>) -> Result<Vec<SaltedClaim>, SdJwtError> {
     disclosures
+        .as_slice()
         .iter()
         .map(|d| {
             let type_id = match &d.claim_name {
@@ -272,8 +300,8 @@ mod tests {
     #[test]
     fn map_known_vocabulary_claims() {
         let d = disclosure_from_raw("raw", "c2FsdA", Some("given_name"), r#""Alice""#);
-        let refs: Vec<&Disclosure> = vec![&d];
-        let claims = map_claims(&refs).unwrap();
+        let verified = VerifiedDisclosures(vec![&d]);
+        let claims = map_claims(&verified).unwrap();
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].claim.type_id, 0x0100);
         assert_eq!(claims[0].claim.value, br#""Alice""#);
@@ -282,8 +310,8 @@ mod tests {
     #[test]
     fn map_unknown_claim_gets_hash_derived_id() {
         let d = disclosure_from_raw("raw", "c2FsdA", Some("custom_field"), r#""value""#);
-        let refs: Vec<&Disclosure> = vec![&d];
-        let claims = map_claims(&refs).unwrap();
+        let verified = VerifiedDisclosures(vec![&d]);
+        let claims = map_claims(&verified).unwrap();
         assert_eq!(claims.len(), 1);
         // High bit must be set for unknown claims.
         assert_ne!(claims[0].claim.type_id & 0x8000, 0);
@@ -293,8 +321,8 @@ mod tests {
     fn map_array_element_gets_zero_type_id() {
         // Array element disclosures have no claim_name.
         let d = disclosure_from_raw("raw", "c2FsdA", None, r#""item""#);
-        let refs: Vec<&Disclosure> = vec![&d];
-        let claims = map_claims(&refs).unwrap();
+        let verified = VerifiedDisclosures(vec![&d]);
+        let claims = map_claims(&verified).unwrap();
         assert_eq!(claims[0].claim.type_id, 0x0000);
     }
 
@@ -302,8 +330,8 @@ mod tests {
     fn map_salt_base64_decoded() {
         // "c2FsdA" is base64url for "salt" = [115, 97, 108, 116]
         let d = disclosure_from_raw("raw", "c2FsdA", Some("email"), r#""a@b""#);
-        let refs: Vec<&Disclosure> = vec![&d];
-        let claims = map_claims(&refs).unwrap();
+        let verified = VerifiedDisclosures(vec![&d]);
+        let claims = map_claims(&verified).unwrap();
         let expected: [u8; 16] = [115, 97, 108, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(claims[0].salt, expected);
     }
@@ -315,8 +343,8 @@ mod tests {
         let long_bytes: Vec<u8> = (0u8..24).collect();
         let salt_str = URL_SAFE_NO_PAD.encode(&long_bytes);
         let d = disclosure_from_raw("raw", &salt_str, Some("email"), r#""x""#);
-        let refs: Vec<&Disclosure> = vec![&d];
-        let claims = map_claims(&refs).unwrap();
+        let verified = VerifiedDisclosures(vec![&d]);
+        let claims = map_claims(&verified).unwrap();
         let expected: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         assert_eq!(claims[0].salt, expected);
     }
@@ -326,8 +354,8 @@ mod tests {
         // Same unknown name must always produce the same type_id.
         let d1 = disclosure_from_raw("r1", "c2FsdA", Some("foo_bar"), r#""a""#);
         let d2 = disclosure_from_raw("r2", "c2FsdA", Some("foo_bar"), r#""b""#);
-        let refs: Vec<&Disclosure> = vec![&d1, &d2];
-        let claims = map_claims(&refs).unwrap();
+        let verified = VerifiedDisclosures(vec![&d1, &d2]);
+        let claims = map_claims(&verified).unwrap();
         assert_eq!(claims[0].claim.type_id, claims[1].claim.type_id);
         assert_ne!(claims[0].claim.type_id & 0x8000, 0);
     }
