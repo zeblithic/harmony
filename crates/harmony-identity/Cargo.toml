@@ -16,6 +16,9 @@ rand_core = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+bs58 = { workspace = true }
+base64 = { workspace = true, features = ["alloc"], optional = true }
+serde_json = { workspace = true, optional = true }
 hashbrown = { workspace = true, optional = true }
 
 [features]
@@ -29,6 +32,9 @@ std = [
     "x25519-dalek/getrandom",
     "thiserror/std",
     "serde/std",
+    "dep:serde_json",
+    "dep:base64",
+    "base64?/std",
 ]
 test-utils = ["dep:hashbrown"]
 
