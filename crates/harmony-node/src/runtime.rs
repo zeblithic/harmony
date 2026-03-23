@@ -639,6 +639,9 @@ impl<B: BookStore> NodeRuntime<B> {
         actions.push(RuntimeAction::Subscribe {
             key_expr: harmony_zenoh::namespace::filters::MEMO_SUB.to_string(),
         });
+        actions.push(RuntimeAction::Subscribe {
+            key_expr: harmony_zenoh::namespace::filters::PAGE_SUB.to_string(),
+        });
 
         let rt = Self {
             router,
@@ -742,6 +745,20 @@ impl<B: BookStore> NodeRuntime<B> {
     pub fn should_query_memo_peer(&self, peer_addr: &str, input_cid: &ContentId) -> bool {
         self.peer_filters
             .should_query_memo(peer_addr, input_cid, self.tick_count)
+    }
+
+    /// Check if a peer should be queried for page addresses.
+    ///
+    /// Returns `false` only if the peer's page Bloom filter definitively says
+    /// the page address is absent. Returns `true` for unknown peers, stale
+    /// filters, or filter matches.
+    pub fn should_query_page_peer(
+        &self,
+        peer_addr: &str,
+        page_addr: &harmony_athenaeum::PageAddr,
+    ) -> bool {
+        self.peer_filters
+            .should_query_page(peer_addr, page_addr, self.tick_count)
     }
 
     /// Read-only access to the contact store.
@@ -2259,8 +2276,8 @@ mod tests {
 
         // 16 shard queryables + 1 stats queryable + 1 compute activity queryable + 1 page queryable = 19
         assert_eq!(queryable_count, 19);
-        // transit + publish + content filter + flatpack filter + memo filter subscriptions = 5
-        assert_eq!(subscribe_count, 5);
+        // transit + publish + content filter + flatpack filter + memo filter + page filter subscriptions = 6
+        assert_eq!(subscribe_count, 6);
     }
 
     #[test]
