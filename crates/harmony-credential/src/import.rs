@@ -245,7 +245,8 @@ fn verify_harmony_proof(
     env: &VcEnvelope,
     issuer_ref: &harmony_identity::IdentityRef,
     subject_ref: &harmony_identity::IdentityRef,
-    issuer_key: &[u8],
+    signer_key: &[u8],
+    signer_suite: harmony_identity::CryptoSuite,
     claim_digests: &[[u8; 32]],
 ) -> Result<(), ImportError> {
     // Reconstruct a temporary Credential so we can call signable_bytes().
@@ -265,7 +266,8 @@ fn verify_harmony_proof(
     };
 
     let payload = credential.signable_bytes();
-    harmony_identity::verify_signature(issuer_ref.suite, issuer_key, &payload, &env.proof_value)
+    // Use the signer's suite (from verificationMethod), not the issuer's suite.
+    harmony_identity::verify_signature(signer_suite, signer_key, &payload, &env.proof_value)
         .map_err(|_| ImportError::ProofInvalid)
 }
 
@@ -425,7 +427,7 @@ fn extract_external_claims(
     subj_obj: &serde_json::Map<String, Value>,
 ) -> Result<Vec<SaltedClaim>, ImportError> {
     let mut out = Vec::new();
-    let skip = ["id", "type", "@context"];
+    let skip = ["id", "type", "@context", "claims"];
 
     for (key, val) in subj_obj {
         if skip.contains(&key.as_str()) {
@@ -676,6 +678,7 @@ pub fn import_jsonld_vc(
                 &issuer_ref,
                 &subject_ref,
                 &issuer_resolved.public_key,
+                issuer_resolved.suite,
                 &claim_digests,
             )?;
 
