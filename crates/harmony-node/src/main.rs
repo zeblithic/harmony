@@ -503,9 +503,11 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             // Destructure to control per-field drop timing.
             let crate::identity_file::NodeIdentity { pq, ed25519 } = identity;
 
-            // Extract DSA public key bytes before pq is moved into TunnelConfig or dropped.
+            // Extract PQ identity hash and DSA public key before pq is moved into TunnelConfig.
             // Used by the discover queryable to verify self-issued Discovery tokens.
-            let local_dsa_pubkey = pq.public_identity().verifying_key.as_bytes();
+            let pq_pub = pq.public_identity();
+            let local_pq_identity_hash = pq_pub.address_hash;
+            let local_dsa_pubkey = pq_pub.verifying_key.as_bytes();
 
             // Build tunnel config if --relay-url was provided.
             // The PQ identity is wrapped in Arc because tunnel tasks need
@@ -552,6 +554,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 },
                 node_addr,
                 local_identity_hash: our_addr_bytes,
+                local_pq_identity_hash,
                 local_dsa_pubkey,
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());

@@ -57,6 +57,11 @@ pub struct NodeConfig {
     /// probe-interval jitter is unique per local-peer pair rather than zero.
     /// Defaults to all-zeros; must be set from the loaded identity at startup.
     pub local_identity_hash: harmony_identity::IdentityHash,
+    /// This node's PQ identity hash (16-byte address derived from ML-KEM + ML-DSA keys).
+    /// Used as the issuer identity for Discovery UCAN tokens. Distinct from
+    /// `local_identity_hash` (Ed25519-derived, used for Reticulum/PeerManager).
+    /// Defaults to all-zeros; must be set from the PQ identity at startup.
+    pub local_pq_identity_hash: harmony_identity::IdentityHash,
     /// This node's ML-DSA-65 public verifying key bytes.
     /// Used to verify Discovery UCAN tokens (which are issued by this node).
     /// Defaults to empty; must be set from the loaded identity at startup.
@@ -120,6 +125,7 @@ impl Default for NodeConfig {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "0000".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
         }
     }
@@ -581,8 +587,11 @@ pub struct NodeRuntime<B: BookStore> {
     // In-flight memo fetches: input CID → tick when fetch was started.
     // Prevents re-querying for the same input while a fetch is in-flight.
     pending_memo_fetches: HashMap<ContentId, u64>,
-    // This node's identity hash (copied from config for direct access).
+    // This node's Ed25519 identity hash (copied from config for direct access).
     local_identity_hash: harmony_identity::IdentityHash,
+    // This node's PQ identity hash (ML-KEM + ML-DSA derived).
+    // Used for Discovery UCAN token validation (issuer check).
+    local_pq_identity_hash: harmony_identity::IdentityHash,
     // Queryable ID for the discover namespace (harmony/discover/**)
     discover_queryable_id: QueryableId,
     // Pre-serialized public announce record (Reticulum-only hints).
@@ -764,6 +773,7 @@ impl<B: BookStore> NodeRuntime<B> {
             memo_queryable_id: memo_qid,
             pending_memo_fetches: HashMap::new(),
             local_identity_hash: config.local_identity_hash,
+            local_pq_identity_hash: config.local_pq_identity_hash,
             discover_queryable_id: discover_qid,
             local_public_announce: None,
             local_full_announce: None,
@@ -2213,8 +2223,8 @@ impl<B: BookStore> NodeRuntime<B> {
         let mut queried_hash = [0u8; 16];
         queried_hash.copy_from_slice(&id_bytes);
 
-        // 2. Check if this is our identity
-        let local_hash = self.local_identity_hash;
+        // 2. Check if this is our PQ identity (Discovery tokens use PQ address hash)
+        let local_hash = self.local_pq_identity_hash;
         if queried_hash != local_hash {
             return Vec::new(); // Not our identity — no reply
         }
@@ -2279,7 +2289,7 @@ impl<B: BookStore> NodeRuntime<B> {
             }];
         }
 
-        // Check expiry
+        // Check expiry (expires_at == 0 means no expiry / indefinite grant).
         if token.expires_at != 0 && self.last_unix_now > token.expires_at {
             return vec![RuntimeAction::SendReply {
                 query_id,
@@ -2309,6 +2319,7 @@ impl<B: BookStore> NodeRuntime<B> {
             match harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(&self.local_dsa_pubkey) {
                 Ok(pk) => pk,
                 Err(_) => {
+                    tracing::warn!("local DSA pubkey invalid or empty — discovery token verification skipped");
                     return vec![RuntimeAction::SendReply {
                         query_id,
                         payload: public_bytes.clone(),
@@ -3481,6 +3492,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -3548,6 +3560,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "self-node".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -3581,6 +3594,7 @@ mod tests {
             },
             node_addr: "reject-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
@@ -3611,6 +3625,7 @@ mod tests {
             },
             node_addr: "skip-timer-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -3670,6 +3685,7 @@ mod tests {
             },
             node_addr: "coalesce-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -3718,6 +3734,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "cuckoo-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -3759,6 +3776,7 @@ mod tests {
             filter_broadcast_config: FilterBroadcastConfig::default(),
             node_addr: "self-node".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4656,6 +4674,7 @@ mod tests {
             },
             node_addr: "page-filter-timer-test".to_string(),
             local_identity_hash: [0u8; 16],
+            local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4992,6 +5011,7 @@ mod tests {
 
         let mut config = NodeConfig::default();
         config.local_identity_hash = id_ref.hash;
+        config.local_pq_identity_hash = id_ref.hash;
         config.local_dsa_pubkey = pub_id.verifying_key.as_bytes();
         config.node_addr = hex::encode(id_ref.hash);
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -5048,6 +5068,7 @@ mod tests {
 
         let mut config = NodeConfig::default();
         config.local_identity_hash = id_ref.hash;
+        config.local_pq_identity_hash = id_ref.hash;
         config.local_dsa_pubkey = pub_id.verifying_key.as_bytes();
         config.node_addr = hex::encode(id_ref.hash);
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -5103,6 +5124,7 @@ mod tests {
 
         let mut config = NodeConfig::default();
         config.local_identity_hash = id_ref.hash;
+        config.local_pq_identity_hash = id_ref.hash;
         config.local_dsa_pubkey = pub_id.verifying_key.as_bytes();
         config.node_addr = hex::encode(id_ref.hash);
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
