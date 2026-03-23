@@ -1232,7 +1232,7 @@ impl<B: BookStore> NodeRuntime<B> {
         }
 
         // 1. Deserialize token
-        let token = match harmony_identity::PqUcanToken::from_bytes(&token_bytes) {
+        let token = match harmony_identity::PqUcanToken::from_bytes(token_bytes) {
             Ok(t) => t,
             Err(e) => {
                 tracing::debug!("token parse failed: {e:?}");
