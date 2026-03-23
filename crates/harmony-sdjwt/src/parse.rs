@@ -154,17 +154,28 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
         return Err(SdJwtError::MalformedCompact);
     }
 
-    let iss = payload_json
-        .get("iss")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let sub = payload_json
-        .get("sub")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let iat = payload_json.get("iat").and_then(|v| v.as_i64());
-    let exp = payload_json.get("exp").and_then(|v| v.as_i64());
-    let nbf = payload_json.get("nbf").and_then(|v| v.as_i64());
+    // RFC 7519 §4.1: iss/sub are StringOrURI, iat/exp/nbf are NumericDate.
+    // Reject present-but-wrong-type to prevent silent normalization to None.
+    let iss: Option<String> = match payload_json.get("iss") {
+        None => None,
+        Some(v) => Some(v.as_str().ok_or(SdJwtError::MalformedCompact)?.to_string()),
+    };
+    let sub: Option<String> = match payload_json.get("sub") {
+        None => None,
+        Some(v) => Some(v.as_str().ok_or(SdJwtError::MalformedCompact)?.to_string()),
+    };
+    let iat: Option<i64> = match payload_json.get("iat") {
+        None => None,
+        Some(v) => Some(v.as_i64().ok_or(SdJwtError::MalformedCompact)?),
+    };
+    let exp: Option<i64> = match payload_json.get("exp") {
+        None => None,
+        Some(v) => Some(v.as_i64().ok_or(SdJwtError::MalformedCompact)?),
+    };
+    let nbf: Option<i64> = match payload_json.get("nbf") {
+        None => None,
+        Some(v) => Some(v.as_i64().ok_or(SdJwtError::MalformedCompact)?),
+    };
 
     // RFC 9901 §5.2: _sd MUST be an array if present.
     let sd: Vec<String> = match payload_json.get("_sd") {
