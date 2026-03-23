@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use harmony_identity::CryptoSuite;
 
 use crate::error::DiscoveryError;
@@ -37,7 +39,22 @@ pub fn verify_announce(record: &AnnounceRecord, now: u64) -> Result<(), Discover
         &record.public_key,
         &payload,
         &record.signature,
-    )
+    )?;
+
+    // Verify that the included public keys derive to the claimed identity hash.
+    // This prevents forged announces where an attacker substitutes their own keys
+    // for a victim's identity address.
+    let mut combined = Vec::with_capacity(
+        record.encryption_key.len() + record.public_key.len(),
+    );
+    combined.extend_from_slice(&record.encryption_key);
+    combined.extend_from_slice(&record.public_key);
+    let derived_hash = harmony_crypto::hash::truncated_hash(&combined);
+    if derived_hash != record.identity_ref.hash {
+        return Err(DiscoveryError::AddressMismatch);
+    }
+
+    Ok(())
 }
 
 fn verify_signature(
@@ -192,6 +209,71 @@ mod tests {
                 let payload = builder.signable_payload();
                 let signature = harmony_crypto::ml_dsa::sign(&sign_sk, &payload).unwrap();
                 let record = builder.build(signature.as_bytes().to_vec());
+
+                assert!(verify_announce(&record, 1500).is_ok());
+            })
+            .expect("failed to spawn thread")
+            .join()
+            .expect("thread panicked");
+    }
+
+    #[test]
+    fn forged_announce_with_wrong_pubkey_rejected() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                // Generate two PQ identities
+                let real_owner = harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
+                let attacker = harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
+
+                let real_pub = real_owner.public_identity();
+                let attacker_pub = attacker.public_identity();
+
+                // Build announce with real_owner's identity_hash but attacker's keys
+                let builder = AnnounceBuilder::new(
+                    IdentityRef {
+                        hash: real_pub.address_hash,
+                        suite: harmony_identity::CryptoSuite::MlDsa65,
+                    },
+                    attacker_pub.verifying_key.as_bytes(),
+                    attacker_pub.encryption_key.as_bytes(),
+                    1000,
+                    2000,
+                    [0u8; 16],
+                );
+                let payload = builder.signable_payload();
+                let sig = attacker.sign(&payload).unwrap();
+                let record = builder.build(sig);
+
+                // Signature is valid (attacker signed with their own key)
+                // but address binding must fail: hash(attacker_keys) != real_owner.address_hash
+                let result = verify_announce(&record, 1500);
+                assert_eq!(result.unwrap_err(), DiscoveryError::AddressMismatch);
+            })
+            .expect("failed to spawn thread")
+            .join()
+            .expect("thread panicked");
+    }
+
+    #[test]
+    fn valid_announce_with_matching_pq_keys_passes() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let owner = harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
+                let pub_id = owner.public_identity();
+
+                let builder = AnnounceBuilder::new(
+                    IdentityRef::from(pub_id),
+                    pub_id.verifying_key.as_bytes(),
+                    pub_id.encryption_key.as_bytes(),
+                    1000,
+                    2000,
+                    [0u8; 16],
+                );
+                let payload = builder.signable_payload();
+                let sig = owner.sign(&payload).unwrap();
+                let record = builder.build(sig);
 
                 assert!(verify_announce(&record, 1500).is_ok());
             })

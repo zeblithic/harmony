@@ -5,9 +5,8 @@ pub enum DiscoveryError {
     FutureTimestamp,
     InvalidRecord,
     SignatureInvalid,
-    /// V2: will be returned when public_key→IdentityHash re-derivation
-    /// check is implemented. Currently unused — see `verify_announce` docs.
-    #[allow(dead_code)]
+    /// Returned when the included public keys don't derive to the claimed
+    /// identity address hash. Rejects forged announces with substituted keys.
     AddressMismatch,
     SerializeError(&'static str),
     DeserializeError(&'static str),
