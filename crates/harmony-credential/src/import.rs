@@ -368,12 +368,32 @@ fn extract_harmony_claims(claims_arr: &[Value]) -> Result<Vec<SaltedClaim>, Impo
             .and_then(|v| v.as_str())
             .ok_or_else(|| ImportError::MalformedVc(String::from("claim item missing 'digest'")))?;
 
-        // Validate digest is decodable (even if we don't use it for disclosed claims)
-        let _ = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(digest_b64)
-            .map_err(|e| ImportError::EncodingError(alloc::format!("claim digest decode: {e}")))?;
+        // Only include disclosed claims (those with both typeId and value).
+        // Undisclosed claims (digest-only) cannot be reconstructed into
+        // SaltedClaims whose digest() matches the original — including them
+        // would violate the contract that claims correspond to claim_digests.
+        // Check disclosure BEFORE parsing salt, so malformed salt on an
+        // undisclosed claim doesn't abort the entire import.
+        let type_id = match obj.get("typeId").and_then(|v| v.as_u64()) {
+            Some(n) => match u16::try_from(n) {
+                Ok(id) => id,
+                Err(_) => continue, // type_id > 65535, skip
+            },
+            None => continue, // undisclosed claim, skip
+        };
 
-        // Salt: from `salt` field (base64url) or sentinel
+        let value: Vec<u8> = match obj.get("value").and_then(|v| v.as_str()) {
+            Some(val_str) => base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(val_str)
+                .map_err(|e| {
+                    ImportError::EncodingError(alloc::format!("claim value decode: {e}"))
+                })?,
+            None => continue, // undisclosed claim, skip
+        };
+
+        // Salt: from `salt` field (base64url) or sentinel.
+        // Parsed after disclosure check so malformed salt on undisclosed
+        // claims doesn't abort the import.
         let salt: [u8; 16] = if let Some(salt_str) = obj.get("salt").and_then(|v| v.as_str()) {
             let salt_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(salt_str)
@@ -393,27 +413,6 @@ fn extract_harmony_claims(claims_arr: &[Value]) -> Result<Vec<SaltedClaim>, Impo
             IMPORT_SENTINEL_SALT
         };
 
-        // Only include disclosed claims (those with both typeId and value).
-        // Undisclosed claims (digest-only) cannot be reconstructed into
-        // SaltedClaims whose digest() matches the original — including them
-        // would violate the contract that claims correspond to claim_digests.
-        let type_id = match obj.get("typeId").and_then(|v| v.as_u64()) {
-            Some(n) => match u16::try_from(n) {
-                Ok(id) => id,
-                Err(_) => continue, // type_id > 65535, skip
-            },
-            None => continue, // undisclosed claim, skip
-        };
-
-        let value: Vec<u8> = match obj.get("value").and_then(|v| v.as_str()) {
-            Some(val_str) => base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(val_str)
-                .map_err(|e| {
-                    ImportError::EncodingError(alloc::format!("claim value decode: {e}"))
-                })?,
-            None => continue, // undisclosed claim, skip
-        };
-
         out.push(SaltedClaim {
             claim: crate::claim::Claim { type_id, value },
             salt,
@@ -427,6 +426,10 @@ fn extract_external_claims(
     subj_obj: &serde_json::Map<String, Value>,
 ) -> Result<Vec<SaltedClaim>, ImportError> {
     let mut out = Vec::new();
+    // Skip standard JSON-LD fields and "claims" (Harmony's reserved key).
+    // An external VC with a non-Harmony "claims" field is ambiguous — silently
+    // importing it as a vocabulary-mapped claim would be equally surprising.
+    // Other credentialSubject fields carry the meaningful data.
     let skip = ["id", "type", "@context", "claims"];
 
     for (key, val) in subj_obj {
