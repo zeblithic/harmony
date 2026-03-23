@@ -356,4 +356,151 @@ mod tests {
         let expected = format!("{{\"{1}\":2,\"{0}\":1}}", '\u{FEFF}', '\u{10000}',);
         assert_eq!(result, expected);
     }
+
+    /// RFC 8785 — key ordering with special characters
+    #[test]
+    fn rfc8785_structure_key_ordering() {
+        use serde_json::json;
+        let val = json!({
+            "\r": "Carriage Return",
+            "1": "One",
+            "": "Empty"
+        });
+        let result = String::from_utf8(canonicalize(&val)).unwrap();
+        // UTF-16 order: "" (empty) < "\r" (000D) < "1" (0031)
+        assert_eq!(
+            result,
+            r#"{"":"Empty","\r":"Carriage Return","1":"One"}"#
+        );
+    }
+
+    /// Verify Unicode key ordering above BMP
+    #[test]
+    fn rfc8785_structure_unicode_keys() {
+        use serde_json::json;
+        let val = json!({
+            "\u{20ac}": "Euro Sign",
+            "\u{00f6}": "Latin Small O Diaeresis"
+        });
+        let result = String::from_utf8(canonicalize(&val)).unwrap();
+        // UTF-16 order: U+00F6 (00F6) < U+20AC (20AC)
+        let f6_pos = result.find('\u{00f6}').unwrap();
+        let euro_pos = result.find('\u{20ac}').unwrap();
+        assert!(f6_pos < euro_pos, "U+00F6 should sort before U+20AC in UTF-16");
+    }
+
+    /// Batch number vector tests from RFC 8785 Appendix B
+    #[test]
+    fn rfc8785_number_vectors() {
+        let cases = vec![
+            ("0", "0"),
+            ("0.0", "0"),
+            ("-0", "0"),
+            ("-0.0", "0"),
+            ("1", "1"),
+            ("-1", "-1"),
+            ("1.5", "1.5"),
+            ("1e20", "100000000000000000000"),
+            ("1e21", "1e+21"),
+            ("-1e21", "-1e+21"),
+            ("1e-6", "0.000001"),
+            ("1e-7", "1e-7"),
+            ("9007199254740991", "9007199254740991"),
+            ("-9007199254740991", "-9007199254740991"),
+            ("0.1", "0.1"),
+            // serde_json parses 999999999999999900000 to the f64 1e21 (the nearest
+            // representable double), so the canonical form is "1e+21".
+            ("999999999999999900000", "1e+21"),
+            ("1e+23", "1e+23"),
+        ];
+
+        for (input, expected) in cases {
+            let val: serde_json::Value = serde_json::from_str(input).unwrap();
+            let result = String::from_utf8(canonicalize(&val)).unwrap();
+            assert_eq!(result, expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn no_whitespace() {
+        let input = r#"{
+            "a" : 1 ,
+            "b" : [ 2 , 3 ]
+        }"#;
+        let val: serde_json::Value = serde_json::from_str(input).unwrap();
+        let result = canonicalize(&val);
+        assert!(!result.contains(&b' '));
+        assert!(!result.contains(&b'\n'));
+        assert!(!result.contains(&b'\t'));
+    }
+
+    /// Deeply nested structure
+    #[test]
+    fn deeply_nested() {
+        let val: serde_json::Value = serde_json::from_str(
+            r#"{"a":{"b":{"c":{"d":"deep"}}}}"#
+        ).unwrap();
+        assert_eq!(
+            canonicalize(&val),
+            b"{\"a\":{\"b\":{\"c\":{\"d\":\"deep\"}}}}"
+        );
+    }
+
+    /// Mixed types in array
+    #[test]
+    fn mixed_array() {
+        let val: serde_json::Value = serde_json::from_str(
+            r#"[null, true, false, 42, "hello", {}, []]"#
+        ).unwrap();
+        assert_eq!(
+            canonicalize(&val),
+            b"[null,true,false,42,\"hello\",{},[]]"
+        );
+    }
+
+    /// String with all control characters U+0000 through U+001F
+    #[test]
+    fn all_control_characters() {
+        // Build a string with all 32 control characters
+        let mut s = String::new();
+        for i in 0u8..=0x1F {
+            s.push(char::from(i));
+        }
+        let val = serde_json::Value::String(s);
+        let result = String::from_utf8(canonicalize(&val)).unwrap();
+
+        // Verify shorthand escapes are used where applicable
+        assert!(result.contains("\\b"));   // U+0008
+        assert!(result.contains("\\t"));   // U+0009
+        assert!(result.contains("\\n"));   // U+000A
+        assert!(result.contains("\\f"));   // U+000C
+        assert!(result.contains("\\r"));   // U+000D
+
+        // Verify hex escapes for others
+        assert!(result.contains("\\u0000")); // U+0000
+        assert!(result.contains("\\u0001")); // U+0001
+        assert!(result.contains("\\u001f")); // U+001F (lowercase hex)
+
+        // Verify NO shorthand for U+000B (vertical tab) — should be \u000b
+        assert!(result.contains("\\u000b"));
+    }
+
+    /// Empty string
+    #[test]
+    fn empty_string() {
+        let val = serde_json::Value::String(String::new());
+        assert_eq!(canonicalize(&val), b"\"\"");
+    }
+
+    /// Canonical output is idempotent
+    #[test]
+    fn idempotent() {
+        let input = r#"{"z":1,"a":2,"m":{"b":3,"a":4}}"#;
+        let val: serde_json::Value = serde_json::from_str(input).unwrap();
+        let first = canonicalize(&val);
+        // Parse the canonical output and re-canonicalize
+        let val2: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        let second = canonicalize(&val2);
+        assert_eq!(first, second, "canonicalization should be idempotent");
+    }
 }
