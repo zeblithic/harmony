@@ -26,7 +26,7 @@ pub struct ResolvedDidDocument {
 }
 ```
 
-`ResolvedDid` is unchanged (`suite: CryptoSuite`, `public_key: Vec<u8>`). The document wraps multiple resolved keys with the DID identifier.
+`ResolvedDid` is unchanged (`suite: CryptoSuite`, `public_key: Vec<u8>`). The document wraps multiple resolved keys with the DID identifier. Both `ResolvedDid` and `ResolvedDidDocument` need `Serialize`/`Deserialize` derives for postcard serialization over Zenoh.
 
 ### WebDidFetcher Trait
 
@@ -45,11 +45,20 @@ The library parses the response bytes. The caller provides the HTTP implementati
 ```rust
 pub trait DidResolver {
     fn resolve(&self, did: &str) -> Result<ResolvedDid, DidError>;
-    fn resolve_document(&self, did: &str) -> Result<ResolvedDidDocument, DidError>;
+
+    /// Default implementation wraps `resolve()` into a single-method document.
+    /// Backward-compatible: existing implementors only need `resolve()`.
+    fn resolve_document(&self, did: &str) -> Result<ResolvedDidDocument, DidError> {
+        let resolved = self.resolve(did)?;
+        Ok(ResolvedDidDocument {
+            id: did.to_string(),
+            verification_methods: vec![resolved],
+        })
+    }
 }
 ```
 
-`DefaultDidResolver` implements `resolve_document` by wrapping the single-key result. A new `WebDidResolver` accepts a `WebDidFetcher` and implements both methods, delegating HTTP to the injected fetcher.
+`resolve_document` is a provided default method — existing `DidResolver` implementors are not broken. `DefaultDidResolver` inherits the default. A new `WebDidResolver` accepts a `WebDidFetcher` and overrides both methods, delegating HTTP to the injected fetcher.
 
 ## DID Document Parsing
 
@@ -81,7 +90,7 @@ Methods with unsupported key types (P-256, RSA, etc.) are skipped without error 
 - The `id` field in the document must match the DID being resolved (prevents document substitution attacks).
 - At least one supported verification method must be present. If none, return `DidError::NoSupportedKeys`.
 
-All parsing is pure function logic — no I/O, fully testable with fixture JSON strings.
+All parsing is pure function logic — no I/O, fully testable with fixture JSON strings. Like `did:jwk`, the DID Document parsing is gated behind `#[cfg(feature = "std")]` since it requires `serde_json`.
 
 ## Gateway Service (harmony-node)
 
