@@ -622,12 +622,16 @@ pub fn import_jsonld_vc(
 ) -> Result<ImportedCredential, ImportError> {
     let env = parse_vc_envelope(vc_json)?;
 
-    // Resolve issuer DID
-    let issuer_resolved = resolver.resolve(&env.issuer_did)?;
-    let issuer_hash = derive_import_identity_hash(&issuer_resolved.public_key);
+    // Resolve the signing key from verificationMethod (may differ from issuer DID
+    // in general, though for did:key they resolve to the same key). Per W3C Data
+    // Integrity, verificationMethod identifies the actual signing key.
+    let issuer_resolved = resolver.resolve(&env.verification_method)?;
+    // Use the issuer DID for the identity hash (not verificationMethod)
+    let issuer_did_resolved = resolver.resolve(&env.issuer_did)?;
+    let issuer_hash = derive_import_identity_hash(&issuer_did_resolved.public_key);
     let issuer_ref = harmony_identity::IdentityRef {
         hash: issuer_hash,
-        suite: issuer_resolved.suite,
+        suite: issuer_did_resolved.suite,
     };
 
     // Resolve subject DID (defaults to issuer if absent).
@@ -699,12 +703,12 @@ pub fn import_jsonld_vc(
                 issuer: issuer_ref,
                 subject: subject_ref,
                 claim_digests,
-                status_list_index: None,
+                status_list_index: env.status_list_index,
                 not_before: env.not_before,
                 expires_at: env.expires_at,
                 issued_at: env.issued_at,
                 nonce: env.nonce,
-                proof: None,
+                proof: env.delegation_proof,
                 signature: env.proof_value.clone(),
             };
 
