@@ -468,6 +468,8 @@ pub struct NodeRuntime<B: BookStore> {
     ticks_since_replica_scan: u32,
     // Page index: maps page addresses to book pages for queryable lookup
     page_index: crate::page_index::PageIndex,
+    // CIDs already indexed — prevents duplicate entries on re-announce
+    indexed_book_cids: HashSet<ContentId>,
     // Queryable ID for the page namespace (harmony/page/**)
     page_queryable_id: QueryableId,
 }
@@ -599,6 +601,7 @@ impl<B: BookStore> NodeRuntime<B> {
             replica_store: MemoryReplicaStore::new(),
             ticks_since_replica_scan: 0,
             page_index: crate::page_index::PageIndex::new(),
+            indexed_book_cids: HashSet::new(),
             page_queryable_id: page_qid,
         };
 
@@ -1229,9 +1232,12 @@ impl<B: BookStore> NodeRuntime<B> {
                         if let Ok(cid_bytes) = hex::decode(cid_hex) {
                             if let Ok(cid_arr) = <[u8; 32]>::try_from(cid_bytes) {
                                 let cid = ContentId::from_bytes(cid_arr);
-                                if cid.cid_type() == harmony_content::cid::CidType::Book {
+                                if cid.cid_type() == harmony_content::cid::CidType::Book
+                                    && !self.indexed_book_cids.contains(&cid)
+                                {
                                     if let Some(data) = self.storage.get(&cid) {
                                         if let Ok(book) = harmony_athenaeum::Book::from_book(cid.to_bytes(), data) {
+                                            self.indexed_book_cids.insert(cid);
                                             self.page_index.insert_book(cid, &book);
                                             for (i, addrs) in book.data_pages().iter().enumerate() {
                                                 let a00 = hex::encode(addrs[0].to_bytes());
@@ -1676,24 +1682,24 @@ impl<B: BookStore> NodeRuntime<B> {
 
         if matches.len() == 1 {
             let entry = &matches[0];
-            // Fetch the 4KB page data from the book store.
+            // Fetch the 4KB page data by direct slice — no Book::from_book needed.
+            // We only index depth-0 (raw) books, so page data is at a fixed offset.
+            const PAGE_SIZE: usize = 4096;
             if let Some(data) = self.storage.get(&entry.book_cid) {
-                if let Ok(book) = harmony_athenaeum::Book::from_book(entry.book_cid.to_bytes(), data)
-                {
-                    let page_bufs = book.page_data_from_book(data);
-                    // page_num is an index into data pages; page_data_from_book returns
-                    // ALL pages (including overhead). Offset by overhead_pages count.
-                    // For raw books overhead is 0, so data page index == page buf index.
-                    // Since we only index depth-0 books via from_book (raw), overhead is 0.
-                    let buf_idx = entry.page_num as usize;
-                    if let Some(page_data) = page_bufs.get(buf_idx) {
-                        let mut payload = vec![0x01];
-                        payload.extend_from_slice(page_data);
-                        return vec![RuntimeAction::SendReply { query_id, payload }];
+                let start = entry.page_num as usize * PAGE_SIZE;
+                if start < data.len() {
+                    let end = (start + PAGE_SIZE).min(data.len());
+                    let mut payload = Vec::with_capacity(1 + PAGE_SIZE);
+                    payload.push(0x01);
+                    payload.extend_from_slice(&data[start..end]);
+                    // Zero-pad if last page is shorter than PAGE_SIZE
+                    if payload.len() < 1 + PAGE_SIZE {
+                        payload.resize(1 + PAGE_SIZE, 0);
                     }
+                    return vec![RuntimeAction::SendReply { query_id, payload }];
                 }
             }
-            // Couldn't fetch — return empty (no reply)
+            // Couldn't fetch page data — no reply
             return Vec::new();
         }
 
