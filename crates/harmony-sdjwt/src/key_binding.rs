@@ -67,22 +67,9 @@ pub fn verify_key_binding(
     let header_json: serde_json::Value =
         serde_json::from_slice(&header_bytes).map_err(|e| SdJwtError::JsonError(e.to_string()))?;
 
-    // 4. Verify typ is "kb+jwt" (case-insensitive, also accept "application/kb+jwt").
-    let typ = header_json
-        .get("typ")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            SdJwtError::KeyBindingInvalid(String::from("KB-JWT typ header missing"))
-        })?;
-    if !typ.eq_ignore_ascii_case("kb+jwt") && !typ.eq_ignore_ascii_case("application/kb+jwt") {
-        return Err(SdJwtError::KeyBindingInvalid(format!(
-            "KB-JWT typ must be \"kb+jwt\", got \"{typ}\""
-        )));
-    }
-
-    // 5. Verify KB-JWT signature BEFORE processing claims.
-    //    This prevents error-message oracles on forged KB-JWTs and
-    //    avoids wasted computation on unauthenticated data.
+    // 4. Verify KB-JWT signature BEFORE any content checks.
+    //    This prevents error-message oracles and avoids wasted
+    //    computation on unauthenticated data.
     let kb_signing_input = format!("{}.{}", kb_header_b64, kb_payload_b64);
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(kb_sig_b64)
@@ -95,7 +82,20 @@ pub fn verify_key_binding(
     )
     .map_err(SdJwtError::SignatureInvalid)?;
 
-    // --- Signature is valid. Now check authenticated claims. ---
+    // --- Signature is valid. Now check authenticated header + claims. ---
+
+    // 5. Verify typ is "kb+jwt" (case-insensitive, also accept "application/kb+jwt").
+    let typ = header_json
+        .get("typ")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            SdJwtError::KeyBindingInvalid(String::from("KB-JWT typ header missing"))
+        })?;
+    if !typ.eq_ignore_ascii_case("kb+jwt") && !typ.eq_ignore_ascii_case("application/kb+jwt") {
+        return Err(SdJwtError::KeyBindingInvalid(format!(
+            "KB-JWT typ must be \"kb+jwt\", got \"{typ}\""
+        )));
+    }
 
     // 6. Decode and parse payload JSON.
     let payload_bytes = URL_SAFE_NO_PAD
@@ -141,14 +141,17 @@ pub fn verify_key_binding(
     const MAX_AGE_SECS: u64 = 300; // 5 minutes
     let iat = payload_json
         .get("iat")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| SdJwtError::KeyBindingInvalid(String::from("KB-JWT iat claim missing")))?;
-    if iat > now + MAX_CLOCK_SKEW {
+        .ok_or_else(|| SdJwtError::KeyBindingInvalid(String::from("KB-JWT iat claim missing")))?
+        .as_u64()
+        .ok_or_else(|| SdJwtError::KeyBindingInvalid(String::from(
+            "KB-JWT iat claim is not a valid non-negative integer"
+        )))?;
+    if iat > now.saturating_add(MAX_CLOCK_SKEW) {
         return Err(SdJwtError::KeyBindingInvalid(format!(
             "KB-JWT iat is in the future: iat={iat}, now={now}"
         )));
     }
-    if now > iat + MAX_AGE_SECS {
+    if now > iat.saturating_add(MAX_AGE_SECS) {
         return Err(SdJwtError::KeyBindingInvalid(format!(
             "KB-JWT iat is too old: iat={iat}, now={now}, max_age={MAX_AGE_SECS}s"
         )));
@@ -421,39 +424,52 @@ mod tests {
     #[test]
     fn wrong_typ() {
         let now = 1_700_000_000u64;
-        let (mut sd_jwt, holder_pub) =
-            make_sd_jwt_with_kb("nonce", "https://verifier.example", now);
-        // Replace the KB-JWT with one that has wrong typ
-        let holder_priv = harmony_identity::PrivateIdentity::generate(&mut OsRng);
-        let _ = holder_priv; // We can't sign with the original holder, but we can
-                             // just replace the KB-JWT header typ — signature will
-                             // also fail, but typ check comes first.
+        let issuer = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let holder = harmony_identity::PrivateIdentity::generate(&mut OsRng);
+        let holder_pub = holder.public_identity();
 
-        // Build a KB-JWT with wrong typ (reuse payload structure but change header)
-        let kb_header = r#"{"alg":"EdDSA","typ":"jwt"}"#;
-        let kb_payload = format!(
-            r#"{{"nonce":"nonce","aud":"https://verifier.example","iat":{},"sd_hash":"irrelevant"}}"#,
-            now
-        );
-        let kb_header_b64 = B64.encode(kb_header.as_bytes());
-        let kb_payload_b64 = B64.encode(kb_payload.as_bytes());
-        let kb_jwt = format!("{}.{}.fakesig", kb_header_b64, kb_payload_b64);
-        sd_jwt.key_binding_jwt = Some(kb_jwt);
+        // Build issuer JWS
+        let header_b64 = B64.encode(r#"{"alg":"EdDSA","typ":"sd+jwt"}"#.as_bytes());
+        let payload_b64 = B64.encode(r#"{"iss":"i","sub":"h"}"#.as_bytes());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let issuer_sig = issuer.sign(signing_input.as_bytes());
+        let sig_b64 = B64.encode(&issuer_sig);
+        let sd_jwt_without_kb = format!("{signing_input}.{sig_b64}~");
+        let sd_hash = B64.encode(Sha256::digest(sd_jwt_without_kb.as_bytes()));
+
+        // Build KB-JWT with wrong typ but VALID signature
+        let kb_header_b64 = B64.encode(r#"{"alg":"EdDSA","typ":"jwt"}"#.as_bytes());
+        let kb_payload = serde_json::json!({
+            "nonce": "n", "aud": "a", "iat": now, "sd_hash": sd_hash
+        });
+        let kb_payload_b64 = B64.encode(serde_json::to_vec(&kb_payload).unwrap());
+        let kb_si = format!("{kb_header_b64}.{kb_payload_b64}");
+        let kb_sig = holder.sign(kb_si.as_bytes());
+        let kb_jwt = format!("{kb_si}.{}", B64.encode(&kb_sig));
+
+        let sd_jwt = SdJwt {
+            header: JwsHeader { alg: "EdDSA".into(), typ: Some("sd+jwt".into()), kid: None },
+            payload: JwtPayload {
+                iss: Some("i".into()), sub: Some("h".into()),
+                iat: None, exp: None, nbf: None, sd: vec![], sd_alg: None,
+                #[cfg(feature = "std")] extra: vec![],
+            },
+            signature: issuer_sig.to_vec(),
+            signing_input,
+            disclosures: vec![],
+            key_binding_jwt: Some(kb_jwt),
+        };
 
         let result = verify_key_binding(
             &sd_jwt,
-            &holder_pub,
+            &holder_pub.verifying_key.to_bytes(),
             CryptoSuite::Ed25519,
-            "nonce",
-            "https://verifier.example",
-            now,
+            "n", "a", now,
         );
-        match result {
-            Err(SdJwtError::KeyBindingInvalid(msg)) => {
-                assert!(msg.contains("typ"), "error should mention typ: {msg}");
-            }
-            other => panic!("expected KeyBindingInvalid with typ, got {:?}", other),
-        }
+        assert!(matches!(
+            result,
+            Err(SdJwtError::KeyBindingInvalid(msg)) if msg.contains("typ")
+        ));
     }
 
     #[test]
