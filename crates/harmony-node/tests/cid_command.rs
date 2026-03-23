@@ -16,9 +16,18 @@ fn cid_from_file() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let hex_str = String::from_utf8(output.stdout).unwrap().trim().to_string();
-    assert_eq!(hex_str.len(), 64, "CID should be 64 hex chars, got {}", hex_str.len());
+    assert_eq!(
+        hex_str.len(),
+        64,
+        "CID should be 64 hex chars, got {}",
+        hex_str.len()
+    );
     assert!(hex::decode(&hex_str).is_ok());
 }
 
@@ -33,7 +42,10 @@ fn cid_from_stdin() {
         .args(["cid", "--file", path.to_str().unwrap()])
         .output()
         .unwrap();
-    let file_cid = String::from_utf8(file_output.stdout).unwrap().trim().to_string();
+    let file_cid = String::from_utf8(file_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     let mut child = harmony_bin()
         .args(["cid"])
@@ -48,7 +60,10 @@ fn cid_from_stdin() {
     assert!(output.status.success());
     let stdin_cid = String::from_utf8(output.stdout).unwrap().trim().to_string();
 
-    assert_eq!(file_cid, stdin_cid, "file and stdin should produce same CID");
+    assert_eq!(
+        file_cid, stdin_cid,
+        "file and stdin should produce same CID"
+    );
 }
 
 #[test]

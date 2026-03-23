@@ -15,10 +15,8 @@ mod tunnel_task;
 
 use clap::{Parser, Subcommand};
 
-type LogReloadHandle = tracing_subscriber::reload::Handle<
-    tracing_subscriber::EnvFilter,
-    tracing_subscriber::Registry,
->;
+type LogReloadHandle =
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
 
 #[derive(Parser)]
 #[command(name = "harmony", about = "Harmony decentralized network tools")]
@@ -167,14 +165,13 @@ async fn main() {
     // it for syslog on OpenWRT). Filter via RUST_LOG env var, default info.
     // Uses reload::Handle so [logging].level from config file can reconfigure
     // the filter after loading.
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|e| {
-            // Only warn if RUST_LOG is set but malformed — missing is the normal case.
-            if std::env::var("RUST_LOG").is_ok() {
-                eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
-            }
-            tracing_subscriber::EnvFilter::new("info")
-        });
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|e| {
+        // Only warn if RUST_LOG is set but malformed — missing is the normal case.
+        if std::env::var("RUST_LOG").is_ok() {
+            eprintln!("Warning: invalid RUST_LOG directive ({e}), defaulting to info");
+        }
+        tracing_subscriber::EnvFilter::new("info")
+    });
     let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -286,15 +283,15 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 let input_cid = harmony_content::ContentId::from_bytes(input_bytes);
                 let output_cid = harmony_content::ContentId::from_bytes(output_bytes);
 
-                let id_path =
-                    crate::identity_file::resolve_path(identity_file.as_deref())?;
+                let id_path = crate::identity_file::resolve_path(identity_file.as_deref())?;
                 let identity = crate::identity_file::load_or_generate(&id_path)?;
 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .map_err(|_| "system clock is before Unix epoch")?;
-                let expires_at = now.checked_add(expires_in)
+                let expires_at = now
+                    .checked_add(expires_in)
                     .ok_or("--expires-in value causes timestamp overflow")?;
 
                 let memo = harmony_memo::create::create_memo(
@@ -310,8 +307,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 let memo_bytes =
                     harmony_memo::serialize(&memo).map_err(|e| format!("serialize: {e}"))?;
 
-                let signer_hex =
-                    hex::encode(identity.pq.public_identity().address_hash);
+                let signer_hex = hex::encode(identity.pq.public_identity().address_hash);
                 // Use canonical lowercase hex from parsed bytes, not raw user input.
                 // Upper/lower case differences would produce different Zenoh keys.
                 let input_hex = hex::encode(input_cid.to_bytes());
@@ -362,8 +358,8 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
 
             // ── Load config file ────────────────────────────────────────
             let (config_path, explicit) = crate::config::resolve_config_path(config.as_deref())?;
-            let config_file = crate::config::load(&config_path, explicit)
-                .map_err(|e| format!("{e}"))?;
+            let config_file =
+                crate::config::load(&config_path, explicit).map_err(|e| format!("{e}"))?;
 
             // Apply config file log level if RUST_LOG is not set.
             if std::env::var("RUST_LOG").is_err() {
@@ -386,19 +382,45 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             use crate::config::resolve;
             let cache_capacity = resolve(cache_capacity, config_file.cache_capacity, 1024);
             let compute_budget = resolve(compute_budget, config_file.compute_budget, 100_000);
-            let filter_broadcast_ticks = resolve(filter_broadcast_ticks, config_file.filter_broadcast_ticks, 30);
-            let filter_mutation_threshold = resolve(filter_mutation_threshold, config_file.filter_mutation_threshold, 100);
-            let mdns_stale_timeout = resolve(mdns_stale_timeout, config_file.mdns_stale_timeout, 60);
-            let listen_address = resolve(listen_address, config_file.listen_address, "0.0.0.0:4242".to_string());
+            let filter_broadcast_ticks = resolve(
+                filter_broadcast_ticks,
+                config_file.filter_broadcast_ticks,
+                30,
+            );
+            let filter_mutation_threshold = resolve(
+                filter_mutation_threshold,
+                config_file.filter_mutation_threshold,
+                100,
+            );
+            let mdns_stale_timeout =
+                resolve(mdns_stale_timeout, config_file.mdns_stale_timeout, 60);
+            let listen_address = resolve(
+                listen_address,
+                config_file.listen_address,
+                "0.0.0.0:4242".to_string(),
+            );
             let identity_file = identity_file.or(config_file.identity_file);
             let relay_url = relay_url.or(config_file.relay_url);
             let no_mdns = resolve(no_mdns, config_file.no_mdns, false);
-            let encrypted_durable_persist = resolve(encrypted_durable_persist, config_file.encrypted_durable_persist, false);
-            let encrypted_durable_announce = resolve(encrypted_durable_announce, config_file.encrypted_durable_announce, false);
-            let no_public_ephemeral_announce = resolve(no_public_ephemeral_announce, config_file.no_public_ephemeral_announce, false);
+            let encrypted_durable_persist = resolve(
+                encrypted_durable_persist,
+                config_file.encrypted_durable_persist,
+                false,
+            );
+            let encrypted_durable_announce = resolve(
+                encrypted_durable_announce,
+                config_file.encrypted_durable_announce,
+                false,
+            );
+            let no_public_ephemeral_announce = resolve(
+                no_public_ephemeral_announce,
+                config_file.no_public_ephemeral_announce,
+                false,
+            );
 
             // ── Parse config-only sections ───────────────────────────────
-            let bootstrap_peers: Vec<std::net::SocketAddr> = config_file.peers
+            let bootstrap_peers: Vec<std::net::SocketAddr> = config_file
+                .peers
                 .unwrap_or_default()
                 .iter()
                 .map(|p| p.address.parse::<std::net::SocketAddr>())
@@ -419,8 +441,10 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     if decoded.len() != 32 {
                         return Err(format!(
                             "invalid tunnel node_id '{}': expected 32 bytes (64 hex chars), got {}",
-                            entry.node_id, decoded.len()
-                        ).into());
+                            entry.node_id,
+                            decoded.len()
+                        )
+                        .into());
                     }
                 }
                 entries
@@ -482,7 +506,10 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             // Build tunnel config if --relay-url was provided.
             // The PQ identity is wrapped in Arc because tunnel tasks need
             // references and PqPrivateIdentity is not Clone.
-            let tunnel_config = if relay_url.is_some() || tunnel_peer.is_some() || !tunnel_entries.is_empty() {
+            let tunnel_config = if relay_url.is_some()
+                || tunnel_peer.is_some()
+                || !tunnel_entries.is_empty()
+            {
                 if tunnel_peer.is_some() {
                     tracing::warn!("--tunnel-peer: outbound connections not yet wired (needs contact store, Bead #3)");
                 }
@@ -526,7 +553,11 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
 
             // Register tunnel peers from CLI.
             for spec in &add_tunnel_peer {
-                let TunnelPeerSpec { identity_hash, node_id, relay_url } = parse_tunnel_peer_spec(spec)?;
+                let TunnelPeerSpec {
+                    identity_hash,
+                    node_id,
+                    relay_url,
+                } = parse_tunnel_peer_spec(spec)?;
                 let contact = harmony_contacts::Contact {
                     identity_hash,
                     display_name: None,
@@ -550,9 +581,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 rt.contact_store_mut()
                     .add(contact)
                     .map_err(|e| format!("failed to add tunnel peer: {e}"))?;
-                rt.push_event(crate::runtime::RuntimeEvent::ContactChanged {
-                    identity_hash,
-                });
+                rt.push_event(crate::runtime::RuntimeEvent::ContactChanged { identity_hash });
                 tracing::info!(
                     identity = %hex::encode(identity_hash),
                     node_id = %hex::encode(&node_id[..8]),
@@ -571,8 +600,9 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 tunnel_config,
                 bootstrap_peers,
                 tunnel_entries,
-            ).await
-                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            )
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
         }
         Commands::Cid { file } => {
@@ -620,9 +650,7 @@ struct TunnelPeerSpec {
 }
 
 /// Parse a tunnel peer spec: `<identity_hash_hex>:<node_id_hex>[@relay_url]`
-fn parse_tunnel_peer_spec(
-    spec: &str,
-) -> Result<TunnelPeerSpec, Box<dyn std::error::Error>> {
+fn parse_tunnel_peer_spec(spec: &str) -> Result<TunnelPeerSpec, Box<dyn std::error::Error>> {
     let (id_and_node, relay_url) = match spec.split_once('@') {
         Some((left, url)) if !url.is_empty() => (left, Some(url.to_string())),
         Some((left, _)) => (left, None), // trailing '@' with no URL → treat as no relay
@@ -739,7 +767,14 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_announce_without_persist() {
-        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--encrypted-durable-announce"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--config",
+            "/dev/null",
+            "--encrypted-durable-announce",
+        ])
+        .unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -751,7 +786,15 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_zero_cache_capacity() {
-        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--cache-capacity", "0"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--config",
+            "/dev/null",
+            "--cache-capacity",
+            "0",
+        ])
+        .unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -764,7 +807,15 @@ mod tests {
     #[tokio::test]
     async fn cli_rejects_oversized_cache_capacity() {
         // 200_000_001 exceeds MAX_CACHE_CAPACITY (200M).
-        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--cache-capacity", "200000001"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--config",
+            "/dev/null",
+            "--cache-capacity",
+            "200000001",
+        ])
+        .unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -797,7 +848,15 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_filter_broadcast_ticks_below_two() {
-        let cli = Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--filter-broadcast-ticks", "1"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--config",
+            "/dev/null",
+            "--filter-broadcast-ticks",
+            "1",
+        ])
+        .unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -830,8 +889,15 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_invalid_listen_address() {
-        let cli =
-            Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--listen-address", "not-an-addr"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--config",
+            "/dev/null",
+            "--listen-address",
+            "not-an-addr",
+        ])
+        .unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -849,7 +915,10 @@ mod tests {
         let parsed = parse_tunnel_peer_spec(&spec).unwrap();
         assert_eq!(parsed.identity_hash, [0xAA; 16]);
         assert_eq!(parsed.node_id, [0xBB; 32]);
-        assert_eq!(parsed.relay_url, Some("https://relay.example.com".to_string()));
+        assert_eq!(
+            parsed.relay_url,
+            Some("https://relay.example.com".to_string())
+        );
     }
 
     #[test]
@@ -902,14 +971,11 @@ mod tests {
         let id_hex = "aa".repeat(16);
         let node_hex = "bb".repeat(32);
         let spec = format!("{id_hex}:{node_hex}@https://relay.example.com");
-        let cli = Cli::try_parse_from([
-            "harmony",
-            "run",
-            "--add-tunnel-peer",
-            &spec,
-        ])
-        .unwrap();
-        if let Commands::Run { add_tunnel_peer, .. } = cli.command {
+        let cli = Cli::try_parse_from(["harmony", "run", "--add-tunnel-peer", &spec]).unwrap();
+        if let Commands::Run {
+            add_tunnel_peer, ..
+        } = cli.command
+        {
             assert_eq!(add_tunnel_peer.len(), 1);
             assert_eq!(add_tunnel_peer[0], spec);
         } else {
@@ -929,7 +995,7 @@ mod tests {
 
     #[test]
     fn cli_parses_multiple_tunnel_peers() {
-        let spec1 = format!("{}:{}",  "aa".repeat(16), "bb".repeat(32));
+        let spec1 = format!("{}:{}", "aa".repeat(16), "bb".repeat(32));
         let spec2 = format!("{}:{}", "cc".repeat(16), "dd".repeat(32));
         let cli = Cli::try_parse_from([
             "harmony",
@@ -940,7 +1006,10 @@ mod tests {
             &spec2,
         ])
         .unwrap();
-        if let Commands::Run { add_tunnel_peer, .. } = cli.command {
+        if let Commands::Run {
+            add_tunnel_peer, ..
+        } = cli.command
+        {
             assert_eq!(add_tunnel_peer.len(), 2);
         } else {
             panic!("expected Run command");
@@ -960,7 +1029,10 @@ mod tests {
     #[test]
     fn cli_parses_mdns_stale_timeout() {
         let cli = Cli::try_parse_from(["harmony", "run", "--mdns-stale-timeout", "120"]).unwrap();
-        if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
+        if let Commands::Run {
+            mdns_stale_timeout, ..
+        } = cli.command
+        {
             assert_eq!(mdns_stale_timeout, Some(120));
         } else {
             panic!("expected Run command");
@@ -970,7 +1042,10 @@ mod tests {
     #[test]
     fn cli_mdns_stale_timeout_default() {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
-        if let Commands::Run { mdns_stale_timeout, .. } = cli.command {
+        if let Commands::Run {
+            mdns_stale_timeout, ..
+        } = cli.command
+        {
             assert!(mdns_stale_timeout.is_none());
         } else {
             panic!("expected Run command");
@@ -979,8 +1054,15 @@ mod tests {
 
     #[tokio::test]
     async fn cli_rejects_zero_mdns_stale_timeout() {
-        let cli =
-            Cli::try_parse_from(["harmony", "run", "--config", "/dev/null", "--mdns-stale-timeout", "0"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "harmony",
+            "run",
+            "--config",
+            "/dev/null",
+            "--mdns-stale-timeout",
+            "0",
+        ])
+        .unwrap();
         let result = run(cli, dummy_reload_handle()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -1015,22 +1097,29 @@ mod tests {
         let input_hex = "aa".repeat(32);
         let output_hex = "bb".repeat(32);
         let cli = Cli::try_parse_from([
-            "harmony", "memo", "sign",
-            "--input", &input_hex,
-            "--output", &output_hex,
-        ]).unwrap();
+            "harmony",
+            "memo",
+            "sign",
+            "--input",
+            &input_hex,
+            "--output",
+            &output_hex,
+        ])
+        .unwrap();
         assert!(matches!(cli.command, Commands::Memo { .. }));
     }
 
     #[test]
     fn cli_parses_memo_list() {
-        let cli = Cli::try_parse_from(["harmony", "memo", "list", "--input", &"cc".repeat(32)]).unwrap();
+        let cli =
+            Cli::try_parse_from(["harmony", "memo", "list", "--input", &"cc".repeat(32)]).unwrap();
         assert!(matches!(cli.command, Commands::Memo { .. }));
     }
 
     #[test]
     fn cli_parses_memo_verify() {
-        let cli = Cli::try_parse_from(["harmony", "memo", "verify", "--input", &"dd".repeat(32)]).unwrap();
+        let cli = Cli::try_parse_from(["harmony", "memo", "verify", "--input", &"dd".repeat(32)])
+            .unwrap();
         assert!(matches!(cli.command, Commands::Memo { .. }));
     }
 
