@@ -63,6 +63,13 @@ impl PeerTable {
             .count()
     }
 
+    /// Check if a MAC address belongs to any known (non-expired) peer.
+    pub fn lookup_by_mac(&self, mac: &[u8; 6]) -> bool {
+        self.entries.values().any(|entry| {
+            entry.mac == *mac && entry.last_seen.elapsed() < self.ttl
+        })
+    }
+
     /// Remove all expired entries from the table.
     pub fn purge_expired(&mut self) {
         let ttl = self.ttl;

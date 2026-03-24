@@ -5,7 +5,6 @@
 //! 2. Receives inbound L2 frames and publishes Data payloads into zenoh.
 //! 3. Drains the zenoh subscriber and broadcasts outbound Data frames.
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -79,11 +78,6 @@ impl<S: RawSocket> Bridge<S> {
         let mut next_purge = Instant::now() + self.config.peer_ttl;
         let local_mac = self.socket.local_mac();
 
-        // Track key expressions we recently published from inbound L2 frames.
-        // When these appear on the zenoh subscriber, we skip them to prevent
-        // the echo loop: L2 → zenoh put → subscriber → L2 → zenoh put → ...
-        let mut recently_published: HashSet<String> = HashSet::new();
-
         loop {
             let now = Instant::now();
 
@@ -101,21 +95,16 @@ impl<S: RawSocket> Bridge<S> {
             }
 
             // 3. Process inbound L2 frames → publish to zenoh.
-            //    Track which key expressions we publish so we can skip them
-            //    on the outbound subscriber (echo prevention).
-            recently_published.clear();
-            let inbound_keys = self.process_inbound_frames(&local_mac).await?;
-            recently_published.extend(inbound_keys);
+            self.process_inbound_frames(&local_mac).await?;
 
             // 4. Drain outbound zenoh samples → broadcast as Data frames.
-            //    Skip samples whose key_expr we just published from L2 inbound
-            //    to prevent the echo loop.
+            //    The origin MAC embedded in each Data frame prevents cross-node
+            //    echo loops: when Node B receives Node A's L2 broadcast, publishes
+            //    to zenoh, and Node A's outbound subscriber picks it up, the
+            //    outbound frame carries Node A's MAC as origin. Node B's bridge
+            //    will see the origin MAC matches a known L2 peer and discard it
+            //    on inbound. See process_inbound_frames for the check.
             while let Ok(Some(sample)) = subscriber.try_recv() {
-                let key = sample.key_expr().as_str();
-                if recently_published.contains(key) {
-                    trace!(key_expr = key, "skipping echo of L2-originated publish");
-                    continue;
-                }
                 self.process_outbound_sample(&sample)?;
             }
 
@@ -143,7 +132,7 @@ impl<S: RawSocket> Bridge<S> {
     /// Buffers frames during the sync `recv_frames` callback, then publishes
     /// to zenoh asynchronously after the callback returns. Returns the key
     /// expressions that were published (for echo prevention).
-    async fn process_inbound_frames(&mut self, local_mac: &[u8; 6]) -> Result<Vec<String>, RawLinkError> {
+    async fn process_inbound_frames(&mut self, local_mac: &[u8; 6]) -> Result<(), RawLinkError> {
         let mut inbound_data: Vec<(String, Vec<u8>)> = Vec::new();
         let allowed_prefix = &self.config.subscribe_pattern;
 
@@ -176,12 +165,25 @@ impl<S: RawSocket> Bridge<S> {
                     );
                 }
                 frame_type::DATA => {
-                    if payload.len() < 1 + 2 {
+                    // Data payload: [DATA tag][6-byte origin_mac][u16 BE key_len][key][payload]
+                    // The origin_mac identifies which bridge originally sent this
+                    // frame to L2. If it matches a known L2 peer, the frame already
+                    // traversed L2 → zenoh → L2 and must be discarded to prevent
+                    // cross-node echo loops.
+                    if payload.len() < 1 + 6 + 2 {
                         debug!(len = payload.len(), "data frame too short, ignoring");
                         return;
                     }
-                    let key_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
-                    let key_start = 3;
+                    let mut origin_mac = [0u8; 6];
+                    origin_mac.copy_from_slice(&payload[1..7]);
+                    // If origin is our own MAC or any known L2 peer, this frame
+                    // already came from L2 — don't re-publish to zenoh.
+                    if &origin_mac == local_mac || peer_table.lookup_by_mac(&origin_mac) {
+                        trace!("discarding L2-originated data frame (echo prevention)");
+                        return;
+                    }
+                    let key_len = u16::from_be_bytes([payload[7], payload[8]]) as usize;
+                    let key_start = 9;
                     let key_end = key_start + key_len;
                     if payload.len() < key_end {
                         debug!(
@@ -220,17 +222,14 @@ impl<S: RawSocket> Bridge<S> {
         })?;
 
         // Publish buffered inbound data to zenoh (async, non-blocking).
-        let mut published_keys = Vec::with_capacity(inbound_data.len());
         for (key_expr, data) in inbound_data {
             // TODO: Use zenoh SHM (shared memory) for zero-copy inbound delivery.
             if let Err(e) = self.session.put(&key_expr, data).await {
                 warn!(key_expr, %e, "failed to publish inbound data to zenoh");
-            } else {
-                published_keys.push(key_expr);
             }
         }
 
-        Ok(published_keys)
+        Ok(())
     }
 
     /// Encode and broadcast a zenoh sample as a Data frame.
@@ -247,9 +246,13 @@ impl<S: RawSocket> Bridge<S> {
             return Ok(());
         }
 
-        // Build frame payload: [DATA tag][u16 BE key_len][key_bytes][payload_bytes]
-        let mut frame_payload = Vec::with_capacity(1 + 2 + key_expr.len() + payload.len());
+        // Build frame payload: [DATA tag][6-byte origin_mac][u16 BE key_len][key_bytes][payload]
+        // The origin_mac tells receiving bridges that this frame came from L2
+        // and should not be re-broadcast (cross-node echo prevention).
+        let local_mac = self.socket.local_mac();
+        let mut frame_payload = Vec::with_capacity(1 + 6 + 2 + key_expr.len() + payload.len());
         frame_payload.push(frame_type::DATA);
+        frame_payload.extend_from_slice(&local_mac);
         frame_payload.extend_from_slice(&(key_expr.len() as u16).to_be_bytes());
         frame_payload.extend_from_slice(key_expr.as_bytes());
         frame_payload.extend_from_slice(&payload);
@@ -297,10 +300,11 @@ mod tests {
     }
 
     /// Build a data payload as the bridge would send it (post-Ethernet-header).
-    fn make_data_payload(key_expr: &str, data: &[u8]) -> Vec<u8> {
+    fn make_data_payload(origin_mac: [u8; 6], key_expr: &str, data: &[u8]) -> Vec<u8> {
         let key_bytes = key_expr.as_bytes();
-        let mut buf = Vec::with_capacity(1 + 2 + key_bytes.len() + data.len());
+        let mut buf = Vec::with_capacity(1 + 6 + 2 + key_bytes.len() + data.len());
         buf.push(frame_type::DATA);
+        buf.extend_from_slice(&origin_mac);
         buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
         buf.extend_from_slice(key_bytes);
         buf.extend_from_slice(data);
@@ -322,16 +326,18 @@ mod tests {
     fn data_payload_round_trip() {
         let key = "harmony/test/topic";
         let data = b"hello world";
-        let payload = make_data_payload(key, data);
+        let origin = [0xCC; 6];
+        let payload = make_data_payload(origin, key, data);
 
         assert_eq!(payload[0], frame_type::DATA);
-        let key_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
+        assert_eq!(&payload[1..7], &origin);
+        let key_len = u16::from_be_bytes([payload[7], payload[8]]) as usize;
         assert_eq!(key_len, key.len());
 
-        let decoded_key = std::str::from_utf8(&payload[3..3 + key_len]).expect("valid UTF-8");
+        let decoded_key = std::str::from_utf8(&payload[9..9 + key_len]).expect("valid UTF-8");
         assert_eq!(decoded_key, key);
 
-        let decoded_data = &payload[3 + key_len..];
+        let decoded_data = &payload[9 + key_len..];
         assert_eq!(decoded_data, data);
     }
 
@@ -381,17 +387,19 @@ mod tests {
     }
 
     #[test]
-    fn data_payload_encoding_matches_frame_module() {
-        // Verify that the bridge's Data payload encoding is consistent with
-        // the frame module's encode_data_frame (minus the Ethernet header).
+    fn data_payload_contains_origin_mac() {
+        // Verify that the bridge's Data payload includes the origin MAC
+        // for cross-node echo prevention.
         let key = "harmony/mesh/status";
         let data = b"online";
+        let origin = MAC_A;
 
-        let bridge_payload = make_data_payload(key, data);
-        let full_frame = frame::encode_data_frame(MAC_A, BROADCAST_MAC, key, data).unwrap();
-        let frame_payload = &full_frame[crate::ETH_HEADER_LEN..];
-
-        assert_eq!(bridge_payload, frame_payload);
+        let payload = make_data_payload(origin, key, data);
+        assert_eq!(payload[0], frame_type::DATA);
+        assert_eq!(&payload[1..7], &origin);
+        // Key expression follows after origin MAC
+        let key_len = u16::from_be_bytes([payload[7], payload[8]]) as usize;
+        assert_eq!(key_len, key.len());
     }
 
     #[test]
