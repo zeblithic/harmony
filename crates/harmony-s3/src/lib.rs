@@ -50,17 +50,22 @@ impl S3Library {
     pub async fn new(
         bucket: impl Into<String>,
         prefix: impl Into<String>,
-        region: impl Into<String>,
+        region: Option<String>,
     ) -> Result<Self, S3Error> {
         let bucket = bucket.into();
-        let prefix = prefix.into();
-        let region_str = region.into();
+        let mut prefix = prefix.into();
+        // Normalize prefix: ensure trailing slash (or empty).
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
 
-        let region = aws_config::Region::new(region_str);
-        let config = aws_config::defaults(BehaviorVersion::latest())
-            .region(region)
-            .load()
-            .await;
+        let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
+        // Only set region explicitly if configured. Otherwise, let the SDK
+        // auto-detect from AWS_DEFAULT_REGION, ~/.aws/config, etc.
+        if let Some(ref region) = region {
+            config_loader = config_loader.region(aws_config::Region::new(region.clone()));
+        }
+        let config = config_loader.load().await;
         let client = Client::new(&config);
 
         debug!("S3Library initialised");

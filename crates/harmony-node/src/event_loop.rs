@@ -245,7 +245,7 @@ pub async fn run(
         match harmony_s3::S3Library::new(
             archivist.bucket.clone(),
             archivist.prefix.clone(),
-            archivist.region.clone().unwrap_or_else(|| "us-east-1".to_string()),
+            archivist.region.clone(),
         ).await {
             Ok(s3) => {
                 let session = session.clone();
