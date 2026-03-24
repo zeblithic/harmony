@@ -6,13 +6,17 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+archivist = ["dep:zenoh"]
+
 [dependencies]
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 hex.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
-zenoh = { workspace = true }
+zenoh = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

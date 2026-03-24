@@ -12,7 +12,7 @@ wasmtime = ["harmony-compute/wasmtime"]
 # Disable BLAKE3 NEON assembly for cross-compilation without a C cross-compiler.
 no-neon = ["harmony-crypto/no-neon"]
 rawlink = ["harmony-rawlink"]
-archivist = ["harmony-s3"]
+archivist = ["harmony-s3/archivist"]
 
 [[bin]]
 name = "harmony"

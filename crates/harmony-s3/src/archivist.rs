@@ -106,6 +106,9 @@ pub async fn run(s3: S3Library, session: zenoh::Session) {
         }
 
         // Upload the book.
+        // TODO(harmony-aa7): verify BLAKE3(payload) matches the hash portion of the CID
+        // before archiving. Currently trusts the publisher — verification is deferred to
+        // the fallback resolver which hashes on download.
         let payload = sample.payload().to_bytes().to_vec();
         match s3.put_book(&cid, payload).await {
             Ok(()) => {

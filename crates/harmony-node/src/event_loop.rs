@@ -249,8 +249,9 @@ pub async fn run(
         ).await {
             Ok(s3) => {
                 let session = session.clone();
-                tokio::spawn(async move {
+                let _archivist_handle = tokio::spawn(async move {
                     harmony_s3::archivist::run(s3, session).await;
+                    tracing::error!("S3 archivist task exited — archival is no longer active");
                 });
                 tracing::info!(
                     bucket = %archivist.bucket,
@@ -262,6 +263,14 @@ pub async fn run(
                 tracing::warn!(err = %e, "S3 archivist failed to start — continuing without archival");
             }
         }
+    }
+
+    #[cfg(not(feature = "archivist"))]
+    if archivist_config.is_some() {
+        tracing::warn!(
+            "archivist config is present but this binary was compiled without \
+             the `archivist` feature — archival is disabled"
+        );
     }
 
     // ── L2 Reticulum channel endpoints (populated when rawlink bridge starts) ─

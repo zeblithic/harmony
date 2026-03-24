@@ -13,6 +13,7 @@
 
 mod error;
 
+#[cfg(feature = "archivist")]
 pub mod archivist;
 
 pub use error::S3Error;
