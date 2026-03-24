@@ -183,6 +183,7 @@ impl Eq for DeferredDial {}
 /// - `bootstrap_peers`: static peers from the config `[peers]` section; added to PeerTable
 ///   at startup so they receive unicast traffic even when not reachable via mDNS.
 /// - `tunnel_entries`: config-sourced tunnel peers to track for reconnection.
+/// - `did_web_cache_ttl`: TTL in seconds for the did:web gateway cache.
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -192,6 +193,7 @@ pub async fn run(
     tunnel_config: Option<TunnelConfig>,
     bootstrap_peers: Vec<SocketAddr>,
     tunnel_entries: Vec<crate::config::TunnelEntry>,
+    did_web_cache_ttl: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -330,6 +332,19 @@ pub async fn run(
             &mut deferred_dials,
         )
         .await;
+    }
+
+    // ── did:web gateway queryable ────────────────────────────────────────────
+    match session
+        .declare_queryable(harmony_zenoh::namespace::identity::web::ALL)
+        .await
+    {
+        Ok(qbl) => {
+            tokio::spawn(crate::did_web_gateway::run(qbl, did_web_cache_ttl));
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "failed to declare did:web gateway queryable");
+        }
     }
 
     // ── Monotonic epoch ─────────────────────────────────────────────────────

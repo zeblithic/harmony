@@ -71,6 +71,7 @@ pub struct ConfigFile {
     pub logging: Option<LoggingConfig>,
     pub peers: Option<Vec<PeerEntry>>,
     pub tunnels: Option<Vec<TunnelEntry>>,
+    pub did_web_cache_ttl: Option<u64>,
 }
 
 #[derive(Deserialize, Debug)]
