@@ -4,6 +4,8 @@
 //! via AF_PACKET sockets with TPACKET_V3 ring buffers. Bridges to Zenoh
 //! pub/sub via shared memory for zero-copy delivery.
 
+#[cfg(target_os = "linux")]
+pub mod af_packet;
 pub mod error;
 pub mod frame;
 pub mod peer_table;
