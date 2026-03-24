@@ -63,7 +63,7 @@ Broadcast every ~5 seconds (with jitter). On receipt, the bridge learns `identit
 ### Data Payload
 
 ```
-[LEB128 key_expr_len][key_expr bytes][payload bytes]
+[u16 BE key_expr_len][key_expr bytes][payload bytes]
 ```
 
 Sent unicast to the learned MAC. Falls back to broadcast if destination MAC is unknown.
@@ -88,12 +88,12 @@ Linux-only, inside `AfPacketSocket`.
 
 ### BPF Filter
 
-Three instructions — only accept Harmony frames:
+Four instructions — only accept Harmony frames:
 ```
 ldh [12]              ; load EtherType at offset 12
-jeq #0x88B5, accept   ; match → accept
-ret #0                ; no match → reject
-accept: ret #65535
+jeq #0x88B5, accept   ; match → jump to accept, else fall through
+ret #0                ; reject
+accept: ret #65535    ; accept full frame
 ```
 
 ### Receive Path
