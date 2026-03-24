@@ -504,6 +504,13 @@ impl RawSocket for AfPacketSocket {
             return Ok(());
         }
 
+        // Check for socket errors (e.g., interface down, ring overflow).
+        if pfd.revents & libc::POLLERR != 0 {
+            return Err(RawLinkError::SocketError(
+                "AF_PACKET socket error (POLLERR)".into(),
+            ));
+        }
+
         // --- Walk available RX blocks ---
         loop {
             // SAFETY: rx_block_idx is always < BLOCK_NR (maintained by modular arithmetic

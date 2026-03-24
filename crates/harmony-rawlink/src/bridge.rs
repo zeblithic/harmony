@@ -200,8 +200,10 @@ impl<S: RawSocket> Bridge<S> {
                     };
                     // Validate key expression against allowed namespace to prevent
                     // unauthenticated injection into arbitrary zenoh key spaces.
-                    let prefix = allowed_prefix.trim_end_matches("**").trim_end_matches('/');
-                    if !key_expr.starts_with(prefix) {
+                    // Ensure prefix ends with '/' to prevent "harmony_evil" matching "harmony/".
+                    let mut prefix = allowed_prefix.trim_end_matches("**").trim_end_matches('/').to_string();
+                    prefix.push('/');
+                    if !key_expr.starts_with(&prefix) {
                         debug!(
                             key_expr,
                             "data frame key_expr outside allowed namespace, ignoring"
@@ -238,6 +240,12 @@ impl<S: RawSocket> Bridge<S> {
     ) -> Result<(), RawLinkError> {
         let key_expr = sample.key_expr().as_str();
         let payload = sample.payload().to_bytes();
+
+        // Guard against key expression length overflow (u16 max = 65535).
+        if key_expr.len() > u16::MAX as usize {
+            warn!(key_expr, "outbound key_expr exceeds u16 max length, dropping frame");
+            return Ok(());
+        }
 
         // Build frame payload: [DATA tag][u16 BE key_len][key_bytes][payload_bytes]
         let mut frame_payload = Vec::with_capacity(1 + 2 + key_expr.len() + payload.len());
