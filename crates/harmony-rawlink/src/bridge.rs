@@ -81,40 +81,68 @@ impl<S: RawSocket> Bridge<S> {
         let mut next_purge = Instant::now() + self.config.peer_ttl;
         let local_mac = self.socket.local_mac();
 
+        let mut consecutive_errors: u32 = 0;
+
         loop {
             let now = Instant::now();
 
-            // 1. Scout — broadcast presence if timer expired.
-            if now >= next_scout {
-                self.send_scout()?;
-                let jitter = self.jittered_scout_interval();
-                next_scout = now + jitter;
+            // Run the iteration body, catching transient errors.
+            let result: Result<(), RawLinkError> = async {
+                // 1. Scout — broadcast presence if timer expired.
+                if now >= next_scout {
+                    self.send_scout()?;
+                    let jitter = self.jittered_scout_interval();
+                    next_scout = now + jitter;
+                }
+
+                // 2. Purge expired peer table entries periodically.
+                if now >= next_purge {
+                    self.peer_table.purge_expired();
+                    next_purge = now + self.config.peer_ttl;
+                }
+
+                // 3. Process inbound L2 frames → publish to zenoh.
+                let inbound_hashes = self.process_inbound_frames(&local_mac).await?;
+
+                // 4. Drain outbound zenoh samples → broadcast as Data frames.
+                //    Skip samples whose content hash matches something we just
+                //    published from inbound L2 (echo prevention).
+                while let Ok(Some(sample)) = subscriber.try_recv() {
+                    let h = content_hash(sample.key_expr().as_str(), &sample.payload().to_bytes());
+                    if inbound_hashes.contains(&h) {
+                        trace!("skipping echo of L2-originated publish");
+                        continue;
+                    }
+                    self.process_outbound_sample(&sample)?;
+                }
+
+                Ok(())
             }
+            .await;
 
-            // 2. Purge expired peer table entries periodically.
-            if now >= next_purge {
-                self.peer_table.purge_expired();
-                next_purge = now + self.config.peer_ttl;
-            }
-
-            // 3. Process inbound L2 frames → publish to zenoh.
-            //    Returns content hashes of published samples for echo prevention.
-            let inbound_hashes = self.process_inbound_frames(&local_mac).await?;
-
-            // 4. Drain outbound zenoh samples → broadcast as Data frames.
-            //    Skip samples whose content hash matches something we just
-            //    published from inbound L2 — these are our own puts echoing
-            //    back through the zenoh subscriber. This prevents both same-node
-            //    echo (bridge put → subscriber → bridge send) and cross-node
-            //    echo (A sends L2 → B publishes to zenoh → B subscriber → B
-            //    sends L2 → A receives → A publishes → A subscriber → ...).
-            while let Ok(Some(sample)) = subscriber.try_recv() {
-                let h = content_hash(sample.key_expr().as_str(), &sample.payload().to_bytes());
-                if inbound_hashes.contains(&h) {
-                    trace!("skipping echo of L2-originated publish");
+            match result {
+                Ok(()) => {
+                    consecutive_errors = 0;
+                }
+                Err(ref e) if consecutive_errors < 10 => {
+                    consecutive_errors += 1;
+                    warn!(
+                        err = %e,
+                        consecutive_errors,
+                        "rawlink bridge iteration error (retrying)"
+                    );
+                    // Back off on repeated errors to avoid log spam.
+                    let backoff_ms = 100 * (1u64 << consecutive_errors.min(6));
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     continue;
                 }
-                self.process_outbound_sample(&sample)?;
+                Err(e) => {
+                    tracing::error!(
+                        err = %e,
+                        "rawlink bridge giving up after {consecutive_errors} consecutive errors"
+                    );
+                    return Err(e);
+                }
             }
 
             // 5. Yield to avoid busy-looping.
@@ -256,9 +284,12 @@ impl<S: RawSocket> Bridge<S> {
         }
 
         // Guard against oversized frames (standard Ethernet MTU = 1500 bytes).
-        // Frame on wire = 14 (Eth header) + 1 (type) + 6 (origin) + 2 (key_len) + key + payload.
+        // ETH_MTU is the max Ethernet PAYLOAD (excludes the 14-byte header).
+        // send_frame receives only the post-header payload, so we don't count
+        // ETH_HEADER_LEN here. Overhead within the payload:
+        //   1 (type tag) + 6 (origin_mac) + 2 (key_len) + key_expr.len()
         const ETH_MTU: usize = 1500;
-        let frame_overhead = crate::ETH_HEADER_LEN + 1 + 6 + 2 + key_expr.len();
+        let frame_overhead = 1 + 6 + 2 + key_expr.len();
         if payload.len() > ETH_MTU.saturating_sub(frame_overhead) {
             trace!(
                 key_expr,
