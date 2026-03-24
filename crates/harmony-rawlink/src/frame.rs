@@ -3,13 +3,7 @@
 //! All frames share the layout:
 //! `[6 dst_mac][6 src_mac][2 EtherType=0x88B5][1 frame_type][payload...]`
 
-use crate::{
-    error::RawLinkError,
-    frame_type,
-    ETH_HEADER_LEN,
-    FRAME_OVERHEAD,
-    HARMONY_ETHERTYPE,
-};
+use crate::{error::RawLinkError, frame_type, ETH_HEADER_LEN, FRAME_OVERHEAD, HARMONY_ETHERTYPE};
 
 /// Broadcast MAC address (FF:FF:FF:FF:FF:FF).
 pub const BROADCAST_MAC: [u8; 6] = [0xFF; 6];
@@ -146,8 +140,7 @@ pub fn decode_data_frame(frame: &[u8]) -> Result<([u8; 6], String, Vec<u8>), Raw
     let mut src_mac = [0u8; 6];
     src_mac.copy_from_slice(&frame[6..12]);
 
-    let key_len =
-        u16::from_be_bytes([frame[FRAME_OVERHEAD], frame[FRAME_OVERHEAD + 1]]) as usize;
+    let key_len = u16::from_be_bytes([frame[FRAME_OVERHEAD], frame[FRAME_OVERHEAD + 1]]) as usize;
 
     let key_start = FRAME_OVERHEAD + 2;
     let key_end = key_start + key_len;
@@ -175,8 +168,8 @@ mod tests {
     const SRC: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
     const DST: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
     const HASH: [u8; 16] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-        0x0F, 0x10,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10,
     ];
 
     #[test]

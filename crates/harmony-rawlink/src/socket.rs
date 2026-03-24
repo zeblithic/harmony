@@ -15,7 +15,10 @@ pub trait RawSocket: Send {
     fn send_frame(&mut self, dst_mac: [u8; 6], payload: &[u8]) -> Result<(), RawLinkError>;
 
     /// Drain incoming frames, calling `callback` for each one.
-    fn recv_frames(&mut self, callback: &mut dyn FnMut(&[u8; 6], &[u8])) -> Result<(), RawLinkError>;
+    fn recv_frames(
+        &mut self,
+        callback: &mut dyn FnMut(&[u8; 6], &[u8]),
+    ) -> Result<(), RawLinkError>;
 
     /// Returns the local MAC address associated with this socket.
     fn local_mac(&self) -> [u8; 6];
@@ -40,8 +43,16 @@ impl MockSocket {
         let (tx_a, rx_b) = std::sync::mpsc::channel();
         let (tx_b, rx_a) = std::sync::mpsc::channel();
 
-        let a = MockSocket { mac: mac_a, tx: tx_a, rx: rx_a };
-        let b = MockSocket { mac: mac_b, tx: tx_b, rx: rx_b };
+        let a = MockSocket {
+            mac: mac_a,
+            tx: tx_a,
+            rx: rx_a,
+        };
+        let b = MockSocket {
+            mac: mac_b,
+            tx: tx_b,
+            rx: rx_b,
+        };
         (a, b)
     }
 }

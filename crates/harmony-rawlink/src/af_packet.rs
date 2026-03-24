@@ -184,9 +184,9 @@ impl AfPacketSocket {
 
         // --- 8. mmap both rings ---
         let total_size = RING_SIZE * 2; // RX + TX
-        // SAFETY: mmap() with valid fd, correct total_size, and MAP_SHARED | MAP_LOCKED.
-        // We request PROT_READ | PROT_WRITE for both rings. The kernel validates all
-        // parameters and returns MAP_FAILED on error.
+                                        // SAFETY: mmap() with valid fd, correct total_size, and MAP_SHARED | MAP_LOCKED.
+                                        // We request PROT_READ | PROT_WRITE for both rings. The kernel validates all
+                                        // parameters and returns MAP_FAILED on error.
         let map = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -357,7 +357,11 @@ impl AfPacketSocket {
     }
 
     /// Configures a ring buffer (RX or TX) via `setsockopt`.
-    fn set_ring(fd: i32, ring_type: libc::c_int, req: &libc::tpacket_req3) -> Result<(), RawLinkError> {
+    fn set_ring(
+        fd: i32,
+        ring_type: libc::c_int,
+        req: &libc::tpacket_req3,
+    ) -> Result<(), RawLinkError> {
         // SAFETY: setsockopt with a tpacket_req3 struct. The kernel validates the struct
         // fields and returns -1 on error.
         unsafe {
@@ -421,8 +425,7 @@ impl AfPacketSocket {
     unsafe fn rx_block_desc(&self, block_idx: usize) -> *mut libc::tpacket_block_desc {
         debug_assert!(block_idx < BLOCK_NR as usize);
         // Each block starts at block_idx * BLOCK_SIZE within the RX ring.
-        self.rx_ring
-            .add(block_idx * BLOCK_SIZE as usize) as *mut libc::tpacket_block_desc
+        self.rx_ring.add(block_idx * BLOCK_SIZE as usize) as *mut libc::tpacket_block_desc
     }
 
     /// Builds a `sockaddr_ll` targeting the bound interface for `sendto()`.

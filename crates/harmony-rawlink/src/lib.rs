@@ -6,10 +6,13 @@
 
 #[cfg(target_os = "linux")]
 pub mod af_packet;
+pub mod bridge;
 pub mod error;
 pub mod frame;
 pub mod peer_table;
 pub mod socket;
+
+pub use bridge::{Bridge, BridgeConfig};
 
 /// IEEE 802.1 Local Experimental EtherType, shared across all Harmony L2 protocols.
 pub const HARMONY_ETHERTYPE: u16 = 0x88B5;
