@@ -13,6 +13,8 @@
 
 mod error;
 
+pub mod archivist;
+
 pub use error::S3Error;
 
 use aws_config::BehaviorVersion;

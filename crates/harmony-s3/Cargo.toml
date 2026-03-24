@@ -12,6 +12,7 @@ aws-sdk-s3 = { workspace = true }
 hex.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
+zenoh = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
