@@ -2076,13 +2076,21 @@ impl<B: BookStore> NodeRuntime<B> {
                     node_id,
                     relay_url,
                 } => {
-                    let (peer_dsa_pubkey, peer_kem_pubkey) = self
+                    let (peer_dsa_pubkey, peer_kem_pubkey) = match self
                         .discovery
                         .get_record(&identity_hash, self.last_unix_now)
-                        .map(|record| {
+                    {
+                        Some(record) => {
                             (record.public_key.clone(), record.encryption_key.clone())
-                        })
-                        .unwrap_or_default();
+                        }
+                        None => {
+                            tracing::warn!(
+                                identity = %hex::encode(identity_hash),
+                                "no announce record for tunnel peer — dial will fail at handshake"
+                            );
+                            (Vec::new(), Vec::new())
+                        }
+                    };
                     out.push(RuntimeAction::InitiateTunnel {
                         identity_hash,
                         node_id,
