@@ -31,6 +31,17 @@ pub struct BridgeConfig {
     pub peer_ttl: Duration,
 }
 
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            identity_hash: [0u8; 16],
+            subscribe_pattern: "harmony/**".to_string(),
+            scout_interval: std::time::Duration::from_secs(5),
+            peer_ttl: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
 /// An async bridge that shuttles frames between a raw L2 socket and a zenoh session.
 pub struct Bridge<S: RawSocket> {
     socket: S,

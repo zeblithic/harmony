@@ -11,6 +11,7 @@ default = []
 wasmtime = ["harmony-compute/wasmtime"]
 # Disable BLAKE3 NEON assembly for cross-compilation without a C cross-compiler.
 no-neon = ["harmony-crypto/no-neon"]
+rawlink = ["harmony-rawlink"]
 
 [[bin]]
 name = "harmony"
@@ -26,6 +27,7 @@ harmony-content = { workspace = true, features = ["std"] }
 harmony-discovery = { workspace = true, features = ["std"] }
 harmony-memo = { workspace = true, features = ["std"] }
 harmony-peers = { workspace = true, features = ["std"] }
+harmony-rawlink = { workspace = true, optional = true }
 harmony-tunnel = { workspace = true, features = ["std"] }
 iroh = { workspace = true }
 harmony-crypto = { workspace = true, features = ["std"] }
