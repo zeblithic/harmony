@@ -649,11 +649,22 @@ pub fn import_jsonld_vc(
 ) -> Result<ImportedCredential, ImportError> {
     let env = parse_vc_envelope(vc_json)?;
 
-    // Resolve the signing key from verificationMethod (may differ from issuer DID
-    // in general, though for did:key they resolve to the same key). Per W3C Data
-    // Integrity, verificationMethod identifies the actual signing key.
+    // Verify that verificationMethod belongs to the issuer DID.
+    // W3C Data Integrity: verificationMethod is typically "{issuer_did}#key-N".
+    // Strip the fragment and compare the base DID to prevent an attacker from
+    // signing with their own key while claiming a different issuer.
+    let vm_base = env
+        .verification_method
+        .split('#')
+        .next()
+        .unwrap_or(&env.verification_method);
+    if vm_base != env.issuer_did {
+        return Err(ImportError::ProofInvalid);
+    }
+
+    // Resolve the signing key from verificationMethod.
     let issuer_resolved = resolver.resolve(&env.verification_method)?;
-    // Use the issuer DID for the identity hash (not verificationMethod)
+    // Use the issuer DID for the identity hash.
     let issuer_did_resolved = resolver.resolve(&env.issuer_did)?;
     let issuer_hash = derive_import_identity_hash(&issuer_did_resolved.public_key);
     let issuer_ref = harmony_identity::IdentityRef {
