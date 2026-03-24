@@ -237,20 +237,46 @@ pub async fn run(
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
 
+    // ── L2 Reticulum channel endpoints (populated when rawlink bridge starts) ─
+    // On non-Linux / non-rawlink builds these stay None; allow_unused_mut avoids
+    // warnings while keeping the cfg-gated assignment path simple.
+    #[allow(unused_mut)]
+    let mut ret_inbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>> = None;
+    #[allow(unused_mut)]
+    let mut ret_outbound_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>> = None;
+    #[allow(unused_mut)]
+    let mut rawlink_iface_name: Option<String> = None;
+
     // ── AF_PACKET rawlink bridge (Linux + rawlink feature only) ──────────────
     #[cfg(all(target_os = "linux", feature = "rawlink"))]
     if let Some(ref iface) = rawlink_interface {
         match harmony_rawlink::af_packet::AfPacketSocket::new(iface) {
             Ok(socket) => {
+                let (ri_tx, ri_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+                let (ro_tx, ro_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+
                 let bridge_config = harmony_rawlink::BridgeConfig {
                     identity_hash: runtime.local_pq_identity_hash(),
+                    reticulum_inbound_tx: Some(ri_tx),
                     ..harmony_rawlink::BridgeConfig::default()
                 };
                 let mut bridge = harmony_rawlink::Bridge::new(
                     socket,
                     session.clone(),
                     bridge_config,
+                    Some(ro_rx),
                 );
+
+                // Register L2 interface with the Reticulum router
+                let iface_name = format!("l2:{}", iface);
+                runtime.push_event(RuntimeEvent::L2InterfaceReady {
+                    interface_name: iface_name.clone(),
+                });
+
+                ret_inbound_rx = Some(ri_rx);
+                ret_outbound_tx = Some(ro_tx);
+                rawlink_iface_name = Some(iface_name);
+
                 tokio::spawn(async move {
                     if let Err(e) = bridge.run().await {
                         tracing::warn!(err = %e, "rawlink bridge stopped");
@@ -373,6 +399,7 @@ pub async fn run(
             None,
             &tunnel_senders,
             &mut deferred_dials,
+            &ret_outbound_tx,
         )
         .await;
     }
@@ -876,7 +903,40 @@ pub async fn run(
                 }
             }
 
-            // Arm 8: Graceful shutdown (SIGTERM from procd, Ctrl+C).
+            // Arm 8: Inbound Reticulum packet from L2 rawlink bridge.
+            result = async {
+                match ret_inbound_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match result {
+                    Some(packet) => {
+                        if let Some(ref iface_name) = rawlink_iface_name {
+                            runtime.push_event(RuntimeEvent::InboundPacket {
+                                interface_name: iface_name.clone(),
+                                raw: packet,
+                                now: now_ms(),
+                            });
+                        }
+                    }
+                    None => {
+                        // Bridge task exited — sender dropped. Clean up fully:
+                        // clear channels, unregister the interface from the router.
+                        tracing::warn!("L2 rawlink bridge inbound channel closed — disabling L2 transport");
+                        ret_inbound_rx = None;
+                        ret_outbound_tx = None;
+                        if let Some(ref iface_name) = rawlink_iface_name {
+                            runtime.push_event(RuntimeEvent::L2InterfaceClosed {
+                                interface_name: iface_name.clone(),
+                            });
+                        }
+                        rawlink_iface_name = None;
+                    }
+                }
+            }
+
+            // Arm 9: Graceful shutdown (SIGTERM from procd, Ctrl+C).
             _ = &mut shutdown => {
                 break;
             }
@@ -901,6 +961,7 @@ pub async fn run(
                     Some(&peer_table),
                     &tunnel_senders,
                     &mut deferred_dials,
+                    &ret_outbound_tx,
                 )
                 .await;
             }
@@ -1062,6 +1123,7 @@ async fn dispatch_action(
     peer_table: Option<&PeerTable>,
     tunnel_senders: &HashMap<String, TunnelSender>,
     deferred_dials: &mut BinaryHeap<Reverse<DeferredDial>>,
+    ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 ) {
     match action {
         // ── Tier 1: Send on interface (UDP broadcast + unicast, or tunnel) ────
@@ -1080,7 +1142,13 @@ async fn dispatch_action(
                 Some(w) => rand::random::<f32>() < w, // probabilistic
             };
             if should_send {
-                if interface_name.starts_with("tunnel-") {
+                if interface_name.starts_with("l2:") {
+                    if let Some(ref tx) = ret_outbound_tx {
+                        if tx.try_send(raw.clone()).is_err() {
+                            tracing::warn!(%interface_name, "L2 send queue full — dropping packet");
+                        }
+                    }
+                } else if interface_name.starts_with("tunnel-") {
                     if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {
                         if sender.try_send_reticulum(raw.clone()).is_err() {
                             tracing::warn!(%interface_name, "tunnel send queue full — dropping packet");

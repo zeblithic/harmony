@@ -31,6 +31,8 @@ pub struct BridgeConfig {
     pub scout_interval: Duration,
     /// Time-to-live for peer table entries.
     pub peer_ttl: Duration,
+    /// Channel to forward inbound Reticulum packets to (frame_type 0x00).
+    pub reticulum_inbound_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl Default for BridgeConfig {
@@ -40,6 +42,7 @@ impl Default for BridgeConfig {
             subscribe_pattern: "harmony/**".to_string(),
             scout_interval: std::time::Duration::from_secs(5),
             peer_ttl: std::time::Duration::from_secs(30),
+            reticulum_inbound_tx: None,
         }
     }
 }
@@ -50,6 +53,7 @@ pub struct Bridge<S: RawSocket> {
     session: zenoh::Session,
     config: BridgeConfig,
     peer_table: PeerTable,
+    reticulum_outbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 }
 
 impl<S: RawSocket> Bridge<S> {
@@ -57,13 +61,22 @@ impl<S: RawSocket> Bridge<S> {
     ///
     /// The zenoh session must already be open. The bridge does **not** own the
     /// session lifetime — callers keep a handle for other uses.
-    pub fn new(socket: S, session: zenoh::Session, config: BridgeConfig) -> Self {
+    ///
+    /// `reticulum_outbound_rx` is an optional channel receiver for outbound
+    /// Reticulum packets that the bridge will broadcast as L2 frames.
+    pub fn new(
+        socket: S,
+        session: zenoh::Session,
+        config: BridgeConfig,
+        reticulum_outbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    ) -> Self {
         let peer_table = PeerTable::new(config.peer_ttl);
         Self {
             socket,
             session,
             config,
             peer_table,
+            reticulum_outbound_rx,
         }
     }
 
@@ -116,6 +129,16 @@ impl<S: RawSocket> Bridge<S> {
                     self.process_outbound_sample(&sample)?;
                 }
 
+                // 5. Drain outbound Reticulum packets → broadcast as L2 frames.
+                if let Some(ref mut rx) = self.reticulum_outbound_rx {
+                    while let Ok(packet) = rx.try_recv() {
+                        let mut frame_payload = Vec::with_capacity(1 + packet.len());
+                        frame_payload.push(frame_type::RETICULUM);
+                        frame_payload.extend_from_slice(&packet);
+                        self.socket.send_frame(frame::BROADCAST_MAC, &frame_payload)?;
+                    }
+                }
+
                 Ok(())
             }
             .await;
@@ -145,7 +168,7 @@ impl<S: RawSocket> Bridge<S> {
                 }
             }
 
-            // 5. Yield to avoid busy-looping.
+            // 6. Yield to avoid busy-looping.
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -171,11 +194,12 @@ impl<S: RawSocket> Bridge<S> {
     /// expressions that were published (for echo prevention).
     async fn process_inbound_frames(&mut self, local_mac: &[u8; 6]) -> Result<HashSet<u64>, RawLinkError> {
         let mut inbound_data: Vec<(String, Vec<u8>)> = Vec::new();
-        let allowed_prefix = &self.config.subscribe_pattern;
 
         let Self {
-            socket, peer_table, ..
+            socket, peer_table, config, ..
         } = self;
+        let allowed_prefix = &config.subscribe_pattern;
+        let reticulum_tx = &config.reticulum_inbound_tx;
 
         socket.recv_frames(&mut |src_mac, payload| {
             // Skip frames from ourselves (loopback on the interface).
@@ -187,6 +211,14 @@ impl<S: RawSocket> Bridge<S> {
             }
 
             match payload[0] {
+                frame_type::RETICULUM => {
+                    if payload.len() > 1 {
+                        if let Some(ref reticulum_tx) = reticulum_tx {
+                            let packet = payload[1..].to_vec();
+                            let _ = reticulum_tx.try_send(packet);
+                        }
+                    }
+                }
                 frame_type::SCOUT => {
                     if payload.len() < 1 + 16 {
                         debug!(len = payload.len(), "scout frame too short, ignoring");
@@ -420,6 +452,7 @@ mod tests {
             subscribe_pattern: "harmony/**".into(),
             scout_interval: Duration::from_secs(5),
             peer_ttl: Duration::from_secs(30),
+            reticulum_inbound_tx: None,
         };
 
         // We can't create a real zenoh::Session in a unit test without a
@@ -515,5 +548,72 @@ mod tests {
             .expect("recv should succeed");
 
         assert_eq!(count, 1, "unknown frame type should be seen but not crash");
+    }
+
+    #[test]
+    fn reticulum_frame_routed_to_channel() {
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let reticulum_packet = vec![0xAA; 100];
+        let mut frame_payload = vec![frame_type::RETICULUM];
+        frame_payload.extend_from_slice(&reticulum_packet);
+        socket_b.send_frame(MAC_A, &frame_payload).expect("mock send");
+
+        socket_a.recv_frames(&mut |_src_mac, payload| {
+            if !payload.is_empty() && payload[0] == frame_type::RETICULUM && payload.len() > 1 {
+                let _ = tx.send(payload[1..].to_vec());
+            }
+        }).expect("recv");
+
+        let received = rx.try_recv().expect("should receive packet");
+        assert_eq!(received, reticulum_packet);
+    }
+
+    #[test]
+    fn reticulum_outbound_encoding() {
+        let packet = vec![0xBB; 200];
+        let mut frame_payload = Vec::with_capacity(1 + packet.len());
+        frame_payload.push(frame_type::RETICULUM);
+        frame_payload.extend_from_slice(&packet);
+        assert_eq!(frame_payload[0], 0x00);
+        assert_eq!(&frame_payload[1..], &packet[..]);
+    }
+
+    #[test]
+    fn interleaved_frame_types_routed_correctly() {
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+        let (ret_tx, ret_rx) = std::sync::mpsc::channel();
+
+        let scout = make_scout_payload(&IDENTITY);
+        let mut ret_frame = vec![frame_type::RETICULUM];
+        ret_frame.extend_from_slice(&[0xCC; 50]);
+        let unknown = vec![0xFF, 0x01, 0x02];
+
+        socket_b.send_frame(MAC_A, &scout).unwrap();
+        socket_b.send_frame(MAC_A, &ret_frame).unwrap();
+        socket_b.send_frame(MAC_A, &unknown).unwrap();
+
+        let mut peer_table = PeerTable::new(Duration::from_secs(30));
+        let mut unknown_count = 0usize;
+
+        socket_a.recv_frames(&mut |src_mac, payload| {
+            if payload.is_empty() { return; }
+            match payload[0] {
+                frame_type::SCOUT if payload.len() >= 17 => {
+                    let mut hash = [0u8; 16];
+                    hash.copy_from_slice(&payload[1..17]);
+                    peer_table.update(hash, *src_mac);
+                }
+                frame_type::RETICULUM if payload.len() > 1 => {
+                    let _ = ret_tx.send(payload[1..].to_vec());
+                }
+                _ => { unknown_count += 1; }
+            }
+        }).unwrap();
+
+        assert_eq!(peer_table.peer_count(), 1);
+        assert!(ret_rx.try_recv().is_ok());
+        assert_eq!(unknown_count, 1);
     }
 }
