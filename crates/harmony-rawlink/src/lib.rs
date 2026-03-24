@@ -5,6 +5,8 @@
 //! pub/sub via shared memory for zero-copy delivery.
 
 pub mod error;
+pub mod frame;
+pub mod socket;
 
 /// IEEE 802.1 Local Experimental EtherType, shared across all Harmony L2 protocols.
 pub const HARMONY_ETHERTYPE: u16 = 0x88B5;
