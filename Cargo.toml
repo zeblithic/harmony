@@ -87,7 +87,7 @@ wasmtime = "38"
 
 # Networking
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
-zenoh = { version = "1", features = ["shared-memory"] }
+zenoh = "1"
 libc = "0.2"
 iroh = "0.91"
 tokio-util = { version = "0.7", features = ["codec"] }

@@ -246,9 +246,20 @@ impl<S: RawSocket> Bridge<S> {
             return Ok(());
         }
 
+        // Guard against oversized frames (standard Ethernet MTU = 1500 bytes).
+        // Frame on wire = 14 (Eth header) + 1 (type) + 6 (origin) + 2 (key_len) + key + payload.
+        const ETH_MTU: usize = 1500;
+        let frame_overhead = crate::ETH_HEADER_LEN + 1 + 6 + 2 + key_expr.len();
+        if payload.len() > ETH_MTU.saturating_sub(frame_overhead) {
+            trace!(
+                key_expr,
+                payload_len = payload.len(),
+                "outbound payload exceeds Ethernet MTU, dropping frame"
+            );
+            return Ok(());
+        }
+
         // Build frame payload: [DATA tag][6-byte origin_mac][u16 BE key_len][key_bytes][payload]
-        // The origin_mac tells receiving bridges that this frame came from L2
-        // and should not be re-broadcast (cross-node echo prevention).
         let local_mac = self.socket.local_mac();
         let mut frame_payload = Vec::with_capacity(1 + 6 + 2 + key_expr.len() + payload.len());
         frame_payload.push(frame_type::DATA);
