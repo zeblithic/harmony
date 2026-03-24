@@ -684,6 +684,27 @@ pub fn import_jsonld_vc(
         issuer_ref
     };
 
+    // Validate that the resolved key type matches the cryptosuite name.
+    // Prevents accepting a credential signed with an algorithm that doesn't
+    // match the declared suite (e.g., eddsa-jcs-2022 with an ML-DSA key).
+    let suite_valid = match env.cryptosuite.as_str() {
+        "harmony-eddsa-2022" | "eddsa-jcs-2022" => {
+            issuer_resolved.suite == harmony_identity::CryptoSuite::Ed25519
+        }
+        "harmony-mldsa65-2025" | "mldsa65-jcs-2024" | "di-mldsa-jcs-2025" => matches!(
+            issuer_resolved.suite,
+            harmony_identity::CryptoSuite::MlDsa65
+                | harmony_identity::CryptoSuite::MlDsa65Rotatable
+        ),
+        _ => false, // unknown suite caught below in the match
+    };
+    if !suite_valid {
+        return Err(ImportError::UnsupportedCryptosuite(alloc::format!(
+            "cryptosuite '{}' does not match resolved key type {:?}",
+            env.cryptosuite, issuer_resolved.suite
+        )));
+    }
+
     // Dispatch on cryptosuite
     match env.cryptosuite.as_str() {
         "harmony-eddsa-2022" | "harmony-mldsa65-2025" => {
