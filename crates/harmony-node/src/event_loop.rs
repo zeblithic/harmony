@@ -910,13 +910,21 @@ pub async fn run(
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(packet) = result {
-                    if let Some(ref iface_name) = rawlink_iface_name {
-                        runtime.push_event(RuntimeEvent::InboundPacket {
-                            interface_name: iface_name.clone(),
-                            raw: packet,
-                            now: now_ms(),
-                        });
+                match result {
+                    Some(packet) => {
+                        if let Some(ref iface_name) = rawlink_iface_name {
+                            runtime.push_event(RuntimeEvent::InboundPacket {
+                                interface_name: iface_name.clone(),
+                                raw: packet,
+                                now: now_ms(),
+                            });
+                        }
+                    }
+                    None => {
+                        // Bridge task exited — sender dropped. Clear the receiver
+                        // so the arm falls back to pending() and stops spinning.
+                        tracing::warn!("L2 rawlink bridge inbound channel closed — disabling L2 arm");
+                        ret_inbound_rx = None;
                     }
                 }
             }
@@ -1129,7 +1137,9 @@ async fn dispatch_action(
             if should_send {
                 if interface_name.starts_with("l2:") {
                     if let Some(ref tx) = ret_outbound_tx {
-                        let _ = tx.try_send(raw.clone());
+                        if tx.try_send(raw.clone()).is_err() {
+                            tracing::warn!(%interface_name, "L2 send queue full — dropping packet");
+                        }
                     }
                 } else if interface_name.starts_with("tunnel-") {
                     if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {

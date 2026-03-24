@@ -168,7 +168,7 @@ impl<S: RawSocket> Bridge<S> {
                 }
             }
 
-            // 5. Yield to avoid busy-looping.
+            // 6. Yield to avoid busy-looping.
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
