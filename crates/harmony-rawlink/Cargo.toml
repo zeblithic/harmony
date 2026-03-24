@@ -1,0 +1,23 @@
+[package]
+name = "harmony-rawlink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = []
+rawlink-integration = []
+
+[dependencies]
+hex.workspace = true
+libc = { workspace = true }
+rand.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+zenoh = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

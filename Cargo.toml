@@ -29,6 +29,7 @@ members = [
     "crates/harmony-workflow",
     "crates/harmony-sdjwt",
     "crates/harmony-zenoh",
+    "crates/harmony-rawlink",
 ]
 
 [workspace.package]
@@ -87,6 +88,7 @@ wasmtime = "38"
 # Networking
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
 zenoh = "1"
+libc = "0.2"
 iroh = "0.91"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = "0.3"
@@ -129,6 +131,7 @@ harmony-semantic = { path = "crates/harmony-semantic", default-features = false 
 harmony-trust = { path = "crates/harmony-trust", default-features = false }
 harmony-tunnel = { path = "crates/harmony-tunnel", default-features = false }
 harmony-workflow = { path = "crates/harmony-workflow" }
+harmony-rawlink = { path = "crates/harmony-rawlink" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
 
 # Optimized profile for cross-compiled deployment binaries (OpenWRT, RPi).

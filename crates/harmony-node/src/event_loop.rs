@@ -185,6 +185,8 @@ impl Eq for DeferredDial {}
 ///   at startup so they receive unicast traffic even when not reachable via mDNS.
 /// - `tunnel_entries`: config-sourced tunnel peers to track for reconnection.
 /// - `did_web_cache_ttl`: TTL in seconds for the did:web gateway cache.
+/// - `rawlink_interface`: optional network interface name for the AF_PACKET L2 bridge
+///   (Linux only, requires the `rawlink` feature and `CAP_NET_RAW`).
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -195,6 +197,7 @@ pub async fn run(
     bootstrap_peers: Vec<SocketAddr>,
     tunnel_entries: Vec<crate::config::TunnelEntry>,
     did_web_cache_ttl: u64,
+    rawlink_interface: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -233,6 +236,37 @@ pub async fn run(
 
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
+
+    // ── AF_PACKET rawlink bridge (Linux + rawlink feature only) ──────────────
+    #[cfg(all(target_os = "linux", feature = "rawlink"))]
+    if let Some(ref iface) = rawlink_interface {
+        match harmony_rawlink::af_packet::AfPacketSocket::new(iface) {
+            Ok(socket) => {
+                let bridge_config = harmony_rawlink::BridgeConfig {
+                    identity_hash: runtime.local_pq_identity_hash(),
+                    ..harmony_rawlink::BridgeConfig::default()
+                };
+                let mut bridge = harmony_rawlink::Bridge::new(
+                    socket,
+                    session.clone(),
+                    bridge_config,
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = bridge.run().await {
+                        tracing::warn!(err = %e, "rawlink bridge stopped");
+                    }
+                });
+                tracing::info!(%iface, "rawlink AF_PACKET bridge started");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    interface = %iface,
+                    err = %e,
+                    "rawlink bridge failed to start — continuing without L2 transport"
+                );
+            }
+        }
+    }
 
     // ── mpsc channel: Zenoh tasks → select loop ───────────────────────────────
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
