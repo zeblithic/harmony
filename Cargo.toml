@@ -30,6 +30,7 @@ members = [
     "crates/harmony-sdjwt",
     "crates/harmony-zenoh",
     "crates/harmony-rawlink",
+    "crates/harmony-s3",
 ]
 
 [workspace.package]
@@ -85,6 +86,10 @@ ciborium = { version = "0.2", default-features = false }
 wasmi = "1"
 wasmtime = "38"
 
+# AWS SDK
+aws-config = "1"
+aws-sdk-s3 = "1"
+
 # Networking
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
 zenoh = "1"
@@ -132,6 +137,7 @@ harmony-trust = { path = "crates/harmony-trust", default-features = false }
 harmony-tunnel = { path = "crates/harmony-tunnel", default-features = false }
 harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-rawlink = { path = "crates/harmony-rawlink" }
+harmony-s3 = { path = "crates/harmony-s3" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
 
 # Optimized profile for cross-compiled deployment binaries (OpenWRT, RPi).
