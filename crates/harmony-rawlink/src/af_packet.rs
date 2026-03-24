@@ -184,15 +184,18 @@ impl AfPacketSocket {
 
         // --- 8. mmap both rings ---
         let total_size = RING_SIZE * 2; // RX + TX
-                                        // SAFETY: mmap() with valid fd, correct total_size, and MAP_SHARED | MAP_LOCKED.
+                                        // SAFETY: mmap() with valid fd, correct total_size, and MAP_SHARED.
                                         // We request PROT_READ | PROT_WRITE for both rings. The kernel validates all
                                         // parameters and returns MAP_FAILED on error.
+                                        // Note: MAP_LOCKED omitted intentionally — it requires RLIMIT_MEMLOCK >= 4MB
+                                        // which may not be available under setcap CAP_NET_RAW (non-root).
+                                        // Pages may be swapped but this is acceptable for correctness.
         let map = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 total_size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_LOCKED,
+                libc::MAP_SHARED,
                 fd.as_raw_fd(),
                 0,
             )

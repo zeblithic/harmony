@@ -5,6 +5,9 @@
 //! 2. Receives inbound L2 frames and publishes Data payloads into zenoh.
 //! 3. Drains the zenoh subscriber and broadcasts outbound Data frames.
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -95,16 +98,22 @@ impl<S: RawSocket> Bridge<S> {
             }
 
             // 3. Process inbound L2 frames → publish to zenoh.
-            self.process_inbound_frames(&local_mac).await?;
+            //    Returns content hashes of published samples for echo prevention.
+            let inbound_hashes = self.process_inbound_frames(&local_mac).await?;
 
             // 4. Drain outbound zenoh samples → broadcast as Data frames.
-            //    The origin MAC embedded in each Data frame prevents cross-node
-            //    echo loops: when Node B receives Node A's L2 broadcast, publishes
-            //    to zenoh, and Node A's outbound subscriber picks it up, the
-            //    outbound frame carries Node A's MAC as origin. Node B's bridge
-            //    will see the origin MAC matches a known L2 peer and discard it
-            //    on inbound. See process_inbound_frames for the check.
+            //    Skip samples whose content hash matches something we just
+            //    published from inbound L2 — these are our own puts echoing
+            //    back through the zenoh subscriber. This prevents both same-node
+            //    echo (bridge put → subscriber → bridge send) and cross-node
+            //    echo (A sends L2 → B publishes to zenoh → B subscriber → B
+            //    sends L2 → A receives → A publishes → A subscriber → ...).
             while let Ok(Some(sample)) = subscriber.try_recv() {
+                let h = content_hash(sample.key_expr().as_str(), &sample.payload().to_bytes());
+                if inbound_hashes.contains(&h) {
+                    trace!("skipping echo of L2-originated publish");
+                    continue;
+                }
                 self.process_outbound_sample(&sample)?;
             }
 
@@ -132,7 +141,7 @@ impl<S: RawSocket> Bridge<S> {
     /// Buffers frames during the sync `recv_frames` callback, then publishes
     /// to zenoh asynchronously after the callback returns. Returns the key
     /// expressions that were published (for echo prevention).
-    async fn process_inbound_frames(&mut self, local_mac: &[u8; 6]) -> Result<(), RawLinkError> {
+    async fn process_inbound_frames(&mut self, local_mac: &[u8; 6]) -> Result<HashSet<u64>, RawLinkError> {
         let mut inbound_data: Vec<(String, Vec<u8>)> = Vec::new();
         let allowed_prefix = &self.config.subscribe_pattern;
 
@@ -166,20 +175,15 @@ impl<S: RawSocket> Bridge<S> {
                 }
                 frame_type::DATA => {
                     // Data payload: [DATA tag][6-byte origin_mac][u16 BE key_len][key][payload]
-                    // The origin_mac identifies which bridge originally sent this
-                    // frame to L2. If it matches a known L2 peer, the frame already
-                    // traversed L2 → zenoh → L2 and must be discarded to prevent
-                    // cross-node echo loops.
                     if payload.len() < 1 + 6 + 2 {
                         debug!(len = payload.len(), "data frame too short, ignoring");
                         return;
                     }
                     let mut origin_mac = [0u8; 6];
                     origin_mac.copy_from_slice(&payload[1..7]);
-                    // If origin is our own MAC or any known L2 peer, this frame
-                    // already came from L2 — don't re-publish to zenoh.
-                    if &origin_mac == local_mac || peer_table.lookup_by_mac(&origin_mac) {
-                        trace!("discarding L2-originated data frame (echo prevention)");
+                    // Discard frames we sent ourselves (L2 loopback).
+                    if &origin_mac == local_mac {
+                        trace!("discarding self-originated data frame");
                         return;
                     }
                     let key_len = u16::from_be_bytes([payload[7], payload[8]]) as usize;
@@ -222,14 +226,19 @@ impl<S: RawSocket> Bridge<S> {
         })?;
 
         // Publish buffered inbound data to zenoh (async, non-blocking).
+        // Track content hashes for echo prevention on the outbound path.
+        let mut published_hashes = HashSet::new();
         for (key_expr, data) in inbound_data {
+            let h = content_hash(&key_expr, &data);
             // TODO: Use zenoh SHM (shared memory) for zero-copy inbound delivery.
             if let Err(e) = self.session.put(&key_expr, data).await {
                 warn!(key_expr, %e, "failed to publish inbound data to zenoh");
+            } else {
+                published_hashes.insert(h);
             }
         }
 
-        Ok(())
+        Ok(published_hashes)
     }
 
     /// Encode and broadcast a zenoh sample as a Data frame.
@@ -288,6 +297,14 @@ impl<S: RawSocket> Bridge<S> {
     pub fn peer_table(&self) -> &PeerTable {
         &self.peer_table
     }
+}
+
+/// Hash a (key_expr, payload) pair for content-based echo deduplication.
+fn content_hash(key_expr: &str, payload: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key_expr.hash(&mut hasher);
+    payload.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]

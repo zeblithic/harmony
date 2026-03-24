@@ -89,12 +89,16 @@ pub fn decode_scout_frame(frame: &[u8]) -> Result<([u8; 6], [u8; 16]), RawLinkEr
 
 /// Encodes a Data frame.
 ///
-/// Layout after FRAME_OVERHEAD: `[2 key_expr_len (big-endian)][key_expr bytes][payload...]`
+/// Layout after FRAME_OVERHEAD: `[6 origin_mac][2 key_expr_len (BE)][key_expr bytes][payload...]`
+///
+/// The `origin_mac` identifies which bridge originally sent this frame to L2,
+/// enabling cross-node echo prevention.
 ///
 /// Returns `FrameError` if `key_expr` exceeds 65535 bytes.
 pub fn encode_data_frame(
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
+    origin_mac: [u8; 6],
     key_expr: &str,
     payload: &[u8],
 ) -> Result<Vec<u8>, RawLinkError> {
@@ -107,7 +111,7 @@ pub fn encode_data_frame(
         )));
     }
 
-    let total = FRAME_OVERHEAD + 2 + key_len + payload.len();
+    let total = FRAME_OVERHEAD + 6 + 2 + key_len + payload.len();
     let mut frame = Vec::with_capacity(total);
 
     // dst_mac, src_mac
@@ -119,6 +123,9 @@ pub fn encode_data_frame(
 
     // Frame type
     frame.push(frame_type::DATA);
+
+    // Origin MAC (for echo prevention)
+    frame.extend_from_slice(&origin_mac);
 
     // key_expr length as u16 big-endian, then key_expr bytes
     frame.extend_from_slice(&(key_len as u16).to_be_bytes());
@@ -132,15 +139,17 @@ pub fn encode_data_frame(
 
 /// Decodes a Data frame.
 ///
-/// Returns `(src_mac, key_expr, payload)`.
-pub fn decode_data_frame(frame: &[u8]) -> Result<([u8; 6], String, Vec<u8>), RawLinkError> {
+/// Returns `(src_mac, origin_mac, key_expr, payload)`.
+pub fn decode_data_frame(
+    frame: &[u8],
+) -> Result<([u8; 6], [u8; 6], String, Vec<u8>), RawLinkError> {
     validate_header(frame, frame_type::DATA)?;
 
-    // Need at least FRAME_OVERHEAD + 2 (key_expr_len field)
-    let min_len = FRAME_OVERHEAD + 2;
+    // Need at least FRAME_OVERHEAD + 6 (origin_mac) + 2 (key_expr_len)
+    let min_len = FRAME_OVERHEAD + 6 + 2;
     if frame.len() < min_len {
         return Err(RawLinkError::FrameError(format!(
-            "data frame too short for key_expr length field: {} < {min_len}",
+            "data frame too short: {} < {min_len}",
             frame.len(),
         )));
     }
@@ -148,9 +157,14 @@ pub fn decode_data_frame(frame: &[u8]) -> Result<([u8; 6], String, Vec<u8>), Raw
     let mut src_mac = [0u8; 6];
     src_mac.copy_from_slice(&frame[6..12]);
 
-    let key_len = u16::from_be_bytes([frame[FRAME_OVERHEAD], frame[FRAME_OVERHEAD + 1]]) as usize;
+    let mut origin_mac = [0u8; 6];
+    origin_mac.copy_from_slice(&frame[FRAME_OVERHEAD..FRAME_OVERHEAD + 6]);
 
-    let key_start = FRAME_OVERHEAD + 2;
+    let key_offset = FRAME_OVERHEAD + 6;
+    let key_len =
+        u16::from_be_bytes([frame[key_offset], frame[key_offset + 1]]) as usize;
+
+    let key_start = key_offset + 2;
     let key_end = key_start + key_len;
 
     if frame.len() < key_end {
@@ -166,7 +180,7 @@ pub fn decode_data_frame(frame: &[u8]) -> Result<([u8; 6], String, Vec<u8>), Raw
 
     let payload = frame[key_end..].to_vec();
 
-    Ok((src_mac, key_expr, payload))
+    Ok((src_mac, origin_mac, key_expr, payload))
 }
 
 #[cfg(test)]
@@ -199,10 +213,13 @@ mod tests {
     fn data_frame_round_trip() {
         let key = "harmony/test/topic";
         let payload = b"hello, world!";
-        let frame = encode_data_frame(SRC, DST, key, payload).expect("encode should succeed");
-        let (got_src, got_key, got_payload) =
+        let origin = [0x77; 6];
+        let frame =
+            encode_data_frame(SRC, DST, origin, key, payload).expect("encode should succeed");
+        let (got_src, got_origin, got_key, got_payload) =
             decode_data_frame(&frame).expect("decode should succeed");
         assert_eq!(got_src, SRC);
+        assert_eq!(got_origin, origin);
         assert_eq!(got_key, key);
         assert_eq!(got_payload, payload);
     }
