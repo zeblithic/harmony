@@ -520,7 +520,8 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
                 "'validUntil' must be a string",
             )))
         }
-        // Optional: default to not_before + 10 years if absent
+        // Default to not_before + 10 years. Adjusted after issued_at is parsed
+        // (see below) to ensure expires_at > issued_at.
         None => not_before + 315_576_000,
     };
 
@@ -569,6 +570,14 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| ImportError::MalformedVc(String::from("proof missing 'created' field")))?;
     let issued_at = parse_iso8601(created_str)?;
+
+    // If expires_at was defaulted and is now <= issued_at, adjust it.
+    // This prevents invalid credentials when validFrom << proof.created.
+    let expires_at = if expires_at <= issued_at {
+        issued_at + 315_576_000
+    } else {
+        expires_at
+    };
 
     // Nonce: hex-encoded in Harmony export; all-zeros if absent
     let nonce = match proof_obj_map.get("nonce").and_then(|v| v.as_str()) {
