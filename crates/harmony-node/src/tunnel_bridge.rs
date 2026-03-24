@@ -74,6 +74,12 @@ pub struct ReadyConnection {
     pub connection: iroh::endpoint::Connection,
     pub connection_id: u64,
     pub interface_name: String,
+    /// For initiator connections: the peer's PQ identity for the handshake.
+    /// None for responder connections (identity learned during handshake).
+    pub remote_pq_identity: Option<harmony_identity::PqIdentity>,
+    /// For initiator connections: the transient iroh Endpoint that must stay alive
+    /// for the duration of the connection. None for responder connections.
+    pub initiator_endpoint: Option<iroh::Endpoint>,
 }
 
 impl TunnelSender {
