@@ -233,6 +233,9 @@ pub enum RuntimeEvent {
         payload: Vec<u8>,
         unix_now: u64,
     },
+
+    /// A raw L2 interface is ready for Reticulum traffic.
+    L2InterfaceReady { interface_name: String },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -1329,6 +1332,13 @@ impl<B: BookStore> NodeRuntime<B> {
                 unix_now,
             } => {
                 self.handle_memo_fetch_response(&key_expr, &payload, unix_now);
+            }
+            RuntimeEvent::L2InterfaceReady { interface_name } => {
+                self.router.register_interface(
+                    interface_name,
+                    harmony_reticulum::InterfaceMode::Full,
+                    None,
+                );
             }
         }
     }
@@ -2705,6 +2715,9 @@ mod tests {
             key_expr: "harmony/memo/aa/**".into(),
             payload: vec![],
             unix_now: 1000,
+        };
+        let _e_l2 = RuntimeEvent::L2InterfaceReady {
+            interface_name: "l2:wlan0".into(),
         };
     }
 
