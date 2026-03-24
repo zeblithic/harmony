@@ -42,10 +42,15 @@ EtherType **0x88B5** (IEEE 802.1 Local Experimental), consistent with harmony-os
 
 ### Frame Types
 
+The first byte after the EtherType is a shared discriminator across all Harmony L2 protocols. This allows rawlink, harmony-os, and future L2 transports to coexist on the same 802.11s mesh segment without misinterpreting each other's frames.
+
 | Tag | Name | Addressing | Purpose |
 |-----|------|-----------|---------|
-| `0x01` | Scout | Broadcast (`ff:ff:ff:ff:ff:ff`) | Announces presence, carries identity_hash + zenoh locator info |
-| `0x02` | Data | Unicast (learned MAC) | Carries zenoh key expression + payload |
+| `0x00` | Reticulum | Per Reticulum routing | Raw Reticulum packet (harmony-os, harmony-kuw) |
+| `0x01` | Scout | Broadcast (`ff:ff:ff:ff:ff:ff`) | Announces presence, carries identity_hash |
+| `0x02` | Data | Broadcast (see note) | Carries zenoh key expression + payload |
+
+**Note on Data addressing:** All outbound Data frames are broadcast in this first implementation. Unicast optimization requires application-level destination addressing (e.g., identity_hash embedded in the zenoh payload or key expression) which is future work. Scouting still populates the peer table for future unicast use.
 
 ### Scout Payload
 
@@ -120,8 +125,8 @@ The bridge runs as a tokio task, connecting `RawSocket` to the zenoh session.
 ### Outbound (zenoh → L2)
 
 1. Bridge subscribes to configurable key expressions (e.g., `harmony/**`)
-2. On zenoh sample: look up destination MAC from peer table. If unknown, broadcast.
-3. Encode as Data frame (0x02), send via `send_frame`.
+2. On zenoh sample: broadcast the frame (all outbound Data frames are broadcast in this version — unicast optimization is future work)
+3. Encode as Data frame (0x02), send via `send_frame` with destination `ff:ff:ff:ff:ff:ff`
 
 ### Peer Table
 
@@ -135,7 +140,7 @@ struct PeerEntry {
 }
 ```
 
-Populated from Scout frames. Entries expire after 30 seconds (3× the ~10s max scout interval). The bridge sends its own Scout every ~5 seconds with jitter.
+Populated from Scout frames. The bridge sends its own Scout every 5-10 seconds (uniform jitter). Entries expire after 30 seconds (3× the 10s max scout interval).
 
 ### SHM Configuration
 
