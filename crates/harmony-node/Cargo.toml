@@ -17,6 +17,7 @@ name = "harmony"
 path = "src/main.rs"
 
 [dependencies]
+bytes = "1"
 harmony-athenaeum = { workspace = true, features = ["std"] }
 harmony-compute.workspace = true
 harmony-contacts = { workspace = true, features = ["std"] }

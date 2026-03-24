@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use futures_util::TryStreamExt as _;
 use harmony_identity::did_document::{did_web_to_url, parse_did_document};
 use harmony_identity::ResolvedDidDocument;
 
@@ -83,38 +84,47 @@ pub async fn run(
                     reply_empty(&query).await;
                     continue;
                 }
-                if resp.content_length().unwrap_or(0) > MAX_DOC_BYTES {
-                    tracing::warn!(%did, "did:web document too large");
-                    reply_empty(&query).await;
-                    continue;
-                }
-                match resp.bytes().await {
-                    Ok(bytes) => match parse_did_document(&did, &bytes) {
-                        Ok(doc) => {
-                            tracing::info!(%did, keys = doc.verification_methods.len(), "did:web resolved");
-                            reply_with_document(&query, &doc).await;
-                            cache.insert(
-                                did,
-                                CacheEntry {
-                                    document: doc,
-                                    expires_at: now + ttl,
-                                },
-                            );
+                // Stream response with size cap — enforces limit even for
+                // chunked transfers that omit Content-Length.
+                let bytes = {
+                    let mut body = bytes::BytesMut::new();
+                    let mut stream = resp.bytes_stream();
+                    let mut too_large = false;
+                    while let Ok(Some(chunk)) = stream.try_next().await {
+                        body.extend_from_slice(&chunk);
+                        if body.len() as u64 > MAX_DOC_BYTES {
+                            too_large = true;
+                            break;
+                        }
+                    }
+                    if too_large {
+                        tracing::warn!(%did, "did:web document too large");
+                        reply_empty(&query).await;
+                        continue;
+                    }
+                    body.freeze()
+                };
+                match parse_did_document(&did, &bytes) {
+                    Ok(doc) => {
+                        tracing::info!(%did, keys = doc.verification_methods.len(), "did:web resolved");
+                        reply_with_document(&query, &doc).await;
+                        cache.insert(
+                            did,
+                            CacheEntry {
+                                document: doc,
+                                expires_at: now + ttl,
+                            },
+                        );
+                        if cache.len() > MAX_CACHE_ENTRIES {
+                            cache.retain(|_, e| e.expires_at > now);
                             if cache.len() > MAX_CACHE_ENTRIES {
-                                cache.retain(|_, e| e.expires_at > now);
-                                if cache.len() > MAX_CACHE_ENTRIES {
-                                    tracing::warn!("did:web cache overflow, clearing");
-                                    cache.clear();
-                                }
+                                tracing::warn!("did:web cache overflow, clearing");
+                                cache.clear();
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(%did, err = ?e, "did:web document parse failed");
-                            reply_empty(&query).await;
-                        }
-                    },
+                    }
                     Err(e) => {
-                        tracing::warn!(%did, err = %e, "did:web response read failed");
+                        tracing::warn!(%did, err = ?e, "did:web document parse failed");
                         reply_empty(&query).await;
                     }
                 }
