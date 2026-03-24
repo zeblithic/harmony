@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod frame;
+pub mod peer_table;
 pub mod socket;
 
 /// IEEE 802.1 Local Experimental EtherType, shared across all Harmony L2 protocols.
