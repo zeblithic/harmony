@@ -137,6 +137,7 @@ harmony-trust = { path = "crates/harmony-trust", default-features = false }
 harmony-tunnel = { path = "crates/harmony-tunnel", default-features = false }
 harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-rawlink = { path = "crates/harmony-rawlink" }
+harmony-s3 = { path = "crates/harmony-s3" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
 
 # Optimized profile for cross-compiled deployment binaries (OpenWRT, RPi).

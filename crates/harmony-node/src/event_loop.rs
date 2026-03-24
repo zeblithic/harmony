@@ -187,6 +187,7 @@ impl Eq for DeferredDial {}
 /// - `did_web_cache_ttl`: TTL in seconds for the did:web gateway cache.
 /// - `rawlink_interface`: optional network interface name for the AF_PACKET L2 bridge
 ///   (Linux only, requires the `rawlink` feature and `CAP_NET_RAW`).
+/// - `archivist_config`: optional S3 archivist configuration (requires the `archivist` feature).
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -198,6 +199,7 @@ pub async fn run(
     tunnel_entries: Vec<crate::config::TunnelEntry>,
     did_web_cache_ttl: u64,
     rawlink_interface: Option<String>,
+    archivist_config: Option<crate::config::ArchivistConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -236,6 +238,31 @@ pub async fn run(
 
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
+
+    // ── S3 archivist (archivist feature only) ────────────────────────────────
+    #[cfg(feature = "archivist")]
+    if let Some(ref archivist) = archivist_config {
+        match harmony_s3::S3Library::new(
+            archivist.bucket.clone(),
+            archivist.prefix.clone(),
+            archivist.region.clone().unwrap_or_else(|| "us-east-1".to_string()),
+        ).await {
+            Ok(s3) => {
+                let session = session.clone();
+                tokio::spawn(async move {
+                    harmony_s3::archivist::run(s3, session).await;
+                });
+                tracing::info!(
+                    bucket = %archivist.bucket,
+                    prefix = %archivist.prefix,
+                    "S3 archivist started"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "S3 archivist failed to start — continuing without archival");
+            }
+        }
+    }
 
     // ── L2 Reticulum channel endpoints (populated when rawlink bridge starts) ─
     // On non-Linux / non-rawlink builds these stay None; allow_unused_mut avoids

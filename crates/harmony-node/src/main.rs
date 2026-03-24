@@ -420,6 +420,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             );
             let did_web_cache_ttl = config_file.did_web_cache_ttl.unwrap_or(300);
             let rawlink_interface = config_file.rawlink_interface.clone();
+            let archivist_config = config_file.archivist;
 
             // ── Parse config-only sections ───────────────────────────────
             let bootstrap_peers: Vec<std::net::SocketAddr> = config_file
@@ -613,6 +614,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 tunnel_entries,
                 did_web_cache_ttl,
                 rawlink_interface,
+                archivist_config,
             )
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;

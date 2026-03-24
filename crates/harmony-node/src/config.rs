@@ -73,6 +73,15 @@ pub struct ConfigFile {
     pub tunnels: Option<Vec<TunnelEntry>>,
     pub did_web_cache_ttl: Option<u64>,
     pub rawlink_interface: Option<String>,
+    pub archivist: Option<ArchivistConfig>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivistConfig {
+    pub bucket: String,
+    pub prefix: String,
+    pub region: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
