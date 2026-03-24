@@ -909,8 +909,18 @@ pub async fn run(
                     inflight_handshakes += 1;
 
                     // Build target NodeAddr
-                    let target_node_id = iroh::NodeId::from_bytes(&dial.node_id)
-                        .expect("node_id must be 32 bytes");
+                    let target_node_id = match iroh::NodeId::from_bytes(&dial.node_id) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            tracing::warn!(
+                                identity = %hex::encode(dial.identity_hash),
+                                err = %e,
+                                "invalid NodeId in announce record — dropping dial"
+                            );
+                            inflight_handshakes -= 1;
+                            continue;
+                        }
+                    };
                     let mut node_addr = iroh::NodeAddr::new(target_node_id);
                     if let Some(ref url) = dial.relay_url {
                         if let Ok(relay_url) = url.parse::<iroh::RelayUrl>() {
@@ -920,7 +930,7 @@ pub async fn run(
 
                     let interface_name = format!(
                         "tunnel-{}",
-                        &hex::encode(&dial.node_id[..4])
+                        &hex::encode(&dial.node_id[..8])
                     );
                     let conn_tx_clone = conn_tx.clone();
                     let relay_map_clone = relay_map.clone();
@@ -963,6 +973,7 @@ pub async fn run(
                             Ok(conn) => conn,
                             Err(e) => {
                                 tracing::warn!(err = %e, "tunnel dial failed");
+                                ep.close().await;
                                 let _ = conn_tx_clone.send(None).await;
                                 return;
                             }
