@@ -927,7 +927,7 @@ pub async fn run(
                         ret_inbound_rx = None;
                         ret_outbound_tx = None;
                         if let Some(ref iface_name) = rawlink_iface_name {
-                            runtime.push_event(RuntimeEvent::TunnelClosed {
+                            runtime.push_event(RuntimeEvent::L2InterfaceClosed {
                                 interface_name: iface_name.clone(),
                             });
                         }

@@ -236,6 +236,8 @@ pub enum RuntimeEvent {
 
     /// A raw L2 interface is ready for Reticulum traffic.
     L2InterfaceReady { interface_name: String },
+    /// A raw L2 interface has been shut down.
+    L2InterfaceClosed { interface_name: String },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -1334,11 +1336,16 @@ impl<B: BookStore> NodeRuntime<B> {
                 self.handle_memo_fetch_response(&key_expr, &payload, unix_now);
             }
             RuntimeEvent::L2InterfaceReady { interface_name } => {
+                tracing::info!(%interface_name, "L2 interface registered");
                 self.router.register_interface(
                     interface_name,
                     harmony_reticulum::InterfaceMode::Full,
                     None,
                 );
+            }
+            RuntimeEvent::L2InterfaceClosed { interface_name } => {
+                tracing::info!(%interface_name, "L2 interface closed — unregistered");
+                self.router.unregister_interface(&interface_name);
             }
         }
     }
@@ -2717,6 +2724,9 @@ mod tests {
             unix_now: 1000,
         };
         let _e_l2 = RuntimeEvent::L2InterfaceReady {
+            interface_name: "l2:wlan0".into(),
+        };
+        let _e_l2c = RuntimeEvent::L2InterfaceClosed {
             interface_name: "l2:wlan0".into(),
         };
     }
