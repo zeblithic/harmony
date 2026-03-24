@@ -8,7 +8,7 @@ Map DeepSeek's Engram conditional memory tables onto Harmony's content-addressed
 
 Three components:
 
-- **Engram table format** — Sharded embedding tables stored as Harmony CAS books. A Vine DAG manifest maps shard indices to CIDs. Each shard holds ~200 embedding vectors (~64KB).
+- **Engram table format** — Sharded embedding tables stored as Harmony CAS books. A Merkle DAG manifest maps shard indices to CIDs. Each shard holds ~200 embedding vectors (~64KB).
 - **Query protocol** — Zenoh queryable namespace `harmony/engram/{version}/`. Client computes multi-head hashes locally, issues parallel shard fetches, extracts vectors by byte offset.
 - **harmony-engram crate** — Sans-I/O client performing tokenizer compression, multi-head hashing, shard resolution, and vector aggregation. Emits lookup requests; caller handles network I/O.
 
@@ -31,7 +31,7 @@ num_shards: 50_000_000
 shards: [CID_0, CID_1, ..., CID_49999999]
 ```
 
-The manifest itself is serialized via postcard and stored as a Harmony Vine DAG (Merkle tree of books), since the shard CID list (50M × 32 bytes = 1.6GB) exceeds the 1MB book limit. The manifest's **root CID** is the single identifier for the entire Engram table version.
+The manifest itself is serialized via postcard and stored as a Harmony Merkle DAG (Merkle tree of books), since the shard CID list (50M × 32 bytes = 1.6GB) exceeds the 1MB book limit. The manifest's **root CID** is the single identifier for the entire Engram table version.
 
 ### Shard Books
 
@@ -74,7 +74,7 @@ Nodes hosting Engram shards declare queryables on `harmony/engram/{version}/shar
 
 5. **Vector extraction** — for each shard, extract the embedding at `(hash % shard_size) * embedding_bytes`. No deserialization — direct byte slice.
 
-6. **Aggregation** — sum the `num_heads` embedding vectors into a single combined embedding.
+6. **Aggregation** — decode each vector from f16 to f32, sum the `num_heads` vectors component-wise in f32 precision. Output is f32 (avoids f16 overflow/saturation on the sum).
 
 7. **Context-aware gating** — the model's forward pass computes a scalar gate. This is model computation, not part of the Engram protocol.
 
@@ -109,7 +109,10 @@ pub struct EngramLookup {
 /// Client for performing Engram lookups.
 pub struct EngramClient {
     config: EngramConfig,
-    manifest_cids: Vec<[u8; 32]>,  // shard index → CID
+    /// Shard index → CID. For a 50M shard table this is ~1.6GB.
+    /// First pass: full in-memory vector (targets laptop/desktop nodes).
+    /// Future: paged/lazy manifest access for constrained edge devices.
+    manifest_cids: Vec<[u8; 32]>,
 }
 ```
 
@@ -128,7 +131,9 @@ impl EngramClient {
     pub fn shard_cid(&self, shard_index: u64) -> Option<&[u8; 32]>;
 
     /// Extract and aggregate embedding vectors from fetched shard bytes.
-    /// Returns the combined embedding (sum of all heads).
+    /// Sums all heads in f32 precision to avoid f16 overflow.
+    /// Returns the combined embedding as f32 bytes (4 bytes per component,
+    /// output length = embedding_dim * 4).
     pub fn resolve(&self, lookup: &EngramLookup, shard_data: &[&[u8]]) -> Vec<u8>;
 }
 ```
