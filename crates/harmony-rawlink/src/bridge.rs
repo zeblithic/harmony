@@ -5,11 +5,11 @@
 //! 2. Receives inbound L2 frames and publishes Data payloads into zenoh.
 //! 3. Drains the zenoh subscriber and broadcasts outbound Data frames.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
 use tracing::{debug, trace, warn};
-use zenoh::Wait;
 
 use crate::{
     error::RawLinkError,
@@ -76,6 +76,13 @@ impl<S: RawSocket> Bridge<S> {
             .map_err(|e| RawLinkError::SocketError(format!("zenoh subscribe failed: {e}")))?;
 
         let mut next_scout = Instant::now();
+        let mut next_purge = Instant::now() + self.config.peer_ttl;
+        let local_mac = self.socket.local_mac();
+
+        // Track key expressions we recently published from inbound L2 frames.
+        // When these appear on the zenoh subscriber, we skip them to prevent
+        // the echo loop: L2 → zenoh put → subscriber → L2 → zenoh put → ...
+        let mut recently_published: HashSet<String> = HashSet::new();
 
         loop {
             let now = Instant::now();
@@ -87,29 +94,43 @@ impl<S: RawSocket> Bridge<S> {
                 next_scout = now + jitter;
             }
 
-            // 2. Process inbound L2 frames.
-            self.process_inbound_frames()?;
+            // 2. Purge expired peer table entries periodically.
+            if now >= next_purge {
+                self.peer_table.purge_expired();
+                next_purge = now + self.config.peer_ttl;
+            }
 
-            // 3. Drain outbound zenoh samples → broadcast as Data frames.
+            // 3. Process inbound L2 frames → publish to zenoh.
+            //    Track which key expressions we publish so we can skip them
+            //    on the outbound subscriber (echo prevention).
+            recently_published.clear();
+            let inbound_keys = self.process_inbound_frames(&local_mac).await?;
+            recently_published.extend(inbound_keys);
+
+            // 4. Drain outbound zenoh samples → broadcast as Data frames.
+            //    Skip samples whose key_expr we just published from L2 inbound
+            //    to prevent the echo loop.
             while let Ok(Some(sample)) = subscriber.try_recv() {
+                let key = sample.key_expr().as_str();
+                if recently_published.contains(key) {
+                    trace!(key_expr = key, "skipping echo of L2-originated publish");
+                    continue;
+                }
                 self.process_outbound_sample(&sample)?;
             }
 
-            // 4. Yield to avoid busy-looping.
+            // 5. Yield to avoid busy-looping.
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
     /// Broadcast a Scout frame carrying our identity hash.
     fn send_scout(&mut self) -> Result<(), RawLinkError> {
-        let local_mac = self.socket.local_mac();
-        let full_frame = frame::encode_scout_frame(local_mac, &self.config.identity_hash);
-        // send_frame expects payload *after* the Ethernet header, but our
-        // encode_* helpers produce a complete frame including the header.
-        // The RawSocket trait says payload is everything after the Ethernet
-        // header, so strip the first 14 bytes.
-        let payload = &full_frame[crate::ETH_HEADER_LEN..];
-        self.socket.send_frame(BROADCAST_MAC, payload)?;
+        // Build payload inline: [SCOUT tag][16-byte identity_hash]
+        let mut payload = [0u8; 17];
+        payload[0] = frame_type::SCOUT;
+        payload[1..17].copy_from_slice(&self.config.identity_hash);
+        self.socket.send_frame(BROADCAST_MAC, &payload)?;
         trace!(
             identity = hex::encode(self.config.identity_hash),
             "scout broadcast sent"
@@ -119,26 +140,28 @@ impl<S: RawSocket> Bridge<S> {
 
     /// Process all pending inbound L2 frames.
     ///
-    /// Destructures `self` to satisfy the borrow checker — the closure needs
-    /// `&mut peer_table` and `&session` while `recv_frames` borrows `&mut socket`.
-    fn process_inbound_frames(&mut self) -> Result<(), RawLinkError> {
-        // Buffer inbound data frames so we can publish to zenoh after the
-        // callback returns (avoids borrow-checker issues with &self.session
-        // inside the FnMut closure).
+    /// Buffers frames during the sync `recv_frames` callback, then publishes
+    /// to zenoh asynchronously after the callback returns. Returns the key
+    /// expressions that were published (for echo prevention).
+    async fn process_inbound_frames(&mut self, local_mac: &[u8; 6]) -> Result<Vec<String>, RawLinkError> {
         let mut inbound_data: Vec<(String, Vec<u8>)> = Vec::new();
+        let allowed_prefix = &self.config.subscribe_pattern;
 
         let Self {
             socket, peer_table, ..
         } = self;
 
         socket.recv_frames(&mut |src_mac, payload| {
+            // Skip frames from ourselves (loopback on the interface).
+            if src_mac == local_mac {
+                return;
+            }
             if payload.is_empty() {
                 return;
             }
 
             match payload[0] {
                 frame_type::SCOUT => {
-                    // Scout payload: [SCOUT tag][16-byte identity_hash]
                     if payload.len() < 1 + 16 {
                         debug!(len = payload.len(), "scout frame too short, ignoring");
                         return;
@@ -153,7 +176,6 @@ impl<S: RawSocket> Bridge<S> {
                     );
                 }
                 frame_type::DATA => {
-                    // Data payload: [DATA tag][u16 BE key_len][key_bytes][payload_bytes]
                     if payload.len() < 1 + 2 {
                         debug!(len = payload.len(), "data frame too short, ignoring");
                         return;
@@ -170,14 +192,24 @@ impl<S: RawSocket> Bridge<S> {
                         return;
                     }
                     let key_expr = match std::str::from_utf8(&payload[key_start..key_end]) {
-                        Ok(s) => s.to_string(),
+                        Ok(s) => s,
                         Err(_) => {
                             debug!("data frame has invalid UTF-8 key_expr, ignoring");
                             return;
                         }
                     };
+                    // Validate key expression against allowed namespace to prevent
+                    // unauthenticated injection into arbitrary zenoh key spaces.
+                    let prefix = allowed_prefix.trim_end_matches("**").trim_end_matches('/');
+                    if !key_expr.starts_with(prefix) {
+                        debug!(
+                            key_expr,
+                            "data frame key_expr outside allowed namespace, ignoring"
+                        );
+                        return;
+                    }
                     let data_payload = payload[key_end..].to_vec();
-                    inbound_data.push((key_expr, data_payload));
+                    inbound_data.push((key_expr.to_string(), data_payload));
                 }
                 other => {
                     trace!(frame_type = other, "ignoring unknown frame type");
@@ -185,18 +217,18 @@ impl<S: RawSocket> Bridge<S> {
             }
         })?;
 
-        // Publish buffered inbound data to zenoh.
+        // Publish buffered inbound data to zenoh (async, non-blocking).
+        let mut published_keys = Vec::with_capacity(inbound_data.len());
         for (key_expr, data) in inbound_data {
             // TODO: Use zenoh SHM (shared memory) for zero-copy inbound delivery.
-            // With the `shared-memory` feature enabled, we could allocate an SHM
-            // buffer via ShmProvider, memcpy the payload, and publish as SHM-backed
-            // ZBytes. For now, we copy the payload into a Vec.
-            if let Err(e) = self.session.put(&key_expr, data).wait() {
+            if let Err(e) = self.session.put(&key_expr, data).await {
                 warn!(key_expr, %e, "failed to publish inbound data to zenoh");
+            } else {
+                published_keys.push(key_expr);
             }
         }
 
-        Ok(())
+        Ok(published_keys)
     }
 
     /// Encode and broadcast a zenoh sample as a Data frame.

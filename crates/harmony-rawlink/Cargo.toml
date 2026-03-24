@@ -14,9 +14,7 @@ rawlink-integration = []
 [dependencies]
 hex.workspace = true
 libc = { workspace = true }
-postcard.workspace = true
 rand.workspace = true
-serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 tokio = { workspace = true }
 tracing.workspace = true
 zenoh = { workspace = true }

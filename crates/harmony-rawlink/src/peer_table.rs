@@ -62,6 +62,12 @@ impl PeerTable {
             .filter(|entry| entry.last_seen.elapsed() < self.ttl)
             .count()
     }
+
+    /// Remove all expired entries from the table.
+    pub fn purge_expired(&mut self) {
+        let ttl = self.ttl;
+        self.entries.retain(|_, entry| entry.last_seen.elapsed() < ttl);
+    }
 }
 
 #[cfg(test)]
