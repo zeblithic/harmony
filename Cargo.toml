@@ -30,6 +30,7 @@ members = [
     "crates/harmony-sdjwt",
     "crates/harmony-zenoh",
     "crates/harmony-rawlink",
+    "crates/harmony-s3",
 ]
 
 [workspace.package]
@@ -84,6 +85,10 @@ ciborium = { version = "0.2", default-features = false }
 # WASM runtime
 wasmi = "1"
 wasmtime = "38"
+
+# AWS SDK
+aws-config = "1"
+aws-sdk-s3 = "1"
 
 # Networking
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
