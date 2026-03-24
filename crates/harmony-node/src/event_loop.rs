@@ -241,6 +241,10 @@ pub async fn run(
     const MAX_TUNNEL_CONNECTIONS: usize = 64;
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<TunnelBridgeEvent>(256);
     let mut tunnel_senders: HashMap<String, TunnelSender> = HashMap::new();
+    // Keeps initiator-side iroh Endpoints alive for the lifetime of the connection.
+    // When the initiator dials, it creates a transient Endpoint that owns the QUIC
+    // state; dropping it would tear down the connection. Removed on TunnelClosed.
+    let mut initiator_endpoints: HashMap<String, iroh::Endpoint> = HashMap::new();
     // Maps interface_name → peer identity hash (first 16 bytes of peer_node_id,
     // which is BLAKE3(ML-DSA pubkey)). Used to route replication frames to the
     // correct peer in RuntimeEvent::ReplicaReceived. Populated at HandshakeComplete,
@@ -261,7 +265,23 @@ pub async fn run(
     let mut inflight_handshakes: usize = 0;
 
     // ── iroh Endpoint (optional, gated on --relay-url) ─────────────────────
-    let mut iroh_endpoint = if let Some(ref config) = tunnel_config {
+    // Pre-compute the relay map so it can be cloned for initiator dials.
+    let relay_map: Option<iroh::RelayMap> = if let Some(ref config) = tunnel_config {
+        if let Some(ref url) = config.relay_url {
+            let relay_url: iroh::RelayUrl =
+                url.parse()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("invalid relay URL '{url}': {e}").into()
+                    })?;
+            Some(iroh::RelayMap::from_iter([relay_url]))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut iroh_endpoint = if tunnel_config.is_some() {
         // Use a fresh random SecretKey so the relay cannot link the Endpoint's
         // NodeId to the node's permanent ML-DSA identity.
         let secret_key = iroh::SecretKey::generate(&mut rand::rngs::OsRng);
@@ -270,14 +290,8 @@ pub async fn run(
             .alpns(vec![tunnel_task::HARMONY_TUNNEL_ALPN.to_vec()])
             .secret_key(secret_key);
 
-        if let Some(ref url) = config.relay_url {
-            let relay_url: iroh::RelayUrl =
-                url.parse()
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("invalid relay URL '{url}': {e}").into()
-                    })?;
-            let relay_map = iroh::RelayMap::from_iter([relay_url]);
-            builder = builder.relay_mode(iroh::RelayMode::Custom(relay_map));
+        if let Some(ref rm) = relay_map {
+            builder = builder.relay_mode(iroh::RelayMode::Custom(rm.clone()));
         } else {
             builder = builder.relay_mode(iroh::RelayMode::Disabled);
         }
@@ -681,6 +695,7 @@ pub async fn run(
                         if is_current {
                             tunnel_senders.remove(&interface_name);
                             tunnel_identities.remove(&interface_name);
+                            initiator_endpoints.remove(&interface_name);
                             runtime.push_event(RuntimeEvent::TunnelClosed { interface_name });
                         }
                         // else: stale close from old connection — ignore
@@ -739,6 +754,8 @@ pub async fn run(
                                                 connection,
                                                 connection_id: conn_id,
                                                 interface_name: iface,
+                                                remote_pq_identity: None,
+                                                initiator_endpoint: None,
                                             })).await;
                                         }
                                         Err(e) => {
@@ -764,25 +781,53 @@ pub async fn run(
             // Arm 7: Ready connection from QUIC handshake task — spawn tunnel.
             ready = conn_rx.recv() => {
                 match ready {
-                    Some(Some(ReadyConnection { connection, connection_id, interface_name })) => {
+                    Some(Some(ready_conn)) => {
                         inflight_handshakes = inflight_handshakes.saturating_sub(1);
+                        let ReadyConnection {
+                            connection,
+                            connection_id,
+                            interface_name,
+                            remote_pq_identity,
+                            initiator_endpoint,
+                        } = ready_conn;
+
+                        // Store initiator endpoint if present — keeps the QUIC state alive.
+                        if let Some(ep) = initiator_endpoint {
+                            initiator_endpoints.insert(interface_name.clone(), ep);
+                        }
+
                         let (cmd_tx, cmd_rx) = mpsc::channel(64);
                         tunnel_senders.insert(
                             interface_name.clone(),
                             TunnelSender::new(cmd_tx, connection_id),
                         );
 
-                        let tx = tunnel_tx.clone();
                         let identity =
                             tunnel_config.as_ref().expect("conn_rx received a connection but tunnel_config is None").local_identity.clone();
-                        let iface_clone = interface_name.clone();
-                        tokio::spawn(async move {
-                            tunnel_task::run_responder(
-                                connection, &identity, tx, cmd_rx, iface_clone, connection_id,
-                            )
-                            .await;
-                        });
-                        tracing::info!(%interface_name, "accepted incoming tunnel");
+
+                        if let Some(remote_id) = remote_pq_identity {
+                            // Initiator path — we know the peer's identity
+                            let tx = tunnel_tx.clone();
+                            let iface_clone = interface_name.clone();
+                            tokio::spawn(async move {
+                                tunnel_task::run_initiator(
+                                    connection, &identity, &remote_id, tx, cmd_rx, iface_clone, connection_id,
+                                )
+                                .await;
+                            });
+                            tracing::info!(%interface_name, "initiated outbound tunnel");
+                        } else {
+                            // Responder path — peer identity learned during handshake
+                            let tx = tunnel_tx.clone();
+                            let iface_clone = interface_name.clone();
+                            tokio::spawn(async move {
+                                tunnel_task::run_responder(
+                                    connection, &identity, tx, cmd_rx, iface_clone, connection_id,
+                                )
+                                .await;
+                            });
+                            tracing::info!(%interface_name, "accepted incoming tunnel");
+                        }
                     }
                     Some(None) => {
                         // Handshake failed — decrement the inflight counter so future
@@ -833,14 +878,107 @@ pub async fn run(
             while let Some(Reverse(front)) = deferred_dials.peek() {
                 if front.fire_at_ms <= current_ms {
                     let Reverse(dial) = deferred_dials.pop().unwrap();
+
+                    // Check tunnel limit (include inflight handshakes)
+                    if tunnel_senders.len() + inflight_handshakes >= MAX_TUNNEL_CONNECTIONS {
+                        tracing::warn!(
+                            identity = %hex::encode(dial.identity_hash),
+                            "tunnel limit reached — dropping deferred dial"
+                        );
+                        continue;
+                    }
+
+                    // Construct PqIdentity from the announce's public key bytes
+                    let remote_pq_identity = match construct_pq_identity(
+                        &dial.peer_dsa_pubkey,
+                        &dial.peer_kem_pubkey,
+                    ) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            tracing::warn!(
+                                identity = %hex::encode(dial.identity_hash),
+                                err = %e,
+                                "PqIdentity construction failed — dropping dial"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let connection_id = next_connection_id;
+                    next_connection_id += 1;
+                    inflight_handshakes += 1;
+
+                    // Build target NodeAddr
+                    let target_node_id = iroh::NodeId::from_bytes(&dial.node_id)
+                        .expect("node_id must be 32 bytes");
+                    let mut node_addr = iroh::NodeAddr::new(target_node_id);
+                    if let Some(ref url) = dial.relay_url {
+                        if let Ok(relay_url) = url.parse::<iroh::RelayUrl>() {
+                            node_addr = node_addr.with_relay_url(relay_url);
+                        }
+                    }
+
+                    let interface_name = format!(
+                        "tunnel-{}",
+                        &hex::encode(&dial.node_id[..4])
+                    );
+                    let conn_tx_clone = conn_tx.clone();
+                    let relay_map_clone = relay_map.clone();
+
                     tracing::info!(
                         identity = %hex::encode(dial.identity_hash),
                         node_id = %hex::encode(&dial.node_id[..8]),
                         relay = ?dial.relay_url,
-                        "InitiateTunnel fired (stub — iroh-net not yet wired)"
+                        "initiating tunnel dial"
                     );
-                    // TODO(harmony-h6k): execute actual iroh Endpoint.connect()
-                    // using dial.node_id and dial.relay_url here.
+
+                    // Spawn async dial — sends ReadyConnection on success
+                    tokio::spawn(async move {
+                        let ephemeral_key = iroh::SecretKey::generate(&mut rand::rngs::OsRng);
+                        let mut ep_builder = iroh::Endpoint::builder()
+                            .alpns(vec![tunnel_task::HARMONY_TUNNEL_ALPN.to_vec()])
+                            .secret_key(ephemeral_key);
+                        if let Some(ref rm) = relay_map_clone {
+                            ep_builder = ep_builder
+                                .relay_mode(iroh::RelayMode::Custom(rm.clone()));
+                        } else {
+                            ep_builder = ep_builder
+                                .relay_mode(iroh::RelayMode::Disabled);
+                        }
+
+                        let ep = match ep_builder.bind().await {
+                            Ok(ep) => ep,
+                            Err(e) => {
+                                tracing::warn!(err = %e, "ephemeral endpoint bind failed");
+                                // Signal failure so inflight_handshakes is decremented
+                                let _ = conn_tx_clone.send(None).await;
+                                return;
+                            }
+                        };
+
+                        let conn = match ep
+                            .connect(node_addr, tunnel_task::HARMONY_TUNNEL_ALPN)
+                            .await
+                        {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                tracing::warn!(err = %e, "tunnel dial failed");
+                                let _ = conn_tx_clone.send(None).await;
+                                return;
+                            }
+                        };
+
+                        tracing::info!(%interface_name, "tunnel dial connected");
+                        let _ = conn_tx_clone
+                            .send(Some(ReadyConnection {
+                                connection: conn,
+                                connection_id,
+                                interface_name,
+                                remote_pq_identity: Some(remote_pq_identity),
+                                initiator_endpoint: Some(ep),
+                            }))
+                            .await;
+                    });
                 } else {
                     break;
                 }
@@ -1119,6 +1257,25 @@ async fn dispatch_action(
             tracing::debug!(%key_expr, "QueryMemo (stub — not yet wired)");
         }
     }
+}
+
+/// Construct a `PqIdentity` from raw ML-DSA verifying key and ML-KEM encapsulation key bytes.
+///
+/// The announce record stores: `public_key` = ML-DSA (1952 bytes),
+/// `encryption_key` = ML-KEM (1184 bytes). `PqIdentity::from_public_keys` takes
+/// `(MlKemPublicKey, MlDsaPublicKey)` — note the order.
+fn construct_pq_identity(
+    dsa_bytes: &[u8],
+    kem_bytes: &[u8],
+) -> Result<harmony_identity::PqIdentity, String> {
+    let verifying_key = harmony_crypto::ml_dsa::MlDsaPublicKey::from_bytes(dsa_bytes)
+        .map_err(|e| format!("invalid ML-DSA public key: {e}"))?;
+    let encryption_key = harmony_crypto::ml_kem::MlKemPublicKey::from_bytes(kem_bytes)
+        .map_err(|e| format!("invalid ML-KEM public key: {e}"))?;
+    Ok(harmony_identity::PqIdentity::from_public_keys(
+        encryption_key,
+        verifying_key,
+    ))
 }
 
 /// Issue a Zenoh `get()` for the given key expression and return the first reply's payload.
