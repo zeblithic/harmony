@@ -33,7 +33,7 @@ pub async fn run(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .unwrap_or_default();
+        .expect("reqwest client must build (TLS backend unavailable?)");
     let ttl = Duration::from_secs(cache_ttl_secs);
     let mut cache: HashMap<String, CacheEntry> = HashMap::new();
 
@@ -85,29 +85,51 @@ pub async fn run(
                     continue;
                 }
                 // Stream response with size cap — enforces limit even for
-                // chunked transfers that omit Content-Length.
-                let bytes = {
-                    let mut body = bytes::BytesMut::new();
-                    let mut stream = resp.bytes_stream();
-                    let mut too_large = false;
-                    while let Ok(Some(chunk)) = stream.try_next().await {
-                        body.extend_from_slice(&chunk);
-                        if body.len() as u64 > MAX_DOC_BYTES {
-                            too_large = true;
+                // chunked transfers that omit Content-Length. Handles stream
+                // errors explicitly to avoid masking network failures.
+                let mut body = bytes::BytesMut::new();
+                let mut stream = resp.bytes_stream();
+                let mut too_large = false;
+                let mut stream_err: Option<reqwest::Error> = None;
+                loop {
+                    match stream.try_next().await {
+                        Ok(Some(chunk)) => {
+                            body.extend_from_slice(&chunk);
+                            if body.len() as u64 > MAX_DOC_BYTES {
+                                too_large = true;
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            stream_err = Some(e);
                             break;
                         }
                     }
-                    if too_large {
-                        tracing::warn!(%did, "did:web document too large");
-                        reply_empty(&query).await;
-                        continue;
-                    }
-                    body.freeze()
-                };
+                }
+                if too_large {
+                    tracing::warn!(%did, "did:web document too large");
+                    reply_empty(&query).await;
+                    continue;
+                }
+                if let Some(e) = stream_err {
+                    tracing::warn!(%did, err = %e, "did:web body stream error");
+                    reply_empty(&query).await;
+                    continue;
+                }
+                let bytes = body.freeze();
                 match parse_did_document(&did, &bytes) {
                     Ok(doc) => {
                         tracing::info!(%did, keys = doc.verification_methods.len(), "did:web resolved");
                         reply_with_document(&query, &doc).await;
+                        // Evict before insert so the new entry survives overflow.
+                        if cache.len() >= MAX_CACHE_ENTRIES {
+                            cache.retain(|_, e| e.expires_at > now);
+                            if cache.len() >= MAX_CACHE_ENTRIES {
+                                tracing::warn!("did:web cache overflow, clearing");
+                                cache.clear();
+                            }
+                        }
                         cache.insert(
                             did,
                             CacheEntry {
@@ -115,13 +137,6 @@ pub async fn run(
                                 expires_at: now + ttl,
                             },
                         );
-                        if cache.len() > MAX_CACHE_ENTRIES {
-                            cache.retain(|_, e| e.expires_at > now);
-                            if cache.len() > MAX_CACHE_ENTRIES {
-                                tracing::warn!("did:web cache overflow, clearing");
-                                cache.clear();
-                            }
-                        }
                     }
                     Err(e) => {
                         tracing::warn!(%did, err = ?e, "did:web document parse failed");
