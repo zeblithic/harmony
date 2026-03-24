@@ -433,12 +433,11 @@ fn extract_external_claims(
     // Other credentialSubject fields carry the meaningful data.
     let skip = ["id", "type", "@context", "claims"];
 
-    // Sort keys alphabetically for deterministic claim_digests ordering.
-    // serde_json::Map may use BTreeMap (sorted) or IndexMap (insertion order)
-    // depending on the `preserve_order` feature — sorting explicitly removes
-    // this dependency so all nodes produce the same digests for the same VC.
+    // Sort keys by UTF-16 code unit order for deterministic claim_digests.
+    // This matches the JCS canonicalization key ordering (RFC 8785) and ensures
+    // cross-implementation consistency for non-ASCII claim names.
     let mut keys: Vec<&String> = subj_obj.keys().collect();
-    keys.sort();
+    keys.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
 
     for key in keys {
         let val = &subj_obj[key];
@@ -603,30 +602,51 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
         obj.remove("proof");
     }
 
-    // Extract optional status list index (from credentialStatus.statusListIndex)
-    let status_list_index = vc
-        .get("credentialStatus")
-        .and_then(|cs| cs.get("statusListIndex"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<u32>().ok());
+    // Extract optional status list index (from credentialStatus.statusListIndex).
+    // If the field is present but malformed, return an error rather than silently
+    // defaulting to None (which would cause a SignablePayload mismatch → ProofInvalid).
+    let status_list_index = if let Some(cs) = vc.get("credentialStatus") {
+        let idx_str = cs
+            .get("statusListIndex")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ImportError::MalformedVc(String::from(
+                    "credentialStatus present but missing statusListIndex string",
+                ))
+            })?;
+        Some(idx_str.parse::<u32>().map_err(|_| {
+            ImportError::MalformedVc(alloc::format!(
+                "statusListIndex is not a valid u32: '{idx_str}'"
+            ))
+        })?)
+    } else {
+        None
+    };
 
-    // Extract optional delegation proof hash (from delegationProof, base64url)
-    let delegation_proof = vc
-        .get("delegationProof")
-        .and_then(Value::as_str)
-        .and_then(|b64| {
-            use base64::Engine;
-            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(b64)
-                .ok()?;
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                Some(arr)
-            } else {
-                None
-            }
-        });
+    // Extract optional delegation proof hash (from delegationProof, base64url).
+    // If the field is present but malformed, return an error.
+    let delegation_proof = if let Some(dp_val) = vc.get("delegationProof") {
+        use base64::Engine;
+        let b64 = dp_val.as_str().ok_or_else(|| {
+            ImportError::MalformedVc(String::from("delegationProof must be a string"))
+        })?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(b64)
+            .map_err(|e| {
+                ImportError::EncodingError(alloc::format!("delegationProof base64: {e}"))
+            })?;
+        if bytes.len() != 32 {
+            return Err(ImportError::MalformedVc(alloc::format!(
+                "delegationProof must be 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Some(arr)
+    } else {
+        None
+    };
 
     Ok(VcEnvelope {
         issuer_did,
