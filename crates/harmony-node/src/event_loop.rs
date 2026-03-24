@@ -921,10 +921,17 @@ pub async fn run(
                         }
                     }
                     None => {
-                        // Bridge task exited — sender dropped. Clear the receiver
-                        // so the arm falls back to pending() and stops spinning.
-                        tracing::warn!("L2 rawlink bridge inbound channel closed — disabling L2 arm");
+                        // Bridge task exited — sender dropped. Clean up fully:
+                        // clear channels, unregister the interface from the router.
+                        tracing::warn!("L2 rawlink bridge inbound channel closed — disabling L2 transport");
                         ret_inbound_rx = None;
+                        ret_outbound_tx = None;
+                        if let Some(ref iface_name) = rawlink_iface_name {
+                            runtime.push_event(RuntimeEvent::TunnelClosed {
+                                interface_name: iface_name.clone(),
+                            });
+                        }
+                        rawlink_iface_name = None;
                     }
                 }
             }
