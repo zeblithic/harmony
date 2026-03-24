@@ -662,14 +662,14 @@ pub fn import_jsonld_vc(
         return Err(ImportError::ProofInvalid);
     }
 
-    // Resolve the signing key from verificationMethod.
+    // Resolve the signing key from verificationMethod. Since we verified
+    // vm_base == issuer_did above, this also gives us the issuer's key and
+    // suite — no need to resolve the issuer DID separately.
     let issuer_resolved = resolver.resolve(&env.verification_method)?;
-    // Use the issuer DID for the identity hash.
-    let issuer_did_resolved = resolver.resolve(&env.issuer_did)?;
-    let issuer_hash = derive_import_identity_hash(&issuer_did_resolved.public_key);
+    let issuer_hash = derive_import_identity_hash(&issuer_resolved.public_key);
     let issuer_ref = harmony_identity::IdentityRef {
         hash: issuer_hash,
-        suite: issuer_did_resolved.suite,
+        suite: issuer_resolved.suite,
     };
 
     // Resolve subject DID (defaults to issuer if absent).
@@ -684,24 +684,36 @@ pub fn import_jsonld_vc(
         issuer_ref
     };
 
-    // Validate that the resolved key type matches the cryptosuite name.
-    // Prevents accepting a credential signed with an algorithm that doesn't
-    // match the declared suite (e.g., eddsa-jcs-2022 with an ML-DSA key).
-    let suite_valid = match env.cryptosuite.as_str() {
+    // Reject unknown cryptosuites early (before key-type validation).
+    let expected_suite = match env.cryptosuite.as_str() {
         "harmony-eddsa-2022" | "eddsa-jcs-2022" => {
+            harmony_identity::CryptoSuite::Ed25519
+        }
+        "harmony-mldsa65-2025" | "mldsa65-jcs-2024" | "di-mldsa-jcs-2025" => {
+            // Accept both MlDsa65 and MlDsa65Rotatable for ML-DSA suites.
+            // We check the actual resolved suite below.
+            harmony_identity::CryptoSuite::MlDsa65
+        }
+        other => {
+            return Err(ImportError::UnsupportedCryptosuite(String::from(other)));
+        }
+    };
+
+    // Validate that the resolved key type matches the cryptosuite name.
+    let suite_matches = match expected_suite {
+        harmony_identity::CryptoSuite::Ed25519 => {
             issuer_resolved.suite == harmony_identity::CryptoSuite::Ed25519
         }
-        "harmony-mldsa65-2025" | "mldsa65-jcs-2024" | "di-mldsa-jcs-2025" => matches!(
+        _ => matches!(
             issuer_resolved.suite,
             harmony_identity::CryptoSuite::MlDsa65
                 | harmony_identity::CryptoSuite::MlDsa65Rotatable
         ),
-        _ => false, // unknown suite caught below in the match
     };
-    if !suite_valid {
+    if !suite_matches {
         return Err(ImportError::UnsupportedCryptosuite(alloc::format!(
-            "cryptosuite '{}' does not match resolved key type {:?}",
-            env.cryptosuite, issuer_resolved.suite
+            "cryptosuite '{}' requires {:?}, but key resolved as {:?}",
+            env.cryptosuite, expected_suite, issuer_resolved.suite
         )));
     }
 
@@ -778,7 +790,8 @@ pub fn import_jsonld_vc(
                 proof_type: ImportedProofType::JcsDataIntegrity,
             })
         }
-        other => Err(ImportError::UnsupportedCryptosuite(String::from(other))),
+        // Unreachable: unknown suites are rejected by the expected_suite match above.
+        _ => unreachable!("unknown cryptosuite should have been rejected earlier"),
     }
 }
 
