@@ -512,8 +512,8 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
         }
     };
 
-    let expires_at = match vc_obj.get("validUntil") {
-        Some(Value::String(s)) => parse_iso8601(s)?,
+    let (expires_at, expires_at_defaulted) = match vc_obj.get("validUntil") {
+        Some(Value::String(s)) => (parse_iso8601(s)?, false),
         Some(_) => {
             return Err(ImportError::MalformedVc(String::from(
                 "'validUntil' must be a string",
@@ -521,7 +521,7 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
         }
         // Default to not_before + 10 years. Adjusted after issued_at is parsed
         // (see below) to ensure expires_at > issued_at.
-        None => not_before + 315_576_000,
+        None => (not_before + 315_576_000, true),
     };
 
     // ── proof ─────────────────────────────────────────────────────────────────
@@ -570,9 +570,10 @@ pub(crate) fn parse_vc_envelope(vc: &Value) -> Result<VcEnvelope, ImportError> {
         .ok_or_else(|| ImportError::MalformedVc(String::from("proof missing 'created' field")))?;
     let issued_at = parse_iso8601(created_str)?;
 
-    // If expires_at was defaulted and is now <= issued_at, adjust it.
-    // This prevents invalid credentials when validFrom << proof.created.
-    let expires_at = if expires_at <= issued_at {
+    // Only adjust expires_at when it was defaulted (validUntil absent).
+    // Explicit validUntil is preserved as-is — even if it falls before
+    // issued_at (the issuer's intent is authoritative for explicit values).
+    let expires_at = if expires_at_defaulted && expires_at <= issued_at {
         issued_at + 315_576_000
     } else {
         expires_at
