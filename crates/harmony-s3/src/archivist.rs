@@ -88,14 +88,14 @@ pub async fn run(s3: S3Library, session: zenoh::Session) {
 
         // Skip ephemeral content.
         if !is_durable(&cid) {
-            tracing::info!(key_expr, "archivist: skipping ephemeral content");
+            tracing::debug!(key_expr, "archivist: skipping ephemeral content");
             continue;
         }
 
         // Skip already-archived content (HEAD request).
         match s3.exists(&cid).await {
             Ok(true) => {
-                tracing::info!(key_expr, "archivist: already archived, skipping");
+                tracing::debug!(key_expr, "archivist: already archived, skipping");
                 continue;
             }
             Ok(false) => {}
