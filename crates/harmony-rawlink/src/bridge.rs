@@ -388,7 +388,7 @@ mod tests {
         let data = b"online";
 
         let bridge_payload = make_data_payload(key, data);
-        let full_frame = frame::encode_data_frame(MAC_A, BROADCAST_MAC, key, data);
+        let full_frame = frame::encode_data_frame(MAC_A, BROADCAST_MAC, key, data).unwrap();
         let frame_payload = &full_frame[crate::ETH_HEADER_LEN..];
 
         assert_eq!(bridge_payload, frame_payload);

@@ -90,14 +90,22 @@ pub fn decode_scout_frame(frame: &[u8]) -> Result<([u8; 6], [u8; 16]), RawLinkEr
 /// Encodes a Data frame.
 ///
 /// Layout after FRAME_OVERHEAD: `[2 key_expr_len (big-endian)][key_expr bytes][payload...]`
+///
+/// Returns `FrameError` if `key_expr` exceeds 65535 bytes.
 pub fn encode_data_frame(
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
     key_expr: &str,
     payload: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, RawLinkError> {
     let key_bytes = key_expr.as_bytes();
     let key_len = key_bytes.len();
+    if key_len > u16::MAX as usize {
+        return Err(RawLinkError::FrameError(format!(
+            "key_expr too long: {key_len} bytes (max {})",
+            u16::MAX
+        )));
+    }
 
     let total = FRAME_OVERHEAD + 2 + key_len + payload.len();
     let mut frame = Vec::with_capacity(total);
@@ -119,7 +127,7 @@ pub fn encode_data_frame(
     // Payload
     frame.extend_from_slice(payload);
 
-    frame
+    Ok(frame)
 }
 
 /// Decodes a Data frame.
@@ -191,7 +199,7 @@ mod tests {
     fn data_frame_round_trip() {
         let key = "harmony/test/topic";
         let payload = b"hello, world!";
-        let frame = encode_data_frame(SRC, DST, key, payload);
+        let frame = encode_data_frame(SRC, DST, key, payload).expect("encode should succeed");
         let (got_src, got_key, got_payload) =
             decode_data_frame(&frame).expect("decode should succeed");
         assert_eq!(got_src, SRC);
