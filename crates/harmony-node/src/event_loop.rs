@@ -148,6 +148,8 @@ struct DeferredDial {
     identity_hash: [u8; 16],
     node_id: [u8; 32],
     relay_url: Option<String>,
+    peer_dsa_pubkey: Vec<u8>,
+    peer_kem_pubkey: Vec<u8>,
 }
 
 impl Ord for DeferredDial {
@@ -1044,6 +1046,8 @@ async fn dispatch_action(
             identity_hash,
             node_id,
             relay_url,
+            peer_dsa_pubkey,
+            peer_kem_pubkey,
         } => {
             let delay_ms = 500 + (rand::random::<u64>() % 3500);
             let fire_at = tunnel_task::millis_since_start() + delay_ms;
@@ -1052,6 +1056,8 @@ async fn dispatch_action(
                 identity_hash,
                 node_id,
                 relay_url,
+                peer_dsa_pubkey,
+                peer_kem_pubkey,
             }));
             tracing::debug!(
                 identity = %hex::encode(identity_hash),

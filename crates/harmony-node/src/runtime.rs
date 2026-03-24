@@ -265,6 +265,10 @@ pub enum RuntimeAction {
         identity_hash: [u8; 16],
         node_id: [u8; 32],
         relay_url: Option<String>,
+        /// ML-DSA-65 public key from the peer's announce record (1952 bytes).
+        peer_dsa_pubkey: Vec<u8>,
+        /// ML-KEM-768 public key from the peer's announce record (1184 bytes).
+        peer_kem_pubkey: Vec<u8>,
     },
     /// Peer lifecycle: send a path request (announce probe) for a peer.
     SendPathRequest { identity_hash: [u8; 16] },
@@ -2072,10 +2076,19 @@ impl<B: BookStore> NodeRuntime<B> {
                     node_id,
                     relay_url,
                 } => {
+                    let (peer_dsa_pubkey, peer_kem_pubkey) = self
+                        .discovery
+                        .get_record(&identity_hash, self.last_unix_now)
+                        .map(|record| {
+                            (record.public_key.clone(), record.encryption_key.clone())
+                        })
+                        .unwrap_or_default();
                     out.push(RuntimeAction::InitiateTunnel {
                         identity_hash,
                         node_id,
                         relay_url,
+                        peer_dsa_pubkey,
+                        peer_kem_pubkey,
                     });
                 }
                 PeerAction::SendPathRequest { identity_hash } => {
@@ -3989,6 +4002,8 @@ mod tests {
             identity_hash: [0xAA; 16],
             node_id: [0xBB; 32],
             relay_url: Some("https://relay.example.com".into()),
+            peer_dsa_pubkey: vec![0xDD; 1952],
+            peer_kem_pubkey: vec![0xEE; 1184],
         };
         let _a2 = RuntimeAction::SendPathRequest {
             identity_hash: [0xCC; 16],
