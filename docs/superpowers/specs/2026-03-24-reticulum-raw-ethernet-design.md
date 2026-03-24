@@ -64,6 +64,13 @@ while let Ok(packet) = reticulum_outbound_rx.try_recv() {
 
 The Node's `PacketHashlist` already deduplicates Reticulum packets by content hash. A packet received from both L2 and UDP is processed once and dropped on the second arrival. No bridge-level dedup required.
 
+### Channel back-pressure
+
+Both channels use `try_send` (non-blocking). If the channel is full, the packet is silently dropped. This is acceptable because:
+- The Node handles retransmits and dedup at the protocol layer
+- Blocking in the bridge's `recv_frames` callback would stall all frame processing (Scout, Data, and Reticulum)
+- Channel capacity of 256 provides ample buffer for normal mesh traffic at 500 bytes/packet
+
 ## Event Loop Changes (harmony-node)
 
 ### Channel setup at startup
@@ -73,16 +80,18 @@ let (ret_inbound_tx, mut ret_inbound_rx) = mpsc::channel(256);
 let (ret_outbound_tx, ret_outbound_rx) = mpsc::channel(256);
 ```
 
-Pass `ret_inbound_tx` to `BridgeConfig::reticulum_inbound_tx`. Pass `ret_outbound_rx` to the bridge. Store `ret_outbound_tx` for the dispatch path.
+Pass `ret_inbound_tx` to `BridgeConfig::reticulum_inbound_tx`. Pass `ret_outbound_rx` to `Bridge::new()` (extend the constructor to accept it alongside socket, session, and config). Store `ret_outbound_tx` for the dispatch path — it must be passed as a parameter to `dispatch_action()` (alongside existing `udp`, `tunnel_senders`, etc.).
 
 ### Interface registration
 
-Register the L2 interface with the runtime so the Node routes packets to it:
+Register the L2 interface with the runtime **during bridge setup** (not inside the select loop — the interface is available at startup, unlike tunnels which are registered dynamically via `TunnelHandshakeComplete`):
+
 ```rust
-runtime.register_interface("l2:mesh0", InterfaceMode::Full, ...);
+let iface_name = format!("l2:{}", rawlink_interface);
+runtime.register_interface(&iface_name, InterfaceMode::Full, ...);
 ```
 
-The interface name uses the `l2:` prefix, consistent with `tunnel-` for QUIC tunnels and `udp0` for UDP broadcast.
+The interface name uses the `l2:` prefix, consistent with `tunnel-` for QUIC tunnels and `udp0` for UDP broadcast. Derived dynamically from the `rawlink_interface` config value.
 
 ### Select loop — inbound
 
