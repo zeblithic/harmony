@@ -1005,6 +1005,10 @@ pub async fn run(
     }
 
     // ── Graceful iroh shutdown ────────────────────────────────────────────
+    for (iface, ep) in initiator_endpoints.drain() {
+        tracing::debug!(%iface, "closing initiator endpoint");
+        ep.close().await;
+    }
     if let Some(ref ep) = iroh_endpoint {
         tracing::info!("closing iroh endpoint");
         ep.close().await;
