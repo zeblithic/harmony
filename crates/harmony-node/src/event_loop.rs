@@ -14,7 +14,6 @@ use harmony_identity::PqPrivateIdentity;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
-use zeroize::Zeroize;
 
 use crate::discovery::{self, PeerTable};
 use crate::runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
@@ -261,15 +260,9 @@ pub async fn run(
 
     // ── iroh Endpoint (optional, gated on --relay-url) ─────────────────────
     let mut iroh_endpoint = if let Some(ref config) = tunnel_config {
-        // Derive iroh SecretKey from PQ identity's ML-DSA *private* signing key.
-        // This gives a deterministic mapping: same PQ identity → same iroh NodeId,
-        // without leaking the secret — the verifying key is public, so deriving
-        // from it would let anyone impersonate this node's iroh transport identity.
-        let mut sk_bytes = config.local_identity.signing_key().as_bytes();
-        let mut hash = harmony_crypto::hash::blake3_hash(&sk_bytes);
-        sk_bytes.zeroize();
-        let secret_key = iroh::SecretKey::from(hash);
-        hash.zeroize(); // [u8; 32] is Copy — SecretKey::from copies it, zeroize the original
+        // Use a fresh random SecretKey so the relay cannot link the Endpoint's
+        // NodeId to the node's permanent ML-DSA identity.
+        let secret_key = iroh::SecretKey::generate(&mut rand::rngs::OsRng);
 
         let mut builder = iroh::Endpoint::builder()
             .alpns(vec![tunnel_task::HARMONY_TUNNEL_ALPN.to_vec()])

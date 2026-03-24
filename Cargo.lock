@@ -1953,6 +1953,7 @@ dependencies = [
 name = "harmony-node"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures-util",
  "harmony-athenaeum",
