@@ -15,8 +15,14 @@ use crate::S3Library;
 /// - bit 4 (0x10) = lsb_mode
 ///
 /// Returns `true` when bit 6 is **clear** (content is durable).
+///
+/// Canonical definition: `harmony_content::cid::ContentFlags::ephemeral` (0x40).
+/// This crate intentionally avoids depending on harmony-content to stay minimal.
+/// If the CID bit layout changes, this constant must be updated to match.
+const EPHEMERAL_FLAG: u8 = 0x40;
+
 pub fn is_durable(cid_bytes: &[u8; 32]) -> bool {
-    (cid_bytes[0] & 0x40) == 0
+    (cid_bytes[0] & EPHEMERAL_FLAG) == 0
 }
 
 /// Extracts the 64-character hex CID from the last segment of a Zenoh key

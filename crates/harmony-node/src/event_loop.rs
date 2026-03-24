@@ -249,6 +249,9 @@ pub async fn run(
         ).await {
             Ok(s3) => {
                 let session = session.clone();
+                // Handle intentionally detached — the archivist is a fire-and-forget
+                // subscriber with no back-channel. Exit is signaled via error! log.
+                // Future: add select! arm or graceful shutdown for in-flight uploads.
                 let _archivist_handle = tokio::spawn(async move {
                     harmony_s3::archivist::run(s3, session).await;
                     tracing::error!("S3 archivist task exited — archival is no longer active");
