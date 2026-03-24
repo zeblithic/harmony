@@ -70,9 +70,7 @@ pub fn credential_to_jsonld(
     let claims: Vec<Value> = credential
         .claim_digests
         .iter()
-        .map(|d| {
-            json!({ "digest": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(d) })
-        })
+        .map(|d| json!({ "digest": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(d) }))
         .collect();
 
     Ok(build_vc_json(credential, &issuer_did, &subject_did, claims))
@@ -194,9 +192,8 @@ fn build_vc_json(
     }
 
     if let Some(ref proof_hash) = credential.proof {
-        vc["delegationProof"] = json!(
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(proof_hash)
-        );
+        vc["delegationProof"] =
+            json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(proof_hash));
     }
 
     vc
@@ -211,7 +208,12 @@ fn epoch_to_iso8601(epoch: u64) -> String {
     let (year, month, day) = days_to_ymd(days);
     alloc::format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hours, minutes, seconds
+        year,
+        month,
+        day,
+        hours,
+        minutes,
+        seconds
     )
 }
 
@@ -364,9 +366,7 @@ mod tests {
             "42"
         );
         assert_eq!(
-            json["credentialStatus"]["statusPurpose"]
-                .as_str()
-                .unwrap(),
+            json["credentialStatus"]["statusPurpose"].as_str().unwrap(),
             "revocation"
         );
         // W3C required: id must be a URL, distinct from statusListCredential
@@ -399,7 +399,10 @@ mod tests {
         assert_eq!(proof["proofPurpose"].as_str().unwrap(), "assertionMethod");
         // proofValue must be multibase base58btc (prefix 'z')
         let pv = proof["proofValue"].as_str().unwrap();
-        assert!(pv.starts_with('z'), "proofValue must use multibase base58btc prefix 'z'");
+        assert!(
+            pv.starts_with('z'),
+            "proofValue must use multibase base58btc prefix 'z'"
+        );
         assert!(proof["nonce"].is_string());
         // W3C required: created and verificationMethod
         assert!(proof["created"].as_str().unwrap().ends_with("Z"));
@@ -464,8 +467,7 @@ mod tests {
             disclosed_claims: vec![salted_claims[0].clone()],
         };
 
-        let json =
-            presentation_to_jsonld(&presentation, &[0x42; 32], &[0x43; 32]).unwrap();
+        let json = presentation_to_jsonld(&presentation, &[0x42; 32], &[0x43; 32]).unwrap();
 
         // VP envelope
         assert!(json["@context"].is_array());
@@ -490,10 +492,7 @@ mod tests {
         assert!(disclosed["value"].is_string());
         assert!(disclosed["digest"].is_string());
 
-        let undisclosed_count = claims
-            .iter()
-            .filter(|c| c.get("typeId").is_none())
-            .count();
+        let undisclosed_count = claims.iter().filter(|c| c.get("typeId").is_none()).count();
         assert_eq!(undisclosed_count, 1);
     }
 

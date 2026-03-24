@@ -29,3 +29,9 @@ pub mod jsonld;
 
 #[cfg(feature = "jsonld")]
 pub use jsonld::{credential_to_jsonld, identity_to_did_key, presentation_to_jsonld};
+
+#[cfg(feature = "jsonld")]
+pub mod import;
+
+#[cfg(feature = "jsonld")]
+pub use import::{import_jsonld_vc, ImportError, ImportedCredential, ImportedProofType};
