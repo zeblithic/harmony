@@ -91,6 +91,11 @@ impl InferenceEngine for QwenEngine {
     }
 
     fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, InferenceError> {
+        if tokens.is_empty() {
+            return Err(InferenceError::ForwardFailed(
+                "tokens slice must not be empty".into(),
+            ));
+        }
         let model = self.model.as_mut().ok_or(InferenceError::ModelNotLoaded)?;
         // ModelWeights::forward expects a 2D tensor (batch, seq_len).
         let seq_len = tokens.len();
