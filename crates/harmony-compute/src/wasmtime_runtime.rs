@@ -291,9 +291,7 @@ impl WasmtimeRuntime {
                         let mut gguf_cid = [0u8; 32];
                         memory
                             .read(&caller, gguf_cid_ptr as usize, &mut gguf_cid)
-                            .map_err(|e| {
-                                wasmtime::Error::msg(format!("read GGUF CID: {e}"))
-                            })?;
+                            .map_err(|e| wasmtime::Error::msg(format!("read GGUF CID: {e}")))?;
 
                         let mut tokenizer_cid = [0u8; 32];
                         memory
@@ -346,9 +344,7 @@ impl WasmtimeRuntime {
                         let tokens = match engine.tokenize(text) {
                             Ok(t) => t,
                             Err(e) => {
-                                return Err(wasmtime::Error::msg(format!(
-                                    "tokenize failed: {e}"
-                                )))
+                                return Err(wasmtime::Error::msg(format!("tokenize failed: {e}")))
                             }
                         };
 
@@ -409,9 +405,7 @@ impl WasmtimeRuntime {
                         let text = match engine.detokenize(&tokens) {
                             Ok(t) => t,
                             Err(e) => {
-                                return Err(wasmtime::Error::msg(format!(
-                                    "detokenize failed: {e}"
-                                )))
+                                return Err(wasmtime::Error::msg(format!("detokenize failed: {e}")))
                             }
                         };
 
@@ -1333,5 +1327,246 @@ mod tests {
             "total fuel ({fuel_after_replay}) should exceed first round ({fuel_after_execute}) \
              due to replay accumulation"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_model_load_triggers_needs_io() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "model_load" (func $load (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $result i32)
+                (local.set $result
+                  (call $load
+                    (local.get $input_ptr)
+                    (i32.add (local.get $input_ptr) (i32.const 32))))
+                (i32.store
+                  (i32.add (local.get $input_ptr) (local.get $input_len))
+                  (local.get $result))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmtimeRuntime::new().expect("failed to create runtime");
+        let input = [0u8; 64];
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            &input,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::NeedsIO { request } => match request {
+                crate::types::IORequest::LoadModel {
+                    gguf_cid,
+                    tokenizer_cid,
+                } => {
+                    assert_eq!(gguf_cid, [0u8; 32]);
+                    assert_eq!(tokenizer_cid, [0u8; 32]);
+                }
+                _ => panic!("expected LoadModel, got {request:?}"),
+            },
+            other => panic!("expected NeedsIO, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_model_load_invalid_gguf_returns_neg3() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "model_load" (func $load (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (local.set $result
+                  (call $load (local.get $input_ptr) (i32.add (local.get $input_ptr) (i32.const 32))))
+                (i32.store (local.get $out_ptr) (local.get $result))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmtimeRuntime::new().expect("failed to create runtime");
+        let input = [0u8; 64];
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            &input,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(
+            result,
+            crate::types::ComputeResult::NeedsIO { .. }
+        ));
+        let result = runtime.resume_with_io(
+            crate::types::IOResponse::ModelReady {
+                gguf_data: b"not a valid gguf".to_vec(),
+                tokenizer_data: b"{}".to_vec(),
+            },
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, -3, "expected -3 for invalid GGUF, got {code}");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_model_load_gguf_not_found() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "model_load" (func $load (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (i32.store (local.get $out_ptr)
+                  (call $load (local.get $input_ptr) (i32.add (local.get $input_ptr) (i32.const 32))))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmtimeRuntime::new().expect("failed to create runtime");
+        let input = [0u8; 64];
+        let _ = runtime.execute(
+            module_wat.as_bytes(),
+            &input,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        let result = runtime.resume_with_io(
+            crate::types::IOResponse::ModelGgufNotFound,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, -1);
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_forward_before_model_load() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "forward" (func $fwd (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (i32.store (local.get $out_ptr)
+                  (call $fwd (local.get $input_ptr) (i32.const 4)))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmtimeRuntime::new().expect("failed to create runtime");
+        let input = 42u32.to_le_bytes();
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            &input,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, -1, "expected -1 (no model), got {code}");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_tokenize_before_model_load() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "tokenize" (func $tok (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (i32.store (local.get $out_ptr)
+                  (call $tok
+                    (local.get $input_ptr) (local.get $input_len)
+                    (i32.add (local.get $out_ptr) (i32.const 4)) (i32.const 1024)))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmtimeRuntime::new().expect("failed to create runtime");
+        let input = b"hello world";
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            input,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, -1, "expected -1 (no tokenizer), got {code}");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_model_reset_empty_engine() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "model_reset" (func $reset (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (i32.store (local.get $out_ptr) (call $reset))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmtimeRuntime::new().expect("failed to create runtime");
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            &[],
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, 0);
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_sample_before_forward() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "sample" (func $samp (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (f32.store (local.get $input_ptr) (f32.const 0.0))
+                (f32.store (i32.add (local.get $input_ptr) (i32.const 4)) (f32.const 1.0))
+                (i32.store (i32.add (local.get $input_ptr) (i32.const 8)) (i32.const 0))
+                (f32.store (i32.add (local.get $input_ptr) (i32.const 12)) (f32.const 1.0))
+                (i32.store (i32.add (local.get $input_ptr) (i32.const 16)) (i32.const 64))
+                (i32.store (local.get $out_ptr)
+                  (call $samp (local.get $input_ptr) (i32.const 20)))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmtimeRuntime::new().expect("failed to create runtime");
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            &[0u8; 20],
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, -1, "expected -1 (no engine), got {code}");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
     }
 }
