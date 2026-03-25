@@ -44,23 +44,115 @@ pub struct ManifestHeader {
 impl ManifestHeader {
     /// Serialize to postcard bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, EngramError> {
-        todo!()
+        postcard::to_allocvec(self).map_err(|_| EngramError::ManifestDeserialize)
     }
 
     /// Deserialize from postcard bytes.
-    pub fn from_bytes(_data: &[u8]) -> Result<Self, EngramError> {
-        todo!()
+    pub fn from_bytes(data: &[u8]) -> Result<Self, EngramError> {
+        postcard::from_bytes(data).map_err(|_| EngramError::ManifestDeserialize)
     }
 
     /// Convert to an [`EngramConfig`] for use with [`EngramClient`](crate::EngramClient).
     pub fn to_config(&self) -> EngramConfig {
-        todo!()
+        EngramConfig {
+            version: self.version.clone(),
+            embedding_dim: self.embedding_dim as usize,
+            dtype_bytes: self.dtype_bytes as usize,
+            num_heads: self.num_heads,
+            shard_size: self.shard_size,
+            num_shards: self.num_shards,
+            total_entries: self.total_entries,
+            hash_seeds: self.hash_seeds.clone(),
+        }
     }
 }
 
 /// Parse raw shard CID bytes into a Vec of 32-byte CID arrays.
 ///
 /// `data` must be a multiple of 32 bytes.  Returns one `[u8; 32]` per shard.
-pub fn parse_shard_cids(_data: &[u8]) -> Result<Vec<[u8; 32]>, EngramError> {
-    todo!()
+pub fn parse_shard_cids(data: &[u8]) -> Result<Vec<[u8; 32]>, EngramError> {
+    if data.len() % 32 != 0 {
+        return Err(EngramError::ManifestDeserialize);
+    }
+    let count = data.len() / 32;
+    let mut cids = Vec::with_capacity(count);
+    for chunk in data.chunks_exact(32) {
+        let mut cid = [0u8; 32];
+        cid.copy_from_slice(chunk);
+        cids.push(cid);
+    }
+    Ok(cids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn test_header() -> ManifestHeader {
+        ManifestHeader {
+            version: String::from("v1"),
+            embedding_dim: 160,
+            dtype_bytes: 2,
+            num_heads: 4,
+            hash_seeds: vec![111, 222, 333, 444],
+            total_entries: 10_000_000_000,
+            shard_size: 200,
+            num_shards: 50_000_000,
+        }
+    }
+
+    #[test]
+    fn header_round_trip() {
+        let header = test_header();
+        let bytes = header.to_bytes().unwrap();
+        let decoded = ManifestHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(header, decoded);
+    }
+
+    #[test]
+    fn header_to_config() {
+        let header = test_header();
+        let config = header.to_config();
+        assert_eq!(config.version, "v1");
+        assert_eq!(config.embedding_dim, 160);
+        assert_eq!(config.dtype_bytes, 2);
+        assert_eq!(config.num_heads, 4);
+        assert_eq!(config.shard_size, 200);
+        assert_eq!(config.num_shards, 50_000_000);
+        assert_eq!(config.total_entries, 10_000_000_000);
+        assert_eq!(config.hash_seeds, vec![111, 222, 333, 444]);
+    }
+
+    #[test]
+    fn parse_shard_cids_basic() {
+        // 2 CIDs, each 32 bytes.
+        let mut data = vec![0u8; 64];
+        data[0] = 0xAA;
+        data[32] = 0xBB;
+        let cids = parse_shard_cids(&data).unwrap();
+        assert_eq!(cids.len(), 2);
+        assert_eq!(cids[0][0], 0xAA);
+        assert_eq!(cids[1][0], 0xBB);
+    }
+
+    #[test]
+    fn parse_shard_cids_empty() {
+        let cids = parse_shard_cids(&[]).unwrap();
+        assert!(cids.is_empty());
+    }
+
+    #[test]
+    fn parse_shard_cids_not_aligned() {
+        // 33 bytes — not a multiple of 32.
+        let data = vec![0u8; 33];
+        let err = parse_shard_cids(&data).unwrap_err();
+        assert!(matches!(err, EngramError::ManifestDeserialize));
+    }
+
+    #[test]
+    fn invalid_bytes_returns_error() {
+        let err = ManifestHeader::from_bytes(&[0xFF, 0xFF]).unwrap_err();
+        assert!(matches!(err, EngramError::ManifestDeserialize));
+    }
 }
