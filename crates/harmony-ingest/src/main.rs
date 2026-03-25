@@ -1,6 +1,7 @@
 mod config;
 mod journal;
 mod shard;
+mod storage;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
