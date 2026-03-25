@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+description = "Sans-I/O Engram embedding table lookup client"
 
 [features]
 default = []
@@ -13,4 +15,5 @@ std = []
 half = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
 xxhash-rust = { workspace = true }
