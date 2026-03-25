@@ -11,7 +11,7 @@ fn main() {
         std::fs::write(&wasm_path, wasm_bytes).expect("failed to write inference_runner.wasm");
     } else {
         // Write empty WASM for CI/test environments without WAT file
-        std::fs::write(&wasm_path, &[]).expect("failed to write empty inference_runner.wasm");
+        std::fs::write(&wasm_path, []).expect("failed to write empty inference_runner.wasm");
     }
 
     println!("cargo:rerun-if-changed=src/inference_runner.wat");

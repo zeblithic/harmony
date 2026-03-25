@@ -5445,4 +5445,110 @@ mod tests {
             assert_eq!(payload, &public_data, "invalid token → public record");
         }
     }
+
+    // ── Tier 3: Inference integration tests ─────────────────────────
+
+    #[test]
+    fn inference_query_no_model_returns_error() {
+        let (mut rt, _) = make_runtime();
+
+        // Build an inference query payload: [0x02] [prompt_len: u32 LE] [prompt_utf8]
+        let prompt = b"Hello";
+        let mut payload = vec![crate::inference::INFERENCE_TAG];
+        payload.extend_from_slice(&(prompt.len() as u32).to_le_bytes());
+        payload.extend_from_slice(prompt);
+
+        rt.push_event(RuntimeEvent::ComputeQuery {
+            query_id: 500,
+            key_expr: "harmony/compute/activity/inference".into(),
+            payload,
+        });
+
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 500, .. }));
+        assert!(
+            reply.is_some(),
+            "inference query without model should produce error reply"
+        );
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            assert_eq!(payload[0], 0x01, "error tag");
+            let msg = std::str::from_utf8(&payload[1..]).unwrap();
+            assert!(
+                msg.contains("no inference model loaded"),
+                "error message should mention no model, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn inference_startup_emits_fetch_for_model_cids() {
+        let mut config = NodeConfig::default();
+        config.inference_gguf_cid = Some([0xAA; 32]);
+        config.inference_tokenizer_cid = Some([0xBB; 32]);
+
+        let (_rt, actions) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        let fetch_cids: Vec<[u8; 32]> = actions
+            .iter()
+            .filter_map(|a| match a {
+                RuntimeAction::FetchContent { cid } => Some(*cid),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            fetch_cids.contains(&[0xAA; 32]),
+            "should fetch GGUF CID at startup"
+        );
+        assert!(
+            fetch_cids.contains(&[0xBB; 32]),
+            "should fetch tokenizer CID at startup"
+        );
+    }
+
+    #[test]
+    fn inference_startup_no_fetch_without_cids() {
+        let (_rt, actions) = make_runtime();
+
+        let fetch_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::FetchContent { .. }))
+            .count();
+
+        assert_eq!(
+            fetch_count, 0,
+            "default config should not emit FetchContent for inference"
+        );
+    }
+
+    #[test]
+    fn parse_compute_payload_inference() {
+        let (rt, _) = make_runtime();
+
+        let prompt = b"test prompt";
+        let mut payload = vec![crate::inference::INFERENCE_TAG];
+        payload.extend_from_slice(&(prompt.len() as u32).to_le_bytes());
+        payload.extend_from_slice(prompt);
+
+        let parsed = rt.parse_compute_payload(payload);
+        assert!(
+            matches!(parsed, Some(ParsedCompute::Inference { .. })),
+            "should parse inference payload"
+        );
+    }
+
+    #[test]
+    fn parse_compute_payload_inference_invalid() {
+        let (rt, _) = make_runtime();
+
+        // Tag 0x02 but too short for prompt length
+        let payload = vec![crate::inference::INFERENCE_TAG, 0xFF, 0, 0, 0];
+        let parsed = rt.parse_compute_payload(payload);
+        assert!(
+            parsed.is_none(),
+            "truncated inference payload should return None"
+        );
+    }
 }

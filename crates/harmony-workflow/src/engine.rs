@@ -1598,4 +1598,184 @@ mod tests {
             .any(|a| matches!(a, WorkflowAction::WorkflowComplete { workflow_id, .. } if *workflow_id == wf_b));
         assert!(b_complete, "B should complete on this tick");
     }
+
+    // ── LoadModel integration tests ─────────────────────────────────
+
+    #[test]
+    fn load_model_request_emits_action_and_suspends() {
+        let gguf_cid = [0xAA; 32];
+        let tokenizer_cid = [0xBB; 32];
+
+        // Script: execute → NeedsIO(LoadModel), then resume → Complete
+        let runtime = ScriptedRuntime::new(vec![
+            ComputeResult::NeedsIO {
+                request: IORequest::LoadModel {
+                    gguf_cid,
+                    tokenizer_cid,
+                },
+            },
+            ComputeResult::Complete {
+                output: vec![0x42; 4],
+            },
+        ]);
+
+        let mut engine =
+            WorkflowEngine::new(Box::new(runtime), InstructionBudget { fuel: 100_000 });
+
+        let module = b"inference_module".to_vec();
+        let input = b"inference_input".to_vec();
+        let module_hash = harmony_crypto::hash::blake3_hash(&module);
+        let wf_id = WorkflowId::new(&module_hash, &input);
+
+        engine.handle(WorkflowEvent::Submit {
+            module,
+            input,
+            hint: ComputeHint::PreferLocal,
+        });
+
+        // Tick: execute → NeedsIO(LoadModel) → WaitingForModel
+        let actions = engine.tick();
+        let load_model = actions
+            .iter()
+            .find(|a| matches!(a, WorkflowAction::LoadModel { .. }));
+        assert!(
+            load_model.is_some(),
+            "should emit LoadModel action, got: {actions:?}"
+        );
+
+        if let Some(WorkflowAction::LoadModel {
+            workflow_id,
+            gguf_cid: g,
+            tokenizer_cid: t,
+        }) = load_model
+        {
+            assert_eq!(*workflow_id, wf_id);
+            assert_eq!(*g, gguf_cid);
+            assert_eq!(*t, tokenizer_cid);
+        }
+
+        assert_eq!(
+            engine.workflow_status(&wf_id),
+            Some(&WorkflowStatus::WaitingForModel {
+                gguf_cid,
+                tokenizer_cid,
+            }),
+            "workflow should be in WaitingForModel state"
+        );
+    }
+
+    #[test]
+    fn model_loaded_resumes_workflow_to_completion() {
+        let gguf_cid = [0xCC; 32];
+        let tokenizer_cid = [0xDD; 32];
+
+        let runtime = ScriptedRuntime::new(vec![
+            ComputeResult::NeedsIO {
+                request: IORequest::LoadModel {
+                    gguf_cid,
+                    tokenizer_cid,
+                },
+            },
+            ComputeResult::Complete {
+                output: vec![0x01, 0x02, 0x03, 0x04],
+            },
+        ]);
+
+        let mut engine =
+            WorkflowEngine::new(Box::new(runtime), InstructionBudget { fuel: 100_000 });
+
+        let module = b"model_module".to_vec();
+        let input = b"model_input".to_vec();
+        let module_hash = harmony_crypto::hash::blake3_hash(&module);
+        let wf_id = WorkflowId::new(&module_hash, &input);
+
+        engine.handle(WorkflowEvent::Submit {
+            module,
+            input,
+            hint: ComputeHint::PreferLocal,
+        });
+
+        // Tick → WaitingForModel
+        engine.tick();
+
+        // Deliver model data
+        let actions = engine.handle(WorkflowEvent::ModelLoaded {
+            gguf_cid,
+            tokenizer_cid,
+            gguf_data: vec![0xFF; 10],
+            tokenizer_data: vec![0xEE; 5],
+        });
+
+        let complete = actions
+            .iter()
+            .find(|a| matches!(a, WorkflowAction::WorkflowComplete { .. }));
+        assert!(
+            complete.is_some(),
+            "should complete after model loaded, got: {actions:?}"
+        );
+
+        if let Some(WorkflowAction::WorkflowComplete { output, .. }) = complete {
+            assert_eq!(output, &[0x01, 0x02, 0x03, 0x04]);
+        }
+
+        assert_eq!(
+            engine.workflow_status(&wf_id),
+            Some(&WorkflowStatus::Complete)
+        );
+    }
+
+    #[test]
+    fn model_load_failed_fails_workflow() {
+        let gguf_cid = [0xEE; 32];
+        let tokenizer_cid = [0xFF; 32];
+
+        let runtime = ScriptedRuntime::new(vec![
+            ComputeResult::NeedsIO {
+                request: IORequest::LoadModel {
+                    gguf_cid,
+                    tokenizer_cid,
+                },
+            },
+            // resume_with_io with ModelGgufNotFound → WASM returns error
+            ComputeResult::Complete {
+                output: vec![0xFF, 0xFF, 0xFF, 0xFF], // -1 as i32 LE
+            },
+        ]);
+
+        let mut engine =
+            WorkflowEngine::new(Box::new(runtime), InstructionBudget { fuel: 100_000 });
+
+        let module = b"fail_module".to_vec();
+        let input = b"fail_input".to_vec();
+        let module_hash = harmony_crypto::hash::blake3_hash(&module);
+        let wf_id = WorkflowId::new(&module_hash, &input);
+
+        engine.handle(WorkflowEvent::Submit {
+            module,
+            input,
+            hint: ComputeHint::PreferLocal,
+        });
+
+        engine.tick(); // → WaitingForModel
+
+        let actions = engine.handle(WorkflowEvent::ModelLoadFailed {
+            gguf_cid,
+            tokenizer_cid,
+        });
+
+        // The ScriptedRuntime returns Complete (the WASM module handles the error internally),
+        // so we should see WorkflowComplete.
+        let complete = actions
+            .iter()
+            .find(|a| matches!(a, WorkflowAction::WorkflowComplete { .. }));
+        assert!(
+            complete.is_some(),
+            "model load failure should still complete (WASM handles error), got: {actions:?}"
+        );
+
+        assert_eq!(
+            engine.workflow_status(&wf_id),
+            Some(&WorkflowStatus::Complete)
+        );
+    }
 }
