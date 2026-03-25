@@ -50,6 +50,11 @@ impl MemoryBookStore {
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+
+    /// Consume the store and return all (CID, data) pairs.
+    pub fn into_books(self) -> impl Iterator<Item = (ContentId, Vec<u8>)> {
+        self.data.into_iter()
+    }
 }
 
 impl Default for MemoryBookStore {
