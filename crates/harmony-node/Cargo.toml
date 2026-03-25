@@ -13,6 +13,7 @@ wasmtime = ["harmony-compute/wasmtime"]
 no-neon = ["harmony-crypto/no-neon"]
 rawlink = ["harmony-rawlink"]
 archivist = ["harmony-s3/archivist"]
+inference = ["harmony-compute/inference", "harmony-workflow/inference"]
 
 [[bin]]
 name = "harmony"

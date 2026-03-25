@@ -66,6 +66,10 @@ pub struct NodeConfig {
     /// Used to verify Discovery UCAN tokens (which are issued by this node).
     /// Defaults to empty; must be set from the loaded identity at startup.
     pub local_dsa_pubkey: Vec<u8>,
+    /// Hex-decoded 32-byte CID of the GGUF model file in CAS (for inference).
+    pub inference_gguf_cid: Option<[u8; 32]>,
+    /// Hex-decoded 32-byte CID of the tokenizer.json file in CAS (for inference).
+    pub inference_tokenizer_cid: Option<[u8; 32]>,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -127,6 +131,8 @@ impl Default for NodeConfig {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            inference_gguf_cid: None,
+            inference_tokenizer_cid: None,
         }
     }
 }
@@ -615,6 +621,16 @@ pub struct NodeRuntime<B: BookStore> {
     // Parsed ML-DSA-65 verifying key for self-issued Discovery tokens.
     // Parsed once at construction; None if local_dsa_pubkey is empty/invalid.
     local_dsa_verifying_key: Option<harmony_crypto::ml_dsa::MlDsaPublicKey>,
+    /// Queryable ID for the inference service, if model is loaded.
+    inference_queryable_id: Option<QueryableId>,
+    /// GGUF model CID for inference runner input construction.
+    inference_model_cid: Option<[u8; 32]>,
+    /// Tokenizer CID for inference runner input construction.
+    inference_tokenizer_cid: Option<[u8; 32]>,
+    /// Whether the GGUF model data has been fetched from CAS.
+    inference_gguf_data: Option<Vec<u8>>,
+    /// Whether the tokenizer data has been fetched from CAS.
+    inference_tokenizer_data: Option<Vec<u8>>,
 }
 
 /// Adapts the runtime's pubkey_cache to the CredentialKeyResolver trait
@@ -795,7 +811,20 @@ impl<B: BookStore> NodeRuntime<B> {
                 &config.local_dsa_pubkey,
             )
             .ok(),
+            inference_queryable_id: None,
+            inference_model_cid: config.inference_gguf_cid,
+            inference_tokenizer_cid: config.inference_tokenizer_cid,
+            inference_gguf_data: None,
+            inference_tokenizer_data: None,
         };
+
+        // If inference model CIDs are configured, fetch both from CAS at startup.
+        if let Some(gguf_cid) = rt.inference_model_cid {
+            actions.push(RuntimeAction::FetchContent { cid: gguf_cid });
+        }
+        if let Some(tok_cid) = rt.inference_tokenizer_cid {
+            actions.push(RuntimeAction::FetchContent { cid: tok_cid });
+        }
 
         (rt, actions)
     }
@@ -1148,6 +1177,23 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
             }
             RuntimeEvent::ContentFetchResponse { cid, result } => {
+                // Check if this is inference model data arriving from startup fetch.
+                let mut is_inference_data = false;
+                if let Ok(ref data) = result {
+                    if Some(cid) == self.inference_model_cid && self.inference_gguf_data.is_none() {
+                        self.inference_gguf_data = Some(data.clone());
+                        is_inference_data = true;
+                    } else if Some(cid) == self.inference_tokenizer_cid
+                        && self.inference_tokenizer_data.is_none()
+                    {
+                        self.inference_tokenizer_data = Some(data.clone());
+                        is_inference_data = true;
+                    }
+                }
+                if is_inference_data {
+                    self.check_inference_model_ready();
+                }
+
                 let event = match result {
                     Ok(data) => WorkflowEvent::ContentFetched { cid, data },
                     Err(_) => WorkflowEvent::ContentFetchFailed { cid },
@@ -1972,6 +2018,34 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
                 Vec::new()
             }
+            ParsedCompute::Inference { request } => {
+                let (gguf_cid, tok_cid) =
+                    match (self.inference_model_cid, self.inference_tokenizer_cid) {
+                        (Some(g), Some(t)) => (g, t),
+                        _ => {
+                            let mut payload = vec![0x01];
+                            payload.extend_from_slice(b"no inference model loaded");
+                            self.pending_direct_actions
+                                .push(RuntimeAction::SendReply { query_id, payload });
+                            return Vec::new();
+                        }
+                    };
+
+                let input =
+                    crate::inference::build_runner_input(&gguf_cid, &tok_cid, &request);
+                let module = crate::inference::INFERENCE_RUNNER_WASM.to_vec();
+                let module_hash = harmony_crypto::hash::blake3_hash(&module);
+                let wf_id = WorkflowId::new(&module_hash, &input);
+                self.workflow_to_query
+                    .entry(wf_id)
+                    .or_default()
+                    .push(query_id);
+                self.workflow.handle(WorkflowEvent::Submit {
+                    module,
+                    input,
+                    hint: ComputeHint::PreferLocal,
+                })
+            }
         }
     }
 
@@ -2022,11 +2096,35 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
                 WorkflowAction::LoadModel {
                     workflow_id: _workflow_id,
-                    gguf_cid: _gguf_cid,
-                    tokenizer_cid: _tokenizer_cid,
+                    gguf_cid,
+                    tokenizer_cid,
                 } => {
-                    // TODO: Fetch model GGUF and tokenizer data from CAS and
-                    // deliver via WorkflowEvent::ModelLoaded / ModelLoadFailed.
+                    // Check if we have the model data cached from startup fetch.
+                    if let (Some(gguf_data), Some(tok_data)) =
+                        (&self.inference_gguf_data, &self.inference_tokenizer_data)
+                    {
+                        if Some(gguf_cid) == self.inference_model_cid
+                            && Some(tokenizer_cid) == self.inference_tokenizer_cid
+                        {
+                            // Model data available — feed it back to the workflow engine.
+                            let model_event = WorkflowEvent::ModelLoaded {
+                                gguf_cid,
+                                tokenizer_cid,
+                                gguf_data: gguf_data.clone(),
+                                tokenizer_data: tok_data.clone(),
+                            };
+                            let new_actions = self.workflow.handle(model_event);
+                            self.dispatch_workflow_actions(new_actions, out);
+                            continue;
+                        }
+                    }
+                    // Model not available — fail the workflow.
+                    let fail_event = WorkflowEvent::ModelLoadFailed {
+                        gguf_cid,
+                        tokenizer_cid,
+                    };
+                    let new_actions = self.workflow.handle(fail_event);
+                    self.dispatch_workflow_actions(new_actions, out);
                 }
                 WorkflowAction::PersistHistory {
                     workflow_id: _workflow_id,
@@ -2039,6 +2137,45 @@ impl<B: BookStore> NodeRuntime<B> {
                     // Compaction is intentionally deferred until persistence is
                     // implemented. Until then, workflows retain their full
                     // in-memory state at the cost of higher memory usage.
+                }
+            }
+        }
+    }
+
+    /// Check if both GGUF and tokenizer data have arrived, and if so,
+    /// declare the inference queryable and publish capacity.
+    fn check_inference_model_ready(&mut self) {
+        if self.inference_queryable_id.is_some() {
+            return; // Already declared
+        }
+        if self.inference_gguf_data.is_some() && self.inference_tokenizer_data.is_some() {
+            // Both pieces arrived — declare the inference queryable.
+            let key_expr = harmony_zenoh::namespace::compute::INFERENCE_ACTIVITY;
+            match self.queryable_router.declare(key_expr) {
+                Ok((qid, actions)) => {
+                    self.inference_queryable_id = Some(qid);
+                    self.compute_queryable_ids.insert(qid);
+                    for action in actions {
+                        if let QueryableAction::SendQueryableDeclare { key_expr } = action {
+                            self.pending_direct_actions
+                                .push(RuntimeAction::DeclareQueryable { key_expr });
+                        }
+                    }
+                    // Publish capacity advertisement.
+                    if let Some(model_cid) = &self.inference_model_cid {
+                        let payload =
+                            crate::inference::build_capacity_payload(model_cid, true);
+                        let cap_key =
+                            harmony_zenoh::namespace::compute::capacity_key(&self.node_addr);
+                        self.pending_direct_actions.push(RuntimeAction::Publish {
+                            key_expr: cap_key,
+                            payload,
+                        });
+                    }
+                    tracing::info!("inference queryable declared on {}", key_expr);
+                }
+                Err(e) => {
+                    tracing::error!("failed to declare inference queryable: {e}");
                 }
             }
         }
@@ -2075,6 +2212,11 @@ impl<B: BookStore> NodeRuntime<B> {
                     input,
                 })
             }
+            // Inference: [0x02] [prompt_len: u32 LE] [prompt_utf8] [sampling_params: 20 bytes (optional)]
+            0x02 => match crate::inference::InferenceRequest::parse(&payload) {
+                Ok(request) => Some(ParsedCompute::Inference { request }),
+                Err(_) => None,
+            },
             _ => None,
         }
     }
@@ -2669,6 +2811,9 @@ enum ParsedCompute {
     ByCid {
         module_cid: [u8; 32],
         input: Vec<u8>,
+    },
+    Inference {
+        request: crate::inference::InferenceRequest,
     },
 }
 
@@ -3564,6 +3709,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            inference_gguf_cid: None,
+            inference_tokenizer_cid: None,
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
@@ -3632,6 +3779,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            inference_gguf_cid: None,
+            inference_tokenizer_cid: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3666,6 +3815,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            inference_gguf_cid: None,
+            inference_tokenizer_cid: None,
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
@@ -3697,6 +3848,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            inference_gguf_cid: None,
+            inference_tokenizer_cid: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3757,6 +3910,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            inference_gguf_cid: None,
+            inference_tokenizer_cid: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3806,6 +3961,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            inference_gguf_cid: None,
+            inference_tokenizer_cid: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -3848,6 +4005,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            inference_gguf_cid: None,
+            inference_tokenizer_cid: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4748,6 +4907,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            inference_gguf_cid: None,
+            inference_tokenizer_cid: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
