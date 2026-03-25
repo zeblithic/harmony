@@ -375,7 +375,7 @@ impl ComputeRuntime for WasmiRuntime {
                         let token_bytes: Vec<u8> =
                             tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
 
-                        if token_bytes.len() > out_cap as usize {
+                        if out_cap < 0 || token_bytes.len() > out_cap as usize {
                             return Ok(-2);
                         }
 
@@ -433,7 +433,7 @@ impl ComputeRuntime for WasmiRuntime {
                             }
                         };
 
-                        if text.len() > out_cap as usize {
+                        if out_cap < 0 || text.len() > out_cap as usize {
                             return Ok(-2);
                         }
 
