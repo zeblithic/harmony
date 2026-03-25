@@ -1,4 +1,5 @@
 mod config;
+mod journal;
 mod shard;
 
 use clap::{Parser, Subcommand};
