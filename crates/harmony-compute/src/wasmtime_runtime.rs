@@ -41,9 +41,10 @@ struct HostState {
     /// Keyed by CID pair so a second `model_load` with different CIDs traps correctly.
     #[cfg(feature = "inference")]
     model_cache: Option<ModelCache>,
-    /// Cached model-not-found error code for replay (-1 or -2).
+    /// Cached model-not-found: (gguf_cid, tokenizer_cid, error_code).
+    /// Keyed by CID pair so a fallback model_load with different CIDs traps correctly.
     #[cfg(feature = "inference")]
-    model_not_found: Option<i32>,
+    model_not_found: Option<([u8; 32], [u8; 32], i32)>,
 }
 
 impl HostState {
@@ -87,7 +88,7 @@ impl HostState {
         io_cache: HashMap<[u8; 32], Vec<u8>>,
         not_found_cids: HashSet<[u8; 32]>,
         model_cache: Option<ModelCache>,
-        model_not_found: Option<i32>,
+        model_not_found: Option<([u8; 32], [u8; 32], i32)>,
     ) -> Self {
         Self {
             io_cache,
@@ -130,9 +131,10 @@ struct WasmtimeSession {
     /// Cached model data for replay: (gguf_cid, tokenizer_cid, gguf_bytes, tokenizer_bytes).
     #[cfg(feature = "inference")]
     model_cache: Option<ModelCache>,
-    /// Cached model-not-found error code for replay (-1 or -2).
+    /// Cached model-not-found: (gguf_cid, tokenizer_cid, error_code).
+    /// Keyed by CID pair so a fallback model_load with different CIDs traps correctly.
     #[cfg(feature = "inference")]
-    model_not_found: Option<i32>,
+    model_not_found: Option<([u8; 32], [u8; 32], i32)>,
     /// CIDs of a pending model load request, if any. Replaces a simple bool
     /// so we can key the model cache on the exact CID pair.
     #[cfg(feature = "inference")]
@@ -288,9 +290,12 @@ impl WasmtimeRuntime {
                                 wasmtime::Error::msg(format!("read tokenizer CID: {e}"))
                             })?;
 
-                        // Check cached model_not_found first (replay path).
-                        if let Some(code) = caller.data().model_not_found {
-                            return Ok(code);
+                        // Check cached model_not_found first (replay path) — only
+                        // if CIDs match, so a fallback model_load traps correctly.
+                        if let Some((nf_gguf, nf_tok, code)) = &caller.data().model_not_found {
+                            if *nf_gguf == gguf_cid && *nf_tok == tokenizer_cid {
+                                return Ok(*code);
+                            }
                         }
 
                         // Check cached model data (replay path) — only use if CIDs match.
@@ -856,10 +861,10 @@ impl ComputeRuntime for WasmtimeRuntime {
                             Some((gguf_cid, tokenizer_cid, gguf_data, tokenizer_data));
                     }
                     crate::types::IOResponse::ModelGgufNotFound => {
-                        session.model_not_found = Some(-1);
+                        session.model_not_found = Some((gguf_cid, tokenizer_cid, -1));
                     }
                     crate::types::IOResponse::ModelTokenizerNotFound => {
-                        session.model_not_found = Some(-2);
+                        session.model_not_found = Some((gguf_cid, tokenizer_cid, -2));
                     }
                     _ => {
                         self.session = Some(session);
