@@ -2020,6 +2020,14 @@ impl<B: BookStore> NodeRuntime<B> {
                 WorkflowAction::FetchModule { cid } => {
                     out.push(RuntimeAction::FetchModule { cid });
                 }
+                WorkflowAction::LoadModel {
+                    workflow_id: _workflow_id,
+                    gguf_cid: _gguf_cid,
+                    tokenizer_cid: _tokenizer_cid,
+                } => {
+                    // TODO: Fetch model GGUF and tokenizer data from CAS and
+                    // deliver via WorkflowEvent::ModelLoaded / ModelLoadFailed.
+                }
                 WorkflowAction::PersistHistory {
                     workflow_id: _workflow_id,
                 } => {
