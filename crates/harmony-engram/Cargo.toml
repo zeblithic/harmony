@@ -9,7 +9,7 @@ description = "Sans-I/O Engram embedding table lookup client"
 
 [features]
 default = []
-std = []
+std = ["thiserror/std"]
 
 [dependencies]
 half = { workspace = true }

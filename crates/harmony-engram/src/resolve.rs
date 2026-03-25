@@ -35,7 +35,18 @@ pub fn aggregate(
     let mut acc = vec![0.0f32; dim];
 
     for (i, (shard, &offset)) in shard_data.iter().zip(&lookup.entry_offsets).enumerate() {
-        if offset + vector_bytes > shard.len() {
+        let end = match offset.checked_add(vector_bytes) {
+            Some(end) => end,
+            None => {
+                return Err(EngramError::ShardTooShort {
+                    shard_index: lookup.shard_indices[i],
+                    offset,
+                    vector_bytes,
+                    shard_len: shard.len(),
+                });
+            }
+        };
+        if end > shard.len() {
             return Err(EngramError::ShardTooShort {
                 shard_index: lookup.shard_indices[i],
                 offset,
@@ -44,7 +55,7 @@ pub fn aggregate(
             });
         }
 
-        let slice = &shard[offset..offset + vector_bytes];
+        let slice = &shard[offset..end];
         for (j, chunk) in slice.chunks_exact(2).enumerate() {
             let val = f16::from_le_bytes([chunk[0], chunk[1]]);
             acc[j] += val.to_f32();
