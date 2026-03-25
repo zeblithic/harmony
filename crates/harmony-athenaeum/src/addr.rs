@@ -112,6 +112,7 @@ impl Algorithm {
 ///
 /// Layout: `[algo:2][hash_bits:28][checksum:2]`
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PageAddr(pub(crate) u32);
 
 impl PageAddr {

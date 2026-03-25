@@ -15,6 +15,7 @@ use crate::encrypted::{EncryptedBookMetadata, ENCRYPTED_SENTINEL};
 
 /// Classifies how a Book's pages are structured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BookType {
     /// No embedded metadata. All pages are data.
     Raw,
@@ -48,6 +49,7 @@ pub enum BookError {
 /// `[PageAddr; ALGO_COUNT]` in Algorithm selector order:
 /// `[Sha256Msb, Sha256Lsb, Sha224Msb, Sha224Lsb]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Book {
     /// Full 32-byte ContentId, stored as opaque bytes.
     ///
