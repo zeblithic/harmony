@@ -120,11 +120,10 @@ async fn run_engram(
 
     // Stage 3: Shard and upload.
     let journal_path = input.with_extension("journal");
-    let mut journal = journal::CidJournal::open(&journal_path)?;
 
-    // Handle resume.
+    // Handle resume: open() appends to existing journal, create() truncates it.
     let start_shard = resume_from.unwrap_or(0);
-    let mut shard_cids: Vec<[u8; 32]> = if start_shard > 0 {
+    let (mut journal, mut shard_cids) = if start_shard > 0 {
         let existing = journal::CidJournal::read_all(&journal_path)?;
         if existing.len() as u64 != start_shard {
             return Err(format!(
@@ -133,9 +132,11 @@ async fn run_engram(
             ));
         }
         tracing::info!(start_shard, "resuming from journal");
-        existing
+        let j = journal::CidJournal::open(&journal_path)?;
+        (j, existing)
     } else {
-        Vec::with_capacity(n_shards as usize)
+        let j = journal::CidJournal::create(&journal_path)?;
+        (j, Vec::with_capacity(n_shards as usize))
     };
 
     for i in start_shard..n_shards {

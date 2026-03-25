@@ -16,7 +16,27 @@ pub struct CidJournal {
 }
 
 impl CidJournal {
-    /// Create or open a journal file.  Truncates any partial last entry.
+    /// Create a fresh journal, truncating any existing file.
+    ///
+    /// Use this for fresh runs (not resuming). Any prior journal content
+    /// is discarded.
+    pub fn create(path: &Path) -> Result<Self, String> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| format!("journal create: {e}"))?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+
+    /// Open an existing journal for appending.  Truncates any partial last entry.
+    ///
+    /// Use this when resuming (`--resume-from`). Preserves existing entries.
     pub fn open(path: &Path) -> Result<Self, String> {
         if path.exists() {
             let len = std::fs::metadata(path)

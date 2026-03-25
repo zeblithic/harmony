@@ -81,13 +81,14 @@ fn end_to_end_local_dir() {
     assert!(status.success(), "harmony-ingest failed");
 
     // Verify shard files exist with correct content.
+    // Prefix uses hash bytes (hex[8..10]), not header bytes (always "00").
     let hex0 = hex::encode(cid0.to_bytes());
-    let path0 = local_dir.join("book").join(&hex0[..2]).join(&hex0);
+    let path0 = local_dir.join("book").join(&hex0[8..10]).join(&hex0);
     assert!(path0.exists(), "shard 0 not found at {}", path0.display());
     assert_eq!(std::fs::read(&path0).unwrap(), shard0_data);
 
     let hex1 = hex::encode(cid1.to_bytes());
-    let path1 = local_dir.join("book").join(&hex1[..2]).join(&hex1);
+    let path1 = local_dir.join("book").join(&hex1[8..10]).join(&hex1);
     assert!(path1.exists(), "shard 1 not found at {}", path1.display());
     assert_eq!(std::fs::read(&path1).unwrap(), shard1_data);
 

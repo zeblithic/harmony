@@ -8,10 +8,15 @@ use std::path::{Path, PathBuf};
 
 /// Write a book to the local directory with two-level hex prefix.
 ///
-/// Layout: `{base}/book/{hex[0..2]}/{hex_cid}`
+/// Layout: `{base}/book/{hash_prefix}/{hex_cid}`
+///
+/// The prefix is derived from the first byte of the hash portion (bytes 4-5
+/// of the CID hex), not the header bytes (which are nearly always `00` for
+/// default-flagged books).  This gives 256-way directory fan-out.
 pub fn write_local_book(base: &Path, cid: &ContentId, data: &[u8]) -> Result<(), String> {
     let hex_cid = hex::encode(cid.to_bytes());
-    let prefix_dir = base.join("book").join(&hex_cid[..2]);
+    // Skip the 4-byte header (8 hex chars) and use the first byte of the hash.
+    let prefix_dir = base.join("book").join(&hex_cid[8..10]);
     std::fs::create_dir_all(&prefix_dir)
         .map_err(|e| format!("create dir {}: {e}", prefix_dir.display()))?;
     let file_path = prefix_dir.join(&hex_cid);
@@ -23,7 +28,8 @@ pub fn write_local_book(base: &Path, cid: &ContentId, data: &[u8]) -> Result<(),
 #[allow(dead_code)] // used by storage tests
 pub fn local_book_path(base: &Path, cid: &ContentId) -> PathBuf {
     let hex_cid = hex::encode(cid.to_bytes());
-    base.join("book").join(&hex_cid[..2]).join(&hex_cid)
+    // Skip the 4-byte header (8 hex chars) and use the first byte of the hash.
+    base.join("book").join(&hex_cid[8..10]).join(&hex_cid)
 }
 
 /// Upload a book to S3 with retry (exponential backoff).
@@ -43,13 +49,15 @@ pub async fn upload_s3_book(
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = format!("{e}");
-                tracing::warn!(
-                    attempt = attempt + 1,
-                    delay_secs,
-                    err = %e,
-                    "S3 upload failed, retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(*delay_secs)).await;
+                if attempt + 1 < delays.len() {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        delay_secs,
+                        err = %e,
+                        "S3 upload failed, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(*delay_secs)).await;
+                }
             }
         }
     }
@@ -67,12 +75,15 @@ mod tests {
     }
 
     #[test]
-    fn local_book_path_two_level_prefix() {
+    fn local_book_path_uses_hash_prefix() {
         let cid = make_cid(b"test data");
         let path = local_book_path(Path::new("/mnt/usb"), &cid);
         let hex_cid = hex::encode(cid.to_bytes());
-        let expected = format!("/mnt/usb/book/{}/{}", &hex_cid[..2], hex_cid);
+        // Prefix is from hash portion (bytes 4-5 of hex), not header (always "00").
+        let expected = format!("/mnt/usb/book/{}/{}", &hex_cid[8..10], hex_cid);
         assert_eq!(path.to_str().unwrap(), expected);
+        // Verify prefix is NOT "00" — hash bytes should be well-distributed.
+        assert_ne!(&hex_cid[8..10], "00");
     }
 
     #[test]
