@@ -1,4 +1,5 @@
 mod config;
+mod shard;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
