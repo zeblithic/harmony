@@ -3067,7 +3067,9 @@ dependencies = [
 name = "harmony-compute"
 version = "0.1.0"
 dependencies = [
+ "candle-core",
  "harmony-crypto",
+ "harmony-inference",
  "thiserror 2.0.18",
  "wasmi",
  "wasmtime",
