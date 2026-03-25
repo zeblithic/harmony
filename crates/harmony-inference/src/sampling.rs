@@ -40,9 +40,10 @@ pub fn apply_top_k(logits: &mut [f32], k: u32) {
 /// Apply nucleus (top-p) filtering: sort by probability, keep tokens whose
 /// cumulative probability mass ≤ `top_p`, set the rest to `-inf`.
 ///
-/// If `top_p >= 1.0`, this is a no-op.
+/// `top_p` must be in `(0.0, 1.0)` to have an effect.
+/// Values `>= 1.0` or `<= 0.0` are no-ops.
 pub fn apply_top_p(logits: &mut [f32], top_p: f32) {
-    if top_p >= 1.0 {
+    if top_p >= 1.0 || top_p <= 0.0 {
         return;
     }
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -70,18 +71,23 @@ pub fn apply_top_p(logits: &mut [f32], top_p: f32) {
     }
 }
 
-/// Apply repeat penalty for tokens seen in context.
+/// Apply repeat penalty for unique tokens seen in context.
 ///
-/// For each token in `context_tokens`:
+/// For each *unique* token in `context_tokens`:
 /// - If its logit is positive, divide by `penalty`
 /// - If its logit is negative, multiply by `penalty`
 ///
-/// This reduces the probability of recently seen tokens.
+/// Tokens appearing multiple times in context are penalized only once,
+/// matching the standard llama.cpp / HF transformers behavior.
 pub fn apply_repeat_penalty(logits: &mut [f32], penalty: f32, context_tokens: &[u32]) {
     if penalty == 1.0 {
         return;
     }
+    let mut seen = std::collections::HashSet::new();
     for &token in context_tokens {
+        if !seen.insert(token) {
+            continue;
+        }
         if let Some(logit) = logits.get_mut(token as usize) {
             if *logit > 0.0 {
                 *logit /= penalty;
@@ -94,8 +100,9 @@ pub fn apply_repeat_penalty(logits: &mut [f32], penalty: f32, context_tokens: &[
 
 /// Sample a token from logits using the full pipeline.
 ///
-/// Order: temperature → repeat penalty → top-k → top-p → weighted random.
-/// If `temperature == 0.0`, returns greedy (argmax) immediately.
+/// Order: repeat penalty → temperature → top-k → top-p → weighted random.
+/// If `temperature == 0.0` (greedy), repeat penalty is still applied before
+/// argmax to avoid repetitive output.
 pub fn sample(
     logits: &[f32],
     params: &crate::SamplingParams,
@@ -105,14 +112,18 @@ pub fn sample(
     if logits.is_empty() {
         return Err(InferenceError::SamplingFailed("empty logits".into()));
     }
-    if params.temperature == 0.0 {
-        return sample_greedy(logits);
-    }
 
     let mut logits = logits.to_vec();
 
-    apply_temperature(&mut logits, params.temperature);
+    // Repeat penalty is always applied — even in greedy mode — to prevent
+    // repetitive output. This matches llama.cpp and HF transformers behavior.
     apply_repeat_penalty(&mut logits, params.repeat_penalty, context_tokens);
+
+    if params.temperature == 0.0 {
+        return sample_greedy(&logits);
+    }
+
+    apply_temperature(&mut logits, params.temperature);
     apply_top_k(&mut logits, params.top_k);
     apply_top_p(&mut logits, params.top_p);
 
@@ -276,6 +287,37 @@ mod tests {
         let original = logits;
         apply_repeat_penalty(&mut logits, 2.0, &[99]);
         assert_eq!(logits, original);
+    }
+
+    #[test]
+    fn test_repeat_penalty_deduplicates_context() {
+        // Token 1 appears 3 times — penalty should apply only once
+        let mut logits = [1.0_f32, 8.0, 2.0];
+        apply_repeat_penalty(&mut logits, 2.0, &[1, 1, 1]);
+        assert_eq!(logits[1], 4.0); // 8.0 / 2.0 (once, not 8.0 / 8.0)
+    }
+
+    #[test]
+    fn test_top_p_zero_is_noop() {
+        let mut logits = [1.0_f32, 2.0, 3.0];
+        let original = logits;
+        apply_top_p(&mut logits, 0.0);
+        assert_eq!(logits, original);
+    }
+
+    #[test]
+    fn test_sample_greedy_applies_repeat_penalty() {
+        // Without repeat penalty, token 1 (logit=5.0) wins.
+        // With repeat penalty=10.0 on token 1, logit becomes 0.5, so token 2 (3.0) wins.
+        let logits = [1.0_f32, 5.0, 3.0];
+        let params = crate::SamplingParams {
+            temperature: 0.0,
+            repeat_penalty: 10.0,
+            ..crate::SamplingParams::greedy()
+        };
+        let mut rng = StdRng::seed_from_u64(42);
+        let result = sample(&logits, &params, &[1], &mut rng).unwrap();
+        assert_eq!(result, 2, "greedy should respect repeat penalty");
     }
 
     #[test]

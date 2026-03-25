@@ -106,12 +106,14 @@ impl InferenceEngine for QwenEngine {
         let logits = match logits.dims().len() {
             1 => logits,
             2 => {
-                // Normal path: [batch=1, vocab_size] — select the last row
-                let batch = logits
+                // Normal path: [rows, vocab_size] — take the last row's logits.
+                // candle's quantized_qwen3 returns [1, vocab_size]; if a future
+                // model returns [seq_len, vocab_size] this still picks the right row.
+                let rows = logits
                     .dim(0)
                     .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
                 logits
-                    .get(batch - 1)
+                    .get(rows - 1)
                     .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?
             }
             n => {
