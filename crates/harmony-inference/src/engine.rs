@@ -101,15 +101,10 @@ impl InferenceEngine for QwenEngine {
             .forward(&input, self.position)
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
 
-        // Track tokens for repeat penalty
-        self.token_history.extend_from_slice(tokens);
-        self.position += tokens.len();
-
-        // ModelWeights::forward squeezes the batch dimension and selects the
-        // last hidden state, so output is typically [vocab_size]. Handle both
-        // [vocab_size] and [batch, vocab_size] shapes for robustness.
+        // Candle's quantized_qwen3 outputs [batch, vocab_size] with batch=1.
+        // Handle both 1D (defensive fallback) and 2D shapes.
         let logits = match logits.dims().len() {
-            1 => logits, // Already [vocab_size]
+            1 => logits, // Defensive: [vocab_size]
             2 => {
                 // [batch, vocab_size] — select the last row
                 let batch = logits
@@ -126,9 +121,16 @@ impl InferenceEngine for QwenEngine {
             }
         };
 
-        logits
+        let result = logits
             .to_vec1::<f32>()
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
+            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+
+        // Only advance state after successful logits extraction, so a failure
+        // doesn't leave position/token_history out of sync with the KV cache.
+        self.token_history.extend_from_slice(tokens);
+        self.position += tokens.len();
+
+        Ok(result)
     }
 
     fn sample(&self, logits: &[f32], params: &SamplingParams) -> Result<u32, InferenceError> {
