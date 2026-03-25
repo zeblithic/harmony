@@ -20,11 +20,24 @@ pub fn aggregate(
     lookup: &EngramLookup,
     shard_data: &[&[u8]],
 ) -> Result<Vec<u8>, EngramError> {
+    // Only f16 (2 bytes per component) is currently supported.
+    if config.dtype_bytes != 2 {
+        return Err(EngramError::UnsupportedDtype {
+            dtype_bytes: config.dtype_bytes,
+        });
+    }
+
     let num_heads = lookup.shard_indices.len();
     if shard_data.len() != num_heads {
         return Err(EngramError::ShardCountMismatch {
             expected: num_heads,
             got: shard_data.len(),
+        });
+    }
+    if lookup.entry_offsets.len() != num_heads {
+        return Err(EngramError::ShardCountMismatch {
+            expected: num_heads,
+            got: lookup.entry_offsets.len(),
         });
     }
 
@@ -212,6 +225,50 @@ mod tests {
         };
         let err = aggregate(&config, &lookup, &[&shard[..]]).unwrap_err();
         assert!(matches!(err, EngramError::ShardTooShort { .. }));
+    }
+
+    #[test]
+    fn unsupported_dtype() {
+        // dtype_bytes != 2 must return UnsupportedDtype error.
+        let config = EngramConfig {
+            version: String::from("v1"),
+            embedding_dim: 4,
+            dtype_bytes: 4, // f32, not supported
+            num_heads: 1,
+            shard_size: 3,
+            num_shards: 1,
+            total_entries: 3,
+            hash_seeds: vec![0],
+        };
+        let shard = [0u8; 48]; // 3 * 4 * 4 = 48
+        let lookup = EngramLookup {
+            shard_indices: vec![0],
+            entry_offsets: vec![0],
+        };
+        let err = aggregate(&config, &lookup, &[&shard[..]]).unwrap_err();
+        assert!(matches!(
+            err,
+            EngramError::UnsupportedDtype { dtype_bytes: 4 }
+        ));
+    }
+
+    #[test]
+    fn entry_offsets_length_mismatch() {
+        // entry_offsets shorter than shard_indices must return error.
+        let config = test_config();
+        let shard = make_f16_bytes(&[1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let lookup = EngramLookup {
+            shard_indices: vec![0, 0],
+            entry_offsets: vec![0], // only 1, but 2 heads
+        };
+        let err = aggregate(&config, &lookup, &[&shard, &shard]).unwrap_err();
+        assert!(matches!(
+            err,
+            EngramError::ShardCountMismatch {
+                expected: 2,
+                got: 1
+            }
+        ));
     }
 
     #[test]

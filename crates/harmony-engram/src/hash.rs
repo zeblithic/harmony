@@ -13,6 +13,13 @@ use alloc::vec::Vec;
 /// 2. For each head seed: `table_index = xxhash64(bytes, seed) % total_entries`
 /// 3. `shard_index = table_index / shard_size`
 /// 4. `byte_offset = (table_index % shard_size) * vector_bytes`
+///
+/// # Panics
+///
+/// Panics if `config.total_entries == 0` or `config.shard_size == 0` (division
+/// by zero).  In debug builds these are caught by `debug_assert`; in release
+/// builds the modulo/division will panic.  Callers must ensure the config is
+/// constructed from a valid [`ManifestHeader`](crate::ManifestHeader).
 pub fn compute_lookup(config: &EngramConfig, ngram_tokens: &[u32]) -> EngramLookup {
     debug_assert!(config.total_entries > 0, "total_entries must be positive");
     debug_assert!(config.shard_size > 0, "shard_size must be positive");

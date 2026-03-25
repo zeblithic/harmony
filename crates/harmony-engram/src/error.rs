@@ -1,9 +1,6 @@
 /// Errors that can occur during Engram operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EngramError {
-    /// Shard index exceeds the manifest's shard count.
-    #[error("shard index {index} out of bounds (num_shards={num_shards})")]
-    ShardIndexOutOfBounds { index: u64, num_shards: u64 },
     /// The number of shard data slices doesn't match the lookup's head count.
     #[error("expected {expected} shard slices, got {got}")]
     ShardCountMismatch { expected: usize, got: usize },
@@ -21,4 +18,7 @@ pub enum EngramError {
     /// Manifest serialization failed.
     #[error("failed to serialize manifest header")]
     ManifestSerialize,
+    /// Unsupported dtype — only f16 (2 bytes) is currently supported.
+    #[error("unsupported dtype_bytes={dtype_bytes}, only 2 (f16) is supported")]
+    UnsupportedDtype { dtype_bytes: usize },
 }
