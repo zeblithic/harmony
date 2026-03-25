@@ -7,6 +7,7 @@ members = [
     "crates/harmony-contacts",
     "crates/harmony-credential",
     "crates/harmony-discovery",
+    "crates/harmony-engram",
     "crates/harmony-content",
     "crates/harmony-crypto",
     "crates/harmony-identity",
@@ -78,8 +79,10 @@ rmp = { version = "0.8", default-features = false }
 bitflags = { version = "2", default-features = false }
 bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
 hex = "0.4"
+half = { version = "2", default-features = false }
 libm = "0.2"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh64"] }
 ciborium = { version = "0.2", default-features = false }
 
 # WASM runtime
@@ -117,6 +120,7 @@ harmony-compute = { path = "crates/harmony-compute" }
 harmony-contacts = { path = "crates/harmony-contacts", default-features = false }
 harmony-credential = { path = "crates/harmony-credential", default-features = false }
 harmony-discovery = { path = "crates/harmony-discovery", default-features = false }
+harmony-engram = { path = "crates/harmony-engram", default-features = false }
 harmony-content = { path = "crates/harmony-content", default-features = false }
 harmony-crypto = { path = "crates/harmony-crypto", default-features = false }
 harmony-identity = { path = "crates/harmony-identity", default-features = false }

@@ -625,6 +625,42 @@ pub mod page {
     }
 }
 
+/// Engram conditional memory table key expressions.
+///
+/// Namespace: `harmony/engram/{version}/`
+///
+/// Engram tables are sharded embedding tables stored as CAS books.
+/// Nodes hosting shards declare queryables on `harmony/engram/{version}/shard/**`.
+/// Any node holding a cached shard can respond.
+pub mod engram {
+    use alloc::{format, string::String};
+
+    /// Base prefix: `harmony/engram`
+    pub const PREFIX: &str = "harmony/engram";
+
+    /// Subscribe to all engram traffic: `harmony/engram/**`
+    pub const SUB: &str = "harmony/engram/**";
+
+    // ── Builders ────────────────────────────────────────────────
+
+    /// Manifest key: `harmony/engram/{version}/manifest`
+    pub fn manifest_key(version: &str) -> String {
+        format!("{PREFIX}/{version}/manifest")
+    }
+
+    /// Individual shard key: `harmony/engram/{version}/shard/{index}`
+    pub fn shard_key(version: &str, index: u64) -> String {
+        format!("{PREFIX}/{version}/shard/{index}")
+    }
+
+    /// Shard queryable pattern: `harmony/engram/{version}/shard/**`
+    ///
+    /// Nodes hosting Engram shards register this pattern.
+    pub fn shard_queryable(version: &str) -> String {
+        format!("{PREFIX}/{version}/shard/**")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,10 +1001,7 @@ mod tests {
 
     #[test]
     fn discover_key() {
-        assert_eq!(
-            discover::key("aabbccdd"),
-            "harmony/discover/aabbccdd"
-        );
+        assert_eq!(discover::key("aabbccdd"), "harmony/discover/aabbccdd");
     }
 
     #[test]
@@ -1175,6 +1208,7 @@ mod tests {
             endorsement::PREFIX,
             memo::PREFIX,
             page::PREFIX,
+            engram::PREFIX,
         ];
         for prefix in prefixes {
             assert!(
@@ -1198,5 +1232,32 @@ mod tests {
             "fetch key shard should match a registered pattern"
         );
         assert!(key.starts_with(shard_prefix));
+    }
+
+    // ── Engram ───────────────────────────────────────────────────
+
+    #[test]
+    fn engram_manifest_key() {
+        assert_eq!(engram::manifest_key("v1"), "harmony/engram/v1/manifest");
+    }
+
+    #[test]
+    fn engram_shard_key() {
+        assert_eq!(engram::shard_key("v1", 42), "harmony/engram/v1/shard/42");
+    }
+
+    #[test]
+    fn engram_shard_key_zero() {
+        assert_eq!(engram::shard_key("v1", 0), "harmony/engram/v1/shard/0");
+    }
+
+    #[test]
+    fn engram_shard_queryable() {
+        assert_eq!(engram::shard_queryable("v1"), "harmony/engram/v1/shard/**");
+    }
+
+    #[test]
+    fn engram_subscription_pattern() {
+        assert_eq!(engram::SUB, "harmony/engram/**");
     }
 }
