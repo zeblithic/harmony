@@ -44,7 +44,7 @@ pub struct ManifestHeader {
 impl ManifestHeader {
     /// Serialize to postcard bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, EngramError> {
-        postcard::to_allocvec(self).map_err(|_| EngramError::ManifestDeserialize)
+        postcard::to_allocvec(self).map_err(|_| EngramError::ManifestSerialize)
     }
 
     /// Deserialize from postcard bytes.

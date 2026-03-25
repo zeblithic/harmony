@@ -18,4 +18,7 @@ pub enum EngramError {
     /// Manifest deserialization failed.
     #[error("failed to deserialize manifest header")]
     ManifestDeserialize,
+    /// Manifest serialization failed.
+    #[error("failed to serialize manifest header")]
+    ManifestSerialize,
 }
