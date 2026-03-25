@@ -17,7 +17,13 @@ pub fn sample_greedy(logits: &[f32]) -> Result<u32, InferenceError> {
 }
 
 /// Apply temperature scaling in place: `logits[i] /= temperature`.
+///
+/// Temperature must be > 0.0. Values <= 0.0 are treated as a no-op
+/// (use greedy sampling instead for deterministic decoding).
 pub fn apply_temperature(logits: &mut [f32], temperature: f32) {
+    if temperature <= 0.0 {
+        return;
+    }
     for l in logits.iter_mut() {
         *l /= temperature;
     }
