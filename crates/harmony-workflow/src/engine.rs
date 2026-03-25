@@ -509,7 +509,26 @@ impl WorkflowEngine {
                     ];
                 }
                 ComputeResult::NeedsIO { request } => {
-                    let IORequest::FetchContent { cid } = request;
+                    let cid = match request {
+                        IORequest::FetchContent { cid } => cid,
+                        IORequest::LoadModel { .. } => {
+                            // LoadModel IO is handled by the caller (NodeRuntime).
+                            // For now, treat it as a workflow failure since the
+                            // engine doesn't yet know how to resolve model loads.
+                            if let Some(state) = self.workflows.get_mut(&wf_id) {
+                                state.status = WorkflowStatus::Failed;
+                            }
+                            self.active = None;
+                            return vec![
+                                WorkflowAction::WorkflowFailed {
+                                    workflow_id: wf_id,
+                                    error: "LoadModel IO not yet supported by workflow engine"
+                                        .into(),
+                                },
+                                WorkflowAction::PersistHistory { workflow_id: wf_id },
+                            ];
+                        }
+                    };
 
                     if let Some(state) = self.workflows.get_mut(&wf_id) {
                         state.history.events.push(HistoryEvent::IoRequested { cid });

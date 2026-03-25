@@ -339,6 +339,14 @@ impl ComputeTier {
                         self.active = None;
                         vec![ComputeTierAction::FetchContent { query_id, cid }]
                     }
+                    harmony_compute::IORequest::LoadModel { .. } => {
+                        // LoadModel IO will be handled by the inference queryable
+                        // (Task 4). For now, report an error back to the caller.
+                        self.active = None;
+                        let mut payload = vec![0x01];
+                        payload.extend_from_slice(b"LoadModel IO not yet supported");
+                        vec![ComputeTierAction::SendReply { query_id, payload }]
+                    }
                 }
             }
         }

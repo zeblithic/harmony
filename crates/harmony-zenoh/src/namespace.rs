@@ -275,6 +275,9 @@ pub mod compute {
     /// Subscribe to all activity requests: `harmony/compute/activity/*`
     pub const ACTIVITY_SUB: &str = "harmony/compute/activity/*";
 
+    /// Key expression for inference queryable.
+    pub const INFERENCE_ACTIVITY: &str = "harmony/compute/activity/inference";
+
     /// Subscribe to all results: `harmony/compute/result/*`
     pub const RESULT_SUB: &str = "harmony/compute/result/*";
 

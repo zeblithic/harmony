@@ -4,6 +4,8 @@ mod did_web_gateway;
 mod discovery;
 mod event_loop;
 mod identity_file;
+#[allow(dead_code)]
+mod inference;
 // Page runtime integration is forward-looking.
 #[allow(dead_code)]
 mod page_index;
