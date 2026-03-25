@@ -75,12 +75,14 @@ The Engram table is a single shared flat table. Multiple hash heads index into d
 
 ### Stage 3: Shard and Upload
 
+Shard CIDs are computed standalone via `ContentId::for_book()` — not through a `BookStore`. The tool manages storage directly: `S3Library::put_book(cid_bytes, data)` takes pre-computed CID bytes and raw book data, and local file writes use the hex CID as the filename. No `BookStore` is involved in shard upload.
+
 For each shard index `i` in `0..num_shards`:
 
 1. Slice rows `[i * shard_size .. (i+1) * shard_size]` from the tensor → contiguous f16 bytes (typically 64KB)
-2. Compute `ContentId::for_book(&shard_bytes, ContentFlags::default())`
-3. If S3 configured: `s3.put_book(&cid_bytes, shard_bytes.to_vec()).await`
-4. If local dir configured: write to `{local-dir}/book/{hex[0..2]}/{hex_cid}` (two-level prefix for filesystem scalability)
+2. Compute `ContentId::for_book(&shard_bytes, ContentFlags::default())` to get the 32-byte CID
+3. If S3 configured: `s3.put_book(&cid.to_bytes(), shard_bytes.to_vec()).await`
+4. If local dir configured: write raw bytes to `{local-dir}/book/{hex[0..2]}/{hex_cid}`
 5. Append the 32-byte CID to the journal file
 6. Log progress every 10,000 shards
 
@@ -98,13 +100,17 @@ For each shard index `i` in `0..num_shards`:
 2. Serialize header via `ManifestHeader::to_bytes()` (postcard)
 3. Concatenate all shard CIDs as raw bytes: `num_shards × 32 bytes`
 4. Combine: `[header_bytes | shard_cid_bytes]`
-5. Ingest combined bytes into CAS via `dag::ingest()` → root ContentId
+5. Create a fresh `MemoryBookStore` and call `dag::ingest(&combined, &chunker_config, &mut store)` → root ContentId
 
-The `dag::ingest` function handles chunking the 1.6GB manifest into ~1MB books, building the Merkle DAG, and returning the root CID. All intermediate books are stored in the provided `BookStore`.
+The `dag::ingest` function chunks the 1.6GB manifest into ~1MB books, builds the Merkle DAG, and returns the root CID. All intermediate books (chunks + bundle nodes) are written into the provided `MemoryBookStore`.
 
 ### Stage 5: Upload Manifest DAG
 
-Iterate all books in the BookStore produced by `dag::ingest()`. Upload each to S3 and/or write to local dir. These are the manifest DAG chunks — typically ~1600 books for a 50M shard table.
+The `MemoryBookStore` used in Stage 4 holds all DAG books in its internal `HashMap<ContentId, Vec<u8>>`. The `data` field is currently private, so this pipeline requires adding a small `into_books(self) -> HashMap<ContentId, Vec<u8>>` consuming method to `MemoryBookStore` in harmony-content. This is a one-liner that does not change the `BookStore` trait.
+
+With `into_books()`, the ingestion tool iterates all (CID, data) pairs and uploads each to S3 and/or writes to local dir. These are the manifest DAG books — typically ~1600 for a 50M shard table.
+
+This is the only place in the pipeline that uses `BookStore` — it serves as a temporary collector for the DAG builder's output, not as persistent storage.
 
 ### Stage 6: Output
 
