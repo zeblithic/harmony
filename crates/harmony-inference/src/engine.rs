@@ -101,6 +101,13 @@ impl InferenceEngine for QwenEngine {
             .forward(&input, self.position)
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
 
+        // model.forward() mutates the KV cache as a side-effect, so position
+        // and token_history must advance immediately to stay in sync with it.
+        // If logits extraction below fails, the engine is in an indeterminate
+        // state — callers must call reset() before reusing after ForwardFailed.
+        self.token_history.extend_from_slice(tokens);
+        self.position += tokens.len();
+
         // Candle's quantized_qwen3 outputs [1, vocab_size] (2D with batch=1).
         // The 2D branch is the normal path; 1D is a defensive fallback.
         let logits = match logits.dims().len() {
@@ -123,16 +130,9 @@ impl InferenceEngine for QwenEngine {
             }
         };
 
-        let result = logits
+        logits
             .to_vec1::<f32>()
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
-
-        // Only advance state after successful logits extraction, so a failure
-        // doesn't leave position/token_history out of sync with the KV cache.
-        self.token_history.extend_from_slice(tokens);
-        self.position += tokens.len();
-
-        Ok(result)
+            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
     }
 
     fn sample(&self, logits: &[f32], params: &SamplingParams) -> Result<u32, InferenceError> {

@@ -80,6 +80,12 @@ pub trait InferenceEngine {
     ///
     /// Manages KV cache internally. First call = prefill, subsequent = decode.
     /// Advances the internal position counter by `tokens.len()`.
+    ///
+    /// # Error recovery
+    ///
+    /// If this method returns `ForwardFailed`, the KV cache may be in an
+    /// indeterminate state. Call [`reset()`](Self::reset) before reusing
+    /// the engine.
     fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, InferenceError>;
 
     /// Sample the next token from logits.
