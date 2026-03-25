@@ -22,6 +22,11 @@ pub struct Checkpoint {
 pub enum IORequest {
     /// Request to fetch content by CID.
     FetchContent { cid: [u8; 32] },
+    /// Request to load a model by GGUF CID and tokenizer CID.
+    LoadModel {
+        gguf_cid: [u8; 32],
+        tokenizer_cid: [u8; 32],
+    },
 }
 
 /// Response to an I/O request, provided by the caller after resolving externally.
@@ -31,6 +36,15 @@ pub enum IOResponse {
     ContentReady { data: Vec<u8> },
     /// Content was not found.
     ContentNotFound,
+    /// Model GGUF and tokenizer data are ready.
+    ModelReady {
+        gguf_data: Vec<u8>,
+        tokenizer_data: Vec<u8>,
+    },
+    /// Model GGUF data was not found.
+    ModelGgufNotFound,
+    /// Model tokenizer data was not found.
+    ModelTokenizerNotFound,
 }
 
 /// Result of executing a WASM computation slice.

@@ -11,6 +11,14 @@ struct HostState {
     io_request: Option<crate::types::IORequest>,
     /// Where to write the IO response data: (out_ptr, out_cap).
     io_write_target: Option<(u32, u32)>,
+    /// Loaded inference engine (only available with `inference` feature).
+    #[cfg(feature = "inference")]
+    inference_engine: Option<harmony_inference::QwenEngine>,
+    /// Logits from the most recent `forward()` call, read by `sample()`.
+    /// Persists until the next `forward()` or `model_reset()` — multiple
+    /// `sample()` calls from the same logits are allowed (e.g. beam search).
+    #[cfg(feature = "inference")]
+    last_logits: Option<Vec<f32>>,
 }
 
 impl HostState {
@@ -18,6 +26,10 @@ impl HostState {
         Self {
             io_request: None,
             io_write_target: None,
+            #[cfg(feature = "inference")]
+            inference_engine: None,
+            #[cfg(feature = "inference")]
+            last_logits: None,
         }
     }
 }
@@ -278,6 +290,309 @@ impl ComputeRuntime for WasmiRuntime {
                 },
             )
             .expect("failed to register harmony.fetch_content");
+
+        // ---- Inference host functions (feature-gated) ----
+        #[cfg(feature = "inference")]
+        {
+            use harmony_inference::InferenceEngine as _;
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "model_load",
+                    |mut caller: wasmi::Caller<'_, HostState>,
+                     gguf_cid_ptr: i32,
+                     tokenizer_cid_ptr: i32|
+                     -> Result<i32, wasmi::Error> {
+                        let memory = caller
+                            .get_export("memory")
+                            .and_then(wasmi::Extern::into_memory)
+                            .ok_or_else(|| wasmi::Error::new("missing exported memory"))?;
+
+                        let mut gguf_cid = [0u8; 32];
+                        memory
+                            .read(&caller, gguf_cid_ptr as usize, &mut gguf_cid)
+                            .map_err(|e| {
+                                wasmi::Error::new(format!("failed to read GGUF CID: {e}"))
+                            })?;
+
+                        let mut tokenizer_cid = [0u8; 32];
+                        memory
+                            .read(&caller, tokenizer_cid_ptr as usize, &mut tokenizer_cid)
+                            .map_err(|e| {
+                                wasmi::Error::new(format!("failed to read tokenizer CID: {e}"))
+                            })?;
+
+                        let data = caller.data_mut();
+                        data.io_request = Some(crate::types::IORequest::LoadModel {
+                            gguf_cid,
+                            tokenizer_cid,
+                        });
+                        // No io_write_target — model_load returns via host function return value
+
+                        Err(wasmi::Error::new("harmony_io_trap"))
+                    },
+                )
+                .expect("failed to register harmony.model_load");
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "tokenize",
+                    |mut caller: wasmi::Caller<'_, HostState>,
+                     text_ptr: i32,
+                     text_len: i32,
+                     out_ptr: i32,
+                     out_cap: i32|
+                     -> Result<i32, wasmi::Error> {
+                        let memory = caller
+                            .get_export("memory")
+                            .and_then(wasmi::Extern::into_memory)
+                            .ok_or_else(|| wasmi::Error::new("missing exported memory"))?;
+
+                        if text_len < 0 {
+                            return Ok(-3);
+                        }
+
+                        let engine = match &caller.data().inference_engine {
+                            Some(e) => e,
+                            None => return Ok(-1),
+                        };
+
+                        let mut text_buf = vec![0u8; text_len as usize];
+                        memory
+                            .read(&caller, text_ptr as usize, &mut text_buf)
+                            .map_err(|e| wasmi::Error::new(format!("failed to read text: {e}")))?;
+
+                        let text = std::str::from_utf8(&text_buf)
+                            .map_err(|e| wasmi::Error::new(format!("invalid UTF-8: {e}")))?;
+
+                        let tokens = match engine.tokenize(text) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                return Err(wasmi::Error::new(format!("tokenize failed: {e}")))
+                            }
+                        };
+
+                        let token_bytes: Vec<u8> =
+                            tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+
+                        if out_cap < 0 || token_bytes.len() > out_cap as usize {
+                            return Ok(-2);
+                        }
+
+                        memory
+                            .write(&mut caller, out_ptr as usize, &token_bytes)
+                            .map_err(|e| {
+                                wasmi::Error::new(format!("failed to write tokens: {e}"))
+                            })?;
+
+                        Ok(token_bytes.len() as i32)
+                    },
+                )
+                .expect("failed to register harmony.tokenize");
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "detokenize",
+                    |mut caller: wasmi::Caller<'_, HostState>,
+                     tokens_ptr: i32,
+                     tokens_len: i32,
+                     out_ptr: i32,
+                     out_cap: i32|
+                     -> Result<i32, wasmi::Error> {
+                        let memory = caller
+                            .get_export("memory")
+                            .and_then(wasmi::Extern::into_memory)
+                            .ok_or_else(|| wasmi::Error::new("missing exported memory"))?;
+
+                        if tokens_len < 0 || tokens_len % 4 != 0 {
+                            return Ok(-3);
+                        }
+
+                        let engine = match &caller.data().inference_engine {
+                            Some(e) => e,
+                            None => return Ok(-1),
+                        };
+
+                        let mut token_bytes = vec![0u8; tokens_len as usize];
+                        memory
+                            .read(&caller, tokens_ptr as usize, &mut token_bytes)
+                            .map_err(|e| {
+                                wasmi::Error::new(format!("failed to read tokens: {e}"))
+                            })?;
+
+                        let tokens: Vec<u32> = token_bytes
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+
+                        let text = match engine.detokenize(&tokens) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                return Err(wasmi::Error::new(format!("detokenize failed: {e}")))
+                            }
+                        };
+
+                        if out_cap < 0 || text.len() > out_cap as usize {
+                            return Ok(-2);
+                        }
+
+                        memory
+                            .write(&mut caller, out_ptr as usize, text.as_bytes())
+                            .map_err(|e| wasmi::Error::new(format!("failed to write text: {e}")))?;
+
+                        Ok(text.len() as i32)
+                    },
+                )
+                .expect("failed to register harmony.detokenize");
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "forward",
+                    |mut caller: wasmi::Caller<'_, HostState>,
+                     tokens_ptr: i32,
+                     tokens_len: i32|
+                     -> Result<i32, wasmi::Error> {
+                        let memory = caller
+                            .get_export("memory")
+                            .and_then(wasmi::Extern::into_memory)
+                            .ok_or_else(|| wasmi::Error::new("missing exported memory"))?;
+
+                        if tokens_len <= 0 || tokens_len % 4 != 0 {
+                            return Ok(-3);
+                        }
+
+                        let mut token_bytes = vec![0u8; tokens_len as usize];
+                        memory
+                            .read(&caller, tokens_ptr as usize, &mut token_bytes)
+                            .map_err(|e| {
+                                wasmi::Error::new(format!("failed to read tokens: {e}"))
+                            })?;
+
+                        let tokens: Vec<u32> = token_bytes
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+
+                        let engine = match caller.data_mut().inference_engine.as_mut() {
+                            Some(e) => e,
+                            None => return Ok(-1),
+                        };
+
+                        let logits = match engine.forward(&tokens) {
+                            Ok(l) => l,
+                            Err(_) => return Ok(-2),
+                        };
+
+                        caller.data_mut().last_logits = Some(logits);
+                        Ok(0)
+                    },
+                )
+                .expect("failed to register harmony.forward");
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "sample",
+                    |caller: wasmi::Caller<'_, HostState>,
+                     params_ptr: i32,
+                     params_len: i32|
+                     -> Result<i32, wasmi::Error> {
+                        let memory = caller
+                            .get_export("memory")
+                            .and_then(wasmi::Extern::into_memory)
+                            .ok_or_else(|| wasmi::Error::new("missing exported memory"))?;
+
+                        if params_len != 20 {
+                            return Ok(-2);
+                        }
+
+                        if caller.data().inference_engine.is_none() {
+                            return Ok(-1);
+                        }
+
+                        let mut param_bytes = [0u8; 20];
+                        memory
+                            .read(&caller, params_ptr as usize, &mut param_bytes)
+                            .map_err(|e| {
+                                wasmi::Error::new(format!("failed to read params: {e}"))
+                            })?;
+
+                        let params = harmony_inference::SamplingParams {
+                            temperature: f32::from_le_bytes([
+                                param_bytes[0],
+                                param_bytes[1],
+                                param_bytes[2],
+                                param_bytes[3],
+                            ]),
+                            top_p: f32::from_le_bytes([
+                                param_bytes[4],
+                                param_bytes[5],
+                                param_bytes[6],
+                                param_bytes[7],
+                            ]),
+                            top_k: u32::from_le_bytes([
+                                param_bytes[8],
+                                param_bytes[9],
+                                param_bytes[10],
+                                param_bytes[11],
+                            ]),
+                            repeat_penalty: f32::from_le_bytes([
+                                param_bytes[12],
+                                param_bytes[13],
+                                param_bytes[14],
+                                param_bytes[15],
+                            ]),
+                            repeat_last_n: u32::from_le_bytes([
+                                param_bytes[16],
+                                param_bytes[17],
+                                param_bytes[18],
+                                param_bytes[19],
+                            ]) as usize,
+                        };
+
+                        // Clone logits to avoid simultaneous borrows of caller.data()
+                        let logits = match caller.data().last_logits.as_deref() {
+                            Some(l) => l.to_vec(),
+                            None => return Ok(-3), // no logits from prior forward()
+                        };
+
+                        let engine = caller.data().inference_engine.as_ref().unwrap();
+                        match engine.sample(&logits, &params) {
+                            Ok(token_id) => {
+                                let id = token_id as i32;
+                                if id < 0 {
+                                    return Err(wasmi::Error::new(format!(
+                                        "token_id {token_id} overflows i32"
+                                    )));
+                                }
+                                Ok(id)
+                            }
+                            Err(_) => Ok(-2),
+                        }
+                    },
+                )
+                .expect("failed to register harmony.sample");
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "model_reset",
+                    |mut caller: wasmi::Caller<'_, HostState>| -> Result<i32, wasmi::Error> {
+                        let data = caller.data_mut();
+                        if let Some(engine) = &mut data.inference_engine {
+                            engine.reset();
+                        }
+                        data.last_logits = None;
+                        Ok(0)
+                    },
+                )
+                .expect("failed to register harmony.model_reset");
+        }
+
         let instance = match linker.instantiate_and_start(&mut store, &module) {
             Ok(inst) => inst,
             Err(e) => {
@@ -459,54 +774,111 @@ impl ComputeRuntime for WasmiRuntime {
             }
         };
 
-        // Read write target from HostState.
-        let (out_ptr, out_cap) = match session.store.data().io_write_target {
-            Some(target) => target,
-            None => {
-                self.session = Some(session);
-                return ComputeResult::Failed {
-                    error: ComputeError::Trap {
-                        reason: "resume_with_io: no write target stored".into(),
-                    },
-                };
-            }
-        };
+        // Branch on the type of pending IO request.
+        let is_model_load = matches!(
+            session.store.data().io_request,
+            Some(crate::types::IORequest::LoadModel { .. })
+        );
 
-        // Determine return value and optionally write data to WASM memory.
-        let return_val: i32 = match &response {
-            crate::types::IOResponse::ContentReady { data } => {
-                if data.len() > out_cap as usize {
-                    -2 // buffer too small
-                } else {
-                    // Write data into WASM memory at out_ptr.
-                    let memory = match session.instance.get_memory(&session.store, "memory") {
-                        Some(mem) => mem,
-                        None => {
-                            self.session = Some(session);
-                            return ComputeResult::Failed {
-                                error: ComputeError::ExportNotFound {
-                                    name: "memory".into(),
-                                },
-                            };
+        let return_val: i32 = if is_model_load {
+            #[cfg(feature = "inference")]
+            {
+                match response {
+                    crate::types::IOResponse::ModelReady {
+                        gguf_data,
+                        tokenizer_data,
+                    } => {
+                        use harmony_inference::InferenceEngine;
+                        let mut engine =
+                            harmony_inference::QwenEngine::new(candle_core::Device::Cpu);
+                        if engine.load_gguf(&gguf_data).is_err() {
+                            -3
+                        } else if engine.load_tokenizer(&tokenizer_data).is_err() {
+                            -4
+                        } else {
+                            let data = session.store.data_mut();
+                            data.inference_engine = Some(engine);
+                            data.last_logits = None;
+                            0
                         }
-                    };
-                    if memory
-                        .write(&mut session.store, out_ptr as usize, data)
-                        .is_err()
-                    {
-                        let have = memory.data_size(&session.store);
+                    }
+                    crate::types::IOResponse::ModelGgufNotFound => -1,
+                    crate::types::IOResponse::ModelTokenizerNotFound => -2,
+                    _ => {
                         self.session = Some(session);
                         return ComputeResult::Failed {
-                            error: ComputeError::MemoryTooSmall {
-                                need: out_ptr as usize + data.len(),
-                                have,
+                            error: ComputeError::Trap {
+                                reason: "unexpected IOResponse for LoadModel".into(),
                             },
                         };
                     }
-                    data.len() as i32
                 }
             }
-            crate::types::IOResponse::ContentNotFound => -1,
+            #[cfg(not(feature = "inference"))]
+            {
+                self.session = Some(session);
+                return ComputeResult::Failed {
+                    error: ComputeError::Trap {
+                        reason: "inference feature not enabled".into(),
+                    },
+                };
+            }
+        } else {
+            // Existing FetchContent logic — read io_write_target and write data.
+            let (out_ptr, out_cap) = match session.store.data().io_write_target {
+                Some(target) => target,
+                None => {
+                    self.session = Some(session);
+                    return ComputeResult::Failed {
+                        error: ComputeError::Trap {
+                            reason: "resume_with_io: no write target stored".into(),
+                        },
+                    };
+                }
+            };
+
+            match &response {
+                crate::types::IOResponse::ContentReady { data } => {
+                    if data.len() > out_cap as usize {
+                        -2
+                    } else {
+                        let memory = match session.instance.get_memory(&session.store, "memory") {
+                            Some(mem) => mem,
+                            None => {
+                                self.session = Some(session);
+                                return ComputeResult::Failed {
+                                    error: ComputeError::ExportNotFound {
+                                        name: "memory".into(),
+                                    },
+                                };
+                            }
+                        };
+                        if memory
+                            .write(&mut session.store, out_ptr as usize, data)
+                            .is_err()
+                        {
+                            let have = memory.data_size(&session.store);
+                            self.session = Some(session);
+                            return ComputeResult::Failed {
+                                error: ComputeError::MemoryTooSmall {
+                                    need: out_ptr as usize + data.len(),
+                                    have,
+                                },
+                            };
+                        }
+                        data.len() as i32
+                    }
+                }
+                crate::types::IOResponse::ContentNotFound => -1,
+                _ => {
+                    self.session = Some(session);
+                    return ComputeResult::Failed {
+                        error: ComputeError::Trap {
+                            reason: "unexpected IOResponse for FetchContent".into(),
+                        },
+                    };
+                }
+            }
         };
 
         // Clear the IO state from HostState.
@@ -1070,5 +1442,246 @@ mod tests {
             .expect("session should be preserved after resume");
         assert!(checkpoint.fuel_consumed > 0);
         assert!(!checkpoint.memory.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_model_load_triggers_needs_io() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "model_load" (func $load (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $result i32)
+                (local.set $result
+                  (call $load
+                    (local.get $input_ptr)
+                    (i32.add (local.get $input_ptr) (i32.const 32))))
+                (i32.store
+                  (i32.add (local.get $input_ptr) (local.get $input_len))
+                  (local.get $result))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmiRuntime::new();
+        let input = [0u8; 64];
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            &input,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::NeedsIO { request } => match request {
+                crate::types::IORequest::LoadModel {
+                    gguf_cid,
+                    tokenizer_cid,
+                } => {
+                    assert_eq!(gguf_cid, [0u8; 32]);
+                    assert_eq!(tokenizer_cid, [0u8; 32]);
+                }
+                _ => panic!("expected LoadModel, got {request:?}"),
+            },
+            other => panic!("expected NeedsIO, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_model_load_invalid_gguf_returns_neg3() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "model_load" (func $load (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (local.set $result
+                  (call $load (local.get $input_ptr) (i32.add (local.get $input_ptr) (i32.const 32))))
+                (i32.store (local.get $out_ptr) (local.get $result))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmiRuntime::new();
+        let input = [0u8; 64];
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            &input,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        assert!(matches!(
+            result,
+            crate::types::ComputeResult::NeedsIO { .. }
+        ));
+        let result = runtime.resume_with_io(
+            crate::types::IOResponse::ModelReady {
+                gguf_data: b"not a valid gguf".to_vec(),
+                tokenizer_data: b"{}".to_vec(),
+            },
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, -3, "expected -3 for invalid GGUF, got {code}");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_model_load_gguf_not_found() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "model_load" (func $load (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (i32.store (local.get $out_ptr)
+                  (call $load (local.get $input_ptr) (i32.add (local.get $input_ptr) (i32.const 32))))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmiRuntime::new();
+        let input = [0u8; 64];
+        let _ = runtime.execute(
+            module_wat.as_bytes(),
+            &input,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        let result = runtime.resume_with_io(
+            crate::types::IOResponse::ModelGgufNotFound,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, -1);
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_forward_before_model_load() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "forward" (func $fwd (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (i32.store (local.get $out_ptr)
+                  (call $fwd (local.get $input_ptr) (i32.const 4)))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmiRuntime::new();
+        let input = 42u32.to_le_bytes();
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            &input,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, -1, "expected -1 (no model), got {code}");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_tokenize_before_model_load() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "tokenize" (func $tok (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (i32.store (local.get $out_ptr)
+                  (call $tok
+                    (local.get $input_ptr) (local.get $input_len)
+                    (i32.add (local.get $out_ptr) (i32.const 4)) (i32.const 1024)))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmiRuntime::new();
+        let input = b"hello world";
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            input,
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, -1, "expected -1 (no tokenizer), got {code}");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_model_reset_empty_engine() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "model_reset" (func $reset (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (i32.store (local.get $out_ptr) (call $reset))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmiRuntime::new();
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            &[],
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, 0);
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn inference_sample_before_forward() {
+        let module_wat = r#"
+            (module
+              (import "harmony" "sample" (func $samp (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "compute") (param $input_ptr i32) (param $input_len i32) (result i32)
+                (local $out_ptr i32)
+                (local.set $out_ptr (i32.add (local.get $input_ptr) (local.get $input_len)))
+                (f32.store (local.get $input_ptr) (f32.const 0.0))
+                (f32.store (i32.add (local.get $input_ptr) (i32.const 4)) (f32.const 1.0))
+                (i32.store (i32.add (local.get $input_ptr) (i32.const 8)) (i32.const 0))
+                (f32.store (i32.add (local.get $input_ptr) (i32.const 12)) (f32.const 1.0))
+                (i32.store (i32.add (local.get $input_ptr) (i32.const 16)) (i32.const 64))
+                (i32.store (local.get $out_ptr)
+                  (call $samp (local.get $input_ptr) (i32.const 20)))
+                (i32.const 4)))
+        "#;
+        let mut runtime = super::WasmiRuntime::new();
+        let result = runtime.execute(
+            module_wat.as_bytes(),
+            &[0u8; 20],
+            crate::types::InstructionBudget { fuel: 1_000_000 },
+        );
+        match result {
+            crate::types::ComputeResult::Complete { output } => {
+                let code = i32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+                assert_eq!(code, -1, "expected -1 (no model loaded), got {code}");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
     }
 }
