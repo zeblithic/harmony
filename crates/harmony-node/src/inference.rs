@@ -11,8 +11,8 @@ pub const CAPACITY_READY: u8 = 0x01;
 pub const CAPACITY_BUSY: u8 = 0x00;
 
 /// Built-in inference runner WASM module (compiled from WAT by build.rs).
-/// Placeholder until Task 3 creates the WAT + build.rs.
-pub const INFERENCE_RUNNER_WASM: &[u8] = &[];
+pub const INFERENCE_RUNNER_WASM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/inference_runner.wasm"));
 
 /// Parsed inference request from a Zenoh query payload.
 pub struct InferenceRequest {
@@ -221,5 +221,18 @@ mod tests {
         let cid = [0xDD; 32];
         let payload = build_capacity_payload(&cid, false);
         assert_eq!(payload[32], CAPACITY_BUSY);
+    }
+
+    #[test]
+    fn inference_runner_wasm_is_valid() {
+        assert!(
+            !INFERENCE_RUNNER_WASM.is_empty(),
+            "inference runner WASM should not be empty"
+        );
+        assert_eq!(
+            &INFERENCE_RUNNER_WASM[0..4],
+            b"\0asm",
+            "should start with WASM magic bytes"
+        );
     }
 }

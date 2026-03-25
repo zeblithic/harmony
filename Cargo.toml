@@ -91,6 +91,7 @@ ciborium = { version = "0.2", default-features = false }
 # WASM runtime
 wasmi = "1"
 wasmtime = "38"
+wat = "1"
 
 # ML inference
 candle-core = "0.9"
