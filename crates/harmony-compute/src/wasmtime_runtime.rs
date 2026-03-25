@@ -304,16 +304,24 @@ impl WasmtimeRuntime {
                         {
                             if *cached_gguf_cid == gguf_cid && *cached_tok_cid == tokenizer_cid {
                                 use harmony_inference::InferenceEngine;
-                                let (_, _, gguf_data, tokenizer_data) =
+                                // Take data out to avoid cloning, restore after use so
+                                // a repeated model_load with the same CIDs hits cache.
+                                let (cg, ct, gguf_data, tokenizer_data) =
                                     caller.data_mut().model_cache.take().unwrap();
                                 let mut engine =
                                     harmony_inference::QwenEngine::new(candle_core::Device::Cpu);
                                 if engine.load_gguf(&gguf_data).is_err() {
+                                    caller.data_mut().model_cache =
+                                        Some((cg, ct, gguf_data, tokenizer_data));
                                     return Ok(-3);
                                 }
                                 if engine.load_tokenizer(&tokenizer_data).is_err() {
+                                    caller.data_mut().model_cache =
+                                        Some((cg, ct, gguf_data, tokenizer_data));
                                     return Ok(-4);
                                 }
+                                caller.data_mut().model_cache =
+                                    Some((cg, ct, gguf_data, tokenizer_data));
                                 caller.data_mut().inference_engine = Some(engine);
                                 return Ok(0);
                             }
@@ -562,7 +570,15 @@ impl WasmtimeRuntime {
 
                         let engine = caller.data().inference_engine.as_ref().unwrap();
                         match engine.sample(&logits, &params) {
-                            Ok(token_id) => Ok(token_id as i32),
+                            Ok(token_id) => {
+                                let id = token_id as i32;
+                                if id < 0 {
+                                    return Err(wasmtime::Error::msg(format!(
+                                        "token_id {token_id} overflows i32"
+                                    )));
+                                }
+                                Ok(id)
+                            }
                             Err(_) => Ok(-2),
                         }
                     },

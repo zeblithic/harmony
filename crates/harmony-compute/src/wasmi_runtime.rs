@@ -562,7 +562,15 @@ impl ComputeRuntime for WasmiRuntime {
 
                         let engine = caller.data().inference_engine.as_ref().unwrap();
                         match engine.sample(&logits, &params) {
-                            Ok(token_id) => Ok(token_id as i32),
+                            Ok(token_id) => {
+                                let id = token_id as i32;
+                                if id < 0 {
+                                    return Err(wasmi::Error::new(format!(
+                                        "token_id {token_id} overflows i32"
+                                    )));
+                                }
+                                Ok(id)
+                            }
                             Err(_) => Ok(-2),
                         }
                     },
