@@ -804,7 +804,14 @@ impl ComputeRuntime for WasmiRuntime {
                     }
                     crate::types::IOResponse::ModelGgufNotFound => -1,
                     crate::types::IOResponse::ModelTokenizerNotFound => -2,
-                    _ => -3,
+                    _ => {
+                        self.session = Some(session);
+                        return ComputeResult::Failed {
+                            error: ComputeError::Trap {
+                                reason: "unexpected IOResponse for LoadModel".into(),
+                            },
+                        };
+                    }
                 }
             }
             #[cfg(not(feature = "inference"))]
