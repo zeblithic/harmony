@@ -49,13 +49,12 @@ pub async fn upload_s3_book(
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = format!("{e}");
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    err = %e,
+                    "S3 upload failed"
+                );
                 if attempt + 1 < delays.len() {
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        delay_secs,
-                        err = %e,
-                        "S3 upload failed, retrying"
-                    );
                     tokio::time::sleep(std::time::Duration::from_secs(*delay_secs)).await;
                 }
             }
