@@ -14,6 +14,14 @@ use crate::{EngramConfig, EngramLookup};
 /// 3. `shard_index = table_index / shard_size`
 /// 4. `byte_offset = (table_index % shard_size) * vector_bytes`
 pub fn compute_lookup(config: &EngramConfig, ngram_tokens: &[u32]) -> EngramLookup {
+    debug_assert!(config.total_entries > 0, "total_entries must be positive");
+    debug_assert!(config.shard_size > 0, "shard_size must be positive");
+    debug_assert_eq!(
+        config.hash_seeds.len(),
+        config.num_heads as usize,
+        "hash_seeds length must match num_heads"
+    );
+
     let vector_bytes = config.vector_bytes();
     let mut shard_indices = Vec::with_capacity(config.num_heads as usize);
     let mut entry_offsets = Vec::with_capacity(config.num_heads as usize);
@@ -72,6 +80,7 @@ mod tests {
 
     #[test]
     fn hash_determinism() {
+        // Same input + seed must produce identical output across calls.
         let tokens = [1u32, 2, 3];
         let h1 = hash_ngram(&tokens, 42);
         let h2 = hash_ngram(&tokens, 42);
@@ -84,6 +93,11 @@ mod tests {
         let h1 = hash_ngram(&tokens, 42);
         let h2 = hash_ngram(&tokens, 99);
         assert_ne!(h1, h2);
+        // Pin concrete values — xxhash64 is a fixed algorithm.
+        // Any change here means the hash function changed, which would
+        // silently corrupt all existing Engram table lookups.
+        assert_eq!(h1, 11547749587308120431_u64);
+        assert_eq!(h2, 469971568748895552_u64);
     }
 
     #[test]
@@ -119,6 +133,7 @@ mod tests {
 
     #[test]
     fn lookup_boundary_single_shard_table() {
+        // Edge case: table with 1 shard, 1 entry.
         let config = EngramConfig {
             version: String::from("v1"),
             embedding_dim: 2,
@@ -136,8 +151,10 @@ mod tests {
 
     #[test]
     fn hash_empty_tokens() {
+        // Empty N-gram is a degenerate case but must not panic.
         let config = test_config();
         let lookup = compute_lookup(&config, &[]);
         assert_eq!(lookup.shard_indices.len(), 2);
     }
+
 }
