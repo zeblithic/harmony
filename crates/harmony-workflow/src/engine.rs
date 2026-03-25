@@ -509,7 +509,14 @@ impl WorkflowEngine {
                     ];
                 }
                 ComputeResult::NeedsIO { request } => {
-                    let IORequest::FetchContent { cid } = request;
+                    let cid = match request {
+                        IORequest::FetchContent { cid } => cid,
+                        IORequest::LoadModel { gguf_cid, .. } => {
+                            // LoadModel IO: use the GGUF CID for content fetch.
+                            // Full model loading support is future work.
+                            gguf_cid
+                        }
+                    };
 
                     if let Some(state) = self.workflows.get_mut(&wf_id) {
                         state.history.events.push(HistoryEvent::IoRequested { cid });
