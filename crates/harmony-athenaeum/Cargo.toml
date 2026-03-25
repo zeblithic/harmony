@@ -10,6 +10,8 @@ description = "32-bit content-addressed page system for on-device memory"
 [features]
 default = ["std"]
 std = []
+serde = ["dep:serde"]
 
 [dependencies]
 sha2 = { workspace = true }
+serde = { workspace = true, features = ["derive", "alloc"], optional = true }

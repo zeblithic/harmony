@@ -111,7 +111,14 @@ impl Algorithm {
 /// A 32-bit content-addressed page identifier.
 ///
 /// Layout: `[algo:2][hash_bits:28][checksum:2]`
+///
+/// **Note on serde:** Deserialization bypasses the 2-bit XOR checksum
+/// invariant — any `u32` is accepted. This is acceptable for internal
+/// hot-swap state transfer (data was just serialized from a valid state)
+/// but means deserialized `PageAddr` values should not be treated as
+/// externally validated.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PageAddr(pub(crate) u32);
 
 impl PageAddr {
