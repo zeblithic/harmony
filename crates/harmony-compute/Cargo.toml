@@ -11,9 +11,12 @@ description = "WASM compute engine with cooperative yielding for the Harmony dec
 default = []
 no-neon = ["harmony-crypto/no-neon"]
 wasmtime = ["dep:wasmtime"]
+inference = ["harmony-inference", "candle-core"]
 
 [dependencies]
 harmony-crypto = { workspace = true, features = ["std"] }
 thiserror.workspace = true
 wasmi = { workspace = true }
 wasmtime = { workspace = true, optional = true }
+harmony-inference = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }

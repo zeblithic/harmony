@@ -388,6 +388,7 @@ impl ComputeRuntime for WasmtimeRuntime {
             let pending_cid = match &result {
                 ComputeResult::NeedsIO { request } => match request {
                     crate::types::IORequest::FetchContent { cid } => Some(*cid),
+                    crate::types::IORequest::LoadModel { .. } => None, // handled in Task 4
                 },
                 _ => None,
             };
@@ -446,6 +447,14 @@ impl ComputeRuntime for WasmtimeRuntime {
             crate::types::IOResponse::ContentNotFound => {
                 session.not_found_cids.insert(pending_cid);
             }
+            _ => {
+                self.session = Some(session);
+                return ComputeResult::Failed {
+                    error: ComputeError::Trap {
+                        reason: "unexpected IOResponse for FetchContent".into(),
+                    },
+                };
+            }
         }
 
         // Re-execute the module from scratch with the updated IO cache.
@@ -460,6 +469,7 @@ impl ComputeRuntime for WasmtimeRuntime {
             let new_pending_cid = match &result {
                 ComputeResult::NeedsIO { request } => match request {
                     crate::types::IORequest::FetchContent { cid } => Some(*cid),
+                    crate::types::IORequest::LoadModel { .. } => None, // handled in Task 4
                 },
                 _ => None,
             };

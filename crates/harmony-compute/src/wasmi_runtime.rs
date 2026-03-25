@@ -507,6 +507,14 @@ impl ComputeRuntime for WasmiRuntime {
                 }
             }
             crate::types::IOResponse::ContentNotFound => -1,
+            _ => {
+                self.session = Some(session);
+                return ComputeResult::Failed {
+                    error: ComputeError::Trap {
+                        reason: "unexpected IOResponse for FetchContent".into(),
+                    },
+                };
+            }
         };
 
         // Clear the IO state from HostState.
