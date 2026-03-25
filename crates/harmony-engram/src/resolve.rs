@@ -4,10 +4,10 @@
 //! offset, extract the vector, decode each f16 component to f32, and sum
 //! across all heads in f32 precision to avoid f16 overflow.
 
+use crate::{EngramConfig, EngramError, EngramLookup};
 use alloc::vec;
 use alloc::vec::Vec;
 use half::f16;
-use crate::{EngramConfig, EngramError, EngramLookup};
 
 /// Extract and aggregate embedding vectors from fetched shard bytes.
 ///
@@ -158,12 +158,10 @@ mod tests {
         let config = test_config();
         let shard_a = make_f16_bytes(&[
             1.0, 2.0, 3.0, 4.0, // slot 0 — head 0 reads here
-            0.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         ]);
         let shard_b = make_f16_bytes(&[
-            0.0, 0.0, 0.0, 0.0,
-            0.5, 1.5, 2.5, 3.5, // slot 1 — head 1 reads here
+            0.0, 0.0, 0.0, 0.0, 0.5, 1.5, 2.5, 3.5, // slot 1 — head 1 reads here
             0.0, 0.0, 0.0, 0.0,
         ]);
         let lookup = EngramLookup {
@@ -185,7 +183,13 @@ mod tests {
         // Only provide 1 shard for a 2-head lookup.
         let shard = make_f16_bytes(&[1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let err = aggregate(&config, &lookup, &[&shard]).unwrap_err();
-        assert!(matches!(err, EngramError::ShardCountMismatch { expected: 2, got: 1 }));
+        assert!(matches!(
+            err,
+            EngramError::ShardCountMismatch {
+                expected: 2,
+                got: 1
+            }
+        ));
     }
 
     #[test]

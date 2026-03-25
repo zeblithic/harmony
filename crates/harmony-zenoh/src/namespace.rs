@@ -1001,10 +1001,7 @@ mod tests {
 
     #[test]
     fn discover_key() {
-        assert_eq!(
-            discover::key("aabbccdd"),
-            "harmony/discover/aabbccdd"
-        );
+        assert_eq!(discover::key("aabbccdd"), "harmony/discover/aabbccdd");
     }
 
     #[test]
@@ -1241,34 +1238,22 @@ mod tests {
 
     #[test]
     fn engram_manifest_key() {
-        assert_eq!(
-            engram::manifest_key("v1"),
-            "harmony/engram/v1/manifest"
-        );
+        assert_eq!(engram::manifest_key("v1"), "harmony/engram/v1/manifest");
     }
 
     #[test]
     fn engram_shard_key() {
-        assert_eq!(
-            engram::shard_key("v1", 42),
-            "harmony/engram/v1/shard/42"
-        );
+        assert_eq!(engram::shard_key("v1", 42), "harmony/engram/v1/shard/42");
     }
 
     #[test]
     fn engram_shard_key_zero() {
-        assert_eq!(
-            engram::shard_key("v1", 0),
-            "harmony/engram/v1/shard/0"
-        );
+        assert_eq!(engram::shard_key("v1", 0), "harmony/engram/v1/shard/0");
     }
 
     #[test]
     fn engram_shard_queryable() {
-        assert_eq!(
-            engram::shard_queryable("v1"),
-            "harmony/engram/v1/shard/**"
-        );
+        assert_eq!(engram::shard_queryable("v1"), "harmony/engram/v1/shard/**");
     }
 
     #[test]

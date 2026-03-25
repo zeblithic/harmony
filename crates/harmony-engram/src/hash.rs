@@ -4,8 +4,8 @@
 //! per-head seeds.  Each hash maps to a table index, which determines the
 //! shard index and byte offset within that shard.
 
-use alloc::vec::Vec;
 use crate::{EngramConfig, EngramLookup};
+use alloc::vec::Vec;
 
 /// Compute the [`EngramLookup`] for an N-gram given the table config.
 ///
@@ -113,7 +113,11 @@ mod tests {
         let config = test_config();
         let lookup = compute_lookup(&config, &[100, 200, 300]);
         for &idx in &lookup.shard_indices {
-            assert!(idx < config.num_shards, "shard index {idx} >= {}", config.num_shards);
+            assert!(
+                idx < config.num_shards,
+                "shard index {idx} >= {}",
+                config.num_shards
+            );
         }
     }
 
@@ -156,5 +160,4 @@ mod tests {
         let lookup = compute_lookup(&config, &[]);
         assert_eq!(lookup.shard_indices.len(), 2);
     }
-
 }
