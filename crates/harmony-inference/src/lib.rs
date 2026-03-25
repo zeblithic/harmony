@@ -35,6 +35,9 @@ pub struct SamplingParams {
     /// Penalty for repeated tokens. 1.0 = no penalty.
     /// Must be > 0.0; values <= 0.0 are treated as no penalty.
     pub repeat_penalty: f32,
+    /// Number of recent tokens to consider for repeat penalty.
+    /// 0 = use entire history (unbounded). Default: 64.
+    pub repeat_last_n: usize,
 }
 
 impl SamplingParams {
@@ -45,6 +48,7 @@ impl SamplingParams {
             top_p: 1.0,
             top_k: 0,
             repeat_penalty: 1.0,
+            repeat_last_n: 64,
         }
     }
 }
@@ -56,6 +60,7 @@ impl Default for SamplingParams {
             top_p: 1.0,
             top_k: 0,
             repeat_penalty: 1.0,
+            repeat_last_n: 64,
         }
     }
 }

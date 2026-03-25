@@ -360,6 +360,7 @@ mod tests {
             top_p: 0.9,
             top_k: 3,
             repeat_penalty: 1.0,
+            repeat_last_n: 64,
         };
         let r1 = sample(&logits, &params, &[], &mut StdRng::seed_from_u64(123)).unwrap();
         let r2 = sample(&logits, &params, &[], &mut StdRng::seed_from_u64(123)).unwrap();

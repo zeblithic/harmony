@@ -142,7 +142,15 @@ impl InferenceEngine for QwenEngine {
 
     fn sample(&self, logits: &[f32], params: &SamplingParams) -> Result<u32, InferenceError> {
         let mut rng = thread_rng();
-        crate::sampling::sample(logits, params, &self.token_history, &mut rng)
+        // Use a sliding window of recent tokens for repeat penalty to avoid
+        // unbounded growth and over-suppression in long conversations.
+        let context = if params.repeat_last_n > 0 && params.repeat_last_n < self.token_history.len()
+        {
+            &self.token_history[self.token_history.len() - params.repeat_last_n..]
+        } else {
+            &self.token_history
+        };
+        crate::sampling::sample(logits, params, context, &mut rng)
     }
 
     fn reset(&mut self) {
