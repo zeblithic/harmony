@@ -24,6 +24,18 @@ struct HostState {
     io_request: Option<crate::types::IORequest>,
     /// Where to write the IO response data: (out_ptr, out_cap).
     io_write_target: Option<(u32, u32)>,
+    /// Loaded inference engine (only available with `inference` feature).
+    #[cfg(feature = "inference")]
+    inference_engine: Option<harmony_inference::QwenEngine>,
+    /// Logits from the most recent `forward()` call, consumed by `sample()`.
+    #[cfg(feature = "inference")]
+    last_logits: Option<Vec<f32>>,
+    /// Cached model data for replay: (gguf_bytes, tokenizer_bytes).
+    #[cfg(feature = "inference")]
+    model_cache: Option<(Vec<u8>, Vec<u8>)>,
+    /// Cached model-not-found error code for replay (-1 or -2).
+    #[cfg(feature = "inference")]
+    model_not_found: Option<i32>,
 }
 
 impl HostState {
@@ -33,15 +45,51 @@ impl HostState {
             not_found_cids: HashSet::new(),
             io_request: None,
             io_write_target: None,
+            #[cfg(feature = "inference")]
+            inference_engine: None,
+            #[cfg(feature = "inference")]
+            last_logits: None,
+            #[cfg(feature = "inference")]
+            model_cache: None,
+            #[cfg(feature = "inference")]
+            model_not_found: None,
         }
     }
 
+    #[cfg_attr(feature = "inference", allow(dead_code))]
     fn with_cache(io_cache: HashMap<[u8; 32], Vec<u8>>, not_found_cids: HashSet<[u8; 32]>) -> Self {
         Self {
             io_cache,
             not_found_cids,
             io_request: None,
             io_write_target: None,
+            #[cfg(feature = "inference")]
+            inference_engine: None,
+            #[cfg(feature = "inference")]
+            last_logits: None,
+            #[cfg(feature = "inference")]
+            model_cache: None,
+            #[cfg(feature = "inference")]
+            model_not_found: None,
+        }
+    }
+
+    #[cfg(feature = "inference")]
+    fn with_inference_cache(
+        io_cache: HashMap<[u8; 32], Vec<u8>>,
+        not_found_cids: HashSet<[u8; 32]>,
+        model_cache: Option<(Vec<u8>, Vec<u8>)>,
+        model_not_found: Option<i32>,
+    ) -> Self {
+        Self {
+            io_cache,
+            not_found_cids,
+            io_request: None,
+            io_write_target: None,
+            inference_engine: None,
+            last_logits: None,
+            model_cache,
+            model_not_found,
         }
     }
 }
@@ -71,6 +119,15 @@ struct WasmtimeSession {
     pending_cid: Option<[u8; 32]>,
     /// Memory snapshot at the end of the last execution.
     memory_snapshot: Vec<u8>,
+    /// Cached model data for replay: (gguf_bytes, tokenizer_bytes).
+    #[cfg(feature = "inference")]
+    model_cache: Option<(Vec<u8>, Vec<u8>)>,
+    /// Cached model-not-found error code for replay (-1 or -2).
+    #[cfg(feature = "inference")]
+    model_not_found: Option<i32>,
+    /// Whether the pending IO request is a model load (vs. content fetch).
+    #[cfg(feature = "inference")]
+    pending_model_load: bool,
 }
 
 /// Wasmtime-backed WASM execution engine with JIT compilation.
@@ -189,6 +246,326 @@ impl WasmtimeRuntime {
                 },
             )
             .expect("failed to register harmony.fetch_content");
+
+        // Register inference host functions (model_load, tokenize, detokenize,
+        // forward, sample, model_reset) with replay/cache support.
+        #[cfg(feature = "inference")]
+        {
+            use harmony_inference::InferenceEngine as _;
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "model_load",
+                    |mut caller: wasmtime::Caller<'_, HostState>,
+                     gguf_cid_ptr: i32,
+                     tokenizer_cid_ptr: i32|
+                     -> Result<i32, wasmtime::Error> {
+                        // Check cached model_not_found first (replay path).
+                        if let Some(code) = caller.data().model_not_found {
+                            return Ok(code);
+                        }
+
+                        // Check cached model data (replay path).
+                        if caller.data().model_cache.is_some() {
+                            let (gguf_data, tokenizer_data) =
+                                caller.data().model_cache.clone().unwrap();
+                            let mut engine =
+                                harmony_inference::QwenEngine::new(candle_core::Device::Cpu);
+                            if engine.load_gguf(&gguf_data).is_err() {
+                                return Ok(-3);
+                            }
+                            if engine.load_tokenizer(&tokenizer_data).is_err() {
+                                return Ok(-4);
+                            }
+                            caller.data_mut().inference_engine = Some(engine);
+                            return Ok(0);
+                        }
+
+                        // Cache miss — read CIDs and trap.
+                        let memory = caller
+                            .get_export("memory")
+                            .and_then(|e| e.into_memory())
+                            .ok_or_else(|| wasmtime::Error::msg("missing exported memory"))?;
+
+                        let mut gguf_cid = [0u8; 32];
+                        memory
+                            .read(&caller, gguf_cid_ptr as usize, &mut gguf_cid)
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("read GGUF CID: {e}"))
+                            })?;
+
+                        let mut tokenizer_cid = [0u8; 32];
+                        memory
+                            .read(&caller, tokenizer_cid_ptr as usize, &mut tokenizer_cid)
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("read tokenizer CID: {e}"))
+                            })?;
+
+                        let host = caller.data_mut();
+                        host.io_request = Some(crate::types::IORequest::LoadModel {
+                            gguf_cid,
+                            tokenizer_cid,
+                        });
+
+                        Err(wasmtime::Error::msg("harmony_io_trap"))
+                    },
+                )
+                .expect("failed to register harmony.model_load");
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "tokenize",
+                    |mut caller: wasmtime::Caller<'_, HostState>,
+                     text_ptr: i32,
+                     text_len: i32,
+                     out_ptr: i32,
+                     out_cap: i32|
+                     -> Result<i32, wasmtime::Error> {
+                        let memory = caller
+                            .get_export("memory")
+                            .and_then(|e| e.into_memory())
+                            .ok_or_else(|| wasmtime::Error::msg("missing exported memory"))?;
+
+                        let engine = match &caller.data().inference_engine {
+                            Some(e) => e,
+                            None => return Ok(-1),
+                        };
+
+                        let mut text_buf = vec![0u8; text_len as usize];
+                        memory
+                            .read(&caller, text_ptr as usize, &mut text_buf)
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("failed to read text: {e}"))
+                            })?;
+
+                        let text = std::str::from_utf8(&text_buf)
+                            .map_err(|e| wasmtime::Error::msg(format!("invalid UTF-8: {e}")))?;
+
+                        let tokens = match engine.tokenize(text) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                return Err(wasmtime::Error::msg(format!(
+                                    "tokenize failed: {e}"
+                                )))
+                            }
+                        };
+
+                        let token_bytes: Vec<u8> =
+                            tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+
+                        if token_bytes.len() > out_cap as usize {
+                            return Ok(-2);
+                        }
+
+                        memory
+                            .write(&mut caller, out_ptr as usize, &token_bytes)
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("failed to write tokens: {e}"))
+                            })?;
+
+                        Ok(token_bytes.len() as i32)
+                    },
+                )
+                .expect("failed to register harmony.tokenize");
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "detokenize",
+                    |mut caller: wasmtime::Caller<'_, HostState>,
+                     tokens_ptr: i32,
+                     tokens_len: i32,
+                     out_ptr: i32,
+                     out_cap: i32|
+                     -> Result<i32, wasmtime::Error> {
+                        let memory = caller
+                            .get_export("memory")
+                            .and_then(|e| e.into_memory())
+                            .ok_or_else(|| wasmtime::Error::msg("missing exported memory"))?;
+
+                        if tokens_len % 4 != 0 {
+                            return Ok(-3);
+                        }
+
+                        let engine = match &caller.data().inference_engine {
+                            Some(e) => e,
+                            None => return Ok(-1),
+                        };
+
+                        let mut token_bytes = vec![0u8; tokens_len as usize];
+                        memory
+                            .read(&caller, tokens_ptr as usize, &mut token_bytes)
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("failed to read tokens: {e}"))
+                            })?;
+
+                        let tokens: Vec<u32> = token_bytes
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+
+                        let text = match engine.detokenize(&tokens) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                return Err(wasmtime::Error::msg(format!(
+                                    "detokenize failed: {e}"
+                                )))
+                            }
+                        };
+
+                        if text.len() > out_cap as usize {
+                            return Ok(-2);
+                        }
+
+                        memory
+                            .write(&mut caller, out_ptr as usize, text.as_bytes())
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("failed to write text: {e}"))
+                            })?;
+
+                        Ok(text.len() as i32)
+                    },
+                )
+                .expect("failed to register harmony.detokenize");
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "forward",
+                    |mut caller: wasmtime::Caller<'_, HostState>,
+                     tokens_ptr: i32,
+                     tokens_len: i32|
+                     -> Result<i32, wasmtime::Error> {
+                        let memory = caller
+                            .get_export("memory")
+                            .and_then(|e| e.into_memory())
+                            .ok_or_else(|| wasmtime::Error::msg("missing exported memory"))?;
+
+                        if tokens_len % 4 != 0 || tokens_len == 0 {
+                            return Ok(-3);
+                        }
+
+                        let mut token_bytes = vec![0u8; tokens_len as usize];
+                        memory
+                            .read(&caller, tokens_ptr as usize, &mut token_bytes)
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("failed to read tokens: {e}"))
+                            })?;
+
+                        let tokens: Vec<u32> = token_bytes
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+
+                        let engine = match caller.data_mut().inference_engine.as_mut() {
+                            Some(e) => e,
+                            None => return Ok(-1),
+                        };
+
+                        let logits = match engine.forward(&tokens) {
+                            Ok(l) => l,
+                            Err(_) => return Ok(-2),
+                        };
+
+                        caller.data_mut().last_logits = Some(logits);
+                        Ok(0)
+                    },
+                )
+                .expect("failed to register harmony.forward");
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "sample",
+                    |mut caller: wasmtime::Caller<'_, HostState>,
+                     params_ptr: i32,
+                     params_len: i32|
+                     -> Result<i32, wasmtime::Error> {
+                        let memory = caller
+                            .get_export("memory")
+                            .and_then(|e| e.into_memory())
+                            .ok_or_else(|| wasmtime::Error::msg("missing exported memory"))?;
+
+                        if params_len != 20 {
+                            return Ok(-2);
+                        }
+
+                        if caller.data().inference_engine.is_none() {
+                            return Ok(-1);
+                        }
+
+                        let mut param_bytes = [0u8; 20];
+                        memory
+                            .read(&caller, params_ptr as usize, &mut param_bytes)
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("failed to read params: {e}"))
+                            })?;
+
+                        let params = harmony_inference::SamplingParams {
+                            temperature: f32::from_le_bytes([
+                                param_bytes[0],
+                                param_bytes[1],
+                                param_bytes[2],
+                                param_bytes[3],
+                            ]),
+                            top_p: f32::from_le_bytes([
+                                param_bytes[4],
+                                param_bytes[5],
+                                param_bytes[6],
+                                param_bytes[7],
+                            ]),
+                            top_k: u32::from_le_bytes([
+                                param_bytes[8],
+                                param_bytes[9],
+                                param_bytes[10],
+                                param_bytes[11],
+                            ]),
+                            repeat_penalty: f32::from_le_bytes([
+                                param_bytes[12],
+                                param_bytes[13],
+                                param_bytes[14],
+                                param_bytes[15],
+                            ]),
+                            repeat_last_n: u32::from_le_bytes([
+                                param_bytes[16],
+                                param_bytes[17],
+                                param_bytes[18],
+                                param_bytes[19],
+                            ]) as usize,
+                        };
+
+                        // Clone logits to avoid simultaneous borrows of caller.data()
+                        let logits = match caller.data().last_logits.as_deref() {
+                            Some(l) => l.to_vec(),
+                            None => return Ok(-2),
+                        };
+
+                        let engine = caller.data().inference_engine.as_ref().unwrap();
+                        match engine.sample(&logits, &params) {
+                            Ok(token_id) => Ok(token_id as i32),
+                            Err(_) => Ok(-2),
+                        }
+                    },
+                )
+                .expect("failed to register harmony.sample");
+
+            linker
+                .func_wrap(
+                    "harmony",
+                    "model_reset",
+                    |mut caller: wasmtime::Caller<'_, HostState>| -> Result<i32, wasmtime::Error> {
+                        let data = caller.data_mut();
+                        if let Some(engine) = &mut data.inference_engine {
+                            engine.reset();
+                        }
+                        data.last_logits = None;
+                        Ok(0)
+                    },
+                )
+                .expect("failed to register harmony.model_reset");
+        }
 
         // Instantiate the module.
         let instance = match linker.instantiate(&mut store, &module) {
@@ -388,10 +765,16 @@ impl ComputeRuntime for WasmtimeRuntime {
             let pending_cid = match &result {
                 ComputeResult::NeedsIO { request } => match request {
                     crate::types::IORequest::FetchContent { cid } => Some(*cid),
-                    crate::types::IORequest::LoadModel { .. } => None, // handled in Task 4
+                    crate::types::IORequest::LoadModel { .. } => None,
                 },
                 _ => None,
             };
+            #[cfg(feature = "inference")]
+            let pending_model_load = matches!(
+                &result,
+                ComputeResult::NeedsIO { request }
+                if matches!(request, crate::types::IORequest::LoadModel { .. })
+            );
             self.session = Some(WasmtimeSession {
                 module_bytes: module_bytes.to_vec(),
                 module_hash,
@@ -401,6 +784,12 @@ impl ComputeRuntime for WasmtimeRuntime {
                 total_fuel_consumed: fuel_consumed,
                 pending_cid,
                 memory_snapshot: mem_snapshot,
+                #[cfg(feature = "inference")]
+                model_cache: None,
+                #[cfg(feature = "inference")]
+                model_not_found: None,
+                #[cfg(feature = "inference")]
+                pending_model_load,
             });
         }
 
@@ -429,6 +818,87 @@ impl ComputeRuntime for WasmtimeRuntime {
             }
         };
 
+        // Check if this is a model load response (inference feature) or
+        // a content fetch response.
+        #[cfg(feature = "inference")]
+        let is_model_load = session.pending_model_load;
+        #[cfg(not(feature = "inference"))]
+        let is_model_load = false;
+
+        if is_model_load {
+            #[cfg(feature = "inference")]
+            {
+                session.pending_model_load = false;
+                match response {
+                    crate::types::IOResponse::ModelReady {
+                        gguf_data,
+                        tokenizer_data,
+                    } => {
+                        session.model_cache = Some((gguf_data, tokenizer_data));
+                    }
+                    crate::types::IOResponse::ModelGgufNotFound => {
+                        session.model_not_found = Some(-1);
+                    }
+                    crate::types::IOResponse::ModelTokenizerNotFound => {
+                        session.model_not_found = Some(-2);
+                    }
+                    _ => {
+                        self.session = Some(session);
+                        return ComputeResult::Failed {
+                            error: ComputeError::Trap {
+                                reason: "unexpected IOResponse for LoadModel".into(),
+                            },
+                        };
+                    }
+                }
+
+                // Re-execute with updated model cache.
+                let host_state = HostState::with_inference_cache(
+                    session.io_cache.clone(),
+                    session.not_found_cids.clone(),
+                    session.model_cache.clone(),
+                    session.model_not_found,
+                );
+                let (result, session_data) =
+                    self.run_module(&session.module_bytes, &session.input, budget, host_state);
+
+                if let Some((host_data, fuel_consumed, mem_snapshot)) = session_data {
+                    let new_pending_cid = match &result {
+                        ComputeResult::NeedsIO {
+                            request: crate::types::IORequest::FetchContent { cid },
+                        } => Some(*cid),
+                        _ => None,
+                    };
+                    let new_pending_model_load = matches!(
+                        &result,
+                        ComputeResult::NeedsIO { request }
+                        if matches!(request, crate::types::IORequest::LoadModel { .. })
+                    );
+                    let total_fuel = session.total_fuel_consumed + fuel_consumed;
+                    self.session = Some(WasmtimeSession {
+                        module_bytes: session.module_bytes,
+                        module_hash: session.module_hash,
+                        input: session.input,
+                        io_cache: host_data.io_cache,
+                        not_found_cids: host_data.not_found_cids,
+                        total_fuel_consumed: total_fuel,
+                        pending_cid: new_pending_cid,
+                        memory_snapshot: mem_snapshot,
+                        model_cache: session.model_cache,
+                        model_not_found: session.model_not_found,
+                        pending_model_load: new_pending_model_load,
+                    });
+                }
+
+                return result;
+            }
+            // Unreachable when inference is disabled, but needed for
+            // compilation when cfg(not(feature = "inference")).
+            #[cfg(not(feature = "inference"))]
+            unreachable!()
+        }
+
+        // --- FetchContent path ---
         let pending_cid = match session.pending_cid.take() {
             Some(cid) => cid,
             None => {
@@ -459,7 +929,17 @@ impl ComputeRuntime for WasmtimeRuntime {
 
         // Re-execute the module from scratch with the updated IO cache.
         // The host function will find the CID in cache and return data
-        // immediately (deterministic replay).
+        // immediately (deterministic replay). When inference is enabled,
+        // preserve model cache from prior rounds so model_load replays
+        // correctly if this module also uses inference.
+        #[cfg(feature = "inference")]
+        let host_state = HostState::with_inference_cache(
+            session.io_cache,
+            session.not_found_cids,
+            session.model_cache.clone(),
+            session.model_not_found,
+        );
+        #[cfg(not(feature = "inference"))]
         let host_state = HostState::with_cache(session.io_cache, session.not_found_cids);
         let (result, session_data) =
             self.run_module(&session.module_bytes, &session.input, budget, host_state);
@@ -469,10 +949,16 @@ impl ComputeRuntime for WasmtimeRuntime {
             let new_pending_cid = match &result {
                 ComputeResult::NeedsIO { request } => match request {
                     crate::types::IORequest::FetchContent { cid } => Some(*cid),
-                    crate::types::IORequest::LoadModel { .. } => None, // handled in Task 4
+                    crate::types::IORequest::LoadModel { .. } => None,
                 },
                 _ => None,
             };
+            #[cfg(feature = "inference")]
+            let new_pending_model_load = matches!(
+                &result,
+                ComputeResult::NeedsIO { request }
+                if matches!(request, crate::types::IORequest::LoadModel { .. })
+            );
             // Accumulate fuel across replay rounds. Each replay re-executes
             // the module from scratch, so `fuel_consumed` includes re-running
             // the cached-IO path. We sum rather than replace because the node
@@ -487,6 +973,12 @@ impl ComputeRuntime for WasmtimeRuntime {
                 total_fuel_consumed: total_fuel,
                 pending_cid: new_pending_cid,
                 memory_snapshot: mem_snapshot,
+                #[cfg(feature = "inference")]
+                model_cache: session.model_cache,
+                #[cfg(feature = "inference")]
+                model_not_found: session.model_not_found,
+                #[cfg(feature = "inference")]
+                pending_model_load: new_pending_model_load,
             });
         }
 
@@ -494,9 +986,16 @@ impl ComputeRuntime for WasmtimeRuntime {
     }
 
     fn has_pending(&self) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|s| s.pending_cid.is_some())
+        self.session.as_ref().is_some_and(|s| {
+            if s.pending_cid.is_some() {
+                return true;
+            }
+            #[cfg(feature = "inference")]
+            if s.pending_model_load {
+                return true;
+            }
+            false
+        })
     }
 
     fn take_session(&mut self) -> Option<Box<dyn std::any::Any>> {
@@ -703,6 +1202,7 @@ mod tests {
                 crate::types::IORequest::FetchContent { cid: req_cid } => {
                     assert_eq!(req_cid, cid, "requested CID should match input");
                 }
+                other => panic!("expected FetchContent, got: {other:?}"),
             },
             other => panic!("expected NeedsIO, got: {other:?}"),
         }
