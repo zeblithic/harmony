@@ -62,6 +62,9 @@ async fn run_engram(
     tracing::info!(version = %cfg.version, tensor = %cfg.tensor, "config loaded");
 
     // Stage 2: Open safetensors.
+    // NOTE: For multi-GB files, mmap (memmap2 crate) would avoid loading the
+    // entire tensor into memory.  std::fs::read is sufficient for the initial
+    // implementation and simplifies error handling.
     let file_bytes =
         std::fs::read(&input).map_err(|e| format!("failed to read {}: {e}", input.display()))?;
     let tensors = safetensors::SafeTensors::deserialize(&file_bytes)
@@ -94,6 +97,15 @@ async fn run_engram(
     let tensor_bytes = tensor.data();
     let n_shards = shard::num_shards(total_entries, cfg.shard_size);
     tracing::info!(total_entries, embedding_dim, n_shards, "tensor validated");
+
+    // Validate shard size fits within CAS book limit.
+    let shard_byte_size = cfg.shard_size as usize * embedding_dim * 2;
+    if shard_byte_size > 1_048_575 {
+        return Err(format!(
+            "shard size {}B exceeds 1MB book limit (shard_size={}, embedding_dim={})",
+            shard_byte_size, cfg.shard_size, embedding_dim
+        ));
+    }
 
     // Set up S3 if configured.
     let s3 = if let Some(ref bucket_name) = bucket {

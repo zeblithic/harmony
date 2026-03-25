@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 /// Append-only binary journal of 32-byte CID entries.
 pub struct CidJournal {
+    #[allow(dead_code)] // used by entry_count (test-only API)
     path: PathBuf,
     file: File,
 }
@@ -51,8 +52,8 @@ impl CidJournal {
             .write_all(&cid.to_bytes())
             .map_err(|e| format!("journal write: {e}"))?;
         self.file
-            .flush()
-            .map_err(|e| format!("journal flush: {e}"))?;
+            .sync_data()
+            .map_err(|e| format!("journal sync: {e}"))?;
         Ok(())
     }
 
@@ -79,6 +80,7 @@ impl CidJournal {
     }
 
     /// Number of entries written so far (based on file size).
+    #[allow(dead_code)]
     pub fn entry_count(&self) -> Result<u64, String> {
         let len = std::fs::metadata(&self.path)
             .map_err(|e| format!("journal metadata: {e}"))?

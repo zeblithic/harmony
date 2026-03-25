@@ -20,6 +20,7 @@ pub fn write_local_book(base: &Path, cid: &ContentId, data: &[u8]) -> Result<(),
 }
 
 /// Compute the expected local path for a book.
+#[allow(dead_code)] // used by storage tests
 pub fn local_book_path(base: &Path, cid: &ContentId) -> PathBuf {
     let hex_cid = hex::encode(cid.to_bytes());
     base.join("book").join(&hex_cid[..2]).join(&hex_cid)

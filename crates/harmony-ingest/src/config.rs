@@ -28,6 +28,7 @@ impl EngramConfig {
     }
 
     /// Parse and validate from a TOML string (for testing).
+    #[allow(dead_code)]
     pub fn parse(text: &str) -> Result<Self, String> {
         let config: Self = toml::from_str(text).map_err(|e| format!("invalid config TOML: {e}"))?;
         config.validate()?;
