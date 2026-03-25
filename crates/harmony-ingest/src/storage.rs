@@ -15,8 +15,7 @@ pub fn write_local_book(base: &Path, cid: &ContentId, data: &[u8]) -> Result<(),
     std::fs::create_dir_all(&prefix_dir)
         .map_err(|e| format!("create dir {}: {e}", prefix_dir.display()))?;
     let file_path = prefix_dir.join(&hex_cid);
-    std::fs::write(&file_path, data)
-        .map_err(|e| format!("write {}: {e}", file_path.display()))?;
+    std::fs::write(&file_path, data).map_err(|e| format!("write {}: {e}", file_path.display()))?;
     Ok(())
 }
 

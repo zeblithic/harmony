@@ -19,8 +19,8 @@ pub struct EngramConfig {
 impl EngramConfig {
     /// Load and validate from a TOML file.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read config: {e}"))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("failed to read config: {e}"))?;
         let config: Self =
             toml::from_str(&text).map_err(|e| format!("invalid config TOML: {e}"))?;
         config.validate()?;
@@ -29,8 +29,7 @@ impl EngramConfig {
 
     /// Parse and validate from a TOML string (for testing).
     pub fn parse(text: &str) -> Result<Self, String> {
-        let config: Self =
-            toml::from_str(text).map_err(|e| format!("invalid config TOML: {e}"))?;
+        let config: Self = toml::from_str(text).map_err(|e| format!("invalid config TOML: {e}"))?;
         config.validate()?;
         Ok(config)
     }

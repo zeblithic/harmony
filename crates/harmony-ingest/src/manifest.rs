@@ -65,12 +65,12 @@ mod tests {
     fn build_and_recover_manifest() {
         let header = make_header(
             "v1".into(),
-            4,    // embedding_dim
-            2,    // num_heads
+            4, // embedding_dim
+            2, // num_heads
             vec![42, 99],
-            6,    // total_entries
-            3,    // shard_size
-            2,    // num_shards
+            6, // total_entries
+            3, // shard_size
+            2, // num_shards
         );
 
         // 2 dummy shard CIDs.

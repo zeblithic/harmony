@@ -135,10 +135,7 @@ impl ReplicaStore for MemoryReplicaStore {
 
         // Single book exceeds entire quota — reject outright.
         if book_size as u64 > quota {
-            return Err(ReplicaError::ExceedsQuota {
-                book_size,
-                quota,
-            });
+            return Err(ReplicaError::ExceedsQuota { book_size, quota });
         }
 
         let peer_store = self.peers.entry(peer).or_insert_with(PeerReplica::new);

@@ -275,7 +275,13 @@ impl ContentId {
                 max: 0xF_FFFF,
             });
         }
-        Ok(Self::assemble(flags, STREAM_DEPTH, chunk_index, hash, false))
+        Ok(Self::assemble(
+            flags,
+            STREAM_DEPTH,
+            chunk_index,
+            hash,
+            false,
+        ))
     }
 
     pub fn inline_data(data: &[u8], flags: ContentFlags) -> Result<Self, ContentError> {
@@ -408,8 +414,19 @@ impl core::fmt::Display for ContentId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let cid_type = self.cid_type();
         match cid_type {
-            CidType::Stream => write!(f, "{} Stream chunk#{}", hex_prefix(&self.hash), self.raw_size_field()),
-            _ => write!(f, "{} {:?} {}B", hex_prefix(&self.hash), cid_type, self.payload_size()),
+            CidType::Stream => write!(
+                f,
+                "{} Stream chunk#{}",
+                hex_prefix(&self.hash),
+                self.raw_size_field()
+            ),
+            _ => write!(
+                f,
+                "{} {:?} {}B",
+                hex_prefix(&self.hash),
+                cid_type,
+                self.payload_size()
+            ),
         }
     }
 }
@@ -809,7 +826,10 @@ mod tests {
         // Encoding always rounds up (decoded >= input).
         for &size in &[1_048_577u64, 1_500_000, 10_000_000, 1_000_000_000] {
             let decoded = decode_bundle_size(encode_bundle_size(size));
-            assert!(decoded >= size, "encode_bundle_size({size}) decoded {decoded} < input");
+            assert!(
+                decoded >= size,
+                "encode_bundle_size({size}) decoded {decoded} < input"
+            );
         }
     }
 

@@ -2537,10 +2537,13 @@ dependencies = [
  "hex",
  "safetensors",
  "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]
