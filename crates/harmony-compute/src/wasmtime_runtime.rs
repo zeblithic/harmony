@@ -322,7 +322,9 @@ impl WasmtimeRuntime {
                                 }
                                 caller.data_mut().model_cache =
                                     Some((cg, ct, gguf_data, tokenizer_data));
-                                caller.data_mut().inference_engine = Some(engine);
+                                let data = caller.data_mut();
+                                data.inference_engine = Some(engine);
+                                data.last_logits = None;
                                 return Ok(0);
                             }
                         }
