@@ -101,12 +101,12 @@ impl InferenceEngine for QwenEngine {
             .forward(&input, self.position)
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
 
-        // Candle's quantized_qwen3 outputs [batch, vocab_size] with batch=1.
-        // Handle both 1D (defensive fallback) and 2D shapes.
+        // Candle's quantized_qwen3 outputs [1, vocab_size] (2D with batch=1).
+        // The 2D branch is the normal path; 1D is a defensive fallback.
         let logits = match logits.dims().len() {
-            1 => logits, // Defensive: [vocab_size]
+            1 => logits,
             2 => {
-                // [batch, vocab_size] — select the last row
+                // Normal path: [batch=1, vocab_size] — select the last row
                 let batch = logits
                     .dim(0)
                     .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;

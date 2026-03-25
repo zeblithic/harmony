@@ -16,8 +16,8 @@ fn load_test_engine() -> QwenEngine {
     let tokenizer_path = std::env::var("HARMONY_TEST_TOKENIZER")
         .expect("set HARMONY_TEST_TOKENIZER to a tokenizer.json path");
 
-    let gguf_bytes = std::fs::read(&gguf_path)
-        .unwrap_or_else(|e| panic!("failed to read {gguf_path}: {e}"));
+    let gguf_bytes =
+        std::fs::read(&gguf_path).unwrap_or_else(|e| panic!("failed to read {gguf_path}: {e}"));
     let tokenizer_bytes = std::fs::read(&tokenizer_path)
         .unwrap_or_else(|e| panic!("failed to read {tokenizer_path}: {e}"));
 
@@ -82,7 +82,9 @@ fn test_forward_pass_returns_logits() {
 #[ignore]
 fn test_sample_produces_valid_token() {
     let mut engine = load_test_engine();
-    let tokens = engine.tokenize("The capital of France is").expect("tokenize");
+    let tokens = engine
+        .tokenize("The capital of France is")
+        .expect("tokenize");
     let logits = engine.forward(&tokens).expect("forward");
 
     let token = engine
@@ -104,12 +106,16 @@ fn test_generate_ten_tokens() {
     let mut engine = load_test_engine();
     let prompt_tokens = engine.tokenize("Once upon a time").expect("tokenize");
     let logits = engine.forward(&prompt_tokens).expect("prefill");
-    let mut next = engine.sample(&logits, &SamplingParams::greedy()).expect("sample");
+    let mut next = engine
+        .sample(&logits, &SamplingParams::greedy())
+        .expect("sample");
 
     let mut generated = vec![next];
     for _ in 0..9 {
         let logits = engine.forward(&[next]).expect("decode step");
-        next = engine.sample(&logits, &SamplingParams::greedy()).expect("sample");
+        next = engine
+            .sample(&logits, &SamplingParams::greedy())
+            .expect("sample");
         generated.push(next);
     }
 

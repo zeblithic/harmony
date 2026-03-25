@@ -15,7 +15,7 @@ The crate wraps candle-transformers' `quantized_qwen3::ModelWeights` behind an `
 | Crate | Purpose |
 |-------|---------|
 | `candle-core` | Tensor operations, Device abstraction (CPU/CUDA/Metal) |
-| `candle-nn` | Neural network primitives |
+| `candle-nn` | Neural network primitives (transitive via candle-transformers) |
 | `candle-transformers` | Qwen3 quantized model implementation |
 | `tokenizers` | Hugging Face BPE tokenizer (Qwen3 vocabulary) |
 | `half` | f16 type (already in workspace) |
