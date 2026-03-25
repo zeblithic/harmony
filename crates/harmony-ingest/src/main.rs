@@ -1,5 +1,6 @@
 mod config;
 mod journal;
+mod manifest;
 mod shard;
 mod storage;
 
