@@ -306,4 +306,3 @@ Require real GGUF model files (env vars `HARMONY_TEST_GGUF`, `HARMONY_TEST_TOKEN
 - **Zenoh queryable service** — harmony-yku, blocked by this bead
 - **Streaming generation API** — trivial to build on token-by-token primitives
 - **Shared engine across modules** — per-module engine for now
-- **Multiple model_load calls per execution** — wasmtime replay uses a single model cache slot; calling `model_load` more than once in a single module execution produces incorrect results on replay. Call `model_load` once per execution.

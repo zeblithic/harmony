@@ -11,6 +11,11 @@ use crate::error::ComputeError;
 use crate::runtime::ComputeRuntime;
 use crate::types::{Checkpoint, ComputeResult, InstructionBudget};
 
+/// Cached model data for wasmtime replay: (gguf_cid, tokenizer_cid, gguf_bytes, tokenizer_bytes).
+/// Keyed by CID pair so a second `model_load` with different CIDs traps correctly.
+#[cfg(feature = "inference")]
+type ModelCache = ([u8; 32], [u8; 32], Vec<u8>, Vec<u8>);
+
 /// Host state stored in the wasmtime `Store`.
 ///
 /// When a WASM module calls `harmony.fetch_content`, the host function
@@ -27,12 +32,15 @@ struct HostState {
     /// Loaded inference engine (only available with `inference` feature).
     #[cfg(feature = "inference")]
     inference_engine: Option<harmony_inference::QwenEngine>,
-    /// Logits from the most recent `forward()` call, consumed by `sample()`.
+    /// Logits from the most recent `forward()` call, read by `sample()`.
+    /// Persists until the next `forward()` or `model_reset()` — multiple
+    /// `sample()` calls from the same logits are allowed (e.g. beam search).
     #[cfg(feature = "inference")]
     last_logits: Option<Vec<f32>>,
-    /// Cached model data for replay: (gguf_bytes, tokenizer_bytes).
+    /// Cached model data for replay: (gguf_cid, tokenizer_cid, gguf_bytes, tokenizer_bytes).
+    /// Keyed by CID pair so a second `model_load` with different CIDs traps correctly.
     #[cfg(feature = "inference")]
-    model_cache: Option<(Vec<u8>, Vec<u8>)>,
+    model_cache: Option<ModelCache>,
     /// Cached model-not-found error code for replay (-1 or -2).
     #[cfg(feature = "inference")]
     model_not_found: Option<i32>,
@@ -78,7 +86,7 @@ impl HostState {
     fn with_inference_cache(
         io_cache: HashMap<[u8; 32], Vec<u8>>,
         not_found_cids: HashSet<[u8; 32]>,
-        model_cache: Option<(Vec<u8>, Vec<u8>)>,
+        model_cache: Option<ModelCache>,
         model_not_found: Option<i32>,
     ) -> Self {
         Self {
@@ -119,15 +127,16 @@ struct WasmtimeSession {
     pending_cid: Option<[u8; 32]>,
     /// Memory snapshot at the end of the last execution.
     memory_snapshot: Vec<u8>,
-    /// Cached model data for replay: (gguf_bytes, tokenizer_bytes).
+    /// Cached model data for replay: (gguf_cid, tokenizer_cid, gguf_bytes, tokenizer_bytes).
     #[cfg(feature = "inference")]
-    model_cache: Option<(Vec<u8>, Vec<u8>)>,
+    model_cache: Option<ModelCache>,
     /// Cached model-not-found error code for replay (-1 or -2).
     #[cfg(feature = "inference")]
     model_not_found: Option<i32>,
-    /// Whether the pending IO request is a model load (vs. content fetch).
+    /// CIDs of a pending model load request, if any. Replaces a simple bool
+    /// so we can key the model cache on the exact CID pair.
     #[cfg(feature = "inference")]
-    pending_model_load: bool,
+    pending_model_cids: Option<([u8; 32], [u8; 32])>,
 }
 
 /// Wasmtime-backed WASM execution engine with JIT compilation.
@@ -261,28 +270,7 @@ impl WasmtimeRuntime {
                      gguf_cid_ptr: i32,
                      tokenizer_cid_ptr: i32|
                      -> Result<i32, wasmtime::Error> {
-                        // Check cached model_not_found first (replay path).
-                        if let Some(code) = caller.data().model_not_found {
-                            return Ok(code);
-                        }
-
-                        // Check cached model data (replay path).
-                        if caller.data().model_cache.is_some() {
-                            let (gguf_data, tokenizer_data) =
-                                caller.data().model_cache.clone().unwrap();
-                            let mut engine =
-                                harmony_inference::QwenEngine::new(candle_core::Device::Cpu);
-                            if engine.load_gguf(&gguf_data).is_err() {
-                                return Ok(-3);
-                            }
-                            if engine.load_tokenizer(&tokenizer_data).is_err() {
-                                return Ok(-4);
-                            }
-                            caller.data_mut().inference_engine = Some(engine);
-                            return Ok(0);
-                        }
-
-                        // Cache miss — read CIDs and trap.
+                        // Read CIDs first — needed for both cache check and trap path.
                         let memory = caller
                             .get_export("memory")
                             .and_then(|e| e.into_memory())
@@ -300,6 +288,33 @@ impl WasmtimeRuntime {
                                 wasmtime::Error::msg(format!("read tokenizer CID: {e}"))
                             })?;
 
+                        // Check cached model_not_found first (replay path).
+                        if let Some(code) = caller.data().model_not_found {
+                            return Ok(code);
+                        }
+
+                        // Check cached model data (replay path) — only use if CIDs match.
+                        if let Some((cached_gguf_cid, cached_tok_cid, _, _)) =
+                            &caller.data().model_cache
+                        {
+                            if *cached_gguf_cid == gguf_cid && *cached_tok_cid == tokenizer_cid {
+                                use harmony_inference::InferenceEngine;
+                                let (_, _, gguf_data, tokenizer_data) =
+                                    caller.data_mut().model_cache.take().unwrap();
+                                let mut engine =
+                                    harmony_inference::QwenEngine::new(candle_core::Device::Cpu);
+                                if engine.load_gguf(&gguf_data).is_err() {
+                                    return Ok(-3);
+                                }
+                                if engine.load_tokenizer(&tokenizer_data).is_err() {
+                                    return Ok(-4);
+                                }
+                                caller.data_mut().inference_engine = Some(engine);
+                                return Ok(0);
+                            }
+                        }
+
+                        // Cache miss or CID mismatch — trap for IO.
                         let host = caller.data_mut();
                         host.io_request = Some(crate::types::IORequest::LoadModel {
                             gguf_cid,
@@ -768,11 +783,16 @@ impl ComputeRuntime for WasmtimeRuntime {
                 _ => None,
             };
             #[cfg(feature = "inference")]
-            let pending_model_load = matches!(
-                &result,
-                ComputeResult::NeedsIO { request }
-                if matches!(request, crate::types::IORequest::LoadModel { .. })
-            );
+            let pending_model_cids = match &result {
+                ComputeResult::NeedsIO {
+                    request:
+                        crate::types::IORequest::LoadModel {
+                            gguf_cid,
+                            tokenizer_cid,
+                        },
+                } => Some((*gguf_cid, *tokenizer_cid)),
+                _ => None,
+            };
             self.session = Some(WasmtimeSession {
                 module_bytes: module_bytes.to_vec(),
                 module_hash,
@@ -787,7 +807,7 @@ impl ComputeRuntime for WasmtimeRuntime {
                 #[cfg(feature = "inference")]
                 model_not_found: None,
                 #[cfg(feature = "inference")]
-                pending_model_load,
+                pending_model_cids,
             });
         }
 
@@ -819,20 +839,21 @@ impl ComputeRuntime for WasmtimeRuntime {
         // Check if this is a model load response (inference feature) or
         // a content fetch response.
         #[cfg(feature = "inference")]
-        let is_model_load = session.pending_model_load;
+        let is_model_load = session.pending_model_cids.is_some();
         #[cfg(not(feature = "inference"))]
         let is_model_load = false;
 
         if is_model_load {
             #[cfg(feature = "inference")]
             {
-                session.pending_model_load = false;
+                let (gguf_cid, tokenizer_cid) = session.pending_model_cids.take().unwrap();
                 match response {
                     crate::types::IOResponse::ModelReady {
                         gguf_data,
                         tokenizer_data,
                     } => {
-                        session.model_cache = Some((gguf_data, tokenizer_data));
+                        session.model_cache =
+                            Some((gguf_cid, tokenizer_cid, gguf_data, tokenizer_data));
                     }
                     crate::types::IOResponse::ModelGgufNotFound => {
                         session.model_not_found = Some(-1);
@@ -850,7 +871,8 @@ impl ComputeRuntime for WasmtimeRuntime {
                     }
                 }
 
-                // Re-execute with updated model cache.
+                // Re-execute with updated model cache. Clone is needed because
+                // session retains the cache for potential future FetchContent replays.
                 let host_state = HostState::with_inference_cache(
                     session.io_cache.clone(),
                     session.not_found_cids.clone(),
@@ -867,11 +889,16 @@ impl ComputeRuntime for WasmtimeRuntime {
                         } => Some(*cid),
                         _ => None,
                     };
-                    let new_pending_model_load = matches!(
-                        &result,
-                        ComputeResult::NeedsIO { request }
-                        if matches!(request, crate::types::IORequest::LoadModel { .. })
-                    );
+                    let new_pending_model_cids = match &result {
+                        ComputeResult::NeedsIO {
+                            request:
+                                crate::types::IORequest::LoadModel {
+                                    gguf_cid,
+                                    tokenizer_cid,
+                                },
+                        } => Some((*gguf_cid, *tokenizer_cid)),
+                        _ => None,
+                    };
                     let total_fuel = session.total_fuel_consumed + fuel_consumed;
                     self.session = Some(WasmtimeSession {
                         module_bytes: session.module_bytes,
@@ -884,7 +911,7 @@ impl ComputeRuntime for WasmtimeRuntime {
                         memory_snapshot: mem_snapshot,
                         model_cache: session.model_cache,
                         model_not_found: session.model_not_found,
-                        pending_model_load: new_pending_model_load,
+                        pending_model_cids: new_pending_model_cids,
                     });
                 }
 
@@ -952,11 +979,16 @@ impl ComputeRuntime for WasmtimeRuntime {
                 _ => None,
             };
             #[cfg(feature = "inference")]
-            let new_pending_model_load = matches!(
-                &result,
-                ComputeResult::NeedsIO { request }
-                if matches!(request, crate::types::IORequest::LoadModel { .. })
-            );
+            let new_pending_model_cids = match &result {
+                ComputeResult::NeedsIO {
+                    request:
+                        crate::types::IORequest::LoadModel {
+                            gguf_cid,
+                            tokenizer_cid,
+                        },
+                } => Some((*gguf_cid, *tokenizer_cid)),
+                _ => None,
+            };
             // Accumulate fuel across replay rounds. Each replay re-executes
             // the module from scratch, so `fuel_consumed` includes re-running
             // the cached-IO path. We sum rather than replace because the node
@@ -976,7 +1008,7 @@ impl ComputeRuntime for WasmtimeRuntime {
                 #[cfg(feature = "inference")]
                 model_not_found: session.model_not_found,
                 #[cfg(feature = "inference")]
-                pending_model_load: new_pending_model_load,
+                pending_model_cids: new_pending_model_cids,
             });
         }
 
@@ -989,7 +1021,7 @@ impl ComputeRuntime for WasmtimeRuntime {
                 return true;
             }
             #[cfg(feature = "inference")]
-            if s.pending_model_load {
+            if s.pending_model_cids.is_some() {
                 return true;
             }
             false

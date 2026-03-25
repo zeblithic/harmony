@@ -14,7 +14,9 @@ struct HostState {
     /// Loaded inference engine (only available with `inference` feature).
     #[cfg(feature = "inference")]
     inference_engine: Option<harmony_inference::QwenEngine>,
-    /// Logits from the most recent `forward()` call, consumed by `sample()`.
+    /// Logits from the most recent `forward()` call, read by `sample()`.
+    /// Persists until the next `forward()` or `model_reset()` — multiple
+    /// `sample()` calls from the same logits are allowed (e.g. beam search).
     #[cfg(feature = "inference")]
     last_logits: Option<Vec<f32>>,
 }
