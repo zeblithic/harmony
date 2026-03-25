@@ -326,6 +326,10 @@ impl WasmtimeRuntime {
                             .and_then(|e| e.into_memory())
                             .ok_or_else(|| wasmtime::Error::msg("missing exported memory"))?;
 
+                        if text_len < 0 {
+                            return Ok(-3);
+                        }
+
                         let engine = match &caller.data().inference_engine {
                             Some(e) => e,
                             None => return Ok(-1),
@@ -381,7 +385,7 @@ impl WasmtimeRuntime {
                             .and_then(|e| e.into_memory())
                             .ok_or_else(|| wasmtime::Error::msg("missing exported memory"))?;
 
-                        if tokens_len % 4 != 0 {
+                        if tokens_len < 0 || tokens_len % 4 != 0 {
                             return Ok(-3);
                         }
 
@@ -437,7 +441,7 @@ impl WasmtimeRuntime {
                             .and_then(|e| e.into_memory())
                             .ok_or_else(|| wasmtime::Error::msg("missing exported memory"))?;
 
-                        if tokens_len % 4 != 0 || tokens_len == 0 {
+                        if tokens_len <= 0 || tokens_len % 4 != 0 {
                             return Ok(-3);
                         }
 
@@ -533,7 +537,7 @@ impl WasmtimeRuntime {
                         // Clone logits to avoid simultaneous borrows of caller.data()
                         let logits = match caller.data().last_logits.as_deref() {
                             Some(l) => l.to_vec(),
-                            None => return Ok(-2),
+                            None => return Ok(-3), // no logits from prior forward()
                         };
 
                         let engine = caller.data().inference_engine.as_ref().unwrap();
