@@ -1,11 +1,14 @@
 //! QwenEngine: candle-based inference engine for quantized Qwen3 models.
 
-use candle_core::Device;
-use crate::{InferenceEngine, SamplingParams};
+#[allow(unused_imports)]
 use crate::error::InferenceError;
+#[allow(unused_imports)]
+use crate::{InferenceEngine, SamplingParams};
+use candle_core::Device;
 
 /// Inference engine wrapping candle-transformers' quantized Qwen3 implementation.
 pub struct QwenEngine {
+    #[allow(dead_code)]
     device: Device,
 }
 
