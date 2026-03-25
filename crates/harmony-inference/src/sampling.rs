@@ -80,7 +80,7 @@ pub fn apply_top_p(logits: &mut [f32], top_p: f32) {
 /// Tokens appearing multiple times in context are penalized only once,
 /// matching the standard llama.cpp / HF transformers behavior.
 pub fn apply_repeat_penalty(logits: &mut [f32], penalty: f32, context_tokens: &[u32]) {
-    if penalty == 1.0 {
+    if penalty == 1.0 || penalty <= 0.0 {
         return;
     }
     let mut seen = std::collections::HashSet::new();

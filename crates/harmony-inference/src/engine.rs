@@ -119,6 +119,11 @@ impl InferenceEngine for QwenEngine {
                 let rows = logits
                     .dim(0)
                     .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+                if rows == 0 {
+                    return Err(InferenceError::ForwardFailed(
+                        "model returned empty logits tensor [0, vocab_size]".into(),
+                    ));
+                }
                 logits
                     .get(rows - 1)
                     .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?

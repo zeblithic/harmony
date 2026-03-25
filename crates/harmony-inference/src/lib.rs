@@ -33,6 +33,7 @@ pub struct SamplingParams {
     /// Top-k filtering. 0 = disabled.
     pub top_k: u32,
     /// Penalty for repeated tokens. 1.0 = no penalty.
+    /// Must be > 0.0; values <= 0.0 are treated as no penalty.
     pub repeat_penalty: f32,
 }
 
