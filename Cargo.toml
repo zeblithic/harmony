@@ -12,6 +12,7 @@ members = [
     "crates/harmony-crypto",
     "crates/harmony-identity",
     "crates/harmony-ingest",
+    "crates/harmony-inference",
     "crates/harmony-jain",
     "crates/harmony-jcs",
     "crates/harmony-kel",
@@ -91,6 +92,11 @@ ciborium = { version = "0.2", default-features = false }
 wasmi = "1"
 wasmtime = "38"
 
+# ML inference
+candle-core = "0.9"
+candle-transformers = "0.9"
+tokenizers = "0.22"
+
 # AWS SDK
 aws-config = "1"
 aws-sdk-s3 = "1"
@@ -144,6 +150,7 @@ harmony-tunnel = { path = "crates/harmony-tunnel", default-features = false }
 harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-rawlink = { path = "crates/harmony-rawlink" }
 harmony-s3 = { path = "crates/harmony-s3" }
+harmony-inference = { path = "crates/harmony-inference" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
 
 # Optimized profile for cross-compiled deployment binaries (OpenWRT, RPi).
