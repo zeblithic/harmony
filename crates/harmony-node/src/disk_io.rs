@@ -21,10 +21,10 @@ use std::{
 /// Return the filesystem path for a CAS book CID under `data_dir`.
 ///
 /// Layout: `{data_dir}/book/{hex_cid[8..10]}/{hex_cid}`
-pub fn book_path(data_dir: &str, cid: &ContentId) -> PathBuf {
+pub fn book_path(data_dir: &std::path::Path, cid: &ContentId) -> PathBuf {
     let hex_cid = hex::encode(cid.to_bytes());
     let prefix = &hex_cid[8..10];
-    PathBuf::from(data_dir)
+    data_dir
         .join("book")
         .join(prefix)
         .join(&hex_cid)
@@ -35,14 +35,22 @@ pub fn book_path(data_dir: &str, cid: &ContentId) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Write `data` for `cid` under `data_dir`, creating parent directories as needed.
-pub fn write_book(data_dir: &str, cid: &ContentId, data: &[u8]) -> Result<(), io::Error> {
+///
+/// Uses write-to-temp-then-rename for crash safety: a power loss during write
+/// leaves the temp file (not the final path), so scan_books never sees a
+/// truncated book.
+pub fn write_book(data_dir: &std::path::Path, cid: &ContentId, data: &[u8]) -> Result<(), io::Error> {
     let path = book_path(data_dir, cid);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = fs::File::create(&path)?;
-    file.write_all(data)?;
-    file.sync_all()?;
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp_path, &path)?;
     Ok(())
 }
 
@@ -53,7 +61,7 @@ pub fn write_book(data_dir: &str, cid: &ContentId, data: &[u8]) -> Result<(), io
 /// Read raw bytes for `cid` from `data_dir`.
 ///
 /// Returns `Err` with `ErrorKind::NotFound` if the file does not exist.
-pub fn read_book(data_dir: &str, cid: &ContentId) -> Result<Vec<u8>, io::Error> {
+pub fn read_book(data_dir: &std::path::Path, cid: &ContentId) -> Result<Vec<u8>, io::Error> {
     let path = book_path(data_dir, cid);
     fs::read(path)
 }
@@ -65,7 +73,7 @@ pub fn read_book(data_dir: &str, cid: &ContentId) -> Result<Vec<u8>, io::Error> 
 /// Walk `{data_dir}/book/` and return all valid `ContentId`s found.
 ///
 /// Files whose names are not valid 64-hex-char CIDs are skipped with a warning.
-pub fn scan_books(data_dir: &str) -> Vec<ContentId> {
+pub fn scan_books(data_dir: &std::path::Path) -> Vec<ContentId> {
     let book_root = PathBuf::from(data_dir).join("book");
     let mut cids = Vec::new();
 
@@ -164,8 +172,8 @@ mod tests {
         let data = b"hello harmony disk_io";
         let cid = make_cid(data);
 
-        write_book(&dir_str(&dir), &cid, data).expect("write should succeed");
-        let read_back = read_book(&dir_str(&dir), &cid).expect("read should succeed");
+        write_book(dir.path(), &cid, data).expect("write should succeed");
+        let read_back = read_book(dir.path(), &cid).expect("read should succeed");
 
         assert_eq!(read_back, data);
     }
@@ -176,9 +184,9 @@ mod tests {
         let data = b"prefix dir test";
         let cid = make_cid(data);
 
-        write_book(&dir_str(&dir), &cid, data).expect("write should succeed");
+        write_book(dir.path(), &cid, data).expect("write should succeed");
 
-        let path = book_path(&dir_str(&dir), &cid);
+        let path = book_path(dir.path(), &cid);
         assert!(path.exists(), "book file should exist at expected path");
 
         let prefix_dir = path.parent().unwrap();
@@ -193,11 +201,11 @@ mod tests {
         let cid_b = make_cid(b"book b");
         let cid_c = make_cid(b"book c");
 
-        write_book(&dir_str(&dir), &cid_a, b"book a").unwrap();
-        write_book(&dir_str(&dir), &cid_b, b"book b").unwrap();
-        write_book(&dir_str(&dir), &cid_c, b"book c").unwrap();
+        write_book(dir.path(), &cid_a, b"book a").unwrap();
+        write_book(dir.path(), &cid_b, b"book b").unwrap();
+        write_book(dir.path(), &cid_c, b"book c").unwrap();
 
-        let mut found = scan_books(&dir_str(&dir));
+        let mut found = scan_books(dir.path());
         found.sort_by_key(|c| c.to_bytes());
 
         let mut expected = vec![cid_a, cid_b, cid_c];
@@ -209,23 +217,22 @@ mod tests {
     #[test]
     fn scan_skips_invalid_filenames() {
         let dir = tempfile::TempDir::new().unwrap();
-        let data_dir = dir_str(&dir);
 
         // Write a valid book first.
         let cid = make_cid(b"valid book");
-        write_book(&data_dir, &cid, b"valid book").unwrap();
+        write_book(dir.path(), &cid, b"valid book").unwrap();
 
         // Inject a garbage file in the same prefix directory.
         let prefix = &hex::encode(cid.to_bytes())[8..10].to_owned();
-        let bad_file = PathBuf::from(&data_dir).join("book").join(prefix).join("not-a-cid.txt");
+        let bad_file = dir.path().join("book").join(prefix).join("not-a-cid.txt");
         fs::write(&bad_file, b"garbage").unwrap();
 
         // Inject a file with wrong length (too short) in a fresh prefix dir.
-        let short_dir = PathBuf::from(&data_dir).join("book").join("ff");
+        let short_dir = dir.path().join("book").join("ff");
         fs::create_dir_all(&short_dir).unwrap();
         fs::write(short_dir.join("tooshort"), b"data").unwrap();
 
-        let found = scan_books(&data_dir);
+        let found = scan_books(dir.path());
 
         // Only the one valid CID should be returned.
         assert_eq!(found.len(), 1);
@@ -237,14 +244,14 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cid = make_cid(b"this was never written");
 
-        let err = read_book(&dir_str(&dir), &cid).expect_err("read of missing file should fail");
+        let err = read_book(dir.path(), &cid).expect_err("read of missing file should fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
     fn scan_empty_directory_returns_empty() {
         let dir = tempfile::TempDir::new().unwrap();
-        let found = scan_books(&dir_str(&dir));
+        let found = scan_books(dir.path());
         assert!(found.is_empty());
     }
 }

@@ -70,9 +70,10 @@ pub struct NodeConfig {
     pub inference_gguf_cid: Option<[u8; 32]>,
     /// Hex-decoded 32-byte CID of the tokenizer.json file in CAS (for inference).
     pub inference_tokenizer_cid: Option<[u8; 32]>,
+    /// Whether disk persistence is enabled (true when data_dir is configured).
+    /// Controls whether StorageTier emits PersistToDisk and DiskLookup actions.
+    pub disk_enabled: bool,
     /// CIDs discovered by scanning the data directory at startup.
-    /// When non-empty, `StorageTier::enable_disk()` is called so that cache
-    /// misses for these CIDs emit `DiskLookup` actions instead of miss replies.
     pub disk_cids: Vec<ContentId>,
 }
 
@@ -137,6 +138,7 @@ impl Default for NodeConfig {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
             disk_cids: Vec::new(),
         }
     }
@@ -840,8 +842,8 @@ impl<B: BookStore> NodeRuntime<B> {
             inference_request_nonce: 0,
         };
 
-        // Activate disk tier if the startup scan found persisted CIDs.
-        if !config.disk_cids.is_empty() {
+        // Activate disk tier when data_dir is configured (even if empty on first boot).
+        if config.disk_enabled {
             rt.storage.enable_disk(config.disk_cids);
         }
 
@@ -3826,6 +3828,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
             disk_cids: Vec::new(),
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -3897,6 +3900,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -3934,6 +3938,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
             disk_cids: Vec::new(),
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
@@ -3968,6 +3973,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4031,6 +4037,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4083,6 +4090,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4128,6 +4136,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -5031,6 +5040,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());

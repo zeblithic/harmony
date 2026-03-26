@@ -216,7 +216,7 @@ pub async fn run(
     did_web_cache_ttl: u64,
     rawlink_interface: Option<String>,
     archivist_config: Option<crate::config::ArchivistConfig>,
-    data_dir: Option<String>,
+    data_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -1202,7 +1202,7 @@ async fn dispatch_action(
     tunnel_senders: &HashMap<String, TunnelSender>,
     deferred_dials: &mut BinaryHeap<Reverse<DeferredDial>>,
     ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    data_dir: &Option<String>,
+    data_dir: &Option<std::path::PathBuf>,
     disk_tx: &mpsc::Sender<DiskIoResult>,
 ) {
     match action {

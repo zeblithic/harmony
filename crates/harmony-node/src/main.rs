@@ -544,6 +544,21 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 public_ephemeral_announce: !no_public_ephemeral_announce,
             };
 
+            // Scan disk for persisted CIDs (spawn_blocking to avoid blocking tokio).
+            let disk_cids = match &config_file.data_dir {
+                Some(dir) => {
+                    let dir = dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let cids = crate::disk_io::scan_books(&dir);
+                        tracing::info!(count = cids.len(), path = %dir.display(), "loaded book CIDs from disk");
+                        cids
+                    })
+                    .await
+                    .unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
+
             let config = NodeConfig {
                 storage_budget: StorageBudget {
                     cache_capacity,
@@ -590,14 +605,8 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                             })
                     })
                     .flatten(),
-                disk_cids: match &config_file.data_dir {
-                    Some(dir) => {
-                        let cids = crate::disk_io::scan_books(dir);
-                        tracing::info!(count = cids.len(), path = %dir, "loaded book CIDs from disk");
-                        cids
-                    }
-                    None => Vec::new(),
-                },
+                disk_enabled: config_file.data_dir.is_some(),
+                disk_cids: disk_cids,
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 

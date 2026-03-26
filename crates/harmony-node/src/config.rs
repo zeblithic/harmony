@@ -62,7 +62,7 @@ pub struct ConfigFile {
     pub compute_budget: Option<u64>,
     /// Directory for persistent CAS book storage. When set, durable books
     /// are written to disk and reloaded on restart.
-    pub data_dir: Option<String>,
+    pub data_dir: Option<PathBuf>,
     pub filter_broadcast_ticks: Option<u32>,
     pub filter_mutation_threshold: Option<u32>,
     pub encrypted_durable_persist: Option<bool>,
