@@ -50,11 +50,6 @@ pub struct WorkflowEngine {
     pending_queue: VecDeque<WorkflowId>,
     /// Workflows with deferred IO responses, ready to be resumed on next tick.
     deferred_resume_queue: VecDeque<WorkflowId>,
-    /// Cached model data shared across all workflows.
-    /// When a ModelLoaded event arrives, the data is cached here so subsequent
-    /// workflows requesting the same model CIDs can be resumed immediately
-    /// without cloning multi-GB data from the caller.
-    model_data_cache: Option<([u8; 32], [u8; 32], Vec<u8>, Vec<u8>)>,
 }
 
 impl WorkflowEngine {
@@ -68,7 +63,6 @@ impl WorkflowEngine {
             active: None,
             pending_queue: VecDeque::new(),
             deferred_resume_queue: VecDeque::new(),
-            model_data_cache: None,
         }
     }
 
