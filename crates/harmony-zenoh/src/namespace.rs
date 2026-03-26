@@ -883,6 +883,22 @@ mod tests {
         assert_eq!(compute::RESULT_SUB, "harmony/compute/result/*");
     }
 
+    #[test]
+    fn compute_speculative_constants() {
+        assert_eq!(
+            compute::VERIFY_ACTIVITY,
+            "harmony/compute/activity/verify"
+        );
+        assert_eq!(
+            compute::SPECULATIVE_ACTIVITY,
+            "harmony/compute/activity/speculative"
+        );
+        assert_eq!(
+            compute::CAPACITY_SUB,
+            "harmony/compute/capacity/*"
+        );
+    }
+
     // ── Tier 3: Workflow ────────────────────────────────────────
 
     #[test]

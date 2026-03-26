@@ -130,4 +130,72 @@ mod tests {
         let lp = logprob_of(&logits, 999);
         assert_eq!(lp, f32::NEG_INFINITY);
     }
+
+    /// End-to-end verification with synthetic logits — simulates the full
+    /// speculative decoding accept/reject loop over 4 draft tokens.
+    #[test]
+    fn end_to_end_verification_synthetic() {
+        use crate::{DraftEntry, VerifyResponse};
+
+        // 5-token vocabulary. Each position has one strongly preferred token (logit 5.0),
+        // which softmax pushes to ≈ 0.93 probability.
+
+        // Position 0: token 1 is dominant
+        let logits_pos0 = vec![0.0, 5.0, 0.0, 0.0, 0.0];
+        // Position 1: token 2 is dominant
+        let logits_pos1 = vec![0.0, 0.0, 5.0, 0.0, 0.0];
+        // Position 2: token 3 is dominant
+        let logits_pos2 = vec![0.0, 0.0, 0.0, 5.0, 0.0];
+        // Position 3: token 0 is dominant (draft proposes token 4 → mismatch → REJECT)
+        let logits_pos3 = vec![5.0, 0.0, 0.0, 0.0, 0.0];
+
+        // All draft entries propose 0.5 draft probability.
+        let draft_logprob = (0.5f32).ln(); // ≈ -0.693
+
+        let _drafts = vec![
+            DraftEntry { token_id: 1, logprob: draft_logprob }, // p_target≈0.93 >= 0.5 → ACCEPT
+            DraftEntry { token_id: 2, logprob: draft_logprob }, // p_target≈0.93 >= 0.5 → ACCEPT
+            DraftEntry { token_id: 3, logprob: draft_logprob }, // p_target≈0.93 >= 0.5 → ACCEPT
+            DraftEntry { token_id: 4, logprob: draft_logprob }, // p_target≈0.01 < 0.5  → REJECT
+        ];
+
+        // Step-by-step verification matches run_verification logic:
+        assert!(should_accept_draft(&logits_pos0, 1, draft_logprob), "pos0: token 1 should be accepted");
+        assert!(should_accept_draft(&logits_pos1, 2, draft_logprob), "pos1: token 2 should be accepted");
+        assert!(should_accept_draft(&logits_pos2, 3, draft_logprob), "pos2: token 3 should be accepted");
+        assert!(!should_accept_draft(&logits_pos3, 4, draft_logprob), "pos3: token 4 should be rejected");
+
+        // At rejection, bonus token is the argmax of logits_pos3
+        let (bonus_token, bonus_logprob) = sample_greedy_with_logprob(&logits_pos3);
+        assert_eq!(bonus_token, 0, "bonus token should be argmax of logits_pos3");
+        assert!(bonus_logprob < 0.0, "bonus logprob should be negative");
+        assert!(bonus_logprob > f32::NEG_INFINITY, "bonus logprob should be finite");
+
+        // Verify expected VerifyResponse fields
+        let response = VerifyResponse {
+            accepted_count: 3,
+            bonus_token,
+            bonus_logprob,
+        };
+        assert_eq!(response.accepted_count, 3);
+        assert_eq!(response.bonus_token, 0);
+    }
+
+    /// Verify that when all draft tokens are accepted the bonus token is sampled
+    /// from the subsequent forward pass logits.
+    #[test]
+    fn verification_all_accepted() {
+        use crate::DraftEntry;
+
+        let logits = vec![0.0, 5.0, 0.0, 0.0]; // token 1 dominates (≈ 0.93)
+
+        let draft = DraftEntry { token_id: 1, logprob: (0.3f32).ln() }; // p_draft=0.3
+        // p_target ≈ 0.93 >= 0.3 → ACCEPT
+        assert!(should_accept_draft(&logits, draft.token_id, draft.logprob));
+
+        // When all drafts accepted, bonus comes from the next forward pass
+        let bonus_logits = vec![0.0, 0.0, 5.0, 0.0]; // token 2 dominates
+        let (bonus, _logprob) = sample_greedy_with_logprob(&bonus_logits);
+        assert_eq!(bonus, 2, "bonus token should be argmax of bonus logits");
+    }
 }

@@ -345,4 +345,39 @@ mod tests {
         let err = VerifyRequest::parse(&bytes).unwrap_err();
         assert!(err.contains("truncated"));
     }
+
+    /// Roundtrip with realistic sizes, asserting exact wire byte counts.
+    ///
+    /// Wire layout:
+    ///   Request: 1 (tag) + 4 (context_len) + 4*1000 (tokens) + 1 (draft_count) + 8*5 (drafts)
+    ///          = 1 + 4 + 4000 + 1 + 40 = 4046 bytes
+    ///   Response: 1 (tag) + 1 (accepted_count) + 4 (bonus_token) + 4 (bonus_logprob) = 10 bytes
+    #[test]
+    fn protocol_roundtrip_realistic() {
+        let request = VerifyRequest {
+            context_tokens: (0..1000).collect(),
+            drafts: (0..5)
+                .map(|i| DraftEntry {
+                    token_id: 100 + i,
+                    logprob: -(i as f32 + 1.0) * 0.1,
+                })
+                .collect(),
+        };
+        let bytes = request.serialize();
+        // 1 + 4 + 4000 + 1 + 40 = 4046
+        assert_eq!(bytes.len(), 4046, "serialized request size mismatch");
+        let parsed = VerifyRequest::parse(&bytes).unwrap();
+        assert_eq!(request, parsed);
+
+        let response = VerifyResponse {
+            accepted_count: 3,
+            bonus_token: 42,
+            bonus_logprob: -0.5,
+        };
+        let resp_bytes = response.serialize();
+        // 1 (ok_tag) + 1 (accepted_count) + 4 (bonus_token) + 4 (bonus_logprob) = 10
+        assert_eq!(resp_bytes.len(), 10, "serialized response size mismatch");
+        let parsed_resp = VerifyResponse::parse(&resp_bytes).unwrap();
+        assert_eq!(response, parsed_resp);
+    }
 }
