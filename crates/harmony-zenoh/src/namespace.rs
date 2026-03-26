@@ -705,6 +705,23 @@ pub mod agent {
     pub fn task_key(agent_id: &str) -> String {
         format!("{PREFIX}/{agent_id}/task")
     }
+
+    /// Per-task stream key: `harmony/agent/{agent_id}/stream/{task_id}`
+    ///
+    /// Agents publish `StreamChunk` messages here for long-running tasks.
+    /// Requesters subscribe before sending the task query.
+    pub fn stream_key(agent_id: &str, task_id: &str) -> String {
+        format!("{PREFIX}/{agent_id}/stream/{task_id}")
+    }
+
+    /// Subscribe to all streams from one agent: `harmony/agent/{agent_id}/stream/*`
+    ///
+    /// Agent-scoped subscription — takes `agent_id` as parameter (unlike
+    /// `capacity_sub_all()` which is cross-agent). Stream subscriptions are
+    /// always scoped to a specific agent.
+    pub fn stream_sub(agent_id: &str) -> String {
+        format!("{PREFIX}/{agent_id}/stream/*")
+    }
 }
 
 #[cfg(test)]
@@ -1335,5 +1352,11 @@ mod tests {
 
         let sub = agent::capacity_sub_all();
         assert_eq!(sub, "harmony/agent/*/capacity");
+
+        let stream = agent::stream_key("deadbeef01020304", "task-abc");
+        assert_eq!(stream, "harmony/agent/deadbeef01020304/stream/task-abc");
+
+        let stream_sub = agent::stream_sub("deadbeef01020304");
+        assert_eq!(stream_sub, "harmony/agent/deadbeef01020304/stream/*");
     }
 }
