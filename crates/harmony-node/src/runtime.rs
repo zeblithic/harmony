@@ -70,6 +70,11 @@ pub struct NodeConfig {
     pub inference_gguf_cid: Option<[u8; 32]>,
     /// Hex-decoded 32-byte CID of the tokenizer.json file in CAS (for inference).
     pub inference_tokenizer_cid: Option<[u8; 32]>,
+    /// Whether disk persistence is enabled (true when data_dir is configured).
+    /// Controls whether StorageTier emits PersistToDisk and DiskLookup actions.
+    pub disk_enabled: bool,
+    /// CIDs discovered by scanning the data directory at startup.
+    pub disk_cids: Vec<ContentId>,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -133,6 +138,8 @@ impl Default for NodeConfig {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
+            disk_cids: Vec::new(),
         }
     }
 }
@@ -246,6 +253,15 @@ pub enum RuntimeEvent {
     L2InterfaceClosed { interface_name: String },
     /// DSD: verify response received from target node.
     VerifyResponse { payload: Vec<u8> },
+
+    /// Disk read completed — content fetched from persistent storage.
+    DiskReadComplete {
+        cid: ContentId,
+        query_id: u64,
+        data: Vec<u8>,
+    },
+    /// Disk read failed — file missing or corrupted.
+    DiskReadFailed { cid: ContentId, query_id: u64 },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -307,6 +323,10 @@ pub enum RuntimeAction {
     /// The event loop sends a Zenoh query to `key_expr` with `payload`,
     /// and feeds the reply back as `RuntimeEvent::VerifyResponse`.
     SendVerifyQuery { key_expr: String, payload: Vec<u8> },
+    /// Persist a CAS book to disk (spawned as blocking I/O by event loop).
+    PersistToDisk { cid: ContentId, data: Vec<u8> },
+    /// Read a CAS book from disk (spawned as blocking I/O by event loop).
+    DiskLookup { cid: ContentId, query_id: u64 },
 }
 
 /// Filter state received from a peer, with metadata.
@@ -807,7 +827,7 @@ impl<B: BookStore> NodeRuntime<B> {
             key_expr: harmony_zenoh::namespace::compute::CAPACITY_SUB.to_string(),
         });
 
-        let rt = Self {
+        let mut rt = Self {
             router,
             queryable_router,
             storage,
@@ -878,6 +898,11 @@ impl<B: BookStore> NodeRuntime<B> {
             #[cfg(feature = "inference")]
             speculative_queryable_id: None,
         };
+
+        // Activate disk tier when data_dir is configured (even if empty on first boot).
+        if config.disk_enabled {
+            rt.storage.enable_disk(config.disk_cids);
+        }
 
         // If inference model CIDs are configured AND the inference feature is
         // enabled, fetch both from CAS at startup. Without the feature, the
@@ -1500,6 +1525,22 @@ impl<B: BookStore> NodeRuntime<B> {
                     let _ = payload;
                 }
             }
+            RuntimeEvent::DiskReadComplete {
+                cid,
+                query_id,
+                data,
+            } => {
+                let storage_actions =
+                    self.storage
+                        .handle(StorageTierEvent::DiskReadComplete { cid, query_id, data });
+                self.dispatch_storage_actions_inline(storage_actions);
+            }
+            RuntimeEvent::DiskReadFailed { cid, query_id } => {
+                let storage_actions =
+                    self.storage
+                        .handle(StorageTierEvent::DiskReadFailed { cid, query_id });
+                self.dispatch_storage_actions_inline(storage_actions);
+            }
         }
     }
 
@@ -1848,11 +1889,15 @@ impl<B: BookStore> NodeRuntime<B> {
                 // Startup-only declarations — already processed in new().
                 StorageTierAction::DeclareQueryables { .. }
                 | StorageTierAction::DeclareSubscribers { .. } => {}
-                // Disk I/O actions — sans-I/O boundary. The runtime must wire
-                // these to actual filesystem operations (not yet implemented).
-                StorageTierAction::PersistToDisk { .. }
-                | StorageTierAction::RemoveFromDisk { .. }
-                | StorageTierAction::DiskLookup { .. } => {}
+                StorageTierAction::PersistToDisk { cid, data } => {
+                    out.push(RuntimeAction::PersistToDisk { cid, data });
+                }
+                StorageTierAction::DiskLookup { cid, query_id } => {
+                    out.push(RuntimeAction::DiskLookup { cid, query_id });
+                }
+                StorageTierAction::RemoveFromDisk { .. } => {
+                    // Deferred to disk eviction bead.
+                }
                 StorageTierAction::BroadcastFilter { payload } => {
                     // Buffer the latest filter payload — multiple threshold crossings
                     // within one tick are coalesced into a single publish at flush time.
@@ -1866,6 +1911,15 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
             }
         }
+    }
+
+    /// Variant of `dispatch_storage_actions` used from `push_event` where no
+    /// output vec is available. Buffers actions into `pending_direct_actions`
+    /// so they are emitted at the start of the next `tick()`.
+    fn dispatch_storage_actions_inline(&mut self, storage_actions: Vec<StorageTierAction>) {
+        let mut out = std::mem::take(&mut self.pending_direct_actions);
+        self.dispatch_storage_actions(storage_actions, &mut out);
+        self.pending_direct_actions = out;
     }
 
     fn dispatch_discovery_actions(&mut self, _actions: Vec<harmony_discovery::DiscoveryAction>) {
@@ -3624,6 +3678,15 @@ mod tests {
         let _e_vr = RuntimeEvent::VerifyResponse {
             payload: vec![0x00, 1, 0, 0, 0, 42, 0, 0, 0, 0],
         };
+        let _e_drc = RuntimeEvent::DiskReadComplete {
+            cid: ContentId::from_bytes([0u8; 32]),
+            query_id: 1,
+            data: vec![1, 2, 3],
+        };
+        let _e_drf = RuntimeEvent::DiskReadFailed {
+            cid: ContentId::from_bytes([0u8; 32]),
+            query_id: 1,
+        };
     }
 
     #[test]
@@ -3655,6 +3718,14 @@ mod tests {
         let _a_vq = RuntimeAction::SendVerifyQuery {
             key_expr: "harmony/compute/activity/verify".into(),
             payload: vec![0x04],
+        };
+        let _a_ptd = RuntimeAction::PersistToDisk {
+            cid: ContentId::from_bytes([0u8; 32]),
+            data: vec![1, 2, 3],
+        };
+        let _a_dl = RuntimeAction::DiskLookup {
+            cid: ContentId::from_bytes([0u8; 32]),
+            query_id: 1,
         };
     }
 
@@ -4457,6 +4528,8 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
+            disk_cids: Vec::new(),
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
@@ -4527,6 +4600,8 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
+            disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4563,6 +4638,8 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
+            disk_cids: Vec::new(),
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
@@ -4596,6 +4673,8 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
+            disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4658,6 +4737,8 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
+            disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4709,6 +4790,8 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
+            disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4753,6 +4836,8 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
+            disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -5655,6 +5740,8 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            disk_enabled: false,
+            disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 

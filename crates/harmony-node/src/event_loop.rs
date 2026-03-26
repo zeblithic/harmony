@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use harmony_content::book::MemoryBookStore;
+use harmony_content::cid::ContentId;
 use harmony_identity::PqPrivateIdentity;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -19,6 +20,18 @@ use crate::discovery::{self, PeerTable};
 use crate::runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
 use crate::tunnel_bridge::{ReadyConnection, TunnelBridgeEvent, TunnelSender};
 use crate::tunnel_task;
+
+/// Result of an async disk I/O operation, sent back to the event loop via channel.
+enum DiskIoResult {
+    /// Book data successfully read from disk.
+    ReadComplete {
+        cid: ContentId,
+        query_id: u64,
+        data: Vec<u8>,
+    },
+    /// Book not found or read error.
+    ReadFailed { cid: ContentId, query_id: u64 },
+}
 
 /// Configuration for iroh tunnel connectivity.
 pub struct TunnelConfig {
@@ -190,6 +203,9 @@ impl Eq for DeferredDial {}
 /// - `rawlink_interface`: optional network interface name for the AF_PACKET L2 bridge
 ///   (Linux only, requires the `rawlink` feature and `CAP_NET_RAW`).
 /// - `archivist_config`: optional S3 archivist configuration (requires the `archivist` feature).
+/// - `data_dir`: optional directory for persistent CAS book storage. When set, durable books
+///   are written to disk via `spawn_blocking` and reloaded on restart.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -202,6 +218,7 @@ pub async fn run(
     did_web_cache_ttl: u64,
     rawlink_interface: Option<String>,
     archivist_config: Option<crate::config::ArchivistConfig>,
+    data_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -429,6 +446,12 @@ pub async fn run(
     // fire times are always drained first regardless of insertion order.
     let mut deferred_dials: BinaryHeap<Reverse<DeferredDial>> = BinaryHeap::new();
 
+    // ── Disk I/O completion channel ─────────────────────────────────────────
+    // spawn_blocking tasks send results back here; the select loop feeds them
+    // into the runtime as DiskReadComplete / DiskReadFailed events.
+    // Write completions are fire-and-forget (errors logged in the spawned task).
+    let (disk_tx, mut disk_rx) = mpsc::channel::<DiskIoResult>(64);
+
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
         dispatch_action(
@@ -441,6 +464,8 @@ pub async fn run(
             &tunnel_senders,
             &mut deferred_dials,
             &ret_outbound_tx,
+            &data_dir,
+            &disk_tx,
         )
         .await;
     }
@@ -595,7 +620,19 @@ pub async fn run(
                 }
             }
 
-            // Arm 4: mDNS discovery events (when enabled).
+            // Arm 4: Disk I/O completion — feed results back into runtime.
+            Some(disk_result) = disk_rx.recv() => {
+                match disk_result {
+                    DiskIoResult::ReadComplete { cid, query_id, data } => {
+                        runtime.push_event(RuntimeEvent::DiskReadComplete { cid, query_id, data });
+                    }
+                    DiskIoResult::ReadFailed { cid, query_id } => {
+                        runtime.push_event(RuntimeEvent::DiskReadFailed { cid, query_id });
+                    }
+                }
+            }
+
+            // Arm 5: mDNS discovery events (when enabled).
             result = async {
                 match &mdns_state {
                     Some((_, rx)) => Some(rx.recv_async().await),
@@ -656,7 +693,7 @@ pub async fn run(
                 }
             }
 
-            // Arm 5: Tunnel bridge event — buffer only, tick on timer.
+            // Arm 6: Tunnel bridge event — buffer only, tick on timer.
             maybe = tunnel_rx.recv() => {
                 let event = match maybe {
                     None => {
@@ -808,7 +845,7 @@ pub async fn run(
                 }
             }
 
-            // Arm 6: Accept incoming iroh connections.
+            // Arm 7: Accept incoming iroh connections.
             //
             // The QUIC handshake (connecting.await) is spawned in a separate
             // task to avoid blocking the event loop for 100-500ms+. Completed
@@ -883,7 +920,7 @@ pub async fn run(
                 }
             }
 
-            // Arm 7: Ready connection from QUIC handshake task — spawn tunnel.
+            // Arm 8: Ready connection from QUIC handshake task — spawn tunnel.
             ready = conn_rx.recv() => {
                 match ready {
                     Some(Some(ready_conn)) => {
@@ -947,7 +984,7 @@ pub async fn run(
                 }
             }
 
-            // Arm 8: Inbound Reticulum packet from L2 rawlink bridge.
+            // Arm 9: Inbound Reticulum packet from L2 rawlink bridge.
             result = async {
                 match ret_inbound_rx.as_mut() {
                     Some(rx) => rx.recv().await,
@@ -980,7 +1017,7 @@ pub async fn run(
                 }
             }
 
-            // Arm 9: Graceful shutdown (SIGTERM from procd, Ctrl+C).
+            // Arm 10: Graceful shutdown (SIGTERM from procd, Ctrl+C).
             _ = &mut shutdown => {
                 break;
             }
@@ -1006,6 +1043,8 @@ pub async fn run(
                     &tunnel_senders,
                     &mut deferred_dials,
                     &ret_outbound_tx,
+                    &data_dir,
+                    &disk_tx,
                 )
                 .await;
             }
@@ -1168,6 +1207,8 @@ async fn dispatch_action(
     tunnel_senders: &HashMap<String, TunnelSender>,
     deferred_dials: &mut BinaryHeap<Reverse<DeferredDial>>,
     ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    data_dir: &Option<std::path::PathBuf>,
+    disk_tx: &mpsc::Sender<DiskIoResult>,
 ) {
     match action {
         // ── Tier 1: Send on interface (UDP broadcast + unicast, or tunnel) ────
@@ -1464,6 +1505,49 @@ async fn dispatch_action(
                     })
                     .await;
             });
+        }
+        RuntimeAction::PersistToDisk { cid, data } => {
+            if let Some(ref dir) = data_dir {
+                let dir = dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = crate::disk_io::write_book(&dir, &cid, &data) {
+                        tracing::error!(
+                            cid = %hex::encode(&cid.to_bytes()[..8]),
+                            err = %e,
+                            "disk write failed"
+                        );
+                    }
+                });
+            }
+        }
+        RuntimeAction::DiskLookup { cid, query_id } => {
+            if let Some(ref dir) = data_dir {
+                let dir = dir.clone();
+                let tx = disk_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    match crate::disk_io::read_book(&dir, &cid) {
+                        Ok(data) => {
+                            let _ = tx.blocking_send(DiskIoResult::ReadComplete {
+                                cid,
+                                query_id,
+                                data,
+                            });
+                        }
+                        Err(_) => {
+                            let _ = tx.blocking_send(DiskIoResult::ReadFailed {
+                                cid,
+                                query_id,
+                            });
+                        }
+                    }
+                });
+            } else {
+                tracing::error!(
+                    cid = %hex::encode(&cid.to_bytes()[..8]),
+                    "DiskLookup dispatched but data_dir not configured"
+                );
+                let _ = disk_tx.try_send(DiskIoResult::ReadFailed { cid, query_id });
+            }
         }
     }
 }

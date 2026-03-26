@@ -678,6 +678,35 @@ pub mod engram {
     }
 }
 
+// ── Agent Protocol ──────────────────────────────────────────────────
+
+/// Agent-to-agent messaging key expressions.
+pub mod agent {
+    use alloc::{format, string::String};
+
+    /// Base prefix: `harmony/agent`
+    pub const PREFIX: &str = "harmony/agent";
+
+    // ── Subscription patterns ───────────────────────────────────
+
+    /// Subscribe to all agent capacity advertisements: `harmony/agent/*/capacity`
+    pub fn capacity_sub_all() -> String {
+        format!("{PREFIX}/*/capacity")
+    }
+
+    // ── Builders ────────────────────────────────────────────────
+
+    /// Capacity key: `harmony/agent/{agent_id}/capacity`
+    pub fn capacity_key(agent_id: &str) -> String {
+        format!("{PREFIX}/{agent_id}/capacity")
+    }
+
+    /// Task submission endpoint: `harmony/agent/{agent_id}/task`
+    pub fn task_key(agent_id: &str) -> String {
+        format!("{PREFIX}/{agent_id}/task")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1292,5 +1321,19 @@ mod tests {
     #[test]
     fn engram_subscription_pattern() {
         assert_eq!(engram::SUB, "harmony/engram/**");
+    }
+
+    // ── Agent ────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_namespace_keys() {
+        let cap = agent::capacity_key("deadbeef01020304");
+        assert_eq!(cap, "harmony/agent/deadbeef01020304/capacity");
+
+        let task = agent::task_key("deadbeef01020304");
+        assert_eq!(task, "harmony/agent/deadbeef01020304/task");
+
+        let sub = agent::capacity_sub_all();
+        assert_eq!(sub, "harmony/agent/*/capacity");
     }
 }
