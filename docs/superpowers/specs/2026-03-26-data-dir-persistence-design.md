@@ -32,7 +32,7 @@ The resolved `data_dir` path is passed through `NodeConfig` to `NodeRuntime::new
 {data_dir}/book/{byte4_5_hex}/{full_cid_hex}
 ```
 
-256-way fan-out using bytes 4-5 of the CID hash as the prefix directory. Same layout as `harmony-ingest/src/storage.rs`. Example:
+256-way fan-out using byte 4 of the CID (first hash byte after the 4-byte header) as the prefix directory. Same layout as `harmony-ingest/src/storage.rs`. Example:
 
 ```
 /mnt/sda1/harmony/book/a1/a1b2c3d4e5f6...64-hex-chars...
@@ -46,11 +46,10 @@ Each file contains the raw book bytes (up to 1MB). Filenames are the full hex-en
 
 `StorageTier` already emits `StorageTierAction::PersistToDisk { cid, data }` for durable content (flags 00/10). This spec wires that action through:
 
-1. `NodeRuntime` receives `PersistToDisk` from `StorageTier`
-2. Converts to `RuntimeAction::PersistToDisk { cid, data }`
-3. Event loop receives the action
-4. Spawns `tokio::task::spawn_blocking` with the disk write (books can be up to 1MB — synchronous writes on USB storage could take 40ms+, so blocking the tick loop is unacceptable)
-5. On completion, adds CID to `disk_index` (or logs error — write failures are non-fatal, content stays in memory cache)
+1. `StorageTier` emits `PersistToDisk` and **optimistically adds the CID to `disk_index`** at emit time (sans-I/O — no waiting for I/O confirmation)
+2. `NodeRuntime` converts to `RuntimeAction::PersistToDisk { cid, data }`
+3. Event loop spawns `tokio::task::spawn_blocking` with the disk write (books can be up to 1MB — synchronous writes on USB storage could take 40ms+, so blocking the tick loop is unacceptable)
+4. On completion, event loop logs success or error — no callback to runtime needed. Write failures are non-fatal (content stays in memory cache; if a `DiskLookup` later hits the stale index entry, `DiskReadFailed` handles it gracefully)
 
 ### Read Path (DiskLookup)
 
@@ -90,7 +89,7 @@ pub fn read_book(data_dir: &Path, cid: &ContentId) -> Result<Vec<u8>, std::io::E
 pub fn scan_books(data_dir: &Path) -> Vec<ContentId>
 ```
 
-File path construction: `{data_dir}/book/{hex_cid[8..10]}/{hex_cid}` (bytes 4-5 as the fan-out prefix, matching `harmony-ingest`).
+File path construction: `{data_dir}/book/{hex_cid[8..10]}/{hex_cid}` (byte 4 = hex chars 8-9, matching `harmony-ingest`).
 
 The `scan_books` function logs warnings for:
 - Files with non-hex names (skipped)
@@ -125,8 +124,9 @@ These may already exist as scaffolding — if so, just wire them. If not, add th
 ```rust
 RuntimeEvent::DiskReadComplete { cid: ContentId, query_id: u64, data: Vec<u8> }
 RuntimeEvent::DiskReadFailed { cid: ContentId, query_id: u64 }
-RuntimeEvent::DiskWriteComplete { cid: ContentId }
 ```
+
+No `DiskWriteComplete` event needed — `disk_index` is updated optimistically at emit time, and write failures are logged by the event loop without callback to the runtime.
 
 Check existing `StorageTierEvent` variants — these may already map to existing event types.
 
@@ -136,7 +136,7 @@ The `disk_index: HashSet<ContentId>` field already exists (currently `#[allow(de
 
 1. Remove `#[allow(dead_code)]`
 2. Populate from startup scan results (new method: `load_disk_index(cids: Vec<ContentId>)`)
-3. Add to index when `PersistToDisk` is emitted
+3. Add to index optimistically when `PersistToDisk` is emitted (before I/O completes)
 4. Check index on cache miss before returning "not found"
 5. Emit `DiskLookup` when index contains the CID but cache doesn't
 
