@@ -66,6 +66,23 @@ pub enum AgentStatus {
     Draining,
 }
 
+/// A single chunk of streaming output from a long-running task.
+///
+/// Published to `harmony/agent/{agent_id}/stream/{task_id}` via Zenoh pub/sub.
+/// The `final_chunk` payload is advisory — the query-reply `AgentResult` is
+/// the authoritative source of truth for task completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamChunk {
+    /// ID of the task this chunk belongs to.
+    pub task_id: String,
+    /// Monotonically increasing sequence number (0-indexed).
+    pub sequence: u32,
+    /// Task-type-specific payload (e.g. {"token": "hello"} for inference).
+    pub payload: serde_json::Value,
+    /// True if this is the last chunk in the stream.
+    pub final_chunk: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +225,51 @@ mod tests {
         assert!(json.contains("\"task_type\""), "expected snake_case key task_type, got: {json}");
         assert!(!json.contains("\"taskId\""), "unexpected camelCase key taskId in: {json}");
         assert!(!json.contains("\"taskType\""), "unexpected camelCase key taskType in: {json}");
+    }
+
+    #[test]
+    fn stream_chunk_round_trip() {
+        let chunk = StreamChunk {
+            task_id: "task-001".to_string(),
+            sequence: 0,
+            payload: json!({"token": "hello"}),
+            final_chunk: false,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let decoded: StreamChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.task_id, "task-001");
+        assert_eq!(decoded.sequence, 0);
+        assert_eq!(decoded.payload, json!({"token": "hello"}));
+        assert!(!decoded.final_chunk);
+    }
+
+    #[test]
+    fn stream_chunk_final_round_trip() {
+        let chunk = StreamChunk {
+            task_id: "task-002".to_string(),
+            sequence: 42,
+            payload: json!({"done": true}),
+            final_chunk: true,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let decoded: StreamChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.task_id, "task-002");
+        assert_eq!(decoded.sequence, 42);
+        assert!(decoded.final_chunk);
+    }
+
+    #[test]
+    fn stream_chunk_snake_case_keys() {
+        let chunk = StreamChunk {
+            task_id: "task-sc".to_string(),
+            sequence: 0,
+            payload: json!({}),
+            final_chunk: true,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("\"task_id\""), "expected snake_case key task_id, got: {json}");
+        assert!(json.contains("\"final_chunk\""), "expected snake_case key final_chunk, got: {json}");
+        assert!(!json.contains("\"taskId\""), "unexpected camelCase in: {json}");
+        assert!(!json.contains("\"finalChunk\""), "unexpected camelCase in: {json}");
     }
 }

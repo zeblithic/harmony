@@ -10,7 +10,7 @@ pub mod wire;
 
 pub use task_id::generate_task_id;
 pub use types::{
-    AgentCapacity, AgentResult, AgentStatus, AgentTask, TaskContext, TaskStatus,
+    AgentCapacity, AgentResult, AgentStatus, AgentTask, StreamChunk, TaskContext, TaskStatus,
 };
 pub use wire::{
     decode_capacity, decode_result, decode_task, encode_capacity, encode_result, encode_task,
