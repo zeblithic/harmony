@@ -3455,6 +3455,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-speculative"
+version = "0.1.0"
+
+[[package]]
 name = "harmony-trust"
 version = "0.1.0"
 dependencies = [
