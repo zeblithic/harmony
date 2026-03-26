@@ -1,0 +1,14 @@
+[package]
+name = "harmony-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Structured agent-to-agent messaging protocol for the Harmony decentralized stack"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+harmony-crypto = { workspace = true, features = ["std"] }
+hex.workspace = true
