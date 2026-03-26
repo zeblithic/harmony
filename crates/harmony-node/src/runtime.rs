@@ -2428,9 +2428,13 @@ impl<B: BookStore> NodeRuntime<B> {
         let mut current_logits = if request.context_tokens.is_empty() {
             return Err("empty context".into());
         } else {
-            engine
+            let logits = engine
                 .forward(&request.context_tokens)
-                .map_err(|e| format!("prefill failed: {e}"))?
+                .map_err(|e| format!("prefill failed: {e}"))?;
+            if logits.is_empty() {
+                return Err("prefill returned empty logits".into());
+            }
+            logits
         };
 
         // 3. Verify each draft token sequentially
@@ -2451,6 +2455,9 @@ impl<B: BookStore> NodeRuntime<B> {
             current_logits = engine
                 .forward(&[draft.token_id])
                 .map_err(|e| format!("forward failed at draft {i}: {e}"))?;
+            if current_logits.is_empty() {
+                return Err(format!("forward returned empty logits at draft {i}"));
+            }
         }
 
         // 4. All accepted — sample bonus token from last logits (the "free" extra token)
@@ -3399,8 +3406,11 @@ impl<B: BookStore> NodeRuntime<B> {
             if peer_addr != self.node_addr && payload.len() >= 33 {
                 let mut peer_model_cid = [0u8; 32];
                 peer_model_cid.copy_from_slice(&payload[..32]);
-                // A target qualifies if its model CID differs from ours.
-                if self.inference_model_cid.map_or(true, |our_cid| peer_model_cid != our_cid) {
+                let status = payload[32];
+                // A target qualifies if it's ready and its model CID differs from ours.
+                if status == crate::inference::CAPACITY_READY
+                    && self.inference_model_cid.map_or(true, |our_cid| peer_model_cid != our_cid)
+                {
                     // Don't overwrite existing target (use first discovered).
                     if self.dsd_target_addr.is_none() {
                         self.dsd_target_addr = Some(peer_addr.to_string());

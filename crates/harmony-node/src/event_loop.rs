@@ -1423,22 +1423,47 @@ async fn dispatch_action(
             let tx = zenoh_tx.clone();
             let session = session.clone();
             tokio::spawn(async move {
-                match session.get(&key_expr).payload(payload).await {
-                    Ok(replies) => {
-                        while let Ok(reply) = replies.recv_async().await {
-                            if let Ok(sample) = reply.into_result() {
-                                let resp_payload = sample.payload().to_bytes().to_vec();
-                                let _ = tx
-                                    .send(ZenohEvent::VerifyResponse {
-                                        payload: resp_payload,
-                                    })
-                                    .await;
+                let deadline = Duration::from_secs(30);
+                let result = tokio::time::timeout(deadline, async {
+                    match session.get(&key_expr).payload(payload).await {
+                        Ok(replies) => {
+                            while let Ok(reply) = replies.recv_async().await {
+                                if let Ok(sample) = reply.into_result() {
+                                    let resp_payload =
+                                        sample.payload().to_bytes().to_vec();
+                                    let _ = tx
+                                        .send(ZenohEvent::VerifyResponse {
+                                            payload: resp_payload,
+                                        })
+                                        .await;
+                                    return;
+                                }
                             }
                         }
+                        Err(e) => {
+                            tracing::warn!(
+                                %key_expr, err = %e, "DSD verify query failed"
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(%key_expr, err = %e, "DSD verify query failed");
-                    }
+                })
+                .await;
+
+                if result.is_err() {
+                    tracing::warn!(
+                        %key_expr,
+                        "DSD verify query timed out after 30s"
+                    );
+                    // Send an error response so the edge clears dsd_session.
+                    let err_payload =
+                        harmony_speculative::VerifyResponse::serialize_error(
+                            "verify query timed out",
+                        );
+                    let _ = tx
+                        .send(ZenohEvent::VerifyResponse {
+                            payload: err_payload,
+                        })
+                        .await;
                 }
             });
         }
