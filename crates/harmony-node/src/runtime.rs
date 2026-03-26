@@ -2581,7 +2581,15 @@ impl<B: BookStore> NodeRuntime<B> {
         // Reset and prefill draft model.
         engine.reset();
         let mut last_logits = match engine.forward(&prompt_tokens) {
-            Ok(l) => l,
+            Ok(l) if !l.is_empty() => l,
+            Ok(_) => {
+                let err = harmony_speculative::VerifyResponse::serialize_error(
+                    "prefill returned empty logits",
+                );
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                return;
+            }
             Err(e) => {
                 let err = harmony_speculative::VerifyResponse::serialize_error(
                     &format!("prefill failed: {e}"),
@@ -2607,7 +2615,15 @@ impl<B: BookStore> NodeRuntime<B> {
 
             // Advance KV cache.
             match engine.forward(&[token_id]) {
-                Ok(l) => last_logits = l,
+                Ok(l) if !l.is_empty() => last_logits = l,
+                Ok(_) => {
+                    let err = harmony_speculative::VerifyResponse::serialize_error(
+                        "draft forward returned empty logits",
+                    );
+                    self.pending_direct_actions
+                        .push(RuntimeAction::SendReply { query_id, payload: err });
+                    return;
+                }
                 Err(e) => {
                     let err = harmony_speculative::VerifyResponse::serialize_error(
                         &format!("draft forward failed: {e}"),
@@ -2777,7 +2793,18 @@ impl<B: BookStore> NodeRuntime<B> {
         let session = self.dsd_session.as_ref().unwrap();
         let full_sequence = session.accepted_tokens.clone();
         let mut last_logits = match engine.forward(&full_sequence) {
-            Ok(l) => l,
+            Ok(l) if !l.is_empty() => l,
+            Ok(_) => {
+                let err = harmony_speculative::VerifyResponse::serialize_error(
+                    "reprefill returned empty logits",
+                );
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
+                self.dsd_session = None;
+                return;
+            }
             Err(e) => {
                 let err = harmony_speculative::VerifyResponse::serialize_error(
                     &format!("reprefill failed: {e}"),
@@ -2809,7 +2836,18 @@ impl<B: BookStore> NodeRuntime<B> {
             }
 
             match engine.forward(&[token_id]) {
-                Ok(l) => last_logits = l,
+                Ok(l) if !l.is_empty() => last_logits = l,
+                Ok(_) => {
+                    let err = harmony_speculative::VerifyResponse::serialize_error(
+                        "draft forward returned empty logits",
+                    );
+                    self.pending_direct_actions.push(RuntimeAction::SendReply {
+                        query_id,
+                        payload: err,
+                    });
+                    self.dsd_session = None;
+                    return;
+                }
                 Err(e) => {
                     let err = harmony_speculative::VerifyResponse::serialize_error(
                         &format!("draft forward failed: {e}"),
