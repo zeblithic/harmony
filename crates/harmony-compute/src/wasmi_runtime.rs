@@ -11,9 +11,9 @@ struct HostState {
     io_request: Option<crate::types::IORequest>,
     /// Where to write the IO response data: (out_ptr, out_cap).
     io_write_target: Option<(u32, u32)>,
-    /// Loaded inference engine (only available with `inference` feature).
+    /// Loaded inference engine with model CIDs: (gguf_cid, tokenizer_cid, engine).
     #[cfg(feature = "inference")]
-    inference_engine: Option<harmony_inference::QwenEngine>,
+    inference_engine: Option<([u8; 32], [u8; 32], harmony_inference::QwenEngine)>,
     /// Logits from the most recent `forward()` call, read by `sample()`.
     /// Persists until the next `forward()` or `model_reset()` — multiple
     /// `sample()` calls from the same logits are allowed (e.g. beam search).
@@ -75,6 +75,10 @@ struct ExecContext {
 pub struct WasmiRuntime {
     engine: wasmi::Engine,
     session: Option<WasmiSession>,
+    /// Persisted inference engine across execute() calls: (gguf_cid, tokenizer_cid, engine).
+    /// When model_load is called with matching CIDs, returns 0 immediately after reset().
+    #[cfg(feature = "inference")]
+    shared_inference_engine: Option<([u8; 32], [u8; 32], harmony_inference::QwenEngine)>,
 }
 
 impl WasmiRuntime {
@@ -86,6 +90,8 @@ impl WasmiRuntime {
         Self {
             engine,
             session: None,
+            #[cfg(feature = "inference")]
+            shared_inference_engine: None,
         }
     }
 
@@ -105,6 +111,11 @@ impl WasmiRuntime {
             Ok(wasmi::TypedResumableCall::Finished(output_len)) => {
                 // Validate output length (negative = WASM-side error).
                 if output_len < 0 {
+                    #[cfg(feature = "inference")]
+                    {
+                        self.shared_inference_engine =
+                            ctx.store.into_data().inference_engine;
+                    }
                     return ComputeResult::Failed {
                         error: ComputeError::Trap {
                             reason: format!("compute returned negative length: {output_len}"),
@@ -117,6 +128,11 @@ impl WasmiRuntime {
                 let memory = match ctx.instance.get_memory(&ctx.store, "memory") {
                     Some(mem) => mem,
                     None => {
+                        #[cfg(feature = "inference")]
+                        {
+                            self.shared_inference_engine =
+                                ctx.store.into_data().inference_engine;
+                        }
                         return ComputeResult::Failed {
                             error: ComputeError::ExportNotFound {
                                 name: "memory".into(),
@@ -129,6 +145,11 @@ impl WasmiRuntime {
                 let output_end = ctx.input_len + output_len;
                 let mem_size = memory.data_size(&ctx.store);
                 if output_end > mem_size {
+                    #[cfg(feature = "inference")]
+                    {
+                        self.shared_inference_engine =
+                            ctx.store.into_data().inference_engine;
+                    }
                     return ComputeResult::Failed {
                         error: ComputeError::MemoryTooSmall {
                             need: output_end,
@@ -200,6 +221,12 @@ impl WasmiRuntime {
                     });
                     ComputeResult::NeedsIO { request }
                 } else {
+                    // Recover inference engine before dropping the store.
+                    #[cfg(feature = "inference")]
+                    {
+                        self.shared_inference_engine =
+                            ctx.store.into_data().inference_engine;
+                    }
                     ComputeResult::Failed {
                         error: ComputeError::Trap {
                             reason: "unexpected host trap with no IO request".into(),
@@ -207,11 +234,19 @@ impl WasmiRuntime {
                     }
                 }
             }
-            Err(e) => ComputeResult::Failed {
-                error: ComputeError::Trap {
-                    reason: e.to_string(),
-                },
-            },
+            Err(e) => {
+                // Recover inference engine before dropping the store.
+                #[cfg(feature = "inference")]
+                {
+                    self.shared_inference_engine =
+                        ctx.store.into_data().inference_engine;
+                }
+                ComputeResult::Failed {
+                    error: ComputeError::Trap {
+                        reason: e.to_string(),
+                    },
+                }
+            }
         }
     }
 }
@@ -229,8 +264,15 @@ impl ComputeRuntime for WasmiRuntime {
         input: &[u8],
         budget: InstructionBudget,
     ) -> ComputeResult {
-        // Drop any existing session.
-        self.session = None;
+        // Recover persisted inference engine from prior session before dropping it.
+        #[cfg(feature = "inference")]
+        if let Some(session) = self.session.take() {
+            self.shared_inference_engine = session.store.into_data().inference_engine;
+        }
+        #[cfg(not(feature = "inference"))]
+        {
+            self.session = None;
+        }
 
         // Hash the module bytes for identity tracking.
         let module_hash = harmony_crypto::hash::blake3_hash(module_bytes);
@@ -247,7 +289,9 @@ impl ComputeRuntime for WasmiRuntime {
             }
         };
 
-        // Create a store with host state and set fuel budget.
+        // Create a store with host state. The inference engine is injected
+        // later (after all fallible setup) to avoid losing it on compilation/
+        // instantiation failure.
         let mut store = wasmi::Store::new(&self.engine, HostState::new());
         if let Err(e) = store.set_fuel(budget.fuel) {
             return ComputeResult::Failed {
@@ -323,6 +367,23 @@ impl ComputeRuntime for WasmiRuntime {
                                 wasmi::Error::new(format!("failed to read tokenizer CID: {e}"))
                             })?;
 
+                        // If engine is already loaded with matching CIDs, reset and
+                        // return success — no trap, no data cloning, no re-parse.
+                        if let Some((g, t, _)) = &caller.data().inference_engine {
+                            if *g == gguf_cid && *t == tokenizer_cid {
+                                // Reset clears KV cache, position, token_history
+                                // so this request starts with a clean slate.
+                                caller
+                                    .data_mut()
+                                    .inference_engine
+                                    .as_mut()
+                                    .unwrap()
+                                    .2
+                                    .reset();
+                                return Ok(0);
+                            }
+                        }
+
                         let data = caller.data_mut();
                         data.io_request = Some(crate::types::IORequest::LoadModel {
                             gguf_cid,
@@ -354,8 +415,8 @@ impl ComputeRuntime for WasmiRuntime {
                             return Ok(-3);
                         }
 
-                        let engine = match &caller.data().inference_engine {
-                            Some(e) => e,
+                        let engine = match caller.data().inference_engine.as_ref() {
+                            Some((_, _, e)) => e,
                             None => return Ok(-1),
                         };
 
@@ -411,8 +472,8 @@ impl ComputeRuntime for WasmiRuntime {
                             return Ok(-3);
                         }
 
-                        let engine = match &caller.data().inference_engine {
-                            Some(e) => e,
+                        let engine = match caller.data().inference_engine.as_ref() {
+                            Some((_, _, e)) => e,
                             None => return Ok(-1),
                         };
 
@@ -478,7 +539,7 @@ impl ComputeRuntime for WasmiRuntime {
                             .collect();
 
                         let engine = match caller.data_mut().inference_engine.as_mut() {
-                            Some(e) => e,
+                            Some((_, _, e)) => e,
                             None => return Ok(-1),
                         };
 
@@ -560,7 +621,7 @@ impl ComputeRuntime for WasmiRuntime {
                             None => return Ok(-3), // no logits from prior forward()
                         };
 
-                        let engine = caller.data().inference_engine.as_ref().unwrap();
+                        let (_, _, engine) = caller.data().inference_engine.as_ref().unwrap();
                         match engine.sample(&logits, &params) {
                             Ok(token_id) => {
                                 let id = token_id as i32;
@@ -583,7 +644,7 @@ impl ComputeRuntime for WasmiRuntime {
                     "model_reset",
                     |mut caller: wasmi::Caller<'_, HostState>| -> Result<i32, wasmi::Error> {
                         let data = caller.data_mut();
-                        if let Some(engine) = &mut data.inference_engine {
+                        if let Some((_, _, engine)) = &mut data.inference_engine {
                             engine.reset();
                         }
                         data.last_logits = None;
@@ -662,6 +723,13 @@ impl ComputeRuntime for WasmiRuntime {
                 };
             }
         };
+
+        // Inject persisted inference engine now that all fallible setup succeeded.
+        // This ensures the engine survives compilation/instantiation failures.
+        #[cfg(feature = "inference")]
+        {
+            store.data_mut().inference_engine = self.shared_inference_engine.take();
+        }
 
         // Call compute with resumable API to support fuel exhaustion.
         let call_result = compute_func.call_resumable(&mut store, (0i32, input_len_i32));
@@ -775,12 +843,15 @@ impl ComputeRuntime for WasmiRuntime {
         };
 
         // Branch on the type of pending IO request.
-        let is_model_load = matches!(
-            session.store.data().io_request,
-            Some(crate::types::IORequest::LoadModel { .. })
-        );
+        let model_load_cids = match session.store.data().io_request {
+            Some(crate::types::IORequest::LoadModel {
+                gguf_cid,
+                tokenizer_cid,
+            }) => Some((gguf_cid, tokenizer_cid)),
+            _ => None,
+        };
 
-        let return_val: i32 = if is_model_load {
+        let return_val: i32 = if let Some((load_gguf_cid, load_tok_cid)) = model_load_cids {
             #[cfg(feature = "inference")]
             {
                 match response {
@@ -797,7 +868,8 @@ impl ComputeRuntime for WasmiRuntime {
                             -4
                         } else {
                             let data = session.store.data_mut();
-                            data.inference_engine = Some(engine);
+                            data.inference_engine =
+                                Some((load_gguf_cid, load_tok_cid, engine));
                             data.last_logits = None;
                             0
                         }

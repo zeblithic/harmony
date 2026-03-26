@@ -47,6 +47,17 @@ pub enum HistoryEvent {
         cid: [u8; 32],
         data: Option<Vec<u8>>,
     },
+    /// WASM module requested model loading.
+    ModelRequested {
+        gguf_cid: [u8; 32],
+        tokenizer_cid: [u8; 32],
+    },
+    /// Model was resolved — data is `Some` if found, `None` if load failed.
+    ModelResolved {
+        gguf_cid: [u8; 32],
+        tokenizer_cid: [u8; 32],
+        success: bool,
+    },
 }
 
 /// The complete event log for a workflow — this IS the durable checkpoint.
@@ -82,6 +93,11 @@ pub enum WorkflowStatus {
     Executing,
     /// Suspended waiting for external IO resolution.
     WaitingForIo { cid: [u8; 32] },
+    /// Suspended waiting for model loading.
+    WaitingForModel {
+        gguf_cid: [u8; 32],
+        tokenizer_cid: [u8; 32],
+    },
     /// Completed successfully.
     Complete,
     /// Failed with an error.
@@ -111,6 +127,18 @@ pub enum WorkflowEvent {
     ContentFetched { cid: [u8; 32], data: Vec<u8> },
     /// External IO failed — content not found.
     ContentFetchFailed { cid: [u8; 32] },
+    /// Model data resolved for an inference workflow.
+    ModelLoaded {
+        gguf_cid: [u8; 32],
+        tokenizer_cid: [u8; 32],
+        gguf_data: Vec<u8>,
+        tokenizer_data: Vec<u8>,
+    },
+    /// Model loading failed.
+    ModelLoadFailed {
+        gguf_cid: [u8; 32],
+        tokenizer_cid: [u8; 32],
+    },
 }
 
 /// Outbound actions returned by the workflow engine.
@@ -122,6 +150,12 @@ pub enum WorkflowAction {
     FetchContent {
         workflow_id: WorkflowId,
         cid: [u8; 32],
+    },
+    /// Request model loading for an inference workflow.
+    LoadModel {
+        workflow_id: WorkflowId,
+        gguf_cid: [u8; 32],
+        tokenizer_cid: [u8; 32],
     },
     /// Workflow completed successfully — here is the output.
     WorkflowComplete {

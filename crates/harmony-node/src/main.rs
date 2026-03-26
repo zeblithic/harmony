@@ -4,6 +4,8 @@ mod did_web_gateway;
 mod discovery;
 mod event_loop;
 mod identity_file;
+#[allow(dead_code)]
+mod inference;
 // Page runtime integration is forward-looking.
 #[allow(dead_code)]
 mod page_index;
@@ -560,6 +562,32 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 local_identity_hash: our_addr_bytes,
                 local_pq_identity_hash,
                 local_dsa_pubkey,
+                inference_gguf_cid: config_file
+                    .inference_model_gguf_cid
+                    .as_deref()
+                    .map(|s| {
+                        hex::decode(s)
+                            .ok()
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                            .or_else(|| {
+                                tracing::warn!("inference_model_gguf_cid is not a valid 32-byte hex string; inference disabled");
+                                None
+                            })
+                    })
+                    .flatten(),
+                inference_tokenizer_cid: config_file
+                    .inference_model_tokenizer_cid
+                    .as_deref()
+                    .map(|s| {
+                        hex::decode(s)
+                            .ok()
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                            .or_else(|| {
+                                tracing::warn!("inference_model_tokenizer_cid is not a valid 32-byte hex string; inference disabled");
+                                None
+                            })
+                    })
+                    .flatten(),
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 

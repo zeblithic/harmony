@@ -13,6 +13,7 @@ wasmtime = ["harmony-compute/wasmtime"]
 no-neon = ["harmony-crypto/no-neon"]
 rawlink = ["harmony-rawlink"]
 archivist = ["harmony-s3/archivist"]
+inference = ["harmony-compute/inference", "harmony-workflow/inference"]
 
 [[bin]]
 name = "harmony"
@@ -52,6 +53,9 @@ zenoh.workspace = true
 postcard.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 zeroize = { workspace = true, features = ["std"] }
+
+[build-dependencies]
+wat = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

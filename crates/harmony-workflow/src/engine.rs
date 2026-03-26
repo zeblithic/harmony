@@ -81,6 +81,16 @@ impl WorkflowEngine {
             } => self.handle_submit(module, input, hint),
             WorkflowEvent::ContentFetched { cid, data } => self.handle_content_fetched(cid, data),
             WorkflowEvent::ContentFetchFailed { cid } => self.handle_content_fetch_failed(cid),
+            WorkflowEvent::ModelLoaded {
+                gguf_cid,
+                tokenizer_cid,
+                gguf_data,
+                tokenizer_data,
+            } => self.handle_model_loaded(gguf_cid, tokenizer_cid, gguf_data, tokenizer_data),
+            WorkflowEvent::ModelLoadFailed {
+                gguf_cid,
+                tokenizer_cid,
+            } => self.handle_model_load_failed(gguf_cid, tokenizer_cid),
             // Stubs for future tasks. Currently, NodeRuntime handles module
             // fetching externally via cid_to_query and converts results into
             // inline Submit events. When these stubs are implemented, remove
@@ -400,6 +410,124 @@ impl WorkflowEngine {
         self.handle_io_resolution(cid, None, IOResponse::ContentNotFound)
     }
 
+    fn handle_model_loaded(
+        &mut self,
+        gguf_cid: [u8; 32],
+        tokenizer_cid: [u8; 32],
+        gguf_data: Vec<u8>,
+        tokenizer_data: Vec<u8>,
+    ) -> Vec<WorkflowAction> {
+        // NOTE: We don't cache model data here. After the first inference
+        // request completes, the WasmiRuntime persists the inference engine —
+        // subsequent model_load calls return 0 immediately, never emitting
+        // NeedsIO(LoadModel), so this cache would never be consulted again.
+        // Avoiding the multi-GB clone saves significant memory.
+        self.handle_model_resolution(
+            gguf_cid,
+            tokenizer_cid,
+            true,
+            IOResponse::ModelReady {
+                gguf_data,
+                tokenizer_data,
+            },
+        )
+    }
+
+    fn handle_model_load_failed(
+        &mut self,
+        gguf_cid: [u8; 32],
+        tokenizer_cid: [u8; 32],
+    ) -> Vec<WorkflowAction> {
+        self.handle_model_resolution(
+            gguf_cid,
+            tokenizer_cid,
+            false,
+            IOResponse::ModelGgufNotFound,
+        )
+    }
+
+    /// Find all workflows waiting for a specific model (by GGUF + tokenizer CIDs).
+    /// Returns results sorted by WorkflowId bytes for deterministic scheduling.
+    fn find_all_waiting_for_model(
+        &self,
+        gguf_cid: &[u8; 32],
+        tokenizer_cid: &[u8; 32],
+    ) -> Vec<WorkflowId> {
+        let mut waiting: Vec<WorkflowId> = self
+            .workflows
+            .iter()
+            .filter(|(_, state)| {
+                state.status
+                    == WorkflowStatus::WaitingForModel {
+                        gguf_cid: *gguf_cid,
+                        tokenizer_cid: *tokenizer_cid,
+                    }
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        waiting.sort_by_key(|id| *id.as_bytes());
+        waiting
+    }
+
+    /// Common handler for model resolution (loaded or load failed).
+    /// Mirrors handle_io_resolution but for model requests.
+    fn handle_model_resolution(
+        &mut self,
+        gguf_cid: [u8; 32],
+        tokenizer_cid: [u8; 32],
+        success: bool,
+        io_response: IOResponse,
+    ) -> Vec<WorkflowAction> {
+        let waiting = self.find_all_waiting_for_model(&gguf_cid, &tokenizer_cid);
+        if waiting.is_empty() {
+            return Vec::new();
+        }
+
+        // If a workflow is currently active (yielded mid-execution), we cannot
+        // restore a different session without destroying the active one. Defer
+        // ALL waiting workflows so they resume after the active one completes.
+        let immediate_resume = self.active.is_none();
+
+        if immediate_resume {
+            let first = waiting[0];
+            let state = self.workflows.get_mut(&first).expect("workflow must exist");
+            state.status = WorkflowStatus::Executing;
+            state.history.events.push(HistoryEvent::ModelResolved {
+                gguf_cid,
+                tokenizer_cid,
+                success,
+            });
+            let saved_session = state
+                .saved_session
+                .take()
+                .expect("WaitingForModel implies saved session");
+            self.runtime.restore_session(saved_session);
+            self.active = Some(first);
+        }
+
+        // Defer remaining workflows (or all, if an active workflow is running).
+        let defer_start = if immediate_resume { 1 } else { 0 };
+        for &wf_id in &waiting[defer_start..] {
+            if let Some(state) = self.workflows.get_mut(&wf_id) {
+                state.history.events.push(HistoryEvent::ModelResolved {
+                    gguf_cid,
+                    tokenizer_cid,
+                    success,
+                });
+                state.status = WorkflowStatus::Executing;
+                state.deferred_io = Some(io_response.clone());
+                self.deferred_resume_queue.push_back(wf_id);
+            }
+        }
+
+        if immediate_resume {
+            let result = self.runtime.resume_with_io(io_response, self.budget);
+            self.handle_compute_result(waiting[0], result)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Common handler for IO resolution (content fetched or fetch failed).
     fn handle_io_resolution(
         &mut self,
@@ -508,65 +636,96 @@ impl WorkflowEngine {
                         WorkflowAction::PersistHistory { workflow_id: wf_id },
                     ];
                 }
-                ComputeResult::NeedsIO { request } => {
-                    let cid = match request {
-                        IORequest::FetchContent { cid } => cid,
-                        IORequest::LoadModel { gguf_cid, .. } => {
-                            // LoadModel IO: use the GGUF CID for content fetch.
-                            // Full model loading support is future work.
-                            gguf_cid
+                ComputeResult::NeedsIO { request } => match request {
+                    IORequest::FetchContent { cid } => {
+                        if let Some(state) = self.workflows.get_mut(&wf_id) {
+                            state.history.events.push(HistoryEvent::IoRequested { cid });
+
+                            // Check replay cache BEFORE extracting session. Use get() (not
+                            // remove) so a workflow that fetches the same CID twice can replay
+                            // both requests from the cache.
+                            if let Some(cached_data) = state.replay_cache.get(&cid).cloned() {
+                                // Cache hit: feed cached data immediately, no external fetch.
+                                state.history.events.push(HistoryEvent::IoResolved {
+                                    cid,
+                                    data: cached_data.clone(),
+                                });
+                                // Resume and loop (iterative, not recursive).
+                                current_result = match cached_data {
+                                    Some(data) => self.runtime.resume_with_io(
+                                        IOResponse::ContentReady { data },
+                                        self.budget,
+                                    ),
+                                    None => self.runtime.resume_with_io(
+                                        IOResponse::ContentNotFound,
+                                        self.budget,
+                                    ),
+                                };
+                                continue;
+                            }
+
+                            // Cache miss: normal path — extract session, emit FetchContent.
+                            let saved_session = self
+                                .runtime
+                                .take_session()
+                                .expect("NeedsIO implies session");
+                            state.saved_session = Some(saved_session);
+                            state.status = WorkflowStatus::WaitingForIo { cid };
+                            self.active = None;
+
+                            // NOTE: Multiple workflows requesting the same CID will each
+                            // emit a FetchContent action. Deduplication is left to the
+                            // caller (NodeRuntime) or the storage layer (CAS).
+                            return vec![
+                                WorkflowAction::FetchContent {
+                                    workflow_id: wf_id,
+                                    cid,
+                                },
+                                WorkflowAction::PersistHistory { workflow_id: wf_id },
+                            ];
                         }
-                    };
 
-                    if let Some(state) = self.workflows.get_mut(&wf_id) {
-                        state.history.events.push(HistoryEvent::IoRequested { cid });
-
-                        // Check replay cache BEFORE extracting session. Use get() (not
-                        // remove) so a workflow that fetches the same CID twice can replay
-                        // both requests from the cache.
-                        if let Some(cached_data) = state.replay_cache.get(&cid).cloned() {
-                            // Cache hit: feed cached data immediately, no external fetch.
-                            state.history.events.push(HistoryEvent::IoResolved {
-                                cid,
-                                data: cached_data.clone(),
-                            });
-                            // Resume and loop (iterative, not recursive).
-                            current_result = match cached_data {
-                                Some(data) => self
-                                    .runtime
-                                    .resume_with_io(IOResponse::ContentReady { data }, self.budget),
-                                None => self
-                                    .runtime
-                                    .resume_with_io(IOResponse::ContentNotFound, self.budget),
-                            };
-                            continue;
-                        }
-
-                        // Cache miss: normal path — extract session, emit FetchContent.
-                        let saved_session = self
-                            .runtime
-                            .take_session()
-                            .expect("NeedsIO implies session");
-                        state.saved_session = Some(saved_session);
-                        state.status = WorkflowStatus::WaitingForIo { cid };
+                        // Workflow not found — still clear active, but emit nothing.
                         self.active = None;
-
-                        // NOTE: Multiple workflows requesting the same CID will each
-                        // emit a FetchContent action. Deduplication is left to the
-                        // caller (NodeRuntime) or the storage layer (CAS).
-                        return vec![
-                            WorkflowAction::FetchContent {
-                                workflow_id: wf_id,
-                                cid,
-                            },
-                            WorkflowAction::PersistHistory { workflow_id: wf_id },
-                        ];
+                        return Vec::new();
                     }
+                    IORequest::LoadModel {
+                        gguf_cid,
+                        tokenizer_cid,
+                    } => {
+                        if let Some(state) = self.workflows.get_mut(&wf_id) {
+                            state.history.events.push(HistoryEvent::ModelRequested {
+                                gguf_cid,
+                                tokenizer_cid,
+                            });
 
-                    // Workflow not found — still clear active, but emit nothing.
-                    self.active = None;
-                    return Vec::new();
-                }
+                            // Extract session, suspend, emit LoadModel action.
+                            let saved_session = self
+                                .runtime
+                                .take_session()
+                                .expect("NeedsIO implies session");
+                            state.saved_session = Some(saved_session);
+                            state.status = WorkflowStatus::WaitingForModel {
+                                gguf_cid,
+                                tokenizer_cid,
+                            };
+                            self.active = None;
+
+                            return vec![
+                                WorkflowAction::LoadModel {
+                                    workflow_id: wf_id,
+                                    gguf_cid,
+                                    tokenizer_cid,
+                                },
+                                WorkflowAction::PersistHistory { workflow_id: wf_id },
+                            ];
+                        }
+
+                        // Workflow not found — still clear active, but emit nothing.
+                        self.active = None;
+                        return Vec::new();
+                    }
+                },
             }
         }
     }
@@ -1443,5 +1602,185 @@ mod tests {
             .iter()
             .any(|a| matches!(a, WorkflowAction::WorkflowComplete { workflow_id, .. } if *workflow_id == wf_b));
         assert!(b_complete, "B should complete on this tick");
+    }
+
+    // ── LoadModel integration tests ─────────────────────────────────
+
+    #[test]
+    fn load_model_request_emits_action_and_suspends() {
+        let gguf_cid = [0xAA; 32];
+        let tokenizer_cid = [0xBB; 32];
+
+        // Script: execute → NeedsIO(LoadModel), then resume → Complete
+        let runtime = ScriptedRuntime::new(vec![
+            ComputeResult::NeedsIO {
+                request: IORequest::LoadModel {
+                    gguf_cid,
+                    tokenizer_cid,
+                },
+            },
+            ComputeResult::Complete {
+                output: vec![0x42; 4],
+            },
+        ]);
+
+        let mut engine =
+            WorkflowEngine::new(Box::new(runtime), InstructionBudget { fuel: 100_000 });
+
+        let module = b"inference_module".to_vec();
+        let input = b"inference_input".to_vec();
+        let module_hash = harmony_crypto::hash::blake3_hash(&module);
+        let wf_id = WorkflowId::new(&module_hash, &input);
+
+        engine.handle(WorkflowEvent::Submit {
+            module,
+            input,
+            hint: ComputeHint::PreferLocal,
+        });
+
+        // Tick: execute → NeedsIO(LoadModel) → WaitingForModel
+        let actions = engine.tick();
+        let load_model = actions
+            .iter()
+            .find(|a| matches!(a, WorkflowAction::LoadModel { .. }));
+        assert!(
+            load_model.is_some(),
+            "should emit LoadModel action, got: {actions:?}"
+        );
+
+        if let Some(WorkflowAction::LoadModel {
+            workflow_id,
+            gguf_cid: g,
+            tokenizer_cid: t,
+        }) = load_model
+        {
+            assert_eq!(*workflow_id, wf_id);
+            assert_eq!(*g, gguf_cid);
+            assert_eq!(*t, tokenizer_cid);
+        }
+
+        assert_eq!(
+            engine.workflow_status(&wf_id),
+            Some(&WorkflowStatus::WaitingForModel {
+                gguf_cid,
+                tokenizer_cid,
+            }),
+            "workflow should be in WaitingForModel state"
+        );
+    }
+
+    #[test]
+    fn model_loaded_resumes_workflow_to_completion() {
+        let gguf_cid = [0xCC; 32];
+        let tokenizer_cid = [0xDD; 32];
+
+        let runtime = ScriptedRuntime::new(vec![
+            ComputeResult::NeedsIO {
+                request: IORequest::LoadModel {
+                    gguf_cid,
+                    tokenizer_cid,
+                },
+            },
+            ComputeResult::Complete {
+                output: vec![0x01, 0x02, 0x03, 0x04],
+            },
+        ]);
+
+        let mut engine =
+            WorkflowEngine::new(Box::new(runtime), InstructionBudget { fuel: 100_000 });
+
+        let module = b"model_module".to_vec();
+        let input = b"model_input".to_vec();
+        let module_hash = harmony_crypto::hash::blake3_hash(&module);
+        let wf_id = WorkflowId::new(&module_hash, &input);
+
+        engine.handle(WorkflowEvent::Submit {
+            module,
+            input,
+            hint: ComputeHint::PreferLocal,
+        });
+
+        // Tick → WaitingForModel
+        engine.tick();
+
+        // Deliver model data
+        let actions = engine.handle(WorkflowEvent::ModelLoaded {
+            gguf_cid,
+            tokenizer_cid,
+            gguf_data: vec![0xFF; 10],
+            tokenizer_data: vec![0xEE; 5],
+        });
+
+        let complete = actions
+            .iter()
+            .find(|a| matches!(a, WorkflowAction::WorkflowComplete { .. }));
+        assert!(
+            complete.is_some(),
+            "should complete after model loaded, got: {actions:?}"
+        );
+
+        if let Some(WorkflowAction::WorkflowComplete { output, .. }) = complete {
+            assert_eq!(output, &[0x01, 0x02, 0x03, 0x04]);
+        }
+
+        assert_eq!(
+            engine.workflow_status(&wf_id),
+            Some(&WorkflowStatus::Complete)
+        );
+    }
+
+    #[test]
+    fn model_load_failed_fails_workflow() {
+        let gguf_cid = [0xEE; 32];
+        let tokenizer_cid = [0xFF; 32];
+
+        let runtime = ScriptedRuntime::new(vec![
+            ComputeResult::NeedsIO {
+                request: IORequest::LoadModel {
+                    gguf_cid,
+                    tokenizer_cid,
+                },
+            },
+            // resume_with_io with ModelGgufNotFound → WASM returns error
+            ComputeResult::Complete {
+                output: vec![0xFF, 0xFF, 0xFF, 0xFF], // -1 as i32 LE
+            },
+        ]);
+
+        let mut engine =
+            WorkflowEngine::new(Box::new(runtime), InstructionBudget { fuel: 100_000 });
+
+        let module = b"fail_module".to_vec();
+        let input = b"fail_input".to_vec();
+        let module_hash = harmony_crypto::hash::blake3_hash(&module);
+        let wf_id = WorkflowId::new(&module_hash, &input);
+
+        engine.handle(WorkflowEvent::Submit {
+            module,
+            input,
+            hint: ComputeHint::PreferLocal,
+        });
+
+        engine.tick(); // → WaitingForModel
+
+        let actions = engine.handle(WorkflowEvent::ModelLoadFailed {
+            gguf_cid,
+            tokenizer_cid,
+        });
+
+        // The ScriptedRuntime returns Complete (the WASM module handles the error internally),
+        // so we should see WorkflowComplete.
+        let complete = actions
+            .iter()
+            .find(|a| matches!(a, WorkflowAction::WorkflowComplete { .. }));
+        assert!(
+            complete.is_some(),
+            "model load failure should still complete (WASM handles error), got: {actions:?}"
+        );
+
+        assert_eq!(
+            engine.workflow_status(&wf_id),
+            Some(&WorkflowStatus::Complete)
+        );
     }
 }

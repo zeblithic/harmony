@@ -74,6 +74,10 @@ pub struct ConfigFile {
     pub did_web_cache_ttl: Option<u64>,
     pub rawlink_interface: Option<String>,
     pub archivist: Option<ArchivistConfig>,
+    /// Hex-encoded 32-byte CID of the GGUF model file in CAS.
+    pub inference_model_gguf_cid: Option<String>,
+    /// Hex-encoded 32-byte CID of the tokenizer.json file in CAS.
+    pub inference_model_tokenizer_cid: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]

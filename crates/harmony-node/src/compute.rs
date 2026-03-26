@@ -339,6 +339,17 @@ impl ComputeTier {
                         self.active = None;
                         vec![ComputeTierAction::FetchContent { query_id, cid }]
                     }
+                    harmony_compute::IORequest::LoadModel { .. } => {
+                        // LoadModel IO is handled at the NodeRuntime level for the
+                        // inference queryable. Any other compute-tier workflow that
+                        // emits LoadModel receives an explicit error here.
+                        // Drop the pending session to avoid a stale HostTrap.
+                        let _ = self.runtime.take_session();
+                        self.active = None;
+                        let mut payload = vec![0x01];
+                        payload.extend_from_slice(b"LoadModel IO not supported in compute tier");
+                        vec![ComputeTierAction::SendReply { query_id, payload }]
+                    }
                 }
             }
         }
