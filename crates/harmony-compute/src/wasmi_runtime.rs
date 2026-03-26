@@ -11,9 +11,9 @@ struct HostState {
     io_request: Option<crate::types::IORequest>,
     /// Where to write the IO response data: (out_ptr, out_cap).
     io_write_target: Option<(u32, u32)>,
-    /// Loaded inference engine (only available with `inference` feature).
+    /// Loaded inference engine with model CIDs: (gguf_cid, tokenizer_cid, engine).
     #[cfg(feature = "inference")]
-    inference_engine: Option<harmony_inference::QwenEngine>,
+    inference_engine: Option<([u8; 32], [u8; 32], harmony_inference::QwenEngine)>,
     /// Logits from the most recent `forward()` call, read by `sample()`.
     /// Persists until the next `forward()` or `model_reset()` — multiple
     /// `sample()` calls from the same logits are allowed (e.g. beam search).
@@ -75,11 +75,10 @@ struct ExecContext {
 pub struct WasmiRuntime {
     engine: wasmi::Engine,
     session: Option<WasmiSession>,
-    /// Persisted inference engine across execute() calls. When a WASM module
-    /// calls model_load with CIDs matching an already-loaded engine, the host
-    /// function returns 0 immediately — no trap, no data cloning, no re-parse.
+    /// Persisted inference engine across execute() calls: (gguf_cid, tokenizer_cid, engine).
+    /// When model_load is called with matching CIDs, returns 0 immediately after reset().
     #[cfg(feature = "inference")]
-    shared_inference_engine: Option<harmony_inference::QwenEngine>,
+    shared_inference_engine: Option<([u8; 32], [u8; 32], harmony_inference::QwenEngine)>,
 }
 
 impl WasmiRuntime {
@@ -342,10 +341,21 @@ impl ComputeRuntime for WasmiRuntime {
                                 wasmi::Error::new(format!("failed to read tokenizer CID: {e}"))
                             })?;
 
-                        // If engine is already loaded, return success immediately —
-                        // no trap, no data cloning, no re-parse.
-                        if caller.data().inference_engine.is_some() {
-                            return Ok(0);
+                        // If engine is already loaded with matching CIDs, reset and
+                        // return success — no trap, no data cloning, no re-parse.
+                        if let Some((g, t, _)) = &caller.data().inference_engine {
+                            if *g == gguf_cid && *t == tokenizer_cid {
+                                // Reset clears KV cache, position, token_history
+                                // so this request starts with a clean slate.
+                                caller
+                                    .data_mut()
+                                    .inference_engine
+                                    .as_mut()
+                                    .unwrap()
+                                    .2
+                                    .reset();
+                                return Ok(0);
+                            }
                         }
 
                         let data = caller.data_mut();
@@ -379,8 +389,8 @@ impl ComputeRuntime for WasmiRuntime {
                             return Ok(-3);
                         }
 
-                        let engine = match &caller.data().inference_engine {
-                            Some(e) => e,
+                        let engine = match caller.data().inference_engine.as_ref() {
+                            Some((_, _, e)) => e,
                             None => return Ok(-1),
                         };
 
@@ -436,8 +446,8 @@ impl ComputeRuntime for WasmiRuntime {
                             return Ok(-3);
                         }
 
-                        let engine = match &caller.data().inference_engine {
-                            Some(e) => e,
+                        let engine = match caller.data().inference_engine.as_ref() {
+                            Some((_, _, e)) => e,
                             None => return Ok(-1),
                         };
 
@@ -503,7 +513,7 @@ impl ComputeRuntime for WasmiRuntime {
                             .collect();
 
                         let engine = match caller.data_mut().inference_engine.as_mut() {
-                            Some(e) => e,
+                            Some((_, _, e)) => e,
                             None => return Ok(-1),
                         };
 
@@ -585,7 +595,7 @@ impl ComputeRuntime for WasmiRuntime {
                             None => return Ok(-3), // no logits from prior forward()
                         };
 
-                        let engine = caller.data().inference_engine.as_ref().unwrap();
+                        let (_, _, engine) = caller.data().inference_engine.as_ref().unwrap();
                         match engine.sample(&logits, &params) {
                             Ok(token_id) => {
                                 let id = token_id as i32;
@@ -608,7 +618,7 @@ impl ComputeRuntime for WasmiRuntime {
                     "model_reset",
                     |mut caller: wasmi::Caller<'_, HostState>| -> Result<i32, wasmi::Error> {
                         let data = caller.data_mut();
-                        if let Some(engine) = &mut data.inference_engine {
+                        if let Some((_, _, engine)) = &mut data.inference_engine {
                             engine.reset();
                         }
                         data.last_logits = None;
@@ -800,12 +810,15 @@ impl ComputeRuntime for WasmiRuntime {
         };
 
         // Branch on the type of pending IO request.
-        let is_model_load = matches!(
-            session.store.data().io_request,
-            Some(crate::types::IORequest::LoadModel { .. })
-        );
+        let model_load_cids = match session.store.data().io_request {
+            Some(crate::types::IORequest::LoadModel {
+                gguf_cid,
+                tokenizer_cid,
+            }) => Some((gguf_cid, tokenizer_cid)),
+            _ => None,
+        };
 
-        let return_val: i32 = if is_model_load {
+        let return_val: i32 = if let Some((load_gguf_cid, load_tok_cid)) = model_load_cids {
             #[cfg(feature = "inference")]
             {
                 match response {
@@ -822,7 +835,8 @@ impl ComputeRuntime for WasmiRuntime {
                             -4
                         } else {
                             let data = session.store.data_mut();
-                            data.inference_engine = Some(engine);
+                            data.inference_engine =
+                                Some((load_gguf_cid, load_tok_cid, engine));
                             data.last_logits = None;
                             0
                         }
