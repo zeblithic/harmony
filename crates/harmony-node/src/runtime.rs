@@ -2366,10 +2366,12 @@ impl<B: BookStore> NodeRuntime<B> {
             }
 
             // Also declare the verify queryable for DSD target verification.
+            // Use a per-node key so edges can route queries to a specific target.
             #[cfg(feature = "inference")]
             if self.verify_queryable_id.is_none() {
-                let verify_key = harmony_zenoh::namespace::compute::VERIFY_ACTIVITY;
-                match self.queryable_router.declare(verify_key) {
+                let verify_key =
+                    harmony_zenoh::namespace::compute::verify_key(&self.node_addr);
+                match self.queryable_router.declare(&verify_key) {
                     Ok((qid, actions)) => {
                         self.verify_queryable_id = Some(qid);
                         self.compute_queryable_ids.insert(qid);
@@ -2535,13 +2537,16 @@ impl<B: BookStore> NodeRuntime<B> {
             }
         };
 
-        if self.dsd_target_addr.is_none() {
-            let err =
-                harmony_speculative::VerifyResponse::serialize_error("no DSD target discovered");
-            self.pending_direct_actions
-                .push(RuntimeAction::SendReply { query_id, payload: err });
-            return;
-        }
+        let target_addr = match &self.dsd_target_addr {
+            Some(a) => a.clone(),
+            None => {
+                let err =
+                    harmony_speculative::VerifyResponse::serialize_error("no DSD target discovered");
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                return;
+            }
+        };
 
         // Tokenize the prompt.
         let prompt_tokens = match engine.tokenize(&request.prompt) {
@@ -2557,7 +2562,10 @@ impl<B: BookStore> NodeRuntime<B> {
         };
 
         // Get EOS token ID from tokenizer.
-        let eos_token_id = engine.tokenize("</s>").ok().and_then(|t| t.first().copied());
+        let eos_token_id = engine.eos_token_id();
+        if eos_token_id.is_none() {
+            tracing::warn!("tokenizer has no EOS token; DSD session will run to max_tokens");
+        }
         let prompt_len = prompt_tokens.len();
 
         // Reset and prefill draft model.
@@ -2608,7 +2616,7 @@ impl<B: BookStore> NodeRuntime<B> {
             drafts,
         };
         let verify_payload = verify_request.serialize();
-        let target_key = harmony_zenoh::namespace::compute::VERIFY_ACTIVITY.to_string();
+        let target_key = harmony_zenoh::namespace::compute::verify_key(&target_addr);
 
         self.pending_direct_actions.push(RuntimeAction::SendVerifyQuery {
             key_expr: target_key.clone(),
@@ -2677,19 +2685,27 @@ impl<B: BookStore> NodeRuntime<B> {
             self.dsd_session = None;
             return;
         }
+        // Append accepted draft tokens, stopping early if EOS is encountered.
+        let mut hit_eos = false;
         for &token_id in pending.iter().take(accepted) {
+            if eos_token_id == Some(token_id) {
+                hit_eos = true;
+                break;
+            }
             session.accepted_tokens.push(token_id);
         }
-        // Append bonus token.
-        session.accepted_tokens.push(response.bonus_token);
+        // Append bonus token only if we haven't already hit EOS.
+        if !hit_eos {
+            if eos_token_id == Some(response.bonus_token) {
+                hit_eos = true;
+            } else {
+                session.accepted_tokens.push(response.bonus_token);
+            }
+        }
 
         // Count generated tokens (total - prompt length).
         let prompt_len = session.prompt_len;
         let generated = session.accepted_tokens.len() - prompt_len;
-
-        // Check for completion: EOS or max_tokens.
-        let hit_eos = eos_token_id == Some(response.bonus_token)
-            || pending.iter().take(accepted).any(|&t| eos_token_id == Some(t));
 
         if hit_eos || generated >= max_tokens {
             // Done — detokenize and reply.

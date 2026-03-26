@@ -9,8 +9,10 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
     let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     if sum == 0.0 {
-        // Degenerate case: all logits are -inf
-        return vec![0.0; logits.len()];
+        // Degenerate case: all logits are -inf. Return uniform distribution
+        // so callers get valid probabilities rather than an all-zeros vector.
+        let uniform = 1.0 / logits.len() as f32;
+        return vec![uniform; logits.len()];
     }
     exps.into_iter().map(|e| e / sum).collect()
 }
