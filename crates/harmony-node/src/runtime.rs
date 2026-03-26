@@ -818,12 +818,24 @@ impl<B: BookStore> NodeRuntime<B> {
             inference_tokenizer_data: None,
         };
 
-        // If inference model CIDs are configured, fetch both from CAS at startup.
-        if let Some(gguf_cid) = rt.inference_model_cid {
-            actions.push(RuntimeAction::FetchContent { cid: gguf_cid });
+        // If inference model CIDs are configured AND the inference feature is
+        // enabled, fetch both from CAS at startup. Without the feature, the
+        // wasmi host functions (model_load etc.) aren't registered and WASM
+        // instantiation would fail.
+        #[cfg(feature = "inference")]
+        {
+            if let Some(gguf_cid) = rt.inference_model_cid {
+                actions.push(RuntimeAction::FetchContent { cid: gguf_cid });
+            }
+            if let Some(tok_cid) = rt.inference_tokenizer_cid {
+                actions.push(RuntimeAction::FetchContent { cid: tok_cid });
+            }
         }
-        if let Some(tok_cid) = rt.inference_tokenizer_cid {
-            actions.push(RuntimeAction::FetchContent { cid: tok_cid });
+        #[cfg(not(feature = "inference"))]
+        if config.inference_gguf_cid.is_some() || config.inference_tokenizer_cid.is_some() {
+            tracing::warn!(
+                "inference CIDs configured but 'inference' feature not enabled; inference disabled"
+            );
         }
 
         (rt, actions)
@@ -1178,8 +1190,6 @@ impl<B: BookStore> NodeRuntime<B> {
             }
             RuntimeEvent::ContentFetchResponse { cid, result } => {
                 // Check if this is inference model data arriving from startup fetch.
-                // Consume the data directly (no clone) and skip forwarding to the
-                // workflow engine, which has no workflow waiting for these CIDs.
                 let is_inference_gguf = Some(cid) == self.inference_model_cid
                     && self.inference_gguf_data.is_none();
                 let is_inference_tok = Some(cid) == self.inference_tokenizer_cid
@@ -1188,28 +1198,39 @@ impl<B: BookStore> NodeRuntime<B> {
                 if is_inference_gguf || is_inference_tok {
                     match result {
                         Ok(data) => {
+                            // Clone for workflow engine in case a workflow also needs
+                            // this CID (unlikely but possible CID collision).
+                            let wf_event = WorkflowEvent::ContentFetched {
+                                cid,
+                                data: data.clone(),
+                            };
                             if is_inference_gguf {
                                 self.inference_gguf_data = Some(data);
                             } else {
                                 self.inference_tokenizer_data = Some(data);
                             }
                             self.check_inference_model_ready();
+                            let actions = self.workflow.handle(wf_event);
+                            self.pending_workflow_actions.extend(actions);
                         }
                         Err(e) => {
-                            let label = if is_inference_gguf { "GGUF model" } else { "tokenizer" };
+                            let label =
+                                if is_inference_gguf { "GGUF model" } else { "tokenizer" };
                             tracing::error!(
                                 "failed to fetch inference {label} (CID {}): {e}; inference disabled",
                                 hex::encode(cid)
                             );
-                            // Clear all inference state — CIDs and any partial data
                             self.inference_model_cid = None;
                             self.inference_tokenizer_cid = None;
                             self.inference_gguf_data = None;
                             self.inference_tokenizer_data = None;
+                            let actions =
+                                self.workflow.handle(WorkflowEvent::ContentFetchFailed { cid });
+                            self.pending_workflow_actions.extend(actions);
                         }
                     }
                 } else {
-                    // Non-inference content — forward to workflow engine as before
+                    // Non-inference content — forward to workflow engine
                     let event = match result {
                         Ok(data) => WorkflowEvent::ContentFetched { cid, data },
                         Err(_) => WorkflowEvent::ContentFetchFailed { cid },
@@ -5500,6 +5521,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "inference")]
     fn inference_startup_emits_fetch_for_model_cids() {
         let mut config = NodeConfig::default();
         config.inference_gguf_cid = Some([0xAA; 32]);

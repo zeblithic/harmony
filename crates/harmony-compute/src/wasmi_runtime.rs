@@ -75,6 +75,11 @@ struct ExecContext {
 pub struct WasmiRuntime {
     engine: wasmi::Engine,
     session: Option<WasmiSession>,
+    /// Persisted inference engine across execute() calls. When a WASM module
+    /// calls model_load with CIDs matching an already-loaded engine, the host
+    /// function returns 0 immediately — no trap, no data cloning, no re-parse.
+    #[cfg(feature = "inference")]
+    shared_inference_engine: Option<harmony_inference::QwenEngine>,
 }
 
 impl WasmiRuntime {
@@ -86,6 +91,8 @@ impl WasmiRuntime {
         Self {
             engine,
             session: None,
+            #[cfg(feature = "inference")]
+            shared_inference_engine: None,
         }
     }
 
@@ -229,8 +236,15 @@ impl ComputeRuntime for WasmiRuntime {
         input: &[u8],
         budget: InstructionBudget,
     ) -> ComputeResult {
-        // Drop any existing session.
-        self.session = None;
+        // Recover persisted inference engine from prior session before dropping it.
+        #[cfg(feature = "inference")]
+        if let Some(session) = self.session.take() {
+            self.shared_inference_engine = session.store.into_data().inference_engine;
+        }
+        #[cfg(not(feature = "inference"))]
+        {
+            self.session = None;
+        }
 
         // Hash the module bytes for identity tracking.
         let module_hash = harmony_crypto::hash::blake3_hash(module_bytes);
@@ -247,8 +261,13 @@ impl ComputeRuntime for WasmiRuntime {
             }
         };
 
-        // Create a store with host state and set fuel budget.
-        let mut store = wasmi::Store::new(&self.engine, HostState::new());
+        // Create a store with host state, injecting any persisted inference engine.
+        let mut host_state = HostState::new();
+        #[cfg(feature = "inference")]
+        {
+            host_state.inference_engine = self.shared_inference_engine.take();
+        }
+        let mut store = wasmi::Store::new(&self.engine, host_state);
         if let Err(e) = store.set_fuel(budget.fuel) {
             return ComputeResult::Failed {
                 error: ComputeError::Trap {
@@ -322,6 +341,12 @@ impl ComputeRuntime for WasmiRuntime {
                             .map_err(|e| {
                                 wasmi::Error::new(format!("failed to read tokenizer CID: {e}"))
                             })?;
+
+                        // If engine is already loaded, return success immediately —
+                        // no trap, no data cloning, no re-parse.
+                        if caller.data().inference_engine.is_some() {
+                            return Ok(0);
+                        }
 
                         let data = caller.data_mut();
                         data.io_request = Some(crate::types::IORequest::LoadModel {
