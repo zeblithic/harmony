@@ -21,6 +21,9 @@ use std::{
 /// Return the filesystem path for a CAS book CID under `data_dir`.
 ///
 /// Layout: `{data_dir}/book/{hex_cid[8..10]}/{hex_cid}`
+///
+/// NOTE: This layout is shared with `harmony_ingest::storage::local_book_path`.
+/// If the convention changes, both must be updated in lockstep.
 pub fn book_path(data_dir: &std::path::Path, cid: &ContentId) -> PathBuf {
     let hex_cid = hex::encode(cid.to_bytes());
     let prefix = &hex_cid[8..10];
