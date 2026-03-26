@@ -101,4 +101,7 @@ pub trait InferenceEngine {
 
     /// Reset the KV cache and position (start a new conversation).
     fn reset(&mut self);
+
+    /// Return the EOS (end-of-sequence) token ID, if the tokenizer defines one.
+    fn eos_token_id(&self) -> Option<u32>;
 }

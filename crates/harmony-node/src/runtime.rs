@@ -251,6 +251,8 @@ pub enum RuntimeEvent {
     L2InterfaceReady { interface_name: String },
     /// A raw L2 interface has been shut down.
     L2InterfaceClosed { interface_name: String },
+    /// DSD: verify response received from target node.
+    VerifyResponse { payload: Vec<u8> },
 
     /// Disk read completed — content fetched from persistent storage.
     DiskReadComplete {
@@ -317,6 +319,10 @@ pub enum RuntimeAction {
     /// The event loop calls session.get(key_expr) and feeds each reply
     /// back as RuntimeEvent::MemoFetchResponse.
     QueryMemo { key_expr: String },
+    /// DSD: send a verify query to the target node's verify queryable.
+    /// The event loop sends a Zenoh query to `key_expr` with `payload`,
+    /// and feeds the reply back as `RuntimeEvent::VerifyResponse`.
+    SendVerifyQuery { key_expr: String, payload: Vec<u8> },
     /// Persist a CAS book to disk (spawned as blocking I/O by event loop).
     PersistToDisk { cid: ContentId, data: Vec<u8> },
     /// Read a CAS book from disk (spawned as blocking I/O by event loop).
@@ -518,6 +524,25 @@ impl PeerFilterTable {
     }
 }
 
+/// Active DSD session state — tracks an in-progress speculative decoding loop.
+#[cfg(feature = "inference")]
+struct DsdSession {
+    /// Query ID of the original speculative request (to reply when done).
+    query_id: u64,
+    /// Accepted token sequence so far (prompt + accepted draft + bonus tokens).
+    accepted_tokens: Vec<u32>,
+    /// Target node's verify key expression.
+    target_verify_key: String,
+    /// Maximum tokens to generate.
+    max_tokens: u32,
+    /// EOS token ID (from tokenizer, if available).
+    eos_token_id: Option<u32>,
+    /// Token IDs of the pending draft tokens (awaiting verification).
+    pending_drafts: Vec<u32>,
+    /// Length of the original prompt in tokens (for slicing generated output).
+    prompt_len: usize,
+}
+
 /// Sans-I/O node runtime wiring Tier 1 (Router), Tier 2 (Storage), and Tier 3 (Compute).
 ///
 /// Events are pushed via [`push_event`](Self::push_event) into internal
@@ -654,6 +679,22 @@ pub struct NodeRuntime<B: BookStore> {
     /// Monotonic nonce for inference requests — ensures each request gets a
     /// unique WorkflowId, preventing dedup of non-deterministic results.
     inference_request_nonce: u64,
+    /// QwenEngine for native verification (DSD target side).
+    /// Separate from the WasmiRuntime's persisted engine used by WASM workflows.
+    #[cfg(feature = "inference")]
+    verification_engine: Option<harmony_inference::QwenEngine>,
+    /// Queryable ID for the DSD verify endpoint.
+    #[cfg(feature = "inference")]
+    verify_queryable_id: Option<QueryableId>,
+    /// Active DSD session (one at a time for simplicity).
+    #[cfg(feature = "inference")]
+    dsd_session: Option<DsdSession>,
+    /// Discovered target node address for DSD (differs from our model CID).
+    #[cfg(feature = "inference")]
+    dsd_target_addr: Option<String>,
+    /// Queryable ID for the speculative inference endpoint.
+    #[cfg(feature = "inference")]
+    speculative_queryable_id: Option<QueryableId>,
 }
 
 /// Adapts the runtime's pubkey_cache to the CredentialKeyResolver trait
@@ -780,6 +821,12 @@ impl<B: BookStore> NodeRuntime<B> {
             key_expr: harmony_zenoh::namespace::filters::PAGE_SUB.to_string(),
         });
 
+        // Subscribe to capacity advertisements for DSD target discovery.
+        #[cfg(feature = "inference")]
+        actions.push(RuntimeAction::Subscribe {
+            key_expr: harmony_zenoh::namespace::compute::CAPACITY_SUB.to_string(),
+        });
+
         let mut rt = Self {
             router,
             queryable_router,
@@ -840,6 +887,16 @@ impl<B: BookStore> NodeRuntime<B> {
             inference_gguf_data: None,
             inference_tokenizer_data: None,
             inference_request_nonce: 0,
+            #[cfg(feature = "inference")]
+            verification_engine: None,
+            #[cfg(feature = "inference")]
+            verify_queryable_id: None,
+            #[cfg(feature = "inference")]
+            dsd_session: None,
+            #[cfg(feature = "inference")]
+            dsd_target_addr: None,
+            #[cfg(feature = "inference")]
+            speculative_queryable_id: None,
         };
 
         // Activate disk tier when data_dir is configured (even if empty on first boot).
@@ -1460,6 +1517,14 @@ impl<B: BookStore> NodeRuntime<B> {
                 tracing::info!(%interface_name, "L2 interface closed — unregistered");
                 self.router.unregister_interface(&interface_name);
             }
+            RuntimeEvent::VerifyResponse { payload } => {
+                #[cfg(feature = "inference")]
+                self.handle_verify_response(payload);
+                #[cfg(not(feature = "inference"))]
+                {
+                    let _ = payload;
+                }
+            }
             RuntimeEvent::DiskReadComplete {
                 cid,
                 query_id,
@@ -2064,9 +2129,18 @@ impl<B: BookStore> NodeRuntime<B> {
     fn route_compute_query(
         &mut self,
         query_id: u64,
-        _key_expr: String,
+        key_expr: String,
         payload: Vec<u8>,
     ) -> Vec<WorkflowAction> {
+        // Check if this is a speculative query (key_expr match, not payload tag).
+        #[cfg(feature = "inference")]
+        if key_expr == harmony_zenoh::namespace::compute::SPECULATIVE_ACTIVITY {
+            self.handle_speculative_query(query_id, payload);
+            return Vec::new();
+        }
+        #[cfg(not(feature = "inference"))]
+        let _ = &key_expr; // Suppress unused warning
+
         let parsed = match self.parse_compute_payload(payload) {
             Some(p) => p,
             None => {
@@ -2143,6 +2217,51 @@ impl<B: BookStore> NodeRuntime<B> {
                     input,
                     hint: ComputeHint::PreferLocal,
                 })
+            }
+            ParsedCompute::Verify { request } => {
+                // DSD target verification — run natively, NOT through WASM.
+                // Reject if a DSD session is active — the engine is shared and
+                // run_verification would destroy the draft model's KV cache.
+                #[cfg(feature = "inference")]
+                {
+                    if self.dsd_session.is_some() {
+                        let payload = harmony_speculative::VerifyResponse::serialize_error(
+                            "busy: DSD session active on this node",
+                        );
+                        self.pending_direct_actions
+                            .push(RuntimeAction::SendReply { query_id, payload });
+                        return Vec::new();
+                    }
+                    if let Some(engine) = &mut self.verification_engine {
+                        let response = Self::run_verification(engine, &request);
+                        let payload = match response {
+                            Ok(resp) => resp.serialize(),
+                            Err(e) => {
+                                harmony_speculative::VerifyResponse::serialize_error(&e)
+                            }
+                        };
+                        self.pending_direct_actions
+                            .push(RuntimeAction::SendReply { query_id, payload });
+                    } else {
+                        let payload =
+                            harmony_speculative::VerifyResponse::serialize_error(
+                                "no verification engine",
+                            );
+                        self.pending_direct_actions
+                            .push(RuntimeAction::SendReply { query_id, payload });
+                    }
+                }
+                #[cfg(not(feature = "inference"))]
+                {
+                    let _ = &request;
+                    let payload =
+                        harmony_speculative::VerifyResponse::serialize_error(
+                            "inference feature not enabled",
+                        );
+                    self.pending_direct_actions
+                        .push(RuntimeAction::SendReply { query_id, payload });
+                }
+                Vec::new()
             }
         }
     }
@@ -2249,6 +2368,37 @@ impl<B: BookStore> NodeRuntime<B> {
             return; // Already declared
         }
         if self.inference_gguf_data.is_some() && self.inference_tokenizer_data.is_some() {
+            // Build the DSD verification engine from the same model data.
+            #[cfg(feature = "inference")]
+            if self.verification_engine.is_none() {
+                if let (Some(gguf_data), Some(tok_data)) = (
+                    self.inference_gguf_data.as_ref(),
+                    self.inference_tokenizer_data.as_ref(),
+                ) {
+                    use harmony_inference::InferenceEngine;
+                    let mut engine =
+                        harmony_inference::QwenEngine::new(candle_core::Device::Cpu);
+                    match engine.load_gguf(gguf_data) {
+                        Ok(()) => match engine.load_tokenizer(tok_data) {
+                            Ok(()) => {
+                                self.verification_engine = Some(engine);
+                                tracing::info!("DSD verification engine loaded");
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "failed to load tokenizer for verification engine: {e}"
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!(
+                                "failed to load GGUF for verification engine: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+
             // Both pieces arrived — declare the inference queryable.
             let key_expr = harmony_zenoh::namespace::compute::INFERENCE_ACTIVITY;
             match self.queryable_router.declare(key_expr) {
@@ -2278,6 +2428,509 @@ impl<B: BookStore> NodeRuntime<B> {
                     tracing::error!("failed to declare inference queryable: {e}");
                 }
             }
+
+            // Also declare the verify queryable for DSD target verification.
+            // Use a per-node key so edges can route queries to a specific target.
+            #[cfg(feature = "inference")]
+            if self.verify_queryable_id.is_none() {
+                let verify_key =
+                    harmony_zenoh::namespace::compute::verify_key(&self.node_addr);
+                match self.queryable_router.declare(&verify_key) {
+                    Ok((qid, actions)) => {
+                        self.verify_queryable_id = Some(qid);
+                        self.compute_queryable_ids.insert(qid);
+                        for action in actions {
+                            if let QueryableAction::SendQueryableDeclare { key_expr } = action {
+                                self.pending_direct_actions
+                                    .push(RuntimeAction::DeclareQueryable { key_expr });
+                            }
+                        }
+                        tracing::info!("DSD verify queryable declared on {}", verify_key);
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to declare verify queryable: {e}");
+                    }
+                }
+            }
+
+            // Check if speculative queryable should be declared now that the engine is ready.
+            #[cfg(feature = "inference")]
+            self.check_speculative_ready();
+        }
+    }
+
+    /// Run DSD sequential verification using the target's inference engine.
+    ///
+    /// Algorithm:
+    /// 1. `engine.reset()` to clear prior KV cache state
+    /// 2. `engine.forward(&context_tokens)` — prefill, returns logits for verifying draft[0]
+    /// 3. For each draft token i:
+    ///    - Check if draft[i] is acceptable given current logits
+    ///    - If rejected: sample bonus token from current distribution, return
+    ///    - If accepted: `engine.forward(&[draft_token[i]])` to advance KV cache
+    /// 4. If all accepted: sample bonus token from last logits (the "free" extra token)
+    /// 5. Return `VerifyResponse` with `accepted_count` + `bonus_token` + `bonus_logprob`
+    #[cfg(feature = "inference")]
+    fn run_verification(
+        engine: &mut harmony_inference::QwenEngine,
+        request: &harmony_speculative::VerifyRequest,
+    ) -> Result<harmony_speculative::VerifyResponse, String> {
+        use harmony_inference::InferenceEngine;
+        use harmony_speculative::verify::{sample_greedy_with_logprob, should_accept_draft};
+
+        if request.drafts.is_empty() {
+            return Err("empty drafts".into());
+        }
+        debug_assert!(
+            request.drafts.len() <= u8::MAX as usize,
+            "draft count {} exceeds u8::MAX",
+            request.drafts.len()
+        );
+
+        // 1. Reset KV cache
+        engine.reset();
+
+        // 2. Prefill with context tokens — returns logits for verifying draft[0]
+        let mut current_logits = if request.context_tokens.is_empty() {
+            return Err("empty context".into());
+        } else {
+            let logits = engine
+                .forward(&request.context_tokens)
+                .map_err(|e| format!("prefill failed: {e}"))?;
+            if logits.is_empty() {
+                return Err("prefill returned empty logits".into());
+            }
+            logits
+        };
+
+        // 3. Verify each draft token sequentially
+        for (i, draft) in request.drafts.iter().enumerate() {
+            // Check if this draft token is acceptable given current_logits
+            if !should_accept_draft(&current_logits, draft.token_id, draft.logprob) {
+                // Rejected — sample bonus token from current distribution
+                let (bonus_token, bonus_logprob) =
+                    sample_greedy_with_logprob(&current_logits);
+                return Ok(harmony_speculative::VerifyResponse {
+                    accepted_count: i as u8,
+                    bonus_token,
+                    bonus_logprob,
+                });
+            }
+
+            // Accepted — feed this token to advance KV cache
+            current_logits = engine
+                .forward(&[draft.token_id])
+                .map_err(|e| format!("forward failed at draft {i}: {e}"))?;
+            if current_logits.is_empty() {
+                return Err(format!("forward returned empty logits at draft {i}"));
+            }
+        }
+
+        // 4. All accepted — sample bonus token from last logits (the "free" extra token)
+        let (bonus_token, bonus_logprob) = sample_greedy_with_logprob(&current_logits);
+
+        Ok(harmony_speculative::VerifyResponse {
+            accepted_count: request.drafts.len() as u8,
+            bonus_token,
+            bonus_logprob,
+        })
+    }
+
+    /// Declare the speculative queryable if we have both a draft model and a target node.
+    #[cfg(feature = "inference")]
+    fn check_speculative_ready(&mut self) {
+        if self.speculative_queryable_id.is_some() {
+            return; // Already declared
+        }
+        if self.verification_engine.is_none() || self.dsd_target_addr.is_none() {
+            return; // Not ready yet
+        }
+        let key_expr = harmony_zenoh::namespace::compute::SPECULATIVE_ACTIVITY;
+        match self.queryable_router.declare(key_expr) {
+            Ok((qid, actions)) => {
+                self.speculative_queryable_id = Some(qid);
+                self.compute_queryable_ids.insert(qid);
+                for action in actions {
+                    if let QueryableAction::SendQueryableDeclare { key_expr } = action {
+                        self.pending_direct_actions
+                            .push(RuntimeAction::DeclareQueryable { key_expr });
+                    }
+                }
+                tracing::info!("DSD speculative queryable declared on {}", key_expr);
+            }
+            Err(e) => {
+                tracing::error!("failed to declare speculative queryable: {e}");
+            }
+        }
+    }
+
+    /// Handle a speculative inference query (DSD edge side).
+    ///
+    /// Parses the text prompt, tokenizes, drafts gamma tokens, and sends
+    /// a verify request to the target node. Stores DSD session state.
+    #[cfg(feature = "inference")]
+    fn handle_speculative_query(&mut self, query_id: u64, payload: Vec<u8>) {
+        use harmony_inference::InferenceEngine;
+
+        // Reject if already in a DSD session (one at a time).
+        if self.dsd_session.is_some() {
+            let err = harmony_speculative::VerifyResponse::serialize_error("busy: DSD session active");
+            self.pending_direct_actions
+                .push(RuntimeAction::SendReply { query_id, payload: err });
+            return;
+        }
+
+        // Parse the prompt (reuse inference request format: 0x02 tag).
+        let request = match crate::inference::InferenceRequest::parse(&payload) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = harmony_speculative::VerifyResponse::serialize_error(&e);
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                return;
+            }
+        };
+
+        let engine = match &mut self.verification_engine {
+            Some(e) => e,
+            None => {
+                let err = harmony_speculative::VerifyResponse::serialize_error("no draft model loaded");
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                return;
+            }
+        };
+
+        let target_addr = match &self.dsd_target_addr {
+            Some(a) => a.clone(),
+            None => {
+                let err =
+                    harmony_speculative::VerifyResponse::serialize_error("no DSD target discovered");
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                return;
+            }
+        };
+
+        // Tokenize the prompt.
+        let prompt_tokens = match engine.tokenize(&request.prompt) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                let err = harmony_speculative::VerifyResponse::serialize_error(
+                    &format!("tokenize failed: {e}"),
+                );
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                return;
+            }
+        };
+
+        // Get EOS token ID from tokenizer.
+        let eos_token_id = engine.eos_token_id();
+        if eos_token_id.is_none() {
+            tracing::warn!("tokenizer has no EOS token; DSD session will run to max_tokens");
+        }
+        let prompt_len = prompt_tokens.len();
+
+        // Reset and prefill draft model.
+        engine.reset();
+        let mut last_logits = match engine.forward(&prompt_tokens) {
+            Ok(l) if !l.is_empty() => l,
+            Ok(_) => {
+                let err = harmony_speculative::VerifyResponse::serialize_error(
+                    "prefill returned empty logits",
+                );
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                return;
+            }
+            Err(e) => {
+                let err = harmony_speculative::VerifyResponse::serialize_error(
+                    &format!("prefill failed: {e}"),
+                );
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                return;
+            }
+        };
+
+        // Draft gamma tokens.
+        let gamma = harmony_speculative::DEFAULT_DRAFT_GAMMA as usize;
+        let mut drafts = Vec::with_capacity(gamma);
+        for _ in 0..gamma {
+            let (token_id, logprob) =
+                harmony_speculative::verify::sample_greedy_with_logprob(&last_logits);
+            drafts.push(harmony_speculative::DraftEntry { token_id, logprob });
+
+            // Check for EOS.
+            if eos_token_id == Some(token_id) {
+                break;
+            }
+
+            // Advance KV cache.
+            match engine.forward(&[token_id]) {
+                Ok(l) if !l.is_empty() => last_logits = l,
+                Ok(_) => {
+                    let err = harmony_speculative::VerifyResponse::serialize_error(
+                        "draft forward returned empty logits",
+                    );
+                    self.pending_direct_actions
+                        .push(RuntimeAction::SendReply { query_id, payload: err });
+                    return;
+                }
+                Err(e) => {
+                    let err = harmony_speculative::VerifyResponse::serialize_error(
+                        &format!("draft forward failed: {e}"),
+                    );
+                    self.pending_direct_actions
+                        .push(RuntimeAction::SendReply { query_id, payload: err });
+                    return;
+                }
+            }
+        }
+
+        // Build and send verify request.
+        let draft_token_ids: Vec<u32> = drafts.iter().map(|d| d.token_id).collect();
+        let verify_request = harmony_speculative::VerifyRequest {
+            context_tokens: prompt_tokens.clone(),
+            drafts,
+        };
+        let verify_payload = verify_request.serialize();
+        let target_key = harmony_zenoh::namespace::compute::verify_key(&target_addr);
+
+        self.pending_direct_actions.push(RuntimeAction::SendVerifyQuery {
+            key_expr: target_key.clone(),
+            payload: verify_payload,
+        });
+
+        // Store session state.
+        self.dsd_session = Some(DsdSession {
+            query_id,
+            accepted_tokens: prompt_tokens,
+            target_verify_key: target_key,
+            max_tokens: crate::inference::DEFAULT_MAX_INFERENCE_TOKENS,
+            eos_token_id,
+            pending_drafts: draft_token_ids,
+            prompt_len,
+        });
+    }
+
+    /// Handle a verify response from the target node (DSD edge side).
+    ///
+    /// Appends accepted tokens + bonus, checks for completion, or drafts more.
+    #[cfg(feature = "inference")]
+    fn handle_verify_response(&mut self, payload: Vec<u8>) {
+        use harmony_inference::InferenceEngine;
+
+        let session = match &mut self.dsd_session {
+            Some(s) => s,
+            None => {
+                tracing::warn!("received VerifyResponse but no active DSD session");
+                return;
+            }
+        };
+
+        let response = match harmony_speculative::VerifyResponse::parse(&payload) {
+            Ok(r) => r,
+            Err(e) => {
+                // Verification failed — reply with error to original requester.
+                let query_id = session.query_id;
+                let err_payload = harmony_speculative::VerifyResponse::serialize_error(&e);
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err_payload,
+                });
+                self.dsd_session = None;
+                return;
+            }
+        };
+
+        let query_id = session.query_id;
+        let eos_token_id = session.eos_token_id;
+        let max_tokens = session.max_tokens as usize;
+
+        // Append accepted draft tokens.
+        let accepted = response.accepted_count as usize;
+        let pending = session.pending_drafts.clone();
+        if accepted > pending.len() {
+            let err_payload = harmony_speculative::VerifyResponse::serialize_error(&format!(
+                "accepted_count {} exceeds pending drafts {}",
+                accepted,
+                pending.len()
+            ));
+            self.pending_direct_actions.push(RuntimeAction::SendReply {
+                query_id,
+                payload: err_payload,
+            });
+            self.dsd_session = None;
+            return;
+        }
+        // Append accepted draft tokens, stopping early if EOS is encountered.
+        let mut hit_eos = false;
+        for &token_id in pending.iter().take(accepted) {
+            if eos_token_id == Some(token_id) {
+                hit_eos = true;
+                break;
+            }
+            session.accepted_tokens.push(token_id);
+        }
+        // Append bonus token only if we haven't already hit EOS.
+        if !hit_eos {
+            if eos_token_id == Some(response.bonus_token) {
+                hit_eos = true;
+            } else {
+                session.accepted_tokens.push(response.bonus_token);
+            }
+        }
+
+        // Count generated tokens (total - prompt length).
+        let prompt_len = session.prompt_len;
+        let generated = session.accepted_tokens.len() - prompt_len;
+
+        if hit_eos || generated >= max_tokens {
+            // Done — detokenize and reply.
+            let engine = match &self.verification_engine {
+                Some(e) => e,
+                None => {
+                    let err = harmony_speculative::VerifyResponse::serialize_error("engine lost");
+                    self.pending_direct_actions.push(RuntimeAction::SendReply {
+                        query_id,
+                        payload: err,
+                    });
+                    self.dsd_session = None;
+                    return;
+                }
+            };
+
+            // Detokenize only the generated tokens (after prompt).
+            let session = self.dsd_session.as_ref().unwrap();
+            let generated_tokens = &session.accepted_tokens[prompt_len..];
+            match engine.detokenize(generated_tokens) {
+                Ok(text) => {
+                    let mut payload = vec![0x00]; // success tag
+                    payload.extend_from_slice(text.as_bytes());
+                    self.pending_direct_actions.push(RuntimeAction::SendReply {
+                        query_id,
+                        payload,
+                    });
+                }
+                Err(e) => {
+                    let err = harmony_speculative::VerifyResponse::serialize_error(
+                        &format!("detokenize failed: {e}"),
+                    );
+                    self.pending_direct_actions.push(RuntimeAction::SendReply {
+                        query_id,
+                        payload: err,
+                    });
+                }
+            }
+            self.dsd_session = None;
+            return;
+        }
+
+        // Not done — draft more tokens and send another verify request.
+        let engine = match &mut self.verification_engine {
+            Some(e) => e,
+            None => {
+                let err = harmony_speculative::VerifyResponse::serialize_error("engine lost");
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
+                self.dsd_session = None;
+                return;
+            }
+        };
+
+        // Reset draft model and prefill with full accepted sequence.
+        engine.reset();
+        let session = self.dsd_session.as_ref().unwrap();
+        let full_sequence = session.accepted_tokens.clone();
+        let mut last_logits = match engine.forward(&full_sequence) {
+            Ok(l) if !l.is_empty() => l,
+            Ok(_) => {
+                let err = harmony_speculative::VerifyResponse::serialize_error(
+                    "reprefill returned empty logits",
+                );
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
+                self.dsd_session = None;
+                return;
+            }
+            Err(e) => {
+                let err = harmony_speculative::VerifyResponse::serialize_error(
+                    &format!("reprefill failed: {e}"),
+                );
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
+                self.dsd_session = None;
+                return;
+            }
+        };
+
+        // Draft gamma more tokens.
+        let gamma = harmony_speculative::DEFAULT_DRAFT_GAMMA as usize;
+        let remaining = max_tokens - generated;
+        let draft_count = gamma.min(remaining);
+        let mut drafts = Vec::with_capacity(draft_count);
+        let mut draft_token_ids = Vec::with_capacity(draft_count);
+
+        for _ in 0..draft_count {
+            let (token_id, logprob) =
+                harmony_speculative::verify::sample_greedy_with_logprob(&last_logits);
+            drafts.push(harmony_speculative::DraftEntry { token_id, logprob });
+            draft_token_ids.push(token_id);
+
+            if eos_token_id == Some(token_id) {
+                break;
+            }
+
+            match engine.forward(&[token_id]) {
+                Ok(l) if !l.is_empty() => last_logits = l,
+                Ok(_) => {
+                    let err = harmony_speculative::VerifyResponse::serialize_error(
+                        "draft forward returned empty logits",
+                    );
+                    self.pending_direct_actions.push(RuntimeAction::SendReply {
+                        query_id,
+                        payload: err,
+                    });
+                    self.dsd_session = None;
+                    return;
+                }
+                Err(e) => {
+                    let err = harmony_speculative::VerifyResponse::serialize_error(
+                        &format!("draft forward failed: {e}"),
+                    );
+                    self.pending_direct_actions.push(RuntimeAction::SendReply {
+                        query_id,
+                        payload: err,
+                    });
+                    self.dsd_session = None;
+                    return;
+                }
+            }
+        }
+
+        // Send verify request.
+        let session = self.dsd_session.as_ref().unwrap();
+        let verify_request = harmony_speculative::VerifyRequest {
+            context_tokens: session.accepted_tokens.clone(),
+            drafts,
+        };
+        let target_key = session.target_verify_key.clone();
+        self.pending_direct_actions.push(RuntimeAction::SendVerifyQuery {
+            key_expr: target_key,
+            payload: verify_request.serialize(),
+        });
+
+        // Update session with new pending drafts.
+        if let Some(session) = &mut self.dsd_session {
+            session.pending_drafts = draft_token_ids;
         }
     }
 
@@ -2315,6 +2968,11 @@ impl<B: BookStore> NodeRuntime<B> {
             // Inference: [0x02] [prompt_len: u32 LE] [prompt_utf8] [sampling_params: 20 bytes (optional)]
             0x02 => match crate::inference::InferenceRequest::parse(&payload) {
                 Ok(request) => Some(ParsedCompute::Inference { request }),
+                Err(_) => None,
+            },
+            // Verify: [0x04] [context_len: u32 LE] [context_tokens...] [draft_count: u8] [draft_entries...]
+            0x04 => match harmony_speculative::VerifyRequest::parse(&payload) {
+                Ok(request) => Some(ParsedCompute::Verify { request }),
                 Err(_) => None,
             },
             _ => None,
@@ -2857,6 +3515,37 @@ impl<B: BookStore> NodeRuntime<B> {
             return;
         }
 
+        // Check if this is a capacity advertisement for DSD target discovery.
+        // Only consume messages that match; let non-matching fall through so
+        // future handlers below can see capacity-prefixed keys if needed.
+        #[cfg(feature = "inference")]
+        if let Some(peer_addr) = key_expr
+            .strip_prefix(harmony_zenoh::namespace::compute::CAPACITY)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            if peer_addr != self.node_addr && payload.len() >= 33 {
+                let mut peer_model_cid = [0u8; 32];
+                peer_model_cid.copy_from_slice(&payload[..32]);
+                let status = payload[32];
+                // A target qualifies if it's ready and its model CID differs from ours.
+                if status == crate::inference::CAPACITY_READY
+                    && self.inference_model_cid.map_or(true, |our_cid| peer_model_cid != our_cid)
+                {
+                    // Don't overwrite existing target (use first discovered).
+                    if self.dsd_target_addr.is_none() {
+                        self.dsd_target_addr = Some(peer_addr.to_string());
+                        tracing::info!(
+                            peer_addr,
+                            peer_model = hex::encode(&peer_model_cid[..4]),
+                            "DSD target discovered"
+                        );
+                        self.check_speculative_ready();
+                    }
+                }
+                return;
+            }
+        }
+
         if let Some(event) = self.parse_subscription_event(&key_expr, payload) {
             self.storage_queue.push_back(event);
         }
@@ -2914,6 +3603,10 @@ enum ParsedCompute {
     },
     Inference {
         request: crate::inference::InferenceRequest,
+    },
+    /// DSD verify request: [0x04] payload
+    Verify {
+        request: harmony_speculative::VerifyRequest,
     },
 }
 
@@ -2982,6 +3675,9 @@ mod tests {
         let _e_l2c = RuntimeEvent::L2InterfaceClosed {
             interface_name: "l2:wlan0".into(),
         };
+        let _e_vr = RuntimeEvent::VerifyResponse {
+            payload: vec![0x00, 1, 0, 0, 0, 42, 0, 0, 0, 0],
+        };
         let _e_drc = RuntimeEvent::DiskReadComplete {
             cid: ContentId::from_bytes([0u8; 32]),
             query_id: 1,
@@ -3018,6 +3714,10 @@ mod tests {
         };
         let _a_qm = RuntimeAction::QueryMemo {
             key_expr: "harmony/memo/aa/**".into(),
+        };
+        let _a_vq = RuntimeAction::SendVerifyQuery {
+            key_expr: "harmony/compute/activity/verify".into(),
+            payload: vec![0x04],
         };
         let _a_ptd = RuntimeAction::PersistToDisk {
             cid: ContentId::from_bytes([0u8; 32]),
@@ -5683,6 +6383,100 @@ mod tests {
         assert!(
             parsed.is_none(),
             "truncated inference payload should return None"
+        );
+    }
+
+    #[test]
+    fn parse_compute_payload_verify() {
+        let (rt, _) = make_runtime();
+
+        let request = harmony_speculative::VerifyRequest {
+            context_tokens: vec![1, 2, 3],
+            drafts: vec![
+                harmony_speculative::DraftEntry {
+                    token_id: 10,
+                    logprob: -0.5,
+                },
+                harmony_speculative::DraftEntry {
+                    token_id: 20,
+                    logprob: -1.0,
+                },
+            ],
+        };
+        let payload = request.serialize();
+        let parsed = rt.parse_compute_payload(payload);
+        assert!(
+            matches!(parsed, Some(ParsedCompute::Verify { .. })),
+            "should parse verify payload"
+        );
+    }
+
+    #[test]
+    fn parse_compute_payload_verify_invalid() {
+        let (rt, _) = make_runtime();
+        // Tag 0x04 but truncated
+        let payload = vec![0x04, 0x01];
+        let parsed = rt.parse_compute_payload(payload);
+        assert!(
+            parsed.is_none(),
+            "truncated verify payload should return None"
+        );
+    }
+
+    #[test]
+    fn verify_query_without_engine_returns_error() {
+        let (mut rt, _) = make_runtime();
+
+        let request = harmony_speculative::VerifyRequest {
+            context_tokens: vec![1, 2, 3],
+            drafts: vec![harmony_speculative::DraftEntry {
+                token_id: 10,
+                logprob: -0.5,
+            }],
+        };
+        let payload = request.serialize();
+
+        rt.push_event(RuntimeEvent::ComputeQuery {
+            query_id: 600,
+            key_expr: "harmony/compute/activity/verify".into(),
+            payload,
+        });
+
+        let actions = rt.tick();
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 600, .. }));
+        assert!(
+            reply.is_some(),
+            "verify query without engine should produce error reply"
+        );
+        if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
+            // Error response starts with 0x01 tag
+            assert_eq!(payload[0], 0x01, "error tag");
+        }
+    }
+
+    #[test]
+    fn runtime_event_verify_response_exists() {
+        let _e = RuntimeEvent::VerifyResponse {
+            payload: vec![0x00, 1, 0, 0, 0, 42, 0, 0, 0, 0],
+        };
+    }
+
+    #[test]
+    fn runtime_action_send_verify_query_exists() {
+        let _a = RuntimeAction::SendVerifyQuery {
+            key_expr: "harmony/compute/activity/verify".into(),
+            payload: vec![0x04],
+        };
+    }
+
+    #[test]
+    fn capacity_sub_constant_matches_prefix() {
+        assert!(
+            harmony_zenoh::namespace::compute::CAPACITY_SUB
+                .starts_with(harmony_zenoh::namespace::compute::CAPACITY),
+            "CAPACITY_SUB should start with CAPACITY prefix"
         );
     }
 }

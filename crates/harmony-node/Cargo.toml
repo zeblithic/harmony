@@ -13,7 +13,7 @@ wasmtime = ["harmony-compute/wasmtime"]
 no-neon = ["harmony-crypto/no-neon"]
 rawlink = ["harmony-rawlink"]
 archivist = ["harmony-s3/archivist"]
-inference = ["harmony-compute/inference", "harmony-workflow/inference"]
+inference = ["harmony-compute/inference", "harmony-workflow/inference", "dep:harmony-inference", "dep:candle-core"]
 
 [[bin]]
 name = "harmony"
@@ -37,7 +37,10 @@ harmony-crypto = { workspace = true, features = ["std"] }
 harmony-identity = { workspace = true, features = ["std"] }
 harmony-reticulum = { workspace = true, features = ["std"] }
 harmony-workflow.workspace = true
+harmony-speculative.workspace = true
+harmony-inference = { workspace = true, optional = true }
 harmony-zenoh.workspace = true
+candle-core = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
 hex.workspace = true
 mdns-sd = { version = "0.18", features = ["async"] }

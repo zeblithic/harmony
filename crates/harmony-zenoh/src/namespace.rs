@@ -278,6 +278,20 @@ pub mod compute {
     /// Key expression for inference queryable.
     pub const INFERENCE_ACTIVITY: &str = "harmony/compute/activity/inference";
 
+    /// Base prefix for DSD verification queryable.
+    pub const VERIFY_ACTIVITY: &str = "harmony/compute/activity/verify";
+
+    /// Per-node verify key: `harmony/compute/activity/verify/{node_addr}`
+    pub fn verify_key(node_addr: &str) -> String {
+        format!("{VERIFY_ACTIVITY}/{node_addr}")
+    }
+
+    /// Key expression for DSD speculative inference queryable.
+    pub const SPECULATIVE_ACTIVITY: &str = "harmony/compute/activity/speculative";
+
+    /// Subscribe to all capacity advertisements: `harmony/compute/capacity/*`
+    pub const CAPACITY_SUB: &str = "harmony/compute/capacity/*";
+
     /// Subscribe to all results: `harmony/compute/result/*`
     pub const RESULT_SUB: &str = "harmony/compute/result/*";
 
@@ -901,6 +915,22 @@ mod tests {
     fn compute_subscription_patterns() {
         assert_eq!(compute::ACTIVITY_SUB, "harmony/compute/activity/*");
         assert_eq!(compute::RESULT_SUB, "harmony/compute/result/*");
+    }
+
+    #[test]
+    fn compute_speculative_constants() {
+        assert_eq!(
+            compute::VERIFY_ACTIVITY,
+            "harmony/compute/activity/verify"
+        );
+        assert_eq!(
+            compute::SPECULATIVE_ACTIVITY,
+            "harmony/compute/activity/speculative"
+        );
+        assert_eq!(
+            compute::CAPACITY_SUB,
+            "harmony/compute/capacity/*"
+        );
     }
 
     // ── Tier 3: Workflow ────────────────────────────────────────

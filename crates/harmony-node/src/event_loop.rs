@@ -147,6 +147,8 @@ enum ZenohEvent {
         is_module: bool,
         result: Result<Vec<u8>, String>,
     },
+    /// DSD: verify response from target node.
+    VerifyResponse { payload: Vec<u8> },
 }
 
 /// A tunnel dial request waiting for its scheduled fire time.
@@ -610,6 +612,9 @@ pub async fn run(
                             } else {
                                 runtime.push_event(RuntimeEvent::ContentFetchResponse { cid, result });
                             }
+                        }
+                        ZenohEvent::VerifyResponse { payload } => {
+                            runtime.push_event(RuntimeEvent::VerifyResponse { payload });
                         }
                     }
                 }
@@ -1453,6 +1458,54 @@ async fn dispatch_action(
             // and feed each reply back as RuntimeEvent::MemoFetchResponse.
             tracing::debug!(%key_expr, "QueryMemo (stub — not yet wired)");
         }
+        RuntimeAction::SendVerifyQuery { key_expr, payload } => {
+            // DSD: send a Zenoh query to the target's verify queryable and feed
+            // the reply back as RuntimeEvent::VerifyResponse.
+            // IMPORTANT: Every code path must send a VerifyResponse (success or
+            // error) so the edge always clears dsd_session.
+            let tx = zenoh_tx.clone();
+            let session = session.clone();
+            tokio::spawn(async move {
+                let deadline = Duration::from_secs(30);
+                let result = tokio::time::timeout(deadline, async {
+                    let replies = match session.get(&key_expr).payload(payload).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Err(format!("zenoh get failed: {e}"));
+                        }
+                    };
+                    while let Ok(reply) = replies.recv_async().await {
+                        if let Ok(sample) = reply.into_result() {
+                            let resp_payload =
+                                sample.payload().to_bytes().to_vec();
+                            let _ = tx
+                                .send(ZenohEvent::VerifyResponse {
+                                    payload: resp_payload,
+                                })
+                                .await;
+                            return Ok(());
+                        }
+                    }
+                    Err("no valid reply from target".to_string())
+                })
+                .await;
+
+                // Send error VerifyResponse for timeout, get failure, or no reply.
+                let err_msg = match result {
+                    Ok(Ok(())) => return, // Success — response already sent above
+                    Ok(Err(e)) => e,
+                    Err(_) => format!("verify query timed out after 30s"),
+                };
+                tracing::warn!(%key_expr, err = %err_msg, "DSD verify query failed");
+                let err_payload =
+                    harmony_speculative::VerifyResponse::serialize_error(&err_msg);
+                let _ = tx
+                    .send(ZenohEvent::VerifyResponse {
+                        payload: err_payload,
+                    })
+                    .await;
+            });
+        }
         RuntimeAction::PersistToDisk { cid, data } => {
             if let Some(ref dir) = data_dir {
                 let dir = dir.clone();
@@ -1489,9 +1542,6 @@ async fn dispatch_action(
                     }
                 });
             } else {
-                // Defensive: data_dir should always be Some when DiskLookup is
-                // dispatched (both gated on config_file.data_dir.is_some()).
-                // Send DiskReadFailed so the query doesn't hang.
                 tracing::error!(
                     cid = %hex::encode(&cid.to_bytes()[..8]),
                     "DiskLookup dispatched but data_dir not configured"

@@ -165,6 +165,26 @@ impl InferenceEngine for QwenEngine {
         self.position = 0;
         self.token_history.clear();
     }
+
+    fn eos_token_id(&self) -> Option<u32> {
+        let tokenizer = self.tokenizer.as_ref()?;
+        // Try common EOS token strings used by Qwen and other models.
+        // The tokenizer's `token_to_id` uses the vocabulary lookup, which
+        // is more reliable than `tokenize()` (which may add special tokens
+        // or split the string).
+        for eos_str in &[
+            "<|endoftext|>",
+            "<|im_end|>",
+            "</s>",
+            "<|end|>",
+            "<eos>",
+        ] {
+            if let Some(id) = tokenizer.token_to_id(eos_str) {
+                return Some(id);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

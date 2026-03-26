@@ -3305,6 +3305,7 @@ name = "harmony-node"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "candle-core",
  "clap",
  "futures-util",
  "harmony-athenaeum",
@@ -3315,11 +3316,13 @@ dependencies = [
  "harmony-crypto",
  "harmony-discovery",
  "harmony-identity",
+ "harmony-inference",
  "harmony-memo",
  "harmony-peers",
  "harmony-rawlink",
  "harmony-reticulum",
  "harmony-s3",
+ "harmony-speculative",
  "harmony-tunnel",
  "harmony-workflow",
  "harmony-zenoh",
@@ -3463,6 +3466,10 @@ dependencies = [
  "hashbrown 0.15.5",
  "serde",
 ]
+
+[[package]]
+name = "harmony-speculative"
+version = "0.1.0"
 
 [[package]]
 name = "harmony-trust"
