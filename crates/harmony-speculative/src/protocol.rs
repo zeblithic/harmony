@@ -76,6 +76,14 @@ impl VerifyRequest {
             u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
+        // Guard against overflow on 32-bit targets: context_len * 4 must not wrap.
+        const MAX_CONTEXT_TOKENS: usize = 32_768;
+        if context_len > MAX_CONTEXT_TOKENS {
+            return Err(format!(
+                "context_len {context_len} exceeds maximum {MAX_CONTEXT_TOKENS}"
+            ));
+        }
+
         // context_tokens
         let context_bytes = context_len * 4;
         if payload.len() < pos + context_bytes {
