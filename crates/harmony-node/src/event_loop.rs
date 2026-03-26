@@ -1488,6 +1488,15 @@ async fn dispatch_action(
                         }
                     }
                 });
+            } else {
+                // Defensive: data_dir should always be Some when DiskLookup is
+                // dispatched (both gated on config_file.data_dir.is_some()).
+                // Send DiskReadFailed so the query doesn't hang.
+                tracing::error!(
+                    cid = %hex::encode(&cid.to_bytes()[..8]),
+                    "DiskLookup dispatched but data_dir not configured"
+                );
+                let _ = disk_tx.try_send(DiskIoResult::ReadFailed { cid, query_id });
             }
         }
     }

@@ -335,6 +335,7 @@ impl<B: BookStore> StorageTier<B> {
                 );
                 if !Self::is_durable_class(&cid) {
                     self.metrics.disk_read_failures += 1;
+                    self.disk_index.remove(&cid);
                     return vec![StorageTierAction::SendReply {
                         query_id,
                         payload: vec![],
@@ -343,6 +344,9 @@ impl<B: BookStore> StorageTier<B> {
                 // Verify integrity — disk data may be corrupted (bit rot, wrong file).
                 if !Self::verify_cid(&cid, &data) {
                     self.metrics.disk_read_failures += 1;
+                    // Retract stale index entry — corrupted files cause infinite
+                    // DiskLookup → read → verify-fail → empty reply loops otherwise.
+                    self.disk_index.remove(&cid);
                     return vec![StorageTierAction::SendReply {
                         query_id,
                         payload: vec![],
