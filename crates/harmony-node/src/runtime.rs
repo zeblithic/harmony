@@ -3462,6 +3462,8 @@ impl<B: BookStore> NodeRuntime<B> {
         }
 
         // Check if this is a capacity advertisement for DSD target discovery.
+        // Only consume messages that match; let non-matching fall through so
+        // future handlers below can see capacity-prefixed keys if needed.
         #[cfg(feature = "inference")]
         if let Some(peer_addr) = key_expr
             .strip_prefix(harmony_zenoh::namespace::compute::CAPACITY)
@@ -3486,8 +3488,8 @@ impl<B: BookStore> NodeRuntime<B> {
                         self.check_speculative_ready();
                     }
                 }
+                return;
             }
-            return;
         }
 
         if let Some(event) = self.parse_subscription_event(&key_expr, payload) {
