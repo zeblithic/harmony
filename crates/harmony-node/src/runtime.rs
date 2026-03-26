@@ -2097,7 +2097,10 @@ impl<B: BookStore> NodeRuntime<B> {
         workflow_actions: Vec<WorkflowAction>,
         out: &mut Vec<RuntimeAction>,
     ) {
-        for action in workflow_actions {
+        // Use an iterative work queue instead of recursion to avoid
+        // unbounded stack depth when LoadModel produces further actions.
+        let mut queue = std::collections::VecDeque::from(workflow_actions);
+        while let Some(action) = queue.pop_front() {
             match action {
                 WorkflowAction::WorkflowComplete {
                     workflow_id,
@@ -2138,13 +2141,16 @@ impl<B: BookStore> NodeRuntime<B> {
                     tokenizer_cid,
                 } => {
                     // Check if we have the model data cached from startup fetch.
+                    // NOTE: This clone only happens on the very first inference
+                    // request. Subsequent requests use the persisted engine in
+                    // WasmiRuntime (model_load returns 0 immediately, no LoadModel
+                    // action is ever emitted again).
                     if let (Some(gguf_data), Some(tok_data)) =
                         (&self.inference_gguf_data, &self.inference_tokenizer_data)
                     {
                         if Some(gguf_cid) == self.inference_model_cid
                             && Some(tokenizer_cid) == self.inference_tokenizer_cid
                         {
-                            // Model data available — feed it back to the workflow engine.
                             let model_event = WorkflowEvent::ModelLoaded {
                                 gguf_cid,
                                 tokenizer_cid,
@@ -2152,7 +2158,7 @@ impl<B: BookStore> NodeRuntime<B> {
                                 tokenizer_data: tok_data.clone(),
                             };
                             let new_actions = self.workflow.handle(model_event);
-                            self.dispatch_workflow_actions(new_actions, out);
+                            queue.extend(new_actions);
                             continue;
                         }
                     }
@@ -2162,7 +2168,7 @@ impl<B: BookStore> NodeRuntime<B> {
                         tokenizer_cid,
                     };
                     let new_actions = self.workflow.handle(fail_event);
-                    self.dispatch_workflow_actions(new_actions, out);
+                    queue.extend(new_actions);
                 }
                 WorkflowAction::PersistHistory {
                     workflow_id: _workflow_id,
