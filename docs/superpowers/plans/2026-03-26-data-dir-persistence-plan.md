@@ -194,7 +194,11 @@ pub fn scan_books(data_dir: &Path) -> Vec<ContentId> {
             }
             match hex::decode(name.as_ref()) {
                 Ok(bytes) => {
-                    if let Ok(cid) = ContentId::from_bytes(&bytes) {
+                    let arr: [u8; 32] = match bytes.try_into() {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+                    if let Ok(cid) = ContentId::from_bytes(arr) {
                         cids.push(cid);
                     }
                 }
@@ -223,7 +227,7 @@ Add it alphabetically among the other fields.
 
 - [ ] **Step 4: Register disk_io module**
 
-Add `pub mod disk_io;` to `crates/harmony-node/src/lib.rs` (or `main.rs` depending on crate structure — check where other modules are declared).
+Add `mod disk_io;` to `crates/harmony-node/src/main.rs` (harmony-node is a binary crate — all module declarations are in main.rs, not lib.rs). Place it near the other `mod` declarations.
 
 - [ ] **Step 5: Run tests**
 
@@ -238,7 +242,7 @@ Expected: No errors
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/harmony-node/src/config.rs crates/harmony-node/src/disk_io.rs crates/harmony-node/src/lib.rs
+git add crates/harmony-node/src/config.rs crates/harmony-node/src/disk_io.rs crates/harmony-node/src/main.rs
 git commit -m "feat(node): add data_dir config option and disk I/O helpers for CAS persistence"
 ```
 
@@ -269,15 +273,24 @@ Remove `#[allow(dead_code)]` from `disk_index`.
 
 - [ ] **Step 2: Emit PersistToDisk for durable content**
 
-In `handle_transit` and `handle_publish`, replace the "PersistToDisk deferred" comments with actual emission:
+In `handle_transit` and `handle_publish`, replace the "PersistToDisk deferred" comments with actual emission. **Important:** The data must be cloned BEFORE it's consumed by `cache.store_preadmitted(cid, data)` (which moves `data`). Clone early:
 
 ```rust
+// Clone data for disk persistence BEFORE cache consumes it.
+let persist_data = if self.disk_enabled && Self::is_durable_class(&cid) {
+    Some(data.clone())
+} else {
+    None
+};
+
+// ... existing cache insertion (consumes data) ...
+
 // After cache insertion, persist durable content to disk.
-if self.disk_enabled && Self::is_durable_class(&cid) {
+if let Some(persist_bytes) = persist_data {
     self.disk_index.insert(cid);
     actions.push(StorageTierAction::PersistToDisk {
         cid,
-        data: data.to_vec(),
+        data: persist_bytes,
     });
 }
 ```
@@ -334,7 +347,33 @@ DiskLookup { cid: ContentId, query_id: u64 },
 
 Note: `ContentId` needs to be imported. Check if it's already imported — if not, add `use harmony_content::cid::ContentId;`.
 
-- [ ] **Step 2: Wire StorageTierAction to RuntimeAction**
+- [ ] **Step 2: Add RuntimeEvent variants for disk I/O completions**
+
+Add to the `RuntimeEvent` enum:
+
+```rust
+/// Disk read completed — content fetched from persistent storage.
+DiskReadComplete { cid: ContentId, query_id: u64, data: Vec<u8> },
+/// Disk read failed — file missing or corrupted.
+DiskReadFailed { cid: ContentId, query_id: u64 },
+```
+
+In `NodeRuntime::push_event`, add handling for these:
+
+```rust
+RuntimeEvent::DiskReadComplete { cid, query_id, data } => {
+    let storage_event = StorageTierEvent::DiskReadComplete { cid, query_id, data };
+    let actions = self.storage.handle(storage_event);
+    self.dispatch_storage_actions(actions);
+}
+RuntimeEvent::DiskReadFailed { cid, query_id } => {
+    let storage_event = StorageTierEvent::DiskReadFailed { cid, query_id };
+    let actions = self.storage.handle(storage_event);
+    self.dispatch_storage_actions(actions);
+}
+```
+
+- [ ] **Step 3: Wire StorageTierAction to RuntimeAction**
 
 In the `dispatch_storage_actions` method (around line 1785), replace the no-op arm:
 
