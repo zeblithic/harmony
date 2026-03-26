@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/harmony-agent",
     "crates/harmony-athenaeum",
     "crates/harmony-browser",
     "crates/harmony-compute",
@@ -124,6 +125,7 @@ clap = { version = "4", features = ["derive"] }
 # Internal crates — default-features = false so bare-metal consumers
 # (harmony-os/harmony-boot) can compile the dependency graph without std.
 # Crates that need std re-enable it via their own `std` feature.
+harmony-agent = { path = "crates/harmony-agent" }
 harmony-athenaeum = { path = "crates/harmony-athenaeum", default-features = false }
 harmony-compute = { path = "crates/harmony-compute" }
 harmony-contacts = { path = "crates/harmony-contacts", default-features = false }

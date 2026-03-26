@@ -3045,6 +3045,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-agent"
+version = "0.1.0"
+dependencies = [
+ "harmony-crypto",
+ "hex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harmony-athenaeum"
 version = "0.1.0"
 dependencies = [
