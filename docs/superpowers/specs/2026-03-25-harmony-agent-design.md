@@ -16,7 +16,7 @@ Submitted by a requestor to an agent's task endpoint via Zenoh query.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+
 pub struct AgentTask {
     /// Unique task identifier. BLAKE3 hex of (submitter_addr + params + nonce).
     pub task_id: String,
@@ -36,7 +36,7 @@ Optional metadata for task chaining and caller context.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+
 pub struct TaskContext {
     /// Links to the parent task in a multi-step chain.
     pub parent_task_id: Option<String>,
@@ -51,7 +51,7 @@ Returned by the agent as the Zenoh query reply.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+
 pub struct AgentResult {
     /// Echoes the task_id from the request.
     pub task_id: String,
@@ -68,7 +68,7 @@ pub struct AgentResult {
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+
 pub enum TaskStatus {
     /// Task completed successfully. `output` is present.
     Success,
@@ -83,15 +83,15 @@ pub enum TaskStatus {
 
 ```json
 {
-  "taskId": "a1b2c3d4e5f6...",
-  "taskType": "inference",
+  "task_id": "a1b2c3d4e5f6...",
+  "task_type": "inference",
   "params": {
     "prompt": "Explain quantum computing in simple terms",
-    "maxTokens": 256,
+    "max_tokens": 256,
     "temperature": 0.7
   },
   "context": {
-    "parentTaskId": "f6e5d4c3b2a1...",
+    "parent_task_id": "f6e5d4c3b2a1...",
     "metadata": { "chain": "research-pipeline" }
   }
 }
@@ -101,11 +101,11 @@ Result:
 
 ```json
 {
-  "taskId": "a1b2c3d4e5f6...",
+  "task_id": "a1b2c3d4e5f6...",
   "status": "success",
   "output": {
     "text": "Quantum computing uses quantum bits...",
-    "tokensGenerated": 142
+    "tokens_generated": 142
   },
   "error": null
 }
@@ -152,7 +152,7 @@ Agents publish their capabilities so requestors can discover them.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+
 pub struct AgentCapacity {
     /// Hex-encoded address hash identifying this agent.
     pub agent_id: String,
@@ -165,7 +165,7 @@ pub struct AgentCapacity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+
 pub enum AgentStatus {
     /// Accepting new tasks.
     Ready,
@@ -256,7 +256,7 @@ The nonce ensures unique task IDs even for identical params (same prompt submitt
 1. **AgentTask round-trip:** Serialize → deserialize, verify all fields preserved.
 2. **AgentResult round-trip:** Success, Failed, and Rejected variants.
 3. **AgentCapacity round-trip:** With multiple task types, all status variants.
-4. **camelCase verification:** JSON keys use camelCase (taskId, taskType, etc.).
+4. **snake_case verification:** JSON keys use snake_case (taskId, taskType, etc.).
 5. **Wire encode/decode:** Tag byte present, JSON body correct.
 6. **Empty payload error:** decode_task on empty slice returns EmptyPayload.
 7. **Unknown tag error:** decode_task with tag 0xFF returns UnsupportedFormat.
