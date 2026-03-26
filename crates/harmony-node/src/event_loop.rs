@@ -134,6 +134,8 @@ enum ZenohEvent {
         is_module: bool,
         result: Result<Vec<u8>, String>,
     },
+    /// DSD: verify response from target node.
+    VerifyResponse { payload: Vec<u8> },
 }
 
 /// A tunnel dial request waiting for its scheduled fire time.
@@ -585,6 +587,9 @@ pub async fn run(
                             } else {
                                 runtime.push_event(RuntimeEvent::ContentFetchResponse { cid, result });
                             }
+                        }
+                        ZenohEvent::VerifyResponse { payload } => {
+                            runtime.push_event(RuntimeEvent::VerifyResponse { payload });
                         }
                     }
                 }
@@ -1411,6 +1416,31 @@ async fn dispatch_action(
             // TODO: implement in Task 3 — issue a Zenoh session.get() for the memo key
             // and feed each reply back as RuntimeEvent::MemoFetchResponse.
             tracing::debug!(%key_expr, "QueryMemo (stub — not yet wired)");
+        }
+        RuntimeAction::SendVerifyQuery { key_expr, payload } => {
+            // DSD: send a Zenoh query to the target's verify queryable and feed
+            // the reply back as RuntimeEvent::VerifyResponse.
+            let tx = zenoh_tx.clone();
+            let session = session.clone();
+            tokio::spawn(async move {
+                match session.get(&key_expr).payload(payload).await {
+                    Ok(replies) => {
+                        while let Ok(reply) = replies.recv_async().await {
+                            if let Ok(sample) = reply.into_result() {
+                                let resp_payload = sample.payload().to_bytes().to_vec();
+                                let _ = tx
+                                    .send(ZenohEvent::VerifyResponse {
+                                        payload: resp_payload,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%key_expr, err = %e, "DSD verify query failed");
+                    }
+                }
+            });
         }
     }
 }

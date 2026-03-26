@@ -284,6 +284,9 @@ pub mod compute {
     /// Key expression for DSD speculative inference queryable.
     pub const SPECULATIVE_ACTIVITY: &str = "harmony/compute/activity/speculative";
 
+    /// Subscribe to all capacity advertisements: `harmony/compute/capacity/*`
+    pub const CAPACITY_SUB: &str = "harmony/compute/capacity/*";
+
     /// Subscribe to all results: `harmony/compute/result/*`
     pub const RESULT_SUB: &str = "harmony/compute/result/*";
 
