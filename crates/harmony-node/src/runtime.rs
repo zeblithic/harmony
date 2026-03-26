@@ -1179,15 +1179,37 @@ impl<B: BookStore> NodeRuntime<B> {
             RuntimeEvent::ContentFetchResponse { cid, result } => {
                 // Check if this is inference model data arriving from startup fetch.
                 let mut is_inference_data = false;
-                if let Ok(ref data) = result {
-                    if Some(cid) == self.inference_model_cid && self.inference_gguf_data.is_none() {
-                        self.inference_gguf_data = Some(data.clone());
-                        is_inference_data = true;
-                    } else if Some(cid) == self.inference_tokenizer_cid
-                        && self.inference_tokenizer_data.is_none()
-                    {
-                        self.inference_tokenizer_data = Some(data.clone());
-                        is_inference_data = true;
+                match &result {
+                    Ok(data) => {
+                        if Some(cid) == self.inference_model_cid
+                            && self.inference_gguf_data.is_none()
+                        {
+                            self.inference_gguf_data = Some(data.clone());
+                            is_inference_data = true;
+                        } else if Some(cid) == self.inference_tokenizer_cid
+                            && self.inference_tokenizer_data.is_none()
+                        {
+                            self.inference_tokenizer_data = Some(data.clone());
+                            is_inference_data = true;
+                        }
+                    }
+                    Err(e) => {
+                        if Some(cid) == self.inference_model_cid {
+                            tracing::error!(
+                                "failed to fetch inference GGUF model (CID {}): {e}; inference disabled",
+                                hex::encode(cid)
+                            );
+                            // Clear CIDs so inference is permanently disabled for this session
+                            self.inference_model_cid = None;
+                            self.inference_tokenizer_cid = None;
+                        } else if Some(cid) == self.inference_tokenizer_cid {
+                            tracing::error!(
+                                "failed to fetch inference tokenizer (CID {}): {e}; inference disabled",
+                                hex::encode(cid)
+                            );
+                            self.inference_model_cid = None;
+                            self.inference_tokenizer_cid = None;
+                        }
                     }
                 }
                 if is_inference_data {

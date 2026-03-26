@@ -50,6 +50,11 @@ pub struct WorkflowEngine {
     pending_queue: VecDeque<WorkflowId>,
     /// Workflows with deferred IO responses, ready to be resumed on next tick.
     deferred_resume_queue: VecDeque<WorkflowId>,
+    /// Cached model data shared across all workflows.
+    /// When a ModelLoaded event arrives, the data is cached here so subsequent
+    /// workflows requesting the same model CIDs can be resumed immediately
+    /// without cloning multi-GB data from the caller.
+    model_data_cache: Option<([u8; 32], [u8; 32], Vec<u8>, Vec<u8>)>,
 }
 
 impl WorkflowEngine {
@@ -63,6 +68,7 @@ impl WorkflowEngine {
             active: None,
             pending_queue: VecDeque::new(),
             deferred_resume_queue: VecDeque::new(),
+            model_data_cache: None,
         }
     }
 
@@ -417,6 +423,14 @@ impl WorkflowEngine {
         gguf_data: Vec<u8>,
         tokenizer_data: Vec<u8>,
     ) -> Vec<WorkflowAction> {
+        // Cache model data so subsequent workflows with the same CIDs
+        // can resume immediately without cloning from the caller.
+        self.model_data_cache = Some((
+            gguf_cid,
+            tokenizer_cid,
+            gguf_data.clone(),
+            tokenizer_data.clone(),
+        ));
         self.handle_model_resolution(
             gguf_cid,
             tokenizer_cid,
@@ -694,7 +708,30 @@ impl WorkflowEngine {
                                 tokenizer_cid,
                             });
 
-                            // Extract session, suspend workflow, emit LoadModel action.
+                            // Check engine-level model cache first — avoids cloning
+                            // multi-GB data from the caller on every inference request.
+                            if let Some((cached_g, cached_t, ref gd, ref td)) =
+                                self.model_data_cache
+                            {
+                                if cached_g == gguf_cid && cached_t == tokenizer_cid {
+                                    state.history.events.push(HistoryEvent::ModelResolved {
+                                        gguf_cid,
+                                        tokenizer_cid,
+                                        success: true,
+                                    });
+                                    // Resume immediately from cache (clone from engine
+                                    // cache, not from caller).
+                                    let response = IOResponse::ModelReady {
+                                        gguf_data: gd.clone(),
+                                        tokenizer_data: td.clone(),
+                                    };
+                                    current_result =
+                                        self.runtime.resume_with_io(response, self.budget);
+                                    continue;
+                                }
+                            }
+
+                            // Cache miss — extract session, suspend, emit LoadModel action.
                             let saved_session = self
                                 .runtime
                                 .take_session()
