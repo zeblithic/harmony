@@ -2166,8 +2166,18 @@ impl<B: BookStore> NodeRuntime<B> {
             }
             ParsedCompute::Verify { request } => {
                 // DSD target verification — run natively, NOT through WASM.
+                // Reject if a DSD session is active — the engine is shared and
+                // run_verification would destroy the draft model's KV cache.
                 #[cfg(feature = "inference")]
                 {
+                    if self.dsd_session.is_some() {
+                        let payload = harmony_speculative::VerifyResponse::serialize_error(
+                            "busy: DSD session active on this node",
+                        );
+                        self.pending_direct_actions
+                            .push(RuntimeAction::SendReply { query_id, payload });
+                        return Vec::new();
+                    }
                     if let Some(engine) = &mut self.verification_engine {
                         let response = Self::run_verification(engine, &request);
                         let payload = match response {
