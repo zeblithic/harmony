@@ -631,6 +631,9 @@ pub struct NodeRuntime<B: BookStore> {
     inference_gguf_data: Option<Vec<u8>>,
     /// Whether the tokenizer data has been fetched from CAS.
     inference_tokenizer_data: Option<Vec<u8>>,
+    /// Monotonic nonce for inference requests — ensures each request gets a
+    /// unique WorkflowId, preventing dedup of non-deterministic results.
+    inference_request_nonce: u64,
 }
 
 /// Adapts the runtime's pubkey_cache to the CredentialKeyResolver trait
@@ -816,6 +819,7 @@ impl<B: BookStore> NodeRuntime<B> {
             inference_tokenizer_cid: config.inference_tokenizer_cid,
             inference_gguf_data: None,
             inference_tokenizer_data: None,
+            inference_request_nonce: 0,
         };
 
         // If inference model CIDs are configured AND the inference feature is
@@ -2069,8 +2073,10 @@ impl<B: BookStore> NodeRuntime<B> {
                         }
                     };
 
+                let nonce = self.inference_request_nonce;
+                self.inference_request_nonce += 1;
                 let input =
-                    crate::inference::build_runner_input(&gguf_cid, &tok_cid, &request);
+                    crate::inference::build_runner_input(&gguf_cid, &tok_cid, &request, nonce);
                 let module = crate::inference::INFERENCE_RUNNER_WASM.to_vec();
                 let module_hash = harmony_crypto::hash::blake3_hash(&module);
                 let wf_id = WorkflowId::new(&module_hash, &input);
@@ -2140,27 +2146,23 @@ impl<B: BookStore> NodeRuntime<B> {
                     gguf_cid,
                     tokenizer_cid,
                 } => {
-                    // Check if we have the model data cached from startup fetch.
-                    // NOTE: This clone only happens on the very first inference
-                    // request. Subsequent requests use the persisted engine in
-                    // WasmiRuntime (model_load returns 0 immediately, no LoadModel
-                    // action is ever emitted again).
-                    if let (Some(gguf_data), Some(tok_data)) =
-                        (&self.inference_gguf_data, &self.inference_tokenizer_data)
+                    // Consume raw model data via take() — the persisted engine
+                    // in WasmiRuntime handles all subsequent requests, so this
+                    // data is never needed again. Avoids retaining multi-GB.
+                    if self.inference_gguf_data.is_some()
+                        && self.inference_tokenizer_data.is_some()
+                        && Some(gguf_cid) == self.inference_model_cid
+                        && Some(tokenizer_cid) == self.inference_tokenizer_cid
                     {
-                        if Some(gguf_cid) == self.inference_model_cid
-                            && Some(tokenizer_cid) == self.inference_tokenizer_cid
-                        {
-                            let model_event = WorkflowEvent::ModelLoaded {
-                                gguf_cid,
-                                tokenizer_cid,
-                                gguf_data: gguf_data.clone(),
-                                tokenizer_data: tok_data.clone(),
-                            };
-                            let new_actions = self.workflow.handle(model_event);
-                            queue.extend(new_actions);
-                            continue;
-                        }
+                        let model_event = WorkflowEvent::ModelLoaded {
+                            gguf_cid,
+                            tokenizer_cid,
+                            gguf_data: self.inference_gguf_data.take().unwrap(),
+                            tokenizer_data: self.inference_tokenizer_data.take().unwrap(),
+                        };
+                        let new_actions = self.workflow.handle(model_event);
+                        queue.extend(new_actions);
+                        continue;
                     }
                     // Model not available — fail the workflow.
                     let fail_event = WorkflowEvent::ModelLoadFailed {

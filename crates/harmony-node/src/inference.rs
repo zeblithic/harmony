@@ -74,21 +74,27 @@ impl InferenceRequest {
 
 /// Build the WASM input for the inference runner module.
 ///
-/// Layout: `[gguf_cid:32] [tokenizer_cid:32] [prompt_len:u32 LE] [prompt_utf8] [sampling_params:20] [max_tokens:u32 LE]`
+/// Layout: `[gguf_cid:32] [tokenizer_cid:32] [prompt_len:u32 LE] [prompt_utf8] [sampling_params:20] [max_tokens:u32 LE] [nonce:u64 LE]`
+///
+/// The trailing nonce ensures each request gets a unique `WorkflowId`,
+/// preventing the WorkflowEngine from deduplicating non-deterministic
+/// inference results (e.g. temperature > 0). The WASM module ignores it.
 pub fn build_runner_input(
     gguf_cid: &[u8; 32],
     tokenizer_cid: &[u8; 32],
     request: &InferenceRequest,
+    nonce: u64,
 ) -> Vec<u8> {
     let prompt_bytes = request.prompt.as_bytes();
     let prompt_len = prompt_bytes.len() as u32;
-    let mut input = Vec::with_capacity(32 + 32 + 4 + prompt_bytes.len() + 20 + 4);
+    let mut input = Vec::with_capacity(32 + 32 + 4 + prompt_bytes.len() + 20 + 4 + 8);
     input.extend_from_slice(gguf_cid);
     input.extend_from_slice(tokenizer_cid);
     input.extend_from_slice(&prompt_len.to_le_bytes());
     input.extend_from_slice(prompt_bytes);
     input.extend_from_slice(&request.sampling_params);
     input.extend_from_slice(&DEFAULT_MAX_INFERENCE_TOKENS.to_le_bytes());
+    input.extend_from_slice(&nonce.to_le_bytes());
     input
 }
 
@@ -186,7 +192,7 @@ mod tests {
             prompt: "hi".to_string(),
             sampling_params: [0u8; 20],
         };
-        let input = build_runner_input(&gguf_cid, &tok_cid, &req);
+        let input = build_runner_input(&gguf_cid, &tok_cid, &req, 42);
         assert_eq!(&input[0..32], &[0xAA; 32]);
         assert_eq!(&input[32..64], &[0xBB; 32]);
         assert_eq!(
@@ -194,8 +200,14 @@ mod tests {
             2
         );
         assert_eq!(&input[68..70], b"hi");
-        assert_eq!(input.len(), 32 + 32 + 4 + 2 + 20 + 4);
-        let mt_offset = input.len() - 4;
+        assert_eq!(input.len(), 32 + 32 + 4 + 2 + 20 + 4 + 8); // +8 for nonce
+        // Nonce is at the end
+        let nonce_offset = input.len() - 8;
+        assert_eq!(
+            u64::from_le_bytes(input[nonce_offset..nonce_offset + 8].try_into().unwrap()),
+            42
+        );
+        let mt_offset = nonce_offset - 4;
         assert_eq!(
             u32::from_le_bytes([
                 input[mt_offset],
