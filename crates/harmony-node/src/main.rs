@@ -590,6 +590,14 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                             })
                     })
                     .flatten(),
+                disk_cids: match &config_file.data_dir {
+                    Some(dir) => {
+                        let cids = crate::disk_io::scan_books(dir);
+                        tracing::info!(count = cids.len(), path = %dir, "loaded book CIDs from disk");
+                        cids
+                    }
+                    None => Vec::new(),
+                },
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -645,6 +653,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 did_web_cache_ttl,
                 rawlink_interface,
                 archivist_config,
+                config_file.data_dir.clone(),
             )
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
