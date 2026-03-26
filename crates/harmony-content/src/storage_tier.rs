@@ -368,8 +368,11 @@ impl<B: BookStore> StorageTier<B> {
                 }
                 actions
             }
-            StorageTierEvent::DiskReadFailed { query_id, .. } => {
+            StorageTierEvent::DiskReadFailed { cid, query_id } => {
                 self.metrics.disk_read_failures += 1;
+                // Retract the optimistic disk_index entry so subsequent queries
+                // don't trigger futile DiskLookup cycles for a CID that failed.
+                self.disk_index.remove(&cid);
                 // Reply with empty payload so the querier doesn't hang.
                 vec![StorageTierAction::SendReply {
                     query_id,
@@ -485,11 +488,14 @@ impl<B: BookStore> StorageTier<B> {
         }
 
         // Clone data for disk persistence BEFORE cache consumes it.
-        let persist_data = if self.disk_enabled && Self::is_durable_class(&cid) {
-            Some(data.clone())
-        } else {
-            None
-        };
+        // Skip if already in disk_index to avoid redundant 1MB clones on re-transit.
+        let persist_data =
+            if self.disk_enabled && Self::is_durable_class(&cid) && !self.disk_index.contains(&cid)
+            {
+                Some(data.clone())
+            } else {
+                None
+            };
 
         // Use store_preadmitted to avoid double-incrementing the sketch
         // counter (should_admit already incremented it).
@@ -531,11 +537,14 @@ impl<B: BookStore> StorageTier<B> {
             return vec![];
         }
         // Clone data for disk persistence BEFORE cache consumes it.
-        let persist_data = if self.disk_enabled && Self::is_durable_class(&cid) {
-            Some(data.clone())
-        } else {
-            None
-        };
+        // Skip if already in disk_index to avoid redundant clones on re-publish.
+        let persist_data =
+            if self.disk_enabled && Self::is_durable_class(&cid) && !self.disk_index.contains(&cid)
+            {
+                Some(data.clone())
+            } else {
+                None
+            };
 
         // Publish always stores — bypasses admission filter.
         // TODO: Pin published content to guarantee long-term retention (deferred).
