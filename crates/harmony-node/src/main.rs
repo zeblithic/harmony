@@ -565,13 +565,29 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 inference_gguf_cid: config_file
                     .inference_model_gguf_cid
                     .as_deref()
-                    .and_then(|s| hex::decode(s).ok())
-                    .and_then(|v| <[u8; 32]>::try_from(v).ok()),
+                    .map(|s| {
+                        hex::decode(s)
+                            .ok()
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                            .or_else(|| {
+                                tracing::warn!("inference_model_gguf_cid is not a valid 32-byte hex string; inference disabled");
+                                None
+                            })
+                    })
+                    .flatten(),
                 inference_tokenizer_cid: config_file
                     .inference_model_tokenizer_cid
                     .as_deref()
-                    .and_then(|s| hex::decode(s).ok())
-                    .and_then(|v| <[u8; 32]>::try_from(v).ok()),
+                    .map(|s| {
+                        hex::decode(s)
+                            .ok()
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                            .or_else(|| {
+                                tracing::warn!("inference_model_tokenizer_cid is not a valid 32-byte hex string; inference disabled");
+                                None
+                            })
+                    })
+                    .flatten(),
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 
