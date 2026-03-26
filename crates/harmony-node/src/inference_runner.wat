@@ -34,10 +34,11 @@
     (local.set $prompt_ptr
       (i32.add (local.get $input_ptr) (i32.const 68)))
 
-    ;; Guard: prompt must not overlap tokenize buffer at 32764.
-    ;; Max safe prompt end = input_ptr + 68 + prompt_len <= 32764.
+    ;; Guard: full input tail (prompt + 20B params + 4B max_tokens) must not
+    ;; reach the single-token scratch slot at 32764.
+    ;; End of input = prompt_ptr + prompt_len + 24.
     (if (i32.gt_u
-          (i32.add (local.get $prompt_ptr) (local.get $prompt_len))
+          (i32.add (i32.add (local.get $prompt_ptr) (local.get $prompt_len)) (i32.const 24))
           (i32.const 32764))
       (then (return (i32.const 0))))
 
