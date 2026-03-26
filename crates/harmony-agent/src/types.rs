@@ -4,45 +4,65 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTask {
+    /// Unique task identifier.
     pub task_id: String,
+    /// Semantic task type (e.g. "inference", "summarize").
     pub task_type: String,
+    /// Task-type-specific parameters.
     pub params: serde_json::Value,
+    /// Optional chaining context for multi-step workflows.
     pub context: Option<TaskContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskContext {
+    /// ID of the parent task in a chained workflow, if any.
     pub parent_task_id: Option<String>,
+    /// Arbitrary metadata attached to the task context.
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResult {
+    /// ID of the task this result corresponds to.
     pub task_id: String,
+    /// Completion status of the task.
     pub status: TaskStatus,
+    /// Task output payload, present on success.
     pub output: Option<serde_json::Value>,
+    /// Human-readable error message, present on failure or rejection.
     pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
+    /// Task completed successfully.
     Success,
+    /// Task failed during execution.
     Failed,
+    /// Task was rejected before execution (e.g. unsupported type or capacity).
     Rejected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCapacity {
+    /// Harmony address hash (hex) identifying this agent.
     pub agent_id: String,
+    /// Task types this agent can handle.
     pub task_types: Vec<String>,
+    /// Current operational status of the agent.
     pub status: AgentStatus,
+    /// Maximum number of tasks this agent will process concurrently.
     pub max_concurrent: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentStatus {
+    /// Agent is accepting new tasks.
     Ready,
+    /// Agent is at capacity and not accepting new tasks.
     Busy,
+    /// Agent is finishing existing tasks and will not accept new ones.
     Draining,
 }
 
