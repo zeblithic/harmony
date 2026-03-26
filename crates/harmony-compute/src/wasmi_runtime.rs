@@ -111,6 +111,11 @@ impl WasmiRuntime {
             Ok(wasmi::TypedResumableCall::Finished(output_len)) => {
                 // Validate output length (negative = WASM-side error).
                 if output_len < 0 {
+                    #[cfg(feature = "inference")]
+                    {
+                        self.shared_inference_engine =
+                            ctx.store.into_data().inference_engine;
+                    }
                     return ComputeResult::Failed {
                         error: ComputeError::Trap {
                             reason: format!("compute returned negative length: {output_len}"),
@@ -123,6 +128,11 @@ impl WasmiRuntime {
                 let memory = match ctx.instance.get_memory(&ctx.store, "memory") {
                     Some(mem) => mem,
                     None => {
+                        #[cfg(feature = "inference")]
+                        {
+                            self.shared_inference_engine =
+                                ctx.store.into_data().inference_engine;
+                        }
                         return ComputeResult::Failed {
                             error: ComputeError::ExportNotFound {
                                 name: "memory".into(),
@@ -135,6 +145,11 @@ impl WasmiRuntime {
                 let output_end = ctx.input_len + output_len;
                 let mem_size = memory.data_size(&ctx.store);
                 if output_end > mem_size {
+                    #[cfg(feature = "inference")]
+                    {
+                        self.shared_inference_engine =
+                            ctx.store.into_data().inference_engine;
+                    }
                     return ComputeResult::Failed {
                         error: ComputeError::MemoryTooSmall {
                             need: output_end,
@@ -206,6 +221,12 @@ impl WasmiRuntime {
                     });
                     ComputeResult::NeedsIO { request }
                 } else {
+                    // Recover inference engine before dropping the store.
+                    #[cfg(feature = "inference")]
+                    {
+                        self.shared_inference_engine =
+                            ctx.store.into_data().inference_engine;
+                    }
                     ComputeResult::Failed {
                         error: ComputeError::Trap {
                             reason: "unexpected host trap with no IO request".into(),
@@ -213,11 +234,19 @@ impl WasmiRuntime {
                     }
                 }
             }
-            Err(e) => ComputeResult::Failed {
-                error: ComputeError::Trap {
-                    reason: e.to_string(),
-                },
-            },
+            Err(e) => {
+                // Recover inference engine before dropping the store.
+                #[cfg(feature = "inference")]
+                {
+                    self.shared_inference_engine =
+                        ctx.store.into_data().inference_engine;
+                }
+                ComputeResult::Failed {
+                    error: ComputeError::Trap {
+                        reason: e.to_string(),
+                    },
+                }
+            }
         }
     }
 }
