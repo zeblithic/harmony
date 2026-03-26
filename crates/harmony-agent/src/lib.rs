@@ -13,6 +13,6 @@ pub use types::{
     AgentCapacity, AgentResult, AgentStatus, AgentTask, StreamChunk, TaskContext, TaskStatus,
 };
 pub use wire::{
-    decode_capacity, decode_result, decode_task, encode_capacity, encode_result, encode_task,
-    AgentError,
+    decode_capacity, decode_chunk, decode_result, decode_task, encode_capacity, encode_chunk,
+    encode_result, encode_task, AgentError,
 };
