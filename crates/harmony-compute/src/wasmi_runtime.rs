@@ -260,13 +260,10 @@ impl ComputeRuntime for WasmiRuntime {
             }
         };
 
-        // Create a store with host state, injecting any persisted inference engine.
-        let mut host_state = HostState::new();
-        #[cfg(feature = "inference")]
-        {
-            host_state.inference_engine = self.shared_inference_engine.take();
-        }
-        let mut store = wasmi::Store::new(&self.engine, host_state);
+        // Create a store with host state. The inference engine is injected
+        // later (after all fallible setup) to avoid losing it on compilation/
+        // instantiation failure.
+        let mut store = wasmi::Store::new(&self.engine, HostState::new());
         if let Err(e) = store.set_fuel(budget.fuel) {
             return ComputeResult::Failed {
                 error: ComputeError::Trap {
@@ -697,6 +694,13 @@ impl ComputeRuntime for WasmiRuntime {
                 };
             }
         };
+
+        // Inject persisted inference engine now that all fallible setup succeeded.
+        // This ensures the engine survives compilation/instantiation failures.
+        #[cfg(feature = "inference")]
+        {
+            store.data_mut().inference_engine = self.shared_inference_engine.take();
+        }
 
         // Call compute with resumable API to support fuel exhaustion.
         let call_result = compute_func.call_resumable(&mut store, (0i32, input_len_i32));

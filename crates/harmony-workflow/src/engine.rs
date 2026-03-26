@@ -423,14 +423,11 @@ impl WorkflowEngine {
         gguf_data: Vec<u8>,
         tokenizer_data: Vec<u8>,
     ) -> Vec<WorkflowAction> {
-        // Cache model data so subsequent workflows with the same CIDs
-        // can resume immediately without cloning from the caller.
-        self.model_data_cache = Some((
-            gguf_cid,
-            tokenizer_cid,
-            gguf_data.clone(),
-            tokenizer_data.clone(),
-        ));
+        // NOTE: We don't cache model data here. After the first inference
+        // request completes, the WasmiRuntime persists the inference engine —
+        // subsequent model_load calls return 0 immediately, never emitting
+        // NeedsIO(LoadModel), so this cache would never be consulted again.
+        // Avoiding the multi-GB clone saves significant memory.
         self.handle_model_resolution(
             gguf_cid,
             tokenizer_cid,
@@ -708,30 +705,7 @@ impl WorkflowEngine {
                                 tokenizer_cid,
                             });
 
-                            // Check engine-level model cache first — avoids cloning
-                            // multi-GB data from the caller on every inference request.
-                            if let Some((cached_g, cached_t, ref gd, ref td)) =
-                                self.model_data_cache
-                            {
-                                if cached_g == gguf_cid && cached_t == tokenizer_cid {
-                                    state.history.events.push(HistoryEvent::ModelResolved {
-                                        gguf_cid,
-                                        tokenizer_cid,
-                                        success: true,
-                                    });
-                                    // Resume immediately from cache (clone from engine
-                                    // cache, not from caller).
-                                    let response = IOResponse::ModelReady {
-                                        gguf_data: gd.clone(),
-                                        tokenizer_data: td.clone(),
-                                    };
-                                    current_result =
-                                        self.runtime.resume_with_io(response, self.budget);
-                                    continue;
-                                }
-                            }
-
-                            // Cache miss — extract session, suspend, emit LoadModel action.
+                            // Extract session, suspend, emit LoadModel action.
                             let saved_session = self
                                 .runtime
                                 .take_session()
