@@ -1178,50 +1178,45 @@ impl<B: BookStore> NodeRuntime<B> {
             }
             RuntimeEvent::ContentFetchResponse { cid, result } => {
                 // Check if this is inference model data arriving from startup fetch.
-                let mut is_inference_data = false;
-                match &result {
-                    Ok(data) => {
-                        if Some(cid) == self.inference_model_cid
-                            && self.inference_gguf_data.is_none()
-                        {
-                            self.inference_gguf_data = Some(data.clone());
-                            is_inference_data = true;
-                        } else if Some(cid) == self.inference_tokenizer_cid
-                            && self.inference_tokenizer_data.is_none()
-                        {
-                            self.inference_tokenizer_data = Some(data.clone());
-                            is_inference_data = true;
-                        }
-                    }
-                    Err(e) => {
-                        if Some(cid) == self.inference_model_cid {
-                            tracing::error!(
-                                "failed to fetch inference GGUF model (CID {}): {e}; inference disabled",
-                                hex::encode(cid)
-                            );
-                            // Clear CIDs so inference is permanently disabled for this session
-                            self.inference_model_cid = None;
-                            self.inference_tokenizer_cid = None;
-                        } else if Some(cid) == self.inference_tokenizer_cid {
-                            tracing::error!(
-                                "failed to fetch inference tokenizer (CID {}): {e}; inference disabled",
-                                hex::encode(cid)
-                            );
-                            self.inference_model_cid = None;
-                            self.inference_tokenizer_cid = None;
-                        }
-                    }
-                }
-                if is_inference_data {
-                    self.check_inference_model_ready();
-                }
+                // Consume the data directly (no clone) and skip forwarding to the
+                // workflow engine, which has no workflow waiting for these CIDs.
+                let is_inference_gguf = Some(cid) == self.inference_model_cid
+                    && self.inference_gguf_data.is_none();
+                let is_inference_tok = Some(cid) == self.inference_tokenizer_cid
+                    && self.inference_tokenizer_data.is_none();
 
-                let event = match result {
-                    Ok(data) => WorkflowEvent::ContentFetched { cid, data },
-                    Err(_) => WorkflowEvent::ContentFetchFailed { cid },
-                };
-                let actions = self.workflow.handle(event);
-                self.pending_workflow_actions.extend(actions);
+                if is_inference_gguf || is_inference_tok {
+                    match result {
+                        Ok(data) => {
+                            if is_inference_gguf {
+                                self.inference_gguf_data = Some(data);
+                            } else {
+                                self.inference_tokenizer_data = Some(data);
+                            }
+                            self.check_inference_model_ready();
+                        }
+                        Err(e) => {
+                            let label = if is_inference_gguf { "GGUF model" } else { "tokenizer" };
+                            tracing::error!(
+                                "failed to fetch inference {label} (CID {}): {e}; inference disabled",
+                                hex::encode(cid)
+                            );
+                            // Clear all inference state — CIDs and any partial data
+                            self.inference_model_cid = None;
+                            self.inference_tokenizer_cid = None;
+                            self.inference_gguf_data = None;
+                            self.inference_tokenizer_data = None;
+                        }
+                    }
+                } else {
+                    // Non-inference content — forward to workflow engine as before
+                    let event = match result {
+                        Ok(data) => WorkflowEvent::ContentFetched { cid, data },
+                        Err(_) => WorkflowEvent::ContentFetchFailed { cid },
+                    };
+                    let actions = self.workflow.handle(event);
+                    self.pending_workflow_actions.extend(actions);
+                }
             }
             RuntimeEvent::TunnelHandshakeComplete {
                 interface_name,

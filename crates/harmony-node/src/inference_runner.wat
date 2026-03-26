@@ -26,7 +26,7 @@
     (local.set $result
       (call $model_load (local.get $input_ptr) (i32.add (local.get $input_ptr) (i32.const 32))))
     (if (i32.ne (local.get $result) (i32.const 0))
-      (then (return (i32.const 0))))
+      (then (return (i32.const -1))))
 
     ;; 2. Read prompt_len and prompt_ptr
     (local.set $prompt_len
@@ -40,7 +40,7 @@
     (if (i32.gt_u
           (i32.add (i32.add (local.get $prompt_ptr) (local.get $prompt_len)) (i32.const 24))
           (i32.const 32764))
-      (then (return (i32.const 0))))
+      (then (return (i32.const -1))))
 
     ;; 3. Tokenize prompt
     (local.set $token_bytes
@@ -48,13 +48,13 @@
         (local.get $prompt_ptr) (local.get $prompt_len)
         (i32.const 32768) (i32.const 8192)))
     (if (i32.lt_s (local.get $token_bytes) (i32.const 0))
-      (then (return (i32.const 0))))
+      (then (return (i32.const -1))))
 
     ;; 4. Forward pass (prefill)
     (local.set $result
       (call $forward (i32.const 32768) (local.get $token_bytes)))
     (if (i32.ne (local.get $result) (i32.const 0))
-      (then (return (i32.const 0))))
+      (then (return (i32.const -1))))
 
     ;; 5. Read params and max_tokens
     (local.set $params_ptr
@@ -94,7 +94,7 @@
             (i32.shl (local.get $gen_count) (i32.const 2))
             (i32.const 49152) (i32.const 16384)))
         (if (i32.lt_s (local.get $output_bytes) (i32.const 0))
-          (then (local.set $output_bytes (i32.const 0)))))
+          (then (return (i32.const -1)))))
       (else
         (local.set $output_bytes (i32.const 0))))
 
