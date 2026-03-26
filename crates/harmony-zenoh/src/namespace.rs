@@ -278,6 +278,12 @@ pub mod compute {
     /// Key expression for inference queryable.
     pub const INFERENCE_ACTIVITY: &str = "harmony/compute/activity/inference";
 
+    /// Key expression for DSD verification queryable.
+    pub const VERIFY_ACTIVITY: &str = "harmony/compute/activity/verify";
+
+    /// Key expression for DSD speculative inference queryable.
+    pub const SPECULATIVE_ACTIVITY: &str = "harmony/compute/activity/speculative";
+
     /// Subscribe to all results: `harmony/compute/result/*`
     pub const RESULT_SUB: &str = "harmony/compute/result/*";
 
