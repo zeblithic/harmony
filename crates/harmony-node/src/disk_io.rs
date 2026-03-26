@@ -162,9 +162,6 @@ mod tests {
         ContentId::for_book(data, ContentFlags::default()).unwrap()
     }
 
-    fn dir_str(dir: &tempfile::TempDir) -> String {
-        dir.path().to_string_lossy().into_owned()
-    }
 
     #[test]
     fn write_and_read_round_trip() {

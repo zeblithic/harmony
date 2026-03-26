@@ -510,6 +510,11 @@ impl<B: BookStore> StorageTier<B> {
         let mut actions = Vec::new();
 
         // After cache insertion, persist durable content to disk.
+        // Optimistic: disk_index is updated before the async write completes.
+        // Race window: if cache evicts this CID before the write finishes and a
+        // query arrives, DiskLookup will fail (file not yet on disk).
+        // DiskReadFailed retracts the index entry; the write eventually succeeds,
+        // leaving an orphaned file that self-heals on the next startup scan.
         if let Some(persist_bytes) = persist_data {
             self.disk_index.insert(cid);
             actions.push(StorageTierAction::PersistToDisk {
