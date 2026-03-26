@@ -32,6 +32,16 @@ const RESPONSE_ERR_TAG: u8 = 0x01;
 impl VerifyRequest {
     /// Serialize this request into a byte vector.
     pub fn serialize(&self) -> Vec<u8> {
+        assert!(
+            self.drafts.len() <= u8::MAX as usize,
+            "draft count {} exceeds u8::MAX",
+            self.drafts.len()
+        );
+        assert!(
+            self.context_tokens.len() <= u32::MAX as usize,
+            "context length {} exceeds u32::MAX",
+            self.context_tokens.len()
+        );
         let context_len = self.context_tokens.len() as u32;
         let draft_count = self.drafts.len() as u8;
 
