@@ -347,6 +347,18 @@ pub enum RuntimeAction {
     RemoveFromDisk { cid: ContentId },
     /// Fetch a CAS book from S3 fallback (spawned as async I/O by event loop).
     S3Lookup { cid: ContentId, query_id: u64 },
+    /// Spawn a streaming inference task.
+    ///
+    /// Sampling parameters are stored as raw 20-byte LE wire format because
+    /// `harmony_inference::SamplingParams` does not derive `PartialEq` (needed
+    /// by `RuntimeAction`). The event loop decodes them before spawning.
+    #[cfg(feature = "inference")]
+    RunInference {
+        query_id: u64,
+        task_id: String,
+        prompt: String,
+        sampling_params_raw: [u8; 20],
+    },
 }
 
 /// Filter state received from a peer, with metadata.
@@ -2258,34 +2270,47 @@ impl<B: BookStore> NodeRuntime<B> {
                 Vec::new()
             }
             ParsedCompute::Inference { request } => {
-                let (gguf_cid, tok_cid) =
-                    match (self.inference_model_cid, self.inference_tokenizer_cid) {
-                        (Some(g), Some(t)) => (g, t),
-                        _ => {
-                            let mut payload = vec![0x01];
-                            payload.extend_from_slice(b"no inference model loaded");
-                            self.pending_direct_actions
-                                .push(RuntimeAction::SendReply { query_id, payload });
-                            return Vec::new();
-                        }
-                    };
+                // Guard: model must be loaded.
+                match (self.inference_model_cid, self.inference_tokenizer_cid) {
+                    (Some(_), Some(_)) => {}
+                    _ => {
+                        let mut payload = vec![0x01];
+                        payload.extend_from_slice(b"no inference model loaded");
+                        self.pending_direct_actions
+                            .push(RuntimeAction::SendReply { query_id, payload });
+                        return Vec::new();
+                    }
+                };
 
-                let nonce = self.inference_request_nonce;
-                self.inference_request_nonce += 1;
-                let input =
-                    crate::inference::build_runner_input(&gguf_cid, &tok_cid, &request, nonce);
-                let module = crate::inference::INFERENCE_RUNNER_WASM.to_vec();
-                let module_hash = harmony_crypto::hash::blake3_hash(&module);
-                let wf_id = WorkflowId::new(&module_hash, &input);
-                self.workflow_to_query
-                    .entry(wf_id)
-                    .or_default()
-                    .push(query_id);
-                self.workflow.handle(WorkflowEvent::Submit {
-                    module,
-                    input,
-                    hint: ComputeHint::PreferLocal,
-                })
+                // Emit RunInference — the event loop spawns the blocking token loop.
+                #[cfg(feature = "inference")]
+                {
+                    self.inference_request_nonce += 1;
+                    let task_id = format!(
+                        "{:016x}-{}",
+                        self.inference_request_nonce,
+                        hex::encode(self.local_identity_hash)
+                    );
+                    self.pending_direct_actions
+                        .push(RuntimeAction::RunInference {
+                            query_id,
+                            task_id,
+                            prompt: request.prompt,
+                            sampling_params_raw: request.sampling_params,
+                        });
+                    return Vec::new();
+                }
+
+                // Without the inference feature, fall through to no-op.
+                #[cfg(not(feature = "inference"))]
+                {
+                    let _ = &request; // Suppress unused warning
+                    let mut payload = vec![0x01];
+                    payload.extend_from_slice(b"inference feature not enabled");
+                    self.pending_direct_actions
+                        .push(RuntimeAction::SendReply { query_id, payload });
+                    Vec::new()
+                }
             }
             ParsedCompute::Verify { request } => {
                 // DSD target verification — run natively, NOT through WASM.

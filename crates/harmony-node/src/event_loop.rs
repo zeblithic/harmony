@@ -1118,6 +1118,56 @@ pub async fn run(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
+                // Intercept RunInference before dispatch — we need `&mut runtime`
+                // to take/return the engine, which dispatch_action doesn't have.
+                #[cfg(feature = "inference")]
+                if let RuntimeAction::RunInference {
+                    query_id,
+                    ref task_id,
+                    ref prompt,
+                    sampling_params_raw,
+                } = action
+                {
+                    if let Some(engine) = runtime.take_inference_engine() {
+                        let tx = inference_tx.clone();
+                        let max_tokens = crate::inference::DEFAULT_MAX_INFERENCE_TOKENS;
+                        let query_id = query_id;
+                        let task_id = task_id.clone();
+                        let prompt = prompt.clone();
+                        let params =
+                            crate::inference::decode_sampling_params(&sampling_params_raw);
+
+                        tokio::task::spawn_blocking(move || {
+                            run_inference_loop(
+                                engine, tx, query_id, task_id, prompt, params, max_tokens,
+                            );
+                        });
+                    } else {
+                        // Engine busy or not loaded — reject the request.
+                        let error_payload = b"inference engine busy or not loaded".to_vec();
+                        dispatch_action(
+                            RuntimeAction::SendReply {
+                                query_id,
+                                payload: error_payload,
+                            },
+                            &session,
+                            &zenoh_tx,
+                            &udp,
+                            &broadcast_addr,
+                            Some(&peer_table),
+                            &tunnel_senders,
+                            &mut deferred_dials,
+                            &ret_outbound_tx,
+                            &data_dir,
+                            &disk_tx,
+                            &s3_read_library,
+                            &s3_tx,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+
                 dispatch_action(
                     action,
                     &session,
@@ -1672,7 +1722,122 @@ async fn dispatch_action(
                 let _ = s3_tx.try_send(S3IoResult::ReadFailed { cid, query_id });
             }
         }
+        // RunInference is intercepted in the action loop before dispatch_action
+        // is called. If it reaches here, it's a logic error — log and ignore.
+        #[cfg(feature = "inference")]
+        RuntimeAction::RunInference { .. } => {
+            tracing::error!("RunInference reached dispatch_action — should be intercepted");
+        }
     }
+}
+
+/// Run the autoregressive token loop on a blocking thread.
+///
+/// Streams token chunks via `tx` and returns the engine (with full text or error)
+/// when complete. The event loop receives these on `inference_rx` and routes them.
+#[cfg(feature = "inference")]
+fn run_inference_loop(
+    mut engine: harmony_inference::QwenEngine,
+    tx: mpsc::Sender<InferenceResult>,
+    query_id: u64,
+    task_id: String,
+    prompt: String,
+    sampling_params: harmony_inference::SamplingParams,
+    max_tokens: u32,
+) {
+    use harmony_inference::InferenceEngine;
+
+    let tokens = match engine.tokenize(&prompt) {
+        Ok(t) => t,
+        Err(e) => {
+            engine.reset();
+            let _ = tx.blocking_send(InferenceResult::Failed {
+                query_id,
+                task_id,
+                error: format!("tokenize failed: {e}"),
+                engine,
+            });
+            return;
+        }
+    };
+
+    let mut logits = match engine.forward(&tokens) {
+        Ok(l) => l,
+        Err(e) => {
+            engine.reset();
+            let _ = tx.blocking_send(InferenceResult::Failed {
+                query_id,
+                task_id,
+                error: format!("forward failed: {e}"),
+                engine,
+            });
+            return;
+        }
+    };
+
+    let mut full_text = String::new();
+    let mut sequence = 0u32;
+    let eos = engine.eos_token_id();
+
+    loop {
+        let next_token = match engine.sample(&logits, &sampling_params) {
+            Ok(t) => t,
+            Err(e) => {
+                engine.reset();
+                let _ = tx.blocking_send(InferenceResult::Failed {
+                    query_id,
+                    task_id,
+                    error: format!("sample failed: {e}"),
+                    engine,
+                });
+                return;
+            }
+        };
+
+        if eos == Some(next_token) || sequence >= max_tokens {
+            let _ = tx.blocking_send(InferenceResult::Chunk {
+                task_id: task_id.clone(),
+                sequence,
+                token_text: String::new(),
+                final_chunk: true,
+            });
+            break;
+        }
+
+        let text = engine.detokenize(&[next_token]).unwrap_or_default();
+        full_text.push_str(&text);
+
+        let _ = tx.blocking_send(InferenceResult::Chunk {
+            task_id: task_id.clone(),
+            sequence,
+            token_text: text,
+            final_chunk: false,
+        });
+
+        sequence += 1;
+
+        logits = match engine.forward(&[next_token]) {
+            Ok(l) => l,
+            Err(e) => {
+                engine.reset();
+                let _ = tx.blocking_send(InferenceResult::Failed {
+                    query_id,
+                    task_id,
+                    error: format!("forward failed: {e}"),
+                    engine,
+                });
+                return;
+            }
+        };
+    }
+
+    engine.reset();
+    let _ = tx.blocking_send(InferenceResult::Complete {
+        query_id,
+        task_id,
+        full_text,
+        engine,
+    });
 }
 
 /// Construct a `PqIdentity` from raw ML-DSA verifying key and ML-KEM encapsulation key bytes.
