@@ -1317,6 +1317,7 @@ mod tests {
             memo::PREFIX,
             page::PREFIX,
             engram::PREFIX,
+            telemetry::PREFIX,
         ];
         for prefix in prefixes {
             assert!(
