@@ -11,9 +11,10 @@
 //! engine.load_gguf(&gguf_bytes)?;
 //! engine.load_tokenizer(&tokenizer_json)?;
 //!
+//! let mut cache = engine.new_cache()?;
 //! let tokens = engine.tokenize("Hello")?;
-//! let logits = engine.forward(&tokens)?;
-//! let next = engine.sample(&logits, &SamplingParams::greedy())?;
+//! let logits = engine.forward(&tokens, &mut cache)?;
+//! let next = engine.sample(&logits, &SamplingParams::greedy(), &tokens)?;
 //! ```
 
 pub mod engine;
@@ -119,8 +120,9 @@ impl Default for SamplingParams {
 
 /// Trait for running inference on quantized language models.
 ///
-/// The caller drives the autoregressive loop, enabling streaming output,
-/// custom stopping criteria, and future Engram embedding injection.
+/// After initialization (`load_gguf`, `load_tokenizer`), all inference methods
+/// take `&self` — the engine is stateless. Mutable state lives in the
+/// caller-owned [`InferenceCache`].
 pub trait InferenceEngine {
     /// Load a GGUF model from raw bytes.
     fn load_gguf(&mut self, gguf_data: &[u8]) -> Result<(), InferenceError>;
@@ -136,26 +138,39 @@ pub trait InferenceEngine {
 
     /// Run a single forward pass: token IDs → logits.
     ///
-    /// Manages KV cache internally. First call = prefill, subsequent = decode.
-    /// Advances the internal position counter by `tokens.len()`.
+    /// Appends new K/V tensors to `cache` and advances `cache.position`.
+    /// First call = prefill, subsequent = decode.
     ///
-    /// # Error recovery
+    /// # Errors
     ///
-    /// If this method returns `ForwardFailed`, the KV cache may be in an
-    /// indeterminate state. Call [`reset()`](Self::reset) before reusing
-    /// the engine.
-    fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, InferenceError>;
+    /// - `ModelNotLoaded` if no model is loaded.
+    /// - `CacheMismatch` if `cache.num_layers` doesn't match the model.
+    /// - `ForwardFailed` on empty tokens or tensor errors. After this error,
+    ///   the cache may be in an indeterminate state — drop and recreate it.
+    fn forward(
+        &self,
+        tokens: &[u32],
+        cache: &mut InferenceCache,
+    ) -> Result<Vec<f32>, InferenceError>;
 
     /// Sample the next token from logits.
     ///
-    /// Uses internal token history (populated by `forward()`) for repeat penalty.
-    fn sample(&self, logits: &[f32], params: &SamplingParams) -> Result<u32, InferenceError>;
-
-    /// Reset the KV cache and position (start a new conversation).
-    fn reset(&mut self);
+    /// Pass the full token history; the implementation applies the
+    /// `repeat_last_n` window from `params` internally.
+    fn sample(
+        &self,
+        logits: &[f32],
+        params: &SamplingParams,
+        history: &[u32],
+    ) -> Result<u32, InferenceError>;
 
     /// Return the EOS (end-of-sequence) token ID, if the tokenizer defines one.
     fn eos_token_id(&self) -> Option<u32>;
+
+    /// Create a new empty cache matching the loaded model's architecture.
+    ///
+    /// Returns `ModelNotLoaded` if no model has been loaded yet.
+    fn new_cache(&self) -> Result<InferenceCache, InferenceError>;
 }
 
 #[cfg(test)]
