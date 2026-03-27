@@ -724,6 +724,29 @@ pub mod agent {
     }
 }
 
+/// Model advertisement key expressions for distributed model discovery.
+pub mod model {
+    use alloc::{format, string::String};
+
+    /// Base prefix for model advertisements.
+    pub const PREFIX: &str = "harmony/model";
+
+    /// Full key for a model advertisement: `harmony/model/{manifest_cid_hex}/{node_addr_hex}`.
+    pub fn advertisement_key(manifest_cid_hex: &str, node_addr_hex: &str) -> String {
+        format!("{PREFIX}/{manifest_cid_hex}/{node_addr_hex}")
+    }
+
+    /// Subscribe to all model advertisements: `harmony/model/**`.
+    pub fn advertisement_sub_all() -> &'static str {
+        "harmony/model/**"
+    }
+
+    /// Subscribe to all nodes advertising a specific model: `harmony/model/{manifest_cid_hex}/*`.
+    pub fn advertisement_sub_model(manifest_cid_hex: &str) -> String {
+        format!("{PREFIX}/{manifest_cid_hex}/*")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,5 +1381,20 @@ mod tests {
 
         let stream_sub = agent::stream_sub("deadbeef01020304");
         assert_eq!(stream_sub, "harmony/agent/deadbeef01020304/stream/*");
+    }
+
+    // ── Model ───────────────────────────────────────────────────
+
+    #[test]
+    fn model_namespace_keys() {
+        let key = model::advertisement_key("abcd1234", "deadbeef");
+        assert_eq!(key, "harmony/model/abcd1234/deadbeef");
+
+        assert_eq!(model::advertisement_sub_all(), "harmony/model/**");
+
+        let pattern = model::advertisement_sub_model("abcd1234");
+        assert_eq!(pattern, "harmony/model/abcd1234/*");
+
+        assert_eq!(model::PREFIX, "harmony/model");
     }
 }
