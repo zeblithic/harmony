@@ -104,6 +104,9 @@ impl TokenInferenceRequest {
             return Err("payload too short for token count".into());
         }
         let token_count = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+        if token_count == 0 {
+            return Err("token count must be at least 1".into());
+        }
         if token_count > MAX_INPUT_TOKENS {
             return Err(format!(
                 "token count {} exceeds maximum {}",
@@ -445,8 +448,7 @@ mod tests {
     fn parse_token_request_empty_tokens() {
         let mut payload = vec![TOKEN_INFERENCE_TAG];
         payload.extend_from_slice(&0u32.to_le_bytes());
-        let req = TokenInferenceRequest::parse(&payload).unwrap();
-        assert!(req.token_ids.is_empty());
+        assert!(TokenInferenceRequest::parse(&payload).is_err());
     }
 
     #[test]

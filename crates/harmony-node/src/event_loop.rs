@@ -1831,7 +1831,9 @@ async fn handle_inference_result(
             token_id,
             final_chunk,
         } => {
-            let payload_value = if let Some(id) = token_id {
+            let payload_value = if final_chunk {
+                serde_json::json!({"final": true})
+            } else if let Some(id) = token_id {
                 serde_json::json!({"token_id": id})
             } else {
                 serde_json::json!({"token": token_text})
