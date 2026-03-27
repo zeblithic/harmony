@@ -126,9 +126,7 @@ pub fn parse_byte_size(s: &str) -> Result<u64, String> {
     if s.is_empty() {
         return Err("empty byte size string".into());
     }
-    let num_end = s
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(s.len());
+    let num_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     if num_end == 0 {
         return Err(format!("no numeric value in '{s}'"));
     }
@@ -144,9 +142,11 @@ pub fn parse_byte_size(s: &str) -> Result<u64, String> {
         "kib" => 1_024,
         "mib" => 1_024 * 1_024,
         "gib" => 1_024 * 1_024 * 1_024,
-        "" => return Err(format!(
-            "bare number '{s}' requires a unit suffix (B, KB, MB, GB, KiB, MiB, GiB)"
-        )),
+        "" => {
+            return Err(format!(
+                "bare number '{s}' requires a unit suffix (B, KB, MB, GB, KiB, MiB, GiB)"
+            ))
+        }
         other => return Err(format!("unknown unit suffix '{other}' in '{s}'")),
     };
     num.checked_mul(multiplier)

@@ -550,13 +550,35 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     let dir = dir.clone();
                     tokio::task::spawn_blocking(move || {
                         let entries = crate::disk_io::scan_books(&dir);
-                        tracing::info!(count = entries.len(), path = %dir.display(), "loaded book entries from disk");
+                        tracing::info!(
+                            count = entries.len(),
+                            total_bytes = entries.iter().map(|(_, s)| s).sum::<u64>(),
+                            path = %dir.display(),
+                            "loaded book entries from disk"
+                        );
                         entries
                     })
                     .await
                     .unwrap_or_default()
                 }
                 None => Vec::new(),
+            };
+
+            let disk_quota = match &config_file.disk_quota {
+                Some(s) => {
+                    let bytes = crate::config::parse_byte_size(s)
+                        .map_err(|e| format!("invalid disk_quota '{s}': {e}"))?;
+                    tracing::info!(quota_bytes = bytes, raw = %s, "disk quota configured");
+                    Some(bytes)
+                }
+                None => {
+                    if config_file.data_dir.is_some() {
+                        tracing::info!(
+                            "disk persistence enabled without quota — disk usage is unbounded"
+                        );
+                    }
+                    None
+                }
             };
 
             let config = NodeConfig {
@@ -607,7 +629,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     .flatten(),
                 disk_enabled: config_file.data_dir.is_some(),
                 disk_entries,
-                disk_quota: None,  // will be wired in Task 7
+                disk_quota,
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 

@@ -27,10 +27,7 @@ use std::{
 pub fn book_path(data_dir: &std::path::Path, cid: &ContentId) -> PathBuf {
     let hex_cid = hex::encode(cid.to_bytes());
     let prefix = &hex_cid[8..10];
-    data_dir
-        .join("book")
-        .join(prefix)
-        .join(&hex_cid)
+    data_dir.join("book").join(prefix).join(&hex_cid)
 }
 
 // ---------------------------------------------------------------------------
@@ -42,7 +39,11 @@ pub fn book_path(data_dir: &std::path::Path, cid: &ContentId) -> PathBuf {
 /// Uses write-to-temp-then-rename for crash safety: a power loss during write
 /// leaves the temp file (not the final path), so scan_books never sees a
 /// truncated book.
-pub fn write_book(data_dir: &std::path::Path, cid: &ContentId, data: &[u8]) -> Result<(), io::Error> {
+pub fn write_book(
+    data_dir: &std::path::Path,
+    cid: &ContentId,
+    data: &[u8],
+) -> Result<(), io::Error> {
     let path = book_path(data_dir, cid);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -183,7 +184,6 @@ mod tests {
         ContentId::for_book(data, ContentFlags::default()).unwrap()
     }
 
-
     #[test]
     fn write_and_read_round_trip() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -208,7 +208,10 @@ mod tests {
         assert!(path.exists(), "book file should exist at expected path");
 
         let prefix_dir = path.parent().unwrap();
-        assert!(prefix_dir.is_dir(), "prefix directory should have been created");
+        assert!(
+            prefix_dir.is_dir(),
+            "prefix directory should have been created"
+        );
     }
 
     #[test]

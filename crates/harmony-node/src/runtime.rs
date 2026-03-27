@@ -1284,8 +1284,8 @@ impl<B: BookStore> NodeRuntime<B> {
             }
             RuntimeEvent::ContentFetchResponse { cid, result } => {
                 // Check if this is inference model data arriving from startup fetch.
-                let is_inference_gguf = Some(cid) == self.inference_model_cid
-                    && self.inference_gguf_data.is_none();
+                let is_inference_gguf =
+                    Some(cid) == self.inference_model_cid && self.inference_gguf_data.is_none();
                 let is_inference_tok = Some(cid) == self.inference_tokenizer_cid
                     && self.inference_tokenizer_data.is_none();
 
@@ -1308,8 +1308,11 @@ impl<B: BookStore> NodeRuntime<B> {
                             self.pending_workflow_actions.extend(actions);
                         }
                         Err(e) => {
-                            let label =
-                                if is_inference_gguf { "GGUF model" } else { "tokenizer" };
+                            let label = if is_inference_gguf {
+                                "GGUF model"
+                            } else {
+                                "tokenizer"
+                            };
                             tracing::error!(
                                 "failed to fetch inference {label} (CID {}): {e}; inference disabled",
                                 hex::encode(cid)
@@ -1318,8 +1321,9 @@ impl<B: BookStore> NodeRuntime<B> {
                             self.inference_tokenizer_cid = None;
                             self.inference_gguf_data = None;
                             self.inference_tokenizer_data = None;
-                            let actions =
-                                self.workflow.handle(WorkflowEvent::ContentFetchFailed { cid });
+                            let actions = self
+                                .workflow
+                                .handle(WorkflowEvent::ContentFetchFailed { cid });
                             self.pending_workflow_actions.extend(actions);
                         }
                     }
@@ -1538,15 +1542,17 @@ impl<B: BookStore> NodeRuntime<B> {
                 query_id,
                 data,
             } => {
-                let storage_actions =
-                    self.storage
-                        .handle(StorageTierEvent::DiskReadComplete { cid, query_id, data });
+                let storage_actions = self.storage.handle(StorageTierEvent::DiskReadComplete {
+                    cid,
+                    query_id,
+                    data,
+                });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
             RuntimeEvent::DiskReadFailed { cid, query_id } => {
-                let storage_actions =
-                    self.storage
-                        .handle(StorageTierEvent::DiskReadFailed { cid, query_id });
+                let storage_actions = self
+                    .storage
+                    .handle(StorageTierEvent::DiskReadFailed { cid, query_id });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
         }
@@ -2244,17 +2250,14 @@ impl<B: BookStore> NodeRuntime<B> {
                         let response = Self::run_verification(engine, &request);
                         let payload = match response {
                             Ok(resp) => resp.serialize(),
-                            Err(e) => {
-                                harmony_speculative::VerifyResponse::serialize_error(&e)
-                            }
+                            Err(e) => harmony_speculative::VerifyResponse::serialize_error(&e),
                         };
                         self.pending_direct_actions
                             .push(RuntimeAction::SendReply { query_id, payload });
                     } else {
-                        let payload =
-                            harmony_speculative::VerifyResponse::serialize_error(
-                                "no verification engine",
-                            );
+                        let payload = harmony_speculative::VerifyResponse::serialize_error(
+                            "no verification engine",
+                        );
                         self.pending_direct_actions
                             .push(RuntimeAction::SendReply { query_id, payload });
                     }
@@ -2262,10 +2265,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 #[cfg(not(feature = "inference"))]
                 {
                     let _ = &request;
-                    let payload =
-                        harmony_speculative::VerifyResponse::serialize_error(
-                            "inference feature not enabled",
-                        );
+                    let payload = harmony_speculative::VerifyResponse::serialize_error(
+                        "inference feature not enabled",
+                    );
                     self.pending_direct_actions
                         .push(RuntimeAction::SendReply { query_id, payload });
                 }
@@ -2384,8 +2386,7 @@ impl<B: BookStore> NodeRuntime<B> {
                     self.inference_tokenizer_data.as_ref(),
                 ) {
                     use harmony_inference::InferenceEngine;
-                    let mut engine =
-                        harmony_inference::QwenEngine::new(candle_core::Device::Cpu);
+                    let mut engine = harmony_inference::QwenEngine::new(candle_core::Device::Cpu);
                     match engine.load_gguf(gguf_data) {
                         Ok(()) => match engine.load_tokenizer(tok_data) {
                             Ok(()) => {
@@ -2399,9 +2400,7 @@ impl<B: BookStore> NodeRuntime<B> {
                             }
                         },
                         Err(e) => {
-                            tracing::error!(
-                                "failed to load GGUF for verification engine: {e}"
-                            );
+                            tracing::error!("failed to load GGUF for verification engine: {e}");
                         }
                     }
                 }
@@ -2421,8 +2420,7 @@ impl<B: BookStore> NodeRuntime<B> {
                     }
                     // Publish capacity advertisement.
                     if let Some(model_cid) = &self.inference_model_cid {
-                        let payload =
-                            crate::inference::build_capacity_payload(model_cid, true);
+                        let payload = crate::inference::build_capacity_payload(model_cid, true);
                         let cap_key =
                             harmony_zenoh::namespace::compute::capacity_key(&self.node_addr);
                         self.pending_direct_actions.push(RuntimeAction::Publish {
@@ -2441,8 +2439,7 @@ impl<B: BookStore> NodeRuntime<B> {
             // Use a per-node key so edges can route queries to a specific target.
             #[cfg(feature = "inference")]
             if self.verify_queryable_id.is_none() {
-                let verify_key =
-                    harmony_zenoh::namespace::compute::verify_key(&self.node_addr);
+                let verify_key = harmony_zenoh::namespace::compute::verify_key(&self.node_addr);
                 match self.queryable_router.declare(&verify_key) {
                     Ok((qid, actions)) => {
                         self.verify_queryable_id = Some(qid);
@@ -2516,8 +2513,7 @@ impl<B: BookStore> NodeRuntime<B> {
             // Check if this draft token is acceptable given current_logits
             if !should_accept_draft(&current_logits, draft.token_id, draft.logprob) {
                 // Rejected — sample bonus token from current distribution
-                let (bonus_token, bonus_logprob) =
-                    sample_greedy_with_logprob(&current_logits);
+                let (bonus_token, bonus_logprob) = sample_greedy_with_logprob(&current_logits);
                 return Ok(harmony_speculative::VerifyResponse {
                     accepted_count: i as u8,
                     bonus_token,
@@ -2582,9 +2578,12 @@ impl<B: BookStore> NodeRuntime<B> {
 
         // Reject if already in a DSD session (one at a time).
         if self.dsd_session.is_some() {
-            let err = harmony_speculative::VerifyResponse::serialize_error("busy: DSD session active");
-            self.pending_direct_actions
-                .push(RuntimeAction::SendReply { query_id, payload: err });
+            let err =
+                harmony_speculative::VerifyResponse::serialize_error("busy: DSD session active");
+            self.pending_direct_actions.push(RuntimeAction::SendReply {
+                query_id,
+                payload: err,
+            });
             return;
         }
 
@@ -2593,8 +2592,10 @@ impl<B: BookStore> NodeRuntime<B> {
             Ok(r) => r,
             Err(e) => {
                 let err = harmony_speculative::VerifyResponse::serialize_error(&e);
-                self.pending_direct_actions
-                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
                 return;
             }
         };
@@ -2602,9 +2603,12 @@ impl<B: BookStore> NodeRuntime<B> {
         let engine = match &mut self.verification_engine {
             Some(e) => e,
             None => {
-                let err = harmony_speculative::VerifyResponse::serialize_error("no draft model loaded");
-                self.pending_direct_actions
-                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                let err =
+                    harmony_speculative::VerifyResponse::serialize_error("no draft model loaded");
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
                 return;
             }
         };
@@ -2612,10 +2616,13 @@ impl<B: BookStore> NodeRuntime<B> {
         let target_addr = match &self.dsd_target_addr {
             Some(a) => a.clone(),
             None => {
-                let err =
-                    harmony_speculative::VerifyResponse::serialize_error("no DSD target discovered");
-                self.pending_direct_actions
-                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                let err = harmony_speculative::VerifyResponse::serialize_error(
+                    "no DSD target discovered",
+                );
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
                 return;
             }
         };
@@ -2624,11 +2631,13 @@ impl<B: BookStore> NodeRuntime<B> {
         let prompt_tokens = match engine.tokenize(&request.prompt) {
             Ok(tokens) => tokens,
             Err(e) => {
-                let err = harmony_speculative::VerifyResponse::serialize_error(
-                    &format!("tokenize failed: {e}"),
-                );
-                self.pending_direct_actions
-                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                let err = harmony_speculative::VerifyResponse::serialize_error(&format!(
+                    "tokenize failed: {e}"
+                ));
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
                 return;
             }
         };
@@ -2648,16 +2657,20 @@ impl<B: BookStore> NodeRuntime<B> {
                 let err = harmony_speculative::VerifyResponse::serialize_error(
                     "prefill returned empty logits",
                 );
-                self.pending_direct_actions
-                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
                 return;
             }
             Err(e) => {
-                let err = harmony_speculative::VerifyResponse::serialize_error(
-                    &format!("prefill failed: {e}"),
-                );
-                self.pending_direct_actions
-                    .push(RuntimeAction::SendReply { query_id, payload: err });
+                let err = harmony_speculative::VerifyResponse::serialize_error(&format!(
+                    "prefill failed: {e}"
+                ));
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
                 return;
             }
         };
@@ -2682,16 +2695,20 @@ impl<B: BookStore> NodeRuntime<B> {
                     let err = harmony_speculative::VerifyResponse::serialize_error(
                         "draft forward returned empty logits",
                     );
-                    self.pending_direct_actions
-                        .push(RuntimeAction::SendReply { query_id, payload: err });
+                    self.pending_direct_actions.push(RuntimeAction::SendReply {
+                        query_id,
+                        payload: err,
+                    });
                     return;
                 }
                 Err(e) => {
-                    let err = harmony_speculative::VerifyResponse::serialize_error(
-                        &format!("draft forward failed: {e}"),
-                    );
-                    self.pending_direct_actions
-                        .push(RuntimeAction::SendReply { query_id, payload: err });
+                    let err = harmony_speculative::VerifyResponse::serialize_error(&format!(
+                        "draft forward failed: {e}"
+                    ));
+                    self.pending_direct_actions.push(RuntimeAction::SendReply {
+                        query_id,
+                        payload: err,
+                    });
                     return;
                 }
             }
@@ -2706,10 +2723,11 @@ impl<B: BookStore> NodeRuntime<B> {
         let verify_payload = verify_request.serialize();
         let target_key = harmony_zenoh::namespace::compute::verify_key(&target_addr);
 
-        self.pending_direct_actions.push(RuntimeAction::SendVerifyQuery {
-            key_expr: target_key.clone(),
-            payload: verify_payload,
-        });
+        self.pending_direct_actions
+            .push(RuntimeAction::SendVerifyQuery {
+                key_expr: target_key.clone(),
+                payload: verify_payload,
+            });
 
         // Store session state.
         self.dsd_session = Some(DsdSession {
@@ -2817,15 +2835,13 @@ impl<B: BookStore> NodeRuntime<B> {
                 Ok(text) => {
                     let mut payload = vec![0x00]; // success tag
                     payload.extend_from_slice(text.as_bytes());
-                    self.pending_direct_actions.push(RuntimeAction::SendReply {
-                        query_id,
-                        payload,
-                    });
+                    self.pending_direct_actions
+                        .push(RuntimeAction::SendReply { query_id, payload });
                 }
                 Err(e) => {
-                    let err = harmony_speculative::VerifyResponse::serialize_error(
-                        &format!("detokenize failed: {e}"),
-                    );
+                    let err = harmony_speculative::VerifyResponse::serialize_error(&format!(
+                        "detokenize failed: {e}"
+                    ));
                     self.pending_direct_actions.push(RuntimeAction::SendReply {
                         query_id,
                         payload: err,
@@ -2868,9 +2884,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 return;
             }
             Err(e) => {
-                let err = harmony_speculative::VerifyResponse::serialize_error(
-                    &format!("reprefill failed: {e}"),
-                );
+                let err = harmony_speculative::VerifyResponse::serialize_error(&format!(
+                    "reprefill failed: {e}"
+                ));
                 self.pending_direct_actions.push(RuntimeAction::SendReply {
                     query_id,
                     payload: err,
@@ -2911,9 +2927,9 @@ impl<B: BookStore> NodeRuntime<B> {
                     return;
                 }
                 Err(e) => {
-                    let err = harmony_speculative::VerifyResponse::serialize_error(
-                        &format!("draft forward failed: {e}"),
-                    );
+                    let err = harmony_speculative::VerifyResponse::serialize_error(&format!(
+                        "draft forward failed: {e}"
+                    ));
                     self.pending_direct_actions.push(RuntimeAction::SendReply {
                         query_id,
                         payload: err,
@@ -2931,10 +2947,11 @@ impl<B: BookStore> NodeRuntime<B> {
             drafts,
         };
         let target_key = session.target_verify_key.clone();
-        self.pending_direct_actions.push(RuntimeAction::SendVerifyQuery {
-            key_expr: target_key,
-            payload: verify_request.serialize(),
-        });
+        self.pending_direct_actions
+            .push(RuntimeAction::SendVerifyQuery {
+                key_expr: target_key,
+                payload: verify_request.serialize(),
+            });
 
         // Update session with new pending drafts.
         if let Some(session) = &mut self.dsd_session {
@@ -3013,9 +3030,7 @@ impl<B: BookStore> NodeRuntime<B> {
                         .discovery
                         .get_record(&identity_hash, self.last_unix_now)
                     {
-                        Some(record) => {
-                            (record.public_key.clone(), record.encryption_key.clone())
-                        }
+                        Some(record) => (record.public_key.clone(), record.encryption_key.clone()),
                         None => {
                             tracing::warn!(
                                 identity = %hex::encode(identity_hash),
@@ -3537,7 +3552,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 let status = payload[32];
                 // A target qualifies if it's ready and its model CID differs from ours.
                 if status == crate::inference::CAPACITY_READY
-                    && self.inference_model_cid.map_or(true, |our_cid| peer_model_cid != our_cid)
+                    && self
+                        .inference_model_cid
+                        .map_or(true, |our_cid| peer_model_cid != our_cid)
                 {
                     // Don't overwrite existing target (use first discovered).
                     if self.dsd_target_addr.is_none() {

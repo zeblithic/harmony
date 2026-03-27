@@ -537,13 +537,14 @@ impl<B: BookStore> StorageTier<B> {
 
         // Clone data for disk persistence BEFORE cache consumes it.
         // Skip if already in disk_index to avoid redundant 1MB clones on re-transit.
-        let persist_data =
-            if self.disk_enabled && Self::is_durable_class(&cid) && !self.disk_index.contains_key(&cid)
-            {
-                Some(data.clone())
-            } else {
-                None
-            };
+        let persist_data = if self.disk_enabled
+            && Self::is_durable_class(&cid)
+            && !self.disk_index.contains_key(&cid)
+        {
+            Some(data.clone())
+        } else {
+            None
+        };
 
         // Use store_preadmitted to avoid double-incrementing the sketch
         // counter (should_admit already incremented it).
@@ -591,13 +592,14 @@ impl<B: BookStore> StorageTier<B> {
         }
         // Clone data for disk persistence BEFORE cache consumes it.
         // Skip if already in disk_index to avoid redundant clones on re-publish.
-        let persist_data =
-            if self.disk_enabled && Self::is_durable_class(&cid) && !self.disk_index.contains_key(&cid)
-            {
-                Some(data.clone())
-            } else {
-                None
-            };
+        let persist_data = if self.disk_enabled
+            && Self::is_durable_class(&cid)
+            && !self.disk_index.contains_key(&cid)
+        {
+            Some(data.clone())
+        } else {
+            None
+        };
 
         // Publish always stores — bypasses admission filter.
         // TODO: Pin published content to guarantee long-term retention (deferred).
@@ -1867,7 +1869,10 @@ mod tests {
         let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 77, cid });
         assert_eq!(actions.len(), 1, "should emit DiskLookup, got: {actions:?}");
         match &actions[0] {
-            StorageTierAction::DiskLookup { cid: lookup_cid, query_id } => {
+            StorageTierAction::DiskLookup {
+                cid: lookup_cid,
+                query_id,
+            } => {
                 assert_eq!(*lookup_cid, cid);
                 assert_eq!(*query_id, 77);
             }
@@ -2287,7 +2292,10 @@ mod tests {
 
     #[test]
     fn enable_disk_with_sizes_tracks_bytes() {
-        let budget = StorageBudget { cache_capacity: 10, max_pinned_bytes: 0 };
+        let budget = StorageBudget {
+            cache_capacity: 10,
+            max_pinned_bytes: 0,
+        };
         let (mut tier, _) = StorageTier::new(
             MemoryBookStore::new(),
             budget,
@@ -2307,7 +2315,10 @@ mod tests {
 
     #[test]
     fn set_disk_quota() {
-        let budget = StorageBudget { cache_capacity: 10, max_pinned_bytes: 0 };
+        let budget = StorageBudget {
+            cache_capacity: 10,
+            max_pinned_bytes: 0,
+        };
         let (mut tier, _) = StorageTier::new(
             MemoryBookStore::new(),
             budget,
@@ -2322,10 +2333,15 @@ mod tests {
 
     #[test]
     fn eviction_removes_oldest_when_over_quota() {
-        let budget = StorageBudget { cache_capacity: 10, max_pinned_bytes: 0 };
+        let budget = StorageBudget {
+            cache_capacity: 10,
+            max_pinned_bytes: 0,
+        };
         let (mut tier, _) = StorageTier::new(
-            MemoryBookStore::new(), budget,
-            ContentPolicy::default(), FilterBroadcastConfig::default(),
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
         );
         tier.enable_disk(Vec::new());
         tier.set_disk_quota(250);
@@ -2335,14 +2351,20 @@ mod tests {
         let cid_c = ContentId::from_bytes([0x0C; 32]);
 
         let actions_a = tier.test_persist_to_disk(cid_a, 100);
-        assert!(!actions_a.iter().any(|a| matches!(a, StorageTierAction::RemoveFromDisk { .. })));
+        assert!(!actions_a
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::RemoveFromDisk { .. })));
 
         let actions_b = tier.test_persist_to_disk(cid_b, 100);
-        assert!(!actions_b.iter().any(|a| matches!(a, StorageTierAction::RemoveFromDisk { .. })));
+        assert!(!actions_b
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::RemoveFromDisk { .. })));
 
         // Third book pushes over quota — should evict cid_a (oldest)
         let actions_c = tier.test_persist_to_disk(cid_c, 100);
-        assert!(actions_c.iter().any(|a| matches!(a, StorageTierAction::RemoveFromDisk { cid } if *cid == cid_a)));
+        assert!(actions_c
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::RemoveFromDisk { cid } if *cid == cid_a)));
         assert!(!tier.disk_contains(&cid_a));
         assert!(tier.disk_contains(&cid_b));
         assert!(tier.disk_contains(&cid_c));
@@ -2351,10 +2373,15 @@ mod tests {
 
     #[test]
     fn eviction_skips_pinned_books() {
-        let budget = StorageBudget { cache_capacity: 10, max_pinned_bytes: 0 };
+        let budget = StorageBudget {
+            cache_capacity: 10,
+            max_pinned_bytes: 0,
+        };
         let (mut tier, _) = StorageTier::new(
-            MemoryBookStore::new(), budget,
-            ContentPolicy::default(), FilterBroadcastConfig::default(),
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
         );
         tier.enable_disk(Vec::new());
         tier.set_disk_quota(250);
@@ -2369,7 +2396,9 @@ mod tests {
 
         // Over quota — should skip cid_a (pinned) and evict cid_b
         let actions = tier.test_persist_to_disk(cid_c, 100);
-        assert!(actions.iter().any(|a| matches!(a, StorageTierAction::RemoveFromDisk { cid } if *cid == cid_b)));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::RemoveFromDisk { cid } if *cid == cid_b)));
         assert!(tier.disk_contains(&cid_a)); // pinned, still present
         assert!(!tier.disk_contains(&cid_b)); // evicted
         assert!(tier.disk_contains(&cid_c));
@@ -2377,24 +2406,36 @@ mod tests {
 
     #[test]
     fn no_eviction_without_quota() {
-        let budget = StorageBudget { cache_capacity: 10, max_pinned_bytes: 0 };
+        let budget = StorageBudget {
+            cache_capacity: 10,
+            max_pinned_bytes: 0,
+        };
         let (mut tier, _) = StorageTier::new(
-            MemoryBookStore::new(), budget,
-            ContentPolicy::default(), FilterBroadcastConfig::default(),
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
         );
         tier.enable_disk(Vec::new());
 
         let cid = ContentId::from_bytes([0x01; 32]);
         let actions = tier.test_persist_to_disk(cid, 1_000_000);
-        assert!(!actions.iter().any(|a| matches!(a, StorageTierAction::RemoveFromDisk { .. })));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::RemoveFromDisk { .. })));
     }
 
     #[test]
     fn eviction_safety_valve_all_pinned() {
-        let budget = StorageBudget { cache_capacity: 100, max_pinned_bytes: 0 };
+        let budget = StorageBudget {
+            cache_capacity: 100,
+            max_pinned_bytes: 0,
+        };
         let (mut tier, _) = StorageTier::new(
-            MemoryBookStore::new(), budget,
-            ContentPolicy::default(), FilterBroadcastConfig::default(),
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
         );
         tier.enable_disk(Vec::new());
         tier.set_disk_quota(150);
@@ -2405,17 +2446,24 @@ mod tests {
         tier.cache_pin(cid_a);
 
         let actions = tier.test_persist_to_disk(cid_b, 100);
-        assert!(!actions.iter().any(|a| matches!(a, StorageTierAction::RemoveFromDisk { .. })));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::RemoveFromDisk { .. })));
         assert!(tier.disk_contains(&cid_a));
         assert!(tier.disk_contains(&cid_b));
     }
 
     #[test]
     fn dedup_on_re_persist() {
-        let budget = StorageBudget { cache_capacity: 10, max_pinned_bytes: 0 };
+        let budget = StorageBudget {
+            cache_capacity: 10,
+            max_pinned_bytes: 0,
+        };
         let (mut tier, _) = StorageTier::new(
-            MemoryBookStore::new(), budget,
-            ContentPolicy::default(), FilterBroadcastConfig::default(),
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
         );
         tier.enable_disk(Vec::new());
         tier.set_disk_quota(500);
@@ -2428,10 +2476,15 @@ mod tests {
 
     #[test]
     fn disk_read_complete_refreshes_lru_ordering() {
-        let budget = StorageBudget { cache_capacity: 10, max_pinned_bytes: 0 };
+        let budget = StorageBudget {
+            cache_capacity: 10,
+            max_pinned_bytes: 0,
+        };
         let (mut tier, _) = StorageTier::new(
-            MemoryBookStore::new(), budget,
-            ContentPolicy::default(), FilterBroadcastConfig::default(),
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
         );
         tier.enable_disk(Vec::new());
         tier.set_disk_quota(250);
@@ -2448,7 +2501,9 @@ mod tests {
 
         // Now cid_b is oldest. Adding cid_c should evict cid_b, not cid_a.
         let actions = tier.test_persist_to_disk(cid_c, 100);
-        assert!(actions.iter().any(|a| matches!(a, StorageTierAction::RemoveFromDisk { cid } if *cid == cid_b)));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::RemoveFromDisk { cid } if *cid == cid_b)));
         assert!(tier.disk_contains(&cid_a)); // refreshed, not evicted
     }
 }
