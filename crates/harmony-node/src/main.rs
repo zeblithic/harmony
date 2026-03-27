@@ -551,7 +551,8 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     tokio::task::spawn_blocking(move || {
                         let cids = crate::disk_io::scan_books(&dir);
                         tracing::info!(count = cids.len(), path = %dir.display(), "loaded book CIDs from disk");
-                        cids
+                        // Temporary: discard sizes until Task 7 threads them through
+                        cids.into_iter().map(|(cid, _)| cid).collect::<Vec<_>>()
                     })
                     .await
                     .unwrap_or_default()
