@@ -1997,7 +1997,7 @@ async fn handle_inference_result(
 /// `inference_rx` and routes them.
 #[cfg(feature = "inference")]
 fn run_inference_loop(
-    mut engine: harmony_inference::QwenEngine,
+    engine: harmony_inference::QwenEngine,
     tx: mpsc::Sender<InferenceResult>,
     query_id: u64,
     task_id: String,
@@ -2007,11 +2007,25 @@ fn run_inference_loop(
 ) {
     use harmony_inference::InferenceEngine;
 
+    let mut cache = match engine.new_cache() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.blocking_send(InferenceResult::Failed {
+                query_id,
+                task_id,
+                error: format!("cache init failed: {e}"),
+                engine,
+            });
+            return;
+        }
+    };
+
+    let mut history: Vec<u32> = Vec::new();
+
     let (tokens, is_token_mode) = match input {
         crate::inference::InferenceInput::Text(prompt) => match engine.tokenize(&prompt) {
             Ok(t) => (t, false),
             Err(e) => {
-                engine.reset();
                 let _ = tx.blocking_send(InferenceResult::Failed {
                     query_id,
                     task_id,
@@ -2024,10 +2038,9 @@ fn run_inference_loop(
         crate::inference::InferenceInput::TokenIds(ids) => (ids, true),
     };
 
-    let mut logits = match engine.forward(&tokens) {
+    let mut logits = match engine.forward(&tokens, &mut cache) {
         Ok(l) => l,
         Err(e) => {
-            engine.reset();
             let _ = tx.blocking_send(InferenceResult::Failed {
                 query_id,
                 task_id,
@@ -2038,16 +2051,17 @@ fn run_inference_loop(
         }
     };
 
+    history.extend_from_slice(&tokens);
+
     let mut full_text = String::new();
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut sequence = 0u32;
     let eos = engine.eos_token_id();
 
     loop {
-        let next_token = match engine.sample(&logits, &sampling_params) {
+        let next_token = match engine.sample(&logits, &sampling_params, &history) {
             Ok(t) => t,
             Err(e) => {
-                engine.reset();
                 let _ = tx.blocking_send(InferenceResult::Failed {
                     query_id,
                     task_id,
@@ -2070,6 +2084,8 @@ fn run_inference_loop(
             });
             break;
         }
+
+        history.push(next_token);
 
         if is_token_mode {
             generated_ids.push(next_token);
@@ -2094,10 +2110,9 @@ fn run_inference_loop(
 
         sequence += 1;
 
-        logits = match engine.forward(&[next_token]) {
+        logits = match engine.forward(&[next_token], &mut cache) {
             Ok(l) => l,
             Err(e) => {
-                engine.reset();
                 let _ = tx.blocking_send(InferenceResult::Failed {
                     query_id,
                     task_id,
@@ -2114,7 +2129,6 @@ fn run_inference_loop(
     } else {
         crate::inference::InferenceOutput::Text(full_text)
     };
-    engine.reset();
     let _ = tx.blocking_send(InferenceResult::Complete {
         query_id,
         task_id,
