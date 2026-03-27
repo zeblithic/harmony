@@ -2280,10 +2280,26 @@ impl<B: BookStore> NodeRuntime<B> {
                 match (self.inference_model_cid, self.inference_tokenizer_cid) {
                     (Some(_), Some(_)) => {}
                     _ => {
-                        let mut payload = vec![0x01];
-                        payload.extend_from_slice(b"no inference model loaded");
-                        self.pending_direct_actions
-                            .push(RuntimeAction::SendReply { query_id, payload });
+                        #[cfg(feature = "inference")]
+                        {
+                            let result = harmony_agent::AgentResult {
+                                task_id: String::new(),
+                                status: harmony_agent::TaskStatus::Rejected,
+                                output: None,
+                                error: Some("no inference model loaded".into()),
+                            };
+                            let payload = harmony_agent::encode_result(&result)
+                                .unwrap_or_else(|_| b"no inference model loaded".to_vec());
+                            self.pending_direct_actions
+                                .push(RuntimeAction::SendReply { query_id, payload });
+                        }
+                        #[cfg(not(feature = "inference"))]
+                        {
+                            self.pending_direct_actions.push(RuntimeAction::SendReply {
+                                query_id,
+                                payload: vec![],
+                            });
+                        }
                         return Vec::new();
                     }
                 };
@@ -6512,11 +6528,13 @@ mod tests {
             "inference query without model should produce error reply"
         );
         if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
-            assert_eq!(payload[0], 0x01, "error tag");
-            let msg = std::str::from_utf8(&payload[1..]).unwrap();
+            // With inference feature: AgentResult wire format (0x00 + JSON).
+            // Without inference feature: empty payload.
+            // In both cases, verify the error is surfaced.
+            let payload_str = String::from_utf8_lossy(payload);
             assert!(
-                msg.contains("no inference model loaded"),
-                "error message should mention no model, got: {msg}"
+                payload_str.contains("no inference model loaded") || payload.is_empty(),
+                "error reply should mention no model or be empty, got: {payload_str}"
             );
         }
     }

@@ -1833,12 +1833,20 @@ async fn handle_inference_result(
                 let node_addr_hex = hex::encode(runtime.local_pq_identity_hash());
                 let key_expr =
                     harmony_zenoh::namespace::agent::stream_key(&node_addr_hex, &task_id);
-                let session_clone = session.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = session_clone.put(&key_expr, payload).await {
-                        tracing::warn!(%key_expr, err = %e, "stream chunk publish error");
+                if final_chunk {
+                    // Await final chunk directly so it completes before the
+                    // Complete/Failed handler dispatches the query reply.
+                    if let Err(e) = session.put(&key_expr, payload).await {
+                        tracing::warn!(%key_expr, err = %e, "final stream chunk publish error");
                     }
-                });
+                } else {
+                    let session_clone = session.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = session_clone.put(&key_expr, payload).await {
+                            tracing::warn!(%key_expr, err = %e, "stream chunk publish error");
+                        }
+                    });
+                }
             }
         }
         InferenceResult::Complete {
