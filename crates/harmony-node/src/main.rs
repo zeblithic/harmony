@@ -606,6 +606,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     })
                     .flatten(),
                 disk_enabled: config_file.data_dir.is_some(),
+                s3_enabled: archivist_config.is_some(),
                 disk_cids: disk_cids,
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());

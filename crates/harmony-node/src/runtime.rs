@@ -73,6 +73,9 @@ pub struct NodeConfig {
     /// Whether disk persistence is enabled (true when data_dir is configured).
     /// Controls whether StorageTier emits PersistToDisk and DiskLookup actions.
     pub disk_enabled: bool,
+    /// Whether S3 fallback is enabled for durable content.
+    /// Controls whether StorageTier emits S3Lookup actions on cache miss.
+    pub s3_enabled: bool,
     /// CIDs discovered by scanning the data directory at startup.
     pub disk_cids: Vec<ContentId>,
 }
@@ -139,6 +142,7 @@ impl Default for NodeConfig {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
+            s3_enabled: false,
             disk_cids: Vec::new(),
         }
     }
@@ -262,6 +266,15 @@ pub enum RuntimeEvent {
     },
     /// Disk read failed — file missing or corrupted.
     DiskReadFailed { cid: ContentId, query_id: u64 },
+
+    /// S3 read completed — content fetched from S3 fallback.
+    S3ReadComplete {
+        cid: ContentId,
+        query_id: u64,
+        data: Vec<u8>,
+    },
+    /// S3 read failed — object missing or fetch error.
+    S3ReadFailed { cid: ContentId, query_id: u64 },
 }
 
 /// Outbound actions returned by the runtime for the caller to execute.
@@ -327,6 +340,8 @@ pub enum RuntimeAction {
     PersistToDisk { cid: ContentId, data: Vec<u8> },
     /// Read a CAS book from disk (spawned as blocking I/O by event loop).
     DiskLookup { cid: ContentId, query_id: u64 },
+    /// Fetch a CAS book from S3 fallback (spawned as async I/O by event loop).
+    S3Lookup { cid: ContentId, query_id: u64 },
 }
 
 /// Filter state received from a peer, with metadata.
@@ -902,6 +917,11 @@ impl<B: BookStore> NodeRuntime<B> {
         // Activate disk tier when data_dir is configured (even if empty on first boot).
         if config.disk_enabled {
             rt.storage.enable_disk(config.disk_cids);
+        }
+
+        // Activate S3 fallback tier for durable content.
+        if config.s3_enabled {
+            rt.storage.enable_s3();
         }
 
         // If inference model CIDs are configured AND the inference feature is
@@ -1541,6 +1561,22 @@ impl<B: BookStore> NodeRuntime<B> {
                         .handle(StorageTierEvent::DiskReadFailed { cid, query_id });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
+            RuntimeEvent::S3ReadComplete {
+                cid,
+                query_id,
+                data,
+            } => {
+                let storage_actions =
+                    self.storage
+                        .handle(StorageTierEvent::S3ReadComplete { cid, query_id, data });
+                self.dispatch_storage_actions_inline(storage_actions);
+            }
+            RuntimeEvent::S3ReadFailed { cid, query_id } => {
+                let storage_actions =
+                    self.storage
+                        .handle(StorageTierEvent::S3ReadFailed { cid, query_id });
+                self.dispatch_storage_actions_inline(storage_actions);
+            }
         }
     }
 
@@ -1894,6 +1930,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
                 StorageTierAction::DiskLookup { cid, query_id } => {
                     out.push(RuntimeAction::DiskLookup { cid, query_id });
+                }
+                StorageTierAction::S3Lookup { cid, query_id } => {
+                    out.push(RuntimeAction::S3Lookup { cid, query_id });
                 }
                 StorageTierAction::RemoveFromDisk { .. } => {
                     // Deferred to disk eviction bead.
@@ -3687,6 +3726,15 @@ mod tests {
             cid: ContentId::from_bytes([0u8; 32]),
             query_id: 1,
         };
+        let _e_s3rc = RuntimeEvent::S3ReadComplete {
+            cid: ContentId::from_bytes([0u8; 32]),
+            query_id: 1,
+            data: vec![1, 2, 3],
+        };
+        let _e_s3rf = RuntimeEvent::S3ReadFailed {
+            cid: ContentId::from_bytes([0u8; 32]),
+            query_id: 1,
+        };
     }
 
     #[test]
@@ -3724,6 +3772,10 @@ mod tests {
             data: vec![1, 2, 3],
         };
         let _a_dl = RuntimeAction::DiskLookup {
+            cid: ContentId::from_bytes([0u8; 32]),
+            query_id: 1,
+        };
+        let _a_s3 = RuntimeAction::S3Lookup {
             cid: ContentId::from_bytes([0u8; 32]),
             query_id: 1,
         };
@@ -3981,8 +4033,8 @@ mod tests {
             .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. }));
         assert!(reply.is_some(), "stats query should produce reply");
         if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
-            // 9 metrics × 8 bytes = 72 bytes
-            assert_eq!(payload.len(), 72);
+            // 11 metrics × 8 bytes = 88 bytes
+            assert_eq!(payload.len(), 88);
             // First metric is queries_served, should be 1
             let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
             assert_eq!(queries, 1);
@@ -4529,6 +4581,7 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
+            s3_enabled: false,
             disk_cids: Vec::new(),
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4601,6 +4654,7 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
+            s3_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4639,6 +4693,7 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
+            s3_enabled: false,
             disk_cids: Vec::new(),
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4674,6 +4729,7 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
+            s3_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4738,6 +4794,7 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
+            s3_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4791,6 +4848,7 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
+            s3_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -4837,6 +4895,7 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
+            s3_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -5741,6 +5800,7 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
+            s3_enabled: false,
             disk_cids: Vec::new(),
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
