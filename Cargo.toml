@@ -36,6 +36,7 @@ members = [
     "crates/harmony-rawlink",
     "crates/harmony-s3",
     "crates/harmony-speculative",
+    "crates/harmony-telemetry",
 ]
 
 [workspace.package]
@@ -155,6 +156,7 @@ harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-rawlink = { path = "crates/harmony-rawlink" }
 harmony-s3 = { path = "crates/harmony-s3" }
 harmony-speculative = { path = "crates/harmony-speculative" }
+harmony-telemetry = { path = "crates/harmony-telemetry" }
 harmony-inference = { path = "crates/harmony-inference" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
 
