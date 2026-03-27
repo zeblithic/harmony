@@ -1,5 +1,9 @@
 # VLM Engine for harmony-inference
 
+> **Status: PARKED** — blocked on candle API gap. `quantized_qwen3::ModelWeights::forward()` accepts token IDs only, not embeddings. There is no `forward_from_embeds()` to inject fp16 vision hidden states into the quantized text model. See "Unresolved Blockers" section at end.
+>
+> **Bead:** harmony-tbbv | **Related:** harmony-e8h2 (full-precision), harmony-fkmv (quantized loader), harmony-ztgq (Coral TPU)
+
 ## Goal
 
 Extend `harmony-inference` to support Qwen3-VL multimodal inference — image+text input, logits output — so edge nodes can run vision-language models locally.
@@ -120,3 +124,22 @@ Normalization constants and resize bounds are read from GGUF metadata when avail
 - **No streaming output** — returns complete logits like existing `forward()`
 - **No Qwen 3.5 early-fusion** — target Qwen3-VL first (candle has `qwen3_vl` module). Qwen 3.5 native multimodal is future work once candle adds support.
 - **No JPEG/PNG decoding** — callers provide decoded RGB bytes. Format decoding is an I/O concern outside the sans-I/O engine.
+
+## Unresolved Blockers (2026-03-26)
+
+These issues were identified during spec review and block implementation:
+
+1. **`quantized_qwen3::ModelWeights::forward()` takes token IDs, not embeddings.** The hybrid approach (fp16 vision encoder + quantized text model) requires injecting vision hidden states into the text model's attention layers. But `ModelWeights::forward(&input, position)` only accepts a token ID tensor — there is no `forward_from_embeds()` entry point. Without this, vision embeddings cannot reach the text model's attention mechanism.
+
+2. **`Qwen3VLModel::forward()` requires complex metadata.** The full VLM forward pass needs `continuous_img_pad` (placeholder token span ranges), `image_grid_thw` (patch grid dimensions), `seqlens`, and `seqlen_offsets`. These are non-trivial to compute and cannot be hidden behind a simple API without significant internal bookkeeping.
+
+3. **`VisionConfig` source unspecified.** `Qwen3VLVisionModel::new()` requires a deserialized `VisionConfig` (from JSON), not derivable from GGUF metadata.
+
+### Paths Forward
+
+| Approach | Effort | Tradeoff |
+|----------|--------|----------|
+| Fork candle, add `forward_from_embeds()` to `quantized_qwen3` | Medium | Maintains a fork; may be accepted upstream |
+| Full-precision `Qwen3VLModel` for VLM (harmony-e8h2) | Low | 16GB+ RAM required; not edge-viable for 8B models |
+| Build `quantized_qwen3_vl` from scratch (harmony-fkmv) | High | Complete solution but significant engineering |
+| Google Coral TPU for vision preprocessing (harmony-ztgq) | Research | Offloads vision to dedicated hardware; different architecture |
