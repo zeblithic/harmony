@@ -724,7 +724,19 @@ impl<B: BookStore> StorageTier<B> {
             if let Some(entry_size) = self.disk_index.remove(&candidate) {
                 self.disk_used_bytes = self.disk_used_bytes.saturating_sub(entry_size);
             }
-            actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
+            // If a PersistToDisk for this candidate is in the current actions
+            // list, remove it — the persist and remove cancel out. Without this,
+            // both would be dispatched as concurrent spawn_blocking tasks and the
+            // delete could race ahead of the write, leaving an orphaned file.
+            let pending_persist = actions.iter().position(
+                |a| matches!(a, StorageTierAction::PersistToDisk { cid: c, .. } if *c == candidate),
+            );
+            if let Some(idx) = pending_persist {
+                actions.swap_remove(idx);
+                // Don't emit RemoveFromDisk either — the file was never written.
+            } else {
+                actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
+            }
             skipped = 0; // Reset after successful eviction
         }
     }
@@ -742,6 +754,22 @@ impl<B: BookStore> StorageTier<B> {
     pub fn test_persist_to_disk(&mut self, cid: ContentId, size: u64) -> Vec<StorageTierAction> {
         let mut actions = Vec::new();
         self.record_disk_persist(cid, size, &mut actions);
+        actions
+    }
+
+    /// Test helper: simulate multiple PersistToDisk events in one batch,
+    /// as would happen when several transits are processed in one tick.
+    /// Each persist pushes a PersistToDisk action before calling
+    /// record_disk_persist, mirroring the real handle_transit flow.
+    pub fn test_persist_batch(&mut self, entries: &[(ContentId, u64)]) -> Vec<StorageTierAction> {
+        let mut actions = Vec::new();
+        for &(cid, size) in entries {
+            actions.push(StorageTierAction::PersistToDisk {
+                cid,
+                data: alloc::vec![0u8; size as usize],
+            });
+            self.record_disk_persist(cid, size, &mut actions);
+        }
         actions
     }
 
@@ -2507,5 +2535,58 @@ mod tests {
             .iter()
             .any(|a| matches!(a, StorageTierAction::RemoveFromDisk { cid } if *cid == cid_b)));
         assert!(tier.disk_contains(&cid_a)); // refreshed, not evicted
+    }
+
+    #[test]
+    fn eviction_cancels_pending_persist_in_same_batch() {
+        // Regression test: when two persists happen in the same tick and the
+        // second triggers eviction of the first, both PersistToDisk and
+        // RemoveFromDisk would be emitted for the same CID. Since the event
+        // loop dispatches these as concurrent spawn_blocking tasks, the delete
+        // could race ahead of the write, leaving an orphaned file.
+        //
+        // The fix cancels both: if a PersistToDisk for the evicted CID is in
+        // the current actions list, remove it and skip RemoveFromDisk.
+        let budget = StorageBudget {
+            cache_capacity: 10,
+            max_pinned_bytes: 0,
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+        tier.enable_disk(Vec::new());
+        tier.set_disk_quota(150); // tight quota: room for one 100-byte book
+
+        let cid_a = ContentId::from_bytes([0x0A; 32]);
+        let cid_b = ContentId::from_bytes([0x0B; 32]);
+
+        // Persist both in one batch — cid_b triggers eviction of cid_a
+        let actions = tier.test_persist_batch(&[(cid_a, 100), (cid_b, 100)]);
+
+        // cid_a's PersistToDisk should have been cancelled (removed)
+        let persist_a = actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::PersistToDisk { cid, .. } if *cid == cid_a));
+        assert!(!persist_a, "PersistToDisk(cid_a) should be cancelled");
+
+        // No RemoveFromDisk(cid_a) either — the pair cancels out
+        let remove_a = actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::RemoveFromDisk { cid } if *cid == cid_a));
+        assert!(!remove_a, "RemoveFromDisk(cid_a) should not be emitted");
+
+        // cid_b's PersistToDisk should still be present
+        let persist_b = actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::PersistToDisk { cid, .. } if *cid == cid_b));
+        assert!(persist_b, "PersistToDisk(cid_b) should still be present");
+
+        // cid_a is gone from disk_index, cid_b is present
+        assert!(!tier.disk_contains(&cid_a));
+        assert!(tier.disk_contains(&cid_b));
+        assert_eq!(tier.disk_used_bytes(), 100);
     }
 }
