@@ -888,6 +888,9 @@ impl<B: BookStore> StorageTier<B> {
 
     /// Move a CID to the back of the disk LRU (most recently used).
     pub(crate) fn touch_disk_lru(&mut self, cid: &ContentId) {
+        if !self.disk_index.contains_key(cid) {
+            return; // CID was evicted while DiskLookup was in-flight; don't re-insert
+        }
         self.disk_lru.retain(|c| c != cid);
         self.disk_lru.push_back(*cid);
     }
