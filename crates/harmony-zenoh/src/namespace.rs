@@ -724,6 +724,35 @@ pub mod agent {
     }
 }
 
+// ── Telemetry ──────────────────────────────────────────────────────
+
+/// Telemetry event key expressions.
+///
+/// Nodes publish structured `TelemetryEvent` messages to these topics.
+/// Intents are free-form strings (e.g. `"health"`, `"anomaly"`,
+/// `"object_detected"`). Node addresses are lowercase hex.
+pub mod telemetry {
+    use alloc::{format, string::String};
+
+    /// Base prefix: `harmony/telemetry`
+    pub const PREFIX: &str = "harmony/telemetry";
+
+    /// Per-node, per-intent telemetry key: `harmony/telemetry/{node_addr}/{intent}`
+    pub fn telemetry_key(node_addr: &str, intent: &str) -> String {
+        format!("{PREFIX}/{node_addr}/{intent}")
+    }
+
+    /// Subscribe to all intents from one node: `harmony/telemetry/{node_addr}/*`
+    pub fn telemetry_sub_node(node_addr: &str) -> String {
+        format!("{PREFIX}/{node_addr}/*")
+    }
+
+    /// Subscribe to one intent across all nodes: `harmony/telemetry/*/{intent}`
+    pub fn telemetry_sub_intent(intent: &str) -> String {
+        format!("{PREFIX}/*/{intent}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,5 +1387,17 @@ mod tests {
 
         let stream_sub = agent::stream_sub("deadbeef01020304");
         assert_eq!(stream_sub, "harmony/agent/deadbeef01020304/stream/*");
+    }
+
+    #[test]
+    fn telemetry_namespace_keys() {
+        let key = telemetry::telemetry_key("node01", "anomaly");
+        assert_eq!(key, "harmony/telemetry/node01/anomaly");
+
+        let sub_node = telemetry::telemetry_sub_node("node01");
+        assert_eq!(sub_node, "harmony/telemetry/node01/*");
+
+        let sub_intent = telemetry::telemetry_sub_intent("health");
+        assert_eq!(sub_intent, "harmony/telemetry/*/health");
     }
 }
