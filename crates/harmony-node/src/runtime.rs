@@ -715,6 +715,10 @@ pub struct NodeRuntime<B: BookStore> {
     /// Separate from the WasmiRuntime's persisted engine used by WASM workflows.
     #[cfg(feature = "inference")]
     verification_engine: Option<harmony_inference::QwenEngine>,
+    /// Whether the inference engine is currently running a streaming task.
+    /// Used by DSD paths to distinguish "engine busy" from "engine not loaded".
+    #[cfg(feature = "inference")]
+    inference_running: bool,
     /// Queryable ID for the DSD verify endpoint.
     #[cfg(feature = "inference")]
     verify_queryable_id: Option<QueryableId>,
@@ -921,6 +925,8 @@ impl<B: BookStore> NodeRuntime<B> {
             inference_request_nonce: 0,
             #[cfg(feature = "inference")]
             verification_engine: None,
+            #[cfg(feature = "inference")]
+            inference_running: false,
             #[cfg(feature = "inference")]
             verify_queryable_id: None,
             #[cfg(feature = "inference")]
@@ -2285,6 +2291,15 @@ impl<B: BookStore> NodeRuntime<B> {
                 // Emit RunInference — the event loop spawns the blocking token loop.
                 #[cfg(feature = "inference")]
                 {
+                    if self.dsd_session.is_some() {
+                        let payload = harmony_speculative::VerifyResponse::serialize_error(
+                            "engine busy with DSD session",
+                        );
+                        self.pending_direct_actions
+                            .push(RuntimeAction::SendReply { query_id, payload });
+                        return Vec::new();
+                    }
+
                     self.inference_request_nonce += 1;
                     let task_id = format!(
                         "{:016x}-{}",
@@ -2318,6 +2333,14 @@ impl<B: BookStore> NodeRuntime<B> {
                 // run_verification would destroy the draft model's KV cache.
                 #[cfg(feature = "inference")]
                 {
+                    if self.inference_running {
+                        let payload = harmony_speculative::VerifyResponse::serialize_error(
+                            "engine busy running inference",
+                        );
+                        self.pending_direct_actions
+                            .push(RuntimeAction::SendReply { query_id, payload });
+                        return Vec::new();
+                    }
                     if self.dsd_session.is_some() {
                         let payload = harmony_speculative::VerifyResponse::serialize_error(
                             "busy: DSD session active on this node",
@@ -2455,13 +2478,18 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Returns `None` if the engine is already in use or not loaded.
     #[cfg(feature = "inference")]
     pub fn take_inference_engine(&mut self) -> Option<harmony_inference::QwenEngine> {
-        self.verification_engine.take()
+        let engine = self.verification_engine.take();
+        if engine.is_some() {
+            self.inference_running = true;
+        }
+        engine
     }
 
     /// Return the inference engine after an async streaming task completes.
     #[cfg(feature = "inference")]
     pub fn return_inference_engine(&mut self, engine: harmony_inference::QwenEngine) {
         self.verification_engine = Some(engine);
+        self.inference_running = false;
     }
 
     /// Check if both GGUF and tokenizer data have arrived, and if so,
@@ -2692,6 +2720,17 @@ impl<B: BookStore> NodeRuntime<B> {
                 return;
             }
         };
+
+        if self.inference_running {
+            let err = harmony_speculative::VerifyResponse::serialize_error(
+                "engine busy running inference",
+            );
+            self.pending_direct_actions.push(RuntimeAction::SendReply {
+                query_id,
+                payload: err,
+            });
+            return;
+        }
 
         let engine = match &mut self.verification_engine {
             Some(e) => e,

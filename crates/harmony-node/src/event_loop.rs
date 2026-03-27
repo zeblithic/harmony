@@ -1173,8 +1173,15 @@ pub async fn run(
                             );
                         });
                     } else {
-                        // Engine busy or not loaded — reject the request.
-                        let error_payload = b"inference engine busy or not loaded".to_vec();
+                        // Engine busy or not loaded — reject with proper AgentResult wire format.
+                        let result = harmony_agent::AgentResult {
+                            task_id: task_id.clone(),
+                            status: harmony_agent::TaskStatus::Rejected,
+                            output: None,
+                            error: Some("inference engine busy or not loaded".into()),
+                        };
+                        let error_payload = harmony_agent::encode_result(&result)
+                            .unwrap_or_else(|_| b"inference engine busy".to_vec());
                         dispatch_action(
                             RuntimeAction::SendReply {
                                 query_id,
@@ -1828,23 +1835,28 @@ async fn handle_inference_result(
                 output: Some(serde_json::json!({"text": full_text})),
                 error: None,
             };
-            if let Ok(payload) = harmony_agent::encode_result(&result) {
-                dispatch_action(
-                    RuntimeAction::SendReply { query_id, payload },
-                    session,
-                    zenoh_tx,
-                    udp,
-                    broadcast_addr,
-                    Some(peer_table),
-                    tunnel_senders,
-                    deferred_dials,
-                    ret_outbound_tx,
-                    data_dir,
-                    disk_tx,
-                    s3_read_library,
-                    s3_tx,
-                )
-                .await;
+            match harmony_agent::encode_result(&result) {
+                Ok(payload) => {
+                    dispatch_action(
+                        RuntimeAction::SendReply { query_id, payload },
+                        session,
+                        zenoh_tx,
+                        udp,
+                        broadcast_addr,
+                        Some(peer_table),
+                        tunnel_senders,
+                        deferred_dials,
+                        ret_outbound_tx,
+                        data_dir,
+                        disk_tx,
+                        s3_read_library,
+                        s3_tx,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::error!(%query_id, err = %e, "encode_result failed; query will not be answered");
+                }
             }
         }
         InferenceResult::Failed {
@@ -1860,23 +1872,28 @@ async fn handle_inference_result(
                 output: None,
                 error: Some(error),
             };
-            if let Ok(payload) = harmony_agent::encode_result(&result) {
-                dispatch_action(
-                    RuntimeAction::SendReply { query_id, payload },
-                    session,
-                    zenoh_tx,
-                    udp,
-                    broadcast_addr,
-                    Some(peer_table),
-                    tunnel_senders,
-                    deferred_dials,
-                    ret_outbound_tx,
-                    data_dir,
-                    disk_tx,
-                    s3_read_library,
-                    s3_tx,
-                )
-                .await;
+            match harmony_agent::encode_result(&result) {
+                Ok(payload) => {
+                    dispatch_action(
+                        RuntimeAction::SendReply { query_id, payload },
+                        session,
+                        zenoh_tx,
+                        udp,
+                        broadcast_addr,
+                        Some(peer_table),
+                        tunnel_senders,
+                        deferred_dials,
+                        ret_outbound_tx,
+                        data_dir,
+                        disk_tx,
+                        s3_read_library,
+                        s3_tx,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::error!(%query_id, err = %e, "encode_result failed; query will not be answered");
+                }
             }
         }
     }
