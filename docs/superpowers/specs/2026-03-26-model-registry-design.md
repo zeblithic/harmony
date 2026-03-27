@@ -40,6 +40,14 @@ The manifest captures what's needed for routing and compatibility: family, param
 
 Both manifests and model data use content flags `00` (public durable). The archivist auto-archives them to S3, and S3 fallback auto-retrieves on miss. No special content-class handling needed.
 
+### Reuse existing RuntimeAction/RuntimeEvent pattern
+
+No new RuntimeAction or RuntimeEvent variants. Publications go through the existing `RuntimeAction::Publish { key_expr, payload }`. Inbound advertisements arrive as `RuntimeEvent::SubscriptionMessage { key_expr, payload }` and are demuxed by key prefix in `route_subscription()`. This follows the established pattern and avoids touching match arms across the codebase.
+
+### Empty-payload retraction
+
+When a node removes a model, it publishes an empty payload to the same Zenoh key. The receiver's `route_subscription` handler checks for empty payload and removes the corresponding entry from `remote_models`. This avoids needing a Zenoh delete API or new event loop plumbing — empty-payload-as-tombstone is a standard Zenoh pattern.
+
 ## New Types
 
 ### ModelManifest
@@ -133,11 +141,13 @@ Postcard encoding for all types (matches engram convention).
 ```rust
 pub fn encode_manifest(manifest: &ModelManifest) -> Result<Vec<u8>, ModelError>;
 pub fn decode_manifest(data: &[u8]) -> Result<ModelManifest, ModelError>;
-pub fn manifest_cid(data: &[u8], flags: ContentFlags) -> ContentId;
+pub fn manifest_cid(data: &[u8]) -> ContentId;
 
 pub fn encode_advertisement(ad: &ModelAdvertisement) -> Result<Vec<u8>, ModelError>;
 pub fn decode_advertisement(data: &[u8]) -> Result<ModelAdvertisement, ModelError>;
 ```
+
+`manifest_cid` hardcodes public durable flags (`00`) — manifests are always public durable per the design decision above.
 
 Safety: `encode_manifest` returns `ManifestTooLarge` if the encoded size exceeds 64KB (manifests should be ~300 bytes).
 
@@ -151,8 +161,10 @@ Sans-I/O state machine tracking local and remote model availability.
 pub struct ModelRegistry {
     /// Models this node has locally (manifest CID → manifest).
     local_models: HashMap<ContentId, ModelManifest>,
-    /// Remote advertisements (manifest CID → set of node addresses).
-    remote_models: HashMap<ContentId, HashSet<[u8; 16]>>,
+    /// Remote advertisements (manifest CID → map of node address → advertisement).
+    remote_models: HashMap<ContentId, HashMap<[u8; 16], ModelAdvertisement>>,
+    /// This node's address (for constructing Zenoh keys).
+    local_addr: [u8; 16],
 }
 ```
 
@@ -175,12 +187,14 @@ pub enum ModelRegistryEvent {
 
 ```rust
 pub enum ModelRegistryAction {
-    /// Publish advertisement to Zenoh.
+    /// Publish advertisement to Zenoh (via existing RuntimeAction::Publish).
     PublishAdvertisement { key_expr: String, payload: Vec<u8> },
-    /// Retract advertisement (model removed).
+    /// Retract advertisement: publish empty payload to same key (tombstone).
     RetractAdvertisement { key_expr: String },
 }
 ```
+
+Both actions map to the existing `RuntimeAction::Publish { key_expr, payload }`. `RetractAdvertisement` uses `payload: vec![]` (empty payload as tombstone).
 
 ### Query Methods
 
@@ -189,13 +203,15 @@ impl ModelRegistry {
     pub fn local_models(&self) -> &HashMap<ContentId, ModelManifest>;
     pub fn find_by_task(&self, task: ModelTask) -> Vec<(&ContentId, Source)>;
     pub fn find_by_family(&self, family: &str) -> Vec<(&ContentId, Source)>;
-    pub fn nodes_for_model(&self, manifest_cid: &ContentId) -> Option<&HashSet<[u8; 16]>>;
+    pub fn nodes_for_model(&self, manifest_cid: &ContentId) -> Option<Vec<[u8; 16]>>;
+    /// Remove a specific node's advertisement (called on empty-payload retraction).
+    pub fn remove_advertisement(&mut self, manifest_cid: &ContentId, node_addr: &[u8; 16]);
 }
 
 pub enum Source {
     Local,
-    Remote(HashSet<[u8; 16]>),
-    Both(HashSet<[u8; 16]>),
+    Remote(Vec<[u8; 16]>),
+    Both(Vec<[u8; 16]>),
 }
 ```
 
@@ -203,8 +219,8 @@ pub enum Source {
 
 - `RegisterLocal`: stores manifest, emits `PublishAdvertisement` with encoded `ModelAdvertisement`.
 - `UnregisterLocal`: removes from local_models, emits `RetractAdvertisement`.
-- `AdvertisementReceived`: inserts into remote_models (manifest_cid → node_addr).
-- `NodeDeparted`: removes node_addr from all remote_models entries; prunes empty entries.
+- `AdvertisementReceived`: stores advertisement in remote_models (manifest_cid → node_addr → ad). This allows `find_by_task` and `find_by_family` to filter remote models by advertisement metadata without fetching manifests from CAS.
+- `NodeDeparted`: removes node_addr from all remote_models entries; prunes entries with no remaining nodes.
 - Query methods return `Source` to distinguish local, remote, or both.
 
 ## Zenoh Namespace
@@ -222,6 +238,7 @@ harmony/model/{manifest_cid_hex}/{node_addr_hex}
 Added to `harmony-zenoh::namespace::model`:
 
 ```rust
+pub const PREFIX: &str = "harmony/model";
 pub fn advertisement_key(manifest_cid: &ContentId, node_addr: &[u8; 16]) -> String;
 pub fn advertisement_sub_all() -> &'static str;
 pub fn advertisement_sub_model(manifest_cid: &ContentId) -> String;
@@ -229,34 +246,22 @@ pub fn advertisement_sub_model(manifest_cid: &ContentId) -> String;
 
 ## NodeRuntime Integration
 
-### New RuntimeAction Variants
+### No new RuntimeAction/RuntimeEvent variants
 
-```rust
-/// Publish a model advertisement to Zenoh.
-PublishModel { key_expr: String, payload: Vec<u8> },
-/// Retract a model advertisement from Zenoh.
-RetractModel { key_expr: String },
-```
-
-### New RuntimeEvent Variants
-
-```rust
-/// Model advertisement received from Zenoh.
-ModelAdvertisement { manifest_cid: ContentId, node_addr: [u8; 16], ad: harmony_model::ModelAdvertisement },
-```
+Follow the existing pattern: all Zenoh publications go through `RuntimeAction::Publish { key_expr, payload }` and all inbound subscriptions arrive as `RuntimeEvent::SubscriptionMessage { key_expr, payload }`, demuxed by key prefix in `route_subscription()`.
 
 ### Wiring
 
-- `ModelRegistryAction::PublishAdvertisement` → `RuntimeAction::PublishModel`
-- `ModelRegistryAction::RetractAdvertisement` → `RuntimeAction::RetractModel`
-- Zenoh subscriber callback for `harmony/model/**` → `RuntimeEvent::ModelAdvertisement`
+- `ModelRegistryAction::PublishAdvertisement` → `RuntimeAction::Publish { key_expr, payload }`
+- `ModelRegistryAction::RetractAdvertisement` → `RuntimeAction::Publish { key_expr, payload: vec![] }`
+- Zenoh subscriber for `harmony/model/**` → `RuntimeEvent::SubscriptionMessage` → `route_subscription()` matches `harmony/model/` prefix → decodes advertisement, extracts manifest_cid and node_addr from key → dispatches to `ModelRegistry::handle_event(AdvertisementReceived { ... })`
+- Empty payload in `route_subscription()`: calls `ModelRegistry::remove_advertisement(manifest_cid, node_addr)` directly (same pattern as `peer_filters.upsert_*()` — no event variant needed for retraction)
 
 ## Event Loop Integration
 
-- On startup, subscribe to `harmony/model/**`.
-- `RuntimeAction::PublishModel`: publish payload to Zenoh key.
-- `RuntimeAction::RetractModel`: delete Zenoh key.
-- Incoming advertisements: decode `ModelAdvertisement`, extract manifest_cid and node_addr from key, send `RuntimeEvent::ModelAdvertisement`.
+- On startup, subscribe to `harmony/model/**` (same mechanism as existing subscriptions).
+- No new action handling needed — `RuntimeAction::Publish` already exists.
+- `route_subscription()` gains a new prefix branch for `harmony/model/` that decodes advertisements and routes to ModelRegistry.
 
 ## Testing
 
@@ -267,37 +272,38 @@ ModelAdvertisement { manifest_cid: ContentId, node_addr: [u8; 16], ad: harmony_m
 3. **Advertisement round-trip** — encode → decode preserves all fields.
 4. **ManifestTooLarge rejected** — manifest exceeding 64KB → error.
 5. **Registry RegisterLocal** — stores manifest, emits PublishAdvertisement with correct key.
-6. **Registry UnregisterLocal** — removes manifest, emits RetractAdvertisement.
-7. **Registry AdvertisementReceived** — tracks remote node for manifest CID.
+6. **Registry UnregisterLocal** — removes manifest, emits RetractAdvertisement with empty payload.
+7. **Registry AdvertisementReceived** — tracks remote node and ad metadata for manifest CID.
 8. **Registry NodeDeparted** — removes node from all entries, prunes empty.
-9. **Registry find_by_task** — returns matching models with correct Source.
+9. **Registry find_by_task** — returns matching models with correct Source (local and remote).
 10. **Registry find_by_family** — returns matching models with correct Source.
-11. **Registry nodes_for_model** — returns node set for known CID, None for unknown.
+11. **Registry nodes_for_model** — returns node list for known CID, None for unknown.
 12. **Registry Source::Both** — model available locally AND remotely.
+13. **Registry remove_advertisement** — `remove_advertisement(cid, node_addr)` removes entry, prunes empty.
 
 ### harmony-zenoh namespace tests
 
-13. **advertisement_key format** — correct key structure.
-14. **advertisement_sub_all** — returns `harmony/model/**`.
-15. **advertisement_sub_model** — correct wildcard pattern.
+14. **advertisement_key format** — correct key structure.
+15. **advertisement_sub_all** — returns `harmony/model/**`.
+16. **advertisement_sub_model** — correct wildcard pattern.
 
 ## Files Modified
 
 | File | Change |
 |------|--------|
-| `crates/harmony-model/Cargo.toml` | New crate: depends on harmony-content, harmony-crypto, serde, postcard |
+| `crates/harmony-model/Cargo.toml` | New crate: depends on harmony-content, serde, postcard |
 | `crates/harmony-model/src/lib.rs` | Public API re-exports |
 | `crates/harmony-model/src/manifest.rs` | ModelManifest, ModelFormat, ModelTask |
 | `crates/harmony-model/src/wire.rs` | encode/decode manifest & advertisement, ModelError |
 | `crates/harmony-model/src/registry.rs` | ModelRegistry state machine |
 | `crates/harmony-zenoh/src/namespace.rs` | `pub mod model` with key builders |
-| `crates/harmony-node/src/runtime.rs` | RuntimeAction/Event variants, wire ModelRegistry |
-| `crates/harmony-node/src/event_loop.rs` | Zenoh pub/sub for model advertisements |
+| `crates/harmony-node/src/runtime.rs` | Wire ModelRegistry into route_subscription, add model subscription |
+| `crates/harmony-node/src/event_loop.rs` | Subscribe to harmony/model/** on startup |
 | `Cargo.toml` (workspace) | Add harmony-model to workspace members |
 
 ## Dependencies
 
-No new external crates. `postcard` and `serde` are already workspace dependencies. `harmony-content` and `harmony-crypto` are existing workspace crates.
+No new external crates. `postcard` and `serde` are already workspace dependencies. `harmony-content` is the only harmony dependency needed — `manifest_cid()` delegates to `ContentId::for_book()` which handles crypto internally. Direct `harmony-crypto` dependency is not needed.
 
 ## What This Does NOT Include
 

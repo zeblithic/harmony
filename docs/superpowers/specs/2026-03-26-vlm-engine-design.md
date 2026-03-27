@@ -1,53 +1,67 @@
 # VLM Engine for harmony-inference
 
-> **Status: PARKED** — blocked on candle API gap. `quantized_qwen3::ModelWeights::forward()` accepts token IDs only, not embeddings. There is no `forward_from_embeds()` to inject fp16 vision hidden states into the quantized text model. See "Unresolved Blockers" section at end.
->
-> **Bead:** harmony-tbbv | **Related:** harmony-e8h2 (full-precision), harmony-fkmv (quantized loader), harmony-ztgq (Coral TPU)
-
 ## Goal
 
-Extend `harmony-inference` to support Qwen3-VL multimodal inference — image+text input, logits output — so edge nodes can run vision-language models locally.
+Extend `harmony-inference` to support Qwen3-VL multimodal inference — text prompt + image input, logits output — so edge nodes can run vision-language models locally.
 
 ## Architecture
 
-The existing `QwenEngine` gains two new capabilities: loading a vision projector and running a multimodal forward pass. Image preprocessing (resize, normalize, tensor conversion) happens inside the engine. Candle's `qwen3_vl` module handles the heavy ML work — Conv3d patch embedding, ViT encoder, multimodal projection, and joint attention with text tokens.
+**Hybrid approach:** the quantized text backbone (existing GGUF `QwenEngine`) is paired with a full-precision (fp16) vision encoder loaded from safetensors. The vision encoder is small (~200-400 MB) and fits on constrained devices. The text model stays Q4_K_M quantized as today.
 
-The `InferenceEngine` trait gets two new methods with default implementations that return errors, so existing text-only consumers are unaffected.
+This avoids the fundamental blocker that candle-transformers has no `quantized_qwen3_vl` module — only full-precision `qwen3_vl`. By splitting the two components, we use what candle provides for vision while keeping our existing quantized text engine.
+
+The `QwenEngine` gains two new capabilities: loading a vision encoder (`load_vision_encoder()`) and running a multimodal forward pass (`forward_with_image()`). Image preprocessing (resize, normalize, patch embedding, placeholder token insertion) happens inside the engine. Candle's `qwen3_vl::Qwen3VLVisionModel` handles the vision encoding.
 
 ### Dependencies
 
 | Crate | Purpose |
 |-------|---------|
 | `harmony-inference` | VLM engine extensions |
-| `candle-transformers` | `qwen3_vl` module (Conv3d, ViT, projection) |
+| `candle-transformers` | `qwen3_vl::Qwen3VLVisionModel` (vision encoder, fp16) |
 | `image` | Resize decoded pixels to model-compatible dimensions |
+| `safetensors` | Load vision encoder weights (not GGUF) |
+
+### Why hybrid, not full-precision VLM
+
+Candle's `Qwen3VLModel` loads text+vision jointly from safetensors via VarBuilder. The full text model at fp16 is ~16 GB for 8B params — far too large for edge devices. Our existing quantized text engine (5 GB at Q4_K_M for 8B) works well. The vision encoder alone is small enough for fp16 on constrained hardware.
+
+Future beads track alternatives: harmony-e8h2 (full-precision for high-capability nodes), harmony-fkmv (quantized VLM loader).
 
 ## API Surface
 
 ### New InferenceEngine trait methods
 
 ```rust
-/// Load a vision projector (mmproj) from raw bytes.
+/// Load a vision encoder from safetensors weight data.
 /// Required for multimodal inference; text-only models return an error.
-fn load_vision_projector(&mut self, mmproj_data: &[u8]) -> Result<(), InferenceError> {
+fn load_vision_encoder(&mut self, weights_data: &[u8]) -> Result<(), InferenceError> {
+    let _ = weights_data;
     Err(InferenceError::UnsupportedOperation(
-        "vision projector not supported by this engine".into(),
+        "vision encoder not supported by this engine".into(),
     ))
 }
 
-/// Run a multimodal forward pass: text tokens + decoded image → logits.
+/// Run a multimodal forward pass: text prompt + decoded image → logits.
+///
+/// Unlike `forward()` which takes pre-tokenized token IDs, this method
+/// takes a raw text prompt because the engine must insert image placeholder
+/// tokens (`<|image_pad|>`) at the correct positions. The number of
+/// placeholder tokens depends on the image resolution (computed during
+/// preprocessing), so tokenization must happen inside the engine.
 ///
 /// `pixels` is raw RGB bytes (decoded from JPEG/PNG by the caller).
-/// The engine handles resizing, normalization, and patch embedding internally.
+/// The engine handles resizing, normalization, patch embedding,
+/// placeholder token insertion, and grid metadata computation internally.
+///
 /// Returns logits at the last position, same as `forward()`.
 fn forward_with_image(
     &mut self,
-    tokens: &[u32],
+    prompt: &str,
     pixels: &[u8],
     width: u32,
     height: u32,
 ) -> Result<Vec<f32>, InferenceError> {
-    let _ = (tokens, pixels, width, height);
+    let _ = (prompt, pixels, width, height);
     Err(InferenceError::UnsupportedOperation(
         "multimodal forward not supported by this engine".into(),
     ))
@@ -67,79 +81,77 @@ UnsupportedOperation(String),
 
 Two new optional fields:
 
-- `vision_projector: Option<VisionProjector>` — loaded from mmproj GGUF data. `VisionProjector` wraps the candle `qwen3_vl` vision encoder + projection layers.
-- `vision_config: Option<VisionConfig>` — preprocessing parameters (resize bounds, normalization constants) extracted from GGUF metadata or hardcoded to Qwen3-VL defaults.
-
-`load_vision_projector()` parses the mmproj GGUF, constructs the vision encoder, and stores it. Returns an error if no base language model is loaded yet.
-
-`forward_with_image()` returns an error if the projector hasn't been loaded.
+- `vision_encoder: Option<Qwen3VLVisionModel>` — loaded from safetensors. Handles image patch embedding, ViT layers, and projection to the text model's hidden dimension.
+- `vision_config: Option<VisionConfig>` — preprocessing parameters (resize bounds, normalization constants, patch size, temporal patch size) from the vision model config.
 
 ## Loading Flow
 
-Two-step model loading, matching how VLM GGUF files are distributed (separate language model + mmproj files):
+Two-step model loading, reflecting the hybrid architecture:
 
-1. `load_gguf(gguf_data)` — loads the language model weights (unchanged from current behavior)
+1. `load_gguf(gguf_data)` — loads the quantized text model (unchanged)
 2. `load_tokenizer(tokenizer_json)` — loads the tokenizer (unchanged)
-3. `load_vision_projector(mmproj_data)` — loads the vision encoder and projection layers
+3. `load_vision_encoder(weights_data)` — loads the fp16 vision encoder from safetensors
 
-Steps 1-2 work without step 3 for text-only inference. Step 3 requires step 1 to have completed (the projector dimensions must match the language model's hidden size).
+Steps 1-2 work without step 3 for text-only inference. Step 3 requires step 1 (the vision encoder's output dimension must match the text model's hidden size).
+
+The vision encoder weights are distributed as a separate safetensors file, fetched via CAS like other content. This mirrors how GGUF + tokenizer are already fetched separately.
 
 ## Image Preprocessing
 
-When `forward_with_image()` is called, the engine preprocesses raw pixels before the vision encoder:
+When `forward_with_image()` is called, the engine runs this pipeline:
 
-1. **Construct image buffer** — wrap `pixels` + `width`/`height` into an RGB image
-2. **Dynamic resize** — resize maintaining aspect ratio, round dimensions to nearest multiple of 28 (Qwen convention). Constrain to configurable min/max pixel budget to bound compute.
-3. **Normalize** — scale pixel values to `[0.0, 1.0]`, then apply model-specific mean/std normalization (values from Qwen3-VL training config)
-4. **Temporal duplication** — duplicate along time axis (time=2) to match the model's native video input format for static images
-5. **Convert to candle Tensor** — shape into `[batch, time, channels, height, width]` for the qwen3_vl vision encoder
+1. **Construct image buffer** — wrap `pixels` (RGB bytes) + `width`/`height` into an image buffer
+2. **Dynamic resize** — resize maintaining aspect ratio, round dimensions to nearest multiple of 28 (Qwen convention). Constrain to configurable min/max pixel budget.
+3. **Normalize** — scale to `[0.0, 1.0]`, apply model-specific mean/std normalization
+4. **Temporal duplication** — duplicate along time axis (time=2) to match the vision encoder's expected input for static images
+5. **Patch and convert to Tensor** — shape into `[batch, time, channels, height, width]` for the vision encoder
+6. **Compute `image_grid_thw`** — build the grid metadata tensor `[1, 3]` with `[T=2, H=h_patches, W=w_patches]` where patch counts are derived from the resized dimensions and the patch size (14x14)
+7. **Vision encode** — run `Qwen3VLVisionModel::forward(patches, grid_thw)` → vision hidden states
+8. **Tokenize with placeholders** — tokenize the text prompt, insert `<|image_pad|>` placeholder tokens at the image position. The number of placeholders equals the number of vision tokens output by the encoder.
+9. **Build combined input** — merge text token embeddings with vision hidden states at the placeholder positions
+10. **Text model forward** — run the quantized text model on the combined input → logits
 
-Normalization constants and resize bounds are read from GGUF metadata when available, falling back to Qwen3-VL defaults:
+Normalization constants (Qwen3-VL defaults):
 - Mean: `[0.48145466, 0.4578275, 0.40821073]`
 - Std: `[0.26862954, 0.26130258, 0.27577711]`
-- Patch size: 14x14 spatial
-- Min pixels: 256x28 = 7168
-- Max pixels: configurable, default 1280x28x28 = 1003520
+- Spatial patch size: 14x14
+- Temporal patch size: 2
+
+## Bridging Vision Encoder and Text Model
+
+The vision encoder outputs fp16 hidden states. The quantized text model expects quantized inputs. The bridge between them:
+
+1. Vision encoder produces `[num_vision_tokens, hidden_size]` in fp16
+2. Cast to f32 (candle handles this via `.to_dtype()`)
+3. The text model's embedding layer is bypassed for vision token positions — vision hidden states are injected directly at the placeholder positions
+4. The text model processes the mixed sequence (text embeddings + vision hidden states) through its quantized attention layers
+
+This bridging is the most architecturally novel part and may require careful study of how candle's quantized models handle mixed-precision input at the attention layer. If the quantized model cannot accept fp32 inputs at arbitrary positions, an alternative is to project the vision hidden states through a small learned linear layer into the quantized space. This projection layer would be part of the vision encoder weights.
 
 ## Testing Strategy
 
 ### Unit tests (no real model)
 
-- `forward_with_image` returns `UnsupportedOperation` on text-only engine (no projector loaded)
-- `load_vision_projector` returns `UnsupportedOperation` on text-only engine (no qwen3_vl model loaded)
+- `forward_with_image` returns `UnsupportedOperation` when no vision encoder loaded
+- `load_vision_encoder` returns `UnsupportedOperation` when no text model loaded
 - Image preprocessing: resize maintains aspect ratio, rounds to multiple of 28
 - Image preprocessing: normalization produces expected output for known input pixels
+- `image_grid_thw` computation: known image dimensions → correct grid tensor
 - `InferenceError::UnsupportedOperation` variant displays correctly
 
 ### Integration tests (`#[ignore]`, real models)
 
-- Load Qwen3-VL GGUF + mmproj, tokenize prompt, call `forward_with_image` with test image, verify logits are non-empty
-- Verify text-only `forward()` still works on a VLM engine
+- Load Qwen3-VL text GGUF + vision safetensors + tokenizer, call `forward_with_image` with a test image, verify logits are non-empty
+- Verify text-only `forward()` still works after vision encoder is loaded
+- Verify `forward_with_image` on a simple scene produces coherent token predictions
 
 ## Scope Exclusions
 
-- **No NodeRuntime integration** — separate sub-bead (sensor pipeline)
-- **No camera/sensor input** — engine accepts pre-decoded pixels only
-- **No video support** — single-frame images only (temporal duplication is an internal implementation detail)
+- **No NodeRuntime integration** — separate sub-bead (sensor pipeline, harmony-60nv)
+- **No camera/sensor input** — engine accepts pre-decoded RGB pixels only
+- **No video support** — single-frame images only
 - **No streaming output** — returns complete logits like existing `forward()`
-- **No Qwen 3.5 early-fusion** — target Qwen3-VL first (candle has `qwen3_vl` module). Qwen 3.5 native multimodal is future work once candle adds support.
-- **No JPEG/PNG decoding** — callers provide decoded RGB bytes. Format decoding is an I/O concern outside the sans-I/O engine.
-
-## Unresolved Blockers (2026-03-26)
-
-These issues were identified during spec review and block implementation:
-
-1. **`quantized_qwen3::ModelWeights::forward()` takes token IDs, not embeddings.** The hybrid approach (fp16 vision encoder + quantized text model) requires injecting vision hidden states into the text model's attention layers. But `ModelWeights::forward(&input, position)` only accepts a token ID tensor — there is no `forward_from_embeds()` entry point. Without this, vision embeddings cannot reach the text model's attention mechanism.
-
-2. **`Qwen3VLModel::forward()` requires complex metadata.** The full VLM forward pass needs `continuous_img_pad` (placeholder token span ranges), `image_grid_thw` (patch grid dimensions), `seqlens`, and `seqlen_offsets`. These are non-trivial to compute and cannot be hidden behind a simple API without significant internal bookkeeping.
-
-3. **`VisionConfig` source unspecified.** `Qwen3VLVisionModel::new()` requires a deserialized `VisionConfig` (from JSON), not derivable from GGUF metadata.
-
-### Paths Forward
-
-| Approach | Effort | Tradeoff |
-|----------|--------|----------|
-| Fork candle, add `forward_from_embeds()` to `quantized_qwen3` | Medium | Maintains a fork; may be accepted upstream |
-| Full-precision `Qwen3VLModel` for VLM (harmony-e8h2) | Low | 16GB+ RAM required; not edge-viable for 8B models |
-| Build `quantized_qwen3_vl` from scratch (harmony-fkmv) | High | Complete solution but significant engineering |
-| Google Coral TPU for vision preprocessing (harmony-ztgq) | Research | Offloads vision to dedicated hardware; different architecture |
+- **No full-precision VLM** — hybrid only (tracked as harmony-e8h2)
+- **No quantized VLM loader** — tracked as harmony-fkmv
+- **No JPEG/PNG decoding** — callers provide decoded RGB bytes
+- **No Google Coral TPU** — tracked as harmony-ztgq

@@ -14,6 +14,7 @@ members = [
     "crates/harmony-identity",
     "crates/harmony-ingest",
     "crates/harmony-inference",
+    "crates/harmony-model",
     "crates/harmony-jain",
     "crates/harmony-jcs",
     "crates/harmony-kel",
@@ -36,6 +37,7 @@ members = [
     "crates/harmony-rawlink",
     "crates/harmony-s3",
     "crates/harmony-speculative",
+    "crates/harmony-telemetry",
 ]
 
 [workspace.package]
@@ -155,6 +157,7 @@ harmony-workflow = { path = "crates/harmony-workflow" }
 harmony-rawlink = { path = "crates/harmony-rawlink" }
 harmony-s3 = { path = "crates/harmony-s3" }
 harmony-speculative = { path = "crates/harmony-speculative" }
+harmony-telemetry = { path = "crates/harmony-telemetry" }
 harmony-inference = { path = "crates/harmony-inference" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
 

@@ -1,0 +1,15 @@
+[package]
+name = "harmony-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Model metadata and registry for Harmony CAS-distributed ML models"
+
+[dependencies]
+harmony-content = { path = "../harmony-content" }
+harmony-zenoh = { path = "../harmony-zenoh" }
+hex.workspace = true
+postcard = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
