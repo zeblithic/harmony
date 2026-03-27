@@ -33,6 +33,29 @@ enum DiskIoResult {
     ReadFailed { cid: ContentId, query_id: u64 },
 }
 
+/// Result of an async S3 fetch, sent back to the event loop via channel.
+#[allow(dead_code)] // Variants constructed only when `archivist` feature is enabled.
+enum S3IoResult {
+    /// Book data successfully fetched from S3.
+    ReadComplete {
+        cid: ContentId,
+        query_id: u64,
+        data: Vec<u8>,
+    },
+    /// Book not found in S3 or fetch error.
+    ReadFailed { cid: ContentId, query_id: u64 },
+}
+
+/// Type alias for the S3 read library reference.
+///
+/// When the `archivist` feature is enabled, this holds an `Arc<S3Library>` for
+/// cloning into spawned async tasks. Without the feature, it is a no-op `()`
+/// placeholder so `dispatch_action`'s signature stays uniform.
+#[cfg(feature = "archivist")]
+type S3ReadLibrary = Option<Arc<harmony_s3::S3Library>>;
+#[cfg(not(feature = "archivist"))]
+type S3ReadLibrary = Option<()>;
+
 /// Configuration for iroh tunnel connectivity.
 pub struct TunnelConfig {
     /// Optional relay URL for NAT traversal.
@@ -258,9 +281,9 @@ pub async fn run(
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
 
-    // ── S3 archivist (archivist feature only) ────────────────────────────────
+    // ── S3 library (single init, shared between archivist + read fallback) ───
     #[cfg(feature = "archivist")]
-    if let Some(ref archivist) = archivist_config {
+    let s3_read_library: S3ReadLibrary = if let Some(ref archivist) = archivist_config {
         match harmony_s3::S3Library::new(
             archivist.bucket.clone(),
             archivist.prefix.clone(),
@@ -269,25 +292,34 @@ pub async fn run(
         .await
         {
             Ok(s3) => {
-                let session = session.clone();
-                // Handle intentionally detached — the archivist is a fire-and-forget
-                // subscriber with no back-channel. Exit is signaled via error! log.
-                // Future: add select! arm or graceful shutdown for in-flight uploads.
+                // Clone for the archivist write path (consumes its copy).
+                let archivist_s3 = s3.clone();
+                let archivist_session = session.clone();
                 let _archivist_handle = tokio::spawn(async move {
-                    harmony_s3::archivist::run(s3, session).await;
+                    harmony_s3::archivist::run(archivist_s3, archivist_session).await;
                     tracing::error!("S3 archivist task exited — archival is no longer active");
                 });
                 tracing::info!(
                     bucket = %archivist.bucket,
                     prefix = %archivist.prefix,
-                    "S3 archivist started"
+                    "S3 archivist + read fallback enabled"
                 );
+                // Wrap in Arc for the read fallback path.
+                Some(Arc::new(s3))
             }
             Err(e) => {
-                tracing::warn!(err = %e, "S3 archivist failed to start — continuing without archival");
+                tracing::warn!(err = %e, "S3 failed to init — archivist and read fallback disabled");
+                // Disable s3 in the runtime so StorageTier stops emitting S3Lookup.
+                runtime.disable_s3();
+                None
             }
         }
-    }
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "archivist"))]
+    let s3_read_library: S3ReadLibrary = None;
 
     #[cfg(not(feature = "archivist"))]
     if archivist_config.is_some() {
@@ -295,6 +327,7 @@ pub async fn run(
             "archivist config is present but this binary was compiled without \
              the `archivist` feature — archival is disabled"
         );
+        runtime.disable_s3();
     }
 
     // ── L2 Reticulum channel endpoints (populated when rawlink bridge starts) ─
@@ -454,6 +487,11 @@ pub async fn run(
     // Write completions are fire-and-forget (errors logged in the spawned task).
     let (disk_tx, mut disk_rx) = mpsc::channel::<DiskIoResult>(64);
 
+    // ── S3 I/O completion channel ────────────────────────────────────────────
+    // Async S3 fetch tasks send results back here; the select loop feeds them
+    // into the runtime as S3ReadComplete / S3ReadFailed events.
+    let (s3_tx, mut s3_rx) = mpsc::channel::<S3IoResult>(64);
+
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
         dispatch_action(
@@ -468,6 +506,8 @@ pub async fn run(
             &ret_outbound_tx,
             &data_dir,
             &disk_tx,
+            &s3_read_library,
+            &s3_tx,
         )
         .await;
     }
@@ -630,6 +670,18 @@ pub async fn run(
                     }
                     DiskIoResult::ReadFailed { cid, query_id } => {
                         runtime.push_event(RuntimeEvent::DiskReadFailed { cid, query_id });
+                    }
+                }
+            }
+
+            // Arm 4b: S3 I/O completion — feed results back into runtime.
+            Some(s3_result) = s3_rx.recv() => {
+                match s3_result {
+                    S3IoResult::ReadComplete { cid, query_id, data } => {
+                        runtime.push_event(RuntimeEvent::S3ReadComplete { cid, query_id, data });
+                    }
+                    S3IoResult::ReadFailed { cid, query_id } => {
+                        runtime.push_event(RuntimeEvent::S3ReadFailed { cid, query_id });
                     }
                 }
             }
@@ -1047,6 +1099,8 @@ pub async fn run(
                     &ret_outbound_tx,
                     &data_dir,
                     &disk_tx,
+                    &s3_read_library,
+                    &s3_tx,
                 )
                 .await;
             }
@@ -1204,6 +1258,8 @@ async fn dispatch_action(
     ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     data_dir: &Option<std::path::PathBuf>,
     disk_tx: &mpsc::Sender<DiskIoResult>,
+    s3_read_library: &S3ReadLibrary,
+    s3_tx: &mpsc::Sender<S3IoResult>,
 ) {
     match action {
         // ── Tier 1: Send on interface (UDP broadcast + unicast, or tunnel) ────
@@ -1545,6 +1601,44 @@ async fn dispatch_action(
                         tracing::warn!(?cid, error = %e, "failed to delete book from disk");
                     }
                 });
+            }
+        }
+        RuntimeAction::S3Lookup { cid, query_id } => {
+            #[cfg(feature = "archivist")]
+            {
+                if let Some(ref s3) = s3_read_library {
+                    let s3 = s3.clone();
+                    let tx = s3_tx.clone();
+                    tokio::spawn(async move {
+                        match s3.get_book(&cid.to_bytes()).await {
+                            Ok(Some(data)) => {
+                                let _ = tx.send(S3IoResult::ReadComplete { cid, query_id, data }).await;
+                            }
+                            Ok(None) => {
+                                tracing::debug!(cid = %hex::encode(&cid.to_bytes()[..8]), "S3 book not found");
+                                let _ = tx.send(S3IoResult::ReadFailed { cid, query_id }).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(cid = %hex::encode(&cid.to_bytes()[..8]), err = %e, "S3 fetch error");
+                                let _ = tx.send(S3IoResult::ReadFailed { cid, query_id }).await;
+                            }
+                        }
+                    });
+                } else {
+                    // S3 library unavailable (init failed at startup) — resolve
+                    // the query immediately so it doesn't hang.
+                    tracing::warn!(
+                        cid = %hex::encode(&cid.to_bytes()[..8]),
+                        "S3Lookup dispatched but s3_read_library not initialised"
+                    );
+                    let _ = s3_tx.try_send(S3IoResult::ReadFailed { cid, query_id });
+                }
+            }
+            // When archivist feature is disabled, resolve the query immediately.
+            #[cfg(not(feature = "archivist"))]
+            {
+                tracing::debug!("S3Lookup ignored — archivist feature not enabled");
+                let _ = s3_tx.try_send(S3IoResult::ReadFailed { cid, query_id });
             }
         }
     }

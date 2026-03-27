@@ -31,7 +31,7 @@ Add the `StreamChunk` struct to `harmony-agent` with serde support and unit test
 - Modify: `crates/harmony-agent/src/types.rs`
 - Modify: `crates/harmony-agent/src/lib.rs`
 
-- [ ] **Step 1: Add StreamChunk struct to types.rs**
+- [x] **Step 1: Add StreamChunk struct to types.rs**
 
 Add after the `AgentStatus` enum (around line 67), before the `#[cfg(test)]` block:
 
@@ -54,7 +54,7 @@ pub struct StreamChunk {
 }
 ```
 
-- [ ] **Step 2: Add re-export in lib.rs**
+- [x] **Step 2: Add re-export in lib.rs**
 
 Update the `pub use types::` line to include `StreamChunk`:
 
@@ -64,7 +64,7 @@ pub use types::{
 };
 ```
 
-- [ ] **Step 3: Add unit tests in types.rs**
+- [x] **Step 3: Add unit tests in types.rs**
 
 Add these tests to the existing `mod tests` block in `types.rs`:
 
@@ -116,11 +116,11 @@ fn stream_chunk_snake_case_keys() {
 }
 ```
 
-- [ ] **Step 4: Verify tests pass**
+- [x] **Step 4: Verify tests pass**
 
 Run: `cargo test -p harmony-agent`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/harmony-agent/src/types.rs crates/harmony-agent/src/lib.rs
@@ -137,7 +137,7 @@ Add `encode_chunk` and `decode_chunk` functions following the existing wire form
 - Modify: `crates/harmony-agent/src/wire.rs`
 - Modify: `crates/harmony-agent/src/lib.rs`
 
-- [ ] **Step 1: Add encode_chunk and decode_chunk to wire.rs**
+- [x] **Step 1: Add encode_chunk and decode_chunk to wire.rs**
 
 Add after `decode_capacity` (around line 91), before the `#[cfg(test)]` block:
 
@@ -168,7 +168,7 @@ Also add the import at the top of wire.rs — update the existing `use` statemen
 use crate::types::{AgentCapacity, AgentResult, AgentTask, StreamChunk};
 ```
 
-- [ ] **Step 2: Add re-exports in lib.rs**
+- [x] **Step 2: Add re-exports in lib.rs**
 
 Update the `pub use wire::` line to include the new functions:
 
@@ -179,7 +179,7 @@ pub use wire::{
 };
 ```
 
-- [ ] **Step 3: Add wire tests**
+- [x] **Step 3: Add wire tests**
 
 Add these tests to the existing `mod tests` block in `wire.rs`:
 
@@ -238,11 +238,11 @@ fn chunk_decode_invalid_json() {
 }
 ```
 
-- [ ] **Step 4: Verify tests pass**
+- [x] **Step 4: Verify tests pass**
 
 Run: `cargo test -p harmony-agent`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/harmony-agent/src/wire.rs crates/harmony-agent/src/lib.rs
@@ -258,7 +258,7 @@ Add `stream_key()` and `stream_sub()` to the agent namespace module, with tests.
 **Files:**
 - Modify: `crates/harmony-zenoh/src/namespace.rs`
 
-- [ ] **Step 1: Add stream_key and stream_sub builders**
+- [x] **Step 1: Add stream_key and stream_sub builders**
 
 In `crates/harmony-zenoh/src/namespace.rs`, in the `agent` module (around line 707, after `task_key`), add:
 
@@ -281,7 +281,7 @@ pub fn stream_sub(agent_id: &str) -> String {
 }
 ```
 
-- [ ] **Step 2: Add namespace tests**
+- [x] **Step 2: Add namespace tests**
 
 In the existing `agent_namespace_keys` test (around line 1329), add after the `capacity_sub_all` assertion:
 
@@ -293,11 +293,11 @@ let stream_sub = agent::stream_sub("deadbeef01020304");
 assert_eq!(stream_sub, "harmony/agent/deadbeef01020304/stream/*");
 ```
 
-- [ ] **Step 3: Verify tests pass**
+- [x] **Step 3: Verify tests pass**
 
 Run: `cargo test -p harmony-zenoh`
 
-- [ ] **Step 4: File follow-on bead for NodeRuntime integration**
+- [x] **Step 4: File follow-on bead for NodeRuntime integration**
 
 ```bash
 bd create --title="Wire agent streaming into NodeRuntime inference path" --description="Integrate the StreamChunk protocol (harmony-q73) into the inference queryable and DSD edge orchestrator. Agents publish token-by-token StreamChunk messages to harmony/agent/{agent_id}/stream/{task_id} as inference runs. Depends on harmony-q73 (streaming protocol types)." --type=feature --priority=3
@@ -308,7 +308,7 @@ Then add dependency:
 bd dep add <new_bead_id> harmony-q73
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/harmony-zenoh/src/namespace.rs

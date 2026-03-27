@@ -637,6 +637,12 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 disk_enabled: config_file.data_dir.is_some(),
                 disk_entries,
                 disk_quota,
+                s3_enabled: {
+                    #[cfg(feature = "archivist")]
+                    { archivist_config.is_some() }
+                    #[cfg(not(feature = "archivist"))]
+                    { false }
+                },
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 

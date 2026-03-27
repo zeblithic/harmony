@@ -40,6 +40,8 @@ pub struct StorageMetrics {
     pub publishes_rejected: u64,
     pub disk_reads_served: u64,
     pub disk_read_failures: u64,
+    pub s3_reads_served: u64,
+    pub s3_read_failures: u64,
 }
 
 impl StorageMetrics {
@@ -58,6 +60,8 @@ impl StorageMetrics {
             publishes_rejected,
             disk_reads_served,
             disk_read_failures,
+            s3_reads_served,
+            s3_read_failures,
         } = self;
         let fields: &[u64] = &[
             *queries_served,
@@ -69,6 +73,8 @@ impl StorageMetrics {
             *publishes_rejected,
             *disk_reads_served,
             *disk_read_failures,
+            *s3_reads_served,
+            *s3_read_failures,
         ];
         let mut buf = Vec::with_capacity(fields.len() * 8);
         for &val in fields {
@@ -97,6 +103,14 @@ pub enum StorageTierEvent {
     },
     /// Disk read failed — runtime could not deliver the requested data.
     DiskReadFailed { cid: ContentId, query_id: u64 },
+    /// S3 read completed — book fetched from remote storage.
+    S3ReadComplete {
+        cid: ContentId,
+        query_id: u64,
+        data: Vec<u8>,
+    },
+    /// S3 read failed — book not found or network error.
+    S3ReadFailed { cid: ContentId, query_id: u64 },
     /// Timer tick for periodic filter broadcasts.
     FilterTimerTick,
 }
@@ -120,6 +134,8 @@ pub enum StorageTierAction {
     RemoveFromDisk { cid: ContentId },
     /// Request disk read for a CID known to be on disk but evicted from memory.
     DiskLookup { cid: ContentId, query_id: u64 },
+    /// Fall back to S3 for a durable CID not found in cache or on disk.
+    S3Lookup { cid: ContentId, query_id: u64 },
     /// Broadcast a Bloom filter snapshot of the cached CID set.
     ///
     /// The runtime constructs the full key expression (including node address)
@@ -210,6 +226,9 @@ pub struct StorageTier<B: BookStore> {
     disk_used_bytes: u64,
     /// Maximum bytes allowed on disk. None = unlimited.
     disk_quota: Option<u64>,
+    /// Whether the runtime has wired up S3 remote storage.
+    /// When false, S3Lookup actions are suppressed.
+    s3_enabled: bool,
     /// Configuration for periodic Bloom filter broadcasts.
     filter_config: FilterBroadcastConfig,
     /// Number of cache mutations since last Bloom filter broadcast.
@@ -266,6 +285,7 @@ impl<B: BookStore> StorageTier<B> {
             disk_lru: VecDeque::new(),
             disk_used_bytes: 0,
             disk_quota: None,
+            s3_enabled: false,
             filter_config,
             mutations_since_broadcast: 0,
             flatpack,
@@ -333,6 +353,24 @@ impl<B: BookStore> StorageTier<B> {
     /// Whether disk I/O is currently enabled.
     pub fn disk_enabled(&self) -> bool {
         self.disk_enabled
+    }
+
+    /// Enable S3 remote storage fallback.
+    ///
+    /// When enabled, cache + disk misses for durable content classes emit
+    /// [`StorageTierAction::S3Lookup`] so the runtime can fetch from S3.
+    pub fn enable_s3(&mut self) {
+        self.s3_enabled = true;
+    }
+
+    /// Disable S3 fallback (e.g., when S3Library init fails at startup).
+    pub fn disable_s3(&mut self) {
+        self.s3_enabled = false;
+    }
+
+    /// Whether S3 remote storage is currently enabled.
+    pub fn s3_enabled(&self) -> bool {
+        self.s3_enabled
     }
 
     /// Retrieve raw book data by CID from the underlying content store.
@@ -427,6 +465,68 @@ impl<B: BookStore> StorageTier<B> {
                     payload: vec![],
                 }]
             }
+            StorageTierEvent::S3ReadComplete {
+                cid,
+                query_id,
+                data,
+            } => {
+                // Verify integrity — S3 data may be corrupted or tampered.
+                if !Self::verify_cid(&cid, &data) {
+                    self.metrics.s3_read_failures += 1;
+                    return vec![StorageTierAction::SendReply {
+                        query_id,
+                        payload: vec![],
+                    }];
+                }
+                // Pre-warm frequency so the cached CID survives the admission
+                // challenge (same rationale as DiskReadComplete).
+                self.cache.warm_frequency(&cid, 5);
+
+                // Clone data for disk persistence BEFORE cache and reply consume it.
+                // At most 2 clones: one for cache, one for persist (reply gets the original).
+                let persist_data = if self.disk_enabled && Self::is_durable_class(&cid) {
+                    Some(data.clone())
+                } else {
+                    None
+                };
+
+                self.cache.store(cid, data.clone());
+                self.mutations_since_broadcast = self.mutations_since_broadcast.saturating_add(1);
+                self.metrics.s3_reads_served += 1;
+
+                // Original `data` goes to SendReply (no clone needed).
+                let mut actions = vec![StorageTierAction::SendReply {
+                    query_id,
+                    payload: data,
+                }];
+
+                // Persist to disk so future queries hit disk instead of S3.
+                if let Some(persist_bytes) = persist_data {
+                    let persist_size = persist_bytes.len() as u64;
+                    actions.push(StorageTierAction::PersistToDisk {
+                        cid,
+                        data: persist_bytes,
+                    });
+                    self.record_disk_persist(cid, persist_size, &mut actions);
+                }
+
+                if self.should_announce(&cid) {
+                    actions.push(self.make_announce_action(&cid));
+                }
+
+                if self.mutations_since_broadcast >= self.filter_config.mutation_threshold {
+                    actions.push(self.rebuild_filter());
+                }
+                actions
+            }
+            StorageTierEvent::S3ReadFailed { cid: _, query_id } => {
+                self.metrics.s3_read_failures += 1;
+                // Reply with empty payload so the querier doesn't hang.
+                vec![StorageTierAction::SendReply {
+                    query_id,
+                    payload: vec![],
+                }]
+            }
             StorageTierEvent::FilterTimerTick => {
                 vec![self.rebuild_filter(), self.rebuild_cuckoo_filter()]
             }
@@ -488,6 +588,12 @@ impl<B: BookStore> StorageTier<B> {
                 self.metrics.cache_misses += 1;
                 if self.disk_enabled && self.disk_index.contains_key(cid) {
                     return vec![StorageTierAction::DiskLookup {
+                        cid: *cid,
+                        query_id,
+                    }];
+                }
+                if self.s3_enabled && Self::is_durable_class(cid) {
+                    return vec![StorageTierAction::S3Lookup {
                         cid: *cid,
                         query_id,
                     }];
@@ -895,7 +1001,7 @@ mod tests {
         match &actions[0] {
             StorageTierAction::SendStatsReply { query_id, payload } => {
                 assert_eq!(*query_id, 77);
-                assert_eq!(payload.len(), 72); // 9 u64 fields
+                assert_eq!(payload.len(), 88); // 11 u64 fields
                 let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
                 assert_eq!(queries, 1); // one ContentQuery was processed
             }
@@ -2588,5 +2694,188 @@ mod tests {
         assert!(!tier.disk_contains(&cid_a));
         assert!(tier.disk_contains(&cid_b));
         assert_eq!(tier.disk_used_bytes(), 100);
+    }
+
+    // ---- S3 fallback ----
+
+    #[test]
+    fn s3_lookup_emitted_on_durable_cache_disk_miss_when_enabled() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        tier.enable_s3();
+
+        // PublicDurable CID — not in cache, not on disk.
+        let (cid, _data) = cid_with_class(b"durable s3 content", false, false);
+        let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 1, cid });
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::S3Lookup {
+                cid: lookup_cid,
+                query_id,
+            } => {
+                assert_eq!(*lookup_cid, cid);
+                assert_eq!(*query_id, 1);
+            }
+            other => panic!("expected S3Lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s3_lookup_not_emitted_for_ephemeral_content() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        tier.enable_s3();
+
+        // PublicEphemeral CID — S3 only serves durable content.
+        let (cid, _data) = cid_with_class(b"ephemeral stream", false, true);
+        let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 2, cid });
+
+        assert!(
+            actions.is_empty(),
+            "ephemeral content should not trigger S3Lookup, got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn s3_lookup_not_emitted_when_s3_disabled() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        // s3 NOT enabled (default).
+
+        let (cid, _data) = cid_with_class(b"durable no s3", false, false);
+        let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 3, cid });
+
+        assert!(
+            actions.is_empty(),
+            "S3Lookup should not be emitted when s3 is disabled, got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn s3_lookup_not_emitted_on_cache_hit() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        tier.enable_s3();
+
+        // Put content in the cache.
+        let data = b"cached s3 content";
+        let cid = tier.cache_mut().insert(data).unwrap();
+
+        let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 4, cid });
+
+        // Should get a SendReply from cache hit, not S3Lookup.
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::SendReply { query_id, payload } => {
+                assert_eq!(*query_id, 4);
+                assert_eq!(payload.as_slice(), data.as_slice());
+            }
+            other => panic!("expected SendReply (cache hit), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s3_lookup_not_emitted_on_disk_hit() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        tier.enable_s3();
+
+        // Put CID in disk index so disk lookup takes priority over S3.
+        let (cid, _data) = cid_with_class(b"disk-resident content", false, false);
+        tier.enable_disk(vec![(cid, 100)]);
+
+        let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 5, cid });
+
+        // Should get DiskLookup, not S3Lookup.
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::DiskLookup {
+                cid: lookup_cid,
+                query_id,
+            } => {
+                assert_eq!(*lookup_cid, cid);
+                assert_eq!(*query_id, 5);
+            }
+            other => panic!("expected DiskLookup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s3_read_complete_caches_and_replies() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, data) = cid_with_class(b"s3 fetched content", false, false);
+
+        let actions = tier.handle(StorageTierEvent::S3ReadComplete {
+            cid,
+            query_id: 10,
+            data: data.clone(),
+        });
+
+        // Should contain SendReply with the data + AnnounceContent (PublicDurable).
+        let reply = actions
+            .iter()
+            .find(|a| matches!(a, StorageTierAction::SendReply { .. }));
+        assert!(reply.is_some(), "should emit SendReply");
+        match reply.unwrap() {
+            StorageTierAction::SendReply { query_id, payload } => {
+                assert_eq!(*query_id, 10);
+                assert_eq!(payload, &data);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(tier.metrics().s3_reads_served, 1);
+
+        // Content should now be in cache.
+        let query_actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 11, cid });
+        assert_eq!(query_actions.len(), 1);
+        match &query_actions[0] {
+            StorageTierAction::SendReply { query_id, payload } => {
+                assert_eq!(*query_id, 11);
+                assert_eq!(payload, &data);
+            }
+            other => panic!("expected SendReply from cache, got {other:?}"),
+        }
+        assert_eq!(tier.metrics().cache_hits, 1);
+    }
+
+    #[test]
+    fn s3_read_complete_corrupted_replies_empty() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, _data) = cid_with_class(b"original s3 data", false, false);
+
+        // Send corrupted data that doesn't match the CID hash.
+        let actions = tier.handle(StorageTierEvent::S3ReadComplete {
+            cid,
+            query_id: 20,
+            data: b"corrupted s3 data".to_vec(),
+        });
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::SendReply { query_id, payload } => {
+                assert_eq!(*query_id, 20);
+                assert!(
+                    payload.is_empty(),
+                    "corrupted S3 data should produce empty reply"
+                );
+            }
+            other => panic!("expected empty SendReply, got {other:?}"),
+        }
+        assert_eq!(tier.metrics().s3_read_failures, 1);
+        assert_eq!(tier.metrics().s3_reads_served, 0);
+    }
+
+    #[test]
+    fn s3_read_failed_replies_empty() {
+        let mut tier = make_tier_with_policy(ContentPolicy::default());
+        let (cid, _data) = cid_with_class(b"missing from s3", false, false);
+
+        let actions = tier.handle(StorageTierEvent::S3ReadFailed { cid, query_id: 30 });
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StorageTierAction::SendReply { query_id, payload } => {
+                assert_eq!(*query_id, 30);
+                assert!(payload.is_empty(), "S3 failure should produce empty reply");
+            }
+            other => panic!("expected empty SendReply, got {other:?}"),
+        }
+        assert_eq!(tier.metrics().s3_read_failures, 1);
     }
 }
