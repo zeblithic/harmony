@@ -46,6 +46,32 @@ enum S3IoResult {
     ReadFailed { cid: ContentId, query_id: u64 },
 }
 
+/// Results from a streaming inference task.
+#[cfg(feature = "inference")]
+enum InferenceResult {
+    /// A streaming token to publish to Zenoh.
+    Chunk {
+        task_id: String,
+        sequence: u32,
+        token_text: String,
+        final_chunk: bool,
+    },
+    /// Inference completed — send query reply and return engine.
+    Complete {
+        query_id: u64,
+        task_id: String,
+        full_text: String,
+        engine: harmony_inference::QwenEngine,
+    },
+    /// Inference failed — send error reply and return engine.
+    Failed {
+        query_id: u64,
+        task_id: String,
+        error: String,
+        engine: harmony_inference::QwenEngine,
+    },
+}
+
 /// Type alias for the S3 read library reference.
 ///
 /// When the `archivist` feature is enabled, this holds an `Arc<S3Library>` for
@@ -491,6 +517,11 @@ pub async fn run(
     // Async S3 fetch tasks send results back here; the select loop feeds them
     // into the runtime as S3ReadComplete / S3ReadFailed events.
     let (s3_tx, mut s3_rx) = mpsc::channel::<S3IoResult>(64);
+
+    // ── Inference streaming completion channel ─────────────────────────────────
+    // spawn_blocking inference tasks stream tokens and final results back here.
+    #[cfg(feature = "inference")]
+    let (inference_tx, mut inference_rx) = mpsc::channel::<InferenceResult>(64);
 
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {

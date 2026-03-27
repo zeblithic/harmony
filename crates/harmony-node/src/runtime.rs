@@ -2426,6 +2426,19 @@ impl<B: BookStore> NodeRuntime<B> {
         }
     }
 
+    /// Take the inference engine for an async streaming task.
+    /// Returns `None` if the engine is already in use or not loaded.
+    #[cfg(feature = "inference")]
+    pub fn take_inference_engine(&mut self) -> Option<harmony_inference::QwenEngine> {
+        self.verification_engine.take()
+    }
+
+    /// Return the inference engine after an async streaming task completes.
+    #[cfg(feature = "inference")]
+    pub fn return_inference_engine(&mut self, engine: harmony_inference::QwenEngine) {
+        self.verification_engine = Some(engine);
+    }
+
     /// Check if both GGUF and tokenizer data have arrived, and if so,
     /// declare the inference queryable and publish capacity.
     fn check_inference_model_ready(&mut self) {
