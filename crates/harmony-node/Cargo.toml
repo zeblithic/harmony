@@ -13,7 +13,7 @@ wasmtime = ["harmony-compute/wasmtime"]
 no-neon = ["harmony-crypto/no-neon"]
 rawlink = ["harmony-rawlink"]
 archivist = ["harmony-s3/archivist"]
-inference = ["harmony-compute/inference", "harmony-workflow/inference", "dep:harmony-inference", "dep:candle-core"]
+inference = ["harmony-compute/inference", "harmony-workflow/inference", "dep:harmony-inference", "dep:candle-core", "dep:harmony-agent"]
 
 [[bin]]
 name = "harmony"
@@ -21,6 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 bytes = "1"
+harmony-agent = { workspace = true, optional = true }
 harmony-athenaeum = { workspace = true, features = ["std"] }
 harmony-compute.workspace = true
 harmony-contacts = { workspace = true, features = ["std"] }
@@ -46,6 +47,7 @@ hex.workspace = true
 mdns-sd = { version = "0.18", features = ["async"] }
 rand.workspace = true
 serde = { workspace = true, features = ["std", "derive"] }
+serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tokio-util = { workspace = true }

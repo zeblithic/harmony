@@ -72,6 +72,25 @@ impl InferenceRequest {
     }
 }
 
+/// Convert raw 20-byte sampling parameters to `SamplingParams`.
+///
+/// Layout: `[temperature:f32 LE] [top_p:f32 LE] [top_k:u32 LE] [repeat_penalty:f32 LE] [repeat_last_n:u32 LE]`
+#[cfg(feature = "inference")]
+pub fn decode_sampling_params(raw: &[u8; 20]) -> harmony_inference::SamplingParams {
+    let temperature = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let top_p = f32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let top_k = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    let repeat_penalty = f32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
+    let repeat_last_n = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]) as usize;
+    harmony_inference::SamplingParams {
+        temperature,
+        top_p,
+        top_k,
+        repeat_penalty,
+        repeat_last_n,
+    }
+}
+
 /// Build the WASM input for the inference runner module.
 ///
 /// Layout: `[gguf_cid:32] [tokenizer_cid:32] [prompt_len:u32 LE] [prompt_utf8] [sampling_params:20] [max_tokens:u32 LE] [nonce:u64 LE]`
@@ -233,6 +252,40 @@ mod tests {
         let cid = [0xDD; 32];
         let payload = build_capacity_payload(&cid, false);
         assert_eq!(payload[32], CAPACITY_BUSY);
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn decode_sampling_params_greedy() {
+        let mut raw = [0u8; 20];
+        raw[4..8].copy_from_slice(&1.0f32.to_le_bytes()); // top_p
+        raw[12..16].copy_from_slice(&1.0f32.to_le_bytes()); // repeat_penalty
+        raw[16..20].copy_from_slice(&64u32.to_le_bytes()); // repeat_last_n
+
+        let params = super::decode_sampling_params(&raw);
+        assert_eq!(params.temperature, 0.0);
+        assert_eq!(params.top_p, 1.0);
+        assert_eq!(params.top_k, 0);
+        assert_eq!(params.repeat_penalty, 1.0);
+        assert_eq!(params.repeat_last_n, 64);
+    }
+
+    #[test]
+    #[cfg(feature = "inference")]
+    fn decode_sampling_params_custom() {
+        let mut raw = [0u8; 20];
+        raw[0..4].copy_from_slice(&0.7f32.to_le_bytes());
+        raw[4..8].copy_from_slice(&0.9f32.to_le_bytes());
+        raw[8..12].copy_from_slice(&40u32.to_le_bytes());
+        raw[12..16].copy_from_slice(&1.1f32.to_le_bytes());
+        raw[16..20].copy_from_slice(&128u32.to_le_bytes());
+
+        let params = super::decode_sampling_params(&raw);
+        assert!((params.temperature - 0.7).abs() < 1e-6);
+        assert!((params.top_p - 0.9).abs() < 1e-6);
+        assert_eq!(params.top_k, 40);
+        assert!((params.repeat_penalty - 1.1).abs() < 1e-6);
+        assert_eq!(params.repeat_last_n, 128);
     }
 
     #[test]
