@@ -544,15 +544,14 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 public_ephemeral_announce: !no_public_ephemeral_announce,
             };
 
-            // Scan disk for persisted CIDs (spawn_blocking to avoid blocking tokio).
-            let disk_cids = match &config_file.data_dir {
+            // Scan disk for persisted CIDs+sizes (spawn_blocking to avoid blocking tokio).
+            let disk_entries = match &config_file.data_dir {
                 Some(dir) => {
                     let dir = dir.clone();
                     tokio::task::spawn_blocking(move || {
-                        let cids = crate::disk_io::scan_books(&dir);
-                        tracing::info!(count = cids.len(), path = %dir.display(), "loaded book CIDs from disk");
-                        // Temporary: discard sizes until Task 7 threads them through
-                        cids.into_iter().map(|(cid, _)| cid).collect::<Vec<_>>()
+                        let entries = crate::disk_io::scan_books(&dir);
+                        tracing::info!(count = entries.len(), path = %dir.display(), "loaded book entries from disk");
+                        entries
                     })
                     .await
                     .unwrap_or_default()
@@ -607,7 +606,8 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     })
                     .flatten(),
                 disk_enabled: config_file.data_dir.is_some(),
-                disk_cids: disk_cids,
+                disk_entries,
+                disk_quota: None,  // will be wired in Task 7
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 

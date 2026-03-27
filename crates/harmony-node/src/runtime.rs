@@ -73,8 +73,10 @@ pub struct NodeConfig {
     /// Whether disk persistence is enabled (true when data_dir is configured).
     /// Controls whether StorageTier emits PersistToDisk and DiskLookup actions.
     pub disk_enabled: bool,
-    /// CIDs discovered by scanning the data directory at startup.
-    pub disk_cids: Vec<ContentId>,
+    /// CID+size entries discovered by scanning the data directory at startup.
+    pub disk_entries: Vec<(ContentId, u64)>,
+    /// Maximum bytes allowed on disk. `None` means no quota enforced.
+    pub disk_quota: Option<u64>,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -139,7 +141,8 @@ impl Default for NodeConfig {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
-            disk_cids: Vec::new(),
+            disk_entries: Vec::new(),
+            disk_quota: None,
         }
     }
 }
@@ -327,6 +330,8 @@ pub enum RuntimeAction {
     PersistToDisk { cid: ContentId, data: Vec<u8> },
     /// Read a CAS book from disk (spawned as blocking I/O by event loop).
     DiskLookup { cid: ContentId, query_id: u64 },
+    /// Delete a book from disk (evicted by quota enforcement).
+    RemoveFromDisk { cid: ContentId },
 }
 
 /// Filter state received from a peer, with metadata.
@@ -901,7 +906,10 @@ impl<B: BookStore> NodeRuntime<B> {
 
         // Activate disk tier when data_dir is configured (even if empty on first boot).
         if config.disk_enabled {
-            rt.storage.enable_disk(config.disk_cids);
+            rt.storage.enable_disk(config.disk_entries);
+            if let Some(quota) = config.disk_quota {
+                rt.storage.set_disk_quota(quota);
+            }
         }
 
         // If inference model CIDs are configured AND the inference feature is
@@ -1895,8 +1903,8 @@ impl<B: BookStore> NodeRuntime<B> {
                 StorageTierAction::DiskLookup { cid, query_id } => {
                     out.push(RuntimeAction::DiskLookup { cid, query_id });
                 }
-                StorageTierAction::RemoveFromDisk { .. } => {
-                    // Deferred to disk eviction bead.
+                StorageTierAction::RemoveFromDisk { cid } => {
+                    out.push(RuntimeAction::RemoveFromDisk { cid });
                 }
                 StorageTierAction::BroadcastFilter { payload } => {
                     // Buffer the latest filter payload — multiple threshold crossings
@@ -4529,7 +4537,8 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
-            disk_cids: Vec::new(),
+            disk_entries: Vec::new(),
+            disk_quota: None,
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
@@ -4601,7 +4610,8 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
-            disk_cids: Vec::new(),
+            disk_entries: Vec::new(),
+            disk_quota: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4639,7 +4649,8 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
-            disk_cids: Vec::new(),
+            disk_entries: Vec::new(),
+            disk_quota: None,
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
@@ -4674,7 +4685,8 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
-            disk_cids: Vec::new(),
+            disk_entries: Vec::new(),
+            disk_quota: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4738,7 +4750,8 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
-            disk_cids: Vec::new(),
+            disk_entries: Vec::new(),
+            disk_quota: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4791,7 +4804,8 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
-            disk_cids: Vec::new(),
+            disk_entries: Vec::new(),
+            disk_quota: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -4837,7 +4851,8 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
-            disk_cids: Vec::new(),
+            disk_entries: Vec::new(),
+            disk_quota: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -5741,7 +5756,8 @@ mod tests {
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             disk_enabled: false,
-            disk_cids: Vec::new(),
+            disk_entries: Vec::new(),
+            disk_quota: None,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 

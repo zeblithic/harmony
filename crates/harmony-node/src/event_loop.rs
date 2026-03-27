@@ -1549,6 +1549,16 @@ async fn dispatch_action(
                 let _ = disk_tx.try_send(DiskIoResult::ReadFailed { cid, query_id });
             }
         }
+        RuntimeAction::RemoveFromDisk { cid } => {
+            if let Some(ref dir) = data_dir {
+                let dir = dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = crate::disk_io::delete_book(&dir, &cid) {
+                        tracing::warn!(?cid, error = %e, "failed to delete book from disk");
+                    }
+                });
+            }
+        }
     }
 }
 
