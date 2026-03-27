@@ -255,6 +255,7 @@ mod tests {
         let decoded: StreamChunk = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.task_id, "task-002");
         assert_eq!(decoded.sequence, 42);
+        assert_eq!(decoded.payload, json!({"done": true}));
         assert!(decoded.final_chunk);
     }
 

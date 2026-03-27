@@ -201,6 +201,7 @@ mod tests {
         let decoded = decode_chunk(&encoded).unwrap();
         assert_eq!(decoded.task_id, "task-final");
         assert_eq!(decoded.sequence, 99);
+        assert_eq!(decoded.payload, serde_json::json!({"summary": "done"}));
         assert!(decoded.final_chunk);
     }
 
