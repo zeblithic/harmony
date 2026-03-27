@@ -220,7 +220,7 @@ mod tests {
         );
         assert_eq!(&input[68..70], b"hi");
         assert_eq!(input.len(), 32 + 32 + 4 + 2 + 20 + 4 + 8); // +8 for nonce
-        // Nonce is at the end
+                                                               // Nonce is at the end
         let nonce_offset = input.len() - 8;
         assert_eq!(
             u64::from_le_bytes(input[nonce_offset..nonce_offset + 8].try_into().unwrap()),

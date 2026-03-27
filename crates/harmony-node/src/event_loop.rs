@@ -1165,8 +1165,7 @@ pub async fn run(
                         let query_id = query_id;
                         let task_id = task_id.clone();
                         let prompt = prompt.clone();
-                        let params =
-                            crate::inference::decode_sampling_params(&sampling_params_raw);
+                        let params = crate::inference::decode_sampling_params(&sampling_params_raw);
 
                         tokio::task::spawn_blocking(move || {
                             run_inference_loop(
@@ -1724,7 +1723,13 @@ async fn dispatch_action(
                     tokio::spawn(async move {
                         match s3.get_book(&cid.to_bytes()).await {
                             Ok(Some(data)) => {
-                                let _ = tx.send(S3IoResult::ReadComplete { cid, query_id, data }).await;
+                                let _ = tx
+                                    .send(S3IoResult::ReadComplete {
+                                        cid,
+                                        query_id,
+                                        data,
+                                    })
+                                    .await;
                             }
                             Ok(None) => {
                                 tracing::debug!(cid = %hex::encode(&cid.to_bytes()[..8]), "S3 book not found");
