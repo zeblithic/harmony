@@ -717,6 +717,37 @@ pub async fn run(
                 }
             }
 
+            // Arm 4c: Inference streaming completion — publish chunks and handle results.
+            // Uses the async-block-with-pending pattern (like rawlink Arm 9) so the
+            // arm compiles even when the `inference` feature is disabled.
+            Some(inference_result) = async {
+                #[cfg(feature = "inference")]
+                { inference_rx.recv().await }
+                #[cfg(not(feature = "inference"))]
+                { std::future::pending::<Option<()>>().await }
+            } => {
+                // The type of `inference_result` differs by feature, but the body
+                // is unreachable when inference is disabled (pending never resolves).
+                #[cfg(feature = "inference")]
+                handle_inference_result(
+                    inference_result,
+                    &mut runtime,
+                    &session,
+                    &zenoh_tx,
+                    &udp,
+                    &broadcast_addr,
+                    &peer_table,
+                    &tunnel_senders,
+                    &mut deferred_dials,
+                    &ret_outbound_tx,
+                    &data_dir,
+                    &disk_tx,
+                    &s3_read_library,
+                    &s3_tx,
+                )
+                .await;
+            }
+
             // Arm 5: mDNS discovery events (when enabled).
             result = async {
                 match &mdns_state {
@@ -1727,6 +1758,121 @@ async fn dispatch_action(
         #[cfg(feature = "inference")]
         RuntimeAction::RunInference { .. } => {
             tracing::error!("RunInference reached dispatch_action — should be intercepted");
+        }
+    }
+}
+
+/// Process a single inference result from the streaming channel.
+///
+/// Called from the select loop's inference arm. Publishes stream chunks to Zenoh,
+/// returns the engine to the runtime on completion/failure, and dispatches a
+/// `SendReply` for the final query response.
+#[cfg(feature = "inference")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_inference_result(
+    inference_result: InferenceResult,
+    runtime: &mut NodeRuntime<MemoryBookStore>,
+    session: &zenoh::Session,
+    zenoh_tx: &mpsc::Sender<ZenohEvent>,
+    udp: &UdpSocket,
+    broadcast_addr: &SocketAddr,
+    peer_table: &PeerTable,
+    tunnel_senders: &HashMap<String, TunnelSender>,
+    deferred_dials: &mut BinaryHeap<Reverse<DeferredDial>>,
+    ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    data_dir: &Option<std::path::PathBuf>,
+    disk_tx: &mpsc::Sender<DiskIoResult>,
+    s3_read_library: &S3ReadLibrary,
+    s3_tx: &mpsc::Sender<S3IoResult>,
+) {
+    match inference_result {
+        InferenceResult::Chunk {
+            task_id,
+            sequence,
+            token_text,
+            final_chunk,
+        } => {
+            let chunk = harmony_agent::StreamChunk {
+                task_id: task_id.clone(),
+                sequence,
+                payload: serde_json::json!({"token": token_text}),
+                final_chunk,
+            };
+            if let Ok(payload) = harmony_agent::encode_chunk(&chunk) {
+                let node_addr_hex = hex::encode(runtime.local_pq_identity_hash());
+                let key_expr =
+                    harmony_zenoh::namespace::agent::stream_key(&node_addr_hex, &task_id);
+                let session_clone = session.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = session_clone.put(&key_expr, payload).await {
+                        tracing::warn!(%key_expr, err = %e, "stream chunk publish error");
+                    }
+                });
+            }
+        }
+        InferenceResult::Complete {
+            query_id,
+            task_id,
+            full_text,
+            engine,
+        } => {
+            runtime.return_inference_engine(engine);
+            let result = harmony_agent::AgentResult {
+                task_id,
+                status: harmony_agent::TaskStatus::Success,
+                output: Some(serde_json::json!({"text": full_text})),
+                error: None,
+            };
+            if let Ok(payload) = harmony_agent::encode_result(&result) {
+                dispatch_action(
+                    RuntimeAction::SendReply { query_id, payload },
+                    session,
+                    zenoh_tx,
+                    udp,
+                    broadcast_addr,
+                    Some(peer_table),
+                    tunnel_senders,
+                    deferred_dials,
+                    ret_outbound_tx,
+                    data_dir,
+                    disk_tx,
+                    s3_read_library,
+                    s3_tx,
+                )
+                .await;
+            }
+        }
+        InferenceResult::Failed {
+            query_id,
+            task_id,
+            error,
+            engine,
+        } => {
+            runtime.return_inference_engine(engine);
+            let result = harmony_agent::AgentResult {
+                task_id,
+                status: harmony_agent::TaskStatus::Failed,
+                output: None,
+                error: Some(error),
+            };
+            if let Ok(payload) = harmony_agent::encode_result(&result) {
+                dispatch_action(
+                    RuntimeAction::SendReply { query_id, payload },
+                    session,
+                    zenoh_tx,
+                    udp,
+                    broadcast_addr,
+                    Some(peer_table),
+                    tunnel_senders,
+                    deferred_dials,
+                    ret_outbound_tx,
+                    data_dir,
+                    disk_tx,
+                    s3_read_library,
+                    s3_tx,
+                )
+                .await;
+            }
         }
     }
 }
