@@ -63,6 +63,9 @@ pub struct ConfigFile {
     /// Directory for persistent CAS book storage. When set, durable books
     /// are written to disk and reloaded on restart.
     pub data_dir: Option<PathBuf>,
+    /// Disk quota for CAS book storage (e.g. "10 GiB"). Requires `data_dir`.
+    /// If absent, disk usage is unbounded.
+    pub disk_quota: Option<String>,
     pub filter_broadcast_ticks: Option<u32>,
     pub filter_mutation_threshold: Option<u32>,
     pub encrypted_durable_persist: Option<bool>,
@@ -108,6 +111,46 @@ pub struct PeerEntry {
 pub struct TunnelEntry {
     pub node_id: String,
     pub name: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Byte-size parser
+// ---------------------------------------------------------------------------
+
+/// Parse a human-readable byte size string like "10 GiB" or "500 MB".
+///
+/// Supported suffixes (case-insensitive): B, KB, MB, GB, KiB, MiB, GiB.
+/// A bare number without a suffix is rejected to avoid ambiguity.
+pub fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty byte size string".into());
+    }
+    let num_end = s
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(s.len());
+    if num_end == 0 {
+        return Err(format!("no numeric value in '{s}'"));
+    }
+    let num: u64 = s[..num_end]
+        .parse()
+        .map_err(|e| format!("invalid number in '{s}': {e}"))?;
+    let suffix = s[num_end..].trim().to_ascii_lowercase();
+    let multiplier: u64 = match suffix.as_str() {
+        "b" => 1,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "kib" => 1_024,
+        "mib" => 1_024 * 1_024,
+        "gib" => 1_024 * 1_024 * 1_024,
+        "" => return Err(format!(
+            "bare number '{s}' requires a unit suffix (B, KB, MB, GB, KiB, MiB, GiB)"
+        )),
+        other => return Err(format!("unknown unit suffix '{other}' in '{s}'")),
+    };
+    num.checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size overflow: {num} * {multiplier}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +359,51 @@ node_id = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
         assert!(!is_explicit);
         let expected = PathBuf::from(home).join(".harmony").join("node.toml");
         assert_eq!(path, expected);
+    }
+
+    // ── parse_byte_size tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_byte_size_binary_units() {
+        assert_eq!(parse_byte_size("1 KiB").unwrap(), 1024);
+        assert_eq!(parse_byte_size("2 MiB").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_byte_size("10 GiB").unwrap(), 10 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_decimal_units() {
+        assert_eq!(parse_byte_size("500 MB").unwrap(), 500 * 1_000_000);
+        assert_eq!(parse_byte_size("1 GB").unwrap(), 1_000_000_000);
+        assert_eq!(parse_byte_size("100 KB").unwrap(), 100_000);
+    }
+
+    #[test]
+    fn parse_byte_size_bytes_suffix() {
+        assert_eq!(parse_byte_size("1024 B").unwrap(), 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_case_insensitive() {
+        assert_eq!(parse_byte_size("1 gib").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("1 GIB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("500 mb").unwrap(), 500 * 1_000_000);
+    }
+
+    #[test]
+    fn parse_byte_size_no_space() {
+        assert_eq!(parse_byte_size("10GiB").unwrap(), 10 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_bare_number_rejected() {
+        assert!(parse_byte_size("1234").is_err());
+    }
+
+    #[test]
+    fn parse_byte_size_invalid_suffix_rejected() {
+        assert!(parse_byte_size("10 TB").is_err());
+        assert!(parse_byte_size("abc").is_err());
+        assert!(parse_byte_size("").is_err());
     }
 
     // ── Merge helper tests ──────────────────────────────────────────────
