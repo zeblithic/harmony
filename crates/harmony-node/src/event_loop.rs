@@ -1831,10 +1831,16 @@ async fn handle_inference_result(
             token_id,
             final_chunk,
         } => {
-            let payload_value = if final_chunk {
-                serde_json::json!({"final": true})
-            } else if let Some(id) = token_id {
-                serde_json::json!({"token_id": id})
+            // Token mode uses token_id (Some): {"token_id": N} for content,
+            // {"final": true} for the termination sentinel.
+            // Text mode uses token_id (None): {"token": "text"} always,
+            // preserving 0x02 backwards compatibility.
+            let payload_value = if let Some(id) = token_id {
+                if final_chunk {
+                    serde_json::json!({"final": true})
+                } else {
+                    serde_json::json!({"token_id": id})
+                }
             } else {
                 serde_json::json!({"token": token_text})
             };
@@ -2053,11 +2059,13 @@ fn run_inference_loop(
         };
 
         if eos == Some(next_token) || sequence >= max_tokens {
+            // Token mode: set token_id to trigger the {"final": true} path.
+            // Text mode: token_id None preserves {"token": ""} (backwards compat).
             let _ = tx.blocking_send(InferenceResult::Chunk {
                 task_id: task_id.clone(),
                 sequence,
                 token_text: String::new(),
-                token_id: None,
+                token_id: if is_token_mode { Some(0) } else { None },
                 final_chunk: true,
             });
             break;
