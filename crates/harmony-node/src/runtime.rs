@@ -356,7 +356,7 @@ pub enum RuntimeAction {
     RunInference {
         query_id: u64,
         task_id: String,
-        prompt: String,
+        input: crate::inference::InferenceInput,
         sampling_params_raw: [u8; 20],
     },
 }
@@ -2209,6 +2209,67 @@ impl<B: BookStore> NodeRuntime<B> {
         }
     }
 
+    /// Shared guard logic and action emission for both text and token inference requests.
+    ///
+    /// Checks that a model is loaded and the engine is not busy, then emits
+    /// `RuntimeAction::RunInference`. Returns an empty `Vec` — all actions are
+    /// pushed into `pending_direct_actions`.
+    #[cfg(feature = "inference")]
+    fn emit_run_inference(
+        &mut self,
+        query_id: u64,
+        input: crate::inference::InferenceInput,
+        sampling_params: [u8; 20],
+    ) -> Vec<WorkflowAction> {
+        // Guard: model must be loaded.
+        match (self.inference_model_cid, self.inference_tokenizer_cid) {
+            (Some(_), Some(_)) => {}
+            _ => {
+                let result = harmony_agent::AgentResult {
+                    task_id: String::new(),
+                    status: harmony_agent::TaskStatus::Rejected,
+                    output: None,
+                    error: Some("no inference model loaded".into()),
+                };
+                let payload = harmony_agent::encode_result(&result)
+                    .unwrap_or_else(|_| b"no inference model loaded".to_vec());
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload });
+                return Vec::new();
+            }
+        };
+
+        // Guard: DSD session must not be active.
+        if self.dsd_session.is_some() {
+            let result = harmony_agent::AgentResult {
+                task_id: String::new(),
+                status: harmony_agent::TaskStatus::Rejected,
+                output: None,
+                error: Some("engine busy with DSD session".into()),
+            };
+            let payload =
+                harmony_agent::encode_result(&result).unwrap_or_else(|_| b"engine busy".to_vec());
+            self.pending_direct_actions
+                .push(RuntimeAction::SendReply { query_id, payload });
+            return Vec::new();
+        }
+
+        self.inference_request_nonce += 1;
+        let task_id = format!(
+            "{:016x}-{}",
+            self.inference_request_nonce,
+            hex::encode(self.local_identity_hash)
+        );
+        self.pending_direct_actions
+            .push(RuntimeAction::RunInference {
+                query_id,
+                task_id,
+                input,
+                sampling_params_raw: sampling_params,
+            });
+        Vec::new()
+    }
+
     /// Route a compute query by parsing its payload and submitting to the workflow engine.
     ///
     /// Returns `WorkflowAction`s to be buffered as pending. For CID-based requests,
@@ -2276,72 +2337,36 @@ impl<B: BookStore> NodeRuntime<B> {
                 Vec::new()
             }
             ParsedCompute::Inference { request } => {
-                // Guard: model must be loaded.
-                match (self.inference_model_cid, self.inference_tokenizer_cid) {
-                    (Some(_), Some(_)) => {}
-                    _ => {
-                        #[cfg(feature = "inference")]
-                        {
-                            let result = harmony_agent::AgentResult {
-                                task_id: String::new(),
-                                status: harmony_agent::TaskStatus::Rejected,
-                                output: None,
-                                error: Some("no inference model loaded".into()),
-                            };
-                            let payload = harmony_agent::encode_result(&result)
-                                .unwrap_or_else(|_| b"no inference model loaded".to_vec());
-                            self.pending_direct_actions
-                                .push(RuntimeAction::SendReply { query_id, payload });
-                        }
-                        #[cfg(not(feature = "inference"))]
-                        {
-                            self.pending_direct_actions.push(RuntimeAction::SendReply {
-                                query_id,
-                                payload: vec![],
-                            });
-                        }
-                        return Vec::new();
-                    }
-                };
-
-                // Emit RunInference — the event loop spawns the blocking token loop.
                 #[cfg(feature = "inference")]
                 {
-                    if self.dsd_session.is_some() {
-                        // Use AgentResult wire format — the caller is an inference client.
-                        let result = harmony_agent::AgentResult {
-                            task_id: String::new(),
-                            status: harmony_agent::TaskStatus::Rejected,
-                            output: None,
-                            error: Some("engine busy with DSD session".into()),
-                        };
-                        let payload = harmony_agent::encode_result(&result)
-                            .unwrap_or_else(|_| b"engine busy".to_vec());
-                        self.pending_direct_actions
-                            .push(RuntimeAction::SendReply { query_id, payload });
-                        return Vec::new();
-                    }
-
-                    self.inference_request_nonce += 1;
-                    let task_id = format!(
-                        "{:016x}-{}",
-                        self.inference_request_nonce,
-                        hex::encode(self.local_identity_hash)
+                    return self.emit_run_inference(
+                        query_id,
+                        crate::inference::InferenceInput::Text(request.prompt),
+                        request.sampling_params,
                     );
-                    self.pending_direct_actions
-                        .push(RuntimeAction::RunInference {
-                            query_id,
-                            task_id,
-                            prompt: request.prompt,
-                            sampling_params_raw: request.sampling_params,
-                        });
-                    return Vec::new();
                 }
-
-                // Without the inference feature, fall through to no-op.
                 #[cfg(not(feature = "inference"))]
                 {
-                    let _ = &request; // Suppress unused warning
+                    let _ = &request;
+                    let mut payload = vec![0x01];
+                    payload.extend_from_slice(b"inference feature not enabled");
+                    self.pending_direct_actions
+                        .push(RuntimeAction::SendReply { query_id, payload });
+                    Vec::new()
+                }
+            }
+            ParsedCompute::TokenInference { request } => {
+                #[cfg(feature = "inference")]
+                {
+                    return self.emit_run_inference(
+                        query_id,
+                        crate::inference::InferenceInput::TokenIds(request.token_ids),
+                        request.sampling_params,
+                    );
+                }
+                #[cfg(not(feature = "inference"))]
+                {
+                    let _ = &request;
                     let mut payload = vec![0x01];
                     payload.extend_from_slice(b"inference feature not enabled");
                     self.pending_direct_actions
@@ -3163,6 +3188,13 @@ impl<B: BookStore> NodeRuntime<B> {
                 Ok(request) => Some(ParsedCompute::Inference { request }),
                 Err(_) => None,
             },
+            // Token inference: [0x03] [token_count: u32 LE] [token_ids: u32 LE × count] [sampling_params: 20 bytes (optional)]
+            crate::inference::TOKEN_INFERENCE_TAG => {
+                match crate::inference::TokenInferenceRequest::parse(&payload) {
+                    Ok(request) => Some(ParsedCompute::TokenInference { request }),
+                    Err(_) => None,
+                }
+            }
             // Verify: [0x04] [context_len: u32 LE] [context_tokens...] [draft_count: u8] [draft_entries...]
             0x04 => match harmony_speculative::VerifyRequest::parse(&payload) {
                 Ok(request) => Some(ParsedCompute::Verify { request }),
@@ -3796,6 +3828,9 @@ enum ParsedCompute {
     },
     Inference {
         request: crate::inference::InferenceRequest,
+    },
+    TokenInference {
+        request: crate::inference::TokenInferenceRequest,
     },
     /// DSD verify request: [0x04] payload
     Verify {
@@ -6528,13 +6563,15 @@ mod tests {
             "inference query without model should produce error reply"
         );
         if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
-            // With inference feature: AgentResult wire format (0x00 + JSON).
-            // Without inference feature: empty payload.
-            // In both cases, verify the error is surfaced.
+            // With inference feature: AgentResult wire format (0x00 + JSON) with "no inference model loaded".
+            // Without inference feature: "inference feature not enabled" message.
+            // In both cases, verify that an error is surfaced.
             let payload_str = String::from_utf8_lossy(payload);
             assert!(
-                payload_str.contains("no inference model loaded") || payload.is_empty(),
-                "error reply should mention no model or be empty, got: {payload_str}"
+                payload_str.contains("no inference model loaded")
+                    || payload_str.contains("inference feature not enabled")
+                    || payload.is_empty(),
+                "error reply should mention no model or feature not enabled, got: {payload_str}"
             );
         }
     }
