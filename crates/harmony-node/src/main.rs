@@ -544,19 +544,48 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 public_ephemeral_announce: !no_public_ephemeral_announce,
             };
 
-            // Scan disk for persisted CIDs (spawn_blocking to avoid blocking tokio).
-            let disk_cids = match &config_file.data_dir {
+            // Scan disk for persisted CIDs+sizes (spawn_blocking to avoid blocking tokio).
+            let disk_entries = match &config_file.data_dir {
                 Some(dir) => {
                     let dir = dir.clone();
                     tokio::task::spawn_blocking(move || {
-                        let cids = crate::disk_io::scan_books(&dir);
-                        tracing::info!(count = cids.len(), path = %dir.display(), "loaded book CIDs from disk");
-                        cids
+                        let entries = crate::disk_io::scan_books(&dir);
+                        tracing::info!(
+                            count = entries.len(),
+                            total_bytes = entries.iter().map(|(_, s)| s).sum::<u64>(),
+                            path = %dir.display(),
+                            "loaded book entries from disk"
+                        );
+                        entries
                     })
                     .await
                     .unwrap_or_default()
                 }
                 None => Vec::new(),
+            };
+
+            let disk_quota = match &config_file.disk_quota {
+                Some(s) => {
+                    let bytes = crate::config::parse_byte_size(s)
+                        .map_err(|e| format!("invalid disk_quota '{s}': {e}"))?;
+                    if config_file.data_dir.is_none() {
+                        tracing::warn!(
+                            raw = %s,
+                            "disk_quota is set but data_dir is not configured — quota will be ignored"
+                        );
+                    } else {
+                        tracing::info!(quota_bytes = bytes, raw = %s, "disk quota configured");
+                    }
+                    Some(bytes)
+                }
+                None => {
+                    if config_file.data_dir.is_some() {
+                        tracing::info!(
+                            "disk persistence enabled without quota — disk usage is unbounded"
+                        );
+                    }
+                    None
+                }
             };
 
             let config = NodeConfig {
@@ -606,13 +635,14 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     })
                     .flatten(),
                 disk_enabled: config_file.data_dir.is_some(),
+                disk_entries,
+                disk_quota,
                 s3_enabled: {
                     #[cfg(feature = "archivist")]
                     { archivist_config.is_some() }
                     #[cfg(not(feature = "archivist"))]
                     { false }
                 },
-                disk_cids: disk_cids,
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 

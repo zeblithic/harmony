@@ -288,7 +288,9 @@ pub async fn run(
             archivist.bucket.clone(),
             archivist.prefix.clone(),
             archivist.region.clone(),
-        ).await {
+        )
+        .await
+        {
             Ok(s3) => {
                 // Clone for the archivist write path (consumes its copy).
                 let archivist_s3 = s3.clone();
@@ -1121,20 +1123,18 @@ pub async fn run(
                     }
 
                     // Construct PqIdentity from the announce's public key bytes
-                    let remote_pq_identity = match construct_pq_identity(
-                        &dial.peer_dsa_pubkey,
-                        &dial.peer_kem_pubkey,
-                    ) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            tracing::warn!(
-                                identity = %hex::encode(dial.identity_hash),
-                                err = %e,
-                                "PqIdentity construction failed — dropping dial"
-                            );
-                            continue;
-                        }
-                    };
+                    let remote_pq_identity =
+                        match construct_pq_identity(&dial.peer_dsa_pubkey, &dial.peer_kem_pubkey) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                tracing::warn!(
+                                    identity = %hex::encode(dial.identity_hash),
+                                    err = %e,
+                                    "PqIdentity construction failed — dropping dial"
+                                );
+                                continue;
+                            }
+                        };
 
                     let connection_id = next_connection_id;
                     next_connection_id += 1;
@@ -1160,10 +1160,7 @@ pub async fn run(
                         }
                     }
 
-                    let interface_name = format!(
-                        "tunnel-{}",
-                        &hex::encode(&dial.node_id[..8])
-                    );
+                    let interface_name = format!("tunnel-{}", &hex::encode(&dial.node_id[..8]));
                     let conn_tx_clone = conn_tx.clone();
                     let relay_map_clone = relay_map.clone();
 
@@ -1181,11 +1178,9 @@ pub async fn run(
                             .alpns(vec![tunnel_task::HARMONY_TUNNEL_ALPN.to_vec()])
                             .secret_key(ephemeral_key);
                         if let Some(ref rm) = relay_map_clone {
-                            ep_builder = ep_builder
-                                .relay_mode(iroh::RelayMode::Custom(rm.clone()));
+                            ep_builder = ep_builder.relay_mode(iroh::RelayMode::Custom(rm.clone()));
                         } else {
-                            ep_builder = ep_builder
-                                .relay_mode(iroh::RelayMode::Disabled);
+                            ep_builder = ep_builder.relay_mode(iroh::RelayMode::Disabled);
                         }
 
                         let ep = match ep_builder.bind().await {
@@ -1532,8 +1527,7 @@ async fn dispatch_action(
                     };
                     while let Ok(reply) = replies.recv_async().await {
                         if let Ok(sample) = reply.into_result() {
-                            let resp_payload =
-                                sample.payload().to_bytes().to_vec();
+                            let resp_payload = sample.payload().to_bytes().to_vec();
                             let _ = tx
                                 .send(ZenohEvent::VerifyResponse {
                                     payload: resp_payload,
@@ -1553,8 +1547,7 @@ async fn dispatch_action(
                     Err(_) => format!("verify query timed out after 30s"),
                 };
                 tracing::warn!(%key_expr, err = %err_msg, "DSD verify query failed");
-                let err_payload =
-                    harmony_speculative::VerifyResponse::serialize_error(&err_msg);
+                let err_payload = harmony_speculative::VerifyResponse::serialize_error(&err_msg);
                 let _ = tx
                     .send(ZenohEvent::VerifyResponse {
                         payload: err_payload,
@@ -1580,21 +1573,16 @@ async fn dispatch_action(
             if let Some(ref dir) = data_dir {
                 let dir = dir.clone();
                 let tx = disk_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    match crate::disk_io::read_book(&dir, &cid) {
-                        Ok(data) => {
-                            let _ = tx.blocking_send(DiskIoResult::ReadComplete {
-                                cid,
-                                query_id,
-                                data,
-                            });
-                        }
-                        Err(_) => {
-                            let _ = tx.blocking_send(DiskIoResult::ReadFailed {
-                                cid,
-                                query_id,
-                            });
-                        }
+                tokio::task::spawn_blocking(move || match crate::disk_io::read_book(&dir, &cid) {
+                    Ok(data) => {
+                        let _ = tx.blocking_send(DiskIoResult::ReadComplete {
+                            cid,
+                            query_id,
+                            data,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = tx.blocking_send(DiskIoResult::ReadFailed { cid, query_id });
                     }
                 });
             } else {
@@ -1603,6 +1591,16 @@ async fn dispatch_action(
                     "DiskLookup dispatched but data_dir not configured"
                 );
                 let _ = disk_tx.try_send(DiskIoResult::ReadFailed { cid, query_id });
+            }
+        }
+        RuntimeAction::RemoveFromDisk { cid } => {
+            if let Some(ref dir) = data_dir {
+                let dir = dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = crate::disk_io::delete_book(&dir, &cid) {
+                        tracing::warn!(?cid, error = %e, "failed to delete book from disk");
+                    }
+                });
             }
         }
         RuntimeAction::S3Lookup { cid, query_id } => {

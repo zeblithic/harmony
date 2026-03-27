@@ -27,10 +27,7 @@ use std::{
 pub fn book_path(data_dir: &std::path::Path, cid: &ContentId) -> PathBuf {
     let hex_cid = hex::encode(cid.to_bytes());
     let prefix = &hex_cid[8..10];
-    data_dir
-        .join("book")
-        .join(prefix)
-        .join(&hex_cid)
+    data_dir.join("book").join(prefix).join(&hex_cid)
 }
 
 // ---------------------------------------------------------------------------
@@ -42,7 +39,11 @@ pub fn book_path(data_dir: &std::path::Path, cid: &ContentId) -> PathBuf {
 /// Uses write-to-temp-then-rename for crash safety: a power loss during write
 /// leaves the temp file (not the final path), so scan_books never sees a
 /// truncated book.
-pub fn write_book(data_dir: &std::path::Path, cid: &ContentId, data: &[u8]) -> Result<(), io::Error> {
+pub fn write_book(
+    data_dir: &std::path::Path,
+    cid: &ContentId,
+    data: &[u8],
+) -> Result<(), io::Error> {
     let path = book_path(data_dir, cid);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -70,13 +71,25 @@ pub fn read_book(data_dir: &std::path::Path, cid: &ContentId) -> Result<Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
+// Delete
+// ---------------------------------------------------------------------------
+
+/// Delete the book file for `cid` from `data_dir`.
+///
+/// Returns `Err` with `ErrorKind::NotFound` if the file does not exist.
+pub fn delete_book(data_dir: &std::path::Path, cid: &ContentId) -> Result<(), io::Error> {
+    fs::remove_file(book_path(data_dir, cid))
+}
+
+// ---------------------------------------------------------------------------
 // Scan
 // ---------------------------------------------------------------------------
 
-/// Walk `{data_dir}/book/` and return all valid `ContentId`s found.
+/// Walk `{data_dir}/book/` and return all valid `ContentId`s found, with their on-disk sizes.
 ///
 /// Files whose names are not valid 64-hex-char CIDs are skipped with a warning.
-pub fn scan_books(data_dir: &std::path::Path) -> Vec<ContentId> {
+/// Files whose metadata cannot be read are also skipped with a warning.
+pub fn scan_books(data_dir: &std::path::Path) -> Vec<(ContentId, u64)> {
     let book_root = PathBuf::from(data_dir).join("book");
     let mut cids = Vec::new();
 
@@ -144,8 +157,14 @@ pub fn scan_books(data_dir: &std::path::Path) -> Vec<ContentId> {
                 }
             };
 
+            let cid = ContentId::from_bytes(arr);
             tracing::debug!("scan_books: discovered CID {}", name);
-            cids.push(ContentId::from_bytes(arr));
+            match entry.metadata() {
+                Ok(meta) => cids.push((cid, meta.len())),
+                Err(e) => {
+                    tracing::warn!(path = %entry.path().display(), error = %e, "skipping book: metadata read failed");
+                }
+            }
         }
     }
 
@@ -164,7 +183,6 @@ mod tests {
     fn make_cid(data: &[u8]) -> ContentId {
         ContentId::for_book(data, ContentFlags::default()).unwrap()
     }
-
 
     #[test]
     fn write_and_read_round_trip() {
@@ -190,7 +208,10 @@ mod tests {
         assert!(path.exists(), "book file should exist at expected path");
 
         let prefix_dir = path.parent().unwrap();
-        assert!(prefix_dir.is_dir(), "prefix directory should have been created");
+        assert!(
+            prefix_dir.is_dir(),
+            "prefix directory should have been created"
+        );
     }
 
     #[test]
@@ -206,12 +227,15 @@ mod tests {
         write_book(dir.path(), &cid_c, b"book c").unwrap();
 
         let mut found = scan_books(dir.path());
-        found.sort_by_key(|c| c.to_bytes());
+        found.sort_by_key(|(c, _)| c.to_bytes());
 
         let mut expected = vec![cid_a, cid_b, cid_c];
         expected.sort_by_key(|c| c.to_bytes());
 
-        assert_eq!(found, expected);
+        assert_eq!(found.len(), expected.len());
+        for (i, expected_cid) in expected.iter().enumerate() {
+            assert_eq!(&found[i].0, expected_cid);
+        }
     }
 
     #[test]
@@ -236,7 +260,7 @@ mod tests {
 
         // Only the one valid CID should be returned.
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0], cid);
+        assert_eq!(found[0].0, cid);
     }
 
     #[test]
@@ -253,5 +277,40 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let found = scan_books(dir.path());
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn delete_book_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cid = ContentId::from_bytes([0xAB; 32]);
+        write_book(dir.path(), &cid, b"hello").unwrap();
+        assert!(book_path(dir.path(), &cid).exists());
+
+        delete_book(dir.path(), &cid).unwrap();
+        assert!(!book_path(dir.path(), &cid).exists());
+    }
+
+    #[test]
+    fn delete_book_missing_file_returns_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let cid = ContentId::from_bytes([0xCD; 32]);
+        let err = delete_book(dir.path(), &cid).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn scan_books_returns_cid_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let cid1 = ContentId::from_bytes([0x01; 32]);
+        let cid2 = ContentId::from_bytes([0x02; 32]);
+        write_book(dir.path(), &cid1, &[0u8; 100]).unwrap();
+        write_book(dir.path(), &cid2, &[0u8; 200]).unwrap();
+
+        let mut entries = scan_books(dir.path());
+        entries.sort_by_key(|(_, size)| *size);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (cid1, 100));
+        assert_eq!(entries[1], (cid2, 200));
     }
 }
