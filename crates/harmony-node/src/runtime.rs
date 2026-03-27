@@ -1671,8 +1671,8 @@ impl<B: BookStore> NodeRuntime<B> {
             {
                 let query_id = session.query_id;
                 tracing::warn!(query_id, "DSD session timed out after {DSD_SESSION_TIMEOUT_TICKS} ticks");
-                let mut payload = vec![0x01];
-                payload.extend_from_slice(b"DSD session timed out");
+                let payload =
+                    harmony_speculative::VerifyResponse::serialize_error("DSD session timed out");
                 self.pending_direct_actions
                     .push(RuntimeAction::SendReply { query_id, payload });
                 self.dsd_session = None;
