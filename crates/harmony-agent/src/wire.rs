@@ -1,6 +1,6 @@
 //! Wire format encode/decode with tag-byte prefix.
 
-use crate::types::{AgentCapacity, AgentResult, AgentTask};
+use crate::types::{AgentCapacity, AgentResult, AgentTask, StreamChunk};
 
 /// Tag byte for JSON-encoded payloads.
 pub const JSON_TAG: u8 = 0x00;
@@ -90,6 +90,26 @@ pub fn decode_capacity(payload: &[u8]) -> Result<AgentCapacity, AgentError> {
     serde_json::from_slice(&payload[1..]).map_err(AgentError::Json)
 }
 
+/// Encode a StreamChunk to wire format: [JSON_TAG][json_bytes].
+pub fn encode_chunk(chunk: &StreamChunk) -> Result<Vec<u8>, serde_json::Error> {
+    let json = serde_json::to_vec(chunk)?;
+    let mut payload = Vec::with_capacity(1 + json.len());
+    payload.push(JSON_TAG);
+    payload.extend_from_slice(&json);
+    Ok(payload)
+}
+
+/// Decode a StreamChunk from wire format.
+///
+/// Returns `AgentError::Json` for deserialization failures, and
+/// `AgentError::EmptyPayload` or `AgentError::UnsupportedFormat`
+/// for wire-level issues. This asymmetry (encode returns `serde_json::Error`,
+/// decode returns `AgentError`) matches the existing encode/decode pattern.
+pub fn decode_chunk(payload: &[u8]) -> Result<StreamChunk, AgentError> {
+    check_tag(payload)?;
+    serde_json::from_slice(&payload[1..]).map_err(AgentError::Json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +170,59 @@ mod tests {
     #[test]
     fn decode_invalid_json_returns_error() {
         assert!(matches!(decode_task(&[JSON_TAG, b'n', b'o', b't']), Err(AgentError::Json(_))));
+    }
+
+    #[test]
+    fn chunk_wire_round_trip() {
+        let chunk = StreamChunk {
+            task_id: "task-wire".to_string(),
+            sequence: 7,
+            payload: serde_json::json!({"token": "world"}),
+            final_chunk: false,
+        };
+        let encoded = encode_chunk(&chunk).unwrap();
+        assert_eq!(encoded[0], JSON_TAG);
+        let decoded = decode_chunk(&encoded).unwrap();
+        assert_eq!(decoded.task_id, "task-wire");
+        assert_eq!(decoded.sequence, 7);
+        assert_eq!(decoded.payload, serde_json::json!({"token": "world"}));
+        assert!(!decoded.final_chunk);
+    }
+
+    #[test]
+    fn chunk_wire_final_round_trip() {
+        let chunk = StreamChunk {
+            task_id: "task-final".to_string(),
+            sequence: 99,
+            payload: serde_json::json!({"summary": "done"}),
+            final_chunk: true,
+        };
+        let encoded = encode_chunk(&chunk).unwrap();
+        let decoded = decode_chunk(&encoded).unwrap();
+        assert_eq!(decoded.task_id, "task-final");
+        assert_eq!(decoded.sequence, 99);
+        assert_eq!(decoded.payload, serde_json::json!({"summary": "done"}));
+        assert!(decoded.final_chunk);
+    }
+
+    #[test]
+    fn chunk_decode_empty_payload() {
+        assert!(matches!(decode_chunk(&[]), Err(AgentError::EmptyPayload)));
+    }
+
+    #[test]
+    fn chunk_decode_unknown_tag() {
+        assert!(matches!(
+            decode_chunk(&[0xFF, b'{', b'}']),
+            Err(AgentError::UnsupportedFormat(0xFF))
+        ));
+    }
+
+    #[test]
+    fn chunk_decode_invalid_json() {
+        assert!(matches!(
+            decode_chunk(&[JSON_TAG, b'n', b'o', b't']),
+            Err(AgentError::Json(_))
+        ));
     }
 }
