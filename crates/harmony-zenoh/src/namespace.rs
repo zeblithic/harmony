@@ -738,17 +738,17 @@ pub mod telemetry {
     pub const PREFIX: &str = "harmony/telemetry";
 
     /// Per-node, per-intent telemetry key: `harmony/telemetry/{node_addr}/{intent}`
-    pub fn telemetry_key(node_addr: &str, intent: &str) -> String {
+    pub fn key(node_addr: &str, intent: &str) -> String {
         format!("{PREFIX}/{node_addr}/{intent}")
     }
 
     /// Subscribe to all intents from one node: `harmony/telemetry/{node_addr}/*`
-    pub fn telemetry_sub_node(node_addr: &str) -> String {
+    pub fn sub_node(node_addr: &str) -> String {
         format!("{PREFIX}/{node_addr}/*")
     }
 
     /// Subscribe to one intent across all nodes: `harmony/telemetry/*/{intent}`
-    pub fn telemetry_sub_intent(intent: &str) -> String {
+    pub fn sub_intent(intent: &str) -> String {
         format!("{PREFIX}/*/{intent}")
     }
 }
@@ -1391,13 +1391,13 @@ mod tests {
 
     #[test]
     fn telemetry_namespace_keys() {
-        let key = telemetry::telemetry_key("node01", "anomaly");
+        let key = telemetry::key("node01", "anomaly");
         assert_eq!(key, "harmony/telemetry/node01/anomaly");
 
-        let sub_node = telemetry::telemetry_sub_node("node01");
+        let sub_node = telemetry::sub_node("node01");
         assert_eq!(sub_node, "harmony/telemetry/node01/*");
 
-        let sub_intent = telemetry::telemetry_sub_intent("health");
+        let sub_intent = telemetry::sub_intent("health");
         assert_eq!(sub_intent, "harmony/telemetry/*/health");
     }
 }
