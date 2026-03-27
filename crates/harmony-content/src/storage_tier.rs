@@ -5,15 +5,16 @@ use crate::cache::ContentStore;
 use crate::cid::{ContentClass, ContentId};
 use crate::flatpack::FlatpackIndex;
 use alloc::{
+    collections::VecDeque,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
 use harmony_zenoh::namespace::{announce as announce_ns, content as ns};
 #[cfg(not(feature = "std"))]
-use hashbrown::HashSet;
+use hashbrown::HashMap;
 #[cfg(feature = "std")]
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// Configuration for storage capacity limits.
 #[derive(Debug, Clone)]
@@ -201,8 +202,14 @@ pub struct StorageTier<B: BookStore> {
     /// Whether the runtime has wired up disk I/O.
     /// When false, PersistToDisk and DiskLookup actions are suppressed.
     disk_enabled: bool,
-    /// CIDs known to be persisted on disk (durable classes only).
-    disk_index: HashSet<ContentId>,
+    /// CIDs known to be persisted on disk, mapped to their byte sizes (durable classes only).
+    disk_index: HashMap<ContentId, u64>,
+    /// LRU ordering of disk-indexed CIDs. Front = oldest, back = most recent.
+    disk_lru: VecDeque<ContentId>,
+    /// Running total of bytes stored on disk.
+    disk_used_bytes: u64,
+    /// Maximum bytes allowed on disk. None = unlimited.
+    disk_quota: Option<u64>,
     /// Configuration for periodic Bloom filter broadcasts.
     filter_config: FilterBroadcastConfig,
     /// Number of cache mutations since last Bloom filter broadcast.
@@ -255,7 +262,10 @@ impl<B: BookStore> StorageTier<B> {
             policy,
             metrics: StorageMetrics::default(),
             disk_enabled: false,
-            disk_index: HashSet::new(),
+            disk_index: HashMap::new(),
+            disk_lru: VecDeque::new(),
+            disk_used_bytes: 0,
+            disk_quota: None,
             filter_config,
             mutations_since_broadcast: 0,
             flatpack,
@@ -284,16 +294,40 @@ impl<B: BookStore> StorageTier<B> {
         &self.flatpack
     }
 
-    /// Enable disk I/O and populate the disk index with CIDs found on disk.
+    /// Enable disk I/O and populate the disk index with CIDs and their byte sizes found on disk.
     ///
     /// Called by the runtime after scanning the data directory at startup.
     /// Once enabled, `handle_transit` and `handle_publish` emit
     /// [`StorageTierAction::PersistToDisk`] for durable content, and
     /// `handle_content_query` emits [`StorageTierAction::DiskLookup`]
     /// on cache misses for CIDs present in the disk index.
-    pub fn enable_disk(&mut self, cids: impl IntoIterator<Item = ContentId>) {
+    pub fn enable_disk(&mut self, entries: impl IntoIterator<Item = (ContentId, u64)>) {
         self.disk_enabled = true;
-        self.disk_index.extend(cids);
+        for (cid, size) in entries {
+            self.disk_index.insert(cid, size);
+            self.disk_lru.push_back(cid);
+            self.disk_used_bytes += size;
+        }
+    }
+
+    /// Set the maximum number of bytes allowed on disk. Replaces any previous quota.
+    pub fn set_disk_quota(&mut self, quota_bytes: u64) {
+        self.disk_quota = Some(quota_bytes);
+    }
+
+    /// Returns the running total of bytes currently tracked in the disk index.
+    pub fn disk_used_bytes(&self) -> u64 {
+        self.disk_used_bytes
+    }
+
+    /// Returns the configured disk quota, or `None` if unlimited.
+    pub fn disk_quota(&self) -> Option<u64> {
+        self.disk_quota
+    }
+
+    /// Returns `true` if the given CID is present in the disk index.
+    pub fn disk_contains(&self, cid: &ContentId) -> bool {
+        self.disk_index.contains_key(cid)
     }
 
     /// Whether disk I/O is currently enabled.
@@ -335,7 +369,10 @@ impl<B: BookStore> StorageTier<B> {
                 );
                 if !Self::is_durable_class(&cid) {
                     self.metrics.disk_read_failures += 1;
-                    self.disk_index.remove(&cid);
+                    if let Some(size) = self.disk_index.remove(&cid) {
+                        self.disk_used_bytes = self.disk_used_bytes.saturating_sub(size);
+                        self.disk_lru.retain(|c| c != &cid);
+                    }
                     return vec![StorageTierAction::SendReply {
                         query_id,
                         payload: vec![],
@@ -346,7 +383,10 @@ impl<B: BookStore> StorageTier<B> {
                     self.metrics.disk_read_failures += 1;
                     // Retract stale index entry — corrupted files cause infinite
                     // DiskLookup → read → verify-fail → empty reply loops otherwise.
-                    self.disk_index.remove(&cid);
+                    if let Some(size) = self.disk_index.remove(&cid) {
+                        self.disk_used_bytes = self.disk_used_bytes.saturating_sub(size);
+                        self.disk_lru.retain(|c| c != &cid);
+                    }
                     return vec![StorageTierAction::SendReply {
                         query_id,
                         payload: vec![],
@@ -376,7 +416,10 @@ impl<B: BookStore> StorageTier<B> {
                 self.metrics.disk_read_failures += 1;
                 // Retract the optimistic disk_index entry so subsequent queries
                 // don't trigger futile DiskLookup cycles for a CID that failed.
-                self.disk_index.remove(&cid);
+                if let Some(size) = self.disk_index.remove(&cid) {
+                    self.disk_used_bytes = self.disk_used_bytes.saturating_sub(size);
+                    self.disk_lru.retain(|c| c != &cid);
+                }
                 // Reply with empty payload so the querier doesn't hang.
                 vec![StorageTierAction::SendReply {
                     query_id,
@@ -442,7 +485,7 @@ impl<B: BookStore> StorageTier<B> {
             }
             None => {
                 self.metrics.cache_misses += 1;
-                if self.disk_enabled && self.disk_index.contains(cid) {
+                if self.disk_enabled && self.disk_index.contains_key(cid) {
                     return vec![StorageTierAction::DiskLookup {
                         cid: *cid,
                         query_id,
@@ -494,7 +537,7 @@ impl<B: BookStore> StorageTier<B> {
         // Clone data for disk persistence BEFORE cache consumes it.
         // Skip if already in disk_index to avoid redundant 1MB clones on re-transit.
         let persist_data =
-            if self.disk_enabled && Self::is_durable_class(&cid) && !self.disk_index.contains(&cid)
+            if self.disk_enabled && Self::is_durable_class(&cid) && !self.disk_index.contains_key(&cid)
             {
                 Some(data.clone())
             } else {
@@ -516,7 +559,10 @@ impl<B: BookStore> StorageTier<B> {
         // DiskReadFailed retracts the index entry; the write eventually succeeds,
         // leaving an orphaned file that self-heals on the next startup scan.
         if let Some(persist_bytes) = persist_data {
-            self.disk_index.insert(cid);
+            let size = persist_bytes.len() as u64;
+            self.disk_index.insert(cid, size);
+            self.disk_lru.push_back(cid);
+            self.disk_used_bytes += size;
             actions.push(StorageTierAction::PersistToDisk {
                 cid,
                 data: persist_bytes,
@@ -548,7 +594,7 @@ impl<B: BookStore> StorageTier<B> {
         // Clone data for disk persistence BEFORE cache consumes it.
         // Skip if already in disk_index to avoid redundant clones on re-publish.
         let persist_data =
-            if self.disk_enabled && Self::is_durable_class(&cid) && !self.disk_index.contains(&cid)
+            if self.disk_enabled && Self::is_durable_class(&cid) && !self.disk_index.contains_key(&cid)
             {
                 Some(data.clone())
             } else {
@@ -565,7 +611,10 @@ impl<B: BookStore> StorageTier<B> {
 
         // After cache insertion, persist durable content to disk.
         if let Some(persist_bytes) = persist_data {
-            self.disk_index.insert(cid);
+            let size = persist_bytes.len() as u64;
+            self.disk_index.insert(cid, size);
+            self.disk_lru.push_back(cid);
+            self.disk_used_bytes += size;
             actions.push(StorageTierAction::PersistToDisk {
                 cid,
                 data: persist_bytes,
@@ -1441,7 +1490,7 @@ mod tests {
     fn persist_to_disk_emitted_when_disk_enabled_transit() {
         // When disk_enabled is true, durable transit content emits PersistToDisk.
         let mut tier = make_tier_with_policy(ContentPolicy::default());
-        tier.enable_disk(std::iter::empty());
+        tier.enable_disk(std::iter::empty::<(ContentId, u64)>());
 
         let (dur_cid, dur_data) = cid_with_class(b"durable content", false, false);
         let actions = tier.handle(StorageTierEvent::TransitContent {
@@ -1481,7 +1530,7 @@ mod tests {
     fn persist_to_disk_emitted_when_disk_enabled_publish() {
         // When disk_enabled is true, durable published content emits PersistToDisk.
         let mut tier = make_tier_with_policy(ContentPolicy::default());
-        tier.enable_disk(std::iter::empty());
+        tier.enable_disk(std::iter::empty::<(ContentId, u64)>());
 
         let (dur_cid, dur_data) = cid_with_class(b"durable published", false, false);
         let actions = tier.handle(StorageTierEvent::PublishContent {
@@ -1712,7 +1761,7 @@ mod tests {
         let (cid, data) = cid_with_class(b"durable on disk", false, false);
 
         // Enable disk with the CID pre-populated (simulates startup scan).
-        tier.enable_disk(std::iter::once(cid));
+        tier.enable_disk(std::iter::once((cid, 100)));
 
         // Store via transit — adds to cache and disk_index.
         tier.handle(StorageTierEvent::TransitContent {
@@ -1751,7 +1800,7 @@ mod tests {
         // Even with disk_enabled, if the CID is not in disk_index,
         // cache miss returns empty.
         let mut tier = make_tier_with_policy(ContentPolicy::default());
-        tier.enable_disk(std::iter::empty());
+        tier.enable_disk(std::iter::empty::<(ContentId, u64)>());
 
         let cid = ContentId::for_book(b"unknown", crate::cid::ContentFlags::default()).unwrap();
         let actions = tier.handle(StorageTierEvent::ContentQuery { query_id: 88, cid });
@@ -1769,7 +1818,7 @@ mod tests {
         let cid_a = ContentId::for_book(b"alpha", crate::cid::ContentFlags::default()).unwrap();
         let cid_b = ContentId::for_book(b"beta", crate::cid::ContentFlags::default()).unwrap();
 
-        tier.enable_disk(vec![cid_a, cid_b]);
+        tier.enable_disk(vec![(cid_a, 100), (cid_b, 100)]);
         assert!(tier.disk_enabled());
 
         // Both CIDs should trigger DiskLookup on cache miss.
@@ -2154,5 +2203,38 @@ mod tests {
                 .any(|a| matches!(a, StorageTierAction::BroadcastCuckooFilter { .. })),
             "should emit BroadcastCuckooFilter"
         );
+    }
+
+    #[test]
+    fn enable_disk_with_sizes_tracks_bytes() {
+        let budget = StorageBudget { cache_capacity: 10, max_pinned_bytes: 0 };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+
+        let cid1 = ContentId::from_bytes([0x01; 32]);
+        let cid2 = ContentId::from_bytes([0x02; 32]);
+
+        tier.enable_disk(vec![(cid1, 100), (cid2, 200)]);
+
+        assert_eq!(tier.disk_used_bytes(), 300);
+        assert!(tier.disk_contains(&cid1));
+        assert!(tier.disk_contains(&cid2));
+    }
+
+    #[test]
+    fn set_disk_quota() {
+        let budget = StorageBudget { cache_capacity: 10, max_pinned_bytes: 0 };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+        tier.set_disk_quota(1024);
+        assert_eq!(tier.disk_quota(), Some(1024));
     }
 }
