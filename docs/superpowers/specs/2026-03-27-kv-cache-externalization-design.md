@@ -46,10 +46,10 @@ pub trait InferenceEngine {
 ```
 
 Changes from current trait:
-- `forward`: `&mut self` → `&self` + `&mut InferenceCache`
-- `sample`: gains `history: &[u32]` parameter (was reading internal `token_history`)
+- `forward`: `&mut self` → `&self` + `&mut InferenceCache`. Returns `ForwardFailed` if tokens slice is empty. On error, the cache may be in an indeterminate state — drop and recreate before reuse.
+- `sample`: gains `history: &[u32]` parameter. Pass the **full** token history; the implementation applies `repeat_last_n` windowing from `params` internally.
 - `reset()`: removed — caller drops the cache or creates a new one
-- `new_cache()`: added — engine creates a correctly-sized empty cache from its architecture params
+- `new_cache()`: added — engine creates a correctly-sized empty cache from its architecture params. Returns `ModelNotLoaded` if model not yet loaded.
 
 ---
 
@@ -82,6 +82,8 @@ pub struct InferenceCache {
 
 Public methods: `new(num_layers, head_dim, num_kv_heads)`, `len()`, `is_empty()`.
 
+`InferenceCache::new()` is public for external construction (e.g., deserialization in harmony-hbf0). Callers must know the architecture params — these are available from the model's GGUF metadata or from `InferenceEngine::new_cache()` which reads them from the loaded model.
+
 ---
 
 ## QwenEngine Refactor
@@ -106,15 +108,35 @@ pub struct QwenEngine {
 }
 ```
 
-**Forked Qwen3 module:** Upstream `candle_transformers::models::quantized_qwen3::ModelWeights::forward` takes `&mut self` (internal cache). We fork ~250 lines into `src/qwen3_ext.rs`, applying the candle-pipelines-models refactor:
+**Forked Qwen3 module:** Upstream `candle_transformers::models::quantized_qwen3::ModelWeights::forward` takes `&mut self` (internal cache). We fork into `src/qwen3_ext.rs`, applying the candle-pipelines-models refactor:
 
-- `ModelWeights::forward(&self, input, cache: &mut InferenceCache)` — no internal state
-- `AttentionWeights::forward(&self, ..., kv_cache: &mut Option<(Tensor, Tensor)>)` — cache passed in
-- Propagate `&self` through `DecoderLayer`
+- `ModelWeights::forward(&self, input, cache: &mut InferenceCache)` — iterates layers with `enumerate`, passing `&mut cache.layers[i]` to each `DecoderLayer`
+- `DecoderLayer::forward(&self, ..., kv_slot: &mut Option<(Tensor, Tensor)>)` — passes slot to attention
+- `AttentionWeights::forward(&self, ..., kv_slot: &mut Option<(Tensor, Tensor)>)` — on each call, concatenates new K/V with existing slot via `Tensor::cat` along dim 2 (seq_len), storing the result back. If slot is `None`, stores the new K/V directly.
+- `forward()` advances `cache.position` by `tokens.len()` on success.
 
-This is a mechanical transformation — attention math unchanged. Uses `candle_core` and `candle_nn` directly (for `QLinear`, `RmsNorm`, `Embedding`, `RotaryEmbedding`).
+**KV cache concat logic in AttentionWeights::forward (pseudocode):**
+```rust
+// After computing k, v from projections and applying RoPE:
+let (k, v) = match kv_slot.take() {
+    Some((prev_k, prev_v)) => {
+        (Tensor::cat(&[&prev_k, &k], 2)?,   // concat along seq_len dim
+         Tensor::cat(&[&prev_v, &v], 2)?)
+    }
+    None => (k, v),
+};
+*kv_slot = Some((k.clone(), v.clone()));
+// Use k, v for attention computation...
+```
 
-**Dependency change:** Remove `candle-transformers` from harmony-inference. Add `candle-nn` as direct dependency. Net simplification — we depend on lower-level crates, not the entire model zoo.
+**Additional forked utilities (~70 lines):**
+- `QMatMul`: tracing wrapper around `candle::quantized::QMatMul` (~30 lines)
+- `RmsNorm`: dequantized weight + `candle_nn::ops::rms_norm` (~27 lines)
+- `repeat_kv`: GQA key/value head expansion via cat + reshape (~10 lines)
+
+Total fork: ~320 lines. All attention math is identical to upstream — only the cache threading changes.
+
+**Dependency change:** Remove `candle-transformers` from harmony-inference. Add `candle-nn` as direct dependency. Net simplification — we depend on lower-level candle crates, not the entire model zoo.
 
 ---
 
@@ -168,6 +190,16 @@ fn verify_draft_tokens(engine: &QwenEngine, request: &VerifyRequest) -> Result<V
 
 No `reset()` call needed. Fresh cache per verification.
 
+### DSD drafting — `handle_speculative_query()` (runtime.rs)
+
+Currently calls `engine.reset()`, then `engine.forward(&prompt_tokens)`, then loops `engine.forward(&[token_id])` to generate draft tokens. Converts to the same pattern: create fresh cache, prefill, draft loop. Cache is dropped when the function returns.
+
+### DSD continuation — `handle_verify_response()` (runtime.rs)
+
+Currently calls `engine.reset()`, then `engine.forward(&full_sequence)` to re-prefill the full context (accepted tokens + bonus), then drafts more tokens. Same conversion: fresh cache, prefill full sequence, draft loop.
+
+**Note:** Both DSD functions currently re-prefill from scratch on each call (no cache persistence between rounds). This is correct for the current stateless DSD design. A future optimization could store an `InferenceCache` in `DsdSession` to avoid re-prefilling the accepted prefix — but that's out of scope for this change.
+
 ---
 
 ## Error Handling
@@ -200,7 +232,7 @@ Checked at the top of `forward()`. All other error paths unchanged.
 
 | File | Purpose |
 |------|---------|
-| `crates/harmony-inference/src/qwen3_ext.rs` | Forked quantized Qwen3 with externalized cache (~250 lines) |
+| `crates/harmony-inference/src/qwen3_ext.rs` | Forked quantized Qwen3 with externalized cache (~320 lines, includes QMatMul/RmsNorm/repeat_kv utilities) |
 
 **Unchanged:**
 
