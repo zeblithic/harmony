@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use harmony_content::ContentId;
 
 use crate::manifest::{ModelAdvertisement, ModelManifest, ModelTask};
-use crate::wire;
+use crate::wire::{self, ModelError};
 
 /// Tracks local and remote model availability.
 pub struct ModelRegistry {
@@ -69,7 +69,10 @@ impl ModelRegistry {
     }
 
     /// Process an event and return any resulting actions.
-    pub fn handle_event(&mut self, event: ModelRegistryEvent) -> Vec<ModelRegistryAction> {
+    pub fn handle_event(
+        &mut self,
+        event: ModelRegistryEvent,
+    ) -> Result<Vec<ModelRegistryAction>, ModelError> {
         match event {
             ModelRegistryEvent::RegisterLocal {
                 manifest_cid,
@@ -84,17 +87,16 @@ impl ModelRegistry {
                     tasks: manifest.tasks.clone(),
                     memory_estimate: manifest.memory_estimate,
                 };
+                self.local_models.insert(manifest_cid, manifest);
                 let key_expr = harmony_zenoh::namespace::model::advertisement_key(
                     &hex::encode(manifest_cid.to_bytes()),
                     &hex::encode(self.local_addr),
                 );
-                match wire::encode_advertisement(&ad) {
-                    Ok(payload) => {
-                        self.local_models.insert(manifest_cid, manifest);
-                        vec![ModelRegistryAction::PublishAdvertisement { key_expr, payload }]
-                    }
-                    Err(_) => vec![],
-                }
+                let payload = wire::encode_advertisement(&ad)?;
+                Ok(vec![ModelRegistryAction::PublishAdvertisement {
+                    key_expr,
+                    payload,
+                }])
             }
             ModelRegistryEvent::UnregisterLocal { manifest_cid } => {
                 if self.local_models.remove(&manifest_cid).is_some() {
@@ -102,9 +104,9 @@ impl ModelRegistry {
                         &hex::encode(manifest_cid.to_bytes()),
                         &hex::encode(self.local_addr),
                     );
-                    vec![ModelRegistryAction::RetractAdvertisement { key_expr }]
+                    Ok(vec![ModelRegistryAction::RetractAdvertisement { key_expr }])
                 } else {
-                    vec![]
+                    Ok(vec![])
                 }
             }
             ModelRegistryEvent::AdvertisementReceived {
@@ -116,14 +118,14 @@ impl ModelRegistry {
                     .entry(manifest_cid)
                     .or_default()
                     .insert(node_addr, ad);
-                vec![]
+                Ok(vec![])
             }
             ModelRegistryEvent::NodeDeparted { node_addr } => {
                 self.remote_models.retain(|_, nodes| {
                     nodes.remove(&node_addr);
                     !nodes.is_empty()
                 });
-                vec![]
+                Ok(vec![])
             }
         }
     }
@@ -219,11 +221,25 @@ impl ModelRegistry {
         results
     }
 
-    /// Which nodes have a specific model? Returns None if unknown.
+    /// Which remote nodes have a specific model?
+    ///
+    /// Returns `None` if the model is completely unknown (not local, not remote).
+    /// Returns `Some(remote_nodes)` if the model is known — the vec may be empty
+    /// if the model is only available locally. Check `local_models()` to determine
+    /// if this node itself holds the model.
     pub fn nodes_for_model(&self, manifest_cid: &ContentId) -> Option<Vec<[u8; 16]>> {
-        self.remote_models
+        let local_has = self.local_models.contains_key(manifest_cid);
+        let remote_nodes: Vec<[u8; 16]> = self
+            .remote_models
             .get(manifest_cid)
             .map(|nodes| nodes.keys().copied().collect())
+            .unwrap_or_default();
+
+        if !local_has && remote_nodes.is_empty() {
+            None
+        } else {
+            Some(remote_nodes)
+        }
     }
 }
 
@@ -257,7 +273,7 @@ mod tests {
             tokenizer_cid: None,
         };
         let encoded = wire::encode_manifest(&manifest).unwrap();
-        let cid = wire::manifest_cid(&encoded);
+        let cid = wire::manifest_cid(&encoded).unwrap();
         (cid, manifest)
     }
 
@@ -277,10 +293,12 @@ mod tests {
     fn register_local_emits_publish() {
         let mut reg = ModelRegistry::new(LOCAL_ADDR);
         let (cid, manifest) = make_manifest("test-model", "qwen3", vec![ModelTask::TextGeneration]);
-        let actions = reg.handle_event(ModelRegistryEvent::RegisterLocal {
-            manifest_cid: cid,
-            manifest: manifest.clone(),
-        });
+        let actions = reg
+            .handle_event(ModelRegistryEvent::RegisterLocal {
+                manifest_cid: cid,
+                manifest: manifest.clone(),
+            })
+            .unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             ModelRegistryAction::PublishAdvertisement { key_expr, payload } => {
@@ -302,8 +320,11 @@ mod tests {
         reg.handle_event(ModelRegistryEvent::RegisterLocal {
             manifest_cid: cid,
             manifest,
-        });
-        let actions = reg.handle_event(ModelRegistryEvent::UnregisterLocal { manifest_cid: cid });
+        })
+        .unwrap();
+        let actions = reg
+            .handle_event(ModelRegistryEvent::UnregisterLocal { manifest_cid: cid })
+            .unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             ModelRegistryAction::RetractAdvertisement { key_expr } => {
@@ -320,11 +341,13 @@ mod tests {
         let (cid, manifest) =
             make_manifest("remote-model", "llama", vec![ModelTask::TextGeneration]);
         let ad = make_advertisement(cid, &manifest);
-        let actions = reg.handle_event(ModelRegistryEvent::AdvertisementReceived {
-            manifest_cid: cid,
-            node_addr: REMOTE_ADDR_1,
-            ad,
-        });
+        let actions = reg
+            .handle_event(ModelRegistryEvent::AdvertisementReceived {
+                manifest_cid: cid,
+                node_addr: REMOTE_ADDR_1,
+                ad,
+            })
+            .unwrap();
         assert!(
             actions.is_empty(),
             "receiving an ad should not emit actions"
@@ -345,16 +368,20 @@ mod tests {
             manifest_cid: cid1,
             node_addr: REMOTE_ADDR_1,
             ad: ad1,
-        });
+        })
+        .unwrap();
         reg.handle_event(ModelRegistryEvent::AdvertisementReceived {
             manifest_cid: cid2,
             node_addr: REMOTE_ADDR_1,
             ad: ad2,
-        });
+        })
+        .unwrap();
 
-        let actions = reg.handle_event(ModelRegistryEvent::NodeDeparted {
-            node_addr: REMOTE_ADDR_1,
-        });
+        let actions = reg
+            .handle_event(ModelRegistryEvent::NodeDeparted {
+                node_addr: REMOTE_ADDR_1,
+            })
+            .unwrap();
         assert!(actions.is_empty());
         assert!(reg.nodes_for_model(&cid1).is_none());
         assert!(reg.nodes_for_model(&cid2).is_none());
@@ -371,13 +398,15 @@ mod tests {
         reg.handle_event(ModelRegistryEvent::RegisterLocal {
             manifest_cid: cid_local,
             manifest: manifest_local,
-        });
+        })
+        .unwrap();
         let ad = make_advertisement(cid_remote, &manifest_remote);
         reg.handle_event(ModelRegistryEvent::AdvertisementReceived {
             manifest_cid: cid_remote,
             node_addr: REMOTE_ADDR_1,
             ad,
-        });
+        })
+        .unwrap();
 
         let text_gen = reg.find_by_task(ModelTask::TextGeneration);
         assert_eq!(text_gen.len(), 1);
@@ -397,7 +426,8 @@ mod tests {
         reg.handle_event(ModelRegistryEvent::RegisterLocal {
             manifest_cid: cid,
             manifest,
-        });
+        })
+        .unwrap();
         let results = reg.find_by_family("qwen3");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, cid);
@@ -414,13 +444,15 @@ mod tests {
         reg.handle_event(ModelRegistryEvent::RegisterLocal {
             manifest_cid: cid,
             manifest: manifest.clone(),
-        });
+        })
+        .unwrap();
         let ad = make_advertisement(cid, &manifest);
         reg.handle_event(ModelRegistryEvent::AdvertisementReceived {
             manifest_cid: cid,
             node_addr: REMOTE_ADDR_1,
             ad,
-        });
+        })
+        .unwrap();
 
         let results = reg.find_by_task(ModelTask::TextGeneration);
         assert_eq!(results.len(), 1);
@@ -438,12 +470,14 @@ mod tests {
             manifest_cid: cid,
             node_addr: REMOTE_ADDR_1,
             ad: ad1,
-        });
+        })
+        .unwrap();
         reg.handle_event(ModelRegistryEvent::AdvertisementReceived {
             manifest_cid: cid,
             node_addr: REMOTE_ADDR_2,
             ad: ad2,
-        });
+        })
+        .unwrap();
 
         reg.remove_advertisement(&cid, &REMOTE_ADDR_1);
         let nodes = reg.nodes_for_model(&cid).unwrap();
@@ -458,5 +492,19 @@ mod tests {
         let reg = ModelRegistry::new(LOCAL_ADDR);
         let fake_cid = ContentId::for_book(b"nonexistent", ContentFlags::default()).unwrap();
         assert!(reg.nodes_for_model(&fake_cid).is_none());
+    }
+
+    #[test]
+    fn nodes_for_local_only_model_returns_some_empty() {
+        let mut reg = ModelRegistry::new(LOCAL_ADDR);
+        let (cid, manifest) = make_manifest("local-only", "qwen3", vec![ModelTask::TextGeneration]);
+        reg.handle_event(ModelRegistryEvent::RegisterLocal {
+            manifest_cid: cid,
+            manifest,
+        })
+        .unwrap();
+        // Model is local-only — nodes_for_model returns Some(empty), not None.
+        let nodes = reg.nodes_for_model(&cid);
+        assert_eq!(nodes, Some(vec![]));
     }
 }

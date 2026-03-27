@@ -51,9 +51,9 @@ pub fn decode_manifest(data: &[u8]) -> Result<ModelManifest, ModelError> {
 /// Compute the [`ContentId`] for an encoded manifest.
 ///
 /// Manifests are always public durable (flags `00`).
-pub fn manifest_cid(data: &[u8]) -> ContentId {
-    ContentId::for_book(data, ContentFlags::default())
-        .expect("encoded manifest should be within book size limit")
+/// Returns [`ModelError::ManifestTooLarge`] if the data exceeds the CAS book size limit.
+pub fn manifest_cid(data: &[u8]) -> Result<ContentId, ModelError> {
+    ContentId::for_book(data, ContentFlags::default()).map_err(|_| ModelError::ManifestTooLarge)
 }
 
 /// Serialize a [`ModelAdvertisement`] to postcard bytes.
@@ -114,8 +114,8 @@ mod tests {
     fn manifest_cid_deterministic() {
         let manifest = sample_manifest();
         let encoded = encode_manifest(&manifest).unwrap();
-        let cid1 = manifest_cid(&encoded);
-        let cid2 = manifest_cid(&encoded);
+        let cid1 = manifest_cid(&encoded).unwrap();
+        let cid2 = manifest_cid(&encoded).unwrap();
         assert_eq!(cid1, cid2);
     }
 
