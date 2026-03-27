@@ -14,6 +14,7 @@ members = [
     "crates/harmony-identity",
     "crates/harmony-ingest",
     "crates/harmony-inference",
+    "crates/harmony-model",
     "crates/harmony-jain",
     "crates/harmony-jcs",
     "crates/harmony-kel",
