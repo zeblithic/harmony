@@ -1157,7 +1157,7 @@ pub async fn run(
                 if let RuntimeAction::RunInference {
                     query_id,
                     ref task_id,
-                    ref prompt,
+                    ref input,
                     sampling_params_raw,
                 } = action
                 {
@@ -1166,8 +1166,22 @@ pub async fn run(
                         let max_tokens = crate::inference::DEFAULT_MAX_INFERENCE_TOKENS;
                         let query_id = query_id;
                         let task_id = task_id.clone();
-                        let prompt = prompt.clone();
+                        let input_clone = input.clone();
                         let params = crate::inference::decode_sampling_params(&sampling_params_raw);
+
+                        // Extract prompt text or reject token mode (Task 3 adds full support).
+                        let prompt = match input_clone {
+                            crate::inference::InferenceInput::Text(t) => t,
+                            crate::inference::InferenceInput::TokenIds(_) => {
+                                let _ = inference_tx.try_send(InferenceResult::Failed {
+                                    query_id,
+                                    task_id: task_id.clone(),
+                                    error: "token inference not yet implemented".into(),
+                                    engine,
+                                });
+                                continue;
+                            }
+                        };
 
                         // Await JoinHandle to detect panics — if the blocking
                         // task panics, the engine is lost. Send a Panicked signal

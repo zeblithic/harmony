@@ -134,7 +134,7 @@ impl TokenInferenceRequest {
 }
 
 /// Input to the inference loop — either text (0x02) or pre-tokenized (0x03).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum InferenceInput {
     /// Text prompt — will be tokenized by the engine.
     Text(String),
