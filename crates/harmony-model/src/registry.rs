@@ -87,12 +87,13 @@ impl ModelRegistry {
                     tasks: manifest.tasks.clone(),
                     memory_estimate: manifest.memory_estimate,
                 };
-                self.local_models.insert(manifest_cid, manifest);
                 let key_expr = harmony_zenoh::namespace::model::advertisement_key(
                     &hex::encode(manifest_cid.to_bytes()),
                     &hex::encode(self.local_addr),
                 );
                 let payload = wire::encode_advertisement(&ad)?;
+                // Insert after encode so error = no state change.
+                self.local_models.insert(manifest_cid, manifest);
                 Ok(vec![ModelRegistryAction::PublishAdvertisement {
                     key_expr,
                     payload,
@@ -114,6 +115,10 @@ impl ModelRegistry {
                 node_addr,
                 ad,
             } => {
+                // Ignore our own advertisements (Zenoh can echo them back).
+                if node_addr == self.local_addr {
+                    return Ok(vec![]);
+                }
                 self.remote_models
                     .entry(manifest_cid)
                     .or_default()
@@ -149,49 +154,25 @@ impl ModelRegistry {
 
     /// Find models matching a task type (searches both local and remote).
     pub fn find_by_task(&self, task: ModelTask) -> Vec<(ContentId, Source)> {
-        let mut results = Vec::new();
-        let mut seen = HashSet::new();
-
-        // Local models matching the task.
-        for (cid, manifest) in &self.local_models {
-            if manifest.tasks.contains(&task) {
-                let remote_nodes: Vec<[u8; 16]> = self
-                    .remote_models
-                    .get(cid)
-                    .map(|nodes| nodes.keys().copied().collect())
-                    .unwrap_or_default();
-                let source = if remote_nodes.is_empty() {
-                    Source::Local
-                } else {
-                    Source::Both(remote_nodes)
-                };
-                results.push((*cid, source));
-                seen.insert(*cid);
-            }
-        }
-
-        // Remote-only models matching the task.
-        for (cid, nodes) in &self.remote_models {
-            if seen.contains(cid) {
-                continue;
-            }
-            let any_match = nodes.values().any(|ad| ad.tasks.contains(&task));
-            if any_match {
-                let node_addrs: Vec<[u8; 16]> = nodes.keys().copied().collect();
-                results.push((*cid, Source::Remote(node_addrs)));
-            }
-        }
-
-        results
+        self.find_matching(|m| m.tasks.contains(&task), |ad| ad.tasks.contains(&task))
     }
 
     /// Find models by family name (searches both local and remote).
     pub fn find_by_family(&self, family: &str) -> Vec<(ContentId, Source)> {
+        self.find_matching(|m| m.family == family, |ad| ad.family == family)
+    }
+
+    /// Shared search logic for local + remote model queries.
+    fn find_matching(
+        &self,
+        local_pred: impl Fn(&ModelManifest) -> bool,
+        remote_pred: impl Fn(&ModelAdvertisement) -> bool,
+    ) -> Vec<(ContentId, Source)> {
         let mut results = Vec::new();
         let mut seen = HashSet::new();
 
         for (cid, manifest) in &self.local_models {
-            if manifest.family == family {
+            if local_pred(manifest) {
                 let remote_nodes: Vec<[u8; 16]> = self
                     .remote_models
                     .get(cid)
@@ -211,8 +192,7 @@ impl ModelRegistry {
             if seen.contains(cid) {
                 continue;
             }
-            let any_match = nodes.values().any(|ad| ad.family == family);
-            if any_match {
+            if nodes.values().any(&remote_pred) {
                 let node_addrs: Vec<[u8; 16]> = nodes.keys().copied().collect();
                 results.push((*cid, Source::Remote(node_addrs)));
             }
@@ -492,6 +472,22 @@ mod tests {
         let reg = ModelRegistry::new(LOCAL_ADDR);
         let fake_cid = ContentId::for_book(b"nonexistent", ContentFlags::default()).unwrap();
         assert!(reg.nodes_for_model(&fake_cid).is_none());
+    }
+
+    #[test]
+    fn self_advertisement_ignored() {
+        let mut reg = ModelRegistry::new(LOCAL_ADDR);
+        let (cid, manifest) = make_manifest("self-model", "qwen3", vec![ModelTask::TextGeneration]);
+        let ad = make_advertisement(cid, &manifest);
+        // Simulate Zenoh echoing our own advertisement back.
+        reg.handle_event(ModelRegistryEvent::AdvertisementReceived {
+            manifest_cid: cid,
+            node_addr: LOCAL_ADDR,
+            ad,
+        })
+        .unwrap();
+        // Should NOT appear in remote_models.
+        assert!(reg.nodes_for_model(&cid).is_none());
     }
 
     #[test]
