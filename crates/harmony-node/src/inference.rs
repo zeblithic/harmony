@@ -6,6 +6,12 @@ pub const DEFAULT_MAX_INFERENCE_TOKENS: u32 = 512;
 /// Request payload tag for inference queries.
 pub const INFERENCE_TAG: u8 = 0x02;
 
+/// Request payload tag for token-level inference queries.
+pub const TOKEN_INFERENCE_TAG: u8 = 0x03;
+
+/// Maximum token count to prevent allocation bombs from untrusted input.
+const MAX_INPUT_TOKENS: u32 = 131_072;
+
 /// Capacity status bytes.
 pub const CAPACITY_READY: u8 = 0x01;
 pub const CAPACITY_BUSY: u8 = 0x00;
@@ -57,12 +63,7 @@ impl InferenceRequest {
             params.copy_from_slice(&payload[5 + prompt_len..5 + prompt_len + 20]);
             params
         } else {
-            // Greedy defaults: temperature=0.0, top_p=1.0, top_k=0, repeat_penalty=1.0, repeat_last_n=64
-            let mut params = [0u8; 20];
-            params[4..8].copy_from_slice(&1.0f32.to_le_bytes()); // top_p
-            params[12..16].copy_from_slice(&1.0f32.to_le_bytes()); // repeat_penalty
-            params[16..20].copy_from_slice(&64u32.to_le_bytes()); // repeat_last_n
-            params
+            greedy_defaults()
         };
 
         Ok(InferenceRequest {
@@ -70,6 +71,84 @@ impl InferenceRequest {
             sampling_params,
         })
     }
+}
+
+/// Greedy sampling defaults: temperature=0.0, top_p=1.0, top_k=0, repeat_penalty=1.0, repeat_last_n=64.
+fn greedy_defaults() -> [u8; 20] {
+    let mut params = [0u8; 20];
+    params[4..8].copy_from_slice(&1.0f32.to_le_bytes());
+    params[12..16].copy_from_slice(&1.0f32.to_le_bytes());
+    params[16..20].copy_from_slice(&64u32.to_le_bytes());
+    params
+}
+
+/// Parsed token-level inference request from a Zenoh query payload.
+pub struct TokenInferenceRequest {
+    pub token_ids: Vec<u32>,
+    pub sampling_params: [u8; 20],
+}
+
+impl TokenInferenceRequest {
+    /// Parse a token-level inference request tagged with 0x03.
+    ///
+    /// Format: `[0x03] [token_count: u32 LE] [token_ids: u32 LE × count] [sampling_params: 20 bytes (optional)]`
+    pub fn parse(payload: &[u8]) -> Result<Self, String> {
+        if payload.is_empty() || payload[0] != TOKEN_INFERENCE_TAG {
+            return Err(format!(
+                "expected token inference tag 0x{:02x}, got 0x{:02x}",
+                TOKEN_INFERENCE_TAG,
+                payload.first().copied().unwrap_or(0)
+            ));
+        }
+        if payload.len() < 5 {
+            return Err("payload too short for token count".into());
+        }
+        let token_count = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+        if token_count > MAX_INPUT_TOKENS {
+            return Err(format!("token count {} exceeds maximum {}", token_count, MAX_INPUT_TOKENS));
+        }
+        let token_count = token_count as usize;
+        let tokens_end = 5 + token_count * 4;
+        if payload.len() < tokens_end {
+            return Err(format!(
+                "payload too short: need {} bytes for {} tokens, have {}",
+                token_count * 4, token_count, payload.len() - 5
+            ));
+        }
+        let mut token_ids = Vec::with_capacity(token_count);
+        for i in 0..token_count {
+            let offset = 5 + i * 4;
+            token_ids.push(u32::from_le_bytes([
+                payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
+            ]));
+        }
+        let sampling_params = if payload.len() >= tokens_end + 20 {
+            let mut params = [0u8; 20];
+            params.copy_from_slice(&payload[tokens_end..tokens_end + 20]);
+            params
+        } else {
+            greedy_defaults()
+        };
+        Ok(TokenInferenceRequest { token_ids, sampling_params })
+    }
+}
+
+/// Input to the inference loop — either text (0x02) or pre-tokenized (0x03).
+#[derive(Debug, Clone)]
+pub enum InferenceInput {
+    /// Text prompt — will be tokenized by the engine.
+    Text(String),
+    /// Pre-tokenized token IDs — skip tokenization.
+    TokenIds(Vec<u32>),
+}
+
+/// Output from the inference loop — matches the input type.
+#[derive(Debug, Clone)]
+pub enum InferenceOutput {
+    /// Concatenated text from detokenized tokens.
+    Text(String),
+    /// Raw generated token IDs.
+    TokenIds(Vec<u32>),
 }
 
 /// Convert raw 20-byte sampling parameters to `SamplingParams`.
@@ -287,6 +366,73 @@ mod tests {
         assert_eq!(params.top_k, 40);
         assert!((params.repeat_penalty - 1.1).abs() < 1e-6);
         assert_eq!(params.repeat_last_n, 128);
+    }
+
+    #[test]
+    fn parse_token_request_with_params() {
+        let tokens: Vec<u32> = vec![100, 200, 300];
+        let mut payload = vec![TOKEN_INFERENCE_TAG];
+        payload.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+        for &t in &tokens {
+            payload.extend_from_slice(&t.to_le_bytes());
+        }
+        let mut params = [0u8; 20];
+        params[0..4].copy_from_slice(&0.7f32.to_le_bytes());
+        params[4..8].copy_from_slice(&1.0f32.to_le_bytes());
+        params[12..16].copy_from_slice(&1.0f32.to_le_bytes());
+        params[16..20].copy_from_slice(&64u32.to_le_bytes());
+        payload.extend_from_slice(&params);
+
+        let req = TokenInferenceRequest::parse(&payload).unwrap();
+        assert_eq!(req.token_ids, vec![100, 200, 300]);
+        assert_eq!(f32::from_le_bytes([
+            req.sampling_params[0], req.sampling_params[1],
+            req.sampling_params[2], req.sampling_params[3]
+        ]), 0.7);
+    }
+
+    #[test]
+    fn parse_token_request_greedy_defaults() {
+        let tokens: Vec<u32> = vec![42];
+        let mut payload = vec![TOKEN_INFERENCE_TAG];
+        payload.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+        for &t in &tokens {
+            payload.extend_from_slice(&t.to_le_bytes());
+        }
+        let req = TokenInferenceRequest::parse(&payload).unwrap();
+        assert_eq!(req.token_ids, vec![42]);
+        assert_eq!(f32::from_le_bytes([
+            req.sampling_params[0], req.sampling_params[1],
+            req.sampling_params[2], req.sampling_params[3]
+        ]), 0.0);
+    }
+
+    #[test]
+    fn parse_token_request_wrong_tag() {
+        let payload = vec![0x02, 0, 0, 0, 0];
+        assert!(TokenInferenceRequest::parse(&payload).is_err());
+    }
+
+    #[test]
+    fn parse_token_request_truncated() {
+        let mut payload = vec![TOKEN_INFERENCE_TAG];
+        payload.extend_from_slice(&100u32.to_le_bytes());
+        assert!(TokenInferenceRequest::parse(&payload).is_err());
+    }
+
+    #[test]
+    fn parse_token_request_empty_tokens() {
+        let mut payload = vec![TOKEN_INFERENCE_TAG];
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let req = TokenInferenceRequest::parse(&payload).unwrap();
+        assert!(req.token_ids.is_empty());
+    }
+
+    #[test]
+    fn parse_token_request_too_many_tokens() {
+        let mut payload = vec![TOKEN_INFERENCE_TAG];
+        payload.extend_from_slice(&(super::MAX_INPUT_TOKENS + 1).to_le_bytes());
+        assert!(TokenInferenceRequest::parse(&payload).is_err());
     }
 
     #[test]
