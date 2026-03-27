@@ -1,0 +1,12 @@
+[package]
+name = "harmony-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Structured telemetry event types for the Harmony mesh network"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

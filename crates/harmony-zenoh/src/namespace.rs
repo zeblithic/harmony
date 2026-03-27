@@ -747,6 +747,35 @@ pub mod model {
     }
 }
 
+// ── Telemetry ──────────────────────────────────────────────────────
+
+/// Telemetry event key expressions.
+///
+/// Nodes publish structured `TelemetryEvent` messages to these topics.
+/// Intents are free-form strings (e.g. `"health"`, `"anomaly"`,
+/// `"object_detected"`). Node addresses are lowercase hex.
+pub mod telemetry {
+    use alloc::{format, string::String};
+
+    /// Base prefix: `harmony/telemetry`
+    pub const PREFIX: &str = "harmony/telemetry";
+
+    /// Per-node, per-intent telemetry key: `harmony/telemetry/{node_addr}/{intent}`
+    pub fn key(node_addr: &str, intent: &str) -> String {
+        format!("{PREFIX}/{node_addr}/{intent}")
+    }
+
+    /// Subscribe to all intents from one node: `harmony/telemetry/{node_addr}/*`
+    pub fn sub_node(node_addr: &str) -> String {
+        format!("{PREFIX}/{node_addr}/*")
+    }
+
+    /// Subscribe to one intent across all nodes: `harmony/telemetry/*/{intent}`
+    pub fn sub_intent(intent: &str) -> String {
+        format!("{PREFIX}/*/{intent}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1311,6 +1340,7 @@ mod tests {
             memo::PREFIX,
             page::PREFIX,
             engram::PREFIX,
+            telemetry::PREFIX,
         ];
         for prefix in prefixes {
             assert!(
@@ -1396,5 +1426,17 @@ mod tests {
         assert_eq!(pattern, "harmony/model/abcd1234/*");
 
         assert_eq!(model::PREFIX, "harmony/model");
+    }
+
+    #[test]
+    fn telemetry_namespace_keys() {
+        let key = telemetry::key("node01", "anomaly");
+        assert_eq!(key, "harmony/telemetry/node01/anomaly");
+
+        let sub_node = telemetry::sub_node("node01");
+        assert_eq!(sub_node, "harmony/telemetry/node01/*");
+
+        let sub_intent = telemetry::sub_intent("health");
+        assert_eq!(sub_intent, "harmony/telemetry/*/health");
     }
 }

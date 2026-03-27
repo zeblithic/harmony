@@ -3483,6 +3483,14 @@ name = "harmony-speculative"
 version = "0.1.0"
 
 [[package]]
+name = "harmony-telemetry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harmony-trust"
 version = "0.1.0"
 dependencies = [
