@@ -403,6 +403,7 @@ impl<B: BookStore> StorageTier<B> {
                 // Note: queries_served was already incremented in handle_content_query
                 // when this query first arrived — only count the disk-specific metric.
                 self.metrics.disk_reads_served += 1;
+                self.touch_disk_lru(&cid);
                 let mut actions = vec![StorageTierAction::SendReply {
                     query_id,
                     payload: data,
@@ -722,6 +723,12 @@ impl<B: BookStore> StorageTier<B> {
             actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
             skipped = 0; // Reset after successful eviction
         }
+    }
+
+    /// Move a CID to the back of the disk LRU (most recently used).
+    pub(crate) fn touch_disk_lru(&mut self, cid: &ContentId) {
+        self.disk_lru.retain(|c| c != cid);
+        self.disk_lru.push_back(*cid);
     }
 }
 
@@ -2417,5 +2424,31 @@ mod tests {
         tier.test_persist_to_disk(cid, 100);
         tier.test_persist_to_disk(cid, 100); // same CID again
         assert_eq!(tier.disk_used_bytes(), 100); // counted once
+    }
+
+    #[test]
+    fn disk_read_complete_refreshes_lru_ordering() {
+        let budget = StorageBudget { cache_capacity: 10, max_pinned_bytes: 0 };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(), budget,
+            ContentPolicy::default(), FilterBroadcastConfig::default(),
+        );
+        tier.enable_disk(Vec::new());
+        tier.set_disk_quota(250);
+
+        let cid_a = ContentId::from_bytes([0x0A; 32]);
+        let cid_b = ContentId::from_bytes([0x0B; 32]);
+        let cid_c = ContentId::from_bytes([0x0C; 32]);
+
+        tier.test_persist_to_disk(cid_a, 100);
+        tier.test_persist_to_disk(cid_b, 100);
+
+        // Simulate a disk read of cid_a — moves it to back of LRU
+        tier.touch_disk_lru(&cid_a);
+
+        // Now cid_b is oldest. Adding cid_c should evict cid_b, not cid_a.
+        let actions = tier.test_persist_to_disk(cid_c, 100);
+        assert!(actions.iter().any(|a| matches!(a, StorageTierAction::RemoveFromDisk { cid } if *cid == cid_b)));
+        assert!(tier.disk_contains(&cid_a)); // refreshed, not evicted
     }
 }
