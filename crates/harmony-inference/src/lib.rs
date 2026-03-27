@@ -19,6 +19,7 @@
 
 pub mod engine;
 pub mod error;
+pub(crate) mod qwen3_ext;
 pub mod sampling;
 
 pub use engine::QwenEngine;
