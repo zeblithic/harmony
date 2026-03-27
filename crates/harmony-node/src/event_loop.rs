@@ -1620,29 +1620,40 @@ async fn dispatch_action(
         }
         RuntimeAction::S3Lookup { cid, query_id } => {
             #[cfg(feature = "archivist")]
-            if let Some(ref s3) = s3_read_library {
-                let s3 = s3.clone();
-                let tx = s3_tx.clone();
-                tokio::spawn(async move {
-                    match s3.get_book(&cid.to_bytes()).await {
-                        Ok(Some(data)) => {
-                            let _ = tx.send(S3IoResult::ReadComplete { cid, query_id, data }).await;
+            {
+                if let Some(ref s3) = s3_read_library {
+                    let s3 = s3.clone();
+                    let tx = s3_tx.clone();
+                    tokio::spawn(async move {
+                        match s3.get_book(&cid.to_bytes()).await {
+                            Ok(Some(data)) => {
+                                let _ = tx.send(S3IoResult::ReadComplete { cid, query_id, data }).await;
+                            }
+                            Ok(None) => {
+                                tracing::debug!(cid = %hex::encode(&cid.to_bytes()[..8]), "S3 book not found");
+                                let _ = tx.send(S3IoResult::ReadFailed { cid, query_id }).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(cid = %hex::encode(&cid.to_bytes()[..8]), err = %e, "S3 fetch error");
+                                let _ = tx.send(S3IoResult::ReadFailed { cid, query_id }).await;
+                            }
                         }
-                        Ok(None) => {
-                            tracing::debug!(cid = %hex::encode(&cid.to_bytes()[..8]), "S3 book not found");
-                            let _ = tx.send(S3IoResult::ReadFailed { cid, query_id }).await;
-                        }
-                        Err(e) => {
-                            tracing::warn!(cid = %hex::encode(&cid.to_bytes()[..8]), err = %e, "S3 fetch error");
-                            let _ = tx.send(S3IoResult::ReadFailed { cid, query_id }).await;
-                        }
-                    }
-                });
+                    });
+                } else {
+                    // S3 library unavailable (init failed at startup) — resolve
+                    // the query immediately so it doesn't hang.
+                    tracing::warn!(
+                        cid = %hex::encode(&cid.to_bytes()[..8]),
+                        "S3Lookup dispatched but s3_read_library not initialised"
+                    );
+                    let _ = s3_tx.try_send(S3IoResult::ReadFailed { cid, query_id });
+                }
             }
-            // Suppress unused-variable warnings when archivist feature is disabled.
+            // When archivist feature is disabled, resolve the query immediately.
             #[cfg(not(feature = "archivist"))]
             {
-                let _ = (cid, query_id);
+                tracing::debug!("S3Lookup ignored — archivist feature not enabled");
+                let _ = s3_tx.try_send(S3IoResult::ReadFailed { cid, query_id });
             }
         }
     }
