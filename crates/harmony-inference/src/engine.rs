@@ -1,16 +1,21 @@
-//! QwenEngine: candle-based inference engine for quantized Qwen3 models.
+//! QwenEngine: stateless inference engine for quantized Qwen3 models.
+//!
+//! After initialization (`load_gguf`, `load_tokenizer`), all inference methods
+//! take `&self`. Mutable state lives in the caller-owned [`InferenceCache`].
 
 use std::io::Cursor;
 
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
-use candle_transformers::models::quantized_qwen3;
 use rand::thread_rng;
 
 use crate::error::InferenceError;
-use crate::{InferenceEngine, SamplingParams};
+use crate::{InferenceCache, InferenceEngine, SamplingParams};
 
-/// Inference engine wrapping candle-transformers' quantized Qwen3 implementation.
+/// Inference engine wrapping a forked quantized Qwen3 implementation.
+///
+/// Stateless after initialization — all inference methods take `&self`.
+/// KV cache and token history are caller-managed via [`InferenceCache`].
 ///
 /// # Usage
 ///
@@ -19,18 +24,15 @@ use crate::{InferenceEngine, SamplingParams};
 /// engine.load_gguf(&gguf_bytes)?;
 /// engine.load_tokenizer(&tokenizer_json)?;
 ///
+/// let mut cache = engine.new_cache()?;
 /// let tokens = engine.tokenize("Hello")?;
-/// let logits = engine.forward(&tokens)?;
-/// let next = engine.sample(&logits, &SamplingParams::greedy())?;
+/// let logits = engine.forward(&tokens, &mut cache)?;
+/// let next = engine.sample(&logits, &SamplingParams::greedy(), &tokens)?;
 /// ```
 pub struct QwenEngine {
-    model: Option<quantized_qwen3::ModelWeights>,
+    model: Option<crate::qwen3_ext::ModelWeights>,
     tokenizer: Option<tokenizers::Tokenizer>,
     device: Device,
-    /// Current position in the KV cache (advances with each forward call).
-    position: usize,
-    /// Tokens seen so far in this conversation (for repeat penalty).
-    token_history: Vec<u32>,
 }
 
 impl QwenEngine {
@@ -43,8 +45,6 @@ impl QwenEngine {
             model: None,
             tokenizer: None,
             device,
-            position: 0,
-            token_history: Vec::new(),
         }
     }
 }
@@ -54,11 +54,10 @@ impl InferenceEngine for QwenEngine {
         let mut cursor = Cursor::new(gguf_data);
         let content = gguf_file::Content::read(&mut cursor)
             .map_err(|e| InferenceError::InvalidGguf(e.to_string()))?;
-        let model = quantized_qwen3::ModelWeights::from_gguf(content, &mut cursor, &self.device)
-            .map_err(|e| InferenceError::InvalidGguf(e.to_string()))?;
+        let model =
+            crate::qwen3_ext::ModelWeights::from_gguf(content, &mut cursor, &self.device)
+                .map_err(|e| InferenceError::InvalidGguf(e.to_string()))?;
         self.model = Some(model);
-        self.position = 0;
-        self.token_history.clear();
         Ok(())
     }
 
@@ -90,37 +89,40 @@ impl InferenceEngine for QwenEngine {
             .map_err(|e| InferenceError::TokenizerError(e.to_string()))
     }
 
-    fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, InferenceError> {
+    fn forward(
+        &self,
+        tokens: &[u32],
+        cache: &mut InferenceCache,
+    ) -> Result<Vec<f32>, InferenceError> {
         if tokens.is_empty() {
             return Err(InferenceError::ForwardFailed(
                 "tokens slice must not be empty".into(),
             ));
         }
-        let model = self.model.as_mut().ok_or(InferenceError::ModelNotLoaded)?;
-        // ModelWeights::forward expects a 2D tensor (batch, seq_len).
+        let model = self.model.as_ref().ok_or(InferenceError::ModelNotLoaded)?;
+
+        // Validate cache matches model architecture.
+        if cache.num_layers != model.num_layers {
+            return Err(InferenceError::CacheMismatch {
+                expected: model.num_layers,
+                actual: cache.num_layers,
+            });
+        }
+
         let seq_len = tokens.len();
         let input = Tensor::new(tokens, &self.device)
             .and_then(|t| t.reshape((1, seq_len)))
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+
+        // model.forward advances cache.position internally.
         let logits = model
-            .forward(&input, self.position)
+            .forward(&input, cache)
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
 
-        // model.forward() mutates the KV cache as a side-effect, so position
-        // and token_history must advance immediately to stay in sync with it.
-        // If logits extraction below fails, the engine is in an indeterminate
-        // state — callers must call reset() before reusing after ForwardFailed.
-        self.token_history.extend_from_slice(tokens);
-        self.position += tokens.len();
-
-        // Candle's quantized_qwen3 outputs [1, vocab_size] (2D with batch=1).
-        // The 2D branch is the normal path; 1D is a defensive fallback.
+        // Extract last logit row.
         let logits = match logits.dims().len() {
             1 => logits,
             2 => {
-                // Normal path: [rows, vocab_size] — take the last row's logits.
-                // candle's quantized_qwen3 returns [1, vocab_size]; if a future
-                // model returns [seq_len, vocab_size] this still picks the right row.
                 let rows = logits
                     .dim(0)
                     .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
@@ -145,33 +147,25 @@ impl InferenceEngine for QwenEngine {
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
     }
 
-    fn sample(&self, logits: &[f32], params: &SamplingParams) -> Result<u32, InferenceError> {
+    fn sample(
+        &self,
+        logits: &[f32],
+        params: &SamplingParams,
+        history: &[u32],
+    ) -> Result<u32, InferenceError> {
         let mut rng = thread_rng();
-        // Use a sliding window of recent tokens for repeat penalty to avoid
-        // unbounded growth and over-suppression in long conversations.
-        let context = if params.repeat_last_n > 0 && params.repeat_last_n < self.token_history.len()
-        {
-            &self.token_history[self.token_history.len() - params.repeat_last_n..]
-        } else {
-            &self.token_history
-        };
+        // Apply repeat_last_n windowing to the caller-provided full history.
+        let context =
+            if params.repeat_last_n > 0 && params.repeat_last_n < history.len() {
+                &history[history.len() - params.repeat_last_n..]
+            } else {
+                history
+            };
         crate::sampling::sample(logits, params, context, &mut rng)
-    }
-
-    fn reset(&mut self) {
-        if let Some(model) = &mut self.model {
-            model.clear_kv_cache();
-        }
-        self.position = 0;
-        self.token_history.clear();
     }
 
     fn eos_token_id(&self) -> Option<u32> {
         let tokenizer = self.tokenizer.as_ref()?;
-        // Try common EOS token strings used by Qwen and other models.
-        // The tokenizer's `token_to_id` uses the vocabulary lookup, which
-        // is more reliable than `tokenize()` (which may add special tokens
-        // or split the string).
         for eos_str in &[
             "<|endoftext|>",
             "<|im_end|>",
@@ -185,6 +179,15 @@ impl InferenceEngine for QwenEngine {
         }
         None
     }
+
+    fn new_cache(&self) -> Result<InferenceCache, InferenceError> {
+        let model = self.model.as_ref().ok_or(InferenceError::ModelNotLoaded)?;
+        Ok(InferenceCache::new(
+            model.num_layers,
+            model.head_dim,
+            model.num_kv_heads,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -192,57 +195,84 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_forward_without_model_returns_error() {
-        let mut engine = QwenEngine::new(Device::Cpu);
-        let result = engine.forward(&[1, 2, 3]);
+    fn forward_without_model_returns_error() {
+        let engine = QwenEngine::new(Device::Cpu);
+        let mut cache = InferenceCache::new(28, 128, 8);
+        let result = engine.forward(&[1, 2, 3], &mut cache);
         assert!(matches!(result, Err(InferenceError::ModelNotLoaded)));
     }
 
     #[test]
-    fn test_tokenize_without_tokenizer_returns_error() {
+    fn forward_empty_tokens_returns_error() {
+        let engine = QwenEngine::new(Device::Cpu);
+        let mut cache = InferenceCache::new(28, 128, 8);
+        let result = engine.forward(&[], &mut cache);
+        assert!(matches!(result, Err(InferenceError::ForwardFailed(_))));
+    }
+
+    #[test]
+    fn tokenize_without_tokenizer_returns_error() {
         let engine = QwenEngine::new(Device::Cpu);
         let result = engine.tokenize("hello");
         assert!(matches!(result, Err(InferenceError::TokenizerNotLoaded)));
     }
 
     #[test]
-    fn test_detokenize_without_tokenizer_returns_error() {
+    fn detokenize_without_tokenizer_returns_error() {
         let engine = QwenEngine::new(Device::Cpu);
         let result = engine.detokenize(&[1, 2, 3]);
         assert!(matches!(result, Err(InferenceError::TokenizerNotLoaded)));
     }
 
     #[test]
-    fn test_invalid_gguf_bytes_returns_error() {
+    fn invalid_gguf_bytes_returns_error() {
         let mut engine = QwenEngine::new(Device::Cpu);
         let result = engine.load_gguf(b"not a valid gguf file");
         assert!(matches!(result, Err(InferenceError::InvalidGguf(_))));
     }
 
     #[test]
-    fn test_invalid_tokenizer_json_returns_error() {
+    fn invalid_tokenizer_json_returns_error() {
         let mut engine = QwenEngine::new(Device::Cpu);
         let result = engine.load_tokenizer(b"not valid json");
         assert!(matches!(result, Err(InferenceError::TokenizerError(_))));
     }
 
     #[test]
-    fn test_sample_without_model_still_works() {
-        // sample() doesn't need a model -- only logits + params
+    fn sample_greedy_works_without_model() {
         let engine = QwenEngine::new(Device::Cpu);
         let logits = [1.0_f32, 5.0, 3.0];
-        let result = engine.sample(&logits, &SamplingParams::greedy());
-        assert_eq!(result.unwrap(), 1); // greedy argmax
+        let result = engine.sample(&logits, &SamplingParams::greedy(), &[]);
+        assert_eq!(result.unwrap(), 1);
     }
 
     #[test]
-    fn test_reset_clears_state() {
-        let mut engine = QwenEngine::new(Device::Cpu);
-        // Simulate some state (without a real model, just verify fields reset)
-        engine.position = 42;
-        engine.token_history = vec![1, 2, 3];
-        engine.reset();
-        assert_eq!(engine.position, 0);
-        assert!(engine.token_history.is_empty());
+    fn sample_applies_repeat_penalty_from_history() {
+        let engine = QwenEngine::new(Device::Cpu);
+        let logits = [1.0_f32, 5.0, 3.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            repeat_penalty: 10.0,
+            ..SamplingParams::greedy()
+        };
+        // Token 1 in history → logit 5.0 / 10.0 = 0.5, so token 2 (3.0) wins
+        let result = engine.sample(&logits, &params, &[1]);
+        assert_eq!(result.unwrap(), 2);
+    }
+
+    #[test]
+    fn new_cache_requires_model() {
+        let engine = QwenEngine::new(Device::Cpu);
+        let result = engine.new_cache();
+        assert!(matches!(result, Err(InferenceError::ModelNotLoaded)));
+    }
+
+    #[test]
+    fn cache_mismatch_detected() {
+        let engine = QwenEngine::new(Device::Cpu);
+        // No model loaded — ModelNotLoaded fires before CacheMismatch check.
+        let mut cache = InferenceCache::new(99, 128, 8);
+        let result = engine.forward(&[1], &mut cache);
+        assert!(matches!(result, Err(InferenceError::ModelNotLoaded)));
     }
 }
