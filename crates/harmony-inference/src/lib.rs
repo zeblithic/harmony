@@ -23,6 +23,58 @@ pub mod sampling;
 pub use engine::QwenEngine;
 pub use error::InferenceError;
 
+use candle_core::Tensor;
+
+/// Externalized KV cache state for transformer inference.
+///
+/// Created via [`InferenceEngine::new_cache()`]. Passed to `forward()` on each
+/// call. The engine appends new K/V tensors; the caller owns the lifecycle.
+///
+/// # Lifecycle
+///
+/// ```ignore
+/// let cache = engine.new_cache()?;
+/// let logits = engine.forward(&tokens, &mut cache)?;
+/// // cache.layers now contains populated K/V tensors
+/// // Drop cache to start a new conversation
+/// ```
+pub struct InferenceCache {
+    /// Per-layer Key/Value tensor pairs. `None` = layer not yet populated.
+    /// Shape per tensor: `[1, num_kv_heads, seq_len, head_dim]`
+    pub layers: Vec<Option<(Tensor, Tensor)>>,
+    /// Number of tokens consumed so far (position offset for RoPE).
+    pub position: usize,
+    /// Expected layer count (validated by `forward()`).
+    pub num_layers: usize,
+    /// Expected head dimension (for downstream consumers).
+    pub head_dim: usize,
+    /// Expected KV head count (for downstream consumers).
+    pub num_kv_heads: usize,
+}
+
+impl InferenceCache {
+    /// Create an empty cache for the given architecture parameters.
+    pub fn new(num_layers: usize, head_dim: usize, num_kv_heads: usize) -> Self {
+        Self {
+            layers: (0..num_layers).map(|_| None).collect(),
+            position: 0,
+            num_layers,
+            head_dim,
+            num_kv_heads,
+        }
+    }
+
+    /// Number of tokens in the cache.
+    pub fn len(&self) -> usize {
+        self.position
+    }
+
+    /// Whether the cache is empty (no tokens consumed).
+    pub fn is_empty(&self) -> bool {
+        self.position == 0
+    }
+}
+
 /// Sampling parameters for token generation.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -104,4 +156,30 @@ pub trait InferenceEngine {
 
     /// Return the EOS (end-of-sequence) token ID, if the tokenizer defines one.
     fn eos_token_id(&self) -> Option<u32>;
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_new_creates_empty_layers() {
+        let cache = InferenceCache::new(28, 128, 8);
+        assert_eq!(cache.layers.len(), 28);
+        assert!(cache.layers.iter().all(|l| l.is_none()));
+        assert_eq!(cache.position, 0);
+        assert_eq!(cache.num_layers, 28);
+        assert_eq!(cache.head_dim, 128);
+        assert_eq!(cache.num_kv_heads, 8);
+    }
+
+    #[test]
+    fn cache_len_tracks_position() {
+        let mut cache = InferenceCache::new(28, 128, 8);
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        cache.position = 42;
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 42);
+    }
 }
