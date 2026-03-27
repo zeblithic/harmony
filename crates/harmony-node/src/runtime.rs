@@ -2292,9 +2292,15 @@ impl<B: BookStore> NodeRuntime<B> {
                 #[cfg(feature = "inference")]
                 {
                     if self.dsd_session.is_some() {
-                        let payload = harmony_speculative::VerifyResponse::serialize_error(
-                            "engine busy with DSD session",
-                        );
+                        // Use AgentResult wire format — the caller is an inference client.
+                        let result = harmony_agent::AgentResult {
+                            task_id: String::new(),
+                            status: harmony_agent::TaskStatus::Rejected,
+                            output: None,
+                            error: Some("engine busy with DSD session".into()),
+                        };
+                        let payload = harmony_agent::encode_result(&result)
+                            .unwrap_or_else(|_| b"engine busy".to_vec());
                         self.pending_direct_actions
                             .push(RuntimeAction::SendReply { query_id, payload });
                         return Vec::new();
@@ -2490,6 +2496,20 @@ impl<B: BookStore> NodeRuntime<B> {
     pub fn return_inference_engine(&mut self, engine: harmony_inference::QwenEngine) {
         self.verification_engine = Some(engine);
         self.inference_running = false;
+    }
+
+    /// Reset inference state after a panic destroyed the engine.
+    ///
+    /// Clears `inference_running` so future requests aren't permanently rejected.
+    /// The engine is gone — `check_inference_model_ready` will recreate it from
+    /// cached GGUF/tokenizer data on the next tick if they're still available.
+    #[cfg(feature = "inference")]
+    pub fn reset_inference_after_panic(&mut self) {
+        self.inference_running = false;
+        // verification_engine is already None (it was moved into the panicked task).
+        // Force re-creation by clearing the queryable so check_inference_model_ready
+        // will re-run.
+        self.inference_queryable_id = None;
     }
 
     /// Check if both GGUF and tokenizer data have arrived, and if so,

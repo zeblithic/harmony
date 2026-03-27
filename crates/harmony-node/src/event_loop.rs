@@ -70,6 +70,8 @@ enum InferenceResult {
         error: String,
         engine: harmony_inference::QwenEngine,
     },
+    /// Inference task panicked — engine is lost, need to recreate.
+    Panicked { query_id: u64, task_id: String },
 }
 
 /// Type alias for the S3 read library reference.
@@ -1167,10 +1169,27 @@ pub async fn run(
                         let prompt = prompt.clone();
                         let params = crate::inference::decode_sampling_params(&sampling_params_raw);
 
-                        tokio::task::spawn_blocking(move || {
+                        // Await JoinHandle to detect panics — if the blocking
+                        // task panics, the engine is lost. Send a Panicked signal
+                        // so the event loop can reset inference_running and recreate.
+                        let panic_tx = inference_tx.clone();
+                        let panic_query_id = query_id;
+                        let panic_task_id = task_id.clone();
+                        let handle = tokio::task::spawn_blocking(move || {
                             run_inference_loop(
                                 engine, tx, query_id, task_id, prompt, params, max_tokens,
                             );
+                        });
+                        tokio::spawn(async move {
+                            if let Err(e) = handle.await {
+                                tracing::error!(err = %e, "inference task panicked — engine lost");
+                                let _ = panic_tx
+                                    .send(InferenceResult::Panicked {
+                                        query_id: panic_query_id,
+                                        task_id: panic_task_id,
+                                    })
+                                    .await;
+                            }
                         });
                     } else {
                         // Engine busy or not loaded — reject with proper AgentResult wire format.
@@ -1893,6 +1912,40 @@ async fn handle_inference_result(
                 }
                 Err(e) => {
                     tracing::error!(%query_id, err = %e, "encode_result failed; query will not be answered");
+                }
+            }
+        }
+        InferenceResult::Panicked { query_id, task_id } => {
+            // Engine is gone (consumed by panic). Reset inference_running so future
+            // requests can reload the engine from cached GGUF/tokenizer data.
+            runtime.reset_inference_after_panic();
+            let result = harmony_agent::AgentResult {
+                task_id,
+                status: harmony_agent::TaskStatus::Failed,
+                output: None,
+                error: Some("inference engine panicked".into()),
+            };
+            match harmony_agent::encode_result(&result) {
+                Ok(payload) => {
+                    dispatch_action(
+                        RuntimeAction::SendReply { query_id, payload },
+                        session,
+                        zenoh_tx,
+                        udp,
+                        broadcast_addr,
+                        Some(peer_table),
+                        tunnel_senders,
+                        deferred_dials,
+                        ret_outbound_tx,
+                        data_dir,
+                        disk_tx,
+                        s3_read_library,
+                        s3_tx,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::error!(%query_id, err = %e, "encode_result failed after panic");
                 }
             }
         }
