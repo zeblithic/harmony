@@ -330,7 +330,6 @@ impl<B: BookStore> StorageTier<B> {
         }
     }
 
-    /// Set the maximum number of bytes allowed on disk. Replaces any previous quota.
     /// Set the disk quota and run an immediate eviction pass if existing
     /// data exceeds the quota. Returns `RemoveFromDisk` actions for any
     /// entries evicted during the initial enforcement.
@@ -895,6 +894,8 @@ impl<B: BookStore> StorageTier<B> {
         if !self.disk_index.contains_key(cid) {
             return; // CID was evicted while DiskLookup was in-flight; don't re-insert
         }
+        // O(n) in disk_lru length; acceptable while disk index stays small.
+        // Replace with an O(1) structure (e.g. LinkedHashMap) if index grows large.
         self.disk_lru.retain(|c| c != cid);
         self.disk_lru.push_back(*cid);
     }

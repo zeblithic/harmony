@@ -119,7 +119,7 @@ pub struct TunnelEntry {
 
 /// Parse a human-readable byte size string like "10 GiB" or "500 MB".
 ///
-/// Supported suffixes (case-insensitive): B, KB, MB, GB, KiB, MiB, GiB.
+/// Supported suffixes (case-insensitive): B, KB, MB, GB, TB, KiB, MiB, GiB, TiB.
 /// A bare number without a suffix is rejected to avoid ambiguity.
 pub fn parse_byte_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
