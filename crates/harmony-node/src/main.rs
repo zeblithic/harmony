@@ -568,7 +568,14 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 Some(s) => {
                     let bytes = crate::config::parse_byte_size(s)
                         .map_err(|e| format!("invalid disk_quota '{s}': {e}"))?;
-                    tracing::info!(quota_bytes = bytes, raw = %s, "disk quota configured");
+                    if config_file.data_dir.is_none() {
+                        tracing::warn!(
+                            raw = %s,
+                            "disk_quota is set but data_dir is not configured — quota will be ignored"
+                        );
+                    } else {
+                        tracing::info!(quota_bytes = bytes, raw = %s, "disk quota configured");
+                    }
                     Some(bytes)
                 }
                 None => {

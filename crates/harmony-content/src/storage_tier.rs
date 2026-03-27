@@ -561,11 +561,12 @@ impl<B: BookStore> StorageTier<B> {
         // DiskReadFailed retracts the index entry; the write eventually succeeds,
         // leaving an orphaned file that self-heals on the next startup scan.
         if let Some(persist_bytes) = persist_data {
+            let persist_size = persist_bytes.len() as u64;
             actions.push(StorageTierAction::PersistToDisk {
                 cid,
-                data: persist_bytes.clone(),
+                data: persist_bytes,
             });
-            self.record_disk_persist(cid, persist_bytes.len() as u64, &mut actions);
+            self.record_disk_persist(cid, persist_size, &mut actions);
         }
         // Re-announcing already-cached content is intentional: it refreshes
         // the announcement TTL so peers know the content is still available.
@@ -611,11 +612,12 @@ impl<B: BookStore> StorageTier<B> {
 
         // After cache insertion, persist durable content to disk.
         if let Some(persist_bytes) = persist_data {
+            let persist_size = persist_bytes.len() as u64;
             actions.push(StorageTierAction::PersistToDisk {
                 cid,
-                data: persist_bytes.clone(),
+                data: persist_bytes,
             });
-            self.record_disk_persist(cid, persist_bytes.len() as u64, &mut actions);
+            self.record_disk_persist(cid, persist_size, &mut actions);
         }
         // Announce only if policy allows it for this content class.
         if self.should_announce(&cid) {
