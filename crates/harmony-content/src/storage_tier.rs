@@ -523,7 +523,11 @@ impl<B: BookStore> StorageTier<B> {
 
                 // Clone data for disk persistence BEFORE cache and reply consume it.
                 // At most 2 clones: one for cache, one for persist (reply gets the original).
-                let persist_data = if self.disk_enabled && Self::is_durable_class(&cid) {
+                // Skip if already on disk — avoids a redundant clone and write.
+                let persist_data = if self.disk_enabled
+                    && Self::is_durable_class(&cid)
+                    && !self.disk_index.contains_key(&cid)
+                {
                     Some(data.clone())
                 } else {
                     None
