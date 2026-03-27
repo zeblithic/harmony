@@ -105,21 +105,29 @@ impl TokenInferenceRequest {
         }
         let token_count = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
         if token_count > MAX_INPUT_TOKENS {
-            return Err(format!("token count {} exceeds maximum {}", token_count, MAX_INPUT_TOKENS));
+            return Err(format!(
+                "token count {} exceeds maximum {}",
+                token_count, MAX_INPUT_TOKENS
+            ));
         }
         let token_count = token_count as usize;
         let tokens_end = 5 + token_count * 4;
         if payload.len() < tokens_end {
             return Err(format!(
                 "payload too short: need {} bytes for {} tokens, have {}",
-                token_count * 4, token_count, payload.len() - 5
+                token_count * 4,
+                token_count,
+                payload.len() - 5
             ));
         }
         let mut token_ids = Vec::with_capacity(token_count);
         for i in 0..token_count {
             let offset = 5 + i * 4;
             token_ids.push(u32::from_le_bytes([
-                payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3],
             ]));
         }
         let sampling_params = if payload.len() >= tokens_end + 20 {
@@ -129,7 +137,10 @@ impl TokenInferenceRequest {
         } else {
             greedy_defaults()
         };
-        Ok(TokenInferenceRequest { token_ids, sampling_params })
+        Ok(TokenInferenceRequest {
+            token_ids,
+            sampling_params,
+        })
     }
 }
 
@@ -385,10 +396,15 @@ mod tests {
 
         let req = TokenInferenceRequest::parse(&payload).unwrap();
         assert_eq!(req.token_ids, vec![100, 200, 300]);
-        assert_eq!(f32::from_le_bytes([
-            req.sampling_params[0], req.sampling_params[1],
-            req.sampling_params[2], req.sampling_params[3]
-        ]), 0.7);
+        assert_eq!(
+            f32::from_le_bytes([
+                req.sampling_params[0],
+                req.sampling_params[1],
+                req.sampling_params[2],
+                req.sampling_params[3]
+            ]),
+            0.7
+        );
     }
 
     #[test]
@@ -401,10 +417,15 @@ mod tests {
         }
         let req = TokenInferenceRequest::parse(&payload).unwrap();
         assert_eq!(req.token_ids, vec![42]);
-        assert_eq!(f32::from_le_bytes([
-            req.sampling_params[0], req.sampling_params[1],
-            req.sampling_params[2], req.sampling_params[3]
-        ]), 0.0);
+        assert_eq!(
+            f32::from_le_bytes([
+                req.sampling_params[0],
+                req.sampling_params[1],
+                req.sampling_params[2],
+                req.sampling_params[3]
+            ]),
+            0.0
+        );
     }
 
     #[test]

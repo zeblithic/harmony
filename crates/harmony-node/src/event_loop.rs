@@ -54,13 +54,14 @@ enum InferenceResult {
         task_id: String,
         sequence: u32,
         token_text: String,
+        token_id: Option<u32>,
         final_chunk: bool,
     },
     /// Inference completed — send query reply and return engine.
     Complete {
         query_id: u64,
         task_id: String,
-        full_text: String,
+        output: crate::inference::InferenceOutput,
         engine: harmony_inference::QwenEngine,
     },
     /// Inference failed — send error reply and return engine.
@@ -1169,20 +1170,6 @@ pub async fn run(
                         let input_clone = input.clone();
                         let params = crate::inference::decode_sampling_params(&sampling_params_raw);
 
-                        // Extract prompt text or reject token mode (Task 3 adds full support).
-                        let prompt = match input_clone {
-                            crate::inference::InferenceInput::Text(t) => t,
-                            crate::inference::InferenceInput::TokenIds(_) => {
-                                let _ = inference_tx.try_send(InferenceResult::Failed {
-                                    query_id,
-                                    task_id: task_id.clone(),
-                                    error: "token inference not yet implemented".into(),
-                                    engine,
-                                });
-                                continue;
-                            }
-                        };
-
                         // Await JoinHandle to detect panics — if the blocking
                         // task panics, the engine is lost. Send a Panicked signal
                         // so the event loop can reset inference_running and recreate.
@@ -1191,7 +1178,13 @@ pub async fn run(
                         let panic_task_id = task_id.clone();
                         let handle = tokio::task::spawn_blocking(move || {
                             run_inference_loop(
-                                engine, tx, query_id, task_id, prompt, params, max_tokens,
+                                engine,
+                                tx,
+                                query_id,
+                                task_id,
+                                input_clone,
+                                params,
+                                max_tokens,
                             );
                         });
                         tokio::spawn(async move {
@@ -1835,12 +1828,18 @@ async fn handle_inference_result(
             task_id,
             sequence,
             token_text,
+            token_id,
             final_chunk,
         } => {
+            let payload_value = if let Some(id) = token_id {
+                serde_json::json!({"token_id": id})
+            } else {
+                serde_json::json!({"token": token_text})
+            };
             let chunk = harmony_agent::StreamChunk {
                 task_id: task_id.clone(),
                 sequence,
-                payload: serde_json::json!({"token": token_text}),
+                payload: payload_value,
                 final_chunk,
             };
             if let Ok(payload) = harmony_agent::encode_chunk(&chunk) {
@@ -1866,14 +1865,22 @@ async fn handle_inference_result(
         InferenceResult::Complete {
             query_id,
             task_id,
-            full_text,
+            output,
             engine,
         } => {
             runtime.return_inference_engine(engine);
+            let output_json = match &output {
+                crate::inference::InferenceOutput::Text(text) => {
+                    serde_json::json!({"text": text})
+                }
+                crate::inference::InferenceOutput::TokenIds(ids) => {
+                    serde_json::json!({"token_ids": ids})
+                }
+            };
             let result = harmony_agent::AgentResult {
                 task_id,
                 status: harmony_agent::TaskStatus::Success,
-                output: Some(serde_json::json!({"text": full_text})),
+                output: Some(output_json),
                 error: None,
             };
             match harmony_agent::encode_result(&result) {
@@ -1976,32 +1983,37 @@ async fn handle_inference_result(
 
 /// Run the autoregressive token loop on a blocking thread.
 ///
-/// Streams token chunks via `tx` and returns the engine (with full text or error)
-/// when complete. The event loop receives these on `inference_rx` and routes them.
+/// Streams token chunks via `tx` and returns the engine (with output or error)
+/// when complete. Supports both text mode (detokenize + accumulate text) and
+/// token mode (accumulate raw token IDs). The event loop receives results on
+/// `inference_rx` and routes them.
 #[cfg(feature = "inference")]
 fn run_inference_loop(
     mut engine: harmony_inference::QwenEngine,
     tx: mpsc::Sender<InferenceResult>,
     query_id: u64,
     task_id: String,
-    prompt: String,
+    input: crate::inference::InferenceInput,
     sampling_params: harmony_inference::SamplingParams,
     max_tokens: u32,
 ) {
     use harmony_inference::InferenceEngine;
 
-    let tokens = match engine.tokenize(&prompt) {
-        Ok(t) => t,
-        Err(e) => {
-            engine.reset();
-            let _ = tx.blocking_send(InferenceResult::Failed {
-                query_id,
-                task_id,
-                error: format!("tokenize failed: {e}"),
-                engine,
-            });
-            return;
-        }
+    let (tokens, is_token_mode) = match input {
+        crate::inference::InferenceInput::Text(prompt) => match engine.tokenize(&prompt) {
+            Ok(t) => (t, false),
+            Err(e) => {
+                engine.reset();
+                let _ = tx.blocking_send(InferenceResult::Failed {
+                    query_id,
+                    task_id,
+                    error: format!("tokenize failed: {e}"),
+                    engine,
+                });
+                return;
+            }
+        },
+        crate::inference::InferenceInput::TokenIds(ids) => (ids, true),
     };
 
     let mut logits = match engine.forward(&tokens) {
@@ -2019,6 +2031,7 @@ fn run_inference_loop(
     };
 
     let mut full_text = String::new();
+    let mut generated_ids: Vec<u32> = Vec::new();
     let mut sequence = 0u32;
     let eos = engine.eos_token_id();
 
@@ -2042,20 +2055,32 @@ fn run_inference_loop(
                 task_id: task_id.clone(),
                 sequence,
                 token_text: String::new(),
+                token_id: None,
                 final_chunk: true,
             });
             break;
         }
 
-        let text = engine.detokenize(&[next_token]).unwrap_or_default();
-        full_text.push_str(&text);
-
-        let _ = tx.blocking_send(InferenceResult::Chunk {
-            task_id: task_id.clone(),
-            sequence,
-            token_text: text,
-            final_chunk: false,
-        });
+        if is_token_mode {
+            generated_ids.push(next_token);
+            let _ = tx.blocking_send(InferenceResult::Chunk {
+                task_id: task_id.clone(),
+                sequence,
+                token_text: String::new(),
+                token_id: Some(next_token),
+                final_chunk: false,
+            });
+        } else {
+            let text = engine.detokenize(&[next_token]).unwrap_or_default();
+            full_text.push_str(&text);
+            let _ = tx.blocking_send(InferenceResult::Chunk {
+                task_id: task_id.clone(),
+                sequence,
+                token_text: text,
+                token_id: None,
+                final_chunk: false,
+            });
+        }
 
         sequence += 1;
 
@@ -2074,11 +2099,16 @@ fn run_inference_loop(
         };
     }
 
+    let output = if is_token_mode {
+        crate::inference::InferenceOutput::TokenIds(generated_ids)
+    } else {
+        crate::inference::InferenceOutput::Text(full_text)
+    };
     engine.reset();
     let _ = tx.blocking_send(InferenceResult::Complete {
         query_id,
         task_id,
-        full_text,
+        output,
         engine,
     });
 }
