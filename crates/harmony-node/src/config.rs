@@ -142,9 +142,11 @@ pub fn parse_byte_size(s: &str) -> Result<u64, String> {
         "kib" => 1_024,
         "mib" => 1_024 * 1_024,
         "gib" => 1_024 * 1_024 * 1_024,
+        "tb" => 1_000_000_000_000,
+        "tib" => 1_024 * 1_024 * 1_024 * 1_024,
         "" => {
             return Err(format!(
-                "bare number '{s}' requires a unit suffix (B, KB, MB, GB, KiB, MiB, GiB)"
+                "bare number '{s}' requires a unit suffix (B, KB, MB, GB, TB, KiB, MiB, GiB, TiB)"
             ))
         }
         other => return Err(format!("unknown unit suffix '{other}' in '{s}'")),
@@ -368,6 +370,10 @@ node_id = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
         assert_eq!(parse_byte_size("1 KiB").unwrap(), 1024);
         assert_eq!(parse_byte_size("2 MiB").unwrap(), 2 * 1024 * 1024);
         assert_eq!(parse_byte_size("10 GiB").unwrap(), 10 * 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_byte_size("2 TiB").unwrap(),
+            2 * 1024 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -375,6 +381,7 @@ node_id = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
         assert_eq!(parse_byte_size("500 MB").unwrap(), 500 * 1_000_000);
         assert_eq!(parse_byte_size("1 GB").unwrap(), 1_000_000_000);
         assert_eq!(parse_byte_size("100 KB").unwrap(), 100_000);
+        assert_eq!(parse_byte_size("1 TB").unwrap(), 1_000_000_000_000);
     }
 
     #[test]
@@ -401,7 +408,7 @@ node_id = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
 
     #[test]
     fn parse_byte_size_invalid_suffix_rejected() {
-        assert!(parse_byte_size("10 TB").is_err());
+        assert!(parse_byte_size("10 PB").is_err());
         assert!(parse_byte_size("abc").is_err());
         assert!(parse_byte_size("").is_err());
     }

@@ -331,8 +331,47 @@ impl<B: BookStore> StorageTier<B> {
     }
 
     /// Set the maximum number of bytes allowed on disk. Replaces any previous quota.
-    pub fn set_disk_quota(&mut self, quota_bytes: u64) {
+    /// Set the disk quota and run an immediate eviction pass if existing
+    /// data exceeds the quota. Returns `RemoveFromDisk` actions for any
+    /// entries evicted during the initial enforcement.
+    pub fn set_disk_quota(&mut self, quota_bytes: u64) -> Vec<StorageTierAction> {
         self.disk_quota = Some(quota_bytes);
+        self.enforce_disk_quota()
+    }
+
+    /// Run a standalone eviction pass without recording a new persist.
+    /// Used at startup when existing data may exceed a new/tightened quota.
+    fn enforce_disk_quota(&mut self) -> Vec<StorageTierAction> {
+        let quota = match self.disk_quota {
+            Some(q) => q,
+            None => return Vec::new(),
+        };
+        if self.disk_used_bytes <= quota {
+            return Vec::new();
+        }
+
+        let mut actions = Vec::new();
+        let mut skipped: usize = 0;
+        while self.disk_used_bytes > quota {
+            if skipped >= self.disk_lru.len() {
+                break;
+            }
+            let candidate = match self.disk_lru.pop_front() {
+                Some(c) => c,
+                None => break,
+            };
+            if self.cache.is_pinned(&candidate) {
+                self.disk_lru.push_back(candidate);
+                skipped += 1;
+                continue;
+            }
+            if let Some(entry_size) = self.disk_index.remove(&candidate) {
+                self.disk_used_bytes = self.disk_used_bytes.saturating_sub(entry_size);
+            }
+            actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
+            skipped = 0;
+        }
+        actions
     }
 
     /// Returns the running total of bytes currently tracked in the disk index.
@@ -2461,8 +2500,43 @@ mod tests {
             ContentPolicy::default(),
             FilterBroadcastConfig::default(),
         );
-        tier.set_disk_quota(1024);
+        let actions = tier.set_disk_quota(1024);
+        assert!(actions.is_empty()); // no data on disk, nothing to evict
         assert_eq!(tier.disk_quota(), Some(1024));
+    }
+
+    #[test]
+    fn set_disk_quota_evicts_existing_data_over_quota() {
+        let budget = StorageBudget {
+            cache_capacity: 10,
+            max_pinned_bytes: 0,
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+
+        let cid_a = ContentId::from_bytes([0x0A; 32]);
+        let cid_b = ContentId::from_bytes([0x0B; 32]);
+        let cid_c = ContentId::from_bytes([0x0C; 32]);
+
+        // Simulate existing data on disk (e.g. from previous run)
+        tier.enable_disk(vec![(cid_a, 100), (cid_b, 100), (cid_c, 100)]);
+        assert_eq!(tier.disk_used_bytes(), 300);
+
+        // Set a quota tighter than existing data — should evict immediately
+        let actions = tier.set_disk_quota(200);
+
+        // Should have evicted the oldest entry (cid_a)
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, StorageTierAction::RemoveFromDisk { cid } if *cid == cid_a)));
+        assert!(!tier.disk_contains(&cid_a));
+        assert!(tier.disk_contains(&cid_b));
+        assert!(tier.disk_contains(&cid_c));
+        assert_eq!(tier.disk_used_bytes(), 200);
     }
 
     // ---- Eviction logic ----

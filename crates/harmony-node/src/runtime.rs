@@ -923,7 +923,15 @@ impl<B: BookStore> NodeRuntime<B> {
         if config.disk_enabled {
             rt.storage.enable_disk(config.disk_entries);
             if let Some(quota) = config.disk_quota {
-                rt.storage.set_disk_quota(quota);
+                let eviction_actions = rt.storage.set_disk_quota(quota);
+                // Startup eviction: if existing data exceeds the new quota,
+                // emit RemoveFromDisk actions so the event loop cleans up
+                // immediately rather than waiting for the first new persist.
+                for action in eviction_actions {
+                    if let StorageTierAction::RemoveFromDisk { cid } = action {
+                        actions.push(RuntimeAction::RemoveFromDisk { cid });
+                    }
+                }
             }
         }
 
@@ -1586,15 +1594,17 @@ impl<B: BookStore> NodeRuntime<B> {
                 query_id,
                 data,
             } => {
-                let storage_actions =
-                    self.storage
-                        .handle(StorageTierEvent::S3ReadComplete { cid, query_id, data });
+                let storage_actions = self.storage.handle(StorageTierEvent::S3ReadComplete {
+                    cid,
+                    query_id,
+                    data,
+                });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
             RuntimeEvent::S3ReadFailed { cid, query_id } => {
-                let storage_actions =
-                    self.storage
-                        .handle(StorageTierEvent::S3ReadFailed { cid, query_id });
+                let storage_actions = self
+                    .storage
+                    .handle(StorageTierEvent::S3ReadFailed { cid, query_id });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
         }
