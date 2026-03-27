@@ -952,6 +952,12 @@ impl<B: BookStore> NodeRuntime<B> {
         &self.schedule
     }
 
+    /// Disable S3 fallback at runtime (e.g., when S3Library init fails).
+    /// Prevents StorageTier from emitting S3Lookup actions.
+    pub fn disable_s3(&mut self) {
+        self.storage.disable_s3();
+    }
+
     /// Read-only access to storage metrics.
     pub fn metrics(&self) -> &StorageMetrics {
         self.storage.metrics()

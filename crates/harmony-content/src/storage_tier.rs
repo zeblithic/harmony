@@ -329,6 +329,11 @@ impl<B: BookStore> StorageTier<B> {
         self.s3_enabled = true;
     }
 
+    /// Disable S3 fallback (e.g., when S3Library init fails at startup).
+    pub fn disable_s3(&mut self) {
+        self.s3_enabled = false;
+    }
+
     /// Whether S3 remote storage is currently enabled.
     pub fn s3_enabled(&self) -> bool {
         self.s3_enabled

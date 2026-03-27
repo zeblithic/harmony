@@ -281,44 +281,7 @@ pub async fn run(
     // ── Zenoh session ─────────────────────────────────────────────────────────
     let session = zenoh::open(zenoh::Config::default()).await?;
 
-    // ── S3 archivist (archivist feature only) ────────────────────────────────
-    #[cfg(feature = "archivist")]
-    if let Some(ref archivist) = archivist_config {
-        match harmony_s3::S3Library::new(
-            archivist.bucket.clone(),
-            archivist.prefix.clone(),
-            archivist.region.clone(),
-        ).await {
-            Ok(s3) => {
-                let session = session.clone();
-                // Handle intentionally detached — the archivist is a fire-and-forget
-                // subscriber with no back-channel. Exit is signaled via error! log.
-                // Future: add select! arm or graceful shutdown for in-flight uploads.
-                let _archivist_handle = tokio::spawn(async move {
-                    harmony_s3::archivist::run(s3, session).await;
-                    tracing::error!("S3 archivist task exited — archival is no longer active");
-                });
-                tracing::info!(
-                    bucket = %archivist.bucket,
-                    prefix = %archivist.prefix,
-                    "S3 archivist started"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "S3 archivist failed to start — continuing without archival");
-            }
-        }
-    }
-
-    #[cfg(not(feature = "archivist"))]
-    if archivist_config.is_some() {
-        tracing::warn!(
-            "archivist config is present but this binary was compiled without \
-             the `archivist` feature — archival is disabled"
-        );
-    }
-
-    // ── S3 read library (separate from the archivist write path) ────────────
+    // ── S3 library (single init, shared between archivist + read fallback) ───
     #[cfg(feature = "archivist")]
     let s3_read_library: S3ReadLibrary = if let Some(ref archivist) = archivist_config {
         match harmony_s3::S3Library::new(
@@ -327,19 +290,43 @@ pub async fn run(
             archivist.region.clone(),
         ).await {
             Ok(s3) => {
-                tracing::info!("S3 read fallback enabled");
+                // Clone for the archivist write path (consumes its copy).
+                let archivist_s3 = s3.clone();
+                let archivist_session = session.clone();
+                let _archivist_handle = tokio::spawn(async move {
+                    harmony_s3::archivist::run(archivist_s3, archivist_session).await;
+                    tracing::error!("S3 archivist task exited — archival is no longer active");
+                });
+                tracing::info!(
+                    bucket = %archivist.bucket,
+                    prefix = %archivist.prefix,
+                    "S3 archivist + read fallback enabled"
+                );
+                // Wrap in Arc for the read fallback path.
                 Some(Arc::new(s3))
             }
             Err(e) => {
-                tracing::warn!(err = %e, "S3 read library failed to init — S3 fallback disabled");
+                tracing::warn!(err = %e, "S3 failed to init — archivist and read fallback disabled");
+                // Disable s3 in the runtime so StorageTier stops emitting S3Lookup.
+                runtime.disable_s3();
                 None
             }
         }
     } else {
         None
     };
+
     #[cfg(not(feature = "archivist"))]
     let s3_read_library: S3ReadLibrary = None;
+
+    #[cfg(not(feature = "archivist"))]
+    if archivist_config.is_some() {
+        tracing::warn!(
+            "archivist config is present but this binary was compiled without \
+             the `archivist` feature — archival is disabled"
+        );
+        runtime.disable_s3();
+    }
 
     // ── L2 Reticulum channel endpoints (populated when rawlink bridge starts) ─
     // On non-Linux / non-rawlink builds these stay None; allow_unused_mut avoids
