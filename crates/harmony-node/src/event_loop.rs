@@ -46,6 +46,34 @@ enum S3IoResult {
     ReadFailed { cid: ContentId, query_id: u64 },
 }
 
+/// Results from a streaming inference task.
+#[cfg(feature = "inference")]
+enum InferenceResult {
+    /// A streaming token to publish to Zenoh.
+    Chunk {
+        task_id: String,
+        sequence: u32,
+        token_text: String,
+        final_chunk: bool,
+    },
+    /// Inference completed — send query reply and return engine.
+    Complete {
+        query_id: u64,
+        task_id: String,
+        full_text: String,
+        engine: harmony_inference::QwenEngine,
+    },
+    /// Inference failed — send error reply and return engine.
+    Failed {
+        query_id: u64,
+        task_id: String,
+        error: String,
+        engine: harmony_inference::QwenEngine,
+    },
+    /// Inference task panicked — engine is lost, need to recreate.
+    Panicked { query_id: u64, task_id: String },
+}
+
 /// Type alias for the S3 read library reference.
 ///
 /// When the `archivist` feature is enabled, this holds an `Arc<S3Library>` for
@@ -492,6 +520,11 @@ pub async fn run(
     // into the runtime as S3ReadComplete / S3ReadFailed events.
     let (s3_tx, mut s3_rx) = mpsc::channel::<S3IoResult>(64);
 
+    // ── Inference streaming completion channel ─────────────────────────────────
+    // spawn_blocking inference tasks stream tokens and final results back here.
+    #[cfg(feature = "inference")]
+    let (inference_tx, mut inference_rx) = mpsc::channel::<InferenceResult>(64);
+
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
         dispatch_action(
@@ -684,6 +717,37 @@ pub async fn run(
                         runtime.push_event(RuntimeEvent::S3ReadFailed { cid, query_id });
                     }
                 }
+            }
+
+            // Arm 4c: Inference streaming completion — publish chunks and handle results.
+            // Uses the async-block-with-pending pattern (like rawlink Arm 9) so the
+            // arm compiles even when the `inference` feature is disabled.
+            Some(inference_result) = async {
+                #[cfg(feature = "inference")]
+                { inference_rx.recv().await }
+                #[cfg(not(feature = "inference"))]
+                { std::future::pending::<Option<()>>().await }
+            } => {
+                // The type of `inference_result` differs by feature, but the body
+                // is unreachable when inference is disabled (pending never resolves).
+                #[cfg(feature = "inference")]
+                handle_inference_result(
+                    inference_result,
+                    &mut runtime,
+                    &session,
+                    &zenoh_tx,
+                    &udp,
+                    &broadcast_addr,
+                    &peer_table,
+                    &tunnel_senders,
+                    &mut deferred_dials,
+                    &ret_outbound_tx,
+                    &data_dir,
+                    &disk_tx,
+                    &s3_read_library,
+                    &s3_tx,
+                )
+                .await;
             }
 
             // Arm 5: mDNS discovery events (when enabled).
@@ -1087,6 +1151,79 @@ pub async fn run(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
+                // Intercept RunInference before dispatch — we need `&mut runtime`
+                // to take/return the engine, which dispatch_action doesn't have.
+                #[cfg(feature = "inference")]
+                if let RuntimeAction::RunInference {
+                    query_id,
+                    ref task_id,
+                    ref prompt,
+                    sampling_params_raw,
+                } = action
+                {
+                    if let Some(engine) = runtime.take_inference_engine() {
+                        let tx = inference_tx.clone();
+                        let max_tokens = crate::inference::DEFAULT_MAX_INFERENCE_TOKENS;
+                        let query_id = query_id;
+                        let task_id = task_id.clone();
+                        let prompt = prompt.clone();
+                        let params = crate::inference::decode_sampling_params(&sampling_params_raw);
+
+                        // Await JoinHandle to detect panics — if the blocking
+                        // task panics, the engine is lost. Send a Panicked signal
+                        // so the event loop can reset inference_running and recreate.
+                        let panic_tx = inference_tx.clone();
+                        let panic_query_id = query_id;
+                        let panic_task_id = task_id.clone();
+                        let handle = tokio::task::spawn_blocking(move || {
+                            run_inference_loop(
+                                engine, tx, query_id, task_id, prompt, params, max_tokens,
+                            );
+                        });
+                        tokio::spawn(async move {
+                            if let Err(e) = handle.await {
+                                tracing::error!(err = %e, "inference task panicked — engine lost");
+                                let _ = panic_tx
+                                    .send(InferenceResult::Panicked {
+                                        query_id: panic_query_id,
+                                        task_id: panic_task_id,
+                                    })
+                                    .await;
+                            }
+                        });
+                    } else {
+                        // Engine busy or not loaded — reject with proper AgentResult wire format.
+                        let result = harmony_agent::AgentResult {
+                            task_id: task_id.clone(),
+                            status: harmony_agent::TaskStatus::Rejected,
+                            output: None,
+                            error: Some("inference engine busy or not loaded".into()),
+                        };
+                        let error_payload = harmony_agent::encode_result(&result)
+                            .unwrap_or_else(|_| b"inference engine busy".to_vec());
+                        dispatch_action(
+                            RuntimeAction::SendReply {
+                                query_id,
+                                payload: error_payload,
+                            },
+                            &session,
+                            &zenoh_tx,
+                            &udp,
+                            &broadcast_addr,
+                            Some(&peer_table),
+                            &tunnel_senders,
+                            &mut deferred_dials,
+                            &ret_outbound_tx,
+                            &data_dir,
+                            &disk_tx,
+                            &s3_read_library,
+                            &s3_tx,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+
                 dispatch_action(
                     action,
                     &session,
@@ -1612,7 +1749,13 @@ async fn dispatch_action(
                     tokio::spawn(async move {
                         match s3.get_book(&cid.to_bytes()).await {
                             Ok(Some(data)) => {
-                                let _ = tx.send(S3IoResult::ReadComplete { cid, query_id, data }).await;
+                                let _ = tx
+                                    .send(S3IoResult::ReadComplete {
+                                        cid,
+                                        query_id,
+                                        data,
+                                    })
+                                    .await;
                             }
                             Ok(None) => {
                                 tracing::debug!(cid = %hex::encode(&cid.to_bytes()[..8]), "S3 book not found");
@@ -1641,7 +1784,289 @@ async fn dispatch_action(
                 let _ = s3_tx.try_send(S3IoResult::ReadFailed { cid, query_id });
             }
         }
+        // RunInference is intercepted in the action loop before dispatch_action
+        // is called. If it reaches here, it's a logic error — log and ignore.
+        #[cfg(feature = "inference")]
+        RuntimeAction::RunInference { .. } => {
+            tracing::error!("RunInference reached dispatch_action — should be intercepted");
+        }
     }
+}
+
+/// Process a single inference result from the streaming channel.
+///
+/// Called from the select loop's inference arm. Publishes stream chunks to Zenoh,
+/// returns the engine to the runtime on completion/failure, and dispatches a
+/// `SendReply` for the final query response.
+#[cfg(feature = "inference")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_inference_result(
+    inference_result: InferenceResult,
+    runtime: &mut NodeRuntime<MemoryBookStore>,
+    session: &zenoh::Session,
+    zenoh_tx: &mpsc::Sender<ZenohEvent>,
+    udp: &UdpSocket,
+    broadcast_addr: &SocketAddr,
+    peer_table: &PeerTable,
+    tunnel_senders: &HashMap<String, TunnelSender>,
+    deferred_dials: &mut BinaryHeap<Reverse<DeferredDial>>,
+    ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    data_dir: &Option<std::path::PathBuf>,
+    disk_tx: &mpsc::Sender<DiskIoResult>,
+    s3_read_library: &S3ReadLibrary,
+    s3_tx: &mpsc::Sender<S3IoResult>,
+) {
+    match inference_result {
+        InferenceResult::Chunk {
+            task_id,
+            sequence,
+            token_text,
+            final_chunk,
+        } => {
+            let chunk = harmony_agent::StreamChunk {
+                task_id: task_id.clone(),
+                sequence,
+                payload: serde_json::json!({"token": token_text}),
+                final_chunk,
+            };
+            if let Ok(payload) = harmony_agent::encode_chunk(&chunk) {
+                let node_addr_hex = hex::encode(runtime.local_pq_identity_hash());
+                let key_expr =
+                    harmony_zenoh::namespace::agent::stream_key(&node_addr_hex, &task_id);
+                if final_chunk {
+                    // Await final chunk directly so it completes before the
+                    // Complete/Failed handler dispatches the query reply.
+                    if let Err(e) = session.put(&key_expr, payload).await {
+                        tracing::warn!(%key_expr, err = %e, "final stream chunk publish error");
+                    }
+                } else {
+                    let session_clone = session.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = session_clone.put(&key_expr, payload).await {
+                            tracing::warn!(%key_expr, err = %e, "stream chunk publish error");
+                        }
+                    });
+                }
+            }
+        }
+        InferenceResult::Complete {
+            query_id,
+            task_id,
+            full_text,
+            engine,
+        } => {
+            runtime.return_inference_engine(engine);
+            let result = harmony_agent::AgentResult {
+                task_id,
+                status: harmony_agent::TaskStatus::Success,
+                output: Some(serde_json::json!({"text": full_text})),
+                error: None,
+            };
+            match harmony_agent::encode_result(&result) {
+                Ok(payload) => {
+                    dispatch_action(
+                        RuntimeAction::SendReply { query_id, payload },
+                        session,
+                        zenoh_tx,
+                        udp,
+                        broadcast_addr,
+                        Some(peer_table),
+                        tunnel_senders,
+                        deferred_dials,
+                        ret_outbound_tx,
+                        data_dir,
+                        disk_tx,
+                        s3_read_library,
+                        s3_tx,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::error!(%query_id, err = %e, "encode_result failed; query will not be answered");
+                }
+            }
+        }
+        InferenceResult::Failed {
+            query_id,
+            task_id,
+            error,
+            engine,
+        } => {
+            runtime.return_inference_engine(engine);
+            let result = harmony_agent::AgentResult {
+                task_id,
+                status: harmony_agent::TaskStatus::Failed,
+                output: None,
+                error: Some(error),
+            };
+            match harmony_agent::encode_result(&result) {
+                Ok(payload) => {
+                    dispatch_action(
+                        RuntimeAction::SendReply { query_id, payload },
+                        session,
+                        zenoh_tx,
+                        udp,
+                        broadcast_addr,
+                        Some(peer_table),
+                        tunnel_senders,
+                        deferred_dials,
+                        ret_outbound_tx,
+                        data_dir,
+                        disk_tx,
+                        s3_read_library,
+                        s3_tx,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::error!(%query_id, err = %e, "encode_result failed; query will not be answered");
+                }
+            }
+        }
+        InferenceResult::Panicked { query_id, task_id } => {
+            // Engine is gone (consumed by panic). Reset inference_running so future
+            // requests can reload the engine from cached GGUF/tokenizer data.
+            runtime.reset_inference_after_panic();
+            let result = harmony_agent::AgentResult {
+                task_id,
+                status: harmony_agent::TaskStatus::Failed,
+                output: None,
+                error: Some("inference engine panicked".into()),
+            };
+            match harmony_agent::encode_result(&result) {
+                Ok(payload) => {
+                    dispatch_action(
+                        RuntimeAction::SendReply { query_id, payload },
+                        session,
+                        zenoh_tx,
+                        udp,
+                        broadcast_addr,
+                        Some(peer_table),
+                        tunnel_senders,
+                        deferred_dials,
+                        ret_outbound_tx,
+                        data_dir,
+                        disk_tx,
+                        s3_read_library,
+                        s3_tx,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::error!(%query_id, err = %e, "encode_result failed after panic");
+                }
+            }
+        }
+    }
+}
+
+/// Run the autoregressive token loop on a blocking thread.
+///
+/// Streams token chunks via `tx` and returns the engine (with full text or error)
+/// when complete. The event loop receives these on `inference_rx` and routes them.
+#[cfg(feature = "inference")]
+fn run_inference_loop(
+    mut engine: harmony_inference::QwenEngine,
+    tx: mpsc::Sender<InferenceResult>,
+    query_id: u64,
+    task_id: String,
+    prompt: String,
+    sampling_params: harmony_inference::SamplingParams,
+    max_tokens: u32,
+) {
+    use harmony_inference::InferenceEngine;
+
+    let tokens = match engine.tokenize(&prompt) {
+        Ok(t) => t,
+        Err(e) => {
+            engine.reset();
+            let _ = tx.blocking_send(InferenceResult::Failed {
+                query_id,
+                task_id,
+                error: format!("tokenize failed: {e}"),
+                engine,
+            });
+            return;
+        }
+    };
+
+    let mut logits = match engine.forward(&tokens) {
+        Ok(l) => l,
+        Err(e) => {
+            engine.reset();
+            let _ = tx.blocking_send(InferenceResult::Failed {
+                query_id,
+                task_id,
+                error: format!("forward failed: {e}"),
+                engine,
+            });
+            return;
+        }
+    };
+
+    let mut full_text = String::new();
+    let mut sequence = 0u32;
+    let eos = engine.eos_token_id();
+
+    loop {
+        let next_token = match engine.sample(&logits, &sampling_params) {
+            Ok(t) => t,
+            Err(e) => {
+                engine.reset();
+                let _ = tx.blocking_send(InferenceResult::Failed {
+                    query_id,
+                    task_id,
+                    error: format!("sample failed: {e}"),
+                    engine,
+                });
+                return;
+            }
+        };
+
+        if eos == Some(next_token) || sequence >= max_tokens {
+            let _ = tx.blocking_send(InferenceResult::Chunk {
+                task_id: task_id.clone(),
+                sequence,
+                token_text: String::new(),
+                final_chunk: true,
+            });
+            break;
+        }
+
+        let text = engine.detokenize(&[next_token]).unwrap_or_default();
+        full_text.push_str(&text);
+
+        let _ = tx.blocking_send(InferenceResult::Chunk {
+            task_id: task_id.clone(),
+            sequence,
+            token_text: text,
+            final_chunk: false,
+        });
+
+        sequence += 1;
+
+        logits = match engine.forward(&[next_token]) {
+            Ok(l) => l,
+            Err(e) => {
+                engine.reset();
+                let _ = tx.blocking_send(InferenceResult::Failed {
+                    query_id,
+                    task_id,
+                    error: format!("forward failed: {e}"),
+                    engine,
+                });
+                return;
+            }
+        };
+    }
+
+    engine.reset();
+    let _ = tx.blocking_send(InferenceResult::Complete {
+        query_id,
+        task_id,
+        full_text,
+        engine,
+    });
 }
 
 /// Construct a `PqIdentity` from raw ML-DSA verifying key and ML-KEM encapsulation key bytes.
