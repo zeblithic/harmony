@@ -30,6 +30,10 @@ use harmony_zenoh::queryable::{QueryableAction, QueryableEvent, QueryableId, Que
 /// Ticks before an in-flight memo fetch expires (20 × 250ms = 5s).
 const MEMO_FETCH_TIMEOUT_TICKS: u64 = 20;
 
+/// Ticks before a DSD session with no VerifyResponse is evicted (40 × 250ms = ~10s).
+#[cfg(feature = "inference")]
+const DSD_SESSION_TIMEOUT_TICKS: u64 = 40;
+
 /// Maximum number of memos in a single query response.
 const MAX_MEMO_RESPONSE_COUNT: usize = 256;
 
@@ -725,6 +729,9 @@ pub struct NodeRuntime<B: BookStore> {
     /// Active DSD session (one at a time for simplicity).
     #[cfg(feature = "inference")]
     dsd_session: Option<DsdSession>,
+    /// Tick when the DSD session last had activity (set on start, reset on verify response).
+    #[cfg(feature = "inference")]
+    dsd_session_last_activity_tick: u64,
     /// Discovered target node address for DSD (differs from our model CID).
     #[cfg(feature = "inference")]
     dsd_target_addr: Option<String>,
@@ -931,6 +938,8 @@ impl<B: BookStore> NodeRuntime<B> {
             verify_queryable_id: None,
             #[cfg(feature = "inference")]
             dsd_session: None,
+            #[cfg(feature = "inference")]
+            dsd_session_last_activity_tick: 0,
             #[cfg(feature = "inference")]
             dsd_target_addr: None,
             #[cfg(feature = "inference")]
@@ -1651,6 +1660,24 @@ impl<B: BookStore> NodeRuntime<B> {
         self.pending_memo_fetches.retain(|_, started| {
             self.tick_count.saturating_sub(*started) < MEMO_FETCH_TIMEOUT_TICKS
         });
+
+        // Evict stale DSD sessions that never received a VerifyResponse.
+        #[cfg(feature = "inference")]
+        if let Some(ref session) = self.dsd_session {
+            if self
+                .tick_count
+                .saturating_sub(self.dsd_session_last_activity_tick)
+                >= DSD_SESSION_TIMEOUT_TICKS
+            {
+                let query_id = session.query_id;
+                tracing::warn!(query_id, "DSD session timed out after {DSD_SESSION_TIMEOUT_TICKS} ticks");
+                let payload =
+                    harmony_speculative::VerifyResponse::serialize_error("DSD session timed out");
+                self.pending_direct_actions
+                    .push(RuntimeAction::SendReply { query_id, payload });
+                self.dsd_session = None;
+            }
+        }
 
         let mut actions = Vec::new();
         // Note: fuel is captured once before any tier executes. When Compute is
@@ -2922,7 +2949,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 payload: verify_payload,
             });
 
-        // Store session state.
+        // Store session state and start the timeout timer.
         self.dsd_session = Some(DsdSession {
             query_id,
             accepted_tokens: prompt_tokens,
@@ -2932,6 +2959,7 @@ impl<B: BookStore> NodeRuntime<B> {
             pending_drafts: draft_token_ids,
             prompt_len,
         });
+        self.dsd_session_last_activity_tick = self.tick_count;
     }
 
     /// Handle a verify response from the target node (DSD edge side).
@@ -2948,6 +2976,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 return;
             }
         };
+
+        // Reset timeout timer — the target is alive and responding.
+        self.dsd_session_last_activity_tick = self.tick_count;
 
         let response = match harmony_speculative::VerifyResponse::parse(&payload) {
             Ok(r) => r,
