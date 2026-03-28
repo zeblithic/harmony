@@ -132,6 +132,21 @@ impl InferenceCache {
         Ok(())
     }
 
+    /// Approximate memory usage in bytes (accounts for compression state).
+    /// Unpopulated layers contribute 0 bytes.
+    pub fn memory_bytes(&self) -> usize {
+        let mut total = 0;
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some((k, v)) = layer {
+                total += (k.elem_count() + v.elem_count()) * k.dtype().size_in_bytes();
+            }
+            if let Some(comp) = &self.compressed[i] {
+                total += comp.byte_size();
+            }
+        }
+        total
+    }
+
     /// Decompress all layers back to full-precision f16 tensors.
     /// No-op if not compressed.
     /// Atomic: on error, cache remains in compressed state.
@@ -407,5 +422,40 @@ mod kv_compress_cache_tests {
         assert!(!cache.is_compressed());
         cache.compress().unwrap();
         assert!(cache.is_compressed());
+    }
+
+    #[test]
+    fn memory_bytes_empty_cache() {
+        let cache = InferenceCache::new(2, 128, 8);
+        assert_eq!(cache.memory_bytes(), 0);
+    }
+
+    #[test]
+    fn memory_bytes_uncompressed() {
+        let cache = cache_with_data(2, 8, 128, 16);
+        let bytes = cache.memory_bytes();
+        // Layer 0: K + V = 2 * 1 * 8 * 16 * 128 * 2 bytes = 65536
+        assert_eq!(bytes, 65536);
+    }
+
+    #[test]
+    fn compress_reduces_memory() {
+        let mut cache = cache_with_data(2, 8, 128, 16);
+        let before = cache.memory_bytes();
+        cache.compress().unwrap();
+        let after = cache.memory_bytes();
+        assert!(after < before, "compressed {after} should be < uncompressed {before}");
+        let ratio = before as f64 / after as f64;
+        // 3-bit uniform: 56 bytes/vec vs 256 bytes/vec ≈ 4.6x
+        assert!(ratio > 3.0, "compression ratio {ratio:.1}x too low");
+    }
+
+    #[test]
+    fn memory_bytes_restored_matches_original() {
+        let mut cache = cache_with_data(2, 8, 128, 16);
+        let original = cache.memory_bytes();
+        cache.compress().unwrap();
+        cache.decompress().unwrap();
+        assert_eq!(cache.memory_bytes(), original);
     }
 }
