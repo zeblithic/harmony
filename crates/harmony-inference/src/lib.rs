@@ -675,7 +675,10 @@ mod kv_compress_cache_tests {
     fn serialize_uncompressed_errors() {
         let cache = cache_with_data(2, 8, 128, 16);
         let result = cache.serialize_compressed();
-        assert!(matches!(result, Err(InferenceError::SerializationFailed(_))));
+        assert!(matches!(
+            result,
+            Err(InferenceError::SerializationFailed(_))
+        ));
     }
 
     #[test]
@@ -685,7 +688,10 @@ mod kv_compress_cache_tests {
         let bytes = cache.serialize_compressed().unwrap();
 
         let result = InferenceCache::deserialize_compressed(&bytes, 99, 128, 8);
-        assert!(matches!(result, Err(InferenceError::SerializationFailed(_))));
+        assert!(matches!(
+            result,
+            Err(InferenceError::SerializationFailed(_))
+        ));
     }
 
     #[test]

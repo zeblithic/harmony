@@ -23,7 +23,7 @@ inference = [
     "harmony-compute/inference",
     "harmony-workflow/inference",
     "dep:harmony-inference",
-
+    "dep:harmony-engram",
     "dep:harmony-agent",
     "dep:candle-core",
 ]
@@ -37,7 +37,7 @@ harmony-content = { workspace = true, features = ["std"] }
 harmony-credential.workspace = true
 harmony-crypto = { workspace = true, features = ["std"] }
 harmony-discovery = { workspace = true, features = ["std"] }
-
+harmony-engram = { workspace = true, optional = true }
 harmony-identity = { workspace = true, features = ["std"] }
 harmony-inference = { workspace = true, optional = true }
 harmony-memo = { workspace = true, features = ["std"] }

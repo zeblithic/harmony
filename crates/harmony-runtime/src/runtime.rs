@@ -73,6 +73,8 @@ pub struct NodeConfig {
     pub inference_gguf_cid: Option<[u8; 32]>,
     /// Hex-decoded 32-byte CID of the tokenizer.json file in CAS (for inference).
     pub inference_tokenizer_cid: Option<[u8; 32]>,
+    /// Hex-decoded 32-byte CID of the Engram manifest in CAS.
+    pub engram_manifest_cid: Option<[u8; 32]>,
     /// Whether disk persistence is enabled (true when data_dir is configured).
     /// Controls whether StorageTier emits PersistToDisk and DiskLookup actions.
     pub disk_enabled: bool,
@@ -146,6 +148,7 @@ impl Default for NodeConfig {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            engram_manifest_cid: None,
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
@@ -739,6 +742,18 @@ pub struct NodeRuntime<B: BookStore> {
     /// Queryable ID for the speculative inference endpoint.
     #[cfg(feature = "inference")]
     speculative_queryable_id: Option<QueryableId>,
+    /// Engram manifest CID (from config). Set to None on parse failure.
+    #[cfg(feature = "inference")]
+    engram_manifest_cid: Option<[u8; 32]>,
+    /// Engram client for shard lookups (constructed after manifest parsed).
+    #[cfg(feature = "inference")]
+    engram_client: Option<harmony_engram::EngramClient>,
+    /// Engram gated residual module (random-init until trained weights loaded).
+    #[cfg(feature = "inference")]
+    engram_module: Option<harmony_inference::EngramGatedResidual>,
+    /// Which transformer layers to inject Engram at.
+    #[cfg(feature = "inference")]
+    engram_injection_layers: Vec<usize>,
 }
 
 /// Adapts the runtime's pubkey_cache to the CredentialKeyResolver trait
@@ -945,6 +960,14 @@ impl<B: BookStore> NodeRuntime<B> {
             dsd_target_addr: None,
             #[cfg(feature = "inference")]
             speculative_queryable_id: None,
+            #[cfg(feature = "inference")]
+            engram_manifest_cid: config.engram_manifest_cid,
+            #[cfg(feature = "inference")]
+            engram_client: None,
+            #[cfg(feature = "inference")]
+            engram_module: None,
+            #[cfg(feature = "inference")]
+            engram_injection_layers: vec![2, 14],
         };
 
         // Activate disk tier when data_dir is configured (even if empty on first boot).
@@ -979,6 +1002,10 @@ impl<B: BookStore> NodeRuntime<B> {
             }
             if let Some(tok_cid) = rt.inference_tokenizer_cid {
                 actions.push(RuntimeAction::FetchContent { cid: tok_cid });
+            }
+            if let Some(engram_cid) = rt.engram_manifest_cid {
+                actions.push(RuntimeAction::FetchContent { cid: engram_cid });
+                tracing::info!("fetching Engram manifest: {}", hex::encode(engram_cid));
             }
         }
         #[cfg(not(feature = "inference"))]
@@ -1350,6 +1377,25 @@ impl<B: BookStore> NodeRuntime<B> {
                     Some(cid) == self.inference_model_cid && self.inference_gguf_data.is_none();
                 let is_inference_tok = Some(cid) == self.inference_tokenizer_cid
                     && self.inference_tokenizer_data.is_none();
+
+                // Check if this is an Engram manifest (borrows result before move).
+                #[cfg(feature = "inference")]
+                {
+                    let is_engram =
+                        Some(cid) == self.engram_manifest_cid && self.engram_client.is_none();
+                    if is_engram {
+                        match &result {
+                            Ok(data) => self.parse_engram_manifest(data),
+                            Err(e) => {
+                                tracing::error!(
+                                    "Engram manifest fetch failed ({}): {e}; Engram disabled",
+                                    hex::encode(cid)
+                                );
+                                self.engram_manifest_cid = None;
+                            }
+                        }
+                    }
+                }
 
                 if is_inference_gguf || is_inference_tok {
                     match result {
@@ -2552,6 +2598,31 @@ impl<B: BookStore> NodeRuntime<B> {
         }
     }
 
+    /// Borrow the inference engine for read-only operations (e.g. tokenization)
+    /// without taking ownership.
+    #[cfg(feature = "inference")]
+    pub fn inference_engine_ref(&self) -> Option<&harmony_inference::QwenEngine> {
+        self.verification_engine.as_ref()
+    }
+
+    /// Borrow the Engram client (if manifest has been parsed).
+    #[cfg(feature = "inference")]
+    pub fn engram_client(&self) -> Option<&harmony_engram::EngramClient> {
+        self.engram_client.as_ref()
+    }
+
+    /// Borrow the Engram gated residual module (if initialized).
+    #[cfg(feature = "inference")]
+    pub fn engram_module(&self) -> Option<&harmony_inference::EngramGatedResidual> {
+        self.engram_module.as_ref()
+    }
+
+    /// Engram injection layer indices.
+    #[cfg(feature = "inference")]
+    pub fn engram_injection_layers(&self) -> &[usize] {
+        &self.engram_injection_layers
+    }
+
     /// Take the inference engine for an async streaming task.
     /// Returns `None` if the engine is already in use or not loaded.
     #[cfg(feature = "inference")]
@@ -2603,6 +2674,35 @@ impl<B: BookStore> NodeRuntime<B> {
                     match engine.load_gguf(gguf_data) {
                         Ok(()) => match engine.load_tokenizer(tok_data) {
                             Ok(()) => {
+                                // (Re-)init Engram module on the engine's device.
+                                // Covers: (a) module was created on CPU before engine
+                                // arrived, (b) module creation failed during manifest
+                                // parse and needs retry now that engine is available.
+                                if self.engram_client.is_some() {
+                                    let engram_dim =
+                                        self.engram_client.as_ref().unwrap().config().embedding_dim;
+                                    let hidden_dim = 1536; // TODO: from model metadata
+                                    match harmony_inference::EngramGatedResidual::new(
+                                        engram_dim,
+                                        hidden_dim,
+                                        3,
+                                        engine.device(),
+                                    ) {
+                                        Ok(m) => {
+                                            self.engram_module = Some(m);
+                                            tracing::info!(
+                                                "Engram module re-initialized on engine device"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Engram module re-init on engine device failed: {e}; \
+                                                 Engram injection disabled"
+                                            );
+                                            self.engram_module = None;
+                                        }
+                                    }
+                                }
                                 self.verification_engine = Some(engine);
                                 tracing::info!("DSD verification engine loaded");
                             }
@@ -2675,6 +2775,69 @@ impl<B: BookStore> NodeRuntime<B> {
             // Check if speculative queryable should be declared now that the engine is ready.
             #[cfg(feature = "inference")]
             self.check_speculative_ready();
+        }
+    }
+
+    /// Parse an Engram manifest and construct the EngramClient + module.
+    #[cfg(feature = "inference")]
+    fn parse_engram_manifest(&mut self, data: &[u8]) {
+        use harmony_engram::{manifest::parse_shard_cids, EngramClient, ManifestHeader};
+
+        // Manifest book: postcard header + raw shard CID bytes.
+        let (header, remaining) = match postcard::take_from_bytes::<ManifestHeader>(data) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!("Engram manifest header parse failed: {e}; Engram disabled");
+                self.engram_manifest_cid = None;
+                return;
+            }
+        };
+
+        let shard_cids = match parse_shard_cids(remaining) {
+            Ok(cids) => cids,
+            Err(e) => {
+                tracing::error!("Engram shard CIDs parse failed: {e}; Engram disabled");
+                self.engram_manifest_cid = None;
+                return;
+            }
+        };
+
+        if shard_cids.len() != header.num_shards as usize {
+            tracing::error!(
+                "Engram shard count mismatch: header={}, actual={}; Engram disabled",
+                header.num_shards,
+                shard_cids.len()
+            );
+            self.engram_manifest_cid = None;
+            return;
+        }
+
+        let config = header.to_config();
+        let engram_dim = config.embedding_dim;
+        tracing::info!(
+            "Engram manifest loaded: {} shards, dim={}, {} heads",
+            shard_cids.len(),
+            engram_dim,
+            config.num_heads,
+        );
+        self.engram_client = Some(EngramClient::from_manifest(config, shard_cids));
+
+        // Random-init module for integration testing. Trained weights loaded separately.
+        // TODO: read hidden_dim from model metadata or manifest once available.
+        let hidden_dim = 1536; // Qwen3-0.6B hidden_size
+                               // Use the engine's device if loaded, otherwise CPU. The engine and manifest
+                               // are fetched in parallel so the engine may not be ready yet.
+        let device = self
+            .verification_engine
+            .as_ref()
+            .map(|e| e.device().clone())
+            .unwrap_or(candle_core::Device::Cpu);
+        match harmony_inference::EngramGatedResidual::new(engram_dim, hidden_dim, 3, &device) {
+            Ok(m) => {
+                self.engram_module = Some(m);
+                tracing::info!("Engram module initialized (random weights)");
+            }
+            Err(e) => tracing::error!("Engram module creation failed: {e}"),
         }
     }
 
@@ -3903,6 +4066,7 @@ enum ParsedCompute {
 mod tests {
     use super::*;
 
+    // WAT source for test compute modules (originally in harmony-node compute.rs).
     const ADD_WAT: &str = r#"
     (module
       (memory (export "memory") 1)
@@ -4861,6 +5025,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            engram_manifest_cid: None,
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
@@ -4935,6 +5100,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            engram_manifest_cid: None,
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
@@ -4975,6 +5141,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            engram_manifest_cid: None,
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
@@ -5012,6 +5179,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            engram_manifest_cid: None,
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
@@ -5078,6 +5246,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            engram_manifest_cid: None,
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
@@ -5133,6 +5302,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            engram_manifest_cid: None,
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
@@ -5181,6 +5351,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            engram_manifest_cid: None,
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
@@ -6087,6 +6258,7 @@ mod tests {
             local_dsa_pubkey: Vec::new(),
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
+            engram_manifest_cid: None,
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,

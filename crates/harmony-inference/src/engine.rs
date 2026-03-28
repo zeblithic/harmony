@@ -62,6 +62,11 @@ impl QwenEngine {
             device,
         }
     }
+
+    /// Reference to the device this engine targets.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
 }
 
 impl InferenceEngine for QwenEngine {
