@@ -2,7 +2,8 @@
 
 pub use harmony_runtime::inference_types::{
     build_capacity_payload, InferenceInput, InferenceRequest, TokenInferenceRequest, CAPACITY_BUSY,
-    CAPACITY_READY, DEFAULT_MAX_INFERENCE_TOKENS, INFERENCE_TAG, TOKEN_INFERENCE_TAG,
+    CAPACITY_READY, DEFAULT_MAX_INFERENCE_TOKENS, INFERENCE_TAG, MAX_INPUT_TOKENS,
+    TOKEN_INFERENCE_TAG,
 };
 
 /// Built-in inference runner WASM module (compiled from WAT by build.rs).
@@ -297,8 +298,7 @@ mod tests {
     #[test]
     fn parse_token_request_too_many_tokens() {
         let mut payload = vec![TOKEN_INFERENCE_TAG];
-        // MAX_INPUT_TOKENS is private in harmony-runtime, use the value directly
-        payload.extend_from_slice(&(131_073u32).to_le_bytes());
+        payload.extend_from_slice(&(MAX_INPUT_TOKENS + 1).to_le_bytes());
         assert!(TokenInferenceRequest::parse(&payload).is_err());
     }
 

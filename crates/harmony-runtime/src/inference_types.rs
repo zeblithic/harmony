@@ -15,7 +15,8 @@ pub const INFERENCE_TAG: u8 = 0x02;
 pub const TOKEN_INFERENCE_TAG: u8 = 0x03;
 
 /// Maximum token count to prevent allocation bombs from untrusted input.
-const MAX_INPUT_TOKENS: u32 = 131_072;
+/// Maximum token count to prevent allocation bombs from untrusted input.
+pub const MAX_INPUT_TOKENS: u32 = 131_072;
 
 /// Capacity status bytes.
 pub const CAPACITY_READY: u8 = 0x01;
@@ -48,6 +49,14 @@ impl InferenceRequest {
         }
         let prompt_len =
             u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+        // Guard against allocation bombs from untrusted input (4 bytes/char upper bound).
+        const MAX_PROMPT_BYTES: usize = MAX_INPUT_TOKENS as usize * 4;
+        if prompt_len > MAX_PROMPT_BYTES {
+            return Err(format!(
+                "prompt length {} exceeds maximum {}",
+                prompt_len, MAX_PROMPT_BYTES
+            ));
+        }
         if payload.len() < 5 + prompt_len {
             return Err(format!(
                 "payload too short: need {} bytes for prompt, have {}",

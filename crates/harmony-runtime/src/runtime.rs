@@ -1,8 +1,7 @@
 //! Node runtime: priority event loop wiring Tier 1 (Router) + Tier 2 (Storage) + Tier 3 (Compute).
 
-// Remaining dead code (RuntimeEvent, push_event, tick, metrics, etc.) is consumed
-// only by tests until the async event loop is wired.
-#![allow(dead_code)]
+// Many items are consumed only by tests until an async event loop consumer is
+// wired. Per-item #[allow(dead_code)] is applied below rather than crate-wide.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -55,7 +54,7 @@ pub struct NodeConfig {
     pub filter_broadcast_config: FilterBroadcastConfig,
     /// This node's address (hex-encoded), used for filter broadcast keys.
     /// Must be unique per node — set from identity address_hash at startup.
-    /// Defaults to `"local"` as a placeholder until identity is wired.
+    /// Defaults to `"0000"` as a placeholder until identity is wired.
     pub node_addr: String,
     /// This node's identity hash (16-byte address), passed to PeerManager so
     /// probe-interval jitter is unique per local-peer pair rather than zero.
@@ -714,6 +713,8 @@ pub struct NodeRuntime<B: BookStore> {
     inference_tokenizer_data: Option<Vec<u8>>,
     /// Monotonic nonce for inference requests — ensures each request gets a
     /// unique WorkflowId, preventing dedup of non-deterministic results.
+    /// Used only when the `inference` feature is enabled.
+    #[allow(dead_code)]
     inference_request_nonce: u64,
     /// QwenEngine for native verification (DSD target side).
     /// Separate from the WasmiRuntime's persisted engine used by WASM workflows.
