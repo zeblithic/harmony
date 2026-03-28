@@ -210,7 +210,7 @@ Verdict: **Comfortable.** Plenty of room for page cache, kernel buffers, and bur
 | W-TinyLFU cache (16 MB) | 16 MB |
 | Tokenizer | 8 MB |
 | Model mmap working set (Q3_K_S) | ~70 MB |
-| KV cache (512 ctx, compressed) | 12 MB |
+| KV cache (512 ctx, compressed) | 12.2 MB |
 | **Total** | **~208 MB** |
 | **Headroom** | **~304 MB** |
 
@@ -225,11 +225,11 @@ Verdict: **Feasible.** 304 MB headroom absorbs mmap page cache fluctuation. 512 
 | W-TinyLFU cache (16 MB) | 16 MB |
 | Tokenizer | 8 MB |
 | Model mmap working set (Q3_K_S) | ~70 MB |
-| KV cache (1024 ctx, compressed) | 25 MB |
+| KV cache (1024 ctx, compressed) | 24.5 MB |
 | **Total** | **~221 MB** |
 | **Headroom** | **~291 MB** |
 
-Verdict: **Viable.** Only 13 MB more than T1-Micro thanks to KV compression. The 291 MB headroom is comfortable — the real constraint on Tier 1 is CPU speed, not RAM. Even Q4_K_M with 1024 compressed context would fit (~235 MB total, ~277 MB headroom).
+Verdict: **Viable.** Only 12.3 MB more than T1-Micro thanks to KV compression. The 291 MB headroom is comfortable — the real constraint on Tier 1 is CPU speed, not RAM. Even Q4_K_M with 1024 compressed context would fit (~251 MB total, ~261 MB headroom).
 
 **T1 finding: KV compression makes the difference between "inference barely fits" and "inference fits comfortably."** Without compression, 1024 context would consume 112 MB instead of 25 MB, pushing total to ~308 MB with only 204 MB headroom — still fits, but tight under mmap pressure.
 
@@ -261,11 +261,11 @@ Verdict: **Comfortable.** No need for KV compression at this tier with 2048 cont
 | LLM mmap working set (Q4_K_M) | ~100 MB |
 | KV cache (2048 ctx, compressed) | 49 MB |
 | Oluo embedding model mmap | ~100 MB |
-| Oluo trie index (100K entries) | 7 MB |
+| Oluo trie index (100K entries) | 6.5 MB |
 | **Total** | **~634 MB** |
 | **Headroom (4GB)** | **~3.4 GB** |
 
-Verdict: **Comfortable.** Even with Oluo and a 128 MB cache, only 634 MB. KV compression here frees 175 MB which is nice but not necessary — it extends the headroom for page cache. Both full GGUF files (365 MB LLM + 365 MB embeddings = 730 MB) can be fully resident in the remaining 3.5 GB.
+Verdict: **Comfortable.** Even with Oluo and a 128 MB cache, only 634 MB. KV compression here frees 175 MB which is nice but not necessary — it extends the headroom for page cache. Both full GGUF files (365 MB LLM + 365 MB embeddings = 730 MB) can be fully resident in the remaining 3.4 GB.
 
 #### T2-Extended: Maximum Context (8GB)
 
@@ -278,7 +278,7 @@ Verdict: **Comfortable.** Even with Oluo and a 128 MB cache, only 634 MB. KV com
 | LLM mmap working set (Q4_K_M) | ~100 MB |
 | KV cache (4096 ctx, compressed) | 98 MB |
 | Oluo embedding model mmap | ~100 MB |
-| Oluo trie index (100K entries) | 7 MB |
+| Oluo trie index (100K entries) | 6.5 MB |
 | **Total** | **~811 MB** |
 | **Headroom (8GB)** | **~7.4 GB** |
 
