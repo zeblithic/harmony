@@ -324,6 +324,102 @@ pub fn verify_proofs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::{DType, Device, Tensor};
+    use harmony_content::book::MemoryBookStore;
+    use harmony_content::cid::ContentId;
+    use crate::prefill::{
+        PREFILL_MAGIC_V2, store_prefill_cache_with_proofs, load_prefill_cache, token_hash,
+    };
+
+    fn make_cache_with_data(num_layers: usize, num_kv_heads: usize, head_dim: usize, n_tokens: usize) -> InferenceCache {
+        let mut cache = InferenceCache::new(num_layers, head_dim, num_kv_heads);
+        if n_tokens > 0 {
+            let shape = (1, num_kv_heads, n_tokens, head_dim);
+            for layer in cache.layers.iter_mut() {
+                let k = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
+                    .unwrap().to_dtype(DType::F16).unwrap();
+                let v = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
+                    .unwrap().to_dtype(DType::F16).unwrap();
+                *layer = Some((k, v));
+            }
+            cache.position = n_tokens;
+        }
+        cache
+    }
+
+    fn make_header(cache: &InferenceCache, token_ids: &[u32]) -> PrefillCacheHeader {
+        PrefillCacheHeader {
+            magic: PREFILL_MAGIC_V2,
+            model_cid: [0xAB; 32],
+            token_hash: token_hash(token_ids),
+            token_count: cache.position as u32,
+            num_layers: cache.num_layers as u16,
+            num_kv_heads: cache.num_kv_heads as u16,
+            head_dim: cache.head_dim as u16,
+            quant_bits: 3,
+            proofs: vec![],
+        }
+    }
+
+    #[test]
+    fn generate_verify_roundtrip() {
+        // 32 tokens * 128 head_dim = 4096 elements >= TOP_K (128)
+        let cache = make_cache_with_data(2, 8, 128, 32);
+        let token_ids: Vec<u32> = (0..32).collect();
+        let header = make_header(&cache, &token_ids);
+
+        let proofs = generate_proofs(&cache, &header).unwrap();
+        assert!(!proofs.is_empty(), "should generate at least one proof");
+
+        let mut header_with_proofs = header;
+        header_with_proofs.proofs = proofs;
+
+        let result = verify_proofs(&cache, &header_with_proofs).unwrap();
+        assert!(result.is_valid(), "verification should pass for identical cache: {:?}", result.details);
+    }
+
+    #[test]
+    fn verify_rejects_tampered_cache() {
+        let cache = make_cache_with_data(2, 8, 128, 32);
+        let token_ids: Vec<u32> = (0..32).collect();
+        let header = make_header(&cache, &token_ids);
+
+        let proofs = generate_proofs(&cache, &header).unwrap();
+        assert!(!proofs.is_empty());
+
+        // Create a different cache (different random data)
+        let tampered = make_cache_with_data(2, 8, 128, 32);
+
+        let mut header_with_proofs = header;
+        header_with_proofs.proofs = proofs;
+
+        let result = verify_proofs(&tampered, &header_with_proofs).unwrap();
+        assert!(!result.is_valid(), "verification should fail for tampered cache");
+    }
+
+    #[test]
+    fn proofs_in_header_roundtrip() {
+        let mut cache = make_cache_with_data(2, 8, 128, 32);
+        let token_ids: Vec<u32> = (0..32).collect();
+        let header = make_header(&cache, &token_ids);
+
+        let proofs = generate_proofs(&cache, &header).unwrap();
+        let proof_count = proofs.len();
+
+        // Compress and store with proofs
+        cache.compress().unwrap();
+        let model_cid = ContentId::for_book(b"test-model", Default::default()).unwrap();
+        let mut store = MemoryBookStore::new();
+
+        let root = store_prefill_cache_with_proofs(
+            &cache, &model_cid, &token_ids, proofs, &mut store
+        ).unwrap();
+
+        // Load and check proofs survived
+        let (_, loaded_header) = load_prefill_cache(&root, &model_cid, &store).unwrap();
+        assert_eq!(loaded_header.magic, PREFILL_MAGIC_V2);
+        assert_eq!(loaded_header.proofs.len(), proof_count);
+    }
 
     #[test]
     fn sampling_deterministic() {
