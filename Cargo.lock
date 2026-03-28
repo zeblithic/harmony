@@ -3160,6 +3160,7 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "harmony-engram",
  "postcard",
  "rand 0.8.5",
  "serde",
