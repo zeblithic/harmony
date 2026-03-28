@@ -166,15 +166,28 @@ impl QwenEngine {
         engram: &EngramContext<'_>,
     ) -> Result<Vec<f32>, InferenceError> {
         // Slice embeddings to match the tokens being processed in this call.
-        // During prefill, offset=0 and seq_len=prompt_len.
-        // During decode, offset=N and seq_len=1.
-        // Without this, broadcast addition would silently corrupt hidden state shapes.
+        // The caller provides fresh embeddings for the current token batch on
+        // each call (prefill: [1, prompt_len, dim], decode: [1, 1, dim]).
+        // We always slice from index 0 — the tensor covers exactly the tokens
+        // being processed, not the full conversation history.
         let seq_len = tokens.len();
-        let offset = cache.position;
-        let embeddings_slice = engram
+        let emb_len = engram
             .embeddings
-            .narrow(1, offset, seq_len)
+            .dim(1)
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+        let embeddings_slice = if emb_len == seq_len {
+            engram.embeddings.clone()
+        } else if emb_len > seq_len {
+            engram
+                .embeddings
+                .narrow(1, 0, seq_len)
+                .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?
+        } else {
+            return Err(InferenceError::ForwardFailed(format!(
+                "engram embeddings have {} positions but need {} (tokens.len())",
+                emb_len, seq_len,
+            )));
+        };
 
         let engram_fn =
             |layer_idx: usize, hidden_state: &Tensor| -> candle_core::Result<Option<Tensor>> {
