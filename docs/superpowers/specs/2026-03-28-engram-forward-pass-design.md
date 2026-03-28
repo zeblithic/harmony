@@ -83,11 +83,24 @@ pub fn resolve_engram_embeddings(
 ) -> Result<Tensor>
 ```
 
-- For each `NgramLookup`, assembles the shard slices from `shard_data` and calls `client.resolve()` to get f32 bytes
-- Aggregates per-position: if multiple N-grams cover the same position, their embeddings are summed
-- Positions with no N-gram coverage get a zero embedding
-- Converts the aggregated f32 bytes to a candle Tensor `[1, seq_len, engram_dim]`
-- Returns `candle_core::Error` if shard data is missing or resolve fails
+The caller fetches each shard by its CID but stores the result in a `HashMap<u64, Vec<u8>>` keyed by `shard_index` (not CID). Phase 2 looks up shard data by `shard_index`.
+
+**Per-lookup assembly** (the core glue logic): `EngramClient::resolve()` takes `&[&[u8]]` — one byte slice per head, ordered by `lookup.shard_indices`. For each `NgramLookup`:
+1. Build `Vec<&[u8]>` of length `num_heads` by indexing into `shard_data` using `lookup.shard_indices[head_idx]` for each head
+2. Call `client.resolve(&lookup, &shard_slices)` → `Result<Vec<u8>>` (f32 little-endian, length = `embedding_dim * 4`)
+3. Interpret the result as `embedding_dim` little-endian f32 values
+
+**Per-position aggregation:** Sum f32 values element-wise in a CPU buffer (`Vec<f32>`) for positions where multiple N-grams overlap. Positions with no N-gram coverage keep zeros.
+
+**Final conversion:** Construct candle Tensor `[1, seq_len, engram_dim]` from the aggregated f32 buffer via `Tensor::from_vec`.
+
+**Errors:** Missing shard data (key not in HashMap) → `candle_core::bail!`. `EngramError` from `resolve()` → mapped to `candle_core::Error` via `format!`.
+
+### Decode-Step Usage
+
+During autoregressive decoding, `prepare_engram_request` receives only the new token(s), not the full context. With seq_len=1 and no prior context, no bigrams or trigrams can be formed — the request is empty, and `resolve_engram_embeddings` returns a zero tensor.
+
+For Engram coverage during decode, the caller should maintain a sliding window of the last 3+ tokens and pass it to `prepare_engram_request`. The resulting embeddings tensor should have shape `[1, window_len, engram_dim]`, but only the last position (matching the new token) feeds into the forward pass. This windowing strategy is the event loop's responsibility (harmony-d13v), not the bridge's.
 
 ---
 
@@ -136,7 +149,9 @@ Internally:
 4. Delegate to `model.forward_with_engram(input, cache, Some(&engram_fn))`
 5. Extract logits (same as `forward()`)
 
-The existing `forward()` method is completely unchanged. The `InferenceEngine` trait is unchanged.
+The existing `forward()` method is completely unchanged. The `InferenceEngine` trait is unchanged. `forward_with_engram` is an inherent method on `QwenEngine`, not a trait method — Engram injection is optional and engine-specific.
+
+Errors from `EngramGatedResidual::forward()` (candle `Result`) are mapped through `InferenceError::ForwardFailed(String)`, consistent with the existing error mapping pattern in `forward()`.
 
 ---
 
@@ -180,11 +195,12 @@ The existing `forward()` method is completely unchanged. The `InferenceEngine` t
 3. **Resolve with mock shard data** — fake EngramClient, mock shard bytes → verify output tensor shape `[1, seq_len, engram_dim]`
 4. **Single token produces empty request** — seq_len=1 → empty required_shards, empty lookups
 5. **Position aggregation** — multiple N-grams at position 3 → embeddings summed
+6. **Missing shard data returns error** — `shard_data` HashMap missing a required shard index → error
 
 **Unit test in `engine.rs`:**
 
-6. **forward_with_engram without model returns ModelNotLoaded**
+7. **forward_with_engram without model returns ModelNotLoaded**
 
 **Integration test (`#[ignore]`):**
 
-7. **forward_with_engram produces different logits than forward** — non-zero Engram embeddings at layer 2 → logits differ
+8. **forward_with_engram produces different logits than forward** — non-zero Engram embeddings at layer 2 → logits differ
