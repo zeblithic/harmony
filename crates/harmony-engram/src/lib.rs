@@ -65,7 +65,7 @@ pub struct EngramLookup {
 ///
 /// Holds the table configuration and the shard-to-CID mapping.
 /// All methods are pure computation — no I/O.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EngramClient {
     config: EngramConfig,
     /// Shard index → CID (32-byte raw content identifier).

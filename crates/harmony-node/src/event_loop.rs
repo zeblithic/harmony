@@ -1162,42 +1162,231 @@ pub async fn run(
                     sampling_params_raw,
                 } = action
                 {
+                    // Step 1: Tokenize BEFORE taking engine — borrow via as_ref().
+                    use harmony_inference::InferenceEngine;
+                    let (tokens, is_token_mode) = match input {
+                        crate::inference::InferenceInput::Text(prompt) => {
+                            match runtime.inference_engine_ref() {
+                                Some(engine_ref) => match engine_ref.tokenize(prompt) {
+                                    Ok(t) => (t, false),
+                                    Err(e) => {
+                                        let result = harmony_agent::AgentResult {
+                                            task_id: task_id.clone(),
+                                            status: harmony_agent::TaskStatus::Rejected,
+                                            output: None,
+                                            error: Some(format!("tokenize failed: {e}")),
+                                        };
+                                        let error_payload = harmony_agent::encode_result(&result)
+                                            .unwrap_or_else(|_| b"tokenize failed".to_vec());
+                                        dispatch_action(
+                                            RuntimeAction::SendReply {
+                                                query_id,
+                                                payload: error_payload,
+                                            },
+                                            &session,
+                                            &zenoh_tx,
+                                            &udp,
+                                            &broadcast_addr,
+                                            Some(&peer_table),
+                                            &tunnel_senders,
+                                            &mut deferred_dials,
+                                            &ret_outbound_tx,
+                                            &data_dir,
+                                            &disk_tx,
+                                            &s3_read_library,
+                                            &s3_tx,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                },
+                                None => {
+                                    let result = harmony_agent::AgentResult {
+                                        task_id: task_id.clone(),
+                                        status: harmony_agent::TaskStatus::Rejected,
+                                        output: None,
+                                        error: Some("inference engine not loaded".into()),
+                                    };
+                                    let error_payload = harmony_agent::encode_result(&result)
+                                        .unwrap_or_else(|_| b"engine not loaded".to_vec());
+                                    dispatch_action(
+                                        RuntimeAction::SendReply {
+                                            query_id,
+                                            payload: error_payload,
+                                        },
+                                        &session,
+                                        &zenoh_tx,
+                                        &udp,
+                                        &broadcast_addr,
+                                        Some(&peer_table),
+                                        &tunnel_senders,
+                                        &mut deferred_dials,
+                                        &ret_outbound_tx,
+                                        &data_dir,
+                                        &disk_tx,
+                                        &s3_read_library,
+                                        &s3_tx,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            }
+                        }
+                        crate::inference::InferenceInput::TokenIds(ids) => (ids.clone(), true),
+                    };
+
+                    // Step 2: Take engine after successful tokenization.
                     if let Some(engine) = runtime.take_inference_engine() {
                         let tx = inference_tx.clone();
                         let max_tokens = crate::inference::DEFAULT_MAX_INFERENCE_TOKENS;
                         let query_id = query_id;
                         let task_id = task_id.clone();
-                        let input_clone = input.clone();
                         let params = crate::inference::decode_sampling_params(&sampling_params_raw);
 
-                        // Await JoinHandle to detect panics — if the blocking
-                        // task panics, the engine is lost. Send a Panicked signal
-                        // so the event loop can reset inference_running and recreate.
-                        let panic_tx = inference_tx.clone();
-                        let panic_query_id = query_id;
-                        let panic_task_id = task_id.clone();
-                        let handle = tokio::task::spawn_blocking(move || {
-                            run_inference_loop(
-                                engine,
-                                tx,
-                                query_id,
-                                task_id,
-                                input_clone,
-                                params,
-                                max_tokens,
-                            );
-                        });
-                        tokio::spawn(async move {
-                            if let Err(e) = handle.await {
-                                tracing::error!(err = %e, "inference task panicked — engine lost");
-                                let _ = panic_tx
-                                    .send(InferenceResult::Panicked {
-                                        query_id: panic_query_id,
-                                        task_id: panic_task_id,
+                        // Step 3: Prepare Engram (sync) — pure computation, no I/O.
+                        let engram_prep = runtime
+                            .engram_client()
+                            .and_then(|client| {
+                                runtime.engram_module().map(|module| (client, module))
+                            })
+                            .and_then(|(client, module)| {
+                                match harmony_inference::engram_bridge::prepare_engram_request(
+                                    client, &tokens,
+                                ) {
+                                    Ok(request) if !request.required_shards.is_empty() => {
+                                        Some((client.clone(), module.clone(), request))
+                                    }
+                                    Ok(_) => {
+                                        tracing::debug!("engram: no shards needed (short sequence)");
+                                        None
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(err = %e, "engram prepare failed — skipping");
+                                        None
+                                    }
+                                }
+                            });
+
+                        if let Some((client, module, request)) = engram_prep {
+                            // Step 4a: Engram branch — fetch shards async, then spawn blocking.
+                            let injection_layers = runtime.engram_injection_layers().to_vec();
+                            let session_clone = session.clone();
+                            let panic_tx = inference_tx.clone();
+                            let panic_query_id = query_id;
+                            let panic_task_id = task_id.clone();
+
+                            tokio::spawn(async move {
+                                // Fetch all required shards in parallel via Zenoh.
+                                let fetch_futures: Vec<_> = request
+                                    .required_shards
+                                    .iter()
+                                    .map(|shard_req| {
+                                        let cid_hex = hex::encode(shard_req.cid);
+                                        let key_expr =
+                                            harmony_zenoh::namespace::content::fetch_key(&cid_hex);
+                                        let session_ref = &session_clone;
+                                        let shard_index = shard_req.shard_index;
+                                        async move {
+                                            let result =
+                                                fetch_via_zenoh(session_ref, &key_expr).await;
+                                            (shard_index, result)
+                                        }
                                     })
-                                    .await;
-                            }
-                        });
+                                    .collect();
+
+                                let results = futures_util::future::join_all(fetch_futures).await;
+
+                                // Build shard_data map, checking for failures.
+                                let mut shard_data = HashMap::with_capacity(results.len());
+                                let mut fetch_failed = false;
+                                for (shard_index, result) in results {
+                                    match result {
+                                        Ok(data) => {
+                                            shard_data.insert(shard_index, data);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                shard_index,
+                                                err = %e,
+                                                "engram shard fetch failed — falling back to non-Engram"
+                                            );
+                                            fetch_failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                let engram_prefill = if fetch_failed {
+                                    None
+                                } else {
+                                    Some(EngramPrefill {
+                                        client,
+                                        module,
+                                        request,
+                                        shard_data,
+                                        injection_layers,
+                                    })
+                                };
+
+                                let handle = tokio::task::spawn_blocking(move || {
+                                    run_inference_loop(
+                                        engine,
+                                        tx,
+                                        query_id,
+                                        task_id,
+                                        tokens,
+                                        is_token_mode,
+                                        params,
+                                        max_tokens,
+                                        engram_prefill,
+                                    );
+                                });
+                                if let Err(e) = handle.await {
+                                    tracing::error!(
+                                        err = %e,
+                                        "inference task panicked — engine lost"
+                                    );
+                                    let _ = panic_tx
+                                        .send(InferenceResult::Panicked {
+                                            query_id: panic_query_id,
+                                            task_id: panic_task_id,
+                                        })
+                                        .await;
+                                }
+                            });
+                        } else {
+                            // Step 4b: Non-Engram branch — spawn blocking directly.
+                            let panic_tx = inference_tx.clone();
+                            let panic_query_id = query_id;
+                            let panic_task_id = task_id.clone();
+                            let handle = tokio::task::spawn_blocking(move || {
+                                run_inference_loop(
+                                    engine,
+                                    tx,
+                                    query_id,
+                                    task_id,
+                                    tokens,
+                                    is_token_mode,
+                                    params,
+                                    max_tokens,
+                                    None,
+                                );
+                            });
+                            tokio::spawn(async move {
+                                if let Err(e) = handle.await {
+                                    tracing::error!(
+                                        err = %e,
+                                        "inference task panicked — engine lost"
+                                    );
+                                    let _ = panic_tx
+                                        .send(InferenceResult::Panicked {
+                                            query_id: panic_query_id,
+                                            task_id: panic_task_id,
+                                        })
+                                        .await;
+                                }
+                            });
+                        }
                     } else {
                         // Engine busy or not loaded — reject with proper AgentResult wire format.
                         let result = harmony_agent::AgentResult {
@@ -1989,21 +2178,36 @@ async fn handle_inference_result(
     }
 }
 
+/// Pre-fetched Engram data for the blocking inference task.
+#[cfg(feature = "inference")]
+struct EngramPrefill {
+    client: harmony_engram::EngramClient,
+    module: harmony_inference::EngramGatedResidual,
+    request: harmony_inference::engram_bridge::EngramRequest,
+    shard_data: std::collections::HashMap<u64, Vec<u8>>,
+    injection_layers: Vec<usize>,
+}
+
 /// Run the autoregressive token loop on a blocking thread.
 ///
 /// Streams token chunks via `tx` and returns the engine (with output or error)
 /// when complete. Supports both text mode (detokenize + accumulate text) and
 /// token mode (accumulate raw token IDs). The event loop receives results on
 /// `inference_rx` and routes them.
+///
+/// Tokens are pre-tokenized by the caller — no `InferenceInput` match needed.
+/// When `engram` is `Some`, the prefill forward uses Engram-augmented inference.
 #[cfg(feature = "inference")]
 fn run_inference_loop(
     engine: harmony_inference::QwenEngine,
     tx: mpsc::Sender<InferenceResult>,
     query_id: u64,
     task_id: String,
-    input: crate::inference::InferenceInput,
+    tokens: Vec<u32>,
+    is_token_mode: bool,
     sampling_params: harmony_inference::SamplingParams,
     max_tokens: u32,
+    engram: Option<EngramPrefill>,
 ) {
     use harmony_inference::InferenceEngine;
 
@@ -2021,37 +2225,72 @@ fn run_inference_loop(
     };
 
     let mut history: Vec<u32> = Vec::new();
+    history.extend_from_slice(&tokens);
 
-    let (tokens, is_token_mode) = match input {
-        crate::inference::InferenceInput::Text(prompt) => match engine.tokenize(&prompt) {
-            Ok(t) => (t, false),
+    // Prefill forward: use Engram-augmented path if available.
+    let mut logits = match engram {
+        Some(ref ep) => {
+            match harmony_inference::engram_bridge::resolve_engram_embeddings(
+                &ep.client,
+                &ep.request,
+                &ep.shard_data,
+                engine.device(),
+            ) {
+                Ok(embeddings) => {
+                    let ctx = harmony_inference::EngramContext {
+                        module: &ep.module,
+                        embeddings,
+                        injection_layers: &ep.injection_layers,
+                    };
+                    match engine.forward_with_engram(&tokens, &mut cache, &ctx) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::warn!(err = %e, "engram forward failed — falling back to plain forward");
+                            match engine.forward(&tokens, &mut cache) {
+                                Ok(l) => l,
+                                Err(e2) => {
+                                    let _ = tx.blocking_send(InferenceResult::Failed {
+                                        query_id,
+                                        task_id,
+                                        error: format!("forward failed: {e2}"),
+                                        engine,
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "engram resolve failed — falling back to plain forward");
+                    match engine.forward(&tokens, &mut cache) {
+                        Ok(l) => l,
+                        Err(e2) => {
+                            let _ = tx.blocking_send(InferenceResult::Failed {
+                                query_id,
+                                task_id,
+                                error: format!("forward failed: {e2}"),
+                                engine,
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        None => match engine.forward(&tokens, &mut cache) {
+            Ok(l) => l,
             Err(e) => {
                 let _ = tx.blocking_send(InferenceResult::Failed {
                     query_id,
                     task_id,
-                    error: format!("tokenize failed: {e}"),
+                    error: format!("forward failed: {e}"),
                     engine,
                 });
                 return;
             }
         },
-        crate::inference::InferenceInput::TokenIds(ids) => (ids, true),
     };
-
-    let mut logits = match engine.forward(&tokens, &mut cache) {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = tx.blocking_send(InferenceResult::Failed {
-                query_id,
-                task_id,
-                error: format!("forward failed: {e}"),
-                engine,
-            });
-            return;
-        }
-    };
-
-    history.extend_from_slice(&tokens);
 
     let mut full_text = String::new();
     let mut generated_ids: Vec<u32> = Vec::new();

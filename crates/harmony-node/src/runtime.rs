@@ -2597,6 +2597,31 @@ impl<B: BookStore> NodeRuntime<B> {
         }
     }
 
+    /// Borrow the inference engine for read-only operations (e.g. tokenization)
+    /// without taking ownership.
+    #[cfg(feature = "inference")]
+    pub fn inference_engine_ref(&self) -> Option<&harmony_inference::QwenEngine> {
+        self.verification_engine.as_ref()
+    }
+
+    /// Borrow the Engram client (if manifest has been parsed).
+    #[cfg(feature = "inference")]
+    pub fn engram_client(&self) -> Option<&harmony_engram::EngramClient> {
+        self.engram_client.as_ref()
+    }
+
+    /// Borrow the Engram gated residual module (if initialized).
+    #[cfg(feature = "inference")]
+    pub fn engram_module(&self) -> Option<&harmony_inference::EngramGatedResidual> {
+        self.engram_module.as_ref()
+    }
+
+    /// Engram injection layer indices.
+    #[cfg(feature = "inference")]
+    pub fn engram_injection_layers(&self) -> &[usize] {
+        &self.engram_injection_layers
+    }
+
     /// Take the inference engine for an async streaming task.
     /// Returns `None` if the engine is already in use or not loaded.
     #[cfg(feature = "inference")]
