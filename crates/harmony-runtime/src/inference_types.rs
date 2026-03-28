@@ -15,7 +15,6 @@ pub const INFERENCE_TAG: u8 = 0x02;
 pub const TOKEN_INFERENCE_TAG: u8 = 0x03;
 
 /// Maximum token count to prevent allocation bombs from untrusted input.
-/// Maximum token count to prevent allocation bombs from untrusted input.
 pub const MAX_INPUT_TOKENS: u32 = 131_072;
 
 /// Capacity status bytes.
