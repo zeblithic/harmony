@@ -120,13 +120,13 @@ harmony-memo ┐ │  │   │   │   │             │              │
        (daemon)      (Tauri app)
 ```
 
-harmony-runtime depends on ~12 core crates (the same ones
+harmony-runtime depends on ~15 core crates (the same ones
 harmony-node currently imports). The full dependency list:
-harmony-platform, harmony-reticulum, harmony-zenoh, harmony-content,
-harmony-compute, harmony-workflow, harmony-discovery, harmony-contacts,
-harmony-peers, harmony-memo, harmony-credential, harmony-speculative,
-harmony-athenaeum. Optional: harmony-tunnel (for tunnel peer state
-tracking).
+harmony-crypto, harmony-identity, harmony-platform, harmony-reticulum,
+harmony-zenoh, harmony-content, harmony-compute, harmony-workflow,
+harmony-discovery, harmony-contacts, harmony-peers, harmony-memo,
+harmony-credential, harmony-speculative, harmony-athenaeum. Optional:
+harmony-tunnel (for tunnel peer state tracking).
 
 ### Feature Flags
 
