@@ -50,3 +50,6 @@ candle-core = { workspace = true, optional = true }
 hex.workspace = true
 postcard.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
