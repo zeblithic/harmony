@@ -243,13 +243,16 @@ impl QwenEngine {
             .and_then(|t| t.reshape((1, seq_len)))
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
 
-        let engram_fn = |layer_idx: usize, hidden_state: &Tensor| -> candle_core::Result<Option<Tensor>> {
-            if engram.injection_layers.contains(&layer_idx) {
-                Ok(Some(engram.module.forward(hidden_state, &engram.embeddings)?))
-            } else {
-                Ok(None)
-            }
-        };
+        let engram_fn =
+            |layer_idx: usize, hidden_state: &Tensor| -> candle_core::Result<Option<Tensor>> {
+                if engram.injection_layers.contains(&layer_idx) {
+                    Ok(Some(
+                        engram.module.forward(hidden_state, &engram.embeddings)?,
+                    ))
+                } else {
+                    Ok(None)
+                }
+            };
 
         let logits = model
             .forward_with_engram(&input, cache, Some(&engram_fn))
