@@ -41,18 +41,17 @@ pub enum InferenceError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "kv-compress")]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(feature = "kv-compress")]
     fn compression_failed_displays_message() {
         let err = InferenceError::CompressionFailed("bad tensor".into());
         assert_eq!(err.to_string(), "compression failed: bad tensor");
     }
 
     #[test]
-    #[cfg(feature = "kv-compress")]
     fn cache_compressed_displays_message() {
         let err = InferenceError::CacheCompressed;
         assert!(err.to_string().contains("compressed"));

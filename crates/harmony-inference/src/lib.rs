@@ -19,9 +19,9 @@
 
 pub mod engine;
 pub mod error;
-pub(crate) mod qwen3_ext;
 #[cfg(feature = "kv-compress")]
 pub(crate) mod kv_compress;
+pub(crate) mod qwen3_ext;
 pub mod sampling;
 
 pub use engine::QwenEngine;
@@ -155,6 +155,7 @@ impl InferenceCache {
             return Ok(());
         }
 
+        // TODO(harmony-51dy): thread device from engine instead of hardcoding Cpu
         let device = candle_core::Device::Cpu;
 
         // Phase 1: decompress into temporary vec.
@@ -163,10 +164,18 @@ impl InferenceCache {
             match comp {
                 Some(c) => {
                     let k = kv_compress::decompress_tensor(
-                        &c.k, self.num_kv_heads, c.seq_len, self.head_dim, &device,
+                        &c.k,
+                        self.num_kv_heads,
+                        c.seq_len,
+                        self.head_dim,
+                        &device,
                     )?;
                     let v = kv_compress::decompress_tensor(
-                        &c.v, self.num_kv_heads, c.seq_len, self.head_dim, &device,
+                        &c.v,
+                        self.num_kv_heads,
+                        c.seq_len,
+                        self.head_dim,
+                        &device,
                     )?;
                     new_layers.push(Some((k, v)));
                 }
@@ -329,7 +338,12 @@ mod kv_compress_cache_tests {
     use candle_core::{DType, Device, Tensor};
 
     /// Create a cache with `n_tokens` of random f16 KV tensors in layer 0.
-    fn cache_with_data(num_layers: usize, num_kv_heads: usize, head_dim: usize, n_tokens: usize) -> InferenceCache {
+    fn cache_with_data(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        n_tokens: usize,
+    ) -> InferenceCache {
         let mut cache = InferenceCache::new(num_layers, head_dim, num_kv_heads);
         if n_tokens > 0 {
             let shape = (1, num_kv_heads, n_tokens, head_dim);
@@ -387,29 +401,46 @@ mod kv_compress_cache_tests {
     #[test]
     fn compress_decompress_roundtrip() {
         let mut cache = cache_with_data(2, 8, 128, 16);
-        let orig_k = cache.layers[0].as_ref().unwrap().0
-            .to_dtype(DType::F32).unwrap()
-            .flatten_all().unwrap()
-            .to_vec1::<f32>().unwrap();
+        let orig_k = cache.layers[0]
+            .as_ref()
+            .unwrap()
+            .0
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
 
         cache.compress().unwrap();
         cache.decompress().unwrap();
         assert!(!cache.is_compressed());
 
-        let (k, v) = cache.layers[0].as_ref().expect("layer 0 should be restored");
+        let (k, v) = cache.layers[0]
+            .as_ref()
+            .expect("layer 0 should be restored");
         assert_eq!(k.dims4().unwrap(), (1, 8, 16, 128));
         assert_eq!(v.dims4().unwrap(), (1, 8, 16, 128));
         assert_eq!(k.dtype(), DType::F16);
 
-        let restored_k = k.to_dtype(DType::F32).unwrap()
-            .flatten_all().unwrap()
-            .to_vec1::<f32>().unwrap();
+        let restored_k = k
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert_eq!(orig_k.len(), restored_k.len());
-        let max_err: f32 = orig_k.iter().zip(restored_k.iter())
+        let max_err: f32 = orig_k
+            .iter()
+            .zip(restored_k.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
         // 3-bit on [0,1]: step=1/7≈0.143, max error < half step + f16 rounding
-        assert!(max_err < 0.15, "max reconstruction error {max_err} too large");
+        assert!(
+            max_err < 0.15,
+            "max reconstruction error {max_err} too large"
+        );
     }
 
     #[test]
@@ -444,7 +475,10 @@ mod kv_compress_cache_tests {
         let before = cache.memory_bytes();
         cache.compress().unwrap();
         let after = cache.memory_bytes();
-        assert!(after < before, "compressed {after} should be < uncompressed {before}");
+        assert!(
+            after < before,
+            "compressed {after} should be < uncompressed {before}"
+        );
         let ratio = before as f64 / after as f64;
         // 3-bit uniform: 56 bytes/vec vs 256 bytes/vec ≈ 4.6x
         assert!(ratio > 3.0, "compression ratio {ratio:.1}x too low");
@@ -466,16 +500,24 @@ mod kv_compress_cache_tests {
         // Layer 0: correct shape [1, 8, 4, 128] f16
         let shape_ok = (1, 8, 4, 128);
         let k0 = Tensor::rand(0f32, 1f32, shape_ok, &Device::Cpu)
-            .unwrap().to_dtype(DType::F16).unwrap();
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         let v0 = Tensor::rand(0f32, 1f32, shape_ok, &Device::Cpu)
-            .unwrap().to_dtype(DType::F16).unwrap();
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         cache.layers[0] = Some((k0, v0));
 
         // Layer 1: 3D tensor (wrong rank) — will fail dims4()
         let k1 = Tensor::rand(0f32, 1f32, (8, 4, 128), &Device::Cpu)
-            .unwrap().to_dtype(DType::F16).unwrap();
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         let v1 = Tensor::rand(0f32, 1f32, (8, 4, 128), &Device::Cpu)
-            .unwrap().to_dtype(DType::F16).unwrap();
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         cache.layers[1] = Some((k1, v1));
 
         let result = cache.compress();
@@ -509,9 +551,13 @@ mod kv_compress_cache_tests {
         let mut cache = InferenceCache::new(4, 128, 8);
         let shape = (1, 8, 4, 128);
         let k = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
-            .unwrap().to_dtype(DType::F16).unwrap();
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         let v = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
-            .unwrap().to_dtype(DType::F16).unwrap();
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         cache.layers[0] = Some((k.clone(), v.clone()));
         cache.layers[2] = Some((k, v));
 
