@@ -76,8 +76,7 @@ fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
         Ok(xs)
     } else {
         let (b_sz, n_kv_head, seq_len, head_dim) = xs.dims4()?;
-        Tensor::cat(&vec![&xs; n_rep], 2)?
-            .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+        Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
     }
 }
 
@@ -140,8 +139,7 @@ impl RotaryEmbedding {
             .map(|i| 1f32 / rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq =
-            Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
             .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
@@ -428,21 +426,14 @@ impl ModelWeights {
             Some(v) => Ok(v),
         };
 
-        let num_attention_heads =
-            md_get("qwen3.attention.head_count")?.to_u32()? as usize;
-        let num_kv_heads =
-            md_get("qwen3.attention.head_count_kv")?.to_u32()? as usize;
-        let head_dim =
-            md_get("qwen3.attention.key_length")?.to_u32()? as usize;
+        let num_attention_heads = md_get("qwen3.attention.head_count")?.to_u32()? as usize;
+        let num_kv_heads = md_get("qwen3.attention.head_count_kv")?.to_u32()? as usize;
+        let head_dim = md_get("qwen3.attention.key_length")?.to_u32()? as usize;
         let num_layers = md_get("qwen3.block_count")?.to_u32()? as usize;
-        let hidden_size =
-            md_get("qwen3.embedding_length")?.to_u32()? as usize;
-        let max_position_embeddings =
-            md_get("qwen3.context_length")?.to_u32()? as usize;
-        let rms_norm_eps =
-            md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-        let rope_freq_base =
-            md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
+        let hidden_size = md_get("qwen3.embedding_length")?.to_u32()? as usize;
+        let max_position_embeddings = md_get("qwen3.context_length")?.to_u32()? as usize;
+        let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
+        let rope_freq_base = md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
 
         let dtype = match gg.metadata().get("general.dtype") {
             Some(v) => match v.to_u32() {
@@ -454,8 +445,7 @@ impl ModelWeights {
         };
 
         let embed_tensor = gg.tensor("token_embd.weight")?;
-        let embed_tokens =
-            candle_nn::Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
+        let embed_tokens = candle_nn::Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
 
         let rotary = Arc::new(RotaryEmbedding::new(
             dtype,
@@ -526,19 +516,14 @@ impl ModelWeights {
                 })
             })
             .collect();
-        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?
-            .to_dtype(self.dtype)
+        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
     }
 
     /// Forward pass with externalized KV cache.
     ///
     /// The caller owns the [`InferenceCache`] and passes it in on every call.
     /// This method advances `cache.position` by the number of input tokens.
-    pub(crate) fn forward(
-        &self,
-        input: &Tensor,
-        cache: &mut InferenceCache,
-    ) -> Result<Tensor> {
+    pub(crate) fn forward(&self, input: &Tensor, cache: &mut InferenceCache) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
         let offset = cache.position;

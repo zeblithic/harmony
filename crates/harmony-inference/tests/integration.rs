@@ -138,7 +138,9 @@ fn test_new_cache_enables_new_conversation() {
     let _ = engine.forward(&tokens, &mut cache1).expect("forward");
 
     // Second conversation uses a fresh cache — no reset() needed
-    let mut cache2 = engine.new_cache().expect("new_cache for second conversation");
+    let mut cache2 = engine
+        .new_cache()
+        .expect("new_cache for second conversation");
     let tokens2 = engine.tokenize("Goodbye").expect("tokenize");
     let logits = engine
         .forward(&tokens2, &mut cache2)

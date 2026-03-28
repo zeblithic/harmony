@@ -54,9 +54,8 @@ impl InferenceEngine for QwenEngine {
         let mut cursor = Cursor::new(gguf_data);
         let content = gguf_file::Content::read(&mut cursor)
             .map_err(|e| InferenceError::InvalidGguf(e.to_string()))?;
-        let model =
-            crate::qwen3_ext::ModelWeights::from_gguf(content, &mut cursor, &self.device)
-                .map_err(|e| InferenceError::InvalidGguf(e.to_string()))?;
+        let model = crate::qwen3_ext::ModelWeights::from_gguf(content, &mut cursor, &self.device)
+            .map_err(|e| InferenceError::InvalidGguf(e.to_string()))?;
         self.model = Some(model);
         Ok(())
     }
@@ -155,24 +154,17 @@ impl InferenceEngine for QwenEngine {
     ) -> Result<u32, InferenceError> {
         let mut rng = thread_rng();
         // Apply repeat_last_n windowing to the caller-provided full history.
-        let context =
-            if params.repeat_last_n > 0 && params.repeat_last_n < history.len() {
-                &history[history.len() - params.repeat_last_n..]
-            } else {
-                history
-            };
+        let context = if params.repeat_last_n > 0 && params.repeat_last_n < history.len() {
+            &history[history.len() - params.repeat_last_n..]
+        } else {
+            history
+        };
         crate::sampling::sample(logits, params, context, &mut rng)
     }
 
     fn eos_token_id(&self) -> Option<u32> {
         let tokenizer = self.tokenizer.as_ref()?;
-        for eos_str in &[
-            "<|endoftext|>",
-            "<|im_end|>",
-            "</s>",
-            "<|end|>",
-            "<eos>",
-        ] {
+        for eos_str in &["<|endoftext|>", "<|im_end|>", "</s>", "<|end|>", "<eos>"] {
             if let Some(id) = tokenizer.token_to_id(eos_str) {
                 return Some(id);
             }
