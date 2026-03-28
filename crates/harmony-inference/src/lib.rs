@@ -20,6 +20,8 @@
 pub mod engine;
 pub mod error;
 pub(crate) mod qwen3_ext;
+#[cfg(feature = "kv-compress")]
+pub(crate) mod kv_compress;
 pub mod sampling;
 
 pub use engine::QwenEngine;
