@@ -54,6 +54,12 @@ pub struct InferenceCache {
     pub head_dim: usize,
     /// Expected KV head count (for downstream consumers).
     pub num_kv_heads: usize,
+    /// Per-layer compressed K/V state. Populated by compress(), consumed by decompress().
+    #[cfg(feature = "kv-compress")]
+    pub(crate) compressed: Vec<Option<kv_compress::CompressedKvLayer>>,
+    /// Whether the cache is currently in compressed form.
+    #[cfg(feature = "kv-compress")]
+    pub(crate) is_compressed: bool,
 }
 
 impl InferenceCache {
@@ -65,6 +71,10 @@ impl InferenceCache {
             num_layers,
             head_dim,
             num_kv_heads,
+            #[cfg(feature = "kv-compress")]
+            compressed: (0..num_layers).map(|_| None).collect(),
+            #[cfg(feature = "kv-compress")]
+            is_compressed: false,
         }
     }
 
@@ -76,6 +86,14 @@ impl InferenceCache {
     /// Whether the cache is empty (no tokens consumed).
     pub fn is_empty(&self) -> bool {
         self.position == 0
+    }
+}
+
+#[cfg(feature = "kv-compress")]
+impl InferenceCache {
+    /// Whether the cache is currently in compressed form.
+    pub fn is_compressed(&self) -> bool {
+        self.is_compressed
     }
 }
 
@@ -199,5 +217,20 @@ mod cache_tests {
         cache.position = 42;
         assert!(!cache.is_empty());
         assert_eq!(cache.len(), 42);
+    }
+
+    #[test]
+    #[cfg(feature = "kv-compress")]
+    fn new_cache_is_not_compressed() {
+        let cache = InferenceCache::new(28, 128, 8);
+        assert!(!cache.is_compressed());
+    }
+
+    #[test]
+    #[cfg(feature = "kv-compress")]
+    fn new_cache_compressed_vec_matches_layers() {
+        let cache = InferenceCache::new(28, 128, 8);
+        assert_eq!(cache.compressed.len(), 28);
+        assert!(cache.compressed.iter().all(|c| c.is_none()));
     }
 }
