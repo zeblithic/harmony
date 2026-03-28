@@ -131,6 +131,42 @@ impl InferenceCache {
         self.is_compressed = true;
         Ok(())
     }
+
+    /// Decompress all layers back to full-precision f16 tensors.
+    /// No-op if not compressed.
+    /// Atomic: on error, cache remains in compressed state.
+    pub fn decompress(&mut self) -> Result<(), InferenceError> {
+        if !self.is_compressed {
+            return Ok(());
+        }
+
+        let device = candle_core::Device::Cpu;
+
+        // Phase 1: decompress into temporary vec.
+        let mut new_layers: Vec<Option<(Tensor, Tensor)>> = Vec::with_capacity(self.num_layers);
+        for comp in &self.compressed {
+            match comp {
+                Some(c) => {
+                    let k = kv_compress::decompress_tensor(
+                        &c.k, self.num_kv_heads, c.seq_len, self.head_dim, &device,
+                    )?;
+                    let v = kv_compress::decompress_tensor(
+                        &c.v, self.num_kv_heads, c.seq_len, self.head_dim, &device,
+                    )?;
+                    new_layers.push(Some((k, v)));
+                }
+                None => new_layers.push(None),
+            }
+        }
+
+        // Phase 2: commit.
+        self.layers = new_layers;
+        for comp in &mut self.compressed {
+            *comp = None;
+        }
+        self.is_compressed = false;
+        Ok(())
+    }
 }
 
 /// Sampling parameters for token generation.
@@ -323,5 +359,53 @@ mod kv_compress_cache_tests {
         assert!(cache.layers[1].is_none());
         assert!(cache.compressed[0].is_some());
         assert!(cache.compressed[1].is_none()); // was unpopulated
+    }
+
+    #[test]
+    fn decompress_noop_when_uncompressed() {
+        let mut cache = cache_with_data(2, 8, 128, 16);
+        assert!(cache.decompress().is_ok());
+        assert!(!cache.is_compressed());
+        assert!(cache.layers[0].is_some());
+    }
+
+    #[test]
+    fn compress_decompress_roundtrip() {
+        let mut cache = cache_with_data(2, 8, 128, 16);
+        let orig_k = cache.layers[0].as_ref().unwrap().0
+            .to_dtype(DType::F32).unwrap()
+            .flatten_all().unwrap()
+            .to_vec1::<f32>().unwrap();
+
+        cache.compress().unwrap();
+        cache.decompress().unwrap();
+        assert!(!cache.is_compressed());
+
+        let (k, v) = cache.layers[0].as_ref().expect("layer 0 should be restored");
+        assert_eq!(k.dims4().unwrap(), (1, 8, 16, 128));
+        assert_eq!(v.dims4().unwrap(), (1, 8, 16, 128));
+        assert_eq!(k.dtype(), DType::F16);
+
+        let restored_k = k.to_dtype(DType::F32).unwrap()
+            .flatten_all().unwrap()
+            .to_vec1::<f32>().unwrap();
+        assert_eq!(orig_k.len(), restored_k.len());
+        let max_err: f32 = orig_k.iter().zip(restored_k.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        // 3-bit on [0,1]: step=1/7≈0.143, max error < half step + f16 rounding
+        assert!(max_err < 0.15, "max reconstruction error {max_err} too large");
+    }
+
+    #[test]
+    fn is_compressed_state_tracking() {
+        let mut cache = cache_with_data(2, 8, 128, 4);
+        assert!(!cache.is_compressed());
+        cache.compress().unwrap();
+        assert!(cache.is_compressed());
+        cache.decompress().unwrap();
+        assert!(!cache.is_compressed());
+        cache.compress().unwrap();
+        assert!(cache.is_compressed());
     }
 }
