@@ -162,6 +162,12 @@ pub fn generate_proofs(
         ));
     }
 
+    if header.num_layers == 0 || header.num_kv_heads == 0 {
+        return Err(PrefillError::SerializationFailed(
+            "header num_layers and num_kv_heads must be non-zero".into(),
+        ));
+    }
+
     let num_layers = header.num_layers as usize;
     let num_kv_heads = header.num_kv_heads as usize;
     let seq_len = cache.position;

@@ -45,7 +45,7 @@ pub struct PrefillCacheHeader {
 }
 
 /// V1 header layout — serialized WITHOUT the proofs field.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct PrefillCacheHeaderV1 {
     magic: [u8; 4],
     model_cid: [u8; 32],
@@ -119,28 +119,50 @@ fn store_prefill_cache_inner(
         )));
     }
 
-    let header = PrefillCacheHeader {
-        magic,
-        model_cid: model_cid.to_bytes(),
-        token_hash: token_hash(token_ids),
-        token_count: u32::try_from(cache.position).map_err(|_| {
-            PrefillError::SerializationFailed(format!("position {} exceeds u32", cache.position))
-        })?,
-        num_layers: u16::try_from(cache.num_layers).map_err(|_| {
-            PrefillError::SerializationFailed(format!("num_layers {} exceeds u16", cache.num_layers))
-        })?,
-        num_kv_heads: u16::try_from(cache.num_kv_heads).map_err(|_| {
-            PrefillError::SerializationFailed(format!("num_kv_heads {} exceeds u16", cache.num_kv_heads))
-        })?,
-        head_dim: u16::try_from(cache.head_dim).map_err(|_| {
-            PrefillError::SerializationFailed(format!("head_dim {} exceeds u16", cache.head_dim))
-        })?,
-        quant_bits: SUPPORTED_QUANT_BITS,
-        proofs,
-    };
+    let token_count = u32::try_from(cache.position).map_err(|_| {
+        PrefillError::SerializationFailed(format!("position {} exceeds u32", cache.position))
+    })?;
+    let num_layers = u16::try_from(cache.num_layers).map_err(|_| {
+        PrefillError::SerializationFailed(format!("num_layers {} exceeds u16", cache.num_layers))
+    })?;
+    let num_kv_heads = u16::try_from(cache.num_kv_heads).map_err(|_| {
+        PrefillError::SerializationFailed(format!("num_kv_heads {} exceeds u16", cache.num_kv_heads))
+    })?;
+    let head_dim = u16::try_from(cache.head_dim).map_err(|_| {
+        PrefillError::SerializationFailed(format!("head_dim {} exceeds u16", cache.head_dim))
+    })?;
+    let model_cid_bytes = model_cid.to_bytes();
+    let tok_hash = token_hash(token_ids);
 
-    let header_bytes = postcard::to_allocvec(&header)
-        .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?;
+    // Serialize v1 headers WITHOUT the proofs field for byte-exact v1 format.
+    // v2 headers include the proofs field.
+    let header_bytes = if magic == PREFILL_MAGIC {
+        let v1 = PrefillCacheHeaderV1 {
+            magic,
+            model_cid: model_cid_bytes,
+            token_hash: tok_hash,
+            token_count,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            quant_bits: SUPPORTED_QUANT_BITS,
+        };
+        postcard::to_allocvec(&v1)
+    } else {
+        let header = PrefillCacheHeader {
+            magic,
+            model_cid: model_cid_bytes,
+            token_hash: tok_hash,
+            token_count,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            quant_bits: SUPPORTED_QUANT_BITS,
+            proofs,
+        };
+        postcard::to_allocvec(&header)
+    }
+    .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?;
 
     let payload_bytes = cache.serialize_compressed()?;
 
