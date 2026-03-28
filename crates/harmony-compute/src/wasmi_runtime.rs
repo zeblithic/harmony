@@ -392,6 +392,11 @@ impl ComputeRuntime for WasmiRuntime {
                         }
 
                         let data = caller.data_mut();
+                        // Clear stale cache/history from previous model before
+                        // loading a new one — prevents wrong-model cache reuse.
+                        data.inference_cache = None;
+                        data.inference_history.clear();
+                        data.last_logits = None;
                         data.io_request = Some(crate::types::IORequest::LoadModel {
                             gguf_cid,
                             tokenizer_cid,

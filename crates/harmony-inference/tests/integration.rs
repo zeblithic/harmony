@@ -113,13 +113,18 @@ fn test_generate_ten_tokens() {
         .sample(&logits, &SamplingParams::greedy(), &prompt_tokens)
         .expect("sample");
 
+    // Track full history (prompt + generated) for correct repeat penalty,
+    // matching the pattern used in harmony-node's run_inference_loop.
+    let mut history: Vec<u32> = prompt_tokens.clone();
     let mut generated = vec![next];
+    history.push(next);
     for _ in 0..9 {
         let logits = engine.forward(&[next], &mut cache).expect("decode step");
         next = engine
-            .sample(&logits, &SamplingParams::greedy(), &generated)
+            .sample(&logits, &SamplingParams::greedy(), &history)
             .expect("sample");
         generated.push(next);
+        history.push(next);
     }
 
     let text = engine.detokenize(&generated).expect("detokenize");
