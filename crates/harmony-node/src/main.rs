@@ -634,6 +634,18 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                             })
                     })
                     .flatten(),
+                engram_manifest_cid: config_file
+                    .engram_manifest_cid
+                    .as_deref()
+                    .and_then(|s| {
+                        hex::decode(s)
+                            .ok()
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                            .or_else(|| {
+                                tracing::warn!("engram_manifest_cid is not a valid 32-byte hex string; Engram disabled");
+                                None
+                            })
+                    }),
                 disk_enabled: config_file.data_dir.is_some(),
                 disk_entries,
                 disk_quota,

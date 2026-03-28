@@ -84,6 +84,8 @@ pub struct ConfigFile {
     pub inference_model_gguf_cid: Option<String>,
     /// Hex-encoded 32-byte CID of the tokenizer.json file in CAS.
     pub inference_model_tokenizer_cid: Option<String>,
+    /// Hex-encoded 32-byte CID of the Engram manifest in CAS.
+    pub engram_manifest_cid: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
