@@ -152,7 +152,9 @@ pub(crate) fn f32_mantissa_u16(value: f32) -> u16 {
 }
 
 /// Extract IEEE 754 exponent (8 bits) from an f32.
+/// Reserved for future exponent intersection verification.
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn f32_exponent(value: f32) -> u8 {
     ((value.to_bits() >> 23) & 0xFF) as u8
 }

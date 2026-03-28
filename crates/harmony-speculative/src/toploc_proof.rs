@@ -129,11 +129,12 @@ fn extract_kv_slice(
     let (_b, _h, seq_len, _head_dim) = tensor
         .dims4()
         .map_err(|e| PrefillError::SerializationFailed(format!("tensor shape: {e}")))?;
-    let end = (token_offset + chunk_size).min(seq_len);
-    let len = end - token_offset;
-    if len == 0 {
-        return Err(PrefillError::SerializationFailed("empty token range".into()));
+    if token_offset >= seq_len {
+        return Err(PrefillError::SerializationFailed(format!(
+            "token_offset {token_offset} >= seq_len {seq_len}"
+        )));
     }
+    let end = (token_offset + chunk_size).min(seq_len);
     let sliced = tensor
         .i((0, head, token_offset..end, ..))
         .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?;
@@ -219,6 +220,12 @@ pub fn verify_proofs(
     local_cache: &InferenceCache,
     header: &PrefillCacheHeader,
 ) -> Result<VerifyResult, PrefillError> {
+    if local_cache.is_compressed() {
+        return Err(PrefillError::SerializationFailed(
+            "cache must not be compressed for verification".into(),
+        ));
+    }
+
     let proofs = &header.proofs;
 
     if proofs.is_empty() {
@@ -272,6 +279,20 @@ pub fn verify_proofs(
             continue;
         }
 
+        // Modulus guard: proof.modulus is untrusted, division by zero panics.
+        if proof.modulus < 2 {
+            details.push(ProofCheckDetail {
+                layer: proof.layer,
+                head: proof.head,
+                token_offset: proof.token_offset,
+                agreement_rate: 0.0,
+                mean_mantissa_diff: f32::INFINITY,
+                median_mantissa_diff: f32::INFINITY,
+                passed: false,
+            });
+            continue;
+        }
+
         let (k_tensor, _) = match &local_cache.layers[layer] {
             Some((k, v)) => (k, v),
             None => {
@@ -309,7 +330,8 @@ pub fn verify_proofs(
         for i in 0..TOP_K {
             let x = (local_indices[i] as u32 % proof.modulus as u32) as u16;
             let claimed = toploc::horner_evaluate(&proof.coefficients, x, proof.modulus);
-            let local = local_mantissas[i];
+            // Reduce local mantissa mod m to match NDD encoding (which reduces y-values mod m).
+            let local = (local_mantissas[i] as u32 % proof.modulus as u32) as u16;
             let diff = (claimed as i32 - local as i32).unsigned_abs() as f32;
             diffs.push(diff);
         }
