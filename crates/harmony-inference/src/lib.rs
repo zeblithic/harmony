@@ -18,6 +18,7 @@
 //! ```
 
 pub mod engine;
+pub mod engram_bridge;
 pub mod engram_residual;
 pub mod error;
 #[cfg(feature = "kv-compress")]
@@ -25,6 +26,7 @@ pub(crate) mod kv_compress;
 pub(crate) mod qwen3_ext;
 pub mod sampling;
 
+pub use engine::EngramContext;
 pub use engine::QwenEngine;
 pub use engram_residual::EngramGatedResidual;
 pub use error::InferenceError;

@@ -9,8 +9,23 @@ use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use rand::thread_rng;
 
+use crate::engram_residual::EngramGatedResidual;
 use crate::error::InferenceError;
 use crate::{InferenceCache, InferenceEngine, SamplingParams};
+
+/// Context for Engram-augmented inference.
+///
+/// Constructed by the caller with a trained module, pre-resolved embeddings
+/// (from [`engram_bridge::resolve_engram_embeddings`](crate::engram_bridge::resolve_engram_embeddings)),
+/// and the layer indices to inject at.
+pub struct EngramContext<'a> {
+    /// The gated residual module (holds projection + gating weights).
+    pub module: &'a EngramGatedResidual,
+    /// Pre-resolved Engram embeddings. Shape: `[1, seq_len, engram_dim]`.
+    pub embeddings: Tensor,
+    /// Which transformer layers to inject at (e.g., `&[2, 14]`).
+    pub injection_layers: &'a [usize],
+}
 
 /// Inference engine wrapping a forked quantized Qwen3 implementation.
 ///
@@ -93,61 +108,7 @@ impl InferenceEngine for QwenEngine {
         tokens: &[u32],
         cache: &mut InferenceCache,
     ) -> Result<Vec<f32>, InferenceError> {
-        if tokens.is_empty() {
-            return Err(InferenceError::ForwardFailed(
-                "tokens slice must not be empty".into(),
-            ));
-        }
-        #[cfg(feature = "kv-compress")]
-        if cache.is_compressed() {
-            return Err(InferenceError::CacheCompressed);
-        }
-        let model = self.model.as_ref().ok_or(InferenceError::ModelNotLoaded)?;
-
-        // Validate cache matches model architecture.
-        if cache.num_layers != model.num_layers {
-            return Err(InferenceError::CacheMismatch {
-                expected: model.num_layers,
-                actual: cache.num_layers,
-            });
-        }
-
-        let seq_len = tokens.len();
-        let input = Tensor::new(tokens, &self.device)
-            .and_then(|t| t.reshape((1, seq_len)))
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
-
-        // model.forward advances cache.position internally.
-        let logits = model
-            .forward(&input, cache)
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
-
-        // Extract last logit row.
-        let logits = match logits.dims().len() {
-            1 => logits,
-            2 => {
-                let rows = logits
-                    .dim(0)
-                    .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
-                if rows == 0 {
-                    return Err(InferenceError::ForwardFailed(
-                        "model returned empty logits tensor [0, vocab_size]".into(),
-                    ));
-                }
-                logits
-                    .get(rows - 1)
-                    .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?
-            }
-            n => {
-                return Err(InferenceError::ForwardFailed(format!(
-                    "unexpected logits dimensionality: {n}D"
-                )))
-            }
-        };
-
-        logits
-            .to_vec1::<f32>()
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
+        self.forward_impl(tokens, cache, None)
     }
 
     fn sample(
@@ -183,6 +144,115 @@ impl InferenceEngine for QwenEngine {
             model.head_dim,
             model.num_kv_heads,
         ))
+    }
+}
+
+impl QwenEngine {
+    /// Run a forward pass with Engram injection.
+    ///
+    /// Behaves identically to [`InferenceEngine::forward`] but injects Engram
+    /// embeddings at the specified transformer layers via the gated residual
+    /// module. This is an inherent method, not a trait method — Engram
+    /// injection is optional and engine-specific.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as `forward()`, plus any tensor errors from
+    /// the Engram module itself (wrapped as `ForwardFailed`).
+    pub fn forward_with_engram(
+        &self,
+        tokens: &[u32],
+        cache: &mut InferenceCache,
+        engram: &EngramContext<'_>,
+    ) -> Result<Vec<f32>, InferenceError> {
+        // Validate that embeddings match the tokens being processed.
+        // The caller must provide fresh embeddings sized to the current batch:
+        // prefill → [1, prompt_len, dim], decode → [1, 1, dim].
+        let seq_len = tokens.len();
+        let emb_len = engram
+            .embeddings
+            .dim(1)
+            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+        if emb_len != seq_len {
+            return Err(InferenceError::ForwardFailed(format!(
+                "engram embeddings have {emb_len} positions but tokens.len()={seq_len}; \
+                 caller must provide embeddings matching the current token batch"
+            )));
+        }
+
+        let engram_fn =
+            |layer_idx: usize, hidden_state: &Tensor| -> candle_core::Result<Option<Tensor>> {
+                if engram.injection_layers.contains(&layer_idx) {
+                    Ok(Some(
+                        engram.module.forward(hidden_state, &engram.embeddings)?,
+                    ))
+                } else {
+                    Ok(None)
+                }
+            };
+        self.forward_impl(tokens, cache, Some(&engram_fn))
+    }
+
+    /// Shared implementation for forward() and forward_with_engram().
+    fn forward_impl(
+        &self,
+        tokens: &[u32],
+        cache: &mut InferenceCache,
+        engram_fn: Option<crate::qwen3_ext::EngramFn<'_>>,
+    ) -> Result<Vec<f32>, InferenceError> {
+        if tokens.is_empty() {
+            return Err(InferenceError::ForwardFailed(
+                "tokens slice must not be empty".into(),
+            ));
+        }
+        #[cfg(feature = "kv-compress")]
+        if cache.is_compressed() {
+            return Err(InferenceError::CacheCompressed);
+        }
+        let model = self.model.as_ref().ok_or(InferenceError::ModelNotLoaded)?;
+
+        if cache.num_layers != model.num_layers {
+            return Err(InferenceError::CacheMismatch {
+                expected: model.num_layers,
+                actual: cache.num_layers,
+            });
+        }
+
+        let seq_len = tokens.len();
+        let input = Tensor::new(tokens, &self.device)
+            .and_then(|t| t.reshape((1, seq_len)))
+            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+
+        let logits = model
+            .forward_with_engram(&input, cache, engram_fn)
+            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+
+        // Extract last logit row.
+        let logits = match logits.dims().len() {
+            1 => logits,
+            2 => {
+                let rows = logits
+                    .dim(0)
+                    .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+                if rows == 0 {
+                    return Err(InferenceError::ForwardFailed(
+                        "model returned empty logits tensor [0, vocab_size]".into(),
+                    ));
+                }
+                logits
+                    .get(rows - 1)
+                    .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?
+            }
+            n => {
+                return Err(InferenceError::ForwardFailed(format!(
+                    "unexpected logits dimensionality: {n}D"
+                )))
+            }
+        };
+
+        logits
+            .to_vec1::<f32>()
+            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
     }
 }
 
@@ -285,6 +355,22 @@ mod tests {
         // No model loaded — ModelNotLoaded fires before CacheMismatch check.
         let mut cache = InferenceCache::new(99, 128, 8);
         let result = engine.forward(&[1], &mut cache);
+        assert!(matches!(result, Err(InferenceError::ModelNotLoaded)));
+    }
+
+    #[test]
+    fn forward_with_engram_without_model_returns_error() {
+        let device = Device::Cpu;
+        let engine = QwenEngine::new(device.clone());
+        let mut cache = InferenceCache::new(28, 128, 8);
+        let module = crate::engram_residual::EngramGatedResidual::new(4, 64, 3, &device).unwrap();
+        let embeddings = Tensor::zeros((1, 3, 4), candle_core::DType::F32, &device).unwrap();
+        let ctx = EngramContext {
+            module: &module,
+            embeddings,
+            injection_layers: &[2, 14],
+        };
+        let result = engine.forward_with_engram(&[1, 2, 3], &mut cache, &ctx);
         assert!(matches!(result, Err(InferenceError::ModelNotLoaded)));
     }
 }
