@@ -18,6 +18,7 @@ use candle_nn::{Conv1d, Conv1dConfig, Linear};
 /// 3. Apply gate: `gated = gate * v`
 /// 4. Causal depthwise conv1d with left-padding
 /// 5. Return `silu(conv_out)` (the residual, NOT added to h)
+#[derive(Debug, Clone)]
 pub struct EngramGatedResidual {
     key_proj: Linear,
     value_proj: Linear,
@@ -95,6 +96,26 @@ impl EngramGatedResidual {
         hidden_dim: usize,
         conv_kernel_size: usize,
     ) -> Result<Self> {
+        // Validate tensor shapes upfront for clear error messages.
+        let kw = key_proj_weight.shape().dims();
+        if kw.len() != 2 || kw[0] != hidden_dim {
+            candle_core::bail!(
+                "key_proj_weight shape {kw:?} does not match hidden_dim={hidden_dim}"
+            );
+        }
+        let vw = value_proj_weight.shape().dims();
+        if vw.len() != 2 || vw[0] != hidden_dim {
+            candle_core::bail!(
+                "value_proj_weight shape {vw:?} does not match hidden_dim={hidden_dim}"
+            );
+        }
+        let cw = conv1d_weight.shape().dims();
+        if cw != [hidden_dim, 1, conv_kernel_size] {
+            candle_core::bail!(
+                "conv1d_weight shape {cw:?} expected [{hidden_dim}, 1, {conv_kernel_size}]"
+            );
+        }
+
         let key_proj = Linear::new(key_proj_weight, None);
         let value_proj = Linear::new(value_proj_weight, None);
 
@@ -209,8 +230,9 @@ mod tests {
 
         let output = module.forward(&hidden, &engram)?;
 
-        // With zero engram, key and value projections produce zeros,
-        // so the gated value is zero, conv output is zero, silu(0) = 0.
+        // With zero engram, key_proj(zeros)=zeros, value_proj(zeros)=zeros (no bias).
+        // gate = sigmoid(0) = 0.5, but gated_value = 0.5 * zeros = zeros.
+        // conv1d(zeros) = zeros, silu(zeros) = 0.
         let max_val: f32 = output.abs()?.max_all()?.to_scalar()?;
         assert!(
             max_val < 1e-6,
@@ -293,7 +315,7 @@ mod tests {
         // - position 3's window covers 1,2,3 (all zero) => also zero
         // Only position 4 (last) should be non-zero.
         let output_data: Vec<Vec<Vec<f32>>> = output.to_vec3()?;
-        for pos in 0..(seq_len - 2) {
+        for pos in 0..(seq_len - 1) {
             let max_at_pos: f32 = output_data[0][pos]
                 .iter()
                 .map(|v| v.abs())
