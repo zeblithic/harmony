@@ -1380,8 +1380,8 @@ impl<B: BookStore> NodeRuntime<B> {
                 // Check if this is an Engram manifest (borrows result before move).
                 #[cfg(feature = "inference")]
                 {
-                    let is_engram = Some(cid) == self.engram_manifest_cid
-                        && self.engram_client.is_none();
+                    let is_engram =
+                        Some(cid) == self.engram_manifest_cid && self.engram_client.is_none();
                     if is_engram {
                         match &result {
                             Ok(data) => self.parse_engram_manifest(data),
@@ -2794,7 +2794,10 @@ impl<B: BookStore> NodeRuntime<B> {
         // Random-init module for integration testing. Trained weights loaded separately.
         let hidden_dim = 1536; // Qwen3-0.6B hidden_size
         match harmony_inference::EngramGatedResidual::new(
-            engram_dim, hidden_dim, 3, &candle_core::Device::Cpu,
+            engram_dim,
+            hidden_dim,
+            3,
+            &candle_core::Device::Cpu,
         ) {
             Ok(m) => {
                 self.engram_module = Some(m);

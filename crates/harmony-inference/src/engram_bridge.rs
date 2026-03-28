@@ -51,10 +51,7 @@ pub struct EngramRequest {
 ///
 /// Returns an [`EngramRequest`] with deduplicated shard requirements.
 /// For seq_len < 2, returns an empty request (no N-grams possible).
-pub fn prepare_engram_request(
-    client: &EngramClient,
-    tokens: &[u32],
-) -> Result<EngramRequest> {
+pub fn prepare_engram_request(client: &EngramClient, tokens: &[u32]) -> Result<EngramRequest> {
     let seq_len = tokens.len();
     let mut lookups = Vec::new();
     let mut seen_shards = HashSet::new();
@@ -137,7 +134,11 @@ pub fn resolve_engram_embeddings(
 
     // Empty sequence → zero-sized tensor.
     if request.seq_len == 0 {
-        return Tensor::zeros((1usize, 0usize, embedding_dim), candle_core::DType::F32, device);
+        return Tensor::zeros(
+            (1usize, 0usize, embedding_dim),
+            candle_core::DType::F32,
+            device,
+        );
     }
 
     // Aggregation buffer: seq_len x embedding_dim, initialized to zero.
