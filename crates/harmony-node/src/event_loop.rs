@@ -1236,6 +1236,13 @@ pub async fn run(
                     };
 
                     // Step 2: Take engine after successful tokenization.
+                    // NOTE: In the Engram branch, the engine is held idle during
+                    // async shard fetches (up to 30s per shard via try_join_all).
+                    // Concurrent requests are rejected as "engine busy" during this
+                    // window. Deferring take_inference_engine() into the async block
+                    // would require a channel-based re-acquisition mechanism.
+                    // The proper fix is prefetch pipelining (harmony-geef) where
+                    // shards are pre-fetched before the inference request arrives.
                     if let Some(engine) = runtime.take_inference_engine() {
                         let tx = inference_tx.clone();
                         let max_tokens = crate::inference::DEFAULT_MAX_INFERENCE_TOKENS;

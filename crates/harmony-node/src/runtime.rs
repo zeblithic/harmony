@@ -2694,8 +2694,10 @@ impl<B: BookStore> NodeRuntime<B> {
                                         }
                                         Err(e) => {
                                             tracing::error!(
-                                                "Engram module re-init on engine device failed: {e}"
+                                                "Engram module re-init on engine device failed: {e}; \
+                                                 Engram injection disabled"
                                             );
+                                            self.engram_module = None;
                                         }
                                     }
                                 }
