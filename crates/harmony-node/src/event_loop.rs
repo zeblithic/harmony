@@ -1297,24 +1297,30 @@ pub async fn run(
                                     })
                                     .collect();
 
-                                let engram_prefill =
-                                    match futures_util::future::try_join_all(fetch_futures).await {
-                                        Ok(pairs) => {
-                                            let shard_data: HashMap<u64, Vec<u8>> =
-                                                pairs.into_iter().collect();
-                                                request,
-                                                shard_data,
-                                                injection_layers,
-                                            })
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                err = %e,
-                                                "engram shard fetch failed — falling back to non-Engram"
-                                            );
-                                            None
-                                        }
-                                    };
+                                let engram_prefill = match futures_util::future::try_join_all(
+                                    fetch_futures,
+                                )
+                                .await
+                                {
+                                    Ok(pairs) => {
+                                        let shard_data: HashMap<u64, Vec<u8>> =
+                                            pairs.into_iter().collect();
+                                        Some(EngramPrefill {
+                                            client,
+                                            module,
+                                            request,
+                                            shard_data,
+                                            injection_layers,
+                                        })
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            err = %e,
+                                            "engram shard fetch failed — falling back to non-Engram"
+                                        );
+                                        None
+                                    }
+                                };
 
                                 let handle = tokio::task::spawn_blocking(move || {
                                     run_inference_loop(
@@ -2244,7 +2250,9 @@ fn run_inference_loop(
                                     let _ = tx.blocking_send(InferenceResult::Failed {
                                         query_id,
                                         task_id,
-                                        error: format!("cache re-init failed after engram error: {e2}"),
+                                        error: format!(
+                                            "cache re-init failed after engram error: {e2}"
+                                        ),
                                         engine,
                                     });
                                     return;

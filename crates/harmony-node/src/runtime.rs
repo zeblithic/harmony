@@ -2673,6 +2673,32 @@ impl<B: BookStore> NodeRuntime<B> {
                     match engine.load_gguf(gguf_data) {
                         Ok(()) => match engine.load_tokenizer(tok_data) {
                             Ok(()) => {
+                                // Re-init Engram module on the engine's device if
+                                // it was created on a different device (manifest may
+                                // arrive before the engine, defaulting to CPU).
+                                if self.engram_module.is_some() && self.engram_client.is_some() {
+                                    let engram_dim =
+                                        self.engram_client.as_ref().unwrap().config().embedding_dim;
+                                    let hidden_dim = 1536; // TODO: from model metadata
+                                    match harmony_inference::EngramGatedResidual::new(
+                                        engram_dim,
+                                        hidden_dim,
+                                        3,
+                                        engine.device(),
+                                    ) {
+                                        Ok(m) => {
+                                            self.engram_module = Some(m);
+                                            tracing::info!(
+                                                "Engram module re-initialized on engine device"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Engram module re-init on engine device failed: {e}"
+                                            );
+                                        }
+                                    }
+                                }
                                 self.verification_engine = Some(engine);
                                 tracing::info!("DSD verification engine loaded");
                             }
@@ -2794,19 +2820,14 @@ impl<B: BookStore> NodeRuntime<B> {
         // Random-init module for integration testing. Trained weights loaded separately.
         // TODO: read hidden_dim from model metadata or manifest once available.
         let hidden_dim = 1536; // Qwen3-0.6B hidden_size
-        // Use the engine's device if loaded, otherwise CPU. The engine and manifest
-        // are fetched in parallel so the engine may not be ready yet.
+                               // Use the engine's device if loaded, otherwise CPU. The engine and manifest
+                               // are fetched in parallel so the engine may not be ready yet.
         let device = self
             .verification_engine
             .as_ref()
             .map(|e| e.device().clone())
             .unwrap_or(candle_core::Device::Cpu);
-        match harmony_inference::EngramGatedResidual::new(
-            engram_dim,
-            hidden_dim,
-            3,
-            &device,
-        ) {
+        match harmony_inference::EngramGatedResidual::new(engram_dim, hidden_dim, 3, &device) {
             Ok(m) => {
                 self.engram_module = Some(m);
                 tracing::info!("Engram module initialized (random weights)");
