@@ -18,11 +18,13 @@
 //! ```
 
 pub mod engine;
+pub mod engram_residual;
 pub mod error;
 pub(crate) mod qwen3_ext;
 pub mod sampling;
 
 pub use engine::QwenEngine;
+pub use engram_residual::EngramGatedResidual;
 pub use error::InferenceError;
 
 use candle_core::Tensor;
