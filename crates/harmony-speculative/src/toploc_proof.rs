@@ -226,6 +226,12 @@ pub fn verify_proofs(
         ));
     }
 
+    if header.num_layers == 0 || header.num_kv_heads == 0 {
+        return Err(PrefillError::SerializationFailed(
+            "header num_layers and num_kv_heads must be non-zero".into(),
+        ));
+    }
+
     let proofs = &header.proofs;
 
     if proofs.is_empty() {
@@ -279,8 +285,12 @@ pub fn verify_proofs(
             continue;
         }
 
-        // Modulus guard: proof.modulus is untrusted, division by zero panics.
-        if proof.modulus < 2 {
+        // Modulus guard: proof.modulus is untrusted. Must be a large prime
+        // (legitimate proofs use primes near 65521). A small modulus collapses
+        // all values to a tiny range, making all diffs trivially small and
+        // defeating the verification threshold checks.
+        const MIN_MODULUS: u16 = 1000;
+        if proof.modulus < MIN_MODULUS {
             details.push(ProofCheckDetail {
                 layer: proof.layer,
                 head: proof.head,

@@ -170,11 +170,12 @@ pub(crate) fn extract_top_k(data: &[f32], k: usize) -> (Vec<u16>, Vec<u16>) {
         .map(|(i, &v)| (v.abs(), i))
         .collect();
 
-    // Stable sort with index tie-breaking for cross-platform reproducibility.
-    // NaN values sort to the end (treated as smallest).
+    // Stable sort descending by absolute magnitude with index tie-breaking
+    // for cross-platform reproducibility. Uses total_cmp for correct NaN
+    // handling (NaN sorts after all finite values, so NaN elements end up
+    // at the end of the descending sort and stay out of top-k).
     indexed.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.0.total_cmp(&a.0)
             .then_with(|| a.1.cmp(&b.1))
     });
 
