@@ -10,10 +10,12 @@
 //! returned actions from [`NodeRuntime::tick`] through platform-specific
 //! I/O (UDP sockets, Zenoh sessions, disk, etc.).
 
+pub mod adapter;
+pub mod attestation;
+pub mod compute_backend;
 pub mod inference_types;
 pub mod page_index;
 pub mod runtime;
 
 // Re-export primary types for ergonomic imports
-pub use runtime::{NodeConfig, NodeRuntime, RuntimeAction, RuntimeEvent};
-pub use runtime::{AdaptiveCompute, TierSchedule};
+pub use runtime::{AdaptiveCompute, NodeConfig, NodeRuntime, RuntimeAction, RuntimeEvent, TierSchedule};
