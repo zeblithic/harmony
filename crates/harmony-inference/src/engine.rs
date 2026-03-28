@@ -165,11 +165,22 @@ impl QwenEngine {
         cache: &mut InferenceCache,
         engram: &EngramContext<'_>,
     ) -> Result<Vec<f32>, InferenceError> {
+        // Slice embeddings to match the tokens being processed in this call.
+        // During prefill, offset=0 and seq_len=prompt_len.
+        // During decode, offset=N and seq_len=1.
+        // Without this, broadcast addition would silently corrupt hidden state shapes.
+        let seq_len = tokens.len();
+        let offset = cache.position;
+        let embeddings_slice = engram
+            .embeddings
+            .narrow(1, offset, seq_len)
+            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+
         let engram_fn =
             |layer_idx: usize, hidden_state: &Tensor| -> candle_core::Result<Option<Tensor>> {
                 if engram.injection_layers.contains(&layer_idx) {
                     Ok(Some(
-                        engram.module.forward(hidden_state, &engram.embeddings)?,
+                        engram.module.forward(hidden_state, &embeddings_slice)?,
                     ))
                 } else {
                     Ok(None)
