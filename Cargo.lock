@@ -3295,6 +3295,7 @@ dependencies = [
  "harmony-peers",
  "harmony-rawlink",
  "harmony-reticulum",
+ "harmony-runtime",
  "harmony-s3",
  "harmony-speculative",
  "harmony-tunnel",
@@ -3405,6 +3406,34 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "zeroize",
+]
+
+[[package]]
+name = "harmony-runtime"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "harmony-agent",
+ "harmony-athenaeum",
+ "harmony-compute",
+ "harmony-contacts",
+ "harmony-content",
+ "harmony-credential",
+ "harmony-crypto",
+ "harmony-discovery",
+ "harmony-engram",
+ "harmony-identity",
+ "harmony-inference",
+ "harmony-memo",
+ "harmony-peers",
+ "harmony-reticulum",
+ "harmony-speculative",
+ "harmony-workflow",
+ "harmony-zenoh",
+ "hex",
+ "postcard",
+ "rand 0.8.5",
+ "tracing",
 ]
 
 [[package]]

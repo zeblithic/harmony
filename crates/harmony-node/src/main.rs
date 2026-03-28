@@ -8,9 +8,6 @@ mod event_loop;
 mod identity_file;
 #[allow(dead_code)]
 mod inference;
-// Page runtime integration is forward-looking.
-#[allow(dead_code)]
-mod page_index;
 mod runtime;
 // Zenoh-over-tunnel, initiator, and close paths are forward-looking (Bead #3).
 #[allow(dead_code)]
