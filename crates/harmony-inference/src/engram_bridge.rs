@@ -51,7 +51,10 @@ pub struct EngramRequest {
 ///
 /// Returns an [`EngramRequest`] with deduplicated shard requirements.
 /// For seq_len < 2, returns an empty request (no N-grams possible).
-pub fn prepare_engram_request(client: &EngramClient, tokens: &[u32]) -> EngramRequest {
+pub fn prepare_engram_request(
+    client: &EngramClient,
+    tokens: &[u32],
+) -> Result<EngramRequest> {
     let seq_len = tokens.len();
     let mut lookups = Vec::new();
     let mut seen_shards = HashSet::new();
@@ -61,7 +64,7 @@ pub fn prepare_engram_request(client: &EngramClient, tokens: &[u32]) -> EngramRe
     for i in 0..seq_len.saturating_sub(1) {
         let bigram = &tokens[i..i + 2];
         let lookup = client.lookup(bigram);
-        collect_shards(client, &lookup, &mut seen_shards, &mut required_shards);
+        collect_shards(client, &lookup, &mut seen_shards, &mut required_shards)?;
         lookups.push(NgramLookup {
             token_position: i + 1, // last token of bigram
             lookup,
@@ -72,37 +75,44 @@ pub fn prepare_engram_request(client: &EngramClient, tokens: &[u32]) -> EngramRe
     for i in 0..seq_len.saturating_sub(2) {
         let trigram = &tokens[i..i + 3];
         let lookup = client.lookup(trigram);
-        collect_shards(client, &lookup, &mut seen_shards, &mut required_shards);
+        collect_shards(client, &lookup, &mut seen_shards, &mut required_shards)?;
         lookups.push(NgramLookup {
             token_position: i + 2, // last token of trigram
             lookup,
         });
     }
 
-    EngramRequest {
+    Ok(EngramRequest {
         required_shards,
         lookups,
         seq_len,
-    }
+    })
 }
 
 /// Helper: collect unique shard requests from a lookup.
+/// Returns an error if a shard index is out of bounds in the manifest.
 fn collect_shards(
     client: &EngramClient,
     lookup: &EngramLookup,
     seen: &mut HashSet<u64>,
     shards: &mut Vec<ShardRequest>,
-) {
+) -> Result<()> {
     for &shard_idx in &lookup.shard_indices {
         if seen.insert(shard_idx) {
-            if let Some(&cid) = client.shard_cid(shard_idx) {
-                shards.push(ShardRequest {
-                    shard_index: shard_idx,
-                    cid,
-                });
-            }
+            let &cid = client.shard_cid(shard_idx).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "shard index {shard_idx} out of bounds in Engram manifest \
+                     (num_shards={})",
+                    client.config().num_shards
+                ))
+            })?;
+            shards.push(ShardRequest {
+                shard_index: shard_idx,
+                cid,
+            });
         }
     }
+    Ok(())
 }
 
 /// Phase 2: Resolve shard data into a candle Tensor of embeddings.
@@ -125,6 +135,11 @@ pub fn resolve_engram_embeddings(
     let embedding_dim = client.config().embedding_dim;
     let num_heads = client.config().num_heads as usize;
 
+    // Empty sequence → zero-sized tensor.
+    if request.seq_len == 0 {
+        return Tensor::zeros((1usize, 0usize, embedding_dim), candle_core::DType::F32, device);
+    }
+
     // Aggregation buffer: seq_len x embedding_dim, initialized to zero.
     let mut buffer = vec![0.0f32; request.seq_len * embedding_dim];
 
@@ -142,6 +157,14 @@ pub fn resolve_engram_embeddings(
         let f32_bytes = client
             .resolve(&ngram.lookup, &head_slices)
             .map_err(|e| candle_core::Error::Msg(format!("engram resolve failed: {e}")))?;
+
+        debug_assert_eq!(
+            f32_bytes.len(),
+            embedding_dim * 4,
+            "resolve returned {} bytes; expected {}",
+            f32_bytes.len(),
+            embedding_dim * 4,
+        );
 
         // Interpret as f32 little-endian and sum into position buffer.
         let pos_offset = ngram.token_position * embedding_dim;
@@ -193,7 +216,7 @@ mod tests {
     #[test]
     fn ngram_extraction_bigrams_and_trigrams() {
         let client = test_client();
-        let request = prepare_engram_request(&client, &[1, 2, 3, 4]);
+        let request = prepare_engram_request(&client, &[1, 2, 3, 4]).unwrap();
 
         // 3 bigrams + 2 trigrams = 5 lookups
         assert_eq!(request.lookups.len(), 5);
@@ -212,7 +235,7 @@ mod tests {
     #[test]
     fn single_token_produces_empty_request() {
         let client = test_client();
-        let request = prepare_engram_request(&client, &[42]);
+        let request = prepare_engram_request(&client, &[42]).unwrap();
 
         assert!(request.lookups.is_empty());
         assert!(request.required_shards.is_empty());
@@ -222,7 +245,7 @@ mod tests {
     #[test]
     fn empty_tokens_produces_empty_request() {
         let client = test_client();
-        let request = prepare_engram_request(&client, &[]);
+        let request = prepare_engram_request(&client, &[]).unwrap();
 
         assert!(request.lookups.is_empty());
         assert!(request.required_shards.is_empty());
@@ -232,7 +255,7 @@ mod tests {
     #[test]
     fn shard_deduplication() {
         let client = test_client();
-        let request = prepare_engram_request(&client, &[1, 2, 3, 4]);
+        let request = prepare_engram_request(&client, &[1, 2, 3, 4]).unwrap();
 
         // Multiple lookups may hit the same shard — required_shards should be deduplicated
         let shard_indices: Vec<u64> = request
@@ -252,7 +275,7 @@ mod tests {
     fn resolve_produces_correct_shape() {
         let client = test_client();
         let tokens = [1u32, 2, 3, 4];
-        let request = prepare_engram_request(&client, &tokens);
+        let request = prepare_engram_request(&client, &tokens).unwrap();
 
         // Each shard needs to be large enough: shard_size(100) * vector_bytes(4*2=8) = 800 bytes
         let shard_data = zero_shard_data(10, 800);
@@ -267,7 +290,7 @@ mod tests {
     fn resolve_missing_shard_returns_error() {
         let client = test_client();
         let tokens = [1u32, 2, 3];
-        let request = prepare_engram_request(&client, &tokens);
+        let request = prepare_engram_request(&client, &tokens).unwrap();
 
         // Provide empty HashMap — all shards missing
         let shard_data = HashMap::new();
@@ -281,7 +304,7 @@ mod tests {
     fn resolve_zero_shards_produces_zero_tensor() {
         let client = test_client();
         let tokens = [1u32, 2, 3, 4];
-        let request = prepare_engram_request(&client, &tokens);
+        let request = prepare_engram_request(&client, &tokens).unwrap();
 
         let shard_data = zero_shard_data(10, 800);
 

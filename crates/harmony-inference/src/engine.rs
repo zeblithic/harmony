@@ -108,61 +108,7 @@ impl InferenceEngine for QwenEngine {
         tokens: &[u32],
         cache: &mut InferenceCache,
     ) -> Result<Vec<f32>, InferenceError> {
-        if tokens.is_empty() {
-            return Err(InferenceError::ForwardFailed(
-                "tokens slice must not be empty".into(),
-            ));
-        }
-        #[cfg(feature = "kv-compress")]
-        if cache.is_compressed() {
-            return Err(InferenceError::CacheCompressed);
-        }
-        let model = self.model.as_ref().ok_or(InferenceError::ModelNotLoaded)?;
-
-        // Validate cache matches model architecture.
-        if cache.num_layers != model.num_layers {
-            return Err(InferenceError::CacheMismatch {
-                expected: model.num_layers,
-                actual: cache.num_layers,
-            });
-        }
-
-        let seq_len = tokens.len();
-        let input = Tensor::new(tokens, &self.device)
-            .and_then(|t| t.reshape((1, seq_len)))
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
-
-        // model.forward advances cache.position internally.
-        let logits = model
-            .forward(&input, cache)
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
-
-        // Extract last logit row.
-        let logits = match logits.dims().len() {
-            1 => logits,
-            2 => {
-                let rows = logits
-                    .dim(0)
-                    .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
-                if rows == 0 {
-                    return Err(InferenceError::ForwardFailed(
-                        "model returned empty logits tensor [0, vocab_size]".into(),
-                    ));
-                }
-                logits
-                    .get(rows - 1)
-                    .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?
-            }
-            n => {
-                return Err(InferenceError::ForwardFailed(format!(
-                    "unexpected logits dimensionality: {n}D"
-                )))
-            }
-        };
-
-        logits
-            .to_vec1::<f32>()
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
+        self.forward_impl(tokens, cache, None)
     }
 
     fn sample(
@@ -204,10 +150,10 @@ impl InferenceEngine for QwenEngine {
 impl QwenEngine {
     /// Run a forward pass with Engram injection.
     ///
-    /// Behaves identically to [`InferenceEngine::forward`] but threads an
-    /// [`EngramContext`] callback through each transformer layer. At each
-    /// layer index listed in `engram.injection_layers`, the gated residual
-    /// from `engram.module` is added to the hidden state.
+    /// Behaves identically to [`InferenceEngine::forward`] but injects Engram
+    /// embeddings at the specified transformer layers via the gated residual
+    /// module. This is an inherent method, not a trait method — Engram
+    /// injection is optional and engine-specific.
     ///
     /// # Errors
     ///
@@ -218,6 +164,26 @@ impl QwenEngine {
         tokens: &[u32],
         cache: &mut InferenceCache,
         engram: &EngramContext<'_>,
+    ) -> Result<Vec<f32>, InferenceError> {
+        let engram_fn =
+            |layer_idx: usize, hidden_state: &Tensor| -> candle_core::Result<Option<Tensor>> {
+                if engram.injection_layers.contains(&layer_idx) {
+                    Ok(Some(
+                        engram.module.forward(hidden_state, &engram.embeddings)?,
+                    ))
+                } else {
+                    Ok(None)
+                }
+            };
+        self.forward_impl(tokens, cache, Some(&engram_fn))
+    }
+
+    /// Shared implementation for forward() and forward_with_engram().
+    fn forward_impl(
+        &self,
+        tokens: &[u32],
+        cache: &mut InferenceCache,
+        engram_fn: Option<crate::qwen3_ext::EngramFn<'_>>,
     ) -> Result<Vec<f32>, InferenceError> {
         if tokens.is_empty() {
             return Err(InferenceError::ForwardFailed(
@@ -230,7 +196,6 @@ impl QwenEngine {
         }
         let model = self.model.as_ref().ok_or(InferenceError::ModelNotLoaded)?;
 
-        // Validate cache matches model architecture.
         if cache.num_layers != model.num_layers {
             return Err(InferenceError::CacheMismatch {
                 expected: model.num_layers,
@@ -243,19 +208,8 @@ impl QwenEngine {
             .and_then(|t| t.reshape((1, seq_len)))
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
 
-        let engram_fn =
-            |layer_idx: usize, hidden_state: &Tensor| -> candle_core::Result<Option<Tensor>> {
-                if engram.injection_layers.contains(&layer_idx) {
-                    Ok(Some(
-                        engram.module.forward(hidden_state, &engram.embeddings)?,
-                    ))
-                } else {
-                    Ok(None)
-                }
-            };
-
         let logits = model
-            .forward_with_engram(&input, cache, Some(&engram_fn))
+            .forward_with_engram(&input, cache, engram_fn)
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
 
         // Extract last logit row.
