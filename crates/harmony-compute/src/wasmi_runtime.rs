@@ -23,6 +23,10 @@ struct HostState {
     /// Cleared by `model_reset()`.
     #[cfg(feature = "inference")]
     inference_cache: Option<harmony_inference::InferenceCache>,
+    /// Token history for repeat penalty in WASM-hosted inference.
+    /// Populated by `forward()`, consumed by `sample()`, cleared by `model_reset()`.
+    #[cfg(feature = "inference")]
+    inference_history: Vec<u32>,
 }
 
 impl HostState {
@@ -36,6 +40,8 @@ impl HostState {
             last_logits: None,
             #[cfg(feature = "inference")]
             inference_cache: None,
+            #[cfg(feature = "inference")]
+            inference_history: Vec::new(),
         }
     }
 }
@@ -373,19 +379,14 @@ impl ComputeRuntime for WasmiRuntime {
                                 wasmi::Error::new(format!("failed to read tokenizer CID: {e}"))
                             })?;
 
-                        // If engine is already loaded with matching CIDs, reset and
-                        // return success — no trap, no data cloning, no re-parse.
+                        // If engine is already loaded with matching CIDs, clear the
+                        // externalized cache and return success — no re-parse needed.
                         if let Some((g, t, _)) = &caller.data().inference_engine {
                             if *g == gguf_cid && *t == tokenizer_cid {
-                                // Reset clears KV cache, position, token_history
-                                // so this request starts with a clean slate.
-                                caller
-                                    .data_mut()
-                                    .inference_engine
-                                    .as_mut()
-                                    .unwrap()
-                                    .2
-                                    .reset();
+                                let data = caller.data_mut();
+                                data.inference_cache = None;
+                                data.inference_history.clear();
+                                data.last_logits = None;
                                 return Ok(0);
                             }
                         }
@@ -564,6 +565,7 @@ impl ComputeRuntime for WasmiRuntime {
                             Err(_) => return Ok(-2),
                         };
 
+                        data.inference_history.extend_from_slice(&tokens);
                         data.last_logits = Some(logits);
                         Ok(0)
                     },
@@ -637,8 +639,9 @@ impl ComputeRuntime for WasmiRuntime {
                             None => return Ok(-3), // no logits from prior forward()
                         };
 
-                        let (_, _, engine) = caller.data().inference_engine.as_ref().unwrap();
-                        match engine.sample(&logits, &params, &[]) {
+                        let data = caller.data();
+                        let (_, _, engine) = data.inference_engine.as_ref().unwrap();
+                        match engine.sample(&logits, &params, &data.inference_history) {
                             Ok(token_id) => {
                                 let id = token_id as i32;
                                 if id < 0 {
@@ -661,6 +664,7 @@ impl ComputeRuntime for WasmiRuntime {
                     |mut caller: wasmi::Caller<'_, HostState>| -> Result<i32, wasmi::Error> {
                         let data = caller.data_mut();
                         data.inference_cache = None;
+                        data.inference_history.clear();
                         data.last_logits = None;
                         Ok(0)
                     },
