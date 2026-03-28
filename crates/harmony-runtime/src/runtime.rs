@@ -2632,7 +2632,8 @@ impl<B: BookStore> NodeRuntime<B> {
                     }
                     // Publish capacity advertisement.
                     if let Some(model_cid) = &self.inference_model_cid {
-                        let payload = crate::inference_types::build_capacity_payload(model_cid, true);
+                        let payload =
+                            crate::inference_types::build_capacity_payload(model_cid, true);
                         let cap_key =
                             harmony_zenoh::namespace::compute::capacity_key(&self.node_addr);
                         self.pending_direct_actions.push(RuntimeAction::Publish {

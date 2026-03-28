@@ -30,7 +30,10 @@ pub enum ComputeBackendKind {
 #[derive(Debug, Clone)]
 pub enum ComputeCapability {
     /// LLM inference with a specific model.
-    Inference { model_id: String, context_length: u32 },
+    Inference {
+        model_id: String,
+        context_length: u32,
+    },
     /// WASM module execution.
     WasmExecution { fuel_budget: u64 },
     /// Raw tensor compute (future).
@@ -74,8 +77,12 @@ mod tests {
             model_id: "llama-3.1".to_string(),
             context_length: 8192,
         };
-        let _ = ComputeCapability::WasmExecution { fuel_budget: 100_000 };
-        let _ = ComputeCapability::TensorCompute { flops_estimate: 1_000_000 };
+        let _ = ComputeCapability::WasmExecution {
+            fuel_budget: 100_000,
+        };
+        let _ = ComputeCapability::TensorCompute {
+            flops_estimate: 1_000_000,
+        };
     }
 
     #[test]

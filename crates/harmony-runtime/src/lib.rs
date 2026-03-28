@@ -18,4 +18,6 @@ pub mod page_index;
 pub mod runtime;
 
 // Re-export primary types for ergonomic imports
-pub use runtime::{AdaptiveCompute, NodeConfig, NodeRuntime, RuntimeAction, RuntimeEvent, TierSchedule};
+pub use runtime::{
+    AdaptiveCompute, NodeConfig, NodeRuntime, RuntimeAction, RuntimeEvent, TierSchedule,
+};
