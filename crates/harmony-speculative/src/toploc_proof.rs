@@ -236,6 +236,42 @@ pub fn verify_proofs(
         let head = proof.head as usize;
         let token_offset = proof.token_offset as usize;
 
+        // Validate routing: re-derive expected (layer, head) from deterministic sampler.
+        // Reject proofs that claim a different layer/head than the sampler dictates.
+        let chunk_idx = token_offset / CHUNK_SIZE;
+        let (expected_layer, expected_head) = sample_coordinates(
+            header,
+            chunk_idx,
+            header.num_layers as usize,
+            header.num_kv_heads as usize,
+        );
+        if layer != expected_layer || head != expected_head {
+            details.push(ProofCheckDetail {
+                layer: proof.layer,
+                head: proof.head,
+                token_offset: proof.token_offset,
+                agreement_rate: 0.0,
+                mean_mantissa_diff: f32::INFINITY,
+                median_mantissa_diff: f32::INFINITY,
+                passed: false,
+            });
+            continue;
+        }
+
+        // Bounds check: proof.layer is untrusted u16 from remote header.
+        if layer >= local_cache.layers.len() {
+            details.push(ProofCheckDetail {
+                layer: proof.layer,
+                head: proof.head,
+                token_offset: proof.token_offset,
+                agreement_rate: 0.0,
+                mean_mantissa_diff: f32::INFINITY,
+                median_mantissa_diff: f32::INFINITY,
+                passed: false,
+            });
+            continue;
+        }
+
         let (k_tensor, _) = match &local_cache.layers[layer] {
             Some((k, v)) => (k, v),
             None => {
@@ -297,8 +333,10 @@ pub fn verify_proofs(
             (mean, median)
         };
 
+        // Note: mean_diff <= MEAN_DIFF_THRESHOLD is tautologically true since
+        // agreeing_diffs is pre-filtered to values <= MEAN_DIFF_THRESHOLD.
+        // The effective criteria are agreement rate + median diff.
         let passed = agreement_rate >= AGREEMENT_THRESHOLD
-            && mean_diff <= MEAN_DIFF_THRESHOLD
             && median_diff <= MEDIAN_DIFF_THRESHOLD;
 
         details.push(ProofCheckDetail {

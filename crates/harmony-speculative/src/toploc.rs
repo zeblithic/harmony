@@ -58,7 +58,7 @@ fn is_prime(n: u16) -> bool {
 /// through primes only. Primality ensures all nonzero elements have
 /// modular inverses, which NDD interpolation requires.
 pub(crate) fn find_injective_modulus(indices: &[u16; TOP_K]) -> u16 {
-    let mut seen = [false; 65536];
+    let mut seen = vec![false; 65536];
     let mut m = START_MODULUS;
     loop {
         for s in seen[..m as usize + 1].iter_mut() {
@@ -168,7 +168,13 @@ pub(crate) fn extract_top_k(data: &[f32], k: usize) -> (Vec<u16>, Vec<u16>) {
         .map(|(i, &v)| (v.abs(), i))
         .collect();
 
-    indexed.select_nth_unstable_by(k - 1, |a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Stable sort with index tie-breaking for cross-platform reproducibility.
+    // NaN values sort to the end (treated as smallest).
+    indexed.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
 
     let top_k = &indexed[..k];
     let indices: Vec<u16> = top_k.iter().map(|(_, i)| *i as u16).collect();
