@@ -95,6 +95,42 @@ impl InferenceCache {
     pub fn is_compressed(&self) -> bool {
         self.is_compressed
     }
+
+    /// Compress all populated layers to 3-bit quantized format.
+    /// Frees full-precision tensors to reclaim memory.
+    /// No-op if already compressed.
+    /// Atomic: on error, cache remains in uncompressed state.
+    pub fn compress(&mut self) -> Result<(), InferenceError> {
+        if self.is_compressed {
+            return Ok(());
+        }
+
+        // Phase 1: compress all populated layers into a temporary vec.
+        // If any layer fails, self is untouched.
+        let mut new_compressed = Vec::with_capacity(self.num_layers);
+        for layer in &self.layers {
+            match layer {
+                Some((k, v)) => {
+                    let (k_vecs, seq_len) = kv_compress::compress_tensor(k)?;
+                    let (v_vecs, _) = kv_compress::compress_tensor(v)?;
+                    new_compressed.push(Some(kv_compress::CompressedKvLayer {
+                        k: k_vecs,
+                        v: v_vecs,
+                        seq_len,
+                    }));
+                }
+                None => new_compressed.push(None),
+            }
+        }
+
+        // Phase 2: commit (cannot fail — just moving data).
+        self.compressed = new_compressed;
+        for layer in &mut self.layers {
+            *layer = None;
+        }
+        self.is_compressed = true;
+        Ok(())
+    }
 }
 
 /// Sampling parameters for token generation.
@@ -232,5 +268,60 @@ mod cache_tests {
         let cache = InferenceCache::new(28, 128, 8);
         assert_eq!(cache.compressed.len(), 28);
         assert!(cache.compressed.iter().all(|c| c.is_none()));
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "kv-compress")]
+mod kv_compress_cache_tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+
+    /// Create a cache with `n_tokens` of random f16 KV tensors in layer 0.
+    fn cache_with_data(num_layers: usize, num_kv_heads: usize, head_dim: usize, n_tokens: usize) -> InferenceCache {
+        let mut cache = InferenceCache::new(num_layers, head_dim, num_kv_heads);
+        if n_tokens > 0 {
+            let shape = (1, num_kv_heads, n_tokens, head_dim);
+            let k = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap();
+            let v = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap();
+            cache.layers[0] = Some((k, v));
+            cache.position = n_tokens;
+        }
+        cache
+    }
+
+    #[test]
+    fn compress_empty_cache_succeeds() {
+        let mut cache = InferenceCache::new(2, 128, 8);
+        assert!(cache.compress().is_ok());
+        assert!(cache.is_compressed());
+    }
+
+    #[test]
+    fn compress_noop_when_already_compressed() {
+        let mut cache = InferenceCache::new(2, 128, 8);
+        cache.compress().unwrap();
+        assert!(cache.compress().is_ok());
+        assert!(cache.is_compressed());
+    }
+
+    #[test]
+    fn compress_frees_full_precision_tensors() {
+        let mut cache = cache_with_data(2, 8, 128, 16);
+        assert!(cache.layers[0].is_some());
+
+        cache.compress().unwrap();
+
+        assert!(cache.is_compressed());
+        assert!(cache.layers[0].is_none());
+        assert!(cache.layers[1].is_none());
+        assert!(cache.compressed[0].is_some());
+        assert!(cache.compressed[1].is_none()); // was unpopulated
     }
 }
