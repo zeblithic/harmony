@@ -1281,6 +1281,9 @@ pub async fn run(
                             let panic_tx = inference_tx.clone();
                             let panic_query_id = query_id;
                             let panic_task_id = task_id.clone();
+                            let outer_panic_tx = inference_tx.clone();
+                            let outer_panic_qid = query_id;
+                            let outer_panic_tid = task_id.clone();
 
                             let outer_handle = tokio::spawn(async move {
                                 // Fetch all required shards in parallel via Zenoh.
@@ -1359,9 +1362,6 @@ pub async fn run(
                             // fetching (before spawn_blocking). If the async portion
                             // panics, the engine is dropped — send Panicked signal
                             // so inference_running is cleared.
-                            let outer_panic_tx = inference_tx.clone();
-                            let outer_panic_qid = query_id;
-                            let outer_panic_tid = task_id.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = outer_handle.await {
                                     tracing::error!(
