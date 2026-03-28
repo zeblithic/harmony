@@ -1,0 +1,52 @@
+[package]
+name = "harmony-runtime"
+description = "Sans-I/O runtime orchestration for Harmony network nodes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "harmony-content/std",
+    "harmony-contacts/std",
+    "harmony-discovery/std",
+    "harmony-memo/std",
+    "harmony-peers/std",
+    "harmony-crypto/std",
+    "harmony-identity/std",
+    "harmony-reticulum/std",
+]
+inference = [
+    "harmony-compute/inference",
+    "harmony-workflow/inference",
+    "dep:harmony-inference",
+    "dep:harmony-engram",
+    "dep:harmony-agent",
+    "dep:candle-core",
+]
+
+[dependencies]
+harmony-agent = { workspace = true, optional = true }
+harmony-athenaeum = { workspace = true, features = ["std"] }
+harmony-compute.workspace = true
+harmony-contacts = { workspace = true, features = ["std"] }
+harmony-content = { workspace = true, features = ["std"] }
+harmony-credential.workspace = true
+harmony-crypto = { workspace = true, features = ["std"] }
+harmony-discovery = { workspace = true, features = ["std"] }
+harmony-engram = { workspace = true, optional = true }
+harmony-identity = { workspace = true, features = ["std"] }
+harmony-inference = { workspace = true, optional = true }
+harmony-memo = { workspace = true, features = ["std"] }
+harmony-peers = { workspace = true, features = ["std"] }
+harmony-reticulum = { workspace = true, features = ["std"] }
+harmony-speculative.workspace = true
+harmony-workflow.workspace = true
+harmony-zenoh.workspace = true
+candle-core = { workspace = true, optional = true }
+hex.workspace = true
+postcard.workspace = true
+tracing.workspace = true
