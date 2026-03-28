@@ -99,10 +99,18 @@ pub fn store_prefill_cache(
         magic: PREFILL_MAGIC,
         model_cid: model_cid.to_bytes(),
         token_hash: token_hash(token_ids),
-        token_count: cache.position as u32,
-        num_layers: cache.num_layers as u16,
-        num_kv_heads: cache.num_kv_heads as u16,
-        head_dim: cache.head_dim as u16,
+        token_count: u32::try_from(cache.position).map_err(|_| {
+            PrefillError::SerializationFailed(format!("position {} exceeds u32", cache.position))
+        })?,
+        num_layers: u16::try_from(cache.num_layers).map_err(|_| {
+            PrefillError::SerializationFailed(format!("num_layers {} exceeds u16", cache.num_layers))
+        })?,
+        num_kv_heads: u16::try_from(cache.num_kv_heads).map_err(|_| {
+            PrefillError::SerializationFailed(format!("num_kv_heads {} exceeds u16", cache.num_kv_heads))
+        })?,
+        head_dim: u16::try_from(cache.head_dim).map_err(|_| {
+            PrefillError::SerializationFailed(format!("head_dim {} exceeds u16", cache.head_dim))
+        })?,
         quant_bits: SUPPORTED_QUANT_BITS,
     };
 
@@ -137,11 +145,14 @@ pub fn load_prefill_cache(
     }
 
     let header_len = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
-    if blob.len() < 4 + header_len {
+    let header_end = 4usize.checked_add(header_len).ok_or_else(|| {
+        PrefillError::SerializationFailed("header_len overflow".into())
+    })?;
+    if blob.len() < header_end {
         return Err(PrefillError::SerializationFailed("truncated header".into()));
     }
 
-    let header: PrefillCacheHeader = postcard::from_bytes(&blob[4..4 + header_len])
+    let header: PrefillCacheHeader = postcard::from_bytes(&blob[4..header_end])
         .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?;
 
     if header.magic != PREFILL_MAGIC {
@@ -160,7 +171,7 @@ pub fn load_prefill_cache(
         });
     }
 
-    let payload = &blob[4 + header_len..];
+    let payload = &blob[header_end..];
     let cache = InferenceCache::deserialize_compressed(
         payload,
         header.num_layers as usize,

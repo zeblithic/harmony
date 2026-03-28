@@ -241,6 +241,21 @@ impl InferenceCache {
             )));
         }
 
+        // Cross-validate num_kv_heads against the first populated layer's
+        // vector count. Each layer stores num_kv_heads * seq_len vectors.
+        if let Some(Some(layer)) = payload.layers.iter().find(|l| l.is_some()) {
+            if layer.seq_len > 0 {
+                let expected_vecs = num_kv_heads * layer.seq_len;
+                if layer.k.len() != expected_vecs {
+                    return Err(InferenceError::SerializationFailed(format!(
+                        "vector count mismatch: header claims {} kv_heads × {} tokens = {}, \
+                         but layer has {} k vectors",
+                        num_kv_heads, layer.seq_len, expected_vecs, layer.k.len()
+                    )));
+                }
+            }
+        }
+
         Ok(InferenceCache {
             layers: (0..num_layers).map(|_| None).collect(),
             position: payload.position,
