@@ -248,9 +248,14 @@ impl InferenceCache {
                 let expected_vecs = num_kv_heads * layer.seq_len;
                 if layer.k.len() != expected_vecs {
                     return Err(InferenceError::SerializationFailed(format!(
-                        "vector count mismatch: header claims {} kv_heads × {} tokens = {}, \
-                         but layer has {} k vectors",
-                        num_kv_heads, layer.seq_len, expected_vecs, layer.k.len()
+                        "k vector count mismatch: expected {expected_vecs}, got {}",
+                        layer.k.len()
+                    )));
+                }
+                if layer.v.len() != expected_vecs {
+                    return Err(InferenceError::SerializationFailed(format!(
+                        "v vector count mismatch: expected {expected_vecs}, got {}",
+                        layer.v.len()
                     )));
                 }
             }

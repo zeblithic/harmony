@@ -95,6 +95,14 @@ pub fn store_prefill_cache(
         return Err(PrefillError::CacheNotCompressed);
     }
 
+    if token_ids.len() != cache.position {
+        return Err(PrefillError::SerializationFailed(format!(
+            "token_ids length {} does not match cache position {}",
+            token_ids.len(),
+            cache.position
+        )));
+    }
+
     let header = PrefillCacheHeader {
         magic: PREFILL_MAGIC,
         model_cid: model_cid.to_bytes(),
@@ -212,7 +220,7 @@ mod tests {
     fn store_load_roundtrip() {
         let cache = compressed_cache(2, 8, 128, 16);
         let model_cid = fake_model_cid();
-        let token_ids = vec![1u32, 2, 3, 4];
+        let token_ids: Vec<u32> = (0..16).collect();
         let mut store = MemoryBookStore::new();
 
         let root = store_prefill_cache(&cache, &model_cid, &token_ids, &mut store).unwrap();
@@ -232,9 +240,10 @@ mod tests {
     fn load_rejects_wrong_model() {
         let cache = compressed_cache(2, 8, 128, 4);
         let model_cid = fake_model_cid();
+        let token_ids: Vec<u32> = (0..4).collect();
         let mut store = MemoryBookStore::new();
 
-        let root = store_prefill_cache(&cache, &model_cid, &[1, 2], &mut store).unwrap();
+        let root = store_prefill_cache(&cache, &model_cid, &token_ids, &mut store).unwrap();
 
         let wrong_cid = ContentId::for_book(b"wrong-model", Default::default()).unwrap();
         let result = load_prefill_cache(&root, &wrong_cid, &store);
@@ -255,9 +264,10 @@ mod tests {
     fn header_magic_validation() {
         let cache = compressed_cache(2, 8, 128, 4);
         let model_cid = fake_model_cid();
+        let token_ids: Vec<u32> = (0..4).collect();
         let mut store = MemoryBookStore::new();
 
-        let root = store_prefill_cache(&cache, &model_cid, &[1], &mut store).unwrap();
+        let root = store_prefill_cache(&cache, &model_cid, &token_ids, &mut store).unwrap();
 
         // Corrupt the blob: reassemble, corrupt magic, re-store
         let mut blob = dag::reassemble(&root, &store).unwrap();
@@ -272,9 +282,10 @@ mod tests {
     fn unsupported_quant_bits_rejected() {
         let cache = compressed_cache(2, 8, 128, 4);
         let model_cid = fake_model_cid();
+        let token_ids: Vec<u32> = (0..4).collect();
         let mut store = MemoryBookStore::new();
 
-        let root = store_prefill_cache(&cache, &model_cid, &[1], &mut store).unwrap();
+        let root = store_prefill_cache(&cache, &model_cid, &token_ids, &mut store).unwrap();
 
         // Reassemble, patch quant_bits in header, re-store
         let blob = dag::reassemble(&root, &store).unwrap();
