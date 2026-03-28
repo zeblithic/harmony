@@ -1,7 +1,7 @@
 //! 3-bit uniform KV cache compression.
 //!
-//! Compresses f16 KV cache tensors to ~52 bytes per 128-dim vector (vs 256
-//! bytes at f16), a ~4.9x reduction. Each vector is independently quantized:
+//! Compresses f16 KV cache tensors to ~56 bytes per 128-dim vector (vs 256
+//! bytes at f16), a ~4.6x reduction. Each vector is independently quantized:
 //! `min` and `scale` header (8 bytes f32) + 3-bit packed indices.
 //!
 //! Feature-gated behind `kv-compress`.
@@ -98,21 +98,32 @@ fn unpack_3bit(packed: &[u8], count: usize) -> Vec<u8> {
 /// Quantize an f32 slice to a QuantizedVec (3-bit uniform).
 fn quantize_vec(data: &[f32]) -> QuantizedVec {
     if data.is_empty() {
-        return QuantizedVec { min: 0.0, scale: 0.0, packed: vec![] };
+        return QuantizedVec {
+            min: 0.0,
+            scale: 0.0,
+            packed: vec![],
+        };
     }
 
     let min = data.iter().copied().fold(f32::INFINITY, f32::min);
     let max = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let range = max - min;
-    let scale = if range > 0.0 { range / MAX_INDEX as f32 } else { 0.0 };
+    let scale = if range > 0.0 {
+        range / MAX_INDEX as f32
+    } else {
+        0.0
+    };
 
-    let indices: Vec<u8> = data.iter().map(|&v| {
-        if scale == 0.0 {
-            0
-        } else {
-            ((v - min) / scale).round().clamp(0.0, MAX_INDEX as f32) as u8
-        }
-    }).collect();
+    let indices: Vec<u8> = data
+        .iter()
+        .map(|&v| {
+            if scale == 0.0 {
+                0
+            } else {
+                ((v - min) / scale).round().clamp(0.0, MAX_INDEX as f32) as u8
+            }
+        })
+        .collect();
 
     QuantizedVec {
         min,
@@ -124,7 +135,10 @@ fn quantize_vec(data: &[f32]) -> QuantizedVec {
 /// Dequantize a QuantizedVec back to f32 values.
 fn dequantize_vec(qv: &QuantizedVec, dim: usize) -> Vec<f32> {
     let indices = unpack_3bit(&qv.packed, dim);
-    indices.iter().map(|&idx| qv.min + idx as f32 * qv.scale).collect()
+    indices
+        .iter()
+        .map(|&idx| qv.min + idx as f32 * qv.scale)
+        .collect()
 }
 
 // ── Tensor bridge ────────────────────────────────────────────────────
@@ -136,8 +150,14 @@ fn dequantize_vec(qv: &QuantizedVec, dim: usize) -> Vec<f32> {
 pub(crate) fn compress_tensor(
     tensor: &Tensor,
 ) -> Result<(Vec<QuantizedVec>, usize), InferenceError> {
-    let (_batch, num_heads, seq_len, head_dim) = tensor.dims4()
+    let (batch, num_heads, seq_len, head_dim) = tensor
+        .dims4()
         .map_err(|e| InferenceError::CompressionFailed(format!("unexpected tensor shape: {e}")))?;
+    if batch != 1 {
+        return Err(InferenceError::CompressionFailed(format!(
+            "expected batch size 1, got {batch}"
+        )));
+    }
 
     let total_vecs = num_heads * seq_len;
     let flat = tensor
@@ -163,7 +183,8 @@ pub(crate) fn decompress_tensor(
     let expected = num_kv_heads * seq_len;
     if vecs.len() != expected {
         return Err(InferenceError::CompressionFailed(format!(
-            "expected {expected} quantized vecs, got {}", vecs.len()
+            "expected {expected} quantized vecs, got {}",
+            vecs.len()
         )));
     }
 
@@ -215,7 +236,9 @@ mod tests {
         let restored = dequantize_vec(&qv, 128);
 
         assert_eq!(restored.len(), 128);
-        let max_err: f32 = data.iter().zip(restored.iter())
+        let max_err: f32 = data
+            .iter()
+            .zip(restored.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
         // 3-bit quantization of [0, 1] range: step = 1/7 ≈ 0.143
@@ -253,7 +276,7 @@ mod tests {
         let data = vec![1.0_f32; 128];
         let qv = quantize_vec(&data);
         let layer = CompressedKvLayer {
-            k: vec![qv.clone(); 8],  // 8 heads × 1 token
+            k: vec![qv.clone(); 8], // 8 heads × 1 token
             v: vec![qv; 8],
             seq_len: 1,
         };

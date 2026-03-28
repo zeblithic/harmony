@@ -150,6 +150,10 @@ impl InferenceCache {
     /// Decompress all layers back to full-precision f16 tensors.
     /// No-op if not compressed.
     /// Atomic: on error, cache remains in compressed state.
+    ///
+    /// # Device limitation
+    /// Decompressed tensors are always placed on `Device::Cpu`. Do not use
+    /// with CUDA/Metal engines until harmony-51dy resolves device threading.
     pub fn decompress(&mut self) -> Result<(), InferenceError> {
         if !self.is_compressed {
             return Ok(());
