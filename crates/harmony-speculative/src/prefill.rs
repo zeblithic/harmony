@@ -14,8 +14,11 @@ use harmony_inference::InferenceCache;
 use harmony_inference::InferenceError;
 use serde::{Deserialize, Serialize};
 
-/// Magic bytes identifying a prefill KV cache blob.
+/// Magic bytes identifying a v1 prefill KV cache blob (no proofs).
 pub const PREFILL_MAGIC: [u8; 4] = *b"HKV\x01";
+
+/// Magic bytes identifying a v2 prefill KV cache blob (with proofs).
+pub const PREFILL_MAGIC_V2: [u8; 4] = *b"HKV\x02";
 
 /// Supported quantization bit width.
 const SUPPORTED_QUANT_BITS: u8 = 3;
@@ -37,12 +40,27 @@ pub struct PrefillCacheHeader {
     pub head_dim: u16,
     /// Compression config.
     pub quant_bits: u8,
+    /// TOPLOC proofs for this cache (empty if not yet generated).
+    pub proofs: Vec<crate::toploc_proof::TocProof>,
+}
+
+/// V1 header layout — serialized WITHOUT the proofs field.
+#[derive(Serialize, Deserialize)]
+struct PrefillCacheHeaderV1 {
+    magic: [u8; 4],
+    model_cid: [u8; 32],
+    token_hash: [u8; 32],
+    token_count: u32,
+    num_layers: u16,
+    num_kv_heads: u16,
+    head_dim: u16,
+    quant_bits: u8,
 }
 
 /// Errors from prefill cache operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PrefillError {
-    #[error("invalid magic: expected HKV\\x01")]
+    #[error("invalid magic: expected HKV\\x01 or HKV\\x02")]
     InvalidMagic,
 
     #[error("unsupported quant_bits: {0}")]
@@ -80,15 +98,13 @@ pub fn token_hash(token_ids: &[u32]) -> [u8; 32] {
     full_hash(&bytes)
 }
 
-/// Store a compressed KV cache in CAS. Returns the root CID.
-///
-/// The cache must be compressed (`is_compressed() == true`).
-/// `model_cid` identifies the GGUF model. `token_ids` is the
-/// prefill token sequence (hashed into the header).
-pub fn store_prefill_cache(
+/// Private helper: build and store the wire blob for a given magic + proofs.
+fn store_prefill_cache_inner(
     cache: &InferenceCache,
     model_cid: &ContentId,
     token_ids: &[u32],
+    magic: [u8; 4],
+    proofs: Vec<crate::toploc_proof::TocProof>,
     store: &mut dyn BookStore,
 ) -> Result<ContentId, PrefillError> {
     if !cache.is_compressed() {
@@ -103,27 +119,50 @@ pub fn store_prefill_cache(
         )));
     }
 
-    let header = PrefillCacheHeader {
-        magic: PREFILL_MAGIC,
-        model_cid: model_cid.to_bytes(),
-        token_hash: token_hash(token_ids),
-        token_count: u32::try_from(cache.position).map_err(|_| {
-            PrefillError::SerializationFailed(format!("position {} exceeds u32", cache.position))
-        })?,
-        num_layers: u16::try_from(cache.num_layers).map_err(|_| {
-            PrefillError::SerializationFailed(format!("num_layers {} exceeds u16", cache.num_layers))
-        })?,
-        num_kv_heads: u16::try_from(cache.num_kv_heads).map_err(|_| {
-            PrefillError::SerializationFailed(format!("num_kv_heads {} exceeds u16", cache.num_kv_heads))
-        })?,
-        head_dim: u16::try_from(cache.head_dim).map_err(|_| {
-            PrefillError::SerializationFailed(format!("head_dim {} exceeds u16", cache.head_dim))
-        })?,
-        quant_bits: SUPPORTED_QUANT_BITS,
-    };
+    let token_count = u32::try_from(cache.position).map_err(|_| {
+        PrefillError::SerializationFailed(format!("position {} exceeds u32", cache.position))
+    })?;
+    let num_layers = u16::try_from(cache.num_layers).map_err(|_| {
+        PrefillError::SerializationFailed(format!("num_layers {} exceeds u16", cache.num_layers))
+    })?;
+    let num_kv_heads = u16::try_from(cache.num_kv_heads).map_err(|_| {
+        PrefillError::SerializationFailed(format!("num_kv_heads {} exceeds u16", cache.num_kv_heads))
+    })?;
+    let head_dim = u16::try_from(cache.head_dim).map_err(|_| {
+        PrefillError::SerializationFailed(format!("head_dim {} exceeds u16", cache.head_dim))
+    })?;
+    let model_cid_bytes = model_cid.to_bytes();
+    let tok_hash = token_hash(token_ids);
 
-    let header_bytes = postcard::to_allocvec(&header)
-        .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?;
+    // Serialize v1 headers WITHOUT the proofs field for byte-exact v1 format.
+    // v2 headers include the proofs field.
+    let header_bytes = if magic == PREFILL_MAGIC {
+        let v1 = PrefillCacheHeaderV1 {
+            magic,
+            model_cid: model_cid_bytes,
+            token_hash: tok_hash,
+            token_count,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            quant_bits: SUPPORTED_QUANT_BITS,
+        };
+        postcard::to_allocvec(&v1)
+    } else {
+        let header = PrefillCacheHeader {
+            magic,
+            model_cid: model_cid_bytes,
+            token_hash: tok_hash,
+            token_count,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            quant_bits: SUPPORTED_QUANT_BITS,
+            proofs,
+        };
+        postcard::to_allocvec(&header)
+    }
+    .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?;
 
     let payload_bytes = cache.serialize_compressed()?;
 
@@ -137,8 +176,37 @@ pub fn store_prefill_cache(
     Ok(root)
 }
 
+/// Store a compressed KV cache in CAS. Returns the root CID.
+///
+/// Emits a v1 blob (`HKV\x01`) with no proofs. The cache must be compressed
+/// (`is_compressed() == true`). `model_cid` identifies the GGUF model.
+/// `token_ids` is the prefill token sequence (hashed into the header).
+pub fn store_prefill_cache(
+    cache: &InferenceCache,
+    model_cid: &ContentId,
+    token_ids: &[u32],
+    store: &mut dyn BookStore,
+) -> Result<ContentId, PrefillError> {
+    store_prefill_cache_inner(cache, model_cid, token_ids, PREFILL_MAGIC, vec![], store)
+}
+
+/// Store a compressed KV cache with TOPLOC proofs in CAS. Returns the root CID.
+///
+/// Emits a v2 blob (`HKV\x02`) containing the supplied proofs. The cache must
+/// be compressed (`is_compressed() == true`).
+pub fn store_prefill_cache_with_proofs(
+    cache: &InferenceCache,
+    model_cid: &ContentId,
+    token_ids: &[u32],
+    proofs: Vec<crate::toploc_proof::TocProof>,
+    store: &mut dyn BookStore,
+) -> Result<ContentId, PrefillError> {
+    store_prefill_cache_inner(cache, model_cid, token_ids, PREFILL_MAGIC_V2, proofs, store)
+}
+
 /// Load a prefill cache from CAS.
 ///
+/// Accepts both v1 (`HKV\x01`) and v2 (`HKV\x02`) blobs.
 /// Validates the header magic, quant_bits, and model CID. Returns the cache
 /// in compressed state (caller must call `decompress()` before `forward()`).
 pub fn load_prefill_cache(
@@ -160,12 +228,32 @@ pub fn load_prefill_cache(
         return Err(PrefillError::SerializationFailed("truncated header".into()));
     }
 
-    let header: PrefillCacheHeader = postcard::from_bytes(&blob[4..header_end])
-        .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?;
-
-    if header.magic != PREFILL_MAGIC {
-        return Err(PrefillError::InvalidMagic);
+    let header_bytes = &blob[4..header_end];
+    if header_bytes.len() < 4 {
+        return Err(PrefillError::SerializationFailed("header too short".into()));
     }
+    let magic: [u8; 4] = header_bytes[0..4].try_into().unwrap();
+
+    let header = if magic == PREFILL_MAGIC {
+        let v1: PrefillCacheHeaderV1 = postcard::from_bytes(header_bytes)
+            .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?;
+        PrefillCacheHeader {
+            magic: v1.magic,
+            model_cid: v1.model_cid,
+            token_hash: v1.token_hash,
+            token_count: v1.token_count,
+            num_layers: v1.num_layers,
+            num_kv_heads: v1.num_kv_heads,
+            head_dim: v1.head_dim,
+            quant_bits: v1.quant_bits,
+            proofs: vec![],
+        }
+    } else if magic == PREFILL_MAGIC_V2 {
+        postcard::from_bytes(header_bytes)
+            .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?
+    } else {
+        return Err(PrefillError::InvalidMagic);
+    };
 
     if header.quant_bits != SUPPORTED_QUANT_BITS {
         return Err(PrefillError::UnsupportedQuantBits(header.quant_bits));
@@ -285,12 +373,16 @@ mod tests {
         let token_ids: Vec<u32> = (0..4).collect();
         let mut store = MemoryBookStore::new();
 
-        let root = store_prefill_cache(&cache, &model_cid, &token_ids, &mut store).unwrap();
+        // Use v2 so we can round-trip through PrefillCacheHeader (which includes proofs).
+        let root = store_prefill_cache_with_proofs(
+            &cache, &model_cid, &token_ids, vec![], &mut store
+        ).unwrap();
 
         // Reassemble, patch quant_bits in header, re-store
         let blob = dag::reassemble(&root, &store).unwrap();
         let header_len = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
-        let mut header: PrefillCacheHeader = postcard::from_bytes(&blob[4..4 + header_len]).unwrap();
+        let mut header: PrefillCacheHeader =
+            postcard::from_bytes(&blob[4..4 + header_len]).unwrap();
         header.quant_bits = 5; // unsupported
         let new_header_bytes = postcard::to_allocvec(&header).unwrap();
         let mut new_blob = Vec::new();
@@ -335,9 +427,37 @@ mod tests {
             num_kv_heads: 8,
             head_dim: 128,
             quant_bits: 3,
+            proofs: vec![],
         };
         let bytes = postcard::to_allocvec(&header).unwrap();
         let restored: PrefillCacheHeader = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(header, restored);
+    }
+
+    #[test]
+    fn load_v1_blob_has_empty_proofs() {
+        let cache = compressed_cache(2, 8, 128, 16);
+        let model_cid = fake_model_cid();
+        let token_ids: Vec<u32> = (0..16).collect();
+        let mut store = MemoryBookStore::new();
+
+        let root = store_prefill_cache(&cache, &model_cid, &token_ids, &mut store).unwrap();
+        let (_, header) = load_prefill_cache(&root, &model_cid, &store).unwrap();
+        assert!(header.proofs.is_empty());
+        assert_eq!(header.magic, PREFILL_MAGIC); // v1
+    }
+
+    #[test]
+    fn store_with_proofs_uses_v2_magic() {
+        let cache = compressed_cache(2, 8, 128, 16);
+        let model_cid = fake_model_cid();
+        let token_ids: Vec<u32> = (0..16).collect();
+        let mut store = MemoryBookStore::new();
+
+        let root = store_prefill_cache_with_proofs(
+            &cache, &model_cid, &token_ids, vec![], &mut store
+        ).unwrap();
+        let (_, header) = load_prefill_cache(&root, &model_cid, &store).unwrap();
+        assert_eq!(header.magic, PREFILL_MAGIC_V2);
     }
 }
