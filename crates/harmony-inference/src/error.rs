@@ -28,4 +28,32 @@ pub enum InferenceError {
     /// Cache does not match the loaded model architecture.
     #[error("cache mismatch: expected {expected} layers, got {actual}")]
     CacheMismatch { expected: usize, actual: usize },
+
+    /// KV cache compression or decompression failed.
+    #[cfg(feature = "kv-compress")]
+    #[error("compression failed: {0}")]
+    CompressionFailed(String),
+
+    /// Forward pass attempted while cache is compressed — call decompress() first.
+    #[cfg(feature = "kv-compress")]
+    #[error("cache is compressed — call decompress() before forward()")]
+    CacheCompressed,
+}
+
+#[cfg(test)]
+#[cfg(feature = "kv-compress")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_failed_displays_message() {
+        let err = InferenceError::CompressionFailed("bad tensor".into());
+        assert_eq!(err.to_string(), "compression failed: bad tensor");
+    }
+
+    #[test]
+    fn cache_compressed_displays_message() {
+        let err = InferenceError::CacheCompressed;
+        assert!(err.to_string().contains("compressed"));
+    }
 }

@@ -98,6 +98,10 @@ impl InferenceEngine for QwenEngine {
                 "tokens slice must not be empty".into(),
             ));
         }
+        #[cfg(feature = "kv-compress")]
+        if cache.is_compressed() {
+            return Err(InferenceError::CacheCompressed);
+        }
         let model = self.model.as_ref().ok_or(InferenceError::ModelNotLoaded)?;
 
         // Validate cache matches model architecture.
@@ -257,6 +261,22 @@ mod tests {
         let engine = QwenEngine::new(Device::Cpu);
         let result = engine.new_cache();
         assert!(matches!(result, Err(InferenceError::ModelNotLoaded)));
+    }
+
+    #[test]
+    #[cfg(feature = "kv-compress")]
+    fn forward_while_compressed_errors() {
+        let engine = QwenEngine::new(Device::Cpu);
+        let mut cache = InferenceCache::new(28, 128, 8);
+        cache.compress().unwrap();
+        assert!(cache.is_compressed());
+
+        let result = engine.forward(&[1, 2, 3], &mut cache);
+        assert!(
+            matches!(result, Err(InferenceError::CacheCompressed)),
+            "expected CacheCompressed, got {result:?}"
+        );
+        assert!(cache.is_compressed());
     }
 
     #[test]
