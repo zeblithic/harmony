@@ -9,3 +9,5 @@
 //! Consumers feed events via [`NodeRuntime::push_event`] and process
 //! returned actions from [`NodeRuntime::tick`] through platform-specific
 //! I/O (UDP sockets, Zenoh sessions, disk, etc.).
+
+pub mod page_index;
