@@ -2389,16 +2389,57 @@ fn run_inference_loop(
 
         sequence += 1;
 
-        logits = match engine.forward(&[next_token], &mut cache) {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = tx.blocking_send(InferenceResult::Failed {
-                    query_id,
-                    task_id,
-                    error: format!("forward failed: {e}"),
-                    engine,
-                });
-                return;
+        // Opportunistic decode-step Engram injection: reuse cached shards from
+        // prefill. Falls back to plain forward on any miss or error.
+        logits = 'decode_fwd: {
+            if let Some(ref ep) = engram {
+                if history.len() >= 2 {
+                    let window = &history[history.len().saturating_sub(3)..];
+                    if let Ok(req) =
+                        harmony_inference::engram_bridge::prepare_engram_request(&ep.client, window)
+                    {
+                        let all_cached = req
+                            .required_shards
+                            .iter()
+                            .all(|s| ep.shard_data.contains_key(&s.shard_index));
+                        if all_cached {
+                            if let Ok(embeddings) =
+                                harmony_inference::engram_bridge::resolve_engram_embeddings(
+                                    &ep.client,
+                                    &req,
+                                    &ep.shard_data,
+                                    engine.device(),
+                                )
+                            {
+                                if let Ok(slice) = embeddings.narrow(1, req.seq_len - 1, 1) {
+                                    let ctx = harmony_inference::EngramContext {
+                                        module: &ep.module,
+                                        embeddings: slice,
+                                        injection_layers: &ep.injection_layers,
+                                    };
+                                    if let Ok(l) =
+                                        engine.forward_with_engram(&[next_token], &mut cache, &ctx)
+                                    {
+                                        break 'decode_fwd l;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tracing::trace!("engram decode miss — using plain forward");
+                }
+            }
+            match engine.forward(&[next_token], &mut cache) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.blocking_send(InferenceResult::Failed {
+                        query_id,
+                        task_id,
+                        error: format!("forward failed: {e}"),
+                        engine,
+                    });
+                    return;
+                }
             }
         };
     }
