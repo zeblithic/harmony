@@ -86,7 +86,8 @@ impl EngramGatedResidual {
     /// - `value_proj_weight`: `[hidden_dim, engram_dim]`
     /// - `gate_norm_weight`: `[hidden_dim]`
     /// - `key_norm_weight`: `[hidden_dim]`
-    /// - `conv1d_weight`: `[hidden_dim, 1, kernel_size]`
+    /// - `conv1d_weight`: `[hidden_dim, 1, kernel_size]` (kernel_size inferred from shape)
+    /// - `rms_norm_eps`: epsilon for RmsNorm layers (e.g., from model GGUF metadata)
     pub fn from_tensors(
         key_proj_weight: Tensor,
         value_proj_weight: Tensor,
@@ -94,7 +95,7 @@ impl EngramGatedResidual {
         key_norm_weight: Tensor,
         conv1d_weight: Tensor,
         hidden_dim: usize,
-        conv_kernel_size: usize,
+        rms_norm_eps: f64,
     ) -> Result<Self> {
         // Validate tensor shapes upfront for clear error messages.
         let kw = key_proj_weight.shape().dims();
@@ -110,17 +111,18 @@ impl EngramGatedResidual {
             );
         }
         let cw = conv1d_weight.shape().dims();
-        if cw != [hidden_dim, 1, conv_kernel_size] {
+        if cw.len() != 3 || cw[0] != hidden_dim || cw[1] != 1 {
             candle_core::bail!(
-                "conv1d_weight shape {cw:?} expected [{hidden_dim}, 1, {conv_kernel_size}]"
+                "conv1d_weight shape {cw:?} expected [{hidden_dim}, 1, kernel_size]"
             );
         }
+        let conv_kernel_size = cw[2];
 
         let key_proj = Linear::new(key_proj_weight, None);
         let value_proj = Linear::new(value_proj_weight, None);
 
-        let gate_norm = candle_nn::RmsNorm::new(gate_norm_weight, 1e-6);
-        let key_norm = candle_nn::RmsNorm::new(key_norm_weight, 1e-6);
+        let gate_norm = candle_nn::RmsNorm::new(gate_norm_weight, rms_norm_eps);
+        let key_norm = candle_nn::RmsNorm::new(key_norm_weight, rms_norm_eps);
 
         let conv1d_config = Conv1dConfig {
             padding: 0,
@@ -293,7 +295,7 @@ mod tests {
             key_norm_w,
             conv_w,
             hidden_dim,
-            kernel_size,
+            1e-6,
         )?;
 
         // Create engram with non-zero value only at the LAST position
@@ -372,7 +374,7 @@ mod tests {
             key_norm_w,
             conv_w,
             hidden_dim,
-            kernel_size,
+            1e-6,
         )?;
 
         let hidden = Tensor::randn(0f32, 1f32, (1, 7, hidden_dim), &device)?;
