@@ -11,7 +11,7 @@ description = "GGUF model loader and inference engine for quantized Qwen3 models
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
-kv-compress = []
+kv-compress = ["dep:serde", "dep:postcard"]
 
 [dependencies]
 candle-core = { workspace = true }
@@ -20,3 +20,5 @@ tokenizers = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true, features = ["std"] }
 tracing = { workspace = true }
+serde = { workspace = true, features = ["derive", "alloc"], optional = true }
+postcard = { workspace = true, optional = true }
