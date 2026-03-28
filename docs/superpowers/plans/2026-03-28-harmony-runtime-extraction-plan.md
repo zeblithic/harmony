@@ -4,7 +4,7 @@
 
 **Goal:** Extract the sans-I/O `NodeRuntime` state machine from the `harmony-node` binary into a reusable `harmony-runtime` library crate, and define the `PlatformAdapter` trait boundary for multi-platform Harmony network participation.
 
-**Architecture:** Move `runtime.rs` (6802 lines, 100 tests), `page_index.rs` (260 lines), and inference type definitions from `harmony-node` into a new `harmony-runtime` library crate. Refactor `harmony-node` to import from `harmony-runtime`. Add new trait definitions (`PlatformAdapter`, `AttestationReport`, `ComputeBackend`) via TDD.
+**Architecture:** Move `runtime.rs` (~6970 lines, 100 tests), `page_index.rs` (260 lines), and inference type definitions from `harmony-node` into a new `harmony-runtime` library crate. Refactor `harmony-node` to import from `harmony-runtime`. Add new trait definitions (`PlatformAdapter`, `AttestationReport`, `ComputeBackend`) via TDD.
 
 **Tech Stack:** Rust, harmony core crate ecosystem (15 crate dependencies), `#[cfg(feature)]` gates for inference support.
 
@@ -873,38 +873,38 @@ git commit -m "feat(runtime): add PlatformAdapter trait and interface types"
 Run: `cargo test -p harmony-runtime`
 Expected: All tests pass (100 runtime + adapter + attestation + compute_backend tests)
 
-- [ ] **Step 3: Run all harmony-node tests**
+- [ ] **Step 2: Run all harmony-node tests**
 
 Run: `cargo test -p harmony-node`
 Expected: All tests pass (config, CLI, integration)
 
-- [ ] **Step 4: Run full workspace tests**
+- [ ] **Step 3: Run full workspace tests**
 
 Run: `cargo test --workspace`
 Expected: All tests pass
 
-- [ ] **Step 5: Run clippy**
+- [ ] **Step 4: Run clippy**
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: No warnings
 
-- [ ] **Step 6: Run nightly rustfmt**
+- [ ] **Step 5: Run nightly rustfmt**
 
 Run: `rustup run nightly cargo fmt --all -- --check`
 Expected: No formatting issues
 
-- [ ] **Step 7: Fix any issues found in steps 4-6**
+- [ ] **Step 6: Fix any issues found in steps 3-5**
 
 Address clippy warnings, formatting issues, or test failures iteratively.
 
-- [ ] **Step 8: Final commit (if any fixes needed)**
+- [ ] **Step 7: Final commit (if any fixes needed)**
 
 ```bash
 git add -A
 git commit -m "chore: fix clippy/fmt issues from harmony-runtime extraction"
 ```
 
-- [ ] **Step 9: Verify git status is clean**
+- [ ] **Step 8: Verify git status is clean**
 
 Run: `git status`
 Expected: Clean working tree, all changes committed
