@@ -1277,6 +1277,9 @@ pub async fn run(
 
                             tokio::spawn(async move {
                                 // Fetch all required shards in parallel via Zenoh.
+                                // Fetch all shards in parallel. try_join_all short-circuits
+                                // on the first failure, avoiding a 30s wait per slow shard
+                                // while the engine is held.
                                 let fetch_futures: Vec<_> = request
                                     .required_shards
                                     .iter()
@@ -1287,46 +1290,31 @@ pub async fn run(
                                         let session_ref = &session_clone;
                                         let shard_index = shard_req.shard_index;
                                         async move {
-                                            let result =
-                                                fetch_via_zenoh(session_ref, &key_expr).await;
-                                            (shard_index, result)
+                                            let data =
+                                                fetch_via_zenoh(session_ref, &key_expr).await?;
+                                            Ok::<_, String>((shard_index, data))
                                         }
                                     })
                                     .collect();
 
-                                let results = futures_util::future::join_all(fetch_futures).await;
-
-                                // Build shard_data map, checking for failures.
-                                let mut shard_data = HashMap::with_capacity(results.len());
-                                let mut fetch_failed = false;
-                                for (shard_index, result) in results {
-                                    match result {
-                                        Ok(data) => {
-                                            shard_data.insert(shard_index, data);
+                                let engram_prefill =
+                                    match futures_util::future::try_join_all(fetch_futures).await {
+                                        Ok(pairs) => {
+                                            let shard_data: HashMap<u64, Vec<u8>> =
+                                                pairs.into_iter().collect();
+                                                request,
+                                                shard_data,
+                                                injection_layers,
+                                            })
                                         }
                                         Err(e) => {
                                             tracing::warn!(
-                                                shard_index,
                                                 err = %e,
                                                 "engram shard fetch failed — falling back to non-Engram"
                                             );
-                                            fetch_failed = true;
-                                            break;
+                                            None
                                         }
-                                    }
-                                }
-
-                                let engram_prefill = if fetch_failed {
-                                    None
-                                } else {
-                                    Some(EngramPrefill {
-                                        client,
-                                        module,
-                                        request,
-                                        shard_data,
-                                        injection_layers,
-                                    })
-                                };
+                                    };
 
                                 let handle = tokio::task::spawn_blocking(move || {
                                     run_inference_loop(
@@ -2245,7 +2233,23 @@ fn run_inference_loop(
                     match engine.forward_with_engram(&tokens, &mut cache, &ctx) {
                         Ok(l) => l,
                         Err(e) => {
-                            tracing::warn!(err = %e, "engram forward failed — falling back to plain forward");
+                            // forward_with_engram may have partially updated the
+                            // KV cache (layers 0..k got entries but position wasn't
+                            // advanced). A fallback with the same cache would produce
+                            // duplicate KV entries. Create a fresh cache instead.
+                            tracing::warn!(err = %e, "engram forward failed — creating fresh cache for fallback");
+                            cache = match engine.new_cache() {
+                                Ok(c) => c,
+                                Err(e2) => {
+                                    let _ = tx.blocking_send(InferenceResult::Failed {
+                                        query_id,
+                                        task_id,
+                                        error: format!("cache re-init failed after engram error: {e2}"),
+                                        engine,
+                                    });
+                                    return;
+                                }
+                            };
                             match engine.forward(&tokens, &mut cache) {
                                 Ok(l) => l,
                                 Err(e2) => {

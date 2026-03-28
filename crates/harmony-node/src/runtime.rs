@@ -2792,12 +2792,20 @@ impl<B: BookStore> NodeRuntime<B> {
         self.engram_client = Some(EngramClient::from_manifest(config, shard_cids));
 
         // Random-init module for integration testing. Trained weights loaded separately.
+        // TODO: read hidden_dim from model metadata or manifest once available.
         let hidden_dim = 1536; // Qwen3-0.6B hidden_size
+        // Use the engine's device if loaded, otherwise CPU. The engine and manifest
+        // are fetched in parallel so the engine may not be ready yet.
+        let device = self
+            .verification_engine
+            .as_ref()
+            .map(|e| e.device().clone())
+            .unwrap_or(candle_core::Device::Cpu);
         match harmony_inference::EngramGatedResidual::new(
             engram_dim,
             hidden_dim,
             3,
-            &candle_core::Device::Cpu,
+            &device,
         ) {
             Ok(m) => {
                 self.engram_module = Some(m);
