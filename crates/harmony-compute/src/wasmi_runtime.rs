@@ -19,6 +19,10 @@ struct HostState {
     /// `sample()` calls from the same logits are allowed (e.g. beam search).
     #[cfg(feature = "inference")]
     last_logits: Option<Vec<f32>>,
+    /// Inference KV cache, lazily created on first `forward()` call.
+    /// Cleared by `model_reset()`.
+    #[cfg(feature = "inference")]
+    inference_cache: Option<harmony_inference::InferenceCache>,
 }
 
 impl HostState {
@@ -30,6 +34,8 @@ impl HostState {
             inference_engine: None,
             #[cfg(feature = "inference")]
             last_logits: None,
+            #[cfg(feature = "inference")]
+            inference_cache: None,
         }
     }
 }
@@ -538,17 +544,27 @@ impl ComputeRuntime for WasmiRuntime {
                             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                             .collect();
 
-                        let engine = match caller.data_mut().inference_engine.as_mut() {
+                        let data = caller.data_mut();
+                        let engine = match data.inference_engine.as_ref() {
                             Some((_, _, e)) => e,
                             None => return Ok(-1),
                         };
 
-                        let logits = match engine.forward(&tokens) {
+                        // Lazily create cache on first forward() call.
+                        if data.inference_cache.is_none() {
+                            match engine.new_cache() {
+                                Ok(c) => data.inference_cache = Some(c),
+                                Err(_) => return Ok(-2),
+                            }
+                        }
+                        let cache = data.inference_cache.as_mut().unwrap();
+
+                        let logits = match engine.forward(&tokens, cache) {
                             Ok(l) => l,
                             Err(_) => return Ok(-2),
                         };
 
-                        caller.data_mut().last_logits = Some(logits);
+                        data.last_logits = Some(logits);
                         Ok(0)
                     },
                 )
@@ -622,7 +638,7 @@ impl ComputeRuntime for WasmiRuntime {
                         };
 
                         let (_, _, engine) = caller.data().inference_engine.as_ref().unwrap();
-                        match engine.sample(&logits, &params) {
+                        match engine.sample(&logits, &params, &[]) {
                             Ok(token_id) => {
                                 let id = token_id as i32;
                                 if id < 0 {
@@ -644,9 +660,7 @@ impl ComputeRuntime for WasmiRuntime {
                     "model_reset",
                     |mut caller: wasmi::Caller<'_, HostState>| -> Result<i32, wasmi::Error> {
                         let data = caller.data_mut();
-                        if let Some((_, _, engine)) = &mut data.inference_engine {
-                            engine.reset();
-                        }
+                        data.inference_cache = None;
                         data.last_logits = None;
                         Ok(0)
                     },
