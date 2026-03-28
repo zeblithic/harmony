@@ -10,4 +10,5 @@
 //! returned actions from [`NodeRuntime::tick`] through platform-specific
 //! I/O (UDP sockets, Zenoh sessions, disk, etc.).
 
+pub mod inference_types;
 pub mod page_index;
