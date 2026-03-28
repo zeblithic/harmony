@@ -524,6 +524,24 @@ impl ModelWeights {
     /// The caller owns the [`InferenceCache`] and passes it in on every call.
     /// This method advances `cache.position` by the number of input tokens.
     pub(crate) fn forward(&self, input: &Tensor, cache: &mut InferenceCache) -> Result<Tensor> {
+        self.forward_with_engram(input, cache, None)
+    }
+
+    /// Forward pass with optional Engram injection callback.
+    ///
+    /// If `engram_fn` is `Some`, it is called after each transformer layer with
+    /// `(layer_index, &hidden_state)`. If the callback returns `Ok(Some(tensor))`,
+    /// that tensor is added to the hidden state as a residual. If it returns
+    /// `Ok(None)`, the layer output passes through unchanged.
+    ///
+    /// The callback returns the *additive residual* tensor `[b, l, hidden_dim]`.
+    /// This method adds it: `h = h + residual`.
+    pub(crate) fn forward_with_engram(
+        &self,
+        input: &Tensor,
+        cache: &mut InferenceCache,
+        engram_fn: Option<&dyn Fn(usize, &Tensor) -> Result<Option<Tensor>>>,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
         let offset = cache.position;
@@ -535,6 +553,12 @@ impl ModelWeights {
         };
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, causal_mask.as_ref(), offset, &mut cache.layers[i])?;
+
+            if let Some(f) = &engram_fn {
+                if let Some(engram_residual) = f(i, &h)? {
+                    h = (h + engram_residual)?;
+                }
+            }
         }
         let h = self.norm.forward(&h)?;
         let _enter = self.span_output.enter();
