@@ -61,7 +61,7 @@ impl CompressedKvLayer {
 /// byte 2: [v5₂ v5₁ | v6₂ v6₁ v6₀ | v7₂ v7₁ v7₀]
 /// ```
 fn pack_3bit(values: &[u8]) -> Vec<u8> {
-    let num_bytes = (values.len() * 3 + 7) / 8;
+    let num_bytes = (values.len() * 3).div_ceil(8);
     let mut packed = vec![0u8; num_bytes];
     for (i, &v) in values.iter().enumerate() {
         let bit_offset = i * 3;

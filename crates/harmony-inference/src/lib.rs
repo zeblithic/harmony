@@ -458,4 +458,73 @@ mod kv_compress_cache_tests {
         cache.decompress().unwrap();
         assert_eq!(cache.memory_bytes(), original);
     }
+
+    #[test]
+    fn compress_atomic_on_error() {
+        let mut cache = InferenceCache::new(2, 128, 8);
+
+        // Layer 0: correct shape [1, 8, 4, 128] f16
+        let shape_ok = (1, 8, 4, 128);
+        let k0 = Tensor::rand(0f32, 1f32, shape_ok, &Device::Cpu)
+            .unwrap().to_dtype(DType::F16).unwrap();
+        let v0 = Tensor::rand(0f32, 1f32, shape_ok, &Device::Cpu)
+            .unwrap().to_dtype(DType::F16).unwrap();
+        cache.layers[0] = Some((k0, v0));
+
+        // Layer 1: 3D tensor (wrong rank) — will fail dims4()
+        let k1 = Tensor::rand(0f32, 1f32, (8, 4, 128), &Device::Cpu)
+            .unwrap().to_dtype(DType::F16).unwrap();
+        let v1 = Tensor::rand(0f32, 1f32, (8, 4, 128), &Device::Cpu)
+            .unwrap().to_dtype(DType::F16).unwrap();
+        cache.layers[1] = Some((k1, v1));
+
+        let result = cache.compress();
+        assert!(result.is_err(), "should fail on malformed tensor");
+
+        // Atomic: cache must remain fully uncompressed
+        assert!(!cache.is_compressed());
+        assert!(cache.layers[0].is_some());
+        assert!(cache.layers[1].is_some());
+        assert!(cache.compressed.iter().all(|c| c.is_none()));
+    }
+
+    #[test]
+    fn double_roundtrip_preserves_shape() {
+        let mut cache = cache_with_data(2, 8, 128, 8);
+
+        cache.compress().unwrap();
+        cache.decompress().unwrap();
+        cache.compress().unwrap();
+        cache.decompress().unwrap();
+
+        assert!(!cache.is_compressed());
+        let (k, v) = cache.layers[0].as_ref().unwrap();
+        assert_eq!(k.dims4().unwrap(), (1, 8, 8, 128));
+        assert_eq!(v.dims4().unwrap(), (1, 8, 8, 128));
+        assert_eq!(k.dtype(), DType::F16);
+    }
+
+    #[test]
+    fn compress_with_partial_layers() {
+        let mut cache = InferenceCache::new(4, 128, 8);
+        let shape = (1, 8, 4, 128);
+        let k = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
+            .unwrap().to_dtype(DType::F16).unwrap();
+        let v = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
+            .unwrap().to_dtype(DType::F16).unwrap();
+        cache.layers[0] = Some((k.clone(), v.clone()));
+        cache.layers[2] = Some((k, v));
+
+        cache.compress().unwrap();
+        assert!(cache.compressed[0].is_some());
+        assert!(cache.compressed[1].is_none());
+        assert!(cache.compressed[2].is_some());
+        assert!(cache.compressed[3].is_none());
+
+        cache.decompress().unwrap();
+        assert!(cache.layers[0].is_some());
+        assert!(cache.layers[1].is_none());
+        assert!(cache.layers[2].is_some());
+        assert!(cache.layers[3].is_none());
+    }
 }
