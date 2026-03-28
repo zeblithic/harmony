@@ -3294,6 +3294,7 @@ dependencies = [
  "harmony-peers",
  "harmony-rawlink",
  "harmony-reticulum",
+ "harmony-runtime",
  "harmony-s3",
  "harmony-speculative",
  "harmony-tunnel",
