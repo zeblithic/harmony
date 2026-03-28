@@ -54,6 +54,30 @@ Follows the inference GGUF/tokenizer pattern:
 5. `engram_module` starts as `None` — for integration testing, constructed with `EngramGatedResidual::new()` (random weights). Production weight loading from CAS is a separate concern (future bead).
 6. `engram_injection_layers` defaults to `vec![2, 14]` (from DeepSeek research).
 
+### EngramGatedResidual Ownership
+
+`EngramGatedResidual` derives `Clone`. The runtime stores a single instance in `engram_module`. For each inference request that uses Engram, the module is cloned into the `EngramPrefill` struct that moves into the blocking task. Cloning is cheap (~4MB of f32 weight tensors — candle Tensors use reference-counted storage, so clone is just Arc bumps).
+
+### Config File Plumbing
+
+In `config.rs`, add to `ConfigFile`:
+
+```rust
+pub engram_manifest_cid: Option<String>,  // hex-encoded 32-byte CID
+```
+
+In `main.rs`, hex-decode and pass to `NodeConfig` (same pattern as `inference_model_gguf_cid`):
+
+```rust
+engram_manifest_cid: config.engram_manifest_cid.as_deref()
+    .and_then(|s| hex::decode(s).ok())
+    .and_then(|v| <[u8; 32]>::try_from(v).ok()),
+```
+
+### Manifest Format
+
+The `engram_manifest_cid` points to a single CAS book containing the postcard-encoded `ManifestHeader` followed by the raw shard CID array. `ManifestHeader` includes a `header_len: u32` field recording its serialized size, enabling the split: `ManifestHeader::from_bytes(&data[..header_len])` then `parse_shard_cids(&data[header_len..])`. DAG-based multi-book manifests (for tables with 50M+ shards) are deferred.
+
 ---
 
 ## RunInference Intercept Expansion
@@ -62,18 +86,28 @@ Follows the inference GGUF/tokenizer pattern:
 
 Currently `run_inference_loop` receives `InferenceInput` (either `Text` or `TokenIds`) and tokenizes inside the blocking task. With Engram, tokens are needed before spawning (for N-gram extraction).
 
-Change: tokenize in the async event loop before spawn. The blocking task always receives `Vec<u32>` tokens.
+Change: tokenize in the async event loop before spawn, **before** calling `take_inference_engine()`. This way, a tokenization failure is handled before the engine is taken — no ownership leak.
 
 ```rust
-// In RunInference intercept:
+// In RunInference intercept — tokenize BEFORE taking engine:
 let (tokens, is_token_mode) = match input {
     InferenceInput::Text(prompt) => {
-        let t = engine.tokenize(&prompt).map_err(...)?;
-        (t, false)
+        match engine_ref.tokenize(&prompt) {
+            Ok(t) => (t, false),
+            Err(e) => {
+                // Engine was never taken — just send error reply
+                send_error_reply(query_id, format!("tokenize failed: {e}"));
+                continue;
+            }
+        }
     }
     InferenceInput::TokenIds(ids) => (ids, true),
 };
+// Now take engine (tokenization succeeded):
+let engine = match runtime.take_inference_engine() { ... };
 ```
+
+Note: tokenization only needs `&self` on the engine, so we can call it via an immutable reference to the runtime's engine *before* taking ownership. The existing `verification_engine` field is `Option<QwenEngine>` — we borrow it via `as_ref()` for tokenization, then `take()` for the blocking task.
 
 ### Engram Branch
 
@@ -149,7 +183,9 @@ The user gets inference output regardless — just without Engram augmentation.
 |------|--------|
 | `crates/harmony-node/src/runtime.rs` | Add `engram_*` fields to NodeRuntime, manifest parse in ContentFetchResponse, `check_engram_ready()` |
 | `crates/harmony-node/src/event_loop.rs` | Tokenize-early in RunInference intercept, Engram shard fetch branch, updated `run_inference_loop` signature |
-| `crates/harmony-node/Cargo.toml` | Add `harmony-engram` to inference feature deps |
+| `crates/harmony-node/Cargo.toml` | Add `harmony-engram = { workspace = true, optional = true }` to deps, add `"dep:harmony-engram"` to `inference` feature array |
+| `crates/harmony-node/src/config.rs` | Add `engram_manifest_cid: Option<String>` to `ConfigFile` |
+| `crates/harmony-node/src/main.rs` | Hex-decode engram manifest CID into NodeConfig |
 
 **No new files.** Integration work into existing files.
 
@@ -174,11 +210,16 @@ The user gets inference output regardless — just without Engram augmentation.
 1. **Manifest parse round-trip** — Construct fake manifest bytes (ManifestHeader + shard CIDs), call the parse logic, verify `EngramClient` has correct config and shard count
 2. **Missing manifest CID → no fetch** — `engram_manifest_cid: None` → verify no `FetchContent` emitted at startup
 
+**Unit tests in event_loop.rs** (or extracted helpers):
+
+3. **Tokenize-early error → no engine leak** — Verify that tokenization failure before `take_inference_engine()` sends error reply without taking the engine
+4. **run_inference_loop with None engram** — Identical behavior to current code (regression check)
+
 **Existing tests preserved:**
 
-3. All existing inference tests pass unchanged — non-Engram path is identical
-4. All existing DSD tests pass — DSD doesn't use Engram
+5. All existing inference tests pass unchanged — non-Engram path is identical
+6. All existing DSD tests pass — DSD doesn't use Engram
 
 **Integration testing** (requires real Zenoh + CAS, deferred):
 
-5. End-to-end: configure manifest CID → fetch → parse → inference query → shard fetch → Engram-augmented logits
+7. End-to-end: configure manifest CID → fetch → parse → inference query → shard fetch → Engram-augmented logits
