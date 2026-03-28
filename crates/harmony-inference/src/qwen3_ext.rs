@@ -14,6 +14,12 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
+/// Callback type for Engram injection in [`ModelWeights::forward_with_engram`].
+///
+/// Called after each transformer layer with `(layer_index, &hidden_state)`.
+/// Return `Ok(Some(residual))` to inject, or `Ok(None)` to skip this layer.
+pub(crate) type EngramFn<'a> = &'a dyn Fn(usize, &Tensor) -> Result<Option<Tensor>>;
+
 // ---------------------------------------------------------------------------
 // Inlined utility types (from candle-transformers internals)
 // ---------------------------------------------------------------------------
@@ -540,7 +546,7 @@ impl ModelWeights {
         &self,
         input: &Tensor,
         cache: &mut InferenceCache,
-        engram_fn: Option<&dyn Fn(usize, &Tensor) -> Result<Option<Tensor>>>,
+        engram_fn: Option<EngramFn<'_>>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
