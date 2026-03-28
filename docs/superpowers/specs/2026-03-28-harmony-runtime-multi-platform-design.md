@@ -50,9 +50,10 @@ across all deployment contexts.
 - **Extract, don't rewrite**: Move existing battle-tested code from
   harmony-node into harmony-runtime. No behavioral changes. All
   existing harmony-node tests must pass after refactor.
-- **Sans-I/O boundary at `tick()`**: `NodeRuntime::tick()` takes
-  events, returns actions. All I/O is the caller's responsibility.
-  This is the same pattern used by harmony-reticulum's `Node`.
+- **Sans-I/O boundary at `push_event()`/`tick()`**: Events are
+  pushed via `push_event()` into internal priority queues; `tick()`
+  processes them and returns actions. Two-phase model matching
+  harmony-reticulum's `Node`.
 - **PlatformAdapter composes existing traits**: Wraps EntropySource,
   PersistentState, and networking into a single trait that platforms
   implement once.
@@ -72,24 +73,29 @@ across all deployment contexts.
 
 ```
 harmony/crates/
-├── harmony-crypto/
-├── harmony-identity/
+├── harmony-crypto/        # Foundation: hashing, encryption, HKDF
+├── harmony-identity/      # Keypairs, addresses, sign/verify
 ├── harmony-platform/      # EntropySource, NetworkInterface, PersistentState
 ├── harmony-reticulum/     # Node state machine, packets, announces
-├── harmony-zenoh/         # Key expressions, subscription tables
-├── harmony-content/       # Content addressing, CAS
+├── harmony-zenoh/         # Key expressions, queryable routing
+├── harmony-content/       # Content addressing, CAS, BookStore trait
 ├── harmony-compute/       # WASM execution engine
-├── harmony-workflow/       # Task orchestration
+├── harmony-workflow/      # Task orchestration (WorkflowEngine)
 ├── harmony-athenaeum/     # Content catalog
+├── harmony-discovery/     # Identity discovery (DiscoveryManager)
+├── harmony-contacts/      # Contact store (intentional peers)
+├── harmony-peers/         # Peer lifecycle (PeerManager)
+├── harmony-memo/          # Memo attestation store
+├── harmony-credential/    # Credential key resolution
+├── harmony-tunnel/        # Tunnel session management
+├── harmony-speculative/   # Speculative decoding
 ├── harmony-runtime/       # NEW — runtime orchestration library
 │   ├── src/
 │   │   ├── lib.rs         # Re-exports
-│   │   ├── runtime.rs     # NodeRuntime state machine
+│   │   ├── runtime.rs     # NodeRuntime<B: BookStore> state machine
 │   │   ├── config.rs      # NodeConfig, tier scheduling, budgets
 │   │   ├── adapter.rs     # PlatformAdapter + ComputeBackend traits
-│   │   ├── attestation.rs # Trust tiers, AttestationReport
-│   │   ├── discovery.rs   # PeerTable, PeerManager (sans-I/O)
-│   │   └── contacts.rs    # ContactStore, tunnel peer tracking
+│   │   └── attestation.rs # Trust tiers, AttestationReport
 │   └── Cargo.toml
 └── harmony-node/          # REFACTORED — thin binary over harmony-runtime
 ```
@@ -97,24 +103,40 @@ harmony/crates/
 ### Dependency Graph
 
 ```
-harmony-platform ─────────────────────────────────────┐
-harmony-reticulum ────────────────────────┐            │
-harmony-zenoh ──────────────┐             │            │
-harmony-content ────────┐   │             │            │
-                        ▼   ▼             ▼            ▼
-                   harmony-runtime    harmony-unikernel (Ring 1)
-                    ▲         ▲        (uses Node directly)
-                    │         │
-              harmony-node  harmony-client
-              (daemon)      (Tauri app)
+harmony-platform ─────────────────────────────────────────┐
+harmony-reticulum ──────────────────────────┐              │
+harmony-zenoh ────────────────┐             │              │
+harmony-content ──────────┐   │             │              │
+harmony-discovery ────┐   │   │             │              │
+harmony-contacts ─┐   │   │   │             │              │
+harmony-peers ─┐  │   │   │   │             │              │
+harmony-memo ┐ │  │   │   │   │             │              │
+  (+ more)   │ │  │   │   │   │             │              │
+             ▼ ▼  ▼   ▼   ▼   ▼             ▼              ▼
+            harmony-runtime              harmony-unikernel (Ring 1)
+             ▲         ▲                  (uses Node directly)
+             │         │
+       harmony-node  harmony-client
+       (daemon)      (Tauri app)
 ```
+
+harmony-runtime depends on ~12 core crates (the same ones
+harmony-node currently imports). The full dependency list:
+harmony-platform, harmony-reticulum, harmony-zenoh, harmony-content,
+harmony-compute, harmony-workflow, harmony-discovery, harmony-contacts,
+harmony-peers, harmony-memo, harmony-credential, harmony-speculative,
+harmony-athenaeum. Optional: harmony-tunnel (for tunnel peer state
+tracking).
 
 ### Feature Flags
 
 - `default = ["std"]` — for hosted platforms
-- No-std support for potential future harmony-os consumption
+- `no_std + alloc` support for potential future harmony-os
+  consumption (types use `Vec`, `String` from `alloc`)
 - `compute` — enables ComputeBackend traits (gated since not all
   nodes offer compute)
+- `inference` — enables `RuntimeAction::RunInference` variant
+  (matches harmony-node's existing feature gate)
 - `attestation` — enables trust tier reporting
 
 ### License
@@ -296,7 +318,8 @@ pub trait ComputeBackend {
 ```
 
 The runtime never calls ComputeBackend directly — it emits
-`RuntimeAction::RunInference` and the platform's event loop
+`RuntimeAction::RunInference` (behind `#[cfg(feature = "inference")]`,
+matching harmony-node's existing gate) and the platform's event loop
 dispatches to the appropriate backend. This preserves the sans-I/O
 boundary.
 
@@ -322,16 +345,16 @@ Remote peer
 
 | Component | Approx Lines | Description |
 |-----------|-------------|-------------|
-| RuntimeEvent enum | ~100 | 28 inbound event variants |
-| RuntimeAction enum | ~60 | 16+ outbound action variants |
+| RuntimeEvent enum | ~130 | 28 inbound event variants |
+| RuntimeAction enum | ~80 | 19 outbound action variants (+1 cfg-gated) |
 | NodeConfig + sub-configs | ~120 | Budgets, scheduling, policy |
-| NodeRuntime + tick() | ~4000 | Core state machine |
-| Tier 1 routing logic | ~800 | Delegates to Node |
-| Tier 2 storage logic | ~1200 | CAS, content policy, Zenoh keys |
-| Tier 3 compute scheduling | ~400 | Dispatch, capacity tracking |
-| PeerManager | ~300 | Announce scheduling, path expiry |
-| PeerTable | ~200 | Peer discovery tracking |
-| ContactStore | ~200 | Contact + tunnel peer state |
+| NodeRuntime<B> + tick() | ~4000 | Core state machine (generic over BookStore) |
+| Tier 1 routing logic | ~800 | Delegates to harmony-reticulum Node |
+| Tier 2 storage logic | ~1200 | StorageTier<B>, content policy, Zenoh key routing |
+| Tier 3 compute scheduling | ~400 | WorkflowEngine dispatch, capacity tracking |
+| PeerManager | ~300 | Announce scheduling, path expiry (from harmony-peers) |
+| DiscoveryManager | ~200 | Identity discovery (from harmony-discovery) |
+| MemoStore | ~200 | Memo attestation (from harmony-memo) |
 
 ### What Stays in harmony-node
 
@@ -353,41 +376,49 @@ Remote peer
 ```rust
 // harmony-runtime/src/runtime.rs
 
-pub struct NodeRuntime {
-    node: Node,                  // harmony-reticulum sans-I/O
-    config: NodeConfig,
-    book_store: MemoryBookStore, // in-memory CAS cache
-    contacts: ContactStore,
+/// Sans-I/O node runtime wiring Tier 1 (Router), Tier 2 (Storage),
+/// and Tier 3 (Compute). Generic over BookStore for storage backend
+/// flexibility (MemoryBookStore for tests, disk-backed for production).
+///
+/// Events are pushed via `push_event()` into internal priority queues.
+/// Each `tick()` processes events according to the TierSchedule:
+/// Router → Storage → Compute, with starvation protection.
+pub struct NodeRuntime<B: BookStore> {
+    router: Node,                    // harmony-reticulum sans-I/O
+    queryable_router: QueryableRouter,
+    storage: StorageTier<B>,
+    workflow: WorkflowEngine,
     peer_manager: PeerManager,
-    peer_table: PeerTable,
-    // ... tier state, counters, queues
+    contact_store: ContactStore,
+    discovery: DiscoveryManager,
+    memo_store: MemoStore,
+    replica_store: MemoryReplicaStore,
+    // ... internal queues, counters, filter tables, caches
 }
 
-impl NodeRuntime {
+impl<B: BookStore> NodeRuntime<B> {
+    /// Construct a new runtime. Returns startup actions the caller
+    /// must execute immediately (queryable declarations, subscriptions).
     pub fn new(
         config: NodeConfig,
-        identity: PrivateIdentity,
-    ) -> Self;
+        store: B,
+    ) -> (Self, Vec<RuntimeAction>);
 
-    /// Process buffered events, return actions for the platform.
+    /// Push an event into the runtime's internal priority queues.
+    /// Events are buffered until the next tick() call.
+    pub fn push_event(&mut self, event: RuntimeEvent);
+
+    /// Run one iteration of the priority event loop. Drains buffered
+    /// events and returns actions for the platform to execute.
     /// Called each tick cycle (typically 250ms).
-    pub fn tick(
-        &mut self,
-        events: &[RuntimeEvent],
-    ) -> Vec<RuntimeAction>;
-
-    pub fn register_interface(
-        &mut self,
-        name: &str,
-        mode: InterfaceMode,
-    );
-
-    pub fn register_destination(
-        &mut self,
-        hash: [u8; 16],
-    );
+    pub fn tick(&mut self) -> Vec<RuntimeAction>;
 }
 ```
+
+Note: Interface registration and destination registration are
+handled internally by `push_event()` when processing
+`L2InterfaceReady` and `TunnelHandshakeComplete` events — they are
+not exposed as separate public methods.
 
 ## Consumer Integration
 
@@ -399,24 +430,29 @@ logic. All existing tests pass unchanged.
 
 ```rust
 // harmony-node/src/event_loop.rs (after refactor)
-async fn run(config: NodeConfig, identity: PrivateIdentity) {
-    let mut runtime = NodeRuntime::new(config, identity);
+async fn run(config: NodeConfig, store: MemoryBookStore) {
+    let (mut runtime, startup_actions) = NodeRuntime::new(config, store);
+
+    // Execute startup actions (declare queryables, subscribe)
+    for action in startup_actions {
+        dispatch_action(&zenoh, action).await;
+    }
+
     // ... setup UDP, Zenoh, iroh, mDNS as today
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                events.push(RuntimeEvent::TimerTick { now, unix_now });
-                let actions = runtime.tick(&events);
-                events.clear();
+                runtime.push_event(RuntimeEvent::TimerTick { now, unix_now });
+                let actions = runtime.tick();
                 for action in actions {
                     dispatch_action(&udp, &zenoh, action).await;
                 }
             }
             Ok((len, addr)) = udp.recv_from(&mut buf) => {
-                events.push(RuntimeEvent::InboundPacket { ... });
+                runtime.push_event(RuntimeEvent::InboundPacket { ... });
             }
-            // ... other async arms push events
+            // ... other async arms call push_event()
         }
     }
 }
