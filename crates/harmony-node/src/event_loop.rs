@@ -2411,16 +2411,29 @@ fn run_inference_loop(
                                     engine.device(),
                                 )
                             {
-                                if let Ok(slice) = embeddings.narrow(1, req.seq_len - 1, 1) {
+                                if let Ok(slice) =
+                                    embeddings.narrow(1, req.seq_len.saturating_sub(1), 1)
+                                {
                                     let ctx = harmony_inference::EngramContext {
                                         module: &ep.module,
                                         embeddings: slice,
                                         injection_layers: &ep.injection_layers,
                                     };
-                                    if let Ok(l) =
-                                        engine.forward_with_engram(&[next_token], &mut cache, &ctx)
+                                    match engine
+                                        .forward_with_engram(&[next_token], &mut cache, &ctx)
                                     {
-                                        break 'decode_fwd l;
+                                        Ok(l) => break 'decode_fwd l,
+                                        Err(e) => {
+                                            // Warn (not trace) — this is an unexpected
+                                            // engine error, not a normal cache miss.
+                                            // Note: KV cache may have partial entries
+                                            // from layers 0..k. For seq_len=1 decode
+                                            // this is minor (1 token of duplicates).
+                                            tracing::warn!(
+                                                err = %e,
+                                                "decode engram forward failed — falling back"
+                                            );
+                                        }
                                     }
                                 }
                             }
