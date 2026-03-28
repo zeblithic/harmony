@@ -4,18 +4,12 @@
 //! so edge nodes can fetch and resume generation without re-evaluating
 //! the prompt. Feature-gated behind `prefill`.
 
-// Imports used by serialize/store functions added in subsequent tasks.
-#[allow(unused_imports)]
 use harmony_content::book::BookStore;
-#[allow(unused_imports)]
 use harmony_content::cid::ContentId;
-#[allow(unused_imports)]
 use harmony_content::chunker::ChunkerConfig;
-#[allow(unused_imports)]
 use harmony_content::dag;
 use harmony_content::error::ContentError;
 use harmony_crypto::hash::full_hash;
-#[allow(unused_imports)]
 use harmony_inference::InferenceCache;
 use harmony_inference::InferenceError;
 use serde::{Deserialize, Serialize};
@@ -24,7 +18,6 @@ use serde::{Deserialize, Serialize};
 pub const PREFILL_MAGIC: [u8; 4] = *b"HKV\x01";
 
 /// Supported quantization bit width.
-#[allow(dead_code)]
 const SUPPORTED_QUANT_BITS: u8 = 3;
 
 /// Header prepended to the serialized KV cache payload in CAS.
@@ -87,9 +80,206 @@ pub fn token_hash(token_ids: &[u32]) -> [u8; 32] {
     full_hash(&bytes)
 }
 
+/// Store a compressed KV cache in CAS. Returns the root CID.
+///
+/// The cache must be compressed (`is_compressed() == true`).
+/// `model_cid` identifies the GGUF model. `token_ids` is the
+/// prefill token sequence (hashed into the header).
+pub fn store_prefill_cache(
+    cache: &InferenceCache,
+    model_cid: &ContentId,
+    token_ids: &[u32],
+    store: &mut dyn BookStore,
+) -> Result<ContentId, PrefillError> {
+    if !cache.is_compressed() {
+        return Err(PrefillError::CacheNotCompressed);
+    }
+
+    let header = PrefillCacheHeader {
+        magic: PREFILL_MAGIC,
+        model_cid: model_cid.to_bytes(),
+        token_hash: token_hash(token_ids),
+        token_count: cache.position as u32,
+        num_layers: cache.num_layers as u16,
+        num_kv_heads: cache.num_kv_heads as u16,
+        head_dim: cache.head_dim as u16,
+        quant_bits: SUPPORTED_QUANT_BITS,
+    };
+
+    let header_bytes = postcard::to_allocvec(&header)
+        .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?;
+
+    let payload_bytes = cache.serialize_compressed()?;
+
+    // Wire blob: [header_len: u32 LE][header][payload]
+    let mut blob = Vec::with_capacity(4 + header_bytes.len() + payload_bytes.len());
+    blob.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&header_bytes);
+    blob.extend_from_slice(&payload_bytes);
+
+    let root = dag::ingest(&blob, &ChunkerConfig::DEFAULT, store)?;
+    Ok(root)
+}
+
+/// Load a prefill cache from CAS.
+///
+/// Validates the header magic, quant_bits, and model CID. Returns the cache
+/// in compressed state (caller must call `decompress()` before `forward()`).
+pub fn load_prefill_cache(
+    root_cid: &ContentId,
+    expected_model_cid: &ContentId,
+    store: &dyn BookStore,
+) -> Result<(InferenceCache, PrefillCacheHeader), PrefillError> {
+    let blob = dag::reassemble(root_cid, store)?;
+
+    if blob.len() < 4 {
+        return Err(PrefillError::SerializationFailed("blob too short".into()));
+    }
+
+    let header_len = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
+    if blob.len() < 4 + header_len {
+        return Err(PrefillError::SerializationFailed("truncated header".into()));
+    }
+
+    let header: PrefillCacheHeader = postcard::from_bytes(&blob[4..4 + header_len])
+        .map_err(|e| PrefillError::SerializationFailed(e.to_string()))?;
+
+    if header.magic != PREFILL_MAGIC {
+        return Err(PrefillError::InvalidMagic);
+    }
+
+    if header.quant_bits != SUPPORTED_QUANT_BITS {
+        return Err(PrefillError::UnsupportedQuantBits(header.quant_bits));
+    }
+
+    let expected_bytes = expected_model_cid.to_bytes();
+    if header.model_cid != expected_bytes {
+        return Err(PrefillError::ModelMismatch {
+            expected: expected_bytes,
+            actual: header.model_cid,
+        });
+    }
+
+    let payload = &blob[4 + header_len..];
+    let cache = InferenceCache::deserialize_compressed(
+        payload,
+        header.num_layers as usize,
+        header.head_dim as usize,
+        header.num_kv_heads as usize,
+    )?;
+
+    Ok((cache, header))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::{DType, Device, Tensor};
+    use harmony_content::book::MemoryBookStore;
+
+    /// Create a compressed InferenceCache with synthetic data.
+    fn compressed_cache(num_layers: usize, num_kv_heads: usize, head_dim: usize, n_tokens: usize) -> InferenceCache {
+        let mut cache = InferenceCache::new(num_layers, head_dim, num_kv_heads);
+        if n_tokens > 0 {
+            let shape = (1, num_kv_heads, n_tokens, head_dim);
+            let k = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
+                .unwrap().to_dtype(DType::F16).unwrap();
+            let v = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
+                .unwrap().to_dtype(DType::F16).unwrap();
+            cache.layers[0] = Some((k, v));
+            cache.position = n_tokens;
+        }
+        cache.compress().unwrap();
+        cache
+    }
+
+    fn fake_model_cid() -> ContentId {
+        ContentId::for_book(b"fake-model-bytes", Default::default()).unwrap()
+    }
+
+    #[test]
+    fn store_load_roundtrip() {
+        let cache = compressed_cache(2, 8, 128, 16);
+        let model_cid = fake_model_cid();
+        let token_ids = vec![1u32, 2, 3, 4];
+        let mut store = MemoryBookStore::new();
+
+        let root = store_prefill_cache(&cache, &model_cid, &token_ids, &mut store).unwrap();
+
+        let (restored, header) = load_prefill_cache(&root, &model_cid, &store).unwrap();
+        assert!(restored.is_compressed());
+        assert_eq!(restored.position, 16);
+        assert_eq!(header.token_count, 16);
+        assert_eq!(header.num_layers, 2);
+        assert_eq!(header.num_kv_heads, 8);
+        assert_eq!(header.head_dim, 128);
+        assert_eq!(header.quant_bits, 3);
+        assert_eq!(header.token_hash, token_hash(&token_ids));
+    }
+
+    #[test]
+    fn load_rejects_wrong_model() {
+        let cache = compressed_cache(2, 8, 128, 4);
+        let model_cid = fake_model_cid();
+        let mut store = MemoryBookStore::new();
+
+        let root = store_prefill_cache(&cache, &model_cid, &[1, 2], &mut store).unwrap();
+
+        let wrong_cid = ContentId::for_book(b"wrong-model", Default::default()).unwrap();
+        let result = load_prefill_cache(&root, &wrong_cid, &store);
+        assert!(matches!(result, Err(PrefillError::ModelMismatch { .. })));
+    }
+
+    #[test]
+    fn store_requires_compressed() {
+        let cache = InferenceCache::new(2, 128, 8); // not compressed
+        let model_cid = fake_model_cid();
+        let mut store = MemoryBookStore::new();
+
+        let result = store_prefill_cache(&cache, &model_cid, &[1], &mut store);
+        assert!(matches!(result, Err(PrefillError::CacheNotCompressed)));
+    }
+
+    #[test]
+    fn header_magic_validation() {
+        let cache = compressed_cache(2, 8, 128, 4);
+        let model_cid = fake_model_cid();
+        let mut store = MemoryBookStore::new();
+
+        let root = store_prefill_cache(&cache, &model_cid, &[1], &mut store).unwrap();
+
+        // Corrupt the blob: reassemble, corrupt magic, re-store
+        let mut blob = dag::reassemble(&root, &store).unwrap();
+        blob[4] = 0xFF; // corrupt first byte of header (after header_len prefix)
+        let corrupt_root = dag::ingest(&blob, &ChunkerConfig::DEFAULT, &mut store).unwrap();
+
+        let result = load_prefill_cache(&corrupt_root, &model_cid, &store);
+        assert!(matches!(result, Err(PrefillError::InvalidMagic)));
+    }
+
+    #[test]
+    fn unsupported_quant_bits_rejected() {
+        let cache = compressed_cache(2, 8, 128, 4);
+        let model_cid = fake_model_cid();
+        let mut store = MemoryBookStore::new();
+
+        let root = store_prefill_cache(&cache, &model_cid, &[1], &mut store).unwrap();
+
+        // Reassemble, patch quant_bits in header, re-store
+        let blob = dag::reassemble(&root, &store).unwrap();
+        let header_len = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
+        let mut header: PrefillCacheHeader = postcard::from_bytes(&blob[4..4 + header_len]).unwrap();
+        header.quant_bits = 5; // unsupported
+        let new_header_bytes = postcard::to_allocvec(&header).unwrap();
+        let mut new_blob = Vec::new();
+        new_blob.extend_from_slice(&(new_header_bytes.len() as u32).to_le_bytes());
+        new_blob.extend_from_slice(&new_header_bytes);
+        new_blob.extend_from_slice(&blob[4 + header_len..]);
+        let corrupt_root = dag::ingest(&new_blob, &ChunkerConfig::DEFAULT, &mut store).unwrap();
+
+        let result = load_prefill_cache(&corrupt_root, &model_cid, &store);
+        assert!(matches!(result, Err(PrefillError::UnsupportedQuantBits(5))));
+    }
 
     #[test]
     fn token_hash_deterministic() {
