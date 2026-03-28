@@ -3288,6 +3288,7 @@ dependencies = [
  "harmony-credential",
  "harmony-crypto",
  "harmony-discovery",
+ "harmony-engram",
  "harmony-identity",
  "harmony-inference",
  "harmony-memo",
