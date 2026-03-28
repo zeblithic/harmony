@@ -10,6 +10,9 @@ pub mod verify;
 #[cfg(feature = "prefill")]
 pub mod prefill;
 
+#[cfg(feature = "prefill")]
+pub(crate) mod toploc;
+
 /// Default number of draft tokens per verification round.
 pub const DEFAULT_DRAFT_GAMMA: u8 = 5;
 
