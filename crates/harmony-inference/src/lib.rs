@@ -18,6 +18,7 @@
 //! ```
 
 pub mod engine;
+pub mod engram_bridge;
 pub mod engram_residual;
 pub mod error;
 #[cfg(feature = "kv-compress")]
