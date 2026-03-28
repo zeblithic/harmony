@@ -3160,7 +3160,9 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "postcard",
  "rand 0.8.5",
+ "serde",
  "thiserror 2.0.18",
  "tokenizers",
  "tracing",
@@ -3441,6 +3443,15 @@ dependencies = [
 [[package]]
 name = "harmony-speculative"
 version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "harmony-content",
+ "harmony-crypto",
+ "harmony-inference",
+ "postcard",
+ "serde",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "harmony-telemetry"
