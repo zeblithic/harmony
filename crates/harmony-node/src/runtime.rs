@@ -1670,7 +1670,10 @@ impl<B: BookStore> NodeRuntime<B> {
                 >= DSD_SESSION_TIMEOUT_TICKS
             {
                 let query_id = session.query_id;
-                tracing::warn!(query_id, "DSD session timed out after {DSD_SESSION_TIMEOUT_TICKS} ticks");
+                tracing::warn!(
+                    query_id,
+                    "DSD session timed out after {DSD_SESSION_TIMEOUT_TICKS} ticks"
+                );
                 let payload =
                     harmony_speculative::VerifyResponse::serialize_error("DSD session timed out");
                 self.pending_direct_actions
@@ -2404,7 +2407,7 @@ impl<B: BookStore> NodeRuntime<B> {
             ParsedCompute::Verify { request } => {
                 // DSD target verification — run natively, NOT through WASM.
                 // Reject if a DSD session is active — the engine is shared and
-                // run_verification would destroy the draft model's KV cache.
+                // concurrent verification could interfere with the draft session.
                 #[cfg(feature = "inference")]
                 {
                     if self.inference_running {
@@ -2423,7 +2426,7 @@ impl<B: BookStore> NodeRuntime<B> {
                             .push(RuntimeAction::SendReply { query_id, payload });
                         return Vec::new();
                     }
-                    if let Some(engine) = &mut self.verification_engine {
+                    if let Some(engine) = &self.verification_engine {
                         let response = Self::run_verification(engine, &request);
                         let payload = match response {
                             Ok(resp) => resp.serialize(),
@@ -2676,17 +2679,17 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Run DSD sequential verification using the target's inference engine.
     ///
     /// Algorithm:
-    /// 1. `engine.reset()` to clear prior KV cache state
-    /// 2. `engine.forward(&context_tokens)` — prefill, returns logits for verifying draft[0]
+    /// 1. Create a fresh inference cache for this verification pass
+    /// 2. `engine.forward(&context_tokens, &mut cache)` — prefill, returns logits for verifying draft[0]
     /// 3. For each draft token i:
     ///    - Check if draft[i] is acceptable given current logits
     ///    - If rejected: sample bonus token from current distribution, return
-    ///    - If accepted: `engine.forward(&[draft_token[i]])` to advance KV cache
+    ///    - If accepted: `engine.forward(&[draft_token[i]], &mut cache)` to advance KV cache
     /// 4. If all accepted: sample bonus token from last logits (the "free" extra token)
     /// 5. Return `VerifyResponse` with `accepted_count` + `bonus_token` + `bonus_logprob`
     #[cfg(feature = "inference")]
     fn run_verification(
-        engine: &mut harmony_inference::QwenEngine,
+        engine: &harmony_inference::QwenEngine,
         request: &harmony_speculative::VerifyRequest,
     ) -> Result<harmony_speculative::VerifyResponse, String> {
         use harmony_inference::InferenceEngine;
@@ -2701,15 +2704,15 @@ impl<B: BookStore> NodeRuntime<B> {
             request.drafts.len()
         );
 
-        // 1. Reset KV cache
-        engine.reset();
+        // 1. Create fresh cache
+        let mut cache = engine.new_cache().map_err(|e| e.to_string())?;
 
         // 2. Prefill with context tokens — returns logits for verifying draft[0]
         let mut current_logits = if request.context_tokens.is_empty() {
             return Err("empty context".into());
         } else {
             let logits = engine
-                .forward(&request.context_tokens)
+                .forward(&request.context_tokens, &mut cache)
                 .map_err(|e| format!("prefill failed: {e}"))?;
             if logits.is_empty() {
                 return Err("prefill returned empty logits".into());
@@ -2732,7 +2735,7 @@ impl<B: BookStore> NodeRuntime<B> {
 
             // Accepted — feed this token to advance KV cache
             current_logits = engine
-                .forward(&[draft.token_id])
+                .forward(&[draft.token_id], &mut cache)
                 .map_err(|e| format!("forward failed at draft {i}: {e}"))?;
             if current_logits.is_empty() {
                 return Err(format!("forward returned empty logits at draft {i}"));
@@ -2820,7 +2823,7 @@ impl<B: BookStore> NodeRuntime<B> {
             return;
         }
 
-        let engine = match &mut self.verification_engine {
+        let engine = match &self.verification_engine {
             Some(e) => e,
             None => {
                 let err =
@@ -2869,9 +2872,21 @@ impl<B: BookStore> NodeRuntime<B> {
         }
         let prompt_len = prompt_tokens.len();
 
-        // Reset and prefill draft model.
-        engine.reset();
-        let mut last_logits = match engine.forward(&prompt_tokens) {
+        // Create fresh cache and prefill draft model.
+        let mut cache = match engine.new_cache() {
+            Ok(c) => c,
+            Err(e) => {
+                let err = harmony_speculative::VerifyResponse::serialize_error(&format!(
+                    "cache creation failed: {e}"
+                ));
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
+                return;
+            }
+        };
+        let mut last_logits = match engine.forward(&prompt_tokens, &mut cache) {
             Ok(l) if !l.is_empty() => l,
             Ok(_) => {
                 let err = harmony_speculative::VerifyResponse::serialize_error(
@@ -2909,7 +2924,7 @@ impl<B: BookStore> NodeRuntime<B> {
             }
 
             // Advance KV cache.
-            match engine.forward(&[token_id]) {
+            match engine.forward(&[token_id], &mut cache) {
                 Ok(l) if !l.is_empty() => last_logits = l,
                 Ok(_) => {
                     let err = harmony_speculative::VerifyResponse::serialize_error(
@@ -3077,7 +3092,7 @@ impl<B: BookStore> NodeRuntime<B> {
         }
 
         // Not done — draft more tokens and send another verify request.
-        let engine = match &mut self.verification_engine {
+        let engine = match &self.verification_engine {
             Some(e) => e,
             None => {
                 let err = harmony_speculative::VerifyResponse::serialize_error("engine lost");
@@ -3090,11 +3105,24 @@ impl<B: BookStore> NodeRuntime<B> {
             }
         };
 
-        // Reset draft model and prefill with full accepted sequence.
-        engine.reset();
+        // Create fresh cache and prefill with full accepted sequence.
+        let mut cache = match engine.new_cache() {
+            Ok(c) => c,
+            Err(e) => {
+                let err = harmony_speculative::VerifyResponse::serialize_error(&format!(
+                    "cache creation failed: {e}"
+                ));
+                self.pending_direct_actions.push(RuntimeAction::SendReply {
+                    query_id,
+                    payload: err,
+                });
+                self.dsd_session = None;
+                return;
+            }
+        };
         let session = self.dsd_session.as_ref().unwrap();
         let full_sequence = session.accepted_tokens.clone();
-        let mut last_logits = match engine.forward(&full_sequence) {
+        let mut last_logits = match engine.forward(&full_sequence, &mut cache) {
             Ok(l) if !l.is_empty() => l,
             Ok(_) => {
                 let err = harmony_speculative::VerifyResponse::serialize_error(
@@ -3137,7 +3165,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 break;
             }
 
-            match engine.forward(&[token_id]) {
+            match engine.forward(&[token_id], &mut cache) {
                 Ok(l) if !l.is_empty() => last_logits = l,
                 Ok(_) => {
                     let err = harmony_speculative::VerifyResponse::serialize_error(

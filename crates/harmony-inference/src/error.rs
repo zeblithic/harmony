@@ -24,4 +24,8 @@ pub enum InferenceError {
     /// Sampling failed (empty logits, invalid params).
     #[error("sampling failed: {0}")]
     SamplingFailed(String),
+
+    /// Cache does not match the loaded model architecture.
+    #[error("cache mismatch: expected {expected} layers, got {actual}")]
+    CacheMismatch { expected: usize, actual: usize },
 }

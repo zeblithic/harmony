@@ -61,9 +61,10 @@ fn test_tokenize_and_detokenize() {
 #[test]
 #[ignore]
 fn test_forward_pass_returns_logits() {
-    let mut engine = load_test_engine();
+    let engine = load_test_engine();
+    let mut cache = engine.new_cache().expect("new_cache failed");
     let tokens = engine.tokenize("Hello").expect("tokenize failed");
-    let logits = engine.forward(&tokens).expect("forward failed");
+    let logits = engine.forward(&tokens, &mut cache).expect("forward failed");
 
     // Logits should have vocab_size entries (Qwen3 vocab is ~151k)
     assert!(
@@ -81,14 +82,15 @@ fn test_forward_pass_returns_logits() {
 #[test]
 #[ignore]
 fn test_sample_produces_valid_token() {
-    let mut engine = load_test_engine();
+    let engine = load_test_engine();
+    let mut cache = engine.new_cache().expect("new_cache failed");
     let tokens = engine
         .tokenize("The capital of France is")
         .expect("tokenize");
-    let logits = engine.forward(&tokens).expect("forward");
+    let logits = engine.forward(&tokens, &mut cache).expect("forward");
 
     let token = engine
-        .sample(&logits, &SamplingParams::greedy())
+        .sample(&logits, &SamplingParams::greedy(), &tokens)
         .expect("sample");
     assert!(
         (token as usize) < logits.len(),
@@ -103,20 +105,26 @@ fn test_sample_produces_valid_token() {
 #[test]
 #[ignore]
 fn test_generate_ten_tokens() {
-    let mut engine = load_test_engine();
+    let engine = load_test_engine();
+    let mut cache = engine.new_cache().expect("new_cache failed");
     let prompt_tokens = engine.tokenize("Once upon a time").expect("tokenize");
-    let logits = engine.forward(&prompt_tokens).expect("prefill");
+    let logits = engine.forward(&prompt_tokens, &mut cache).expect("prefill");
     let mut next = engine
-        .sample(&logits, &SamplingParams::greedy())
+        .sample(&logits, &SamplingParams::greedy(), &prompt_tokens)
         .expect("sample");
 
+    // Track full history (prompt + generated) for correct repeat penalty,
+    // matching the pattern used in harmony-node's run_inference_loop.
+    let mut history: Vec<u32> = prompt_tokens.clone();
     let mut generated = vec![next];
+    history.push(next);
     for _ in 0..9 {
-        let logits = engine.forward(&[next]).expect("decode step");
+        let logits = engine.forward(&[next], &mut cache).expect("decode step");
         next = engine
-            .sample(&logits, &SamplingParams::greedy())
+            .sample(&logits, &SamplingParams::greedy(), &history)
             .expect("sample");
         generated.push(next);
+        history.push(next);
     }
 
     let text = engine.detokenize(&generated).expect("detokenize");
@@ -126,18 +134,21 @@ fn test_generate_ten_tokens() {
 
 #[test]
 #[ignore]
-fn test_reset_allows_new_conversation() {
-    let mut engine = load_test_engine();
+fn test_new_cache_enables_new_conversation() {
+    let engine = load_test_engine();
 
     // First conversation
+    let mut cache1 = engine.new_cache().expect("new_cache");
     let tokens = engine.tokenize("Hello").expect("tokenize");
-    let _ = engine.forward(&tokens).expect("forward");
+    let _ = engine.forward(&tokens, &mut cache1).expect("forward");
 
-    // Reset
-    engine.reset();
-
-    // Second conversation should work from position 0
-    let tokens = engine.tokenize("Goodbye").expect("tokenize");
-    let logits = engine.forward(&tokens).expect("forward after reset");
+    // Second conversation uses a fresh cache — no reset() needed
+    let mut cache2 = engine
+        .new_cache()
+        .expect("new_cache for second conversation");
+    let tokens2 = engine.tokenize("Goodbye").expect("tokenize");
+    let logits = engine
+        .forward(&tokens2, &mut cache2)
+        .expect("forward after new cache");
     assert!(!logits.is_empty());
 }
