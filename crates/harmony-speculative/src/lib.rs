@@ -7,6 +7,9 @@
 pub mod protocol;
 pub mod verify;
 
+#[cfg(feature = "prefill")]
+pub mod prefill;
+
 /// Default number of draft tokens per verification round.
 pub const DEFAULT_DRAFT_GAMMA: u8 = 5;
 

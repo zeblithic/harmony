@@ -38,6 +38,11 @@ pub enum InferenceError {
     #[cfg(feature = "kv-compress")]
     #[error("cache is compressed — call decompress() before forward()")]
     CacheCompressed,
+
+    /// Serialization or deserialization of compressed cache failed.
+    #[cfg(feature = "kv-compress")]
+    #[error("serialization failed: {0}")]
+    SerializationFailed(String),
 }
 
 #[cfg(test)]
@@ -55,5 +60,11 @@ mod tests {
     fn cache_compressed_displays_message() {
         let err = InferenceError::CacheCompressed;
         assert!(err.to_string().contains("compressed"));
+    }
+
+    #[test]
+    fn serialization_failed_displays_message() {
+        let err = InferenceError::SerializationFailed("bad data".into());
+        assert_eq!(err.to_string(), "serialization failed: bad data");
     }
 }

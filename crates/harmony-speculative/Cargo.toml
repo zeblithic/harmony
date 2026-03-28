@@ -7,4 +7,17 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Decentralized Speculative Decoding protocol for Harmony"
 
+[features]
+default = []
+prefill = ["dep:harmony-inference", "dep:harmony-content", "dep:harmony-crypto", "dep:serde", "dep:postcard", "dep:thiserror"]
+
 [dependencies]
+harmony-inference = { workspace = true, features = ["kv-compress"], optional = true }
+harmony-content = { workspace = true, optional = true }
+harmony-crypto = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive", "alloc"], optional = true }
+postcard = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+
+[dev-dependencies]
+candle-core = { workspace = true }

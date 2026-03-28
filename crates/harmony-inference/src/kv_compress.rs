@@ -8,43 +8,44 @@
 
 use crate::error::InferenceError;
 use candle_core::{DType, Device, Tensor};
+use serde::{Deserialize, Serialize};
 
 /// Maximum quantization index (2^3 - 1 = 7, i.e., 8 levels 0..=7).
 const MAX_INDEX: u8 = 7;
 
 /// A single compressed vector: per-vector min/scale + 3-bit packed indices.
-#[derive(Clone, Debug)]
-pub(crate) struct QuantizedVec {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuantizedVec {
     /// Minimum value of the original vector (dequant base).
-    min: f32,
+    pub min: f32,
     /// Scale factor: `(max - min) / 7.0`. Zero if vector is constant.
-    scale: f32,
+    pub scale: f32,
     /// 3-bit packed quantization indices. `ceil(dim * 3 / 8)` bytes.
-    packed: Vec<u8>,
+    pub packed: Vec<u8>,
 }
 
 impl QuantizedVec {
     /// Approximate memory usage in bytes.
-    pub(crate) fn byte_size(&self) -> usize {
+    pub fn byte_size(&self) -> usize {
         // 4 (min) + 4 (scale) + packed data
         8 + self.packed.len()
     }
 }
 
 /// Compressed representation of one layer's K and V tensors.
-#[derive(Clone, Debug)]
-pub(crate) struct CompressedKvLayer {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompressedKvLayer {
     /// Compressed key vectors, row-major: [head0_tok0, head0_tok1, ..., headH_tokT].
-    pub(crate) k: Vec<QuantizedVec>,
+    pub k: Vec<QuantizedVec>,
     /// Compressed value vectors, same layout as k.
-    pub(crate) v: Vec<QuantizedVec>,
+    pub v: Vec<QuantizedVec>,
     /// Sequence length at compression time (for tensor shape reconstruction).
-    pub(crate) seq_len: usize,
+    pub seq_len: usize,
 }
 
 impl CompressedKvLayer {
     /// Approximate memory usage in bytes.
-    pub(crate) fn byte_size(&self) -> usize {
+    pub fn byte_size(&self) -> usize {
         self.k.iter().map(|q| q.byte_size()).sum::<usize>()
             + self.v.iter().map(|q| q.byte_size()).sum::<usize>()
     }
@@ -299,5 +300,32 @@ mod tests {
         let restored = decompress_tensor(&vecs, 8, 4, 128, &Device::Cpu).unwrap();
         assert_eq!(restored.dims4().unwrap(), (1, 8, 4, 128));
         assert_eq!(restored.dtype(), DType::F16);
+    }
+
+    #[test]
+    fn quantized_vec_serde_roundtrip() {
+        let data = vec![1.0_f32; 128];
+        let qv = quantize_vec(&data);
+        let bytes = postcard::to_allocvec(&qv).unwrap();
+        let restored: QuantizedVec = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(qv.min, restored.min);
+        assert_eq!(qv.scale, restored.scale);
+        assert_eq!(qv.packed, restored.packed);
+    }
+
+    #[test]
+    fn compressed_kv_layer_serde_roundtrip() {
+        let data = vec![1.0_f32; 128];
+        let qv = quantize_vec(&data);
+        let layer = CompressedKvLayer {
+            k: vec![qv.clone(); 4],
+            v: vec![qv; 4],
+            seq_len: 2,
+        };
+        let bytes = postcard::to_allocvec(&layer).unwrap();
+        let restored: CompressedKvLayer = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(layer.seq_len, restored.seq_len);
+        assert_eq!(layer.k.len(), restored.k.len());
+        assert_eq!(layer.v.len(), restored.v.len());
     }
 }

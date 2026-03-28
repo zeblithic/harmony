@@ -93,6 +93,14 @@ impl InferenceCache {
     }
 }
 
+/// Internal type for postcard serialization of compressed cache state.
+#[cfg(feature = "kv-compress")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CompressedCachePayload {
+    position: usize,
+    layers: Vec<Option<kv_compress::CompressedKvLayer>>,
+}
+
 #[cfg(feature = "kv-compress")]
 impl InferenceCache {
     /// Whether the cache is currently in compressed form.
@@ -198,6 +206,72 @@ impl InferenceCache {
         }
         self.is_compressed = false;
         Ok(())
+    }
+
+    /// Serialize the compressed cache to bytes.
+    /// Returns Err if the cache is not compressed.
+    pub fn serialize_compressed(&self) -> Result<Vec<u8>, InferenceError> {
+        if !self.is_compressed {
+            return Err(InferenceError::SerializationFailed(
+                "cache is not compressed — call compress() first".into(),
+            ));
+        }
+        let payload = CompressedCachePayload {
+            position: self.position,
+            layers: self.compressed.clone(),
+        };
+        postcard::to_allocvec(&payload)
+            .map_err(|e| InferenceError::SerializationFailed(e.to_string()))
+    }
+
+    /// Deserialize a compressed cache from bytes.
+    /// Validates that the serialized layer count matches `num_layers`.
+    /// `head_dim` and `num_kv_heads` are trusted inputs (from PrefillCacheHeader).
+    pub fn deserialize_compressed(
+        data: &[u8],
+        num_layers: usize,
+        head_dim: usize,
+        num_kv_heads: usize,
+    ) -> Result<InferenceCache, InferenceError> {
+        let payload: CompressedCachePayload = postcard::from_bytes(data)
+            .map_err(|e| InferenceError::SerializationFailed(e.to_string()))?;
+
+        if payload.layers.len() != num_layers {
+            return Err(InferenceError::SerializationFailed(format!(
+                "layer count mismatch: expected {num_layers}, got {}",
+                payload.layers.len()
+            )));
+        }
+
+        // Cross-validate num_kv_heads against the first populated layer's
+        // vector count. Each layer stores num_kv_heads * seq_len vectors.
+        if let Some(Some(layer)) = payload.layers.iter().find(|l| l.is_some()) {
+            if layer.seq_len > 0 {
+                let expected_vecs = num_kv_heads * layer.seq_len;
+                if layer.k.len() != expected_vecs {
+                    return Err(InferenceError::SerializationFailed(format!(
+                        "k vector count mismatch: expected {expected_vecs}, got {}",
+                        layer.k.len()
+                    )));
+                }
+                if layer.v.len() != expected_vecs {
+                    return Err(InferenceError::SerializationFailed(format!(
+                        "v vector count mismatch: expected {expected_vecs}, got {}",
+                        layer.v.len()
+                    )));
+                }
+            }
+        }
+
+        Ok(InferenceCache {
+            layers: (0..num_layers).map(|_| None).collect(),
+            position: payload.position,
+            num_layers,
+            head_dim,
+            num_kv_heads,
+            compressed: payload.layers,
+            is_compressed: true,
+        })
     }
 }
 
@@ -580,5 +654,61 @@ mod kv_compress_cache_tests {
         assert!(cache.layers[1].is_none());
         assert!(cache.layers[2].is_some());
         assert!(cache.layers[3].is_none());
+    }
+
+    #[test]
+    fn serialize_deserialize_roundtrip() {
+        let mut cache = cache_with_data(2, 8, 128, 16);
+        cache.compress().unwrap();
+
+        let bytes = cache.serialize_compressed().unwrap();
+        let restored = InferenceCache::deserialize_compressed(&bytes, 2, 128, 8).unwrap();
+
+        assert!(restored.is_compressed());
+        assert_eq!(restored.position, 16);
+        assert_eq!(restored.num_layers, 2);
+        assert!(restored.compressed[0].is_some());
+        assert!(restored.compressed[1].is_none());
+    }
+
+    #[test]
+    fn serialize_uncompressed_errors() {
+        let cache = cache_with_data(2, 8, 128, 16);
+        let result = cache.serialize_compressed();
+        assert!(matches!(result, Err(InferenceError::SerializationFailed(_))));
+    }
+
+    #[test]
+    fn deserialize_validates_num_layers() {
+        let mut cache = cache_with_data(2, 8, 128, 4);
+        cache.compress().unwrap();
+        let bytes = cache.serialize_compressed().unwrap();
+
+        let result = InferenceCache::deserialize_compressed(&bytes, 99, 128, 8);
+        assert!(matches!(result, Err(InferenceError::SerializationFailed(_))));
+    }
+
+    #[test]
+    fn serialize_empty_compressed_cache() {
+        let mut cache = InferenceCache::new(2, 128, 8);
+        cache.compress().unwrap();
+
+        let bytes = cache.serialize_compressed().unwrap();
+        let restored = InferenceCache::deserialize_compressed(&bytes, 2, 128, 8).unwrap();
+
+        assert!(restored.is_compressed());
+        assert_eq!(restored.position, 0);
+        assert!(restored.compressed.iter().all(|c| c.is_none()));
+    }
+
+    #[test]
+    fn serialize_preserves_position() {
+        let mut cache = cache_with_data(2, 8, 128, 42);
+        cache.position = 42;
+        cache.compress().unwrap();
+
+        let bytes = cache.serialize_compressed().unwrap();
+        let restored = InferenceCache::deserialize_compressed(&bytes, 2, 128, 8).unwrap();
+        assert_eq!(restored.position, 42);
     }
 }
