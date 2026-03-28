@@ -15,7 +15,7 @@ use harmony_inference::InferenceError;
 use serde::{Deserialize, Serialize};
 
 /// Magic bytes identifying a prefill KV cache blob.
-pub const PREFILL_MAGIC: [u8; 4] = *b"HKV\x01";
+pub const PREFILL_MAGIC: [u8; 4] = *b"HKV\x02";
 
 /// Supported quantization bit width.
 const SUPPORTED_QUANT_BITS: u8 = 3;
@@ -37,12 +37,14 @@ pub struct PrefillCacheHeader {
     pub head_dim: u16,
     /// Compression config.
     pub quant_bits: u8,
+    /// TOPLOC proofs for this cache (empty if not yet generated).
+    pub proofs: Vec<crate::toploc_proof::TocProof>,
 }
 
 /// Errors from prefill cache operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PrefillError {
-    #[error("invalid magic: expected HKV\\x01")]
+    #[error("invalid magic: expected HKV\\x02")]
     InvalidMagic,
 
     #[error("unsupported quant_bits: {0}")]
@@ -120,6 +122,7 @@ pub fn store_prefill_cache(
             PrefillError::SerializationFailed(format!("head_dim {} exceeds u16", cache.head_dim))
         })?,
         quant_bits: SUPPORTED_QUANT_BITS,
+        proofs: vec![],
     };
 
     let header_bytes = postcard::to_allocvec(&header)
@@ -335,6 +338,7 @@ mod tests {
             num_kv_heads: 8,
             head_dim: 128,
             quant_bits: 3,
+            proofs: vec![],
         };
         let bytes = postcard::to_allocvec(&header).unwrap();
         let restored: PrefillCacheHeader = postcard::from_bytes(&bytes).unwrap();
