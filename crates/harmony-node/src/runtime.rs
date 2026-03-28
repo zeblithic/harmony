@@ -2673,10 +2673,11 @@ impl<B: BookStore> NodeRuntime<B> {
                     match engine.load_gguf(gguf_data) {
                         Ok(()) => match engine.load_tokenizer(tok_data) {
                             Ok(()) => {
-                                // Re-init Engram module on the engine's device if
-                                // it was created on a different device (manifest may
-                                // arrive before the engine, defaulting to CPU).
-                                if self.engram_module.is_some() && self.engram_client.is_some() {
+                                // (Re-)init Engram module on the engine's device.
+                                // Covers: (a) module was created on CPU before engine
+                                // arrived, (b) module creation failed during manifest
+                                // parse and needs retry now that engine is available.
+                                if self.engram_client.is_some() {
                                     let engram_dim =
                                         self.engram_client.as_ref().unwrap().config().embedding_dim;
                                     let hidden_dim = 1536; // TODO: from model metadata

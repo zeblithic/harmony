@@ -1205,10 +1205,10 @@ pub async fn run(
                                         task_id: task_id.clone(),
                                         status: harmony_agent::TaskStatus::Rejected,
                                         output: None,
-                                        error: Some("inference engine not loaded".into()),
+                                        error: Some("inference engine busy or not loaded".into()),
                                     };
                                     let error_payload = harmony_agent::encode_result(&result)
-                                        .unwrap_or_else(|_| b"engine not loaded".to_vec());
+                                        .unwrap_or_else(|_| b"engine busy or not loaded".to_vec());
                                     dispatch_action(
                                         RuntimeAction::SendReply {
                                             query_id,
@@ -1282,9 +1282,9 @@ pub async fn run(
                             let panic_query_id = query_id;
                             let panic_task_id = task_id.clone();
 
-                            tokio::spawn(async move {
+                            let outer_handle = tokio::spawn(async move {
                                 // Fetch all required shards in parallel via Zenoh.
-                                // Fetch all shards in parallel. try_join_all short-circuits
+                                // try_join_all short-circuits
                                 // on the first failure, avoiding a 30s wait per slow shard
                                 // while the engine is held.
                                 let fetch_futures: Vec<_> = request
@@ -1351,6 +1351,27 @@ pub async fn run(
                                         .send(InferenceResult::Panicked {
                                             query_id: panic_query_id,
                                             task_id: panic_task_id,
+                                        })
+                                        .await;
+                                }
+                            });
+                            // Monitor the outer async task for panics during shard
+                            // fetching (before spawn_blocking). If the async portion
+                            // panics, the engine is dropped — send Panicked signal
+                            // so inference_running is cleared.
+                            let outer_panic_tx = inference_tx.clone();
+                            let outer_panic_qid = query_id;
+                            let outer_panic_tid = task_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = outer_handle.await {
+                                    tracing::error!(
+                                        err = %e,
+                                        "engram async task panicked — engine lost"
+                                    );
+                                    let _ = outer_panic_tx
+                                        .send(InferenceResult::Panicked {
+                                            query_id: outer_panic_qid,
+                                            task_id: outer_panic_tid,
                                         })
                                         .await;
                                 }
