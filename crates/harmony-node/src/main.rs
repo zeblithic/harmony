@@ -97,7 +97,7 @@ enum Commands {
         /// Path to file (reads stdin if omitted)
         #[arg(long, value_name = "PATH")]
         file: Option<std::path::PathBuf>,
-        /// Show CID metadata (type, size, chunk count) on stderr
+        /// Print CID metadata (type, size, chunks) to stderr
         #[arg(long)]
         verbose: bool,
     },
@@ -718,7 +718,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
         }
         Commands::Cid { file, verbose } => {
             use harmony_content::book::MemoryBookStore;
-            use harmony_content::chunker::ChunkerConfig;
+            use harmony_content::chunker::{chunk_all, ChunkerConfig};
             use harmony_content::cid::{CidType, ContentFlags, ContentId, MAX_PAYLOAD_SIZE};
             use harmony_content::dag;
 
@@ -744,8 +744,10 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     .map_err(|e| format!("CID computation failed: {e}"))?
             } else {
                 // Large files: full DAG ingest (FastCDC chunking → Merkle DAG).
-                // Produces a retrievable root CID that can be walked to
-                // reassemble the original data from CAS.
+                // The MemoryBookStore is ephemeral — chunks are not persisted
+                // to a CAS. The CID is deterministic and can be used as a
+                // content fingerprint; reassembly requires a separate ingest
+                // into a persistent store.
                 let mut store = MemoryBookStore::new();
                 dag::ingest(&data, &ChunkerConfig::DEFAULT, &mut store)
                     .map_err(|e| format!("DAG ingest failed: {e}"))?
@@ -757,19 +759,24 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 let input_size = data.len();
                 match cid.cid_type() {
                     CidType::Book => {
-                        eprintln!("Type:  Book (single chunk)");
-                        eprintln!("Size:  {} bytes", input_size);
+                        eprintln!("Type:   Book (single chunk)");
+                        eprintln!("Size:   {} bytes", input_size);
+                        eprintln!("Chunks: 1");
                     }
                     CidType::Bundle(depth) => {
-                        eprintln!("Type:  Bundle (Merkle DAG, depth {})", depth);
-                        eprintln!("Size:  {} bytes ({:.1} MB)", input_size, input_size as f64 / (1024.0 * 1024.0));
+                        let chunks = chunk_all(&data, &ChunkerConfig::DEFAULT)
+                            .map(|r| r.len())
+                            .unwrap_or(0);
+                        eprintln!("Type:   Bundle (Merkle DAG, depth {})", depth);
+                        eprintln!("Size:   {} bytes ({:.1} MB)", input_size, input_size as f64 / (1024.0 * 1024.0));
+                        eprintln!("Chunks: {}", chunks);
                     }
                     other => {
-                        eprintln!("Type:  {:?}", other);
-                        eprintln!("Size:  {} bytes", input_size);
+                        eprintln!("Type:   {:?}", other);
+                        eprintln!("Size:   {} bytes", input_size);
                     }
                 }
-                eprintln!("Flags: {:?}", cid.flags());
+                eprintln!("Flags:  {:?}", cid.flags());
             }
 
             Ok(())
