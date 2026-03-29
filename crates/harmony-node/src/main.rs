@@ -97,6 +97,9 @@ enum Commands {
         /// Path to file (reads stdin if omitted)
         #[arg(long, value_name = "PATH")]
         file: Option<std::path::PathBuf>,
+        /// Show CID metadata (type, size, chunk count) on stderr
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -713,8 +716,11 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
         }
-        Commands::Cid { file } => {
-            use harmony_content::cid::{ContentFlags, ContentId, MAX_PAYLOAD_SIZE};
+        Commands::Cid { file, verbose } => {
+            use harmony_content::book::MemoryBookStore;
+            use harmony_content::chunker::ChunkerConfig;
+            use harmony_content::cid::{CidType, ContentFlags, ContentId, MAX_PAYLOAD_SIZE};
+            use harmony_content::dag;
 
             let data = match file {
                 Some(path) => std::fs::read(&path)
@@ -737,18 +743,35 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 ContentId::for_book(&data, ContentFlags::default())
                     .map_err(|e| format!("CID computation failed: {e}"))?
             } else {
-                // For large files (> MAX_PAYLOAD_SIZE), hash first then wrap
-                // in a Book CID. This produces a CID-of-the-hash, not a
-                // CID-of-the-file: payload_size will be 32 and verify_hash()
-                // won't round-trip against the original data. This is
-                // intentional — the CID is used as an opaque fingerprint for
-                // memo attestations, not for content retrieval.
-                let digest = harmony_crypto::hash::full_hash(&data);
-                ContentId::for_book(&digest, ContentFlags::default())
-                    .map_err(|e| format!("CID computation failed: {e}"))?
+                // Large files: full DAG ingest (FastCDC chunking → Merkle DAG).
+                // Produces a retrievable root CID that can be walked to
+                // reassemble the original data from CAS.
+                let mut store = MemoryBookStore::new();
+                dag::ingest(&data, &ChunkerConfig::DEFAULT, &mut store)
+                    .map_err(|e| format!("DAG ingest failed: {e}"))?
             };
 
             println!("{}", hex::encode(cid.to_bytes()));
+
+            if verbose {
+                let input_size = data.len();
+                match cid.cid_type() {
+                    CidType::Book => {
+                        eprintln!("Type:  Book (single chunk)");
+                        eprintln!("Size:  {} bytes", input_size);
+                    }
+                    CidType::Bundle(depth) => {
+                        eprintln!("Type:  Bundle (Merkle DAG, depth {})", depth);
+                        eprintln!("Size:  {} bytes ({:.1} MB)", input_size, input_size as f64 / (1024.0 * 1024.0));
+                    }
+                    other => {
+                        eprintln!("Type:  {:?}", other);
+                        eprintln!("Size:  {} bytes", input_size);
+                    }
+                }
+                eprintln!("Flags: {:?}", cid.flags());
+            }
+
             Ok(())
         }
     }
