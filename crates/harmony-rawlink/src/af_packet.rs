@@ -324,7 +324,7 @@ impl AfPacketSocket {
 
     /// Sets the packet version to `TPACKET_V3` via `setsockopt(SOL_PACKET, PACKET_VERSION)`.
     fn set_packet_version(fd: i32) -> Result<(), RawLinkError> {
-        let version: libc::c_int = libc::TPACKET_V3 as libc::c_int;
+        let version: libc::c_int = libc::tpacket_versions::TPACKET_V3 as libc::c_int;
 
         // SAFETY: setsockopt with a valid integer option value. The kernel validates
         // the option level and name, returning -1 on error.
