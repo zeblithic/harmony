@@ -582,15 +582,18 @@ pub async fn run(
         }
         tracing::info!("Loaded {} memos from disk ({} bytes)", store.len(), memo_disk_bytes);
 
-        // Load LFU counts if available.
+        // Load LFU counts if available (via spawn_blocking to stay off async runtime).
         let lfu_path = dir.join("memo_lfu.bin");
-        if lfu_path.exists() {
-            match std::fs::read(&lfu_path) {
-                Ok(bytes) => match store.load_lfu_counts(&bytes) {
-                    Ok(n) => tracing::info!("Loaded {} LFU counters from disk", n),
-                    Err(e) => tracing::warn!("Failed to parse memo_lfu.bin: {} — starting fresh", e),
-                },
-                Err(e) => tracing::warn!("Failed to read memo_lfu.bin: {} — starting fresh", e),
+        let lfu_bytes = {
+            let p = lfu_path.clone();
+            tokio::task::spawn_blocking(move || std::fs::read(&p).ok())
+                .await
+                .unwrap_or(None)
+        };
+        if let Some(bytes) = lfu_bytes {
+            match store.load_lfu_counts(&bytes) {
+                Ok(n) => tracing::info!("Loaded {} LFU counters from disk", n),
+                Err(e) => tracing::warn!("Failed to parse memo_lfu.bin: {} — starting fresh", e),
             }
         }
     }
@@ -653,6 +656,8 @@ pub async fn run(
     // ServiceRemoved when a service's DNS TTL expires without refresh.
     let mut ticks_since_peer_refresh: u64 = 0;
     const PEER_REFRESH_INTERVAL_TICKS: u64 = 80; // ~20 seconds
+    let mut memo_lfu_flush_ticks: u64 = 0;
+    const MEMO_LFU_FLUSH_INTERVAL: u64 = 1200; // 1200 × 250ms = 5 minutes
 
     // ── Select loop ──────────────────────────────────────────────────────────
     //
@@ -712,32 +717,28 @@ pub async fn run(
                 }
 
                 // ── Flush memo LFU counters periodically (~5 min) ──────────
-                {
-                    static MEMO_FLUSH_COUNTER: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    let tick = MEMO_FLUSH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // Timer is 250ms; 1200 ticks × 250ms = 5 minutes.
-                    if tick % 1200 == 0 && tick > 0 {
-                        if let Some(ref dir) = data_dir {
-                            match runtime.memo_store_mut().serialize_lfu_counts() {
-                                Ok(bytes) => {
-                                    let path = dir.join("memo_lfu.bin");
-                                    tokio::task::spawn_blocking(move || {
-                                        let tmp = path.with_extension("tmp");
-                                        let result = (|| -> std::io::Result<()> {
-                                            let mut f = std::fs::File::create(&tmp)?;
-                                            std::io::Write::write_all(&mut f, &bytes)?;
-                                            f.sync_all()?;
-                                            std::fs::rename(&tmp, &path)?;
-                                            Ok(())
-                                        })();
-                                        if let Err(e) = result {
-                                            tracing::warn!("Failed to flush memo_lfu.bin: {}", e);
-                                        }
-                                    });
-                                }
-                                Err(e) => tracing::warn!("Failed to serialize LFU counts: {}", e),
+                memo_lfu_flush_ticks += 1;
+                if memo_lfu_flush_ticks >= MEMO_LFU_FLUSH_INTERVAL {
+                    memo_lfu_flush_ticks = 0;
+                    if let Some(ref dir) = data_dir {
+                        match runtime.memo_store_mut().serialize_lfu_counts() {
+                            Ok(bytes) => {
+                                let path = dir.join("memo_lfu.bin");
+                                tokio::task::spawn_blocking(move || {
+                                    let tmp = path.with_extension("tmp");
+                                    let result = (|| -> std::io::Result<()> {
+                                        let mut f = std::fs::File::create(&tmp)?;
+                                        std::io::Write::write_all(&mut f, &bytes)?;
+                                        f.sync_all()?;
+                                        std::fs::rename(&tmp, &path)?;
+                                        Ok(())
+                                    })();
+                                    if let Err(e) = result {
+                                        tracing::warn!("Failed to flush memo_lfu.bin: {}", e);
+                                    }
+                                });
                             }
+                            Err(e) => tracing::warn!("Failed to serialize LFU counts: {}", e),
                         }
                     }
                 }
