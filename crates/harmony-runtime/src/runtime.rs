@@ -1938,6 +1938,12 @@ impl<B: BookStore> NodeRuntime<B> {
             .any(|(_, c)| c.replication.is_some() && c.peering.enabled);
 
         if !has_replication_peers {
+            // Guard clause: skip scan when no peers have replication enabled.
+            // Clippy flags this as unneeded because the body below is a TODO,
+            // but the early return is intentional — it must stay when the TODO
+            // is implemented.
+            #[allow(clippy::needless_return)]
+            return;
         }
 
         // TODO: When BookStore gains an iter() method, iterate local
