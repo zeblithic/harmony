@@ -47,7 +47,7 @@ impl MemoStore {
         let input = memo.input;
         let output = memo.output;
         let signer_hash = memo.credential.issuer.hash;
-        let entry = self.by_input.entry(input).or_insert_with(Vec::new);
+        let entry = self.by_input.entry(input).or_default();
 
         // Dedup: skip if we already have a memo with the same output + issuer hash.
         let already_present = entry.iter().any(|existing| {

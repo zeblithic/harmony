@@ -821,7 +821,7 @@ impl Node {
         // Safety net: send unweighted on any interface missing from the cooperation
         // table. Should not happen in practice (register_interface adds to both maps).
         for name in self.interfaces.keys() {
-            let excluded = exclude.map_or(false, |e| &**name == e);
+            let excluded = exclude.is_some_and(|e| &**name == e);
             if !excluded && !weights.iter().any(|(n, _)| n == name) {
                 debug_assert!(
                     false,

@@ -513,7 +513,7 @@ pub fn encode_bundle_size(size_bytes: u64) -> u32 {
             ((mantissa + 1) << 8) | exponent
         } else if exponent < 255 {
             // Mantissa maxed out — roll to next exponent with mantissa 0
-            (0u32 << 8) | (exponent + 1)
+            exponent + 1
         } else {
             // Both maxed — return maximum representable value
             (4095u32 << 8) | 255

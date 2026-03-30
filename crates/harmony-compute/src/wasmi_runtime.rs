@@ -874,7 +874,7 @@ impl ComputeRuntime for WasmiRuntime {
             _ => None,
         };
 
-        let return_val: i32 = if let Some((load_gguf_cid, load_tok_cid)) = model_load_cids {
+        let return_val: i32 = if let Some((_load_gguf_cid, _load_tok_cid)) = model_load_cids {
             #[cfg(feature = "inference")]
             {
                 match response {

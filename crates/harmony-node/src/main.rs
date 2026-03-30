@@ -163,10 +163,12 @@ enum MemoAction {
     },
 }
 
-// NodeRuntime is !Send — all tasks run on a single thread. Making the
-// flavor explicit prevents silent behavior change if rt-multi-thread
-// is ever added to the tokio feature set.
-#[tokio::main(flavor = "current_thread")]
+// Zenoh requires a multi-thread Tokio runtime. We use worker_threads = 1
+// to give Zenoh a multi-thread scheduler while keeping only one OS thread
+// for worker tasks. NodeRuntime's !Send types are safe here because they
+// live exclusively in the block_on future (main thread), never in a
+// tokio::spawn task — the compiler enforces this via Send bounds on spawn.
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() {
     // Initialize structured logging. Output goes to stderr (procd captures
     // it for syslog on OpenWRT). Filter via RUST_LOG env var, default info.
@@ -613,7 +615,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 inference_gguf_cid: config_file
                     .inference_model_gguf_cid
                     .as_deref()
-                    .map(|s| {
+                    .and_then(|s| {
                         hex::decode(s)
                             .ok()
                             .and_then(|v| <[u8; 32]>::try_from(v).ok())
@@ -621,12 +623,11 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                                 tracing::warn!("inference_model_gguf_cid is not a valid 32-byte hex string; inference disabled");
                                 None
                             })
-                    })
-                    .flatten(),
+                    }),
                 inference_tokenizer_cid: config_file
                     .inference_model_tokenizer_cid
                     .as_deref()
-                    .map(|s| {
+                    .and_then(|s| {
                         hex::decode(s)
                             .ok()
                             .and_then(|v| <[u8; 32]>::try_from(v).ok())
@@ -634,8 +635,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                                 tracing::warn!("inference_model_tokenizer_cid is not a valid 32-byte hex string; inference disabled");
                                 None
                             })
-                    })
-                    .flatten(),
+                    }),
                 engram_manifest_cid: config_file
                     .engram_manifest_cid
                     .as_deref()
@@ -1271,7 +1271,7 @@ mod tests {
     #[test]
     fn cli_parses_cid_with_file() {
         let cli = Cli::try_parse_from(["harmony", "cid", "--file", "/tmp/test.bin"]).unwrap();
-        if let Commands::Cid { file, verbose: _ } = cli.command {
+        if let Commands::Cid { file, .. } = cli.command {
             assert_eq!(file, Some(std::path::PathBuf::from("/tmp/test.bin")));
         } else {
             panic!("expected Cid command");
@@ -1281,7 +1281,7 @@ mod tests {
     #[test]
     fn cli_parses_cid_stdin_mode() {
         let cli = Cli::try_parse_from(["harmony", "cid"]).unwrap();
-        if let Commands::Cid { file, verbose: _ } = cli.command {
+        if let Commands::Cid { file, .. } = cli.command {
             assert!(file.is_none());
         } else {
             panic!("expected Cid command");

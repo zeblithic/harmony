@@ -257,7 +257,7 @@ impl Eq for DeferredDial {}
 /// - `archivist_config`: optional S3 archivist configuration (requires the `archivist` feature).
 /// - `data_dir`: optional directory for persistent CAS book storage. When set, durable books
 ///   are written to disk via `spawn_blocking` and reloaded on restart.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -647,6 +647,13 @@ pub async fn run(
     };
     tokio::pin!(shutdown);
 
+    // ── Peer keepalive counter ──────────────────────────────────────────────
+    // Refresh mDNS peer timestamps every ~20s (80 ticks × 250ms) to prevent
+    // false stale eviction. The mDNS daemon handles actual peer removal via
+    // ServiceRemoved when a service's DNS TTL expires without refresh.
+    let mut ticks_since_peer_refresh: u64 = 0;
+    const PEER_REFRESH_INTERVAL_TICKS: u64 = 80; // ~20 seconds
+
     // ── Select loop ──────────────────────────────────────────────────────────
     //
     // Events from UDP and Zenoh are buffered via push_event(). tick() is
@@ -690,6 +697,16 @@ pub async fn run(
                     .unwrap_or(0);
                 runtime.push_event(RuntimeEvent::TimerTick { now: now_ms(), unix_now });
                 should_tick = true;
+
+                // Periodically refresh mDNS peer timestamps to prevent false
+                // stale eviction. Actual peer removal is handled by mDNS
+                // ServiceRemoved events (DNS TTL expiry / goodbye packets).
+                ticks_since_peer_refresh += 1;
+                if mdns_state.is_some() && ticks_since_peer_refresh >= PEER_REFRESH_INTERVAL_TICKS {
+                    ticks_since_peer_refresh = 0;
+                    peer_table.refresh_mdns_peers();
+                }
+
                 for addr in peer_table.evict_stale() {
                     tracing::info!(peer = %addr, "evicted stale mDNS peer");
                 }
@@ -790,7 +807,7 @@ pub async fn run(
             // Arm 4c: Inference streaming completion — publish chunks and handle results.
             // Uses the async-block-with-pending pattern (like rawlink Arm 9) so the
             // arm compiles even when the `inference` feature is disabled.
-            Some(inference_result) = async {
+            Some(_inference_result) = async {
                 #[cfg(feature = "inference")]
                 { inference_rx.recv().await }
                 #[cfg(not(feature = "inference"))]
@@ -1667,7 +1684,7 @@ pub async fn run(
 }
 
 /// Dispatch a single `RuntimeAction` to the appropriate I/O mechanism.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 async fn dispatch_action(
     action: RuntimeAction,
     session: &zenoh::Session,
@@ -1966,7 +1983,7 @@ async fn dispatch_action(
                 let err_msg = match result {
                     Ok(Ok(())) => return, // Success — response already sent above
                     Ok(Err(e)) => e,
-                    Err(_) => format!("verify query timed out after 30s"),
+                    Err(_) => "verify query timed out after 30s".to_string(),
                 };
                 tracing::warn!(%key_expr, err = %err_msg, "DSD verify query failed");
                 let err_payload = harmony_speculative::VerifyResponse::serialize_error(&err_msg);
