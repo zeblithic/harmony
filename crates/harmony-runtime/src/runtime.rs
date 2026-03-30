@@ -2017,6 +2017,10 @@ impl<B: BookStore> NodeRuntime<B> {
                     // Use identity.address_hash (the raw identity hash), NOT
                     // destination_hash (which is SHA256(name_hash || address_hash)[:16]).
                     let identity_hash = validated_announce.identity.address_hash;
+                    tracing::info!(
+                        peer = %hex::encode(&identity_hash[..4]),
+                        "Reticulum announce received from peer"
+                    );
                     let peer_actions = self.peer_manager.on_event(
                         PeerEvent::AnnounceReceived { identity_hash },
                         &self.contact_store,
@@ -2029,6 +2033,7 @@ impl<B: BookStore> NodeRuntime<B> {
                         &mut rand_core::OsRng,
                         self.last_now,
                     );
+                    let mut sent = 0u32;
                     for aa in announce_actions {
                         match aa {
                             NodeAction::SendOnInterface {
@@ -2036,6 +2041,7 @@ impl<B: BookStore> NodeRuntime<B> {
                                 raw,
                                 weight,
                             } => {
+                                sent += 1;
                                 out.push(RuntimeAction::SendOnInterface {
                                     interface_name,
                                     raw,
@@ -2047,6 +2053,13 @@ impl<B: BookStore> NodeRuntime<B> {
                             }
                             _ => {}
                         }
+                    }
+                    if sent > 0 {
+                        tracing::info!(
+                            interfaces = sent,
+                            dest = %hex::encode(&dest_hash[..4]),
+                            "Reticulum path announce sent"
+                        );
                     }
                 }
                 // Other router actions are diagnostics — drop for now.
