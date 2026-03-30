@@ -537,7 +537,9 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 drop(pq); // zeroize-on-drop
                 None
             };
-            // Ed25519 key material is no longer needed; zeroize-on-drop fires now.
+            // Extract Ed25519 private bytes for Reticulum announcing destination,
+            // then drop the key (zeroize-on-drop fires).
+            let reticulum_identity_bytes = Some(ed25519.to_private_bytes());
             drop(ed25519);
 
             let content_policy = ContentPolicy {
@@ -610,6 +612,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 local_identity_hash: our_addr_bytes,
                 local_pq_identity_hash,
                 local_dsa_pubkey,
+                reticulum_identity_bytes,
                 inference_gguf_cid: config_file
                     .inference_model_gguf_cid
                     .as_deref()
