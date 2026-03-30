@@ -162,8 +162,10 @@ enum MemoAction {
 }
 
 // Zenoh requires a multi-thread Tokio runtime. We use worker_threads = 1
-// to keep the single-worker behavior that NodeRuntime's !Send types need —
-// with only one worker thread, tasks won't actually move between threads.
+// to give Zenoh a multi-thread scheduler while keeping only one OS thread
+// for worker tasks. NodeRuntime's !Send types are safe here because they
+// live exclusively in the block_on future (main thread), never in a
+// tokio::spawn task — the compiler enforces this via Send bounds on spawn.
 #[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() {
     // Initialize structured logging. Output goes to stderr (procd captures

@@ -611,4 +611,50 @@ mod tests {
         let fullname = "aabb._harmony._udp.local.";
         assert!(parse_instance_addr(fullname).is_none());
     }
+
+    // ── refresh_mdns_peers tests ─────────────────────────────────────────
+
+    #[test]
+    fn refresh_mdns_peers_updates_non_pinned_only() {
+        let mut t = table_with_timeout(60);
+        let sa_dyn = make_addr(7000);
+        let sa_pin = make_addr(7001);
+        t.add_peer(sa_dyn, make_reticulum_addr(20), 1);
+        t.add_pinned_peer(sa_pin);
+
+        let before_dyn = t.peers.get(&sa_dyn).unwrap().last_seen;
+        let before_pin = t.peers.get(&sa_pin).unwrap().last_seen;
+
+        // Spin to ensure Instant advances
+        let start = Instant::now();
+        while Instant::now().duration_since(start) < Duration::from_nanos(1) {}
+
+        t.refresh_mdns_peers();
+
+        assert!(
+            t.peers.get(&sa_dyn).unwrap().last_seen >= before_dyn,
+            "non-pinned peer last_seen must be refreshed"
+        );
+        assert_eq!(
+            t.peers.get(&sa_pin).unwrap().last_seen, before_pin,
+            "pinned peer last_seen must not change"
+        );
+    }
+
+    #[test]
+    fn refresh_mdns_peers_prevents_stale_eviction() {
+        let mut t = PeerTable::new([0u8; 16], Duration::ZERO);
+        let sa = make_addr(7002);
+        t.add_peer(sa, make_reticulum_addr(21), 1);
+
+        // Spin past zero timeout
+        let start = Instant::now();
+        while Instant::now().duration_since(start) < Duration::from_nanos(1) {}
+
+        // Without refresh, peer would be evicted
+        t.refresh_mdns_peers();
+        let evicted = t.evict_stale();
+        assert!(evicted.is_empty(), "refreshed peer must not be evicted");
+        assert_eq!(t.peer_count(), 1);
+    }
 }
