@@ -4,8 +4,8 @@
 //!
 //! File layout: `{data_dir}/memo/{input_hex[8..10]}/{input_hex}_{output_hex}_{signer_hex}`
 //!
-//! The fan-out prefix `input_hex[8..10]` corresponds to byte 4 of the input CID
-//! (the first hash byte), giving 256 possible subdirectories.
+//! The fan-out prefix `input_hex[8..10]` = byte 4 of the raw input CID bytes,
+//! giving 256 possible subdirectories.
 
 use harmony_memo::Memo;
 use std::{

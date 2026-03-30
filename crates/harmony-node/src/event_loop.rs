@@ -559,9 +559,7 @@ pub async fn run(
         }
     }
 
-    // ── Load persisted memos ───────────────────────────────────────────
-    #[allow(unused_mut, unused_variables)]
-    let mut memo_store = harmony_memo::store::MemoStore::new();
+    // ── Load persisted memos into NodeRuntime's store ───────────────────
     #[allow(unused_variables)]
     let mut memo_disk_bytes: u64 = 0;
 
@@ -576,18 +574,19 @@ pub async fn run(
             Vec::new()
         });
 
+        let store = runtime.memo_store_mut();
         for (memo, size) in memo_entries {
-            if memo_store.insert(memo) {
+            if store.insert(memo) {
                 memo_disk_bytes += size;
             }
         }
-        tracing::info!("Loaded {} memos from disk ({} bytes)", memo_store.len(), memo_disk_bytes);
+        tracing::info!("Loaded {} memos from disk ({} bytes)", store.len(), memo_disk_bytes);
 
         // Load LFU counts if available.
         let lfu_path = dir.join("memo_lfu.bin");
         if lfu_path.exists() {
             match std::fs::read(&lfu_path) {
-                Ok(bytes) => match memo_store.load_lfu_counts(&bytes) {
+                Ok(bytes) => match store.load_lfu_counts(&bytes) {
                     Ok(n) => tracing::info!("Loaded {} LFU counters from disk", n),
                     Err(e) => tracing::warn!("Failed to parse memo_lfu.bin: {} — starting fresh", e),
                 },
@@ -704,11 +703,14 @@ pub async fn run(
                     // 30 ticks at 10s each = 5 min. Adjust if tick interval differs.
                     if tick % 30 == 0 && tick > 0 {
                         if let Some(ref dir) = data_dir {
-                            match memo_store.serialize_lfu_counts() {
+                            match runtime.memo_store_mut().serialize_lfu_counts() {
                                 Ok(bytes) => {
                                     let path = dir.join("memo_lfu.bin");
                                     tokio::task::spawn_blocking(move || {
-                                        if let Err(e) = std::fs::write(&path, &bytes) {
+                                        let tmp = path.with_extension("tmp");
+                                        if let Err(e) = std::fs::write(&tmp, &bytes)
+                                            .and_then(|_| std::fs::rename(&tmp, &path))
+                                        {
                                             tracing::warn!("Failed to flush memo_lfu.bin: {}", e);
                                         }
                                     });
