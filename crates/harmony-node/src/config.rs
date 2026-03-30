@@ -90,6 +90,7 @@ pub struct ConfigFile {
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Fields read by serde deserialization, not direct access
 pub struct ArchivistConfig {
     pub bucket: String,
     pub prefix: String,

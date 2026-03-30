@@ -20,6 +20,7 @@ pub struct PageIndexEntry {
 }
 
 /// In-memory index keyed by mode-00 (Sha256Msb) page addresses.
+#[derive(Default)]
 pub struct PageIndex {
     by_addr00: HashMap<PageAddr, Vec<PageIndexEntry>>,
     total: usize,
@@ -28,10 +29,7 @@ pub struct PageIndex {
 impl PageIndex {
     /// Create an empty index.
     pub fn new() -> Self {
-        PageIndex {
-            by_addr00: HashMap::new(),
-            total: 0,
-        }
+        Self::default()
     }
 
     /// Index all data pages from a book.

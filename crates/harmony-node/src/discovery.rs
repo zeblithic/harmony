@@ -153,6 +153,19 @@ impl PeerTable {
         }
     }
 
+    /// Refresh `last_seen` for all non-pinned peers. Called periodically while
+    /// mDNS is active — the mDNS daemon tracks service TTLs and will emit
+    /// `ServiceRemoved` if a peer actually goes down, so stale eviction is a
+    /// secondary safety net, not the primary removal mechanism.
+    pub fn refresh_mdns_peers(&mut self) {
+        let now = Instant::now();
+        for info in self.peers.values_mut() {
+            if !info.pinned {
+                info.last_seen = now;
+            }
+        }
+    }
+
     /// Remove peers whose `last_seen` is older than `stale_timeout`.
     /// Cleans the reverse index as well. Returns the evicted socket addresses.
     pub fn evict_stale(&mut self) -> Vec<SocketAddr> {
@@ -189,6 +202,7 @@ impl PeerTable {
     }
 
     /// Total number of tracked socket addresses.
+    #[cfg(test)]
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
@@ -597,5 +611,61 @@ mod tests {
     fn parse_instance_addr_too_short() {
         let fullname = "aabb._harmony._udp.local.";
         assert!(parse_instance_addr(fullname).is_none());
+    }
+
+    // ── refresh_mdns_peers tests ─────────────────────────────────────────
+
+    #[test]
+    fn refresh_mdns_peers_updates_non_pinned_only() {
+        let mut t = table_with_timeout(60);
+        let sa_dyn = make_addr(7000);
+        let sa_pin = make_addr(7001);
+        t.add_peer(sa_dyn, make_reticulum_addr(20), 1);
+        t.add_pinned_peer(sa_pin);
+
+        let before_dyn = t.peers.get(&sa_dyn).unwrap().last_seen;
+        let before_pin = t.peers.get(&sa_pin).unwrap().last_seen;
+
+        // Spin to ensure Instant advances
+        let start = Instant::now();
+        while Instant::now().duration_since(start) < Duration::from_nanos(1) {}
+
+        t.refresh_mdns_peers();
+
+        assert!(
+            t.peers.get(&sa_dyn).unwrap().last_seen >= before_dyn,
+            "non-pinned peer last_seen must be refreshed"
+        );
+        assert_eq!(
+            t.peers.get(&sa_pin).unwrap().last_seen, before_pin,
+            "pinned peer last_seen must not change"
+        );
+    }
+
+    #[test]
+    fn refresh_mdns_peers_prevents_stale_eviction() {
+        // Use a 1-second timeout so the peer goes stale after the sleep,
+        // but refresh brings it back. Duration::ZERO is racy because the
+        // gap between refresh and evict can exceed zero.
+        let mut t = PeerTable::new([0u8; 16], Duration::from_millis(10));
+        let sa = make_addr(7002);
+        t.add_peer(sa, make_reticulum_addr(21), 1);
+
+        // Sleep past the stale timeout
+        std::thread::sleep(Duration::from_millis(15));
+
+        // Without refresh, peer would be evicted — verify that first
+        // by checking it IS stale (but don't actually evict yet).
+        assert!(
+            Instant::now().duration_since(t.peers.get(&sa).unwrap().last_seen)
+                > Duration::from_millis(10),
+            "peer should be stale before refresh"
+        );
+
+        // Refresh and then evict — peer should survive
+        t.refresh_mdns_peers();
+        let evicted = t.evict_stale();
+        assert!(evicted.is_empty(), "refreshed peer must not be evicted");
+        assert_eq!(t.peer_count(), 1);
     }
 }

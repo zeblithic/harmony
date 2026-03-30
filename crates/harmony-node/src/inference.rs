@@ -1,9 +1,12 @@
 //! Inference queryable types and payload parsing.
 
+pub use harmony_runtime::inference_types::{InferenceRequest, DEFAULT_MAX_INFERENCE_TOKENS};
+#[cfg(feature = "inference")]
+pub use harmony_runtime::inference_types::InferenceInput;
+#[cfg(test)]
 pub use harmony_runtime::inference_types::{
-    build_capacity_payload, InferenceInput, InferenceRequest, TokenInferenceRequest, CAPACITY_BUSY,
-    CAPACITY_READY, DEFAULT_MAX_INFERENCE_TOKENS, INFERENCE_TAG, MAX_INPUT_TOKENS,
-    TOKEN_INFERENCE_TAG,
+    build_capacity_payload, TokenInferenceRequest, CAPACITY_BUSY, CAPACITY_READY, INFERENCE_TAG,
+    MAX_INPUT_TOKENS, TOKEN_INFERENCE_TAG,
 };
 
 /// Built-in inference runner WASM module (compiled from WAT by build.rs).
