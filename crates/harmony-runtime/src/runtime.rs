@@ -1154,8 +1154,9 @@ impl<B: BookStore> NodeRuntime<B> {
 
     /// Handle a memo fetch request: check local store, dedup, issue Zenoh query.
     fn handle_memo_fetch_request(&mut self, input: ContentId) {
-        // 1. Local check — short-circuit if we already have memos
-        if !self.memo_store.get_by_input(&input).is_empty() {
+        // 1. Local check — short-circuit if we already have memos.
+        // Use peek (no LFU increment) since this is a dedup check, not a real access.
+        if !self.memo_store.peek_by_input(&input).is_empty() {
             return;
         }
 
@@ -3634,7 +3635,9 @@ impl<B: BookStore> NodeRuntime<B> {
         arr.copy_from_slice(&cid_bytes);
         let input_cid = ContentId::from_bytes(arr);
 
-        let memos = self.memo_store.get_by_input(&input_cid);
+        // Use peek (no LFU increment) — serving remote queries isn't local usage
+        // and shouldn't influence local eviction decisions.
+        let memos = self.memo_store.peek_by_input(&input_cid);
         if memos.is_empty() {
             return Vec::new();
         }
@@ -6510,7 +6513,7 @@ mod tests {
         rt.tick();
 
         // Memo should now be in the store
-        let stored = rt.memo_store().get_by_input(&input);
+        let stored = rt.memo_store_mut().get_by_input(&input);
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].output, output);
     }
@@ -6537,7 +6540,7 @@ mod tests {
         rt.tick();
 
         // No memo should be stored
-        assert!(rt.memo_store().get_by_input(&input).is_empty());
+        assert!(rt.memo_store_mut().get_by_input(&input).is_empty());
     }
 
     #[test]
@@ -6557,7 +6560,7 @@ mod tests {
         });
         rt.tick();
 
-        assert!(rt.memo_store().get_by_input(&input).is_empty());
+        assert!(rt.memo_store_mut().get_by_input(&input).is_empty());
     }
 
     #[test]
@@ -6625,7 +6628,7 @@ mod tests {
         rt.tick();
 
         // Both memos should be in the store
-        let stored = rt.memo_store().get_by_input(&input);
+        let stored = rt.memo_store_mut().get_by_input(&input);
         assert_eq!(
             stored.len(),
             2,

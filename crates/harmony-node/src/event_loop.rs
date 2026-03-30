@@ -559,6 +559,45 @@ pub async fn run(
         }
     }
 
+    // ── Load persisted memos into NodeRuntime's store ───────────────────
+    #[allow(unused_variables)]
+    let mut memo_disk_bytes: u64 = 0;
+
+    if let Some(ref dir) = data_dir {
+        let dir_clone = dir.clone();
+        let memo_entries = tokio::task::spawn_blocking(move || {
+            crate::memo_io::scan_memos(&dir_clone)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("memo scan task panicked: {}", e);
+            Vec::new()
+        });
+
+        let store = runtime.memo_store_mut();
+        for (memo, size) in memo_entries {
+            if store.insert(memo) {
+                memo_disk_bytes += size;
+            }
+        }
+        tracing::info!("Loaded {} memos from disk ({} bytes)", store.len(), memo_disk_bytes);
+
+        // Load LFU counts if available (via spawn_blocking to stay off async runtime).
+        let lfu_path = dir.join("memo_lfu.bin");
+        let lfu_bytes = {
+            let p = lfu_path.clone();
+            tokio::task::spawn_blocking(move || std::fs::read(&p).ok())
+                .await
+                .unwrap_or(None)
+        };
+        if let Some(bytes) = lfu_bytes {
+            match store.load_lfu_counts(&bytes) {
+                Ok(n) => tracing::info!("Loaded {} LFU counters from disk", n),
+                Err(e) => tracing::warn!("Failed to parse memo_lfu.bin: {} — starting fresh", e),
+            }
+        }
+    }
+
     // ── Monotonic epoch ─────────────────────────────────────────────────────
     // Shared with tunnel_task::millis_since_start() via OnceLock — same epoch.
     let now_ms = crate::tunnel_task::millis_since_start;
@@ -617,6 +656,8 @@ pub async fn run(
     // ServiceRemoved when a service's DNS TTL expires without refresh.
     let mut ticks_since_peer_refresh: u64 = 0;
     const PEER_REFRESH_INTERVAL_TICKS: u64 = 80; // ~20 seconds
+    let mut memo_lfu_flush_ticks: u64 = 0;
+    const MEMO_LFU_FLUSH_INTERVAL: u64 = 1200; // 1200 × 250ms = 5 minutes
 
     // ── Select loop ──────────────────────────────────────────────────────────
     //
@@ -673,6 +714,33 @@ pub async fn run(
 
                 for addr in peer_table.evict_stale() {
                     tracing::info!(peer = %addr, "evicted stale mDNS peer");
+                }
+
+                // ── Flush memo LFU counters periodically (~5 min) ──────────
+                memo_lfu_flush_ticks += 1;
+                if memo_lfu_flush_ticks >= MEMO_LFU_FLUSH_INTERVAL {
+                    memo_lfu_flush_ticks = 0;
+                    if let Some(ref dir) = data_dir {
+                        match runtime.memo_store_mut().serialize_lfu_counts() {
+                            Ok(bytes) => {
+                                let path = dir.join("memo_lfu.bin");
+                                tokio::task::spawn_blocking(move || {
+                                    let tmp = path.with_extension("tmp");
+                                    let result = (|| -> std::io::Result<()> {
+                                        let mut f = std::fs::File::create(&tmp)?;
+                                        std::io::Write::write_all(&mut f, &bytes)?;
+                                        f.sync_all()?;
+                                        std::fs::rename(&tmp, &path)?;
+                                        Ok(())
+                                    })();
+                                    if let Err(e) = result {
+                                        tracing::warn!("Failed to flush memo_lfu.bin: {}", e);
+                                    }
+                                });
+                            }
+                            Err(e) => tracing::warn!("Failed to serialize LFU counts: {}", e),
+                        }
+                    }
                 }
             }
 
@@ -2538,4 +2606,21 @@ async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec
             "no successful reply for '{key_expr}' (timed out after 30s)"
         ))
     })
+}
+
+/// Persist a memo to disk if data_dir is configured.
+#[allow(dead_code)]
+fn persist_memo_to_disk(
+    data_dir: &Option<std::path::PathBuf>,
+    memo: &harmony_memo::Memo,
+) {
+    if let Some(ref dir) = data_dir {
+        let dir = dir.clone();
+        let memo = memo.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = crate::memo_io::write_memo(&dir, &memo) {
+                tracing::warn!("Failed to persist memo: {}", e);
+            }
+        });
+    }
 }

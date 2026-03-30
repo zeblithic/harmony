@@ -4,6 +4,8 @@ mod did_web_gateway;
 mod discovery;
 #[allow(dead_code)]
 pub(crate) mod disk_io;
+#[allow(dead_code)]
+pub(crate) mod memo_io;
 mod event_loop;
 mod identity_file;
 #[allow(dead_code)]
