@@ -611,6 +611,13 @@ pub async fn run(
     };
     tokio::pin!(shutdown);
 
+    // ── Peer keepalive counter ──────────────────────────────────────────────
+    // Refresh mDNS peer timestamps every ~20s (80 ticks × 250ms) to prevent
+    // false stale eviction. The mDNS daemon handles actual peer removal via
+    // ServiceRemoved when a service's DNS TTL expires without refresh.
+    let mut ticks_since_peer_refresh: u64 = 0;
+    const PEER_REFRESH_INTERVAL_TICKS: u64 = 80; // ~20 seconds
+
     // ── Select loop ──────────────────────────────────────────────────────────
     //
     // Events from UDP and Zenoh are buffered via push_event(). tick() is
@@ -654,6 +661,16 @@ pub async fn run(
                     .unwrap_or(0);
                 runtime.push_event(RuntimeEvent::TimerTick { now: now_ms(), unix_now });
                 should_tick = true;
+
+                // Periodically refresh mDNS peer timestamps to prevent false
+                // stale eviction. Actual peer removal is handled by mDNS
+                // ServiceRemoved events (DNS TTL expiry / goodbye packets).
+                ticks_since_peer_refresh += 1;
+                if mdns_state.is_some() && ticks_since_peer_refresh >= PEER_REFRESH_INTERVAL_TICKS {
+                    ticks_since_peer_refresh = 0;
+                    peer_table.refresh_mdns_peers();
+                }
+
                 for addr in peer_table.evict_stale() {
                     tracing::info!(peer = %addr, "evicted stale mDNS peer");
                 }

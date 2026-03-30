@@ -161,10 +161,10 @@ enum MemoAction {
     },
 }
 
-// NodeRuntime is !Send — all tasks run on a single thread. Making the
-// flavor explicit prevents silent behavior change if rt-multi-thread
-// is ever added to the tokio feature set.
-#[tokio::main(flavor = "current_thread")]
+// Zenoh requires a multi-thread Tokio runtime. We use worker_threads = 1
+// to keep the single-worker behavior that NodeRuntime's !Send types need —
+// with only one worker thread, tasks won't actually move between threads.
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() {
     // Initialize structured logging. Output goes to stderr (procd captures
     // it for syslog on OpenWRT). Filter via RUST_LOG env var, default info.

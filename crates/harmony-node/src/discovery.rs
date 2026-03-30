@@ -153,6 +153,19 @@ impl PeerTable {
         }
     }
 
+    /// Refresh `last_seen` for all non-pinned peers. Called periodically while
+    /// mDNS is active — the mDNS daemon tracks service TTLs and will emit
+    /// `ServiceRemoved` if a peer actually goes down, so stale eviction is a
+    /// secondary safety net, not the primary removal mechanism.
+    pub fn refresh_mdns_peers(&mut self) {
+        let now = Instant::now();
+        for info in self.peers.values_mut() {
+            if !info.pinned {
+                info.last_seen = now;
+            }
+        }
+    }
+
     /// Remove peers whose `last_seen` is older than `stale_timeout`.
     /// Cleans the reverse index as well. Returns the evicted socket addresses.
     pub fn evict_stale(&mut self) -> Vec<SocketAddr> {
