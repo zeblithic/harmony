@@ -257,7 +257,7 @@ impl Eq for DeferredDial {}
 /// - `archivist_config`: optional S3 archivist configuration (requires the `archivist` feature).
 /// - `data_dir`: optional directory for persistent CAS book storage. When set, durable books
 ///   are written to disk via `spawn_blocking` and reloaded on restart.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -268,7 +268,7 @@ pub async fn run(
     bootstrap_peers: Vec<SocketAddr>,
     tunnel_entries: Vec<crate::config::TunnelEntry>,
     did_web_cache_ttl: u64,
-    _rawlink_interface: Option<String>,
+    rawlink_interface: Option<String>,
     archivist_config: Option<crate::config::ArchivistConfig>,
     data_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1617,7 +1617,7 @@ pub async fn run(
 }
 
 /// Dispatch a single `RuntimeAction` to the appropriate I/O mechanism.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 async fn dispatch_action(
     action: RuntimeAction,
     session: &zenoh::Session,
@@ -1630,7 +1630,7 @@ async fn dispatch_action(
     ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     data_dir: &Option<std::path::PathBuf>,
     disk_tx: &mpsc::Sender<DiskIoResult>,
-    _s3_read_library: &S3ReadLibrary,
+    s3_read_library: &S3ReadLibrary,
     s3_tx: &mpsc::Sender<S3IoResult>,
 ) {
     match action {
