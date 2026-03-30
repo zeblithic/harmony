@@ -699,9 +699,8 @@ pub async fn run(
                     static MEMO_FLUSH_COUNTER: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
                     let tick = MEMO_FLUSH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // The tick interval varies; aim for ~5 minute flushes.
-                    // 30 ticks at 10s each = 5 min. Adjust if tick interval differs.
-                    if tick % 30 == 0 && tick > 0 {
+                    // Timer is 250ms; 1200 ticks × 250ms = 5 minutes.
+                    if tick % 1200 == 0 && tick > 0 {
                         if let Some(ref dir) = data_dir {
                             match runtime.memo_store_mut().serialize_lfu_counts() {
                                 Ok(bytes) => {

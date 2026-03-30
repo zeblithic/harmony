@@ -90,6 +90,17 @@ impl MemoStore {
             .unwrap_or(&[])
     }
 
+    /// Return all memos whose input matches `input` without incrementing LFU counters.
+    ///
+    /// Use this for existence checks and dedup lookups where access shouldn't
+    /// influence eviction ordering.
+    pub fn peek_by_input(&self, input: &ContentId) -> &[Memo] {
+        match self.by_input.get(input) {
+            Some(v) => v.as_slice(),
+            None => &[],
+        }
+    }
+
     /// Return all memos from `signer` about `input`.
     /// A signer may have multiple memos for the same input with different outputs
     /// (e.g., if they recomputed and got a different result).

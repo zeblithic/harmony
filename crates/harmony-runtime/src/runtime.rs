@@ -1114,8 +1114,9 @@ impl<B: BookStore> NodeRuntime<B> {
 
     /// Handle a memo fetch request: check local store, dedup, issue Zenoh query.
     fn handle_memo_fetch_request(&mut self, input: ContentId) {
-        // 1. Local check — short-circuit if we already have memos
-        if !self.memo_store.get_by_input(&input).is_empty() {
+        // 1. Local check — short-circuit if we already have memos.
+        // Use peek (no LFU increment) since this is a dedup check, not a real access.
+        if !self.memo_store.peek_by_input(&input).is_empty() {
             return;
         }
 
