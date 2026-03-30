@@ -43,6 +43,8 @@ harmony-inference = { workspace = true, optional = true }
 harmony-memo = { workspace = true, features = ["std"] }
 harmony-peers = { workspace = true, features = ["std"] }
 harmony-reticulum = { workspace = true, features = ["std"] }
+rand_core = { workspace = true, features = ["getrandom"] }
+zeroize = { workspace = true }
 harmony-speculative.workspace = true
 harmony-workflow.workspace = true
 harmony-zenoh.workspace = true
