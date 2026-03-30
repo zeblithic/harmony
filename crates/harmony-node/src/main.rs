@@ -539,7 +539,8 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             };
             // Extract Ed25519 private bytes for Reticulum announcing destination,
             // then drop the key (zeroize-on-drop fires).
-            let reticulum_identity_bytes = Some(ed25519.to_private_bytes());
+            let reticulum_identity_bytes =
+                Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
             drop(ed25519);
 
             let content_policy = ContentPolicy {

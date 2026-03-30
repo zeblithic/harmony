@@ -69,11 +69,12 @@ pub struct NodeConfig {
     /// Used to verify Discovery UCAN tokens (which are issued by this node).
     /// Defaults to empty; must be set from the loaded identity at startup.
     pub local_dsa_pubkey: Vec<u8>,
-    /// Ed25519 private identity bytes (64 bytes: 32B X25519 secret + 32B Ed25519 secret).
+    /// Combined Reticulum private identity bytes (64 bytes: 32B X25519 secret + 32B Ed25519 secret).
     /// When present, the runtime registers a Reticulum announcing destination
     /// so periodic path announces flow to UDP peers.
     /// Consumed (moved out) during `new()`; `None` disables announces.
-    pub reticulum_identity_bytes: Option<[u8; 64]>,
+    /// Wrapped in `Zeroizing` so key material is wiped when the config is dropped.
+    pub reticulum_identity_bytes: Option<zeroize::Zeroizing<[u8; 64]>>,
     /// Hex-decoded 32-byte CID of the GGUF model file in CAS (for inference).
     pub inference_gguf_cid: Option<[u8; 32]>,
     /// Hex-decoded 32-byte CID of the tokenizer.json file in CAS (for inference).
@@ -802,20 +803,23 @@ impl<B: BookStore> NodeRuntime<B> {
         // provided. This causes periodic path announces (~30s) so mDNS-
         // discovered peers get real Reticulum routing entries.
         if let Some(id_bytes) = config.reticulum_identity_bytes.take() {
-            if let Ok(identity) =
-                harmony_identity::PrivateIdentity::from_private_bytes(&id_bytes)
-            {
-                let dest_name =
-                    harmony_reticulum::DestinationName::from_name("harmony", &["node"])
-                        .expect("static destination name");
-                router.register_announcing_destination(
-                    identity,
-                    dest_name,
-                    Vec::new(),    // no app_data
-                    Some(30_000),  // 30-second announce interval (millis)
-                    0,             // now=0: first announce on next TimerTick
-                );
-                tracing::info!("Reticulum announcing destination registered (30s interval)");
+            match harmony_identity::PrivateIdentity::from_private_bytes(id_bytes.as_ref()) {
+                Ok(identity) => {
+                    let dest_name =
+                        harmony_reticulum::DestinationName::from_name("harmony", &["node"])
+                            .expect("static destination name");
+                    router.register_announcing_destination(
+                        identity,
+                        dest_name,
+                        Vec::new(),    // no app_data
+                        Some(30_000),  // 30-second announce interval (millis)
+                        0,             // now=0: first announce on next TimerTick
+                    );
+                    tracing::info!("Reticulum announcing destination registered (30s interval)");
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "failed to deserialize Reticulum identity — announces disabled");
+                }
             }
         }
 
@@ -2026,17 +2030,22 @@ impl<B: BookStore> NodeRuntime<B> {
                         self.last_now,
                     );
                     for aa in announce_actions {
-                        if let NodeAction::SendOnInterface {
-                            interface_name,
-                            raw,
-                            weight,
-                        } = aa
-                        {
-                            out.push(RuntimeAction::SendOnInterface {
+                        match aa {
+                            NodeAction::SendOnInterface {
                                 interface_name,
                                 raw,
                                 weight,
-                            });
+                            } => {
+                                out.push(RuntimeAction::SendOnInterface {
+                                    interface_name,
+                                    raw,
+                                    weight,
+                                });
+                            }
+                            NodeAction::PacketDropped { reason, .. } => {
+                                tracing::warn!(?reason, "Reticulum announce dropped");
+                            }
+                            _ => {}
                         }
                     }
                 }
