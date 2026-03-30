@@ -6439,7 +6439,7 @@ mod tests {
         rt.tick();
 
         // Memo should now be in the store
-        let stored = rt.memo_store().get_by_input(&input);
+        let stored = rt.memo_store_mut().get_by_input(&input);
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].output, output);
     }
@@ -6466,7 +6466,7 @@ mod tests {
         rt.tick();
 
         // No memo should be stored
-        assert!(rt.memo_store().get_by_input(&input).is_empty());
+        assert!(rt.memo_store_mut().get_by_input(&input).is_empty());
     }
 
     #[test]
@@ -6486,7 +6486,7 @@ mod tests {
         });
         rt.tick();
 
-        assert!(rt.memo_store().get_by_input(&input).is_empty());
+        assert!(rt.memo_store_mut().get_by_input(&input).is_empty());
     }
 
     #[test]
@@ -6554,7 +6554,7 @@ mod tests {
         rt.tick();
 
         // Both memos should be in the store
-        let stored = rt.memo_store().get_by_input(&input);
+        let stored = rt.memo_store_mut().get_by_input(&input);
         assert_eq!(
             stored.len(),
             2,
