@@ -69,25 +69,17 @@ impl MemoStore {
     /// Returns an empty slice when no memos are known for this input.
     /// Increments LFU counters for each returned memo.
     pub fn get_by_input(&mut self, input: &ContentId) -> &[Memo] {
-        // First pass: collect keys to increment
-        let keys: Vec<MemoKey> = match self.by_input.get(input) {
-            Some(v) => v
-                .iter()
-                .map(|m| (m.input, m.output, m.credential.issuer.hash))
-                .collect(),
+        let memos = match self.by_input.get(input) {
+            Some(v) => v,
             None => return &[],
         };
-        // Increment LFU counters
-        for key in keys {
+        for memo in memos {
+            let key = (memo.input, memo.output, memo.credential.issuer.hash);
             if let Some(count) = self.lfu_counts.get_mut(&key) {
                 *count = count.saturating_add(1);
             }
         }
-        // Return the slice
-        self.by_input
-            .get(input)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        memos.as_slice()
     }
 
     /// Return all memos whose input matches `input` without incrementing LFU counters.
@@ -110,29 +102,21 @@ impl MemoStore {
         input: &ContentId,
         signer: &[u8; 16],
     ) -> Vec<&Memo> {
-        // First pass: collect matching keys to increment
-        let keys: Vec<MemoKey> = match self.by_input.get(input) {
-            Some(memos) => memos
-                .iter()
-                .filter(|m| &m.credential.issuer.hash == signer)
-                .map(|m| (m.input, m.output, m.credential.issuer.hash))
-                .collect(),
+        let memos = match self.by_input.get(input) {
+            Some(v) => v,
             None => return Vec::new(),
         };
-        // Increment LFU counters
-        for key in keys {
+        let results: Vec<&Memo> = memos
+            .iter()
+            .filter(|m| &m.credential.issuer.hash == signer)
+            .collect();
+        for memo in &results {
+            let key = (memo.input, memo.output, memo.credential.issuer.hash);
             if let Some(count) = self.lfu_counts.get_mut(&key) {
                 *count = count.saturating_add(1);
             }
         }
-        // Return matching memos
-        match self.by_input.get(input) {
-            Some(memos) => memos
-                .iter()
-                .filter(|m| &m.credential.issuer.hash == signer)
-                .collect(),
-            None => Vec::new(),
-        }
+        results
     }
 
     /// Return the LFU access count for a specific memo identified by its
