@@ -3569,7 +3569,9 @@ impl<B: BookStore> NodeRuntime<B> {
         arr.copy_from_slice(&cid_bytes);
         let input_cid = ContentId::from_bytes(arr);
 
-        let memos = self.memo_store.get_by_input(&input_cid);
+        // Use peek (no LFU increment) — serving remote queries isn't local usage
+        // and shouldn't influence local eviction decisions.
+        let memos = self.memo_store.peek_by_input(&input_cid);
         if memos.is_empty() {
             return Vec::new();
         }
