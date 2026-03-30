@@ -4,6 +4,8 @@ mod did_web_gateway;
 mod discovery;
 #[allow(dead_code)]
 pub(crate) mod disk_io;
+#[allow(dead_code)]
+pub(crate) mod memo_io;
 mod event_loop;
 mod identity_file;
 #[allow(dead_code)]
@@ -1269,7 +1271,7 @@ mod tests {
     #[test]
     fn cli_parses_cid_with_file() {
         let cli = Cli::try_parse_from(["harmony", "cid", "--file", "/tmp/test.bin"]).unwrap();
-        if let Commands::Cid { file } = cli.command {
+        if let Commands::Cid { file, verbose: _ } = cli.command {
             assert_eq!(file, Some(std::path::PathBuf::from("/tmp/test.bin")));
         } else {
             panic!("expected Cid command");
@@ -1279,7 +1281,7 @@ mod tests {
     #[test]
     fn cli_parses_cid_stdin_mode() {
         let cli = Cli::try_parse_from(["harmony", "cid"]).unwrap();
-        if let Commands::Cid { file } = cli.command {
+        if let Commands::Cid { file, verbose: _ } = cli.command {
             assert!(file.is_none());
         } else {
             panic!("expected Cid command");
