@@ -707,9 +707,14 @@ pub async fn run(
                                     let path = dir.join("memo_lfu.bin");
                                     tokio::task::spawn_blocking(move || {
                                         let tmp = path.with_extension("tmp");
-                                        if let Err(e) = std::fs::write(&tmp, &bytes)
-                                            .and_then(|_| std::fs::rename(&tmp, &path))
-                                        {
+                                        let result = (|| -> std::io::Result<()> {
+                                            let mut f = std::fs::File::create(&tmp)?;
+                                            std::io::Write::write_all(&mut f, &bytes)?;
+                                            f.sync_all()?;
+                                            std::fs::rename(&tmp, &path)?;
+                                            Ok(())
+                                        })();
+                                        if let Err(e) = result {
                                             tracing::warn!("Failed to flush memo_lfu.bin: {}", e);
                                         }
                                     });
