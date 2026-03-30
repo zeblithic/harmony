@@ -268,7 +268,7 @@ pub async fn run(
     bootstrap_peers: Vec<SocketAddr>,
     tunnel_entries: Vec<crate::config::TunnelEntry>,
     did_web_cache_ttl: u64,
-    rawlink_interface: Option<String>,
+    _rawlink_interface: Option<String>,
     archivist_config: Option<crate::config::ArchivistConfig>,
     data_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -740,7 +740,7 @@ pub async fn run(
             // Arm 4c: Inference streaming completion — publish chunks and handle results.
             // Uses the async-block-with-pending pattern (like rawlink Arm 9) so the
             // arm compiles even when the `inference` feature is disabled.
-            Some(inference_result) = async {
+            Some(_inference_result) = async {
                 #[cfg(feature = "inference")]
                 { inference_rx.recv().await }
                 #[cfg(not(feature = "inference"))]
@@ -1630,7 +1630,7 @@ async fn dispatch_action(
     ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     data_dir: &Option<std::path::PathBuf>,
     disk_tx: &mpsc::Sender<DiskIoResult>,
-    s3_read_library: &S3ReadLibrary,
+    _s3_read_library: &S3ReadLibrary,
     s3_tx: &mpsc::Sender<S3IoResult>,
 ) {
     match action {
@@ -1916,7 +1916,7 @@ async fn dispatch_action(
                 let err_msg = match result {
                     Ok(Ok(())) => return, // Success — response already sent above
                     Ok(Err(e)) => e,
-                    Err(_) => format!("verify query timed out after 30s"),
+                    Err(_) => "verify query timed out after 30s".to_string(),
                 };
                 tracing::warn!(%key_expr, err = %err_msg, "DSD verify query failed");
                 let err_payload = harmony_speculative::VerifyResponse::serialize_error(&err_msg);

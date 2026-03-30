@@ -1938,7 +1938,6 @@ impl<B: BookStore> NodeRuntime<B> {
             .any(|(_, c)| c.replication.is_some() && c.peering.enabled);
 
         if !has_replication_peers {
-            return;
         }
 
         // TODO: When BookStore gains an iter() method, iterate local

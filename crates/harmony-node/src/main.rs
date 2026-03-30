@@ -613,7 +613,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 inference_gguf_cid: config_file
                     .inference_model_gguf_cid
                     .as_deref()
-                    .map(|s| {
+                    .and_then(|s| {
                         hex::decode(s)
                             .ok()
                             .and_then(|v| <[u8; 32]>::try_from(v).ok())
@@ -621,12 +621,11 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                                 tracing::warn!("inference_model_gguf_cid is not a valid 32-byte hex string; inference disabled");
                                 None
                             })
-                    })
-                    .flatten(),
+                    }),
                 inference_tokenizer_cid: config_file
                     .inference_model_tokenizer_cid
                     .as_deref()
-                    .map(|s| {
+                    .and_then(|s| {
                         hex::decode(s)
                             .ok()
                             .and_then(|v| <[u8; 32]>::try_from(v).ok())
@@ -634,8 +633,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                                 tracing::warn!("inference_model_tokenizer_cid is not a valid 32-byte hex string; inference disabled");
                                 None
                             })
-                    })
-                    .flatten(),
+                    }),
                 engram_manifest_cid: config_file
                     .engram_manifest_cid
                     .as_deref()
@@ -1271,7 +1269,7 @@ mod tests {
     #[test]
     fn cli_parses_cid_with_file() {
         let cli = Cli::try_parse_from(["harmony", "cid", "--file", "/tmp/test.bin"]).unwrap();
-        if let Commands::Cid { file } = cli.command {
+        if let Commands::Cid { file, .. } = cli.command {
             assert_eq!(file, Some(std::path::PathBuf::from("/tmp/test.bin")));
         } else {
             panic!("expected Cid command");
@@ -1281,7 +1279,7 @@ mod tests {
     #[test]
     fn cli_parses_cid_stdin_mode() {
         let cli = Cli::try_parse_from(["harmony", "cid"]).unwrap();
-        if let Commands::Cid { file } = cli.command {
+        if let Commands::Cid { file, .. } = cli.command {
             assert!(file.is_none());
         } else {
             panic!("expected Cid command");

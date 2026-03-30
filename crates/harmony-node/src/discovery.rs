@@ -202,6 +202,7 @@ impl PeerTable {
     }
 
     /// Total number of tracked socket addresses.
+    #[cfg(test)]
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
@@ -643,15 +644,25 @@ mod tests {
 
     #[test]
     fn refresh_mdns_peers_prevents_stale_eviction() {
-        let mut t = PeerTable::new([0u8; 16], Duration::ZERO);
+        // Use a 1-second timeout so the peer goes stale after the sleep,
+        // but refresh brings it back. Duration::ZERO is racy because the
+        // gap between refresh and evict can exceed zero.
+        let mut t = PeerTable::new([0u8; 16], Duration::from_millis(10));
         let sa = make_addr(7002);
         t.add_peer(sa, make_reticulum_addr(21), 1);
 
-        // Spin past zero timeout
-        let start = Instant::now();
-        while Instant::now().duration_since(start) < Duration::from_nanos(1) {}
+        // Sleep past the stale timeout
+        std::thread::sleep(Duration::from_millis(15));
 
-        // Without refresh, peer would be evicted
+        // Without refresh, peer would be evicted — verify that first
+        // by checking it IS stale (but don't actually evict yet).
+        assert!(
+            Instant::now().duration_since(t.peers.get(&sa).unwrap().last_seen)
+                > Duration::from_millis(10),
+            "peer should be stale before refresh"
+        );
+
+        // Refresh and then evict — peer should survive
         t.refresh_mdns_peers();
         let evicted = t.evict_stale();
         assert!(evicted.is_empty(), "refreshed peer must not be evicted");

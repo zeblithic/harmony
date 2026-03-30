@@ -39,7 +39,7 @@ impl MemoStore {
     /// same `(input, output, issuer.hash)` triple already exists.
     pub fn insert(&mut self, memo: Memo) -> bool {
         let signer_hash = memo.credential.issuer.hash;
-        let entry = self.by_input.entry(memo.input).or_insert_with(Vec::new);
+        let entry = self.by_input.entry(memo.input).or_default();
 
         // Dedup: skip if we already have a memo with the same output + issuer hash.
         let already_present = entry.iter().any(|existing| {
