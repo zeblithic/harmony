@@ -3541,7 +3541,7 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Key expression: `harmony/memo/{input_hex}/**`
     /// Response: `[u16 LE count][u32 LE len][memo_bytes]...`
     /// Returns empty vec (no reply) if no memos found or key malformed.
-    fn handle_memo_query(&self, query_id: u64, key_expr: &str) -> Vec<RuntimeAction> {
+    fn handle_memo_query(&mut self, query_id: u64, key_expr: &str) -> Vec<RuntimeAction> {
         // Strip prefix and trailing wildcard to extract input_hex.
         let input_hex = match key_expr
             .strip_prefix(harmony_zenoh::namespace::memo::PREFIX)

@@ -559,6 +559,43 @@ pub async fn run(
         }
     }
 
+    // ── Load persisted memos ───────────────────────────────────────────
+    #[allow(unused_mut, unused_variables)]
+    let mut memo_store = harmony_memo::store::MemoStore::new();
+    #[allow(unused_variables)]
+    let mut memo_disk_bytes: u64 = 0;
+
+    if let Some(ref dir) = data_dir {
+        let dir_clone = dir.clone();
+        let memo_entries = tokio::task::spawn_blocking(move || {
+            crate::memo_io::scan_memos(&dir_clone)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("memo scan task panicked: {}", e);
+            Vec::new()
+        });
+
+        for (memo, size) in memo_entries {
+            if memo_store.insert(memo) {
+                memo_disk_bytes += size;
+            }
+        }
+        tracing::info!("Loaded {} memos from disk ({} bytes)", memo_store.len(), memo_disk_bytes);
+
+        // Load LFU counts if available.
+        let lfu_path = dir.join("memo_lfu.bin");
+        if lfu_path.exists() {
+            match std::fs::read(&lfu_path) {
+                Ok(bytes) => match memo_store.load_lfu_counts(&bytes) {
+                    Ok(n) => tracing::info!("Loaded {} LFU counters from disk", n),
+                    Err(e) => tracing::warn!("Failed to parse memo_lfu.bin: {} — starting fresh", e),
+                },
+                Err(e) => tracing::warn!("Failed to read memo_lfu.bin: {} — starting fresh", e),
+            }
+        }
+    }
+
     // ── Monotonic epoch ─────────────────────────────────────────────────────
     // Shared with tunnel_task::millis_since_start() via OnceLock — same epoch.
     let now_ms = crate::tunnel_task::millis_since_start;
@@ -656,6 +693,30 @@ pub async fn run(
                 should_tick = true;
                 for addr in peer_table.evict_stale() {
                     tracing::info!(peer = %addr, "evicted stale mDNS peer");
+                }
+
+                // ── Flush memo LFU counters periodically (~5 min) ──────────
+                {
+                    static MEMO_FLUSH_COUNTER: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let tick = MEMO_FLUSH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // The tick interval varies; aim for ~5 minute flushes.
+                    // 30 ticks at 10s each = 5 min. Adjust if tick interval differs.
+                    if tick % 30 == 0 && tick > 0 {
+                        if let Some(ref dir) = data_dir {
+                            match memo_store.serialize_lfu_counts() {
+                                Ok(bytes) => {
+                                    let path = dir.join("memo_lfu.bin");
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Err(e) = std::fs::write(&path, &bytes) {
+                                            tracing::warn!("Failed to flush memo_lfu.bin: {}", e);
+                                        }
+                                    });
+                                }
+                                Err(e) => tracing::warn!("Failed to serialize LFU counts: {}", e),
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2521,4 +2582,21 @@ async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec
             "no successful reply for '{key_expr}' (timed out after 30s)"
         ))
     })
+}
+
+/// Persist a memo to disk if data_dir is configured.
+#[allow(dead_code)]
+fn persist_memo_to_disk(
+    data_dir: &Option<std::path::PathBuf>,
+    memo: &harmony_memo::Memo,
+) {
+    if let Some(ref dir) = data_dir {
+        let dir = dir.clone();
+        let memo = memo.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = crate::memo_io::write_memo(&dir, &memo) {
+                tracing::warn!("Failed to persist memo: {}", e);
+            }
+        });
+    }
 }
