@@ -1891,8 +1891,12 @@ impl<B: BookStore> NodeRuntime<B> {
         }
 
         // Periodic Discovery announce re-publish (~5 min).
+        // Only fire when a local announce has been set (nodes without --relay-url
+        // never receive LocalAnnounceReady, so local_full_announce stays None).
         self.ticks_since_announce_publish += 1;
-        if self.ticks_since_announce_publish >= ANNOUNCE_REPUBLISH_INTERVAL_TICKS {
+        if self.ticks_since_announce_publish >= ANNOUNCE_REPUBLISH_INTERVAL_TICKS
+            && self.local_full_announce.is_some()
+        {
             self.ticks_since_announce_publish = 0;
             // Re-call start_announcing() which is idempotent and emits PublishAnnounce.
             let disc_actions = self.discovery.start_announcing();

@@ -262,7 +262,7 @@ fn build_local_announce(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let expires_at = now + 600; // 10 minutes
+    let expires_at = now + 3600; // 1 hour — re-publish every 5 min keeps it fresh
 
     let mut nonce = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
