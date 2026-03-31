@@ -36,6 +36,18 @@ impl PeerManager {
         self.peers.get(identity_hash).map(|p| p.status)
     }
 
+    /// Transition a tracked peer to `Connecting`. Used by the runtime after
+    /// emitting `InitiateTunnel` to prevent duplicate initiation within the
+    /// same tick.
+    pub fn set_connecting(&mut self, identity_hash: &IdentityHash) {
+        if let Some(peer) = self.peers.get_mut(identity_hash) {
+            if peer.status == PeerStatus::Searching {
+                peer.status = PeerStatus::Connecting;
+                peer.connecting_since = None; // stamped on first Tick
+            }
+        }
+    }
+
     #[must_use]
     pub fn on_event(&mut self, event: PeerEvent, contacts: &ContactStore) -> Vec<PeerAction> {
         let mut actions = Vec::new();

@@ -1335,6 +1335,10 @@ impl<B: BookStore> NodeRuntime<B> {
                 peer_dsa_pubkey,
                 peer_kem_pubkey,
             });
+
+        // Transition to Connecting immediately so subsequent events in the
+        // same tick don't emit a duplicate InitiateTunnel.
+        self.peer_manager.set_connecting(&identity_hash);
     }
 
     /// Read-only access to the memo store.
