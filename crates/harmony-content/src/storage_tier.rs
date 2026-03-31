@@ -407,10 +407,12 @@ impl<B: BookStore> StorageTier<B> {
             }
             let evicted_size = self.disk_index.remove(&candidate).unwrap_or(0);
             self.disk_used_bytes = self.disk_used_bytes.saturating_sub(evicted_size);
-            if self.archive_enabled {
+            if self.archive_enabled && !self.archive_index.contains_key(&candidate) {
+                // Not yet in archive — cascade the content.
                 actions.push(StorageTierAction::CascadeToArchive { cid: candidate });
                 self.record_archive_persist(candidate, evicted_size, &mut actions);
             } else {
+                // Already in archive (promoted then re-evicted) or archive disabled.
                 actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
             }
             skipped = 0;
@@ -679,16 +681,23 @@ impl<B: BookStore> StorageTier<B> {
             StorageTierEvent::ArchiveReadFailed { cid, query_id } => {
                 self.metrics.archive_read_failures += 1;
                 // Retract the index entry so subsequent queries don't re-trigger
-                // futile ArchiveLookup cycles, and so S3 fallback is not blocked.
+                // futile ArchiveLookup cycles.
                 if let Some(entry_size) = self.archive_index.remove(&cid) {
                     self.archive_used_bytes =
                         self.archive_used_bytes.saturating_sub(entry_size);
                     self.archive_lru.retain(|c| c != &cid);
                 }
-                vec![StorageTierAction::SendReply {
-                    query_id,
-                    payload: vec![],
-                }]
+                // Cascade to S3 for this query if available, rather than
+                // returning empty (S3 fallback for future queries is already
+                // unblocked by the index retraction above).
+                if self.s3_enabled && Self::is_durable_class(&cid) {
+                    vec![StorageTierAction::S3Lookup { cid, query_id }]
+                } else {
+                    vec![StorageTierAction::SendReply {
+                        query_id,
+                        payload: vec![],
+                    }]
+                }
             }
             StorageTierEvent::S3ReadComplete {
                 cid,
@@ -1087,12 +1096,12 @@ impl<B: BookStore> StorageTier<B> {
                     actions.swap_remove(idx);
                     // Don't emit RemoveFromDisk — the file was never written.
                 }
-            } else if self.archive_enabled {
-                // Content is already on disk — tell event loop to move it to archive.
-                // Use the disk entry size for archive quota accounting.
+            } else if self.archive_enabled && !self.archive_index.contains_key(&candidate) {
+                // Content is already on disk but not in archive — move it.
                 actions.push(StorageTierAction::CascadeToArchive { cid: candidate });
                 self.record_archive_persist(candidate, evicted_size, actions);
             } else {
+                // Already in archive (promoted then re-evicted) or archive disabled.
                 actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
             }
             skipped = 0; // Reset after successful eviction
