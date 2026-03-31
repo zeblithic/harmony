@@ -4,6 +4,7 @@
   inputs = {
     # Unstable channel — needed for Rust 1.85+ (edition2024 in Cargo.lock).
     # nixos-24.11 shipped Rust 1.82 which is too old for cranelift-codegen-shared.
+    # Currently provides Rust 1.94 via nixpkgs commit 8110df5 (March 2026).
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
@@ -62,9 +63,9 @@
             openssl
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-            # On nixpkgs unstable (26.05+), darwin.apple_sdk.frameworks is removed.
-            # Security and SystemConfiguration are pulled transitively by openssl
-            # and other deps — no explicit listing needed.
+            # darwin.apple_sdk.frameworks was removed in nixpkgs 26.05.
+            # Security and SystemConfiguration are propagated transitively
+            # by openssl — no explicit listing needed.
             pkgs.libiconv
           ];
 
