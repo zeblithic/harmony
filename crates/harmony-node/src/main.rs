@@ -520,6 +520,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             let pq_pub = pq.public_identity();
             let local_pq_identity_hash = pq_pub.address_hash;
             let local_dsa_pubkey = pq_pub.verifying_key.as_bytes();
+            let local_kem_pubkey = pq_pub.encryption_key.as_bytes();
 
             // Build tunnel config if --relay-url was provided.
             // The PQ identity is wrapped in Arc because tunnel tasks need
@@ -615,6 +616,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 local_identity_hash: our_addr_bytes,
                 local_pq_identity_hash,
                 local_dsa_pubkey,
+                local_kem_pubkey,
                 reticulum_identity_bytes,
                 inference_gguf_cid: config_file
                     .inference_model_gguf_cid
