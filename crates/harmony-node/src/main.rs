@@ -99,6 +99,16 @@ enum Commands {
         /// with tunnel addressing and peering enabled at Normal priority.
         #[arg(long, value_name = "PEER_SPEC")]
         add_tunnel_peer: Vec<String>,
+        /// Port for Nix binary cache HTTP server (0 = disabled)
+        #[cfg(feature = "nix-cache")]
+        #[arg(long)]
+        nix_cache_port: Option<u16>,
+    },
+    /// Nix binary cache commands
+    #[cfg(feature = "nix-cache")]
+    Nar {
+        #[command(subcommand)]
+        action: NarAction,
     },
     /// Compute ContentId for a file or stdin
     Cid {
@@ -166,6 +176,34 @@ enum MemoAction {
         /// Input CID (hex, 64 chars)
         #[arg(long)]
         input: String,
+    },
+}
+
+#[cfg(feature = "nix-cache")]
+#[derive(Subcommand)]
+enum NarAction {
+    /// Push a Nix store path (or closure) into the Harmony CAS
+    Push {
+        /// Nix store path to push (e.g., /nix/store/abc...-package-1.0)
+        store_path: Option<String>,
+        /// Push the entire closure (all transitive dependencies)
+        #[arg(long)]
+        closure: bool,
+        /// Read NAR data from stdin instead of running nix-store --dump
+        #[arg(long)]
+        stdin: bool,
+        /// Store path name (required with --stdin, e.g., abc...-package-1.0)
+        #[arg(long, value_name = "NAME")]
+        store_path_name: Option<String>,
+        /// Path to Nix binary cache signing key file
+        #[arg(long, value_name = "PATH")]
+        signing_key: std::path::PathBuf,
+        /// CAS data directory for persistent storage
+        #[arg(long, value_name = "PATH")]
+        data_dir: std::path::PathBuf,
+        /// Path to identity key file
+        #[arg(long, value_name = "PATH")]
+        identity_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -363,6 +401,8 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             relay_url,
             tunnel_peer,
             add_tunnel_peer,
+            #[cfg(feature = "nix-cache")]
+            nix_cache_port,
         } => {
             use crate::runtime::{NodeConfig, NodeRuntime};
             use harmony_compute::InstructionBudget;
@@ -712,6 +752,12 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
 
             tracing::info!(cache_capacity, compute_budget, %listen_addr, "harmony node starting");
 
+            #[cfg(feature = "nix-cache")]
+            spawn_nix_cache_server(
+                crate::config::resolve(nix_cache_port, config_file.nix_cache_port, 0u16),
+                config_file.data_dir.clone(),
+            )?;
+
             crate::event_loop::run(
                 rt,
                 startup_actions,
@@ -730,6 +776,8 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(())
         }
+        #[cfg(feature = "nix-cache")]
+        Commands::Nar { action } => run_nar_command(action),
         Commands::Cid { file, verbose } => {
             use harmony_content::book::MemoryBookStore;
             use harmony_content::chunker::{chunk_all, ChunkerConfig};
@@ -796,6 +844,133 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             Ok(())
         }
     }
+}
+
+/// Handle the `nar` subcommand.
+///
+/// Extracted into its own non-async function so its locals do not inflate the
+/// `run()` async future's state machine size (which causes stack overflows in
+/// tests when the `nix-cache` feature is enabled).
+#[cfg(feature = "nix-cache")]
+fn run_nar_command(action: NarAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        NarAction::Push {
+            store_path,
+            closure,
+            stdin,
+            store_path_name,
+            signing_key,
+            data_dir,
+            identity_file,
+        } => {
+            let key_contents = std::fs::read_to_string(&signing_key).map_err(|e| {
+                format!("failed to read signing key {}: {e}", signing_key.display())
+            })?;
+            let nix_key = crate::narinfo::NixSigningKey::from_nix_format(&key_contents)
+                .map_err(|e| format!("invalid Nix signing key: {e}"))?;
+
+            let id_path = crate::identity_file::resolve_path(identity_file.as_deref())?;
+            let identity = crate::identity_file::load_or_generate(&id_path)?;
+
+            if stdin {
+                let sp_name = store_path_name.or(store_path).ok_or(
+                    "--store-path-name (or positional store_path) required with --stdin",
+                )?;
+                let full_path = if sp_name.starts_with("/nix/store/") {
+                    sp_name
+                } else {
+                    format!("/nix/store/{sp_name}")
+                };
+
+                use std::io::Read;
+                let mut nar_data = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut nar_data)
+                    .map_err(|e| format!("failed to read stdin: {e}"))?;
+                if nar_data.is_empty() {
+                    return Err("empty NAR data from stdin".into());
+                }
+
+                let result = crate::nar::push_store_path(
+                    &full_path, &nar_data, &nix_key, &data_dir, &identity.pq,
+                )?;
+                if result.skipped {
+                    eprintln!("Skipped (already cached): {}", result.store_path);
+                } else {
+                    eprintln!("Pushed: {} ({} bytes)", result.store_path, result.nar_size);
+                }
+            } else if closure {
+                let sp = store_path.ok_or("store path required for closure mode")?;
+                let paths = crate::nar::enumerate_closure(&sp)?;
+                let total = paths.len();
+                eprintln!("Closure contains {total} store paths");
+
+                for (i, path) in paths.iter().enumerate() {
+                    let refs = crate::nar::get_references(path).unwrap_or_default();
+                    let nar_data = crate::nar::dump_nar(path)?;
+                    let result = crate::nar::push_store_path_with_refs(
+                        path, &nar_data, &refs, &nix_key, &data_dir, &identity.pq,
+                    )?;
+                    if result.skipped {
+                        eprintln!("[{}/{}] Skipped: {}", i + 1, total, result.store_path);
+                    } else {
+                        eprintln!(
+                            "[{}/{}] Pushed: {} ({} bytes)",
+                            i + 1, total, result.store_path, result.nar_size
+                        );
+                    }
+                }
+            } else {
+                let sp = store_path.ok_or("store path required")?;
+                let refs = crate::nar::get_references(&sp).unwrap_or_default();
+                let nar_data = crate::nar::dump_nar(&sp)?;
+                let result = crate::nar::push_store_path_with_refs(
+                    &sp, &nar_data, &refs, &nix_key, &data_dir, &identity.pq,
+                )?;
+                if result.skipped {
+                    eprintln!("Skipped (already cached): {}", result.store_path);
+                } else {
+                    eprintln!("Pushed: {} ({} bytes)", result.store_path, result.nar_size);
+                }
+            }
+
+            drop(identity);
+            Ok(())
+        }
+    }
+}
+
+/// Spawn the Nix binary cache HTTP server if `port > 0`.
+///
+/// Extracted into its own function to keep the large `run()` async frame
+/// from growing further (axum Router is sizable on the stack).
+#[cfg(feature = "nix-cache")]
+fn spawn_nix_cache_server(
+    port: u16,
+    data_dir: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if port == 0 {
+        return Ok(());
+    }
+    let state = std::sync::Arc::new(crate::nix_cache::NixCacheState {
+        book_store: std::sync::Arc::new(harmony_content::book::MemoryBookStore::new()),
+        memo_store: std::sync::Arc::new(harmony_memo::store::MemoStore::new()),
+        data_dir,
+    });
+    let nix_addr: std::net::SocketAddr = format!("0.0.0.0:{port}")
+        .parse()
+        .map_err(|e| format!("invalid nix-cache-port {port}: {e}"))?;
+    let nix_router = crate::nix_cache::router(state);
+    tracing::info!(%nix_addr, "nix binary cache server starting");
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(nix_addr)
+            .await
+            .expect("failed to bind nix-cache port");
+        if let Err(e) = axum::serve(listener, nix_router).await {
+            tracing::error!("nix cache server error: {e}");
+        }
+    });
+    Ok(())
 }
 
 /// Parsed tunnel peer specification.
