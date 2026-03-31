@@ -117,6 +117,8 @@ pub enum StorageTierEvent {
     },
     /// Archive read failed — book not found or I/O error.
     ArchiveReadFailed { cid: ContentId, query_id: u64 },
+    /// Archive write failed — retract the speculative archive_index entry.
+    ArchiveWriteFailed { cid: ContentId },
     /// S3 read completed — book fetched from remote storage.
     S3ReadComplete {
         cid: ContentId,
@@ -477,11 +479,13 @@ impl<B: BookStore> StorageTier<B> {
     /// Set the archive quota and run an immediate eviction pass.
     pub fn set_archive_quota(&mut self, quota_bytes: u64) -> Vec<StorageTierAction> {
         self.archive_quota = Some(quota_bytes);
-        self.enforce_archive_quota()
+        self.enforce_archive_quota(None)
     }
 
-    /// Run a standalone archive eviction pass.
-    fn enforce_archive_quota(&mut self) -> Vec<StorageTierAction> {
+    /// Run a standalone archive eviction pass. `skip_cid` prevents the
+    /// just-persisted CID from being immediately re-evicted when all other
+    /// entries are pinned.
+    fn enforce_archive_quota(&mut self, skip_cid: Option<ContentId>) -> Vec<StorageTierAction> {
         let quota = match self.archive_quota {
             Some(q) => q,
             None => return Vec::new(),
@@ -499,7 +503,7 @@ impl<B: BookStore> StorageTier<B> {
                 Some(c) => c,
                 None => break,
             };
-            if self.cache.is_pinned(&candidate) {
+            if Some(candidate) == skip_cid || self.cache.is_pinned(&candidate) {
                 self.archive_lru.push_back(candidate);
                 skipped += 1;
                 continue;
@@ -697,6 +701,16 @@ impl<B: BookStore> StorageTier<B> {
                         payload: vec![],
                     }]
                 }
+            }
+            StorageTierEvent::ArchiveWriteFailed { cid } => {
+                // Retract the speculative archive_index entry so accounting
+                // stays accurate and the phantom entry doesn't inflate quota.
+                if let Some(entry_size) = self.archive_index.remove(&cid) {
+                    self.archive_used_bytes =
+                        self.archive_used_bytes.saturating_sub(entry_size);
+                    self.archive_lru.retain(|c| c != &cid);
+                }
+                vec![]
             }
             StorageTierEvent::S3ReadComplete {
                 cid,
@@ -1148,7 +1162,7 @@ impl<B: BookStore> StorageTier<B> {
         self.archive_index.insert(cid, size);
         self.archive_lru.push_back(cid);
         self.archive_used_bytes += size;
-        let eviction_actions = self.enforce_archive_quota();
+        let eviction_actions = self.enforce_archive_quota(Some(cid));
         actions.extend(eviction_actions);
     }
 

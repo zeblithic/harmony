@@ -43,6 +43,8 @@ enum ArchiveIoResult {
     },
     /// Book not found or read error.
     ReadFailed { cid: ContentId, query_id: u64 },
+    /// Archive write failed — runtime should retract the phantom archive_index entry.
+    WriteFailed { cid: ContentId },
 }
 
 /// Result of an async S3 fetch, sent back to the event loop via channel.
@@ -905,6 +907,9 @@ pub async fn run(
                     }
                     ArchiveIoResult::ReadFailed { cid, query_id } => {
                         runtime.push_event(RuntimeEvent::ArchiveReadFailed { cid, query_id });
+                    }
+                    ArchiveIoResult::WriteFailed { cid } => {
+                        runtime.push_event(RuntimeEvent::ArchiveWriteFailed { cid });
                     }
                 }
             }
@@ -2166,11 +2171,15 @@ async fn dispatch_action(
         RuntimeAction::PersistToArchive { cid, data } => {
             if let Some(ref dir) = archive_dir {
                 let dir = dir.clone();
+                let tx = archive_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     if let Err(e) = crate::disk_io::write_book(&dir, &cid, &data) {
                         tracing::error!(?cid, error = %e, "failed to write book to archive");
+                        let _ = tx.blocking_send(ArchiveIoResult::WriteFailed { cid });
                     }
                 });
+            } else {
+                let _ = archive_tx.try_send(ArchiveIoResult::WriteFailed { cid });
             }
         }
         RuntimeAction::CascadeToArchive { cid } => {
@@ -2178,11 +2187,13 @@ async fn dispatch_action(
             if let (Some(ref ddir), Some(ref adir)) = (&data_dir, &archive_dir) {
                 let ddir = ddir.clone();
                 let adir = adir.clone();
+                let tx = archive_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     match crate::disk_io::read_book(&ddir, &cid) {
                         Ok(data) => {
                             if let Err(e) = crate::disk_io::write_book(&adir, &cid, &data) {
                                 tracing::error!(?cid, error = %e, "cascade to archive: write failed");
+                                let _ = tx.blocking_send(ArchiveIoResult::WriteFailed { cid });
                                 return;
                             }
                             if let Err(e) = crate::disk_io::delete_book(&ddir, &cid) {
@@ -2191,6 +2202,7 @@ async fn dispatch_action(
                         }
                         Err(e) => {
                             tracing::warn!(?cid, error = %e, "cascade to archive: disk read failed");
+                            let _ = tx.blocking_send(ArchiveIoResult::WriteFailed { cid });
                         }
                     }
                 });
@@ -2217,6 +2229,8 @@ async fn dispatch_action(
                         }
                     }
                 });
+            } else {
+                let _ = archive_tx.try_send(ArchiveIoResult::ReadFailed { cid, query_id });
             }
         }
         RuntimeAction::RemoveFromArchive { cid } => {
