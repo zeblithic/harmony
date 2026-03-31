@@ -955,32 +955,25 @@ async fn spawn_nix_cache_server(
         return Ok(());
     }
 
-    // Load existing memos and books from disk so the HTTP server can serve
-    // narinfo for previously-pushed store paths (not just an empty store).
-    use harmony_content::book::BookStore as _;
+    // Load existing memos from disk so narinfo lookups work for previously
+    // pushed store paths. Books (NAR chunks) are NOT loaded into memory —
+    // they can be gigabytes and the HTTP handlers already fall back to disk
+    // via disk_io::read_book when a book isn't in the in-memory store.
     let mut memo_store = harmony_memo::store::MemoStore::new();
-    let mut book_store = harmony_content::book::MemoryBookStore::new();
+    let book_store = harmony_content::book::MemoryBookStore::new();
     if let Some(ref dir) = data_dir {
         let dir_clone = dir.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            let memos = crate::memo_io::scan_memos(&dir_clone);
-            let books = crate::disk_io::scan_books(&dir_clone);
-            (memos, books)
+        let memos = tokio::task::spawn_blocking(move || {
+            crate::memo_io::scan_memos(&dir_clone)
         })
         .await
-        .map_err(|e| format!("failed to load disk data: {e}"))?;
+        .map_err(|e| format!("failed to load memos: {e}"))?;
 
-        let (memos, books) = loaded;
         let memo_count = memos.len();
         for (memo, _) in memos {
             memo_store.insert(memo);
         }
-        for (cid, _) in &books {
-            if let Ok(data) = crate::disk_io::read_book(dir, cid) {
-                book_store.store(*cid, data);
-            }
-        }
-        tracing::info!(memo_count, book_count = books.len(), "loaded nix-cache state from disk");
+        tracing::info!(memo_count, "loaded nix-cache memos from disk");
     }
 
     let state = std::sync::Arc::new(crate::nix_cache::NixCacheState {
