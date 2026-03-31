@@ -86,6 +86,10 @@ pub struct ConfigFile {
     pub inference_model_tokenizer_cid: Option<String>,
     /// Hex-encoded 32-byte CID of the Engram manifest in CAS.
     pub engram_manifest_cid: Option<String>,
+    /// Port for the Nix binary cache HTTP server (0 or absent = disabled).
+    /// Requires the `nix-cache` feature.
+    #[cfg_attr(not(feature = "nix-cache"), allow(dead_code))]
+    pub nix_cache_port: Option<u16>,
 }
 
 #[derive(Deserialize, Debug)]
