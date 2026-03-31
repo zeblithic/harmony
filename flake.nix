@@ -41,6 +41,8 @@
           # Include .cargo/config.toml so cross-build rustflags
           # (e.g., link-self-contained=yes for aarch64 musl) are visible.
           (pkgs.lib.fileset.maybeMissing ./.cargo/config.toml)
+          # Include .wat files needed by build.rs (compiled to WASM at build time).
+          ./crates/harmony-node/src/inference_runner.wat
         ];
       };
 
@@ -60,8 +62,9 @@
             openssl
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.darwin.apple_sdk.frameworks.Security
-            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            # On nixpkgs unstable (26.05+), darwin.apple_sdk.frameworks is removed.
+            # Security and SystemConfiguration are pulled transitively by openssl
+            # and other deps — no explicit listing needed.
             pkgs.libiconv
           ];
 
@@ -94,8 +97,6 @@
             openssl
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.darwin.apple_sdk.frameworks.Security
-            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
             pkgs.libiconv
           ];
 
