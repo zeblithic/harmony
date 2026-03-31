@@ -1314,7 +1314,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
                 _ => {
                     tracing::info!(
-                        identity = %hex::encode(identity_hash),
+                        identity = %hex::encode(&identity_hash[..4]),
                         "contact has tunnel address but PQ keys not in discovery cache — \
                          tunnel dial deferred until announce arrives"
                     );
@@ -1725,8 +1725,8 @@ impl<B: BookStore> NodeRuntime<B> {
                 if !dsa_pubkey.is_empty() {
                     self.insert_pubkey_capped(identity_hash, dsa_pubkey);
                 }
-                // PQ keys arriving may complete the requirements for tunnel
-                // dial if the contact already has a tunnel address.
+                // A learned key (classic or ML-DSA) may coincide with PQ keys
+                // already cached in the discovery record — attempt tunnel initiation.
                 self.try_initiate_tunnel(identity_hash);
             }
             RuntimeEvent::MemoFetchRequest { input } => {
@@ -2402,6 +2402,7 @@ impl<B: BookStore> NodeRuntime<B> {
                 &self.contact_store,
             );
             self.translate_peer_actions(peer_actions);
+            self.try_initiate_tunnel(identity_hash);
         } else {
             // Auto-create contact for discovered peer.
             let unix_now = std::time::SystemTime::now()
@@ -2427,6 +2428,7 @@ impl<B: BookStore> NodeRuntime<B> {
                     &self.contact_store,
                 );
                 self.translate_peer_actions(peer_actions);
+                self.try_initiate_tunnel(identity_hash);
             }
         }
     }
