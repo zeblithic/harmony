@@ -66,6 +66,12 @@ pub struct ConfigFile {
     /// Disk quota for CAS book storage (e.g. "10 GiB"). Requires `data_dir`.
     /// If absent, disk usage is unbounded.
     pub disk_quota: Option<String>,
+    /// Directory for cold-tier archive storage (e.g. HDD).
+    /// When NVMe `data_dir` evicts content, it cascades here instead of being deleted.
+    pub archive_dir: Option<PathBuf>,
+    /// Archive quota (e.g. "20 TiB"). Requires `archive_dir`.
+    /// If absent, archive usage is unbounded.
+    pub archive_quota: Option<String>,
     pub filter_broadcast_ticks: Option<u32>,
     pub filter_mutation_threshold: Option<u32>,
     pub encrypted_durable_persist: Option<bool>,

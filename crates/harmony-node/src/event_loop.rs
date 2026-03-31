@@ -33,6 +33,18 @@ enum DiskIoResult {
     ReadFailed { cid: ContentId, query_id: u64 },
 }
 
+/// Result of an async archive I/O operation (cold tier, e.g. HDD).
+enum ArchiveIoResult {
+    /// Book data successfully read from archive.
+    ReadComplete {
+        cid: ContentId,
+        query_id: u64,
+        data: Vec<u8>,
+    },
+    /// Book not found or read error.
+    ReadFailed { cid: ContentId, query_id: u64 },
+}
+
 /// Result of an async S3 fetch, sent back to the event loop via channel.
 #[allow(dead_code)] // Variants constructed only when `archivist` feature is enabled.
 enum S3IoResult {
@@ -340,6 +352,7 @@ pub async fn run(
     rawlink_interface: Option<String>,
     archivist_config: Option<crate::config::ArchivistConfig>,
     data_dir: Option<std::path::PathBuf>,
+    archive_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -600,6 +613,11 @@ pub async fn run(
     // Write completions are fire-and-forget (errors logged in the spawned task).
     let (disk_tx, mut disk_rx) = mpsc::channel::<DiskIoResult>(64);
 
+    // ── Archive I/O completion channel ────────────────────────────────────────
+    // Blocking archive (HDD) tasks send results back here; the select loop feeds
+    // them into the runtime as ArchiveReadComplete / ArchiveReadFailed events.
+    let (archive_tx, mut archive_rx) = mpsc::channel::<ArchiveIoResult>(64);
+
     // ── S3 I/O completion channel ────────────────────────────────────────────
     // Async S3 fetch tasks send results back here; the select loop feeds them
     // into the runtime as S3ReadComplete / S3ReadFailed events.
@@ -624,6 +642,8 @@ pub async fn run(
             &ret_outbound_tx,
             &data_dir,
             &disk_tx,
+            &archive_dir,
+            &archive_tx,
             &s3_read_library,
             &s3_tx,
         )
@@ -873,6 +893,18 @@ pub async fn run(
                     }
                     DiskIoResult::ReadFailed { cid, query_id } => {
                         runtime.push_event(RuntimeEvent::DiskReadFailed { cid, query_id });
+                    }
+                }
+            }
+
+            // Arm 4a: Archive I/O completion — feed results back into runtime.
+            Some(archive_result) = archive_rx.recv() => {
+                match archive_result {
+                    ArchiveIoResult::ReadComplete { cid, query_id, data } => {
+                        runtime.push_event(RuntimeEvent::ArchiveReadComplete { cid, query_id, data });
+                    }
+                    ArchiveIoResult::ReadFailed { cid, query_id } => {
+                        runtime.push_event(RuntimeEvent::ArchiveReadFailed { cid, query_id });
                     }
                 }
             }
@@ -1623,6 +1655,8 @@ pub async fn run(
                     &ret_outbound_tx,
                     &data_dir,
                     &disk_tx,
+                    &archive_dir,
+                    &archive_tx,
                     &s3_read_library,
                     &s3_tx,
                 )
@@ -1782,6 +1816,8 @@ async fn dispatch_action(
     ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     data_dir: &Option<std::path::PathBuf>,
     disk_tx: &mpsc::Sender<DiskIoResult>,
+    archive_dir: &Option<std::path::PathBuf>,
+    archive_tx: &mpsc::Sender<ArchiveIoResult>,
     s3_read_library: &S3ReadLibrary,
     s3_tx: &mpsc::Sender<S3IoResult>,
 ) {
@@ -2127,6 +2163,72 @@ async fn dispatch_action(
                 });
             }
         }
+        RuntimeAction::PersistToArchive { cid, data } => {
+            if let Some(ref dir) = archive_dir {
+                let dir = dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = crate::disk_io::write_book(&dir, &cid, &data) {
+                        tracing::error!(?cid, error = %e, "failed to write book to archive");
+                    }
+                });
+            }
+        }
+        RuntimeAction::CascadeToArchive { cid } => {
+            // Read from disk (NVMe), write to archive (HDD), then delete from disk.
+            if let (Some(ref ddir), Some(ref adir)) = (&data_dir, &archive_dir) {
+                let ddir = ddir.clone();
+                let adir = adir.clone();
+                tokio::task::spawn_blocking(move || {
+                    match crate::disk_io::read_book(&ddir, &cid) {
+                        Ok(data) => {
+                            if let Err(e) = crate::disk_io::write_book(&adir, &cid, &data) {
+                                tracing::error!(?cid, error = %e, "cascade to archive: write failed");
+                                return;
+                            }
+                            if let Err(e) = crate::disk_io::delete_book(&ddir, &cid) {
+                                tracing::warn!(?cid, error = %e, "cascade to archive: disk cleanup failed");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(?cid, error = %e, "cascade to archive: disk read failed");
+                        }
+                    }
+                });
+            }
+        }
+        RuntimeAction::ArchiveLookup { cid, query_id } => {
+            if let Some(ref dir) = archive_dir {
+                let dir = dir.clone();
+                let tx = archive_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    match crate::disk_io::read_book(&dir, &cid) {
+                        Ok(data) => {
+                            let _ = tx.blocking_send(ArchiveIoResult::ReadComplete {
+                                cid,
+                                query_id,
+                                data,
+                            });
+                        }
+                        Err(_) => {
+                            let _ = tx.blocking_send(ArchiveIoResult::ReadFailed {
+                                cid,
+                                query_id,
+                            });
+                        }
+                    }
+                });
+            }
+        }
+        RuntimeAction::RemoveFromArchive { cid } => {
+            if let Some(ref dir) = archive_dir {
+                let dir = dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = crate::disk_io::delete_book(&dir, &cid) {
+                        tracing::warn!(?cid, error = %e, "failed to delete book from archive");
+                    }
+                });
+            }
+        }
         RuntimeAction::S3Lookup { cid, query_id } => {
             #[cfg(feature = "archivist")]
             {
@@ -2200,6 +2302,8 @@ async fn handle_inference_result(
     ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     data_dir: &Option<std::path::PathBuf>,
     disk_tx: &mpsc::Sender<DiskIoResult>,
+    archive_dir: &Option<std::path::PathBuf>,
+    archive_tx: &mpsc::Sender<ArchiveIoResult>,
     s3_read_library: &S3ReadLibrary,
     s3_tx: &mpsc::Sender<S3IoResult>,
 ) {
