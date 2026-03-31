@@ -2144,8 +2144,23 @@ impl<B: BookStore> NodeRuntime<B> {
                     });
                 }
                 NodeAction::AnnounceReceived {
-                    validated_announce, ..
+                    validated_announce,
+                    path_update,
+                    ..
                 } => {
+                    // Skip duplicate and unroutable announces. The path table
+                    // tracks the random blob from each announce and returns
+                    // DuplicateBlob when the same blob is received again (e.g.
+                    // via broadcast + unicast). ExceedsMaxHops means the path
+                    // table rejected the entry — no route was recorded, so
+                    // emitting a PeerEvent would trigger initiation with no path.
+                    if matches!(
+                        path_update,
+                        harmony_reticulum::PathUpdateResult::DuplicateBlob
+                            | harmony_reticulum::PathUpdateResult::ExceedsMaxHops
+                    ) {
+                        continue;
+                    }
                     // Feed announce into PeerManager so it can trigger
                     // link/tunnel initiation for known contacts.
                     // Use identity.address_hash (the raw identity hash), NOT
