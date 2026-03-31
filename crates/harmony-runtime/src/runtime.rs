@@ -1090,6 +1090,9 @@ impl<B: BookStore> NodeRuntime<B> {
                         StorageTierAction::CascadeToArchive { cid } => {
                             actions.push(RuntimeAction::CascadeToArchive { cid });
                         }
+                        StorageTierAction::RemoveFromArchive { cid } => {
+                            actions.push(RuntimeAction::RemoveFromArchive { cid });
+                        }
                         _ => {}
                     }
                 }
