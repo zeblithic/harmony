@@ -31,6 +31,11 @@ impl PeerManager {
         }
     }
 
+    /// Returns the current status for a tracked peer, or `None` if untracked.
+    pub fn peer_status(&self, identity_hash: &IdentityHash) -> Option<PeerStatus> {
+        self.peers.get(identity_hash).map(|p| p.status)
+    }
+
     #[must_use]
     pub fn on_event(&mut self, event: PeerEvent, contacts: &ContactStore) -> Vec<PeerAction> {
         let mut actions = Vec::new();

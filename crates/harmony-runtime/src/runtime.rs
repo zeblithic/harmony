@@ -1269,6 +1269,74 @@ impl<B: BookStore> NodeRuntime<B> {
         self.pubkey_cache.insert(identity_hash, pubkey);
     }
 
+    /// If the contact has a tunnel address and we have their PQ keys from a
+    /// discovery record, emit `RuntimeAction::InitiateTunnel`. This bridges
+    /// the gap where Discovery-announced peers get tunnel addresses but the
+    /// PeerManager only moves them to `Searching` without initiating a tunnel.
+    fn try_initiate_tunnel(&mut self, identity_hash: [u8; 16]) {
+        use harmony_contacts::ContactAddress;
+        use harmony_peers::PeerStatus;
+
+        // Skip if peer is already connecting or connected.
+        match self.peer_manager.peer_status(&identity_hash) {
+            Some(PeerStatus::Connecting) | Some(PeerStatus::Connected) => return,
+            Some(PeerStatus::Disabled) => return,
+            _ => {} // Searching or untracked — proceed
+        }
+
+        // Find the first tunnel address on the contact.
+        let tunnel_addr = match self.contact_store.get(&identity_hash) {
+            Some(contact) => contact.addresses.iter().find_map(|addr| {
+                if let ContactAddress::Tunnel {
+                    node_id, relay_url, ..
+                } = addr
+                {
+                    Some((*node_id, relay_url.clone()))
+                } else {
+                    None
+                }
+            }),
+            None => return,
+        };
+
+        let (node_id, relay_url) = match tunnel_addr {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Look up PQ public keys from the discovery record.
+        let (peer_dsa_pubkey, peer_kem_pubkey) =
+            match self.discovery.get_record(&identity_hash, self.last_unix_now) {
+                Some(record)
+                    if !record.public_key.is_empty() && !record.encryption_key.is_empty() =>
+                {
+                    (record.public_key.clone(), record.encryption_key.clone())
+                }
+                _ => {
+                    tracing::info!(
+                        identity = %hex::encode(identity_hash),
+                        "contact has tunnel address but PQ keys not in discovery cache — \
+                         tunnel dial deferred until announce arrives"
+                    );
+                    return;
+                }
+            };
+
+        tracing::info!(
+            identity = %hex::encode(&identity_hash[..4]),
+            "initiating tunnel for contact with tunnel address and PQ keys"
+        );
+
+        self.pending_direct_actions
+            .push(RuntimeAction::InitiateTunnel {
+                identity_hash,
+                node_id,
+                relay_url,
+                peer_dsa_pubkey,
+                peer_kem_pubkey,
+            });
+    }
+
     /// Read-only access to the memo store.
     pub fn memo_store(&self) -> &MemoStore {
         &self.memo_store
@@ -1616,6 +1684,9 @@ impl<B: BookStore> NodeRuntime<B> {
                     &self.contact_store,
                 );
                 self.translate_peer_actions(peer_actions);
+                // If the contact has a tunnel address and we have their PQ
+                // keys, proactively initiate a tunnel.
+                self.try_initiate_tunnel(identity_hash);
             }
             RuntimeEvent::ReplicaPushReceived {
                 peer_identity,
@@ -1654,6 +1725,9 @@ impl<B: BookStore> NodeRuntime<B> {
                 if !dsa_pubkey.is_empty() {
                     self.insert_pubkey_capped(identity_hash, dsa_pubkey);
                 }
+                // PQ keys arriving may complete the requirements for tunnel
+                // dial if the contact already has a tunnel address.
+                self.try_initiate_tunnel(identity_hash);
             }
             RuntimeEvent::MemoFetchRequest { input } => {
                 self.handle_memo_fetch_request(input);
