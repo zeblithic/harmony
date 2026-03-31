@@ -123,16 +123,31 @@ impl NarInfo {
     }
 
     /// Compute the Nix fingerprint that gets signed:
-    /// `1;<StorePath>;<NarHash>;<NarSize>;<space-separated-sorted-references>`
+    /// `1;<StorePath>;<NarHash>;<NarSize>;<comma-separated-sorted-full-store-paths>`
+    ///
+    /// References in the fingerprint are **full store paths** joined by commas,
+    /// NOT the space-separated basenames used in the narinfo text. Example:
+    /// `1;/nix/store/abc-pkg;sha256:...;1234;/nix/store/def-dep1,/nix/store/ghi-dep2`
     pub fn fingerprint(&self) -> String {
-        let mut sorted_refs = self.references.clone();
-        sorted_refs.sort();
+        // References are stored as basenames; prepend /nix/store/ for the fingerprint.
+        let mut full_refs: Vec<String> = self
+            .references
+            .iter()
+            .map(|r| {
+                if r.starts_with("/nix/store/") {
+                    r.clone()
+                } else {
+                    format!("/nix/store/{r}")
+                }
+            })
+            .collect();
+        full_refs.sort();
         format!(
             "1;{};{};{};{}",
             self.store_path,
             self.nar_hash,
             self.nar_size,
-            sorted_refs.join(" ")
+            full_refs.join(",")
         )
     }
 
@@ -298,19 +313,19 @@ mod tests {
     fn fingerprint_format() {
         let ni = sample_narinfo();
         let fp = ni.fingerprint();
-        // References must be sorted.
         assert!(
             fp.starts_with("1;/nix/store/"),
-            "fingerprint must start with '1;'"
+            "fingerprint must start with '1;/nix/store/'"
         );
-        // Sorted: dep0 comes before dep1.
+        // References in the fingerprint are comma-separated full store paths, sorted.
         let refs_part = fp.split(';').nth(4).expect("fingerprint has 5 semicolon parts");
-        let refs: Vec<&str> = refs_part.split_whitespace().collect();
+        let refs: Vec<&str> = refs_part.split(',').collect();
         assert_eq!(refs.len(), 2);
-        assert!(
-            refs[0] < refs[1],
-            "references must be sorted in fingerprint"
-        );
+        // Each ref is a full store path
+        assert!(refs[0].starts_with("/nix/store/"), "ref must be full path");
+        assert!(refs[1].starts_with("/nix/store/"), "ref must be full path");
+        // Sorted alphabetically
+        assert!(refs[0] < refs[1], "references must be sorted: {} < {}", refs[0], refs[1]);
         assert!(fp.contains(&ni.nar_hash));
         assert!(fp.contains(&ni.nar_size.to_string()));
     }

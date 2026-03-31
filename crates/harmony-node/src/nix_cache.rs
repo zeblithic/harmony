@@ -175,23 +175,28 @@ async fn nar_handler(
     };
     let root_cid = ContentId::from_bytes(cid_bytes);
 
-    // Try reassembling from the in-memory store first.
+    // Try reassembling from the in-memory store first (no disk I/O).
     let nar_bytes = match dag::reassemble(&root_cid, state.book_store.as_ref()) {
         Ok(data) => data,
         Err(_) => {
-            // Fall back to loading the entire DAG from disk into a temp store.
-            match &state.data_dir {
-                Some(dir) => {
-                    let mut temp_store = MemoryBookStore::new();
-                    if load_dag_from_disk(dir, &root_cid, &mut temp_store).is_err() {
-                        return StatusCode::NOT_FOUND.into_response();
-                    }
-                    match dag::reassemble(&root_cid, &temp_store) {
-                        Ok(data) => data,
-                        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-                    }
-                }
+            // Fall back to loading the DAG from disk. Use spawn_blocking to
+            // avoid blocking the async executor (worker_threads = 1).
+            let data_dir = match &state.data_dir {
+                Some(dir) => dir.clone(),
                 None => return StatusCode::NOT_FOUND.into_response(),
+            };
+            let cid = root_cid;
+            let result = tokio::task::spawn_blocking(move || {
+                let mut temp_store = MemoryBookStore::new();
+                if load_dag_from_disk(&data_dir, &cid, &mut temp_store).is_err() {
+                    return None;
+                }
+                dag::reassemble(&cid, &temp_store).ok()
+            })
+            .await;
+            match result {
+                Ok(Some(data)) => data,
+                _ => return StatusCode::NOT_FOUND.into_response(),
             }
         }
     };
