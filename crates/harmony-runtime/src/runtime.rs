@@ -1100,6 +1100,9 @@ impl<B: BookStore> NodeRuntime<B> {
                             if archive_removals.contains(&cid) {
                                 // Archive is also evicting this CID — don't cascade,
                                 // just delete from disk to avoid a write→delete race.
+                                // Retract the phantom archive_index entry that
+                                // record_archive_persist just inserted.
+                                rt.storage.retract_archive_entry(&cid);
                                 actions.push(RuntimeAction::RemoveFromDisk { cid });
                             } else {
                                 actions.push(RuntimeAction::CascadeToArchive { cid });

@@ -535,6 +535,15 @@ impl<B: BookStore> StorageTier<B> {
         self.archive_index.contains_key(cid)
     }
 
+    /// Retract a speculative archive_index entry (e.g. when a startup cascade
+    /// is cancelled because archive quota already evicted the same CID).
+    pub fn retract_archive_entry(&mut self, cid: &ContentId) {
+        if let Some(entry_size) = self.archive_index.remove(cid) {
+            self.archive_used_bytes = self.archive_used_bytes.saturating_sub(entry_size);
+            self.archive_lru.retain(|c| c != cid);
+        }
+    }
+
     /// Retrieve raw book data by CID from the underlying content store.
     pub fn get(&self, cid: &ContentId) -> Option<&[u8]> {
         self.cache.get(cid)
