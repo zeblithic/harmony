@@ -39,6 +39,9 @@ const MAX_MEMO_RESPONSE_COUNT: usize = 256;
 /// Maximum total response payload size (1 MiB).
 const MAX_MEMO_RESPONSE_BYTES: usize = 1_048_576;
 
+/// Ticks between Discovery announce re-publishes (1200 × 250ms = 5 min).
+const ANNOUNCE_REPUBLISH_INTERVAL_TICKS: u64 = 1200;
+
 /// Configuration for a Harmony node runtime.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -69,6 +72,10 @@ pub struct NodeConfig {
     /// Used to verify Discovery UCAN tokens (which are issued by this node).
     /// Defaults to empty; must be set from the loaded identity at startup.
     pub local_dsa_pubkey: Vec<u8>,
+    /// This node's ML-KEM-768 public encapsulation key bytes.
+    /// Included in Discovery announce records so peers can initiate PQ tunnels.
+    /// Defaults to empty; must be set from the loaded PQ identity at startup.
+    pub local_kem_pubkey: Vec<u8>,
     /// Combined Reticulum private identity bytes (64 bytes: 32B X25519 secret + 32B Ed25519 secret).
     /// When present, the runtime registers a Reticulum announcing destination
     /// so periodic path announces flow to UDP peers.
@@ -152,6 +159,7 @@ impl Default for NodeConfig {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            local_kem_pubkey: Vec::new(),
             reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
@@ -224,6 +232,10 @@ pub enum RuntimeEvent {
         node_id: [u8; 32],
         relay_url: Option<String>,
     },
+    /// A pre-built, signed Discovery announce record is ready for publishing.
+    /// Built and signed by the event loop (which holds the ML-DSA signing key),
+    /// then fed here for the sans-I/O runtime to publish via Zenoh.
+    LocalAnnounceReady { record_bytes: Vec<u8> },
     /// Peer lifecycle: a tunnel connection has been established to a peer.
     TunnelPeerEstablished {
         identity_hash: [u8; 16],
@@ -664,9 +676,14 @@ pub struct NodeRuntime<B: BookStore> {
     // Identity discovery manager (sans-I/O)
     discovery: DiscoveryManager,
     // Local tunnel routing hint (populated when iroh endpoint binds).
-    // TODO: Wire into AnnounceBuilder when outgoing announce publishing
-    // is implemented via DiscoveryAction::PublishAnnounce + Zenoh put.
     local_tunnel_hint: Option<harmony_discovery::RoutingHint>,
+    // ML-KEM-768 public encapsulation key (for Discovery announce records).
+    // Stored for future use by discover queryable responses.
+    #[allow(dead_code)]
+    local_kem_pubkey: Vec<u8>,
+    // Ticks since last Discovery announce publish. Re-publishes every
+    // ANNOUNCE_REPUBLISH_INTERVAL_TICKS (~5 min at 250ms/tick).
+    ticks_since_announce_publish: u64,
     // Most recent monotonic timestamp from TimerTick (used for PeerManager ticks).
     last_now: u64,
     // Replication: stores encrypted books on behalf of other peers
@@ -920,6 +937,11 @@ impl<B: BookStore> NodeRuntime<B> {
             key_expr: harmony_zenoh::namespace::filters::PAGE_SUB.to_string(),
         });
 
+        // Subscribe to peer Discovery announce records (PQ keys + routing hints).
+        actions.push(RuntimeAction::Subscribe {
+            key_expr: harmony_zenoh::namespace::identity::ALL_ANNOUNCES.to_string(),
+        });
+
         // Subscribe to capacity advertisements for DSD target discovery.
         #[cfg(feature = "inference")]
         actions.push(RuntimeAction::Subscribe {
@@ -958,6 +980,8 @@ impl<B: BookStore> NodeRuntime<B> {
             memo_store: MemoStore::new(),
             discovery: DiscoveryManager::new(),
             local_tunnel_hint: None,
+            local_kem_pubkey: config.local_kem_pubkey.clone(),
+            ticks_since_announce_publish: 0,
             last_now: 0,
             replica_store: MemoryReplicaStore::new(),
             ticks_since_replica_scan: 0,
@@ -1654,6 +1678,23 @@ impl<B: BookStore> NodeRuntime<B> {
                     direct_addrs: vec![],
                 });
             }
+            RuntimeEvent::LocalAnnounceReady { record_bytes } => {
+                let record = match harmony_discovery::AnnounceRecord::deserialize(&record_bytes) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(?e, "failed to deserialize local announce record");
+                        return;
+                    }
+                };
+                // Store for query serving + cache.
+                self.local_full_announce = Some(record_bytes);
+                self.discovery.set_local_record(record);
+                // Emit PublishAnnounce + SetLiveliness via DiscoveryManager.
+                let actions = self.discovery.start_announcing();
+                self.dispatch_discovery_actions(actions);
+                self.ticks_since_announce_publish = 0;
+                tracing::info!("Discovery announce record published to Zenoh");
+            }
             RuntimeEvent::TunnelPeerEstablished {
                 identity_hash,
                 node_id,
@@ -1847,6 +1888,15 @@ impl<B: BookStore> NodeRuntime<B> {
                     .push(RuntimeAction::SendReply { query_id, payload });
                 self.dsd_session = None;
             }
+        }
+
+        // Periodic Discovery announce re-publish (~5 min).
+        self.ticks_since_announce_publish += 1;
+        if self.ticks_since_announce_publish >= ANNOUNCE_REPUBLISH_INTERVAL_TICKS {
+            self.ticks_since_announce_publish = 0;
+            // Re-call start_announcing() which is idempotent and emits PublishAnnounce.
+            let disc_actions = self.discovery.start_announcing();
+            self.dispatch_discovery_actions(disc_actions);
         }
 
         let mut actions = Vec::new();
@@ -2228,6 +2278,53 @@ impl<B: BookStore> NodeRuntime<B> {
         }
     }
 
+    /// Handle an inbound Discovery announce received via Zenoh subscription.
+    /// Shares logic with `DiscoveryAnnounceReceived` but is called inline from
+    /// `route_subscription` (which already has `&mut self`).
+    fn handle_discovery_announce(&mut self, record_bytes: Vec<u8>) {
+        let unix_now = self.last_unix_now;
+        let record = match harmony_discovery::AnnounceRecord::deserialize(&record_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("invalid announce record from Zenoh: {e:?}");
+                return;
+            }
+        };
+        if let Err(e) = harmony_discovery::verify_announce(&record, unix_now) {
+            tracing::debug!("Zenoh announce verification failed: {e:?}");
+            return;
+        }
+        let identity_hash = record.identity_ref.hash;
+
+        // Skip our own announces (we published them).
+        if identity_hash == self.local_pq_identity_hash {
+            return;
+        }
+
+        let old_published_at = self
+            .discovery
+            .get_record(&identity_hash, unix_now)
+            .map(|r| r.published_at);
+        let actions =
+            self.discovery
+                .on_event(harmony_discovery::DiscoveryEvent::AnnounceReceived {
+                    record,
+                    now: unix_now,
+                });
+        self.dispatch_discovery_actions(actions);
+
+        let new_published_at = self
+            .discovery
+            .get_record(&identity_hash, unix_now)
+            .map(|r| r.published_at);
+        if new_published_at != old_published_at {
+            if let Some(cached) = self.discovery.get_record(&identity_hash, unix_now) {
+                let cached_clone = cached.clone();
+                self.process_discovered_tunnel_hints(&cached_clone);
+            }
+        }
+    }
+
     /// Variant of `dispatch_storage_actions` used from `push_event` where no
     /// output vec is available. Buffers actions into `pending_direct_actions`
     /// so they are emitted at the start of the next `tick()`.
@@ -2237,12 +2334,31 @@ impl<B: BookStore> NodeRuntime<B> {
         self.pending_direct_actions = out;
     }
 
-    fn dispatch_discovery_actions(&mut self, _actions: Vec<harmony_discovery::DiscoveryAction>) {
-        // Tunnel hint processing is done at the call site (after staleness
-        // check) rather than here via IdentityDiscovered, because
-        // IdentityDiscovered requires Zenoh liveliness tokens (not wired).
-        // Other actions (PublishAnnounce, SetLiveliness, etc.) deferred to
-        // full Zenoh wiring.
+    fn dispatch_discovery_actions(&mut self, actions: Vec<harmony_discovery::DiscoveryAction>) {
+        use harmony_discovery::DiscoveryAction;
+        for action in actions {
+            match action {
+                DiscoveryAction::PublishAnnounce { record } => {
+                    match record.serialize() {
+                        Ok(bytes) => {
+                            let identity_hex = hex::encode(self.local_pq_identity_hash);
+                            let key_expr =
+                                harmony_zenoh::namespace::identity::announce_key(&identity_hex);
+                            self.pending_direct_actions
+                                .push(RuntimeAction::Publish { key_expr, payload: bytes });
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, "failed to serialize local announce record");
+                        }
+                    }
+                }
+                // SetLiveliness requires Zenoh liveliness token wiring (future work).
+                // Tunnel hint processing is done at the call site (after staleness
+                // check) rather than here via IdentityDiscovered, because
+                // IdentityDiscovered requires Zenoh liveliness tokens (not wired).
+                _ => {}
+            }
+        }
     }
 
     /// Validate a PullWithToken request and emit a PullResponse if authorized.
@@ -4150,6 +4266,14 @@ impl<B: BookStore> NodeRuntime<B> {
             }
         }
 
+        // Check if this is a Discovery identity announce.
+        if key_expr.starts_with(harmony_zenoh::namespace::identity::PREFIX)
+            && key_expr.ends_with("/announce")
+        {
+            self.handle_discovery_announce(payload);
+            return;
+        }
+
         if let Some(event) = self.parse_subscription_event(&key_expr, payload) {
             self.storage_queue.push_back(event);
         }
@@ -4300,6 +4424,9 @@ mod tests {
             node_id: [0u8; 32],
             relay_url: Some("https://iroh.q8.fyi".into()),
         };
+        let _e8b = RuntimeEvent::LocalAnnounceReady {
+            record_bytes: vec![0u8; 10],
+        };
         let _e_mfr = RuntimeEvent::MemoFetchRequest {
             input: ContentId::from_bytes([0u8; 32]),
         };
@@ -4420,8 +4547,8 @@ mod tests {
 
         // 16 shard + 1 stats + 1 compute + 1 page + 1 memo + 1 discover = 21
         assert_eq!(queryable_count, 21);
-        // transit + publish + content filter + flatpack filter + memo filter + page filter subscriptions = 6
-        assert_eq!(subscribe_count, 6);
+        // transit + publish + content filter + flatpack filter + memo filter + page filter + identity announce = 7
+        assert_eq!(subscribe_count, 7);
     }
 
     #[test]
@@ -5178,6 +5305,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            local_kem_pubkey: Vec::new(),
+            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -5253,6 +5382,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            local_kem_pubkey: Vec::new(),
+            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -5294,6 +5425,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            local_kem_pubkey: Vec::new(),
+            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -5332,6 +5465,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            local_kem_pubkey: Vec::new(),
+            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -5399,6 +5534,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            local_kem_pubkey: Vec::new(),
+            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -5455,6 +5592,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            local_kem_pubkey: Vec::new(),
+            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -5504,6 +5643,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            local_kem_pubkey: Vec::new(),
+            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -6411,6 +6552,8 @@ mod tests {
             local_identity_hash: [0u8; 16],
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
+            local_kem_pubkey: Vec::new(),
+            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,

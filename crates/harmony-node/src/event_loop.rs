@@ -239,6 +239,75 @@ impl PartialEq for DeferredDial {
 
 impl Eq for DeferredDial {}
 
+/// Build a signed Discovery announce record with PQ keys and routing hints.
+///
+/// Called once at startup when the iroh tunnel endpoint is ready. The record is
+/// serialized and fed to the runtime as `LocalAnnounceReady` for Zenoh publishing.
+fn build_local_announce(
+    pq_identity: &PqPrivateIdentity,
+    node_id: [u8; 32],
+    relay_url: Option<String>,
+    reticulum_addr: Option<[u8; 16]>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    use harmony_discovery::{AnnounceBuilder, AnnounceRecord, RoutingHint};
+    use harmony_identity::IdentityRef;
+    use rand::RngCore;
+
+    let pub_id = pq_identity.public_identity();
+    let identity_ref = IdentityRef::from(pub_id);
+    let public_key = pub_id.verifying_key.as_bytes();
+    let encryption_key = pub_id.encryption_key.as_bytes();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expires_at = now + 600; // 10 minutes
+
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+    let mut builder = AnnounceBuilder::new(
+        identity_ref,
+        public_key,
+        encryption_key,
+        now,
+        expires_at,
+        nonce,
+    );
+
+    // Tunnel routing hint (iroh QUIC endpoint).
+    builder.add_routing_hint(RoutingHint::Tunnel {
+        node_id,
+        relay_url,
+        direct_addrs: vec![],
+    });
+
+    // Reticulum routing hint (Ed25519 destination hash for UDP mesh).
+    if let Some(dest_hash) = reticulum_addr {
+        builder.add_routing_hint(RoutingHint::Reticulum {
+            destination_hash: dest_hash,
+        });
+    }
+
+    let payload = builder.signable_payload();
+    let signature = pq_identity
+        .sign(&payload)
+        .map_err(|e| format!("ML-DSA sign failed: {e}"))?;
+    let record: AnnounceRecord = builder.build(signature);
+    let bytes = record
+        .serialize()
+        .map_err(|e| format!("announce serialize failed: {e:?}"))?;
+
+    tracing::info!(
+        identity = %hex::encode(&identity_ref.hash[..4]),
+        hints = record.routing_hints.len(),
+        "built Discovery announce record"
+    );
+
+    Ok(bytes)
+}
+
 /// Run the async event loop.
 ///
 /// # Parameters
@@ -496,8 +565,23 @@ pub async fn run(
         let relay_url = tunnel_config.as_ref().and_then(|c| c.relay_url.clone());
         runtime.push_event(RuntimeEvent::LocalTunnelInfo {
             node_id: node_id_bytes,
-            relay_url,
+            relay_url: relay_url.clone(),
         });
+
+        // Build and sign Discovery announce record with PQ keys + routing hints.
+        // The runtime is sans-I/O and doesn't hold the signing key, so we build
+        // the announce here (where Arc<PqPrivateIdentity> is accessible) and feed
+        // the pre-serialized bytes to the runtime for Zenoh publishing.
+        if let Some(ref tc) = tunnel_config {
+            match build_local_announce(&tc.local_identity, node_id_bytes, relay_url, mdns_addr) {
+                Ok(record_bytes) => {
+                    runtime.push_event(RuntimeEvent::LocalAnnounceReady { record_bytes });
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "failed to build Discovery announce — publishing disabled");
+                }
+            }
+        }
     }
 
     // ConfigTunnelPeers tracks config-sourced tunnels and drives backoff reconnection.
