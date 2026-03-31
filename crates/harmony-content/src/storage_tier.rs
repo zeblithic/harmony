@@ -119,6 +119,9 @@ pub enum StorageTierEvent {
     ArchiveReadFailed { cid: ContentId, query_id: u64 },
     /// Archive write failed — retract the speculative archive_index entry.
     ArchiveWriteFailed { cid: ContentId },
+    /// Cascade to archive failed but NVMe file still exists — retract archive
+    /// phantom and re-insert into disk_index so the content stays reachable.
+    ArchiveCascadeFailed { cid: ContentId, size: u64 },
     /// S3 read completed — book fetched from remote storage.
     S3ReadComplete {
         cid: ContentId,
@@ -709,6 +712,22 @@ impl<B: BookStore> StorageTier<B> {
                     self.archive_used_bytes =
                         self.archive_used_bytes.saturating_sub(entry_size);
                     self.archive_lru.retain(|c| c != &cid);
+                }
+                vec![]
+            }
+            StorageTierEvent::ArchiveCascadeFailed { cid, size } => {
+                // Archive write failed but the NVMe file still exists.
+                // Retract archive phantom and re-insert into disk_index so
+                // the content stays reachable via the NVMe copy.
+                if let Some(entry_size) = self.archive_index.remove(&cid) {
+                    self.archive_used_bytes =
+                        self.archive_used_bytes.saturating_sub(entry_size);
+                    self.archive_lru.retain(|c| c != &cid);
+                }
+                if !self.disk_index.contains_key(&cid) {
+                    self.disk_index.insert(cid, size);
+                    self.disk_lru.push_back(cid);
+                    self.disk_used_bytes += size;
                 }
                 vec![]
             }

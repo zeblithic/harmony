@@ -315,6 +315,8 @@ pub enum RuntimeEvent {
     ArchiveReadFailed { cid: ContentId, query_id: u64 },
     /// Archive write failed — retract phantom archive_index entry.
     ArchiveWriteFailed { cid: ContentId },
+    /// Cascade to archive failed but NVMe file still exists — re-index on disk.
+    ArchiveCascadeFailed { cid: ContentId, size: u64 },
 
     /// S3 read completed — content fetched from S3 fallback.
     S3ReadComplete {
@@ -1895,6 +1897,12 @@ impl<B: BookStore> NodeRuntime<B> {
                 let storage_actions = self
                     .storage
                     .handle(StorageTierEvent::ArchiveWriteFailed { cid });
+                self.dispatch_storage_actions_inline(storage_actions);
+            }
+            RuntimeEvent::ArchiveCascadeFailed { cid, size } => {
+                let storage_actions = self
+                    .storage
+                    .handle(StorageTierEvent::ArchiveCascadeFailed { cid, size });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
             RuntimeEvent::S3ReadComplete {

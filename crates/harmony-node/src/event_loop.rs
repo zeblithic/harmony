@@ -45,6 +45,8 @@ enum ArchiveIoResult {
     ReadFailed { cid: ContentId, query_id: u64 },
     /// Archive write failed — runtime should retract the phantom archive_index entry.
     WriteFailed { cid: ContentId },
+    /// Cascade write failed — the NVMe file still exists and should be re-indexed.
+    CascadeFailed { cid: ContentId, size: u64 },
 }
 
 /// Result of an async S3 fetch, sent back to the event loop via channel.
@@ -910,6 +912,9 @@ pub async fn run(
                     }
                     ArchiveIoResult::WriteFailed { cid } => {
                         runtime.push_event(RuntimeEvent::ArchiveWriteFailed { cid });
+                    }
+                    ArchiveIoResult::CascadeFailed { cid, size } => {
+                        runtime.push_event(RuntimeEvent::ArchiveCascadeFailed { cid, size });
                     }
                 }
             }
@@ -2191,9 +2196,11 @@ async fn dispatch_action(
                 tokio::task::spawn_blocking(move || {
                     match crate::disk_io::read_book(&ddir, &cid) {
                         Ok(data) => {
+                            let size = data.len() as u64;
                             if let Err(e) = crate::disk_io::write_book(&adir, &cid, &data) {
                                 tracing::error!(?cid, error = %e, "cascade to archive: write failed");
-                                let _ = tx.blocking_send(ArchiveIoResult::WriteFailed { cid });
+                                // NVMe file still exists — tell runtime to re-index it.
+                                let _ = tx.blocking_send(ArchiveIoResult::CascadeFailed { cid, size });
                                 return;
                             }
                             if let Err(e) = crate::disk_io::delete_book(&ddir, &cid) {
@@ -2202,10 +2209,13 @@ async fn dispatch_action(
                         }
                         Err(e) => {
                             tracing::warn!(?cid, error = %e, "cascade to archive: disk read failed");
+                            // NVMe file may still exist — send WriteFailed to retract phantom.
                             let _ = tx.blocking_send(ArchiveIoResult::WriteFailed { cid });
                         }
                     }
                 });
+            } else {
+                let _ = archive_tx.try_send(ArchiveIoResult::WriteFailed { cid });
             }
         }
         RuntimeAction::ArchiveLookup { cid, query_id } => {
