@@ -2144,8 +2144,16 @@ impl<B: BookStore> NodeRuntime<B> {
                     });
                 }
                 NodeAction::AnnounceReceived {
-                    validated_announce, ..
+                    validated_announce,
+                    path_update,
+                    ..
                 } => {
+                    // Skip duplicate announces. The path table tracks random_hash
+                    // blobs and returns DuplicateBlob when the same announce is
+                    // received a second time (e.g. via broadcast + unicast).
+                    if path_update == harmony_reticulum::PathUpdateResult::DuplicateBlob {
+                        continue;
+                    }
                     // Feed announce into PeerManager so it can trigger
                     // link/tunnel initiation for known contacts.
                     // Use identity.address_hash (the raw identity hash), NOT
