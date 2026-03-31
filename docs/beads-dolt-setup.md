@@ -3,6 +3,91 @@
 Comprehensive guide to how issue tracking is set up and used across all
 Zeblithic Harmony repositories.
 
+---
+
+## CRITICAL: The Git-Tracking Trap
+
+> **If `.beads/` files are tracked by git, beads WILL break on every branch
+> switch, stash, merge, or checkout.** This is the single most common cause
+> of beads failures in AI-assisted workflows.
+
+### What happens
+
+1. `bd init` creates `.beads/metadata.json` with `dolt_mode: "embedded"`
+2. If `.beads/` files get committed to git (e.g., `bd init` without `--stealth`,
+   or an AI agent runs `git add -A`), git now tracks `metadata.json`
+3. You fix `metadata.json` locally to `"embedded"` — it works
+4. Next `git checkout`, `git stash pop`, `git merge`, or branch switch **silently
+   reverts `metadata.json`** to whatever version git has committed (often `"server"`)
+5. Every `bd` command now fails with "database not found on Dolt server"
+6. You fix it again. Git reverts it again. Repeat for months.
+
+### Why `.git/info/exclude` is NOT sufficient
+
+`bd init --stealth` adds `.beads/` to `.git/info/exclude`. This is a **local-only
+gitignore** that:
+- Prevents new untracked `.beads/` files from showing in `git status`
+- Does **NOT** untrack files already committed to git
+- Does **NOT** propagate to other clones or machines
+
+If `.beads/` files were ever committed (even once), `.git/info/exclude` does nothing
+to protect them from git operations.
+
+### The correct setup (mandatory for all repos)
+
+**`.beads/` must be in the committed `.gitignore` AND untracked from the git index:**
+
+```bash
+# 1. Add to .gitignore (committed, works for all clones)
+echo ".beads/" >> .gitignore
+
+# 2. Remove from git index (keeps local files, stops git from tracking them)
+git rm -r --cached .beads/
+
+# 3. Commit
+git add .gitignore
+git commit -m "chore: untrack .beads/ directory from git"
+git push
+```
+
+After this, git will never touch `.beads/` again — no matter what branch
+operations happen. The `.beads/` directory stays on disk for `bd` to use,
+but git doesn't know it exists.
+
+**Verify with:** `git ls-files --cached .beads/` — must return nothing.
+
+### After untracking: fix Dolt remote sync
+
+Removing `.beads/` from git moves the git remote's HEAD ahead of what Dolt's
+internal `refs/dolt/data` ref tracks. This causes `bd dolt push` to fail with
+"non-fast-forward". Fix with a one-time force push:
+
+```bash
+bd dolt push --force
+```
+
+### Auto-sync configuration (required)
+
+After fixing the git-tracking issue, ensure auto-sync is enabled so changes
+push automatically instead of silently accumulating locally:
+
+```bash
+bd config set dolt.auto-commit on      # Commit after every bd write operation
+bd config set dolt.auto-push true      # Push to remote after commits
+```
+
+Verify with:
+```bash
+bd config get dolt.auto-commit    # Should show: on
+bd config get dolt.auto-push      # Should show: true
+```
+
+Without `dolt.auto-push`, changes only sync when you manually run `bd dolt push`.
+With it enabled, every `bd create`, `bd update`, `bd close`, etc. automatically
+commits and pushes (throttled to every 5 minutes to avoid excessive network calls).
+
+---
+
 ## Scope
 
 This applies to **every** `zeblithic/harmony-*` repo:
@@ -88,8 +173,10 @@ re-initialized (see [Fixing Wrong Mode](#fixing-wrong-mode-server-instead-of-emb
 | | `config.yaml` (rebuilt at init) |
 | | `metadata.json` (rebuilt at init) |
 
-The `.beads/.gitignore` prevents all of this from entering git commits.
-Beads data syncs through Dolt remotes only — never through git commits/PRs.
+`.beads/` is listed in the repo's committed `.gitignore` to prevent any of
+this from entering git. Beads data syncs through Dolt remotes only — never
+through git commits/PRs. See [The Git-Tracking Trap](#critical-the-git-tracking-trap)
+for why this must be in `.gitignore` and not just `.git/info/exclude`.
 
 ### How Dolt Remotes Work
 
@@ -485,10 +572,15 @@ bd dolt remote list   # Shows origin remote
 backup:
     enabled: false
 no-git-ops: true
+dolt:
+    auto-commit: "on"
+    auto-push: true
 ```
 
 - `no-git-ops: true`: Stealth mode — bd never runs git commands, installs hooks, or auto-commits
 - `backup.enabled: false`: No auto-backup exports
+- `dolt.auto-commit: "on"`: Commit to Dolt history after every `bd` write operation
+- `dolt.auto-push: true`: Push to remote after commits (throttled to every 5 minutes)
 
 ### repo_state.json (inside embeddeddolt/<db>/.dolt/)
 
@@ -616,3 +708,20 @@ remote.
 
 **To prevent this in the future:** always pull before re-initializing. If you
 must re-init, export first (`bd export -o backup.jsonl`) so you don't lose data.
+
+### The Git-Tracking Bug (2026-03-30)
+
+For months, beads intermittently broke across sessions. The root cause was
+finally identified: `bd init` had committed `.beads/metadata.json` to git with
+`dolt_mode: "server"`. The file was later changed locally to `"embedded"`, but
+because git tracked it, every branch switch or stash reverted it to `"server"`.
+
+The fix applied across all 5 zeblithic repos:
+1. `git rm -r --cached .beads/` — untrack from git index
+2. Added `.beads/` to committed `.gitignore` (not just `.git/info/exclude`)
+3. Rewrote `metadata.json` to `dolt_mode: "embedded"`
+4. `bd dolt push --force` — reset remote `refs/dolt/data` ref
+5. `bd config set dolt.auto-push true` — enable automatic sync
+
+This is now the documented canonical setup. Any new repo or machine setup
+must follow the steps in [The Git-Tracking Trap](#critical-the-git-tracking-trap).
