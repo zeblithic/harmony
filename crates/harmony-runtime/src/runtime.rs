@@ -1067,12 +1067,17 @@ impl<B: BookStore> NodeRuntime<B> {
 
         // Activate archive (cold-tier) BEFORE disk quota enforcement so that
         // disk eviction can cascade to archive instead of deleting content.
+        // Track CIDs being removed from archive so we don't also cascade them
+        // (which would create a race: RemoveFromArchive + CascadeToArchive
+        // on the same CID → data loss).
+        let mut archive_removals = HashSet::new();
         if config.archive_enabled {
             rt.storage.enable_archive(config.archive_entries);
             if let Some(quota) = config.archive_quota {
                 let eviction_actions = rt.storage.set_archive_quota(quota);
                 for action in eviction_actions {
                     if let StorageTierAction::RemoveFromArchive { cid } = action {
+                        archive_removals.insert(cid);
                         actions.push(RuntimeAction::RemoveFromArchive { cid });
                     }
                 }
@@ -1092,7 +1097,13 @@ impl<B: BookStore> NodeRuntime<B> {
                             actions.push(RuntimeAction::RemoveFromDisk { cid });
                         }
                         StorageTierAction::CascadeToArchive { cid } => {
-                            actions.push(RuntimeAction::CascadeToArchive { cid });
+                            if archive_removals.contains(&cid) {
+                                // Archive is also evicting this CID — don't cascade,
+                                // just delete from disk to avoid a write→delete race.
+                                actions.push(RuntimeAction::RemoveFromDisk { cid });
+                            } else {
+                                actions.push(RuntimeAction::CascadeToArchive { cid });
+                            }
                         }
                         StorageTierAction::RemoveFromArchive { cid } => {
                             actions.push(RuntimeAction::RemoveFromArchive { cid });
