@@ -405,12 +405,11 @@ impl<B: BookStore> StorageTier<B> {
                 skipped += 1;
                 continue;
             }
-            if let Some(entry_size) = self.disk_index.remove(&candidate) {
-                self.disk_used_bytes = self.disk_used_bytes.saturating_sub(entry_size);
-            }
+            let evicted_size = self.disk_index.remove(&candidate).unwrap_or(0);
+            self.disk_used_bytes = self.disk_used_bytes.saturating_sub(evicted_size);
             if self.archive_enabled {
                 actions.push(StorageTierAction::CascadeToArchive { cid: candidate });
-                self.record_archive_persist(candidate, 0, &mut actions);
+                self.record_archive_persist(candidate, evicted_size, &mut actions);
             } else {
                 actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
             }
@@ -624,8 +623,13 @@ impl<B: BookStore> StorageTier<B> {
                 // Verify integrity — archive data may be corrupted.
                 if !Self::verify_cid(&cid, &data) {
                     self.metrics.archive_read_failures += 1;
-                    // Retract from archive index to prevent infinite retry.
-                    self.archive_index.remove(&cid);
+                    // Retract from archive index and LRU to prevent infinite
+                    // retry and stale-entry accumulation in eviction passes.
+                    if let Some(entry_size) = self.archive_index.remove(&cid) {
+                        self.archive_used_bytes =
+                            self.archive_used_bytes.saturating_sub(entry_size);
+                    }
+                    self.archive_lru.retain(|c| c != &cid);
                     return vec![StorageTierAction::SendReply {
                         query_id,
                         payload: vec![],
@@ -672,8 +676,15 @@ impl<B: BookStore> StorageTier<B> {
                 }
                 actions
             }
-            StorageTierEvent::ArchiveReadFailed { cid: _, query_id } => {
+            StorageTierEvent::ArchiveReadFailed { cid, query_id } => {
                 self.metrics.archive_read_failures += 1;
+                // Retract the index entry so subsequent queries don't re-trigger
+                // futile ArchiveLookup cycles, and so S3 fallback is not blocked.
+                if let Some(entry_size) = self.archive_index.remove(&cid) {
+                    self.archive_used_bytes =
+                        self.archive_used_bytes.saturating_sub(entry_size);
+                    self.archive_lru.retain(|c| c != &cid);
+                }
                 vec![StorageTierAction::SendReply {
                     query_id,
                     payload: vec![],
@@ -1050,10 +1061,9 @@ impl<B: BookStore> StorageTier<B> {
                 continue;
             }
 
-            // Evict
-            if let Some(entry_size) = self.disk_index.remove(&candidate) {
-                self.disk_used_bytes = self.disk_used_bytes.saturating_sub(entry_size);
-            }
+            // Evict — capture size for archive quota accounting.
+            let evicted_size = self.disk_index.remove(&candidate).unwrap_or(0);
+            self.disk_used_bytes = self.disk_used_bytes.saturating_sub(evicted_size);
             // If a PersistToDisk for this candidate is in the current actions
             // list, handle the cascade or cancellation.
             let pending_persist = actions.iter().position(
@@ -1067,21 +1077,21 @@ impl<B: BookStore> StorageTier<B> {
                         StorageTierAction::PersistToDisk { data, .. } => data,
                         _ => unreachable!(),
                     };
+                    let archive_size = data.len() as u64;
                     actions.push(StorageTierAction::PersistToArchive {
                         cid: candidate,
                         data,
                     });
-                    self.record_archive_persist(candidate, 0, actions);
+                    self.record_archive_persist(candidate, archive_size, actions);
                 } else {
                     actions.swap_remove(idx);
                     // Don't emit RemoveFromDisk — the file was never written.
                 }
             } else if self.archive_enabled {
                 // Content is already on disk — tell event loop to move it to archive.
+                // Use the disk entry size for archive quota accounting.
                 actions.push(StorageTierAction::CascadeToArchive { cid: candidate });
-                // Track in archive index; actual size will be updated on write completion.
-                // Use disk size as estimate.
-                self.record_archive_persist(candidate, 0, actions);
+                self.record_archive_persist(candidate, evicted_size, actions);
             } else {
                 actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
             }
@@ -1101,8 +1111,7 @@ impl<B: BookStore> StorageTier<B> {
     }
 
     /// Record that a CID has been persisted to archive. Updates bookkeeping and
-    /// enforces archive quota. `size` may be 0 for CascadeToArchive (size unknown
-    /// until the event loop reads the file); the archive index tracks presence.
+    /// enforces archive quota.
     fn record_archive_persist(
         &mut self,
         cid: ContentId,
