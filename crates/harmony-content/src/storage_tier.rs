@@ -1123,7 +1123,7 @@ impl<B: BookStore> StorageTier<B> {
                 |a| matches!(a, StorageTierAction::PersistToDisk { cid: c, .. } if *c == candidate),
             );
             if let Some(idx) = pending_persist {
-                if self.archive_enabled {
+                if self.archive_enabled && !self.archive_index.contains_key(&candidate) {
                     // Redirect the pending write to archive instead of disk.
                     // Extract the data from the PersistToDisk action.
                     let data = match actions.swap_remove(idx) {
