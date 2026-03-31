@@ -408,10 +408,12 @@ impl<B: BookStore> StorageTier<B> {
             let evicted_size = self.disk_index.remove(&candidate).unwrap_or(0);
             self.disk_used_bytes = self.disk_used_bytes.saturating_sub(evicted_size);
             if self.archive_enabled && !self.archive_index.contains_key(&candidate) {
-                // Not yet in archive — cascade the content. Don't speculatively
-                // insert into archive_index; the cascade is fire-and-forget and
-                // may fail. The entry will be picked up by scan_books on restart.
+                // Not yet in archive — cascade the content. Pre-insert into
+                // archive_index so content is immediately queryable (not only
+                // after restart). On the rare write-failure path, ArchiveReadFailed
+                // self-heals by retracting the phantom entry.
                 actions.push(StorageTierAction::CascadeToArchive { cid: candidate });
+                self.record_archive_persist(candidate, evicted_size, &mut actions);
             } else {
                 // Already in archive (promoted then re-evicted) or archive disabled.
                 actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
@@ -564,10 +566,7 @@ impl<B: BookStore> StorageTier<B> {
                         self.disk_used_bytes = self.disk_used_bytes.saturating_sub(size);
                         self.disk_lru.retain(|c| c != &cid);
                     }
-                    return vec![StorageTierAction::SendReply {
-                        query_id,
-                        payload: vec![],
-                    }];
+                    return self.disk_failure_fallback(cid, query_id);
                 }
                 // Verify integrity — disk data may be corrupted (bit rot, wrong file).
                 if !Self::verify_cid(&cid, &data) {
@@ -578,10 +577,7 @@ impl<B: BookStore> StorageTier<B> {
                         self.disk_used_bytes = self.disk_used_bytes.saturating_sub(size);
                         self.disk_lru.retain(|c| c != &cid);
                     }
-                    return vec![StorageTierAction::SendReply {
-                        query_id,
-                        payload: vec![],
-                    }];
+                    return self.disk_failure_fallback(cid, query_id);
                 }
                 // Pre-warm frequency so the re-cached CID survives the admission
                 // challenge. Without this, a CID with decayed sketch counts would
@@ -612,11 +608,8 @@ impl<B: BookStore> StorageTier<B> {
                     self.disk_used_bytes = self.disk_used_bytes.saturating_sub(size);
                     self.disk_lru.retain(|c| c != &cid);
                 }
-                // Reply with empty payload so the querier doesn't hang.
-                vec![StorageTierAction::SendReply {
-                    query_id,
-                    payload: vec![],
-                }]
+                // Cascade to archive → S3 for this query.
+                self.disk_failure_fallback(cid, query_id)
             }
             StorageTierEvent::ArchiveReadComplete {
                 cid,
@@ -1103,9 +1096,11 @@ impl<B: BookStore> StorageTier<B> {
                     // Don't emit RemoveFromDisk — the file was never written.
                 }
             } else if self.archive_enabled && !self.archive_index.contains_key(&candidate) {
-                // Content is on disk but not in archive — cascade. Don't
-                // speculatively insert into archive_index (fire-and-forget I/O).
+                // Content is on disk but not in archive — cascade. Pre-insert
+                // into archive_index so content is immediately queryable.
+                // ArchiveReadFailed self-heals phantom entries on write failure.
                 actions.push(StorageTierAction::CascadeToArchive { cid: candidate });
+                self.record_archive_persist(candidate, evicted_size, actions);
             } else {
                 // Already in archive (promoted then re-evicted) or archive disabled.
                 actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
@@ -1123,6 +1118,20 @@ impl<B: BookStore> StorageTier<B> {
         // Replace with an O(1) structure (e.g. LinkedHashMap) if index grows large.
         self.disk_lru.retain(|c| c != cid);
         self.disk_lru.push_back(*cid);
+    }
+
+    /// Cascade a disk read failure to the next available tier: archive → S3 → empty.
+    fn disk_failure_fallback(&self, cid: ContentId, query_id: u64) -> Vec<StorageTierAction> {
+        if self.archive_enabled && self.archive_index.contains_key(&cid) {
+            return vec![StorageTierAction::ArchiveLookup { cid, query_id }];
+        }
+        if self.s3_enabled && Self::is_durable_class(&cid) {
+            return vec![StorageTierAction::S3Lookup { cid, query_id }];
+        }
+        vec![StorageTierAction::SendReply {
+            query_id,
+            payload: vec![],
+        }]
     }
 
     /// Record that a CID has been persisted to archive. Updates bookkeeping and
