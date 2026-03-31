@@ -2,8 +2,9 @@
   description = "Harmony — decentralized internet stack";
 
   inputs = {
-    # Stable channel for reproducible builds.
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    # Unstable channel — needed for Rust 1.85+ (edition2024 in Cargo.lock).
+    # nixos-24.11 shipped Rust 1.82 which is too old for cranelift-codegen-shared.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
 
