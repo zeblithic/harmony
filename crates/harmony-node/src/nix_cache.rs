@@ -147,6 +147,10 @@ async fn narinfo_handler(
 ///
 /// The path parameter captures the full filename (e.g. `<cid>.nar`).
 /// The handler strips the `.nar` suffix to obtain the 64-character hex CID.
+///
+/// NOTE: The entire NAR is reassembled into a `Vec<u8>` before the response
+/// is sent. For large packages (100+ MB), consider streaming reassembly via
+/// `Body::from_stream` in a future iteration.
 async fn nar_handler(
     State(state): State<Arc<NixCacheState>>,
     Path(filename): Path<String>,

@@ -756,7 +756,8 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             spawn_nix_cache_server(
                 crate::config::resolve(nix_cache_port, config_file.nix_cache_port, 0u16),
                 config_file.data_dir.clone(),
-            )?;
+            )
+            .await?;
 
             crate::event_loop::run(
                 rt,
@@ -942,30 +943,64 @@ fn run_nar_command(action: NarAction) -> Result<(), Box<dyn std::error::Error>> 
 
 /// Spawn the Nix binary cache HTTP server if `port > 0`.
 ///
-/// Extracted into its own function to keep the large `run()` async frame
-/// from growing further (axum Router is sizable on the stack).
+/// Loads existing memos from disk into the MemoStore so narinfo lookups
+/// work for previously-pushed store paths. Binds the TCP listener before
+/// spawning the server task so port conflicts are surfaced immediately.
 #[cfg(feature = "nix-cache")]
-fn spawn_nix_cache_server(
+async fn spawn_nix_cache_server(
     port: u16,
     data_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if port == 0 {
         return Ok(());
     }
+
+    // Load existing memos and books from disk so the HTTP server can serve
+    // narinfo for previously-pushed store paths (not just an empty store).
+    use harmony_content::book::BookStore as _;
+    let mut memo_store = harmony_memo::store::MemoStore::new();
+    let mut book_store = harmony_content::book::MemoryBookStore::new();
+    if let Some(ref dir) = data_dir {
+        let dir_clone = dir.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let memos = crate::memo_io::scan_memos(&dir_clone);
+            let books = crate::disk_io::scan_books(&dir_clone);
+            (memos, books)
+        })
+        .await
+        .map_err(|e| format!("failed to load disk data: {e}"))?;
+
+        let (memos, books) = loaded;
+        let memo_count = memos.len();
+        for (memo, _) in memos {
+            memo_store.insert(memo);
+        }
+        for (cid, _) in &books {
+            if let Ok(data) = crate::disk_io::read_book(dir, cid) {
+                book_store.store(*cid, data);
+            }
+        }
+        tracing::info!(memo_count, book_count = books.len(), "loaded nix-cache state from disk");
+    }
+
     let state = std::sync::Arc::new(crate::nix_cache::NixCacheState {
-        book_store: std::sync::Arc::new(harmony_content::book::MemoryBookStore::new()),
-        memo_store: std::sync::Arc::new(harmony_memo::store::MemoStore::new()),
+        book_store: std::sync::Arc::new(book_store),
+        memo_store: std::sync::Arc::new(memo_store),
         data_dir,
     });
+
     let nix_addr: std::net::SocketAddr = format!("0.0.0.0:{port}")
         .parse()
         .map_err(|e| format!("invalid nix-cache-port {port}: {e}"))?;
+
+    // Bind before spawning so port conflicts surface as a startup error.
+    let listener = tokio::net::TcpListener::bind(nix_addr)
+        .await
+        .map_err(|e| format!("failed to bind nix-cache port {port}: {e}"))?;
+
     let nix_router = crate::nix_cache::router(state);
     tracing::info!(%nix_addr, "nix binary cache server starting");
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(nix_addr)
-            .await
-            .expect("failed to bind nix-cache port");
         if let Err(e) = axum::serve(listener, nix_router).await {
             tracing::error!("nix cache server error: {e}");
         }

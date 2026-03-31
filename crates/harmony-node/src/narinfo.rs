@@ -8,6 +8,39 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
 
+// ---------------------------------------------------------------------------
+// Nix base-32 encoding
+// ---------------------------------------------------------------------------
+
+/// Nix-specific base-32 alphabet (omits e, o, t, u from lowercase ASCII).
+const NIX_BASE32_CHARS: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+
+/// Encode raw bytes using Nix's custom base-32 encoding.
+///
+/// This is NOT RFC 4648 base32. Nix processes bits from LSB to MSB in 5-bit
+/// groups, then reverses the output. For a SHA-256 hash (32 bytes / 256 bits)
+/// this produces 52 characters.
+///
+/// Reference: `nix/src/libutil/hash.cc` — `printHash32()`
+fn nix_base32_encode(bytes: &[u8]) -> String {
+    let bit_count = bytes.len() * 8;
+    let len = (bit_count + 4) / 5; // ceil(bits / 5)
+    let mut out = String::with_capacity(len);
+
+    for n in (0..len).rev() {
+        let b = n * 5;
+        let i = b / 8;
+        let j = b % 8;
+        let mut c = (bytes[i] >> j) as u16;
+        if j > 3 && i + 1 < bytes.len() {
+            c |= (bytes[i + 1] as u16) << (8 - j);
+        }
+        out.push(NIX_BASE32_CHARS[(c & 0x1f) as usize] as char);
+    }
+
+    out
+}
+
 /// A Nix binary cache signing key loaded from the standard `<name>:<base64>` format.
 ///
 /// The 64-byte payload is the ed25519 secret key in libsodium format:
@@ -72,7 +105,7 @@ impl NixSigningKey {
 pub struct NarInfo {
     pub store_path: String,
     pub url: String,
-    /// `sha256:<base64>` — hash of the NAR archive
+    /// `sha256:<nix-base32>` — hash of the NAR archive
     pub nar_hash: String,
     pub nar_size: u64,
     pub references: Vec<String>,
@@ -80,9 +113,13 @@ pub struct NarInfo {
 }
 
 impl NarInfo {
-    /// Format a raw SHA-256 digest as a Nix hash string: `sha256:<base64>`.
+    /// Format a raw SHA-256 digest as a Nix hash string: `sha256:<nix-base32>`.
+    ///
+    /// Nix uses a custom base-32 encoding (not RFC 4648 and not standard base64)
+    /// for hashes in narinfo files and fingerprints. A 32-byte SHA-256 digest
+    /// produces a 52-character nix-base32 string.
     pub fn format_nix_hash(sha256: &[u8; 32]) -> String {
-        format!("sha256:{}", BASE64.encode(sha256))
+        format!("sha256:{}", nix_base32_encode(sha256))
     }
 
     /// Compute the Nix fingerprint that gets signed:
@@ -202,10 +239,12 @@ mod tests {
     }
 
     fn sample_narinfo() -> NarInfo {
+        // Use a real nix-base32 hash (all-zero SHA-256 → 52 nix-base32 chars)
+        let zero_hash = NarInfo::format_nix_hash(&[0u8; 32]);
         NarInfo {
             store_path: "/nix/store/aaaabbbbccccdddd0000111122223333-test-package-1.0".to_string(),
             url: "nar/aabbccdd.nar".to_string(),
-            nar_hash: "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            nar_hash: zero_hash,
             nar_size: 12345,
             references: vec![
                 "zzzzwwwwxxxxyyyyaaaa0000111122223333-dep1".to_string(),
@@ -320,11 +359,54 @@ mod tests {
         let hash = [0u8; 32];
         let result = NarInfo::format_nix_hash(&hash);
         assert!(result.starts_with("sha256:"), "must start with 'sha256:'");
-        // The base64 of 32 zero bytes is 44 characters (with padding).
-        let b64_part = result.strip_prefix("sha256:").unwrap();
-        assert_eq!(b64_part.len(), 44);
-        let decoded = BASE64.decode(b64_part).expect("must be valid base64");
-        assert_eq!(decoded, vec![0u8; 32]);
+        // SHA-256 (32 bytes / 256 bits) → 52 nix-base32 chars
+        let nix32_part = result.strip_prefix("sha256:").unwrap();
+        assert_eq!(nix32_part.len(), 52, "nix-base32 of 32 bytes should be 52 chars");
+        // All-zero hash should produce all-zero nix-base32 (all '0' chars)
+        assert!(
+            nix32_part.chars().all(|c| c == '0'),
+            "all-zero hash should encode to all-zero nix-base32: {nix32_part}"
+        );
+    }
+
+    #[test]
+    fn nix_base32_properties() {
+        // Verify encoding properties: correct length, alphabet, determinism
+        let hash = [0xABu8; 32];
+        let encoded = super::nix_base32_encode(&hash);
+
+        // SHA-256 (32 bytes / 256 bits) → ceil(256/5) = 52 chars
+        assert_eq!(encoded.len(), 52, "nix-base32 of 32 bytes should be 52 chars");
+
+        // All chars must be in the nix-base32 alphabet (no e, o, t, u)
+        let alphabet = "0123456789abcdfghijklmnpqrsvwxyz";
+        for ch in encoded.chars() {
+            assert!(
+                alphabet.contains(ch),
+                "char '{ch}' not in nix-base32 alphabet"
+            );
+        }
+
+        // Deterministic: same input → same output
+        assert_eq!(encoded, super::nix_base32_encode(&hash));
+
+        // Different input → different output
+        let hash2 = [0xCDu8; 32];
+        assert_ne!(encoded, super::nix_base32_encode(&hash2));
+    }
+
+    #[test]
+    fn nix_base32_small_known_vectors() {
+        // Single byte: 0xFF = 0b11111111
+        // n=1: b=5, i=0, j=5 → 0xFF >> 5 = 7 → '7'
+        // n=0: b=0, i=0, j=0 → 0xFF & 0x1f = 31 → 'z'
+        assert_eq!(super::nix_base32_encode(&[0xFF]), "7z");
+
+        // Single byte: 0x00 → "00"
+        assert_eq!(super::nix_base32_encode(&[0x00]), "00");
+
+        // Two bytes: 0x00 0x00 → "0000" (ceil(16/5)=4)
+        assert_eq!(super::nix_base32_encode(&[0x00, 0x00]), "0000");
     }
 
     #[test]
