@@ -2148,10 +2148,17 @@ impl<B: BookStore> NodeRuntime<B> {
                     path_update,
                     ..
                 } => {
-                    // Skip duplicate announces. The path table tracks random_hash
-                    // blobs and returns DuplicateBlob when the same announce is
-                    // received a second time (e.g. via broadcast + unicast).
-                    if path_update == harmony_reticulum::PathUpdateResult::DuplicateBlob {
+                    // Skip duplicate and unroutable announces. The path table
+                    // tracks the random blob from each announce and returns
+                    // DuplicateBlob when the same blob is received again (e.g.
+                    // via broadcast + unicast). ExceedsMaxHops means the path
+                    // table rejected the entry — no route was recorded, so
+                    // emitting a PeerEvent would trigger initiation with no path.
+                    if matches!(
+                        path_update,
+                        harmony_reticulum::PathUpdateResult::DuplicateBlob
+                            | harmony_reticulum::PathUpdateResult::ExceedsMaxHops
+                    ) {
                         continue;
                     }
                     // Feed announce into PeerManager so it can trigger
