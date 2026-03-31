@@ -1697,17 +1697,17 @@ git commit -m "feat(node): wire Nar CLI subcommand and HTTP server into main"
 ### Task 6: NixOS Service Integration (harmony-os repo)
 
 **Files:**
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/nixos/harmony-node-service.nix`
-- Modify: `/Users/zeblith/work/zeblithic/harmony-os/nixos/rpi5-base.nix`
+- Modify: `nixos/harmony-node-service.nix` (in the harmony-os repo)
+- Modify: `nixos/rpi5-base.nix` (in the harmony-os repo)
 
-**Important:** This task is in the `harmony-os` repo, not the `harmony` repo. Create a matching branch `jake-node-nix-cache` in harmony-os before committing.
+**Important:** This task is in the `harmony-os` repo, not the `harmony` repo. Create a matching branch in harmony-os before committing.
 
 - [ ] **Step 1: Create branch in harmony-os**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-os
+cd <harmony-os-repo>
 git fetch origin
-git checkout -b jake-node-nix-cache origin/main
+git checkout -b <matching-branch-name> origin/main
 ```
 
 - [ ] **Step 2: Add nixCachePort option to harmony-node-service.nix**
@@ -1755,10 +1755,10 @@ Run: `nix eval .#nixosConfigurations.rpi5-luna.config.services.harmony-node.nixC
 - [ ] **Step 5: Commit and push**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-os
+cd <harmony-os-repo>
 git add nixos/harmony-node-service.nix nixos/rpi5-base.nix
 git commit -m "feat(nixos): add Nix binary cache port option to harmony-node service"
-git push -u origin jake-node-nix-cache
+git push -u origin <branch-name>
 ```
 
 ---
