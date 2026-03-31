@@ -408,9 +408,10 @@ impl<B: BookStore> StorageTier<B> {
             let evicted_size = self.disk_index.remove(&candidate).unwrap_or(0);
             self.disk_used_bytes = self.disk_used_bytes.saturating_sub(evicted_size);
             if self.archive_enabled && !self.archive_index.contains_key(&candidate) {
-                // Not yet in archive — cascade the content.
+                // Not yet in archive — cascade the content. Don't speculatively
+                // insert into archive_index; the cascade is fire-and-forget and
+                // may fail. The entry will be picked up by scan_books on restart.
                 actions.push(StorageTierAction::CascadeToArchive { cid: candidate });
-                self.record_archive_persist(candidate, evicted_size, &mut actions);
             } else {
                 // Already in archive (promoted then re-evicted) or archive disabled.
                 actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
@@ -632,10 +633,15 @@ impl<B: BookStore> StorageTier<B> {
                             self.archive_used_bytes.saturating_sub(entry_size);
                     }
                     self.archive_lru.retain(|c| c != &cid);
-                    return vec![StorageTierAction::SendReply {
-                        query_id,
-                        payload: vec![],
-                    }];
+                    // Cascade to S3 for this query if available.
+                    return if self.s3_enabled && Self::is_durable_class(&cid) {
+                        vec![StorageTierAction::S3Lookup { cid, query_id }]
+                    } else {
+                        vec![StorageTierAction::SendReply {
+                            query_id,
+                            payload: vec![],
+                        }]
+                    };
                 }
                 self.cache.warm_frequency(&cid, 5);
 
@@ -1097,9 +1103,9 @@ impl<B: BookStore> StorageTier<B> {
                     // Don't emit RemoveFromDisk — the file was never written.
                 }
             } else if self.archive_enabled && !self.archive_index.contains_key(&candidate) {
-                // Content is already on disk but not in archive — move it.
+                // Content is on disk but not in archive — cascade. Don't
+                // speculatively insert into archive_index (fire-and-forget I/O).
                 actions.push(StorageTierAction::CascadeToArchive { cid: candidate });
-                self.record_archive_persist(candidate, evicted_size, actions);
             } else {
                 // Already in archive (promoted then re-evicted) or archive disabled.
                 actions.push(StorageTierAction::RemoveFromDisk { cid: candidate });
@@ -1120,7 +1126,7 @@ impl<B: BookStore> StorageTier<B> {
     }
 
     /// Record that a CID has been persisted to archive. Updates bookkeeping and
-    /// enforces archive quota.
+    /// enforces archive quota (reuses `enforce_archive_quota` to avoid duplication).
     fn record_archive_persist(
         &mut self,
         cid: ContentId,
@@ -1133,41 +1139,8 @@ impl<B: BookStore> StorageTier<B> {
         self.archive_index.insert(cid, size);
         self.archive_lru.push_back(cid);
         self.archive_used_bytes += size;
-
-        let quota = match self.archive_quota {
-            Some(q) => q,
-            None => return,
-        };
-        if self.archive_used_bytes <= quota {
-            return;
-        }
-
-        // Evict LRU archive entries until under quota.
-        let mut skipped: usize = 0;
-        while self.archive_used_bytes > quota {
-            if skipped >= self.archive_lru.len() {
-                break;
-            }
-            let candidate = match self.archive_lru.pop_front() {
-                Some(c) => c,
-                None => break,
-            };
-            if candidate == cid {
-                self.archive_lru.push_back(candidate);
-                skipped += 1;
-                continue;
-            }
-            if self.cache.is_pinned(&candidate) {
-                self.archive_lru.push_back(candidate);
-                skipped += 1;
-                continue;
-            }
-            if let Some(entry_size) = self.archive_index.remove(&candidate) {
-                self.archive_used_bytes = self.archive_used_bytes.saturating_sub(entry_size);
-            }
-            actions.push(StorageTierAction::RemoveFromArchive { cid: candidate });
-            skipped = 0;
-        }
+        let eviction_actions = self.enforce_archive_quota();
+        actions.extend(eviction_actions);
     }
 
     /// Move a CID to the back of the archive LRU (most recently used).

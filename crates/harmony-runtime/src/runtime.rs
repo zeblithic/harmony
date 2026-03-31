@@ -1061,23 +1061,8 @@ impl<B: BookStore> NodeRuntime<B> {
             engram_injection_layers: vec![2, 14],
         };
 
-        // Activate disk tier when data_dir is configured (even if empty on first boot).
-        if config.disk_enabled {
-            rt.storage.enable_disk(config.disk_entries);
-            if let Some(quota) = config.disk_quota {
-                let eviction_actions = rt.storage.set_disk_quota(quota);
-                // Startup eviction: if existing data exceeds the new quota,
-                // emit RemoveFromDisk actions so the event loop cleans up
-                // immediately rather than waiting for the first new persist.
-                for action in eviction_actions {
-                    if let StorageTierAction::RemoveFromDisk { cid } = action {
-                        actions.push(RuntimeAction::RemoveFromDisk { cid });
-                    }
-                }
-            }
-        }
-
-        // Activate archive (cold-tier) for disk eviction cascade.
+        // Activate archive (cold-tier) BEFORE disk quota enforcement so that
+        // disk eviction can cascade to archive instead of deleting content.
         if config.archive_enabled {
             rt.storage.enable_archive(config.archive_entries);
             if let Some(quota) = config.archive_quota {
@@ -1085,6 +1070,27 @@ impl<B: BookStore> NodeRuntime<B> {
                 for action in eviction_actions {
                     if let StorageTierAction::RemoveFromArchive { cid } = action {
                         actions.push(RuntimeAction::RemoveFromArchive { cid });
+                    }
+                }
+            }
+        }
+
+        // Activate disk tier when data_dir is configured (even if empty on first boot).
+        if config.disk_enabled {
+            rt.storage.enable_disk(config.disk_entries);
+            if let Some(quota) = config.disk_quota {
+                let eviction_actions = rt.storage.set_disk_quota(quota);
+                // Startup eviction: if existing data exceeds the new quota,
+                // cascade to archive or delete depending on archive state.
+                for action in eviction_actions {
+                    match action {
+                        StorageTierAction::RemoveFromDisk { cid } => {
+                            actions.push(RuntimeAction::RemoveFromDisk { cid });
+                        }
+                        StorageTierAction::CascadeToArchive { cid } => {
+                            actions.push(RuntimeAction::CascadeToArchive { cid });
+                        }
+                        _ => {}
                     }
                 }
             }
