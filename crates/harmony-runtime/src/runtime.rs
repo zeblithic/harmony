@@ -1277,11 +1277,12 @@ impl<B: BookStore> NodeRuntime<B> {
         use harmony_contacts::ContactAddress;
         use harmony_peers::PeerStatus;
 
-        // Skip if peer is already connecting or connected.
+        // Only proceed if the peer is tracked and Searching. Untracked peers
+        // (None) must wait for ContactChanged to register them first —
+        // otherwise set_connecting() is a no-op and the dedup guard fails.
         match self.peer_manager.peer_status(&identity_hash) {
-            Some(PeerStatus::Connecting) | Some(PeerStatus::Connected) => return,
-            Some(PeerStatus::Disabled) => return,
-            _ => {} // Searching or untracked — proceed
+            Some(PeerStatus::Searching) => {} // proceed
+            _ => return, // Connecting, Connected, Disabled, or untracked
         }
 
         // Find the first tunnel address on the contact.
