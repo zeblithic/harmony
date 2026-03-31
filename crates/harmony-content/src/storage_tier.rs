@@ -159,7 +159,7 @@ pub enum StorageTierAction {
     /// Move content from disk to archive. The event loop reads from disk, writes
     /// to archive, then deletes from disk. Emitted when disk evicts content that
     /// is already persisted on disk (no in-memory data available).
-    CascadeToArchive { cid: ContentId },
+    CascadeToArchive { cid: ContentId, size: u64 },
     /// Remove content from archive. Emitted by archive quota enforcement.
     RemoveFromArchive { cid: ContentId },
     /// Request archive read for a CID known to be in archive but not in cache or disk.
@@ -417,7 +417,7 @@ impl<B: BookStore> StorageTier<B> {
                 // archive_index so content is immediately queryable (not only
                 // after restart). On the rare write-failure path, ArchiveReadFailed
                 // self-heals by retracting the phantom entry.
-                actions.push(StorageTierAction::CascadeToArchive { cid: candidate });
+                actions.push(StorageTierAction::CascadeToArchive { cid: candidate, size: evicted_size });
                 self.record_archive_persist(candidate, evicted_size, &mut actions);
             } else {
                 // Already in archive (promoted then re-evicted) or archive disabled.
@@ -1141,7 +1141,7 @@ impl<B: BookStore> StorageTier<B> {
                 // Content is on disk but not in archive — cascade. Pre-insert
                 // into archive_index so content is immediately queryable.
                 // ArchiveReadFailed self-heals phantom entries on write failure.
-                actions.push(StorageTierAction::CascadeToArchive { cid: candidate });
+                actions.push(StorageTierAction::CascadeToArchive { cid: candidate, size: evicted_size });
                 self.record_archive_persist(candidate, evicted_size, actions);
             } else {
                 // Already in archive (promoted then re-evicted) or archive disabled.
@@ -1178,6 +1178,10 @@ impl<B: BookStore> StorageTier<B> {
 
     /// Record that a CID has been persisted to archive. Updates bookkeeping and
     /// enforces archive quota (reuses `enforce_archive_quota` to avoid duplication).
+    ///
+    /// After quota enforcement, cancels any `RemoveFromArchive` that conflicts
+    /// with a pending `CascadeToArchive` or `PersistToArchive` in the same
+    /// action list — prevents race between concurrent fire-and-forget tasks.
     fn record_archive_persist(
         &mut self,
         cid: ContentId,
@@ -1191,7 +1195,31 @@ impl<B: BookStore> StorageTier<B> {
         self.archive_lru.push_back(cid);
         self.archive_used_bytes += size;
         let eviction_actions = self.enforce_archive_quota(Some(cid));
-        actions.extend(eviction_actions);
+
+        // Cancel any RemoveFromArchive that conflicts with a pending cascade/persist
+        // in the same action list. Without this, archive quota enforcement could evict
+        // a CID that has an in-flight CascadeToArchive, causing both the cascade write
+        // and the removal delete to race as concurrent spawn_blocking tasks.
+        for evict_action in eviction_actions {
+            if let StorageTierAction::RemoveFromArchive { cid: evict_cid } = &evict_action {
+                // Find the size from the pending cascade/persist action.
+                let pending_size = actions.iter().find_map(|a| match a {
+                    StorageTierAction::CascadeToArchive { cid: c, size: s } if c == evict_cid => Some(*s),
+                    StorageTierAction::PersistToArchive { cid: c, data } if c == evict_cid => Some(data.len() as u64),
+                    _ => None,
+                });
+                if let Some(entry_size) = pending_size {
+                    // Re-insert the entry — the cascade/persist is still in-flight.
+                    // The over-quota state is temporary; it will be resolved on the
+                    // next eviction pass after the cascade completes.
+                    self.archive_index.insert(*evict_cid, entry_size);
+                    self.archive_lru.push_back(*evict_cid);
+                    self.archive_used_bytes += entry_size;
+                    continue; // Don't emit the RemoveFromArchive
+                }
+            }
+            actions.push(evict_action);
+        }
     }
 
     /// Move a CID to the back of the archive LRU (most recently used).

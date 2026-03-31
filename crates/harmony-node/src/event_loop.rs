@@ -2187,7 +2187,7 @@ async fn dispatch_action(
                 let _ = archive_tx.try_send(ArchiveIoResult::WriteFailed { cid });
             }
         }
-        RuntimeAction::CascadeToArchive { cid } => {
+        RuntimeAction::CascadeToArchive { cid, size } => {
             // Read from disk (NVMe), write to archive (HDD), then delete from disk.
             if let (Some(ref ddir), Some(ref adir)) = (&data_dir, &archive_dir) {
                 let ddir = ddir.clone();
@@ -2196,11 +2196,11 @@ async fn dispatch_action(
                 tokio::task::spawn_blocking(move || {
                     match crate::disk_io::read_book(&ddir, &cid) {
                         Ok(data) => {
-                            let size = data.len() as u64;
+                            let actual_size = data.len() as u64;
                             if let Err(e) = crate::disk_io::write_book(&adir, &cid, &data) {
                                 tracing::error!(?cid, error = %e, "cascade to archive: write failed");
                                 // NVMe file still exists — tell runtime to re-index it.
-                                let _ = tx.blocking_send(ArchiveIoResult::CascadeFailed { cid, size });
+                                let _ = tx.blocking_send(ArchiveIoResult::CascadeFailed { cid, size: actual_size });
                                 return;
                             }
                             if let Err(e) = crate::disk_io::delete_book(&ddir, &cid) {
@@ -2209,13 +2209,13 @@ async fn dispatch_action(
                         }
                         Err(e) => {
                             tracing::warn!(?cid, error = %e, "cascade to archive: disk read failed");
-                            // NVMe file may still exist — send WriteFailed to retract phantom.
-                            let _ = tx.blocking_send(ArchiveIoResult::WriteFailed { cid });
+                            // NVMe file may still exist — use CascadeFailed to re-index.
+                            let _ = tx.blocking_send(ArchiveIoResult::CascadeFailed { cid, size });
                         }
                     }
                 });
             } else {
-                let _ = archive_tx.try_send(ArchiveIoResult::WriteFailed { cid });
+                let _ = archive_tx.try_send(ArchiveIoResult::CascadeFailed { cid, size });
             }
         }
         RuntimeAction::ArchiveLookup { cid, query_id } => {

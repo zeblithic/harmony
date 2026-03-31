@@ -396,7 +396,7 @@ pub enum RuntimeAction {
     /// Persist content to archive (cold tier, e.g. HDD).
     PersistToArchive { cid: ContentId, data: Vec<u8> },
     /// Move content from disk to archive (read disk → write archive → delete disk).
-    CascadeToArchive { cid: ContentId },
+    CascadeToArchive { cid: ContentId, size: u64 },
     /// Read a CAS book from archive (cold-tier HDD).
     ArchiveLookup { cid: ContentId, query_id: u64 },
     /// Delete a book from archive (evicted by archive quota enforcement).
@@ -1096,7 +1096,7 @@ impl<B: BookStore> NodeRuntime<B> {
                         StorageTierAction::RemoveFromDisk { cid } => {
                             actions.push(RuntimeAction::RemoveFromDisk { cid });
                         }
-                        StorageTierAction::CascadeToArchive { cid } => {
+                        StorageTierAction::CascadeToArchive { cid, size } => {
                             if archive_removals.contains(&cid) {
                                 // Archive is also evicting this CID — don't cascade,
                                 // just delete from disk to avoid a write→delete race.
@@ -1105,7 +1105,7 @@ impl<B: BookStore> NodeRuntime<B> {
                                 rt.storage.retract_archive_entry(&cid);
                                 actions.push(RuntimeAction::RemoveFromDisk { cid });
                             } else {
-                                actions.push(RuntimeAction::CascadeToArchive { cid });
+                                actions.push(RuntimeAction::CascadeToArchive { cid, size });
                             }
                         }
                         StorageTierAction::RemoveFromArchive { cid } => {
@@ -2377,8 +2377,8 @@ impl<B: BookStore> NodeRuntime<B> {
                 StorageTierAction::PersistToArchive { cid, data } => {
                     out.push(RuntimeAction::PersistToArchive { cid, data });
                 }
-                StorageTierAction::CascadeToArchive { cid } => {
-                    out.push(RuntimeAction::CascadeToArchive { cid });
+                StorageTierAction::CascadeToArchive { cid, size } => {
+                    out.push(RuntimeAction::CascadeToArchive { cid, size });
                 }
                 StorageTierAction::ArchiveLookup { cid, query_id } => {
                     out.push(RuntimeAction::ArchiveLookup { cid, query_id });
