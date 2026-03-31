@@ -642,6 +642,50 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 }
             };
 
+            // Scan archive dir for persisted CIDs+sizes (cold tier, e.g. HDD).
+            let archive_entries = match &config_file.archive_dir {
+                Some(dir) => {
+                    let dir = dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let entries = crate::disk_io::scan_books(&dir);
+                        tracing::info!(
+                            count = entries.len(),
+                            total_bytes = entries.iter().map(|(_, s)| s).sum::<u64>(),
+                            path = %dir.display(),
+                            "loaded book entries from archive"
+                        );
+                        entries
+                    })
+                    .await
+                    .unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
+
+            let archive_quota = match &config_file.archive_quota {
+                Some(s) => {
+                    let bytes = crate::config::parse_byte_size(s)
+                        .map_err(|e| format!("invalid archive_quota '{s}': {e}"))?;
+                    if config_file.archive_dir.is_none() {
+                        tracing::warn!(
+                            raw = %s,
+                            "archive_quota is set but archive_dir is not configured — quota will be ignored"
+                        );
+                    } else {
+                        tracing::info!(quota_bytes = bytes, raw = %s, "archive quota configured");
+                    }
+                    Some(bytes)
+                }
+                None => {
+                    if config_file.archive_dir.is_some() {
+                        tracing::info!(
+                            "archive persistence enabled without quota — archive usage is unbounded"
+                        );
+                    }
+                    None
+                }
+            };
+
             let config = NodeConfig {
                 storage_budget: StorageBudget {
                     cache_capacity,
@@ -703,6 +747,9 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 disk_enabled: config_file.data_dir.is_some(),
                 disk_entries,
                 disk_quota,
+                archive_enabled: config_file.archive_dir.is_some(),
+                archive_entries,
+                archive_quota,
                 s3_enabled: {
                     #[cfg(feature = "archivist")]
                     { archivist_config.is_some() }
@@ -772,6 +819,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 rawlink_interface,
                 archivist_config,
                 config_file.data_dir.clone(),
+                config_file.archive_dir.clone(),
             )
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;

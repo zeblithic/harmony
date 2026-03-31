@@ -95,6 +95,13 @@ pub struct NodeConfig {
     pub disk_entries: Vec<(ContentId, u64)>,
     /// Maximum bytes allowed on disk. `None` means no quota enforced.
     pub disk_quota: Option<u64>,
+    /// Whether archive (cold-tier) persistence is enabled (true when archive_dir is configured).
+    /// Controls whether disk eviction cascades to archive instead of deleting.
+    pub archive_enabled: bool,
+    /// CID+size entries discovered by scanning the archive directory at startup.
+    pub archive_entries: Vec<(ContentId, u64)>,
+    /// Maximum bytes allowed in archive. `None` means no quota enforced.
+    pub archive_quota: Option<u64>,
     /// Whether S3 fallback is enabled for durable content.
     /// Controls whether StorageTier emits S3Lookup actions on cache miss.
     pub s3_enabled: bool,
@@ -167,6 +174,9 @@ impl Default for NodeConfig {
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
+            archive_enabled: false,
+            archive_entries: Vec::new(),
+            archive_quota: None,
             s3_enabled: false,
         }
     }
@@ -295,6 +305,19 @@ pub enum RuntimeEvent {
     /// Disk read failed — file missing or corrupted.
     DiskReadFailed { cid: ContentId, query_id: u64 },
 
+    /// Archive read completed — content fetched from cold-tier storage (e.g. HDD).
+    ArchiveReadComplete {
+        cid: ContentId,
+        query_id: u64,
+        data: Vec<u8>,
+    },
+    /// Archive read failed — file missing or I/O error.
+    ArchiveReadFailed { cid: ContentId, query_id: u64 },
+    /// Archive write failed — retract phantom archive_index entry.
+    ArchiveWriteFailed { cid: ContentId },
+    /// Cascade to archive failed but NVMe file still exists — re-index on disk.
+    ArchiveCascadeFailed { cid: ContentId, size: u64 },
+
     /// S3 read completed — content fetched from S3 fallback.
     S3ReadComplete {
         cid: ContentId,
@@ -370,6 +393,14 @@ pub enum RuntimeAction {
     DiskLookup { cid: ContentId, query_id: u64 },
     /// Delete a book from disk (evicted by quota enforcement).
     RemoveFromDisk { cid: ContentId },
+    /// Persist content to archive (cold tier, e.g. HDD).
+    PersistToArchive { cid: ContentId, data: Vec<u8> },
+    /// Move content from disk to archive (read disk → write archive → delete disk).
+    CascadeToArchive { cid: ContentId, size: u64 },
+    /// Read a CAS book from archive (cold-tier HDD).
+    ArchiveLookup { cid: ContentId, query_id: u64 },
+    /// Delete a book from archive (evicted by archive quota enforcement).
+    RemoveFromArchive { cid: ContentId },
     /// Fetch a CAS book from S3 fallback (spawned as async I/O by event loop).
     S3Lookup { cid: ContentId, query_id: u64 },
     /// Spawn a streaming inference task.
@@ -1034,17 +1065,53 @@ impl<B: BookStore> NodeRuntime<B> {
             engram_injection_layers: vec![2, 14],
         };
 
+        // Activate archive (cold-tier) BEFORE disk quota enforcement so that
+        // disk eviction can cascade to archive instead of deleting content.
+        // Track CIDs being removed from archive so we don't also cascade them
+        // (which would create a race: RemoveFromArchive + CascadeToArchive
+        // on the same CID → data loss).
+        let mut archive_removals = HashSet::new();
+        if config.archive_enabled {
+            rt.storage.enable_archive(config.archive_entries);
+            if let Some(quota) = config.archive_quota {
+                let eviction_actions = rt.storage.set_archive_quota(quota);
+                for action in eviction_actions {
+                    if let StorageTierAction::RemoveFromArchive { cid } = action {
+                        archive_removals.insert(cid);
+                        actions.push(RuntimeAction::RemoveFromArchive { cid });
+                    }
+                }
+            }
+        }
+
         // Activate disk tier when data_dir is configured (even if empty on first boot).
         if config.disk_enabled {
             rt.storage.enable_disk(config.disk_entries);
             if let Some(quota) = config.disk_quota {
                 let eviction_actions = rt.storage.set_disk_quota(quota);
                 // Startup eviction: if existing data exceeds the new quota,
-                // emit RemoveFromDisk actions so the event loop cleans up
-                // immediately rather than waiting for the first new persist.
+                // cascade to archive or delete depending on archive state.
                 for action in eviction_actions {
-                    if let StorageTierAction::RemoveFromDisk { cid } = action {
-                        actions.push(RuntimeAction::RemoveFromDisk { cid });
+                    match action {
+                        StorageTierAction::RemoveFromDisk { cid } => {
+                            actions.push(RuntimeAction::RemoveFromDisk { cid });
+                        }
+                        StorageTierAction::CascadeToArchive { cid, size } => {
+                            if archive_removals.contains(&cid) {
+                                // Archive is also evicting this CID — don't cascade,
+                                // just delete from disk to avoid a write→delete race.
+                                // Retract the phantom archive_index entry that
+                                // record_archive_persist just inserted.
+                                rt.storage.retract_archive_entry(&cid);
+                                actions.push(RuntimeAction::RemoveFromDisk { cid });
+                            } else {
+                                actions.push(RuntimeAction::CascadeToArchive { cid, size });
+                            }
+                        }
+                        StorageTierAction::RemoveFromArchive { cid } => {
+                            actions.push(RuntimeAction::RemoveFromArchive { cid });
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1824,6 +1891,34 @@ impl<B: BookStore> NodeRuntime<B> {
                     .handle(StorageTierEvent::DiskReadFailed { cid, query_id });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
+            RuntimeEvent::ArchiveReadComplete {
+                cid,
+                query_id,
+                data,
+            } => {
+                let storage_actions =
+                    self.storage
+                        .handle(StorageTierEvent::ArchiveReadComplete { cid, query_id, data });
+                self.dispatch_storage_actions_inline(storage_actions);
+            }
+            RuntimeEvent::ArchiveReadFailed { cid, query_id } => {
+                let storage_actions = self
+                    .storage
+                    .handle(StorageTierEvent::ArchiveReadFailed { cid, query_id });
+                self.dispatch_storage_actions_inline(storage_actions);
+            }
+            RuntimeEvent::ArchiveWriteFailed { cid } => {
+                let storage_actions = self
+                    .storage
+                    .handle(StorageTierEvent::ArchiveWriteFailed { cid });
+                self.dispatch_storage_actions_inline(storage_actions);
+            }
+            RuntimeEvent::ArchiveCascadeFailed { cid, size } => {
+                let storage_actions = self
+                    .storage
+                    .handle(StorageTierEvent::ArchiveCascadeFailed { cid, size });
+                self.dispatch_storage_actions_inline(storage_actions);
+            }
             RuntimeEvent::S3ReadComplete {
                 cid,
                 query_id,
@@ -2278,6 +2373,18 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
                 StorageTierAction::RemoveFromDisk { cid } => {
                     out.push(RuntimeAction::RemoveFromDisk { cid });
+                }
+                StorageTierAction::PersistToArchive { cid, data } => {
+                    out.push(RuntimeAction::PersistToArchive { cid, data });
+                }
+                StorageTierAction::CascadeToArchive { cid, size } => {
+                    out.push(RuntimeAction::CascadeToArchive { cid, size });
+                }
+                StorageTierAction::ArchiveLookup { cid, query_id } => {
+                    out.push(RuntimeAction::ArchiveLookup { cid, query_id });
+                }
+                StorageTierAction::RemoveFromArchive { cid } => {
+                    out.push(RuntimeAction::RemoveFromArchive { cid });
                 }
                 StorageTierAction::S3Lookup { cid, query_id } => {
                     out.push(RuntimeAction::S3Lookup { cid, query_id });
@@ -4779,8 +4886,8 @@ mod tests {
             .find(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. }));
         assert!(reply.is_some(), "stats query should produce reply");
         if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
-            // 11 metrics × 8 bytes = 88 bytes
-            assert_eq!(payload.len(), 88);
+            // 13 metrics × 8 bytes = 104 bytes
+            assert_eq!(payload.len(), 104);
             // First metric is queries_served, should be 1
             let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
             assert_eq!(queries, 1);
@@ -5332,6 +5439,9 @@ mod tests {
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
+            archive_enabled: false,
+            archive_entries: Vec::new(),
+            archive_quota: None,
             s3_enabled: false,
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -5409,6 +5519,9 @@ mod tests {
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
+            archive_enabled: false,
+            archive_entries: Vec::new(),
+            archive_quota: None,
             s3_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -5452,6 +5565,9 @@ mod tests {
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
+            archive_enabled: false,
+            archive_entries: Vec::new(),
+            archive_quota: None,
             s3_enabled: false,
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
@@ -5492,6 +5608,9 @@ mod tests {
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
+            archive_enabled: false,
+            archive_entries: Vec::new(),
+            archive_quota: None,
             s3_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -5561,6 +5680,9 @@ mod tests {
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
+            archive_enabled: false,
+            archive_entries: Vec::new(),
+            archive_quota: None,
             s3_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -5619,6 +5741,9 @@ mod tests {
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
+            archive_enabled: false,
+            archive_entries: Vec::new(),
+            archive_quota: None,
             s3_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -5670,6 +5795,9 @@ mod tests {
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
+            archive_enabled: false,
+            archive_entries: Vec::new(),
+            archive_quota: None,
             s3_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
@@ -6579,6 +6707,9 @@ mod tests {
             disk_enabled: false,
             disk_entries: Vec::new(),
             disk_quota: None,
+            archive_enabled: false,
+            archive_entries: Vec::new(),
+            archive_quota: None,
             s3_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
