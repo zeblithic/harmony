@@ -2,8 +2,10 @@
   description = "Harmony — decentralized internet stack";
 
   inputs = {
-    # Stable channel for reproducible builds.
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    # Unstable channel — needed for Rust 1.85+ (edition2024 in Cargo.lock).
+    # nixos-24.11 shipped Rust 1.82 which is too old for cranelift-codegen-shared.
+    # Currently provides Rust 1.94 via nixpkgs commit 8110df5 (March 2026).
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
 
@@ -40,6 +42,8 @@
           # Include .cargo/config.toml so cross-build rustflags
           # (e.g., link-self-contained=yes for aarch64 musl) are visible.
           (pkgs.lib.fileset.maybeMissing ./.cargo/config.toml)
+          # Include .wat files needed by build.rs (compiled to WASM at build time).
+          ./crates/harmony-node/src/inference_runner.wat
         ];
       };
 
@@ -59,8 +63,9 @@
             openssl
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.darwin.apple_sdk.frameworks.Security
-            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            # darwin.apple_sdk.frameworks was removed in nixpkgs 26.05.
+            # Security and SystemConfiguration are propagated transitively
+            # by openssl — no explicit listing needed.
             pkgs.libiconv
           ];
 
@@ -93,8 +98,6 @@
             openssl
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.darwin.apple_sdk.frameworks.Security
-            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
             pkgs.libiconv
           ];
 
