@@ -1,5 +1,7 @@
 mod compute;
 mod config;
+#[cfg(feature = "nix-cache")]
+mod narinfo;
 mod did_web_gateway;
 mod discovery;
 #[allow(dead_code)]
