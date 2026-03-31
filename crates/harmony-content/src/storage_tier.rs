@@ -667,6 +667,11 @@ impl<B: BookStore> StorageTier<B> {
                 self.cache.store(cid, data.clone());
                 self.mutations_since_broadcast = self.mutations_since_broadcast.saturating_add(1);
                 self.metrics.archive_reads_served += 1;
+                // Touch archive LRU BEFORE disk persist — record_disk_persist can
+                // trigger disk eviction → cascade → archive eviction. Without the
+                // touch, the just-read CID sits at its old LRU position and could
+                // be evicted by the cascading quota enforcement.
+                self.touch_archive_lru(&cid);
 
                 let mut actions = vec![StorageTierAction::SendReply {
                     query_id,
@@ -682,8 +687,6 @@ impl<B: BookStore> StorageTier<B> {
                     });
                     self.record_disk_persist(cid, persist_size, &mut actions);
                 }
-
-                self.touch_archive_lru(&cid);
 
                 if self.should_announce(&cid) {
                     actions.push(self.make_announce_action(&cid));
