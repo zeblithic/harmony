@@ -2,6 +2,8 @@ mod compute;
 mod config;
 #[cfg(feature = "nix-cache")]
 mod narinfo;
+#[cfg(feature = "nix-cache")]
+pub(crate) mod nix_cache;
 mod did_web_gateway;
 mod discovery;
 #[allow(dead_code)]

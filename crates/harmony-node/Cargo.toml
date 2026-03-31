@@ -71,3 +71,4 @@ wat = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tower = "0.5"
