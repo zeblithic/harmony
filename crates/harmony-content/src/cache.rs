@@ -54,6 +54,10 @@ pub struct ContentStore<S: BookStore> {
     probation: Lru,
     protected: Lru,
     pinned: HashSet<ContentId>,
+    /// Buffer of (CID, data) pairs evicted during the most recent `store()` call.
+    /// Callers drain this via [`drain_evicted`](Self::drain_evicted) after each
+    /// store operation to capture evicted content for network push or cleanup.
+    evicted: Vec<(ContentId, Vec<u8>)>,
 }
 
 impl<S: BookStore> fmt::Debug for ContentStore<S> {
@@ -100,6 +104,7 @@ impl<S: BookStore> ContentStore<S> {
             probation: Lru::new(probation_cap),
             protected: Lru::new(protected_cap),
             pinned: HashSet::new(),
+            evicted: Vec::new(),
         }
     }
 
@@ -366,18 +371,29 @@ impl<S: BookStore> ContentStore<S> {
         }
     }
 
-    /// Remove a CID from the backing store.
+    /// Remove a CID from the backing store and buffer the evicted data.
     ///
-    /// No-op for now: `MemoryBookStore` does not support removal. The CID is
-    /// no longer tracked by the cache but data stays in the store.
+    /// Callers retrieve evicted data via [`drain_evicted`](Self::drain_evicted).
     ///
-    /// **WARNING:** Before implementing this, audit ALL eviction paths to check
-    /// pins. Currently only `admission_challenge` checks the pinned set.
-    /// Window eviction and protected→probation demotion do not. A real
-    /// `store_remove` on those paths would destroy backing data for pinned CIDs.
-    /// See the "Pin Scope Limitation" section on [`ContentStore`].
-    fn store_remove(&mut self, _cid: &ContentId) {
-        // No-op — backing store removal not yet supported.
+    /// **Pin safety audit (2026-04-01):** This method is ONLY called from
+    /// `admission_challenge()`, which already checks the pinned set — pinned
+    /// CIDs are never passed to `store_remove`. Window eviction and
+    /// protected→probation demotion do not call `store_remove`; they move
+    /// CIDs between segments without removing backing data. If new eviction
+    /// paths are added in the future, they MUST check pins before calling this.
+    fn store_remove(&mut self, cid: &ContentId) {
+        if let Some(data) = self.store.remove(cid) {
+            self.evicted.push((*cid, data));
+        }
+    }
+
+    /// Drain the buffer of CIDs evicted during the most recent `store()` call.
+    ///
+    /// Returns an iterator of `(ContentId, Vec<u8>)` pairs. Must be called
+    /// after each `store()` / `store_preadmitted()` to consume evictions —
+    /// the buffer is NOT automatically cleared between calls.
+    pub fn drain_evicted(&mut self) -> alloc::vec::Drain<'_, (ContentId, Vec<u8>)> {
+        self.evicted.drain(..)
     }
 }
 
@@ -403,6 +419,10 @@ impl<S: BookStore> BookStore for ContentStore<S> {
 
     fn contains(&self, cid: &ContentId) -> bool {
         self.store.contains(cid)
+    }
+
+    fn remove(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
+        self.store.remove(cid)
     }
 }
 

@@ -173,6 +173,21 @@ pub mod announce {
     }
 }
 
+/// Eviction push: durable content evicted from cache, published for archivist subscribers.
+pub mod archive {
+    use alloc::{format, string::String};
+    /// Base prefix: `harmony/archive`
+    pub const PREFIX: &str = "harmony/archive";
+
+    /// Subscription pattern for archivist subscribers: `harmony/archive/*`
+    pub const SUB: &str = "harmony/archive/*";
+
+    /// Eviction push key: `harmony/archive/{cid_hex}`
+    pub fn key(cid_hex: &str) -> String {
+        format!("{PREFIX}/{cid_hex}")
+    }
+}
+
 /// Content filter broadcasts.
 ///
 /// Nodes periodically broadcast Bloom filters of their cached CID set.
