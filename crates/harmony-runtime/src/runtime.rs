@@ -108,6 +108,9 @@ pub struct NodeConfig {
     /// Whether to push evicted durable content to remote archivists via Zenoh.
     /// When true, cache evictions of durable CIDs not on disk emit EvictionPush actions.
     pub eviction_push_enabled: bool,
+    /// Whether to subscribe to `harmony/archive/*` and ingest pushed content.
+    /// Enables this node to act as a passive archivist for eviction-pushed CAS blobs.
+    pub archive_ingest_enabled: bool,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -182,6 +185,7 @@ impl Default for NodeConfig {
             archive_quota: None,
             s3_enabled: false,
             eviction_push_enabled: false,
+            archive_ingest_enabled: false,
         }
     }
 }
@@ -1129,6 +1133,13 @@ impl<B: BookStore> NodeRuntime<B> {
         // Activate eviction push: publish evicted durable content to archivists.
         if config.eviction_push_enabled {
             rt.storage.enable_eviction_push();
+        }
+
+        // Subscribe to archive topic to ingest pushed content from other nodes.
+        if config.archive_ingest_enabled {
+            actions.push(RuntimeAction::Subscribe {
+                key_expr: archive_ns::SUB.to_string(),
+            });
         }
 
         // If inference model CIDs are configured AND the inference feature is
@@ -4457,6 +4468,15 @@ impl<B: BookStore> NodeRuntime<B> {
             let cid = ContentId::from_bytes(cid_bytes);
             return Some(StorageTierEvent::PublishContent { cid, data: payload });
         }
+        // Archive ingest: treat pushed content like a local publish.
+        if let Some(cid_hex) = key_expr
+            .strip_prefix(archive_ns::PREFIX)
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            let cid_bytes: [u8; 32] = hex::decode(cid_hex).ok()?.try_into().ok()?;
+            let cid = ContentId::from_bytes(cid_bytes);
+            return Some(StorageTierEvent::PublishContent { cid, data: payload });
+        }
         None
     }
 }
@@ -5460,6 +5480,7 @@ mod tests {
             archive_quota: None,
             s3_enabled: false,
             eviction_push_enabled: false,
+            archive_ingest_enabled: false,
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
@@ -5541,6 +5562,7 @@ mod tests {
             archive_quota: None,
             s3_enabled: false,
             eviction_push_enabled: false,
+            archive_ingest_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -5588,6 +5610,7 @@ mod tests {
             archive_quota: None,
             s3_enabled: false,
             eviction_push_enabled: false,
+            archive_ingest_enabled: false,
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
@@ -5632,6 +5655,7 @@ mod tests {
             archive_quota: None,
             s3_enabled: false,
             eviction_push_enabled: false,
+            archive_ingest_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -5705,6 +5729,7 @@ mod tests {
             archive_quota: None,
             s3_enabled: false,
             eviction_push_enabled: false,
+            archive_ingest_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -5767,6 +5792,7 @@ mod tests {
             archive_quota: None,
             s3_enabled: false,
             eviction_push_enabled: false,
+            archive_ingest_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -5822,6 +5848,7 @@ mod tests {
             archive_quota: None,
             s3_enabled: false,
             eviction_push_enabled: false,
+            archive_ingest_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -6735,6 +6762,7 @@ mod tests {
             archive_quota: None,
             s3_enabled: false,
             eviction_push_enabled: false,
+            archive_ingest_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 

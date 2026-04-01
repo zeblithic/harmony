@@ -757,6 +757,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     { false }
                 },
                 eviction_push_enabled: config_file.eviction_push.unwrap_or(false),
+                archive_ingest_enabled: config_file.archive_ingest.unwrap_or(false),
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 
