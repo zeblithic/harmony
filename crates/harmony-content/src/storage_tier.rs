@@ -44,6 +44,7 @@ pub struct StorageMetrics {
     pub archive_read_failures: u64,
     pub s3_reads_served: u64,
     pub s3_read_failures: u64,
+    pub eviction_pushes: u64,
 }
 
 impl StorageMetrics {
@@ -66,6 +67,7 @@ impl StorageMetrics {
             archive_read_failures,
             s3_reads_served,
             s3_read_failures,
+            eviction_pushes,
         } = self;
         let fields: &[u64] = &[
             *queries_served,
@@ -81,6 +83,7 @@ impl StorageMetrics {
             *archive_read_failures,
             *s3_reads_served,
             *s3_read_failures,
+            *eviction_pushes,
         ];
         let mut buf = Vec::with_capacity(fields.len() * 8);
         for &val in fields {
@@ -176,6 +179,13 @@ pub enum StorageTierAction {
     /// The runtime constructs the full key expression (including node address)
     /// since `StorageTier` is sans-I/O and has no identity context.
     BroadcastCuckooFilter { payload: Vec<u8> },
+    /// Push evicted durable content to remote archivists via Zenoh pub/sub.
+    ///
+    /// Emitted when the W-TinyLFU cache evicts a durable CID that is not
+    /// already persisted on disk. The runtime publishes the full data blob
+    /// to `harmony/archive/{cid_hex}` for passive archivist subscribers.
+    /// Fire-and-forget: no ACKs, no retry, no archivist health checks.
+    EvictionPush { cid: ContentId, data: Vec<u8> },
 }
 
 /// Per-class storage and publishing policy.
@@ -270,6 +280,9 @@ pub struct StorageTier<B: BookStore> {
     /// Whether the runtime has wired up S3 remote storage.
     /// When false, S3Lookup actions are suppressed.
     s3_enabled: bool,
+    /// Whether to push evicted durable content to remote archivists via Zenoh.
+    /// When true, cache evictions of durable CIDs not on disk emit EvictionPush actions.
+    eviction_push_enabled: bool,
     /// Configuration for periodic Bloom filter broadcasts.
     filter_config: FilterBroadcastConfig,
     /// Number of cache mutations since last Bloom filter broadcast.
@@ -332,6 +345,7 @@ impl<B: BookStore> StorageTier<B> {
             archive_used_bytes: 0,
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
             filter_config,
             mutations_since_broadcast: 0,
             flatpack,
@@ -464,6 +478,17 @@ impl<B: BookStore> StorageTier<B> {
     /// Whether S3 remote storage is currently enabled.
     pub fn s3_enabled(&self) -> bool {
         self.s3_enabled
+    }
+
+    /// Enable eviction push: durable content evicted from cache is published
+    /// to `harmony/archive/{cid}` for remote archivist subscribers.
+    pub fn enable_eviction_push(&mut self) {
+        self.eviction_push_enabled = true;
+    }
+
+    /// Whether eviction push is currently enabled.
+    pub fn eviction_push_enabled(&self) -> bool {
+        self.eviction_push_enabled
     }
 
     /// Enable archive (cold-tier) I/O and populate the archive index.
@@ -611,6 +636,7 @@ impl<B: BookStore> StorageTier<B> {
                     query_id,
                     payload: data,
                 }];
+                self.drain_eviction_pushes(&mut actions);
                 if self.mutations_since_broadcast >= self.filter_config.mutation_threshold {
                     actions.push(self.rebuild_filter());
                 }
@@ -677,6 +703,7 @@ impl<B: BookStore> StorageTier<B> {
                     query_id,
                     payload: data,
                 }];
+                self.drain_eviction_pushes(&mut actions);
 
                 // Promote to disk so future reads hit NVMe instead of HDD.
                 if let Some(persist_bytes) = persist_data {
@@ -781,6 +808,7 @@ impl<B: BookStore> StorageTier<B> {
                     query_id,
                     payload: data,
                 }];
+                self.drain_eviction_pushes(&mut actions);
 
                 // Persist to disk so future queries hit disk instead of S3.
                 if let Some(persist_bytes) = persist_data {
@@ -947,6 +975,7 @@ impl<B: BookStore> StorageTier<B> {
         self.mutations_since_broadcast = self.mutations_since_broadcast.saturating_add(1);
 
         let mut actions = Vec::new();
+        self.drain_eviction_pushes(&mut actions);
 
         // After cache insertion, persist durable content to disk.
         // Optimistic: disk_index is updated before the async write completes.
@@ -1003,6 +1032,7 @@ impl<B: BookStore> StorageTier<B> {
         self.mutations_since_broadcast = self.mutations_since_broadcast.saturating_add(1);
 
         let mut actions = Vec::new();
+        self.drain_eviction_pushes(&mut actions);
 
         // After cache insertion, persist durable content to disk.
         if let Some(persist_bytes) = persist_data {
@@ -1050,6 +1080,22 @@ impl<B: BookStore> StorageTier<B> {
         let key_expr = announce_ns::key(&cid_hex);
         let payload = cid.payload_size().to_be_bytes().to_vec();
         StorageTierAction::AnnounceContent { key_expr, payload }
+    }
+
+    /// Drain cache evictions and emit `EvictionPush` for durable CIDs not on disk.
+    ///
+    /// Must be called after every `cache.store()` / `cache.store_preadmitted()`.
+    /// Always drains the eviction buffer to free memory, even when push is disabled.
+    fn drain_eviction_pushes(&mut self, actions: &mut Vec<StorageTierAction>) {
+        for (cid, data) in self.cache.drain_evicted() {
+            if self.eviction_push_enabled
+                && Self::is_durable_class(&cid)
+                && !self.disk_index.contains_key(&cid)
+            {
+                self.metrics.eviction_pushes += 1;
+                actions.push(StorageTierAction::EvictionPush { cid, data });
+            }
+        }
     }
 
     fn handle_stats_query(&mut self, query_id: u64) -> Vec<StorageTierAction> {
@@ -1382,7 +1428,7 @@ mod tests {
         match &actions[0] {
             StorageTierAction::SendStatsReply { query_id, payload } => {
                 assert_eq!(*query_id, 77);
-                assert_eq!(payload.len(), 104); // 13 u64 fields
+                assert_eq!(payload.len(), 112); // 14 u64 fields
                 let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
                 assert_eq!(queries, 1); // one ContentQuery was processed
             }
@@ -3293,5 +3339,156 @@ mod tests {
             other => panic!("expected empty SendReply, got {other:?}"),
         }
         assert_eq!(tier.metrics().s3_read_failures, 1);
+    }
+
+    #[test]
+    fn eviction_push_emitted_for_durable_cid_not_on_disk() {
+        // Cache capacity 2: the third publish forces an eviction.
+        // Uses PublishContent (bypasses admission filter) to guarantee insertion.
+        let budget = StorageBudget {
+            cache_capacity: 2,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+        tier.enable_eviction_push();
+
+        let data_a = b"aaaa";
+        let data_b = b"bbbb";
+        let data_c = b"cccc";
+        let cid_a =
+            ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
+        let cid_b =
+            ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
+        let cid_c =
+            ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
+
+        // First two inserts: no evictions expected.
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_a,
+            data: data_a.to_vec(),
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            "no eviction push on first insert"
+        );
+
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_b,
+            data: data_b.to_vec(),
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            "no eviction push on second insert"
+        );
+
+        // Third insert: should cause an eviction push.
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_c,
+            data: data_c.to_vec(),
+        });
+        let push_count = actions
+            .iter()
+            .filter(|a| matches!(a, StorageTierAction::EvictionPush { .. }))
+            .count();
+        assert!(push_count > 0, "expected at least one EvictionPush on third insert");
+        assert_eq!(tier.metrics().eviction_pushes, push_count as u64);
+    }
+
+    #[test]
+    fn eviction_push_suppressed_when_disabled() {
+        let budget = StorageBudget {
+            cache_capacity: 2,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+        // eviction_push NOT enabled (default)
+
+        let data_a = b"aaaa";
+        let data_b = b"bbbb";
+        let data_c = b"cccc";
+        let cid_a =
+            ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
+        let cid_b =
+            ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
+        let cid_c =
+            ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
+
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_a,
+            data: data_a.to_vec(),
+        });
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_b,
+            data: data_b.to_vec(),
+        });
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_c,
+            data: data_c.to_vec(),
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            "no EvictionPush when feature is disabled"
+        );
+        assert_eq!(tier.metrics().eviction_pushes, 0);
+    }
+
+    #[test]
+    fn eviction_push_suppressed_when_cid_on_disk() {
+        let budget = StorageBudget {
+            cache_capacity: 2,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+        tier.enable_eviction_push();
+
+        let data_a = b"aaaa";
+        let data_b = b"bbbb";
+        let data_c = b"cccc";
+        let cid_a =
+            ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
+        let cid_b =
+            ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
+        let cid_c =
+            ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
+
+        // Enable disk and pre-populate disk_index with all three CIDs.
+        tier.enable_disk(vec![
+            (cid_a, data_a.len() as u64),
+            (cid_b, data_b.len() as u64),
+            (cid_c, data_c.len() as u64),
+        ]);
+
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_a,
+            data: data_a.to_vec(),
+        });
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_b,
+            data: data_b.to_vec(),
+        });
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_c,
+            data: data_c.to_vec(),
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            "no EvictionPush when CID is already on disk"
+        );
+        assert_eq!(tier.metrics().eviction_pushes, 0);
     }
 }

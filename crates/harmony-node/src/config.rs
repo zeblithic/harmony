@@ -85,6 +85,10 @@ pub struct ConfigFile {
     pub tunnels: Option<Vec<TunnelEntry>>,
     pub did_web_cache_ttl: Option<u64>,
     pub rawlink_interface: Option<String>,
+    /// Push evicted durable content to remote archivists via Zenoh pub/sub.
+    /// When true, cache evictions of durable CIDs not on disk are published to
+    /// `harmony/archive/{cid}` for passive archivist subscribers.
+    pub eviction_push: Option<bool>,
     pub archivist: Option<ArchivistConfig>,
     /// Hex-encoded 32-byte CID of the GGUF model file in CAS.
     pub inference_model_gguf_cid: Option<String>,

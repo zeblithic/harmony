@@ -29,6 +29,9 @@ pub trait BookStore {
 
     /// Check if a CID exists in the store.
     fn contains(&self, cid: &ContentId) -> bool;
+
+    /// Remove data by CID, returning the data if it was present.
+    fn remove(&mut self, cid: &ContentId) -> Option<Vec<u8>>;
 }
 
 /// In-memory content-addressed store backed by a HashMap.
@@ -84,6 +87,10 @@ impl BookStore for MemoryBookStore {
 
     fn contains(&self, cid: &ContentId) -> bool {
         self.data.contains_key(cid)
+    }
+
+    fn remove(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
+        self.data.remove(cid)
     }
 }
 

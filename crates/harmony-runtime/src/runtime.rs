@@ -23,7 +23,7 @@ use harmony_peers::{PeerAction, PeerEvent, PeerManager};
 use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
 use harmony_zenoh::namespace::content as content_ns;
-use harmony_zenoh::namespace::{announce as announce_ns, page as page_ns};
+use harmony_zenoh::namespace::{announce as announce_ns, archive as archive_ns, page as page_ns};
 use harmony_zenoh::queryable::{QueryableAction, QueryableEvent, QueryableId, QueryableRouter};
 
 /// Ticks before an in-flight memo fetch expires (20 × 250ms = 5s).
@@ -105,6 +105,9 @@ pub struct NodeConfig {
     /// Whether S3 fallback is enabled for durable content.
     /// Controls whether StorageTier emits S3Lookup actions on cache miss.
     pub s3_enabled: bool,
+    /// Whether to push evicted durable content to remote archivists via Zenoh.
+    /// When true, cache evictions of durable CIDs not on disk emit EvictionPush actions.
+    pub eviction_push_enabled: bool,
 }
 
 /// Per-tick scheduling strategy for the three-tier event loop.
@@ -178,6 +181,7 @@ impl Default for NodeConfig {
             archive_entries: Vec::new(),
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
         }
     }
 }
@@ -1120,6 +1124,11 @@ impl<B: BookStore> NodeRuntime<B> {
         // Activate S3 fallback tier for durable content.
         if config.s3_enabled {
             rt.storage.enable_s3();
+        }
+
+        // Activate eviction push: publish evicted durable content to archivists.
+        if config.eviction_push_enabled {
+            rt.storage.enable_eviction_push();
         }
 
         // If inference model CIDs are configured AND the inference feature is
@@ -2399,6 +2408,13 @@ impl<B: BookStore> NodeRuntime<B> {
                 }
                 StorageTierAction::BroadcastCuckooFilter { payload } => {
                     self.pending_cuckoo_broadcast = Some(payload);
+                }
+                StorageTierAction::EvictionPush { cid, data } => {
+                    let cid_hex = hex::encode(cid.to_bytes());
+                    out.push(RuntimeAction::Publish {
+                        key_expr: archive_ns::key(&cid_hex),
+                        payload: data,
+                    });
                 }
             }
         }
@@ -4887,7 +4903,7 @@ mod tests {
         assert!(reply.is_some(), "stats query should produce reply");
         if let Some(RuntimeAction::SendReply { payload, .. }) = reply {
             // 13 metrics × 8 bytes = 104 bytes
-            assert_eq!(payload.len(), 104);
+            assert_eq!(payload.len(), 112);
             // First metric is queries_served, should be 1
             let queries = u64::from_be_bytes(payload[0..8].try_into().unwrap());
             assert_eq!(queries, 1);
@@ -5443,6 +5459,7 @@ mod tests {
             archive_entries: Vec::new(),
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
         };
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.storage_queue_len(), 0);
@@ -5523,6 +5540,7 @@ mod tests {
             archive_entries: Vec::new(),
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -5569,6 +5587,7 @@ mod tests {
             archive_entries: Vec::new(),
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
         };
         let _ = NodeRuntime::new(config, MemoryBookStore::new());
     }
@@ -5612,6 +5631,7 @@ mod tests {
             archive_entries: Vec::new(),
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -5684,6 +5704,7 @@ mod tests {
             archive_entries: Vec::new(),
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -5745,6 +5766,7 @@ mod tests {
             archive_entries: Vec::new(),
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -5799,6 +5821,7 @@ mod tests {
             archive_entries: Vec::new(),
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 
@@ -6711,6 +6734,7 @@ mod tests {
             archive_entries: Vec::new(),
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
         };
         let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
 

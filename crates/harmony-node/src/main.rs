@@ -756,6 +756,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                     #[cfg(not(feature = "archivist"))]
                     { false }
                 },
+                eviction_push_enabled: config_file.eviction_push.unwrap_or(false),
             };
             let (mut rt, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
 
