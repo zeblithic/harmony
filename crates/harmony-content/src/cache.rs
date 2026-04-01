@@ -422,6 +422,12 @@ impl<S: BookStore> BookStore for ContentStore<S> {
     }
 
     fn remove(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
+        // Clean up LRU segments so cache metadata stays consistent.
+        // Without this, the CID would remain a "ghost" in the segments:
+        // is_admitted() returns true, but get() returns None.
+        self.window.remove(cid);
+        self.probation.remove(cid);
+        self.protected.remove(cid);
         self.store.remove(cid)
     }
 }

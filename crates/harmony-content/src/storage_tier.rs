@@ -3340,4 +3340,155 @@ mod tests {
         }
         assert_eq!(tier.metrics().s3_read_failures, 1);
     }
+
+    #[test]
+    fn eviction_push_emitted_for_durable_cid_not_on_disk() {
+        // Cache capacity 2: the third publish forces an eviction.
+        // Uses PublishContent (bypasses admission filter) to guarantee insertion.
+        let budget = StorageBudget {
+            cache_capacity: 2,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+        tier.enable_eviction_push();
+
+        let data_a = b"aaaa";
+        let data_b = b"bbbb";
+        let data_c = b"cccc";
+        let cid_a =
+            ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
+        let cid_b =
+            ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
+        let cid_c =
+            ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
+
+        // First two inserts: no evictions expected.
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_a,
+            data: data_a.to_vec(),
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            "no eviction push on first insert"
+        );
+
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_b,
+            data: data_b.to_vec(),
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            "no eviction push on second insert"
+        );
+
+        // Third insert: should cause an eviction push.
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_c,
+            data: data_c.to_vec(),
+        });
+        let push_count = actions
+            .iter()
+            .filter(|a| matches!(a, StorageTierAction::EvictionPush { .. }))
+            .count();
+        assert!(push_count > 0, "expected at least one EvictionPush on third insert");
+        assert_eq!(tier.metrics().eviction_pushes, push_count as u64);
+    }
+
+    #[test]
+    fn eviction_push_suppressed_when_disabled() {
+        let budget = StorageBudget {
+            cache_capacity: 2,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+        // eviction_push NOT enabled (default)
+
+        let data_a = b"aaaa";
+        let data_b = b"bbbb";
+        let data_c = b"cccc";
+        let cid_a =
+            ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
+        let cid_b =
+            ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
+        let cid_c =
+            ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
+
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_a,
+            data: data_a.to_vec(),
+        });
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_b,
+            data: data_b.to_vec(),
+        });
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_c,
+            data: data_c.to_vec(),
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            "no EvictionPush when feature is disabled"
+        );
+        assert_eq!(tier.metrics().eviction_pushes, 0);
+    }
+
+    #[test]
+    fn eviction_push_suppressed_when_cid_on_disk() {
+        let budget = StorageBudget {
+            cache_capacity: 2,
+            max_pinned_bytes: 1_000_000,
+        };
+        let (mut tier, _) = StorageTier::new(
+            MemoryBookStore::new(),
+            budget,
+            ContentPolicy::default(),
+            FilterBroadcastConfig::default(),
+        );
+        tier.enable_eviction_push();
+
+        let data_a = b"aaaa";
+        let data_b = b"bbbb";
+        let data_c = b"cccc";
+        let cid_a =
+            ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
+        let cid_b =
+            ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
+        let cid_c =
+            ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
+
+        // Enable disk and pre-populate disk_index with all three CIDs.
+        tier.enable_disk(vec![
+            (cid_a, data_a.len() as u64),
+            (cid_b, data_b.len() as u64),
+            (cid_c, data_c.len() as u64),
+        ]);
+
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_a,
+            data: data_a.to_vec(),
+        });
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_b,
+            data: data_b.to_vec(),
+        });
+        let actions = tier.handle(StorageTierEvent::PublishContent {
+            cid: cid_c,
+            data: data_c.to_vec(),
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            "no EvictionPush when CID is already on disk"
+        );
+        assert_eq!(tier.metrics().eviction_pushes, 0);
+    }
 }
