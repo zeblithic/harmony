@@ -101,6 +101,49 @@ bd close bd-42 --reason "Completed" --json
    - `bd create "Found bug" --description="Details about what was found" -p 1 --deps discovered-from:<parent-id>`
 5. **Complete**: `bd close <id> --reason "Done"`
 
+### Setting Up beads on a New Machine
+
+When cloning this repo onto a fresh machine, `bd bootstrap` will pull the
+Dolt database from the remote but does **not** generate the files bd needs
+to open it. After bootstrapping, you must create these manually:
+
+```bash
+bd bootstrap          # pulls data into .beads/embeddeddolt/beads/
+
+# Fix permissions
+chmod 700 .beads
+
+# Create metadata.json so bd knows which embedded database to open
+cat > .beads/metadata.json << 'EOF'
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "beads"
+}
+EOF
+
+# Create the lock file and interactions log
+touch .beads/embeddeddolt/.lock
+touch .beads/interactions.jsonl
+
+# Create config.yaml with auto-sync enabled
+cat > .beads/config.yaml << 'EOF'
+backup:
+  enabled: false
+
+dolt.auto-push: true
+dolt.auto-commit: "on"
+EOF
+
+# Verify
+bd ready
+```
+
+Without `metadata.json`, bd will fail with `"no database selected"`.
+These files live in `.beads/` which is gitignored, so they must be
+recreated on each new machine.
+
 ### Auto-Sync
 
 bd automatically syncs with git:
