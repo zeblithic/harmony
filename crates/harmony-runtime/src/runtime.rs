@@ -817,6 +817,10 @@ pub struct NodeRuntime<B: BookStore> {
     /// Which transformer layers to inject Engram at.
     #[cfg(feature = "inference")]
     engram_injection_layers: Vec<usize>,
+    /// Whether archive ingest is enabled (subscribe to harmony/archive/*).
+    /// Used as a runtime guard in parse_subscription_event to prevent routing
+    /// archive messages when the feature is not active.
+    archive_ingest_enabled: bool,
 }
 
 /// Adapts the runtime's pubkey_cache to the CredentialKeyResolver trait
@@ -1071,6 +1075,7 @@ impl<B: BookStore> NodeRuntime<B> {
             engram_module: None,
             #[cfg(feature = "inference")]
             engram_injection_layers: vec![2, 14],
+            archive_ingest_enabled: config.archive_ingest_enabled,
         };
 
         // Activate archive (cold-tier) BEFORE disk quota enforcement so that
@@ -4469,13 +4474,20 @@ impl<B: BookStore> NodeRuntime<B> {
             return Some(StorageTierEvent::PublishContent { cid, data: payload });
         }
         // Archive ingest: treat pushed content like a local publish.
-        if let Some(cid_hex) = key_expr
-            .strip_prefix(archive_ns::PREFIX)
-            .and_then(|s| s.strip_prefix('/'))
-        {
-            let cid_bytes: [u8; 32] = hex::decode(cid_hex).ok()?.try_into().ok()?;
-            let cid = ContentId::from_bytes(cid_bytes);
-            return Some(StorageTierEvent::PublishContent { cid, data: payload });
+        // Guarded by config flag to prevent a self-loop: a node with both
+        // eviction_push and archive_ingest enabled would re-ingest its own
+        // eviction pushes via Zenoh local loopback (archive keys carry no
+        // peer ID, so self-published messages can't be filtered by origin).
+        // In practice, routers push and archivists ingest — not both.
+        if self.archive_ingest_enabled {
+            if let Some(cid_hex) = key_expr
+                .strip_prefix(archive_ns::PREFIX)
+                .and_then(|s| s.strip_prefix('/'))
+            {
+                let cid_bytes: [u8; 32] = hex::decode(cid_hex).ok()?.try_into().ok()?;
+                let cid = ContentId::from_bytes(cid_bytes);
+                return Some(StorageTierEvent::PublishContent { cid, data: payload });
+            }
         }
         None
     }
