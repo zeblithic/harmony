@@ -17,16 +17,14 @@ endpoint = "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
 use_ssl = true
 region = "auto"
 key_prefix = ""
+server_side_encryption = false
+
+[cache.s3.credentials]
+aws_access_key_id = "<R2_ACCESS_KEY_ID>"
+aws_secret_access_key = "<R2_SECRET_ACCESS_KEY>"
 ```
 
-Set the R2 API credentials as environment variables (add to `~/.bashrc` or equivalent):
-
-```bash
-export AWS_ACCESS_KEY_ID="<R2_ACCESS_KEY_ID>"
-export AWS_SECRET_ACCESS_KEY="<R2_SECRET_ACCESS_KEY>"
-```
-
-Ask a team member for the R2 credentials or find them in the Cloudflare dashboard under R2 > API Tokens.
+This keeps credentials scoped to sccache only — they are not exposed to unrelated processes. Ask a team member for the R2 credentials or find them in the Cloudflare dashboard under R2 > API Tokens.
 
 ### 2. Verify
 

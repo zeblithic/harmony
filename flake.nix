@@ -231,7 +231,7 @@
         # Credentials live in ~/.config/sccache/config (see docs/sccache-setup.md).
         # CARGO_INCREMENTAL=0 is required — incremental builds are incompatible
         # with sccache (each machine's incremental artifacts are host-specific).
-        RUSTC_WRAPPER = "sccache";
+        RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
         CARGO_INCREMENTAL = "0";
       };
     });
