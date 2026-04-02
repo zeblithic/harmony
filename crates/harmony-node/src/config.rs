@@ -112,6 +112,9 @@ pub struct ArchivistConfig {
     pub bucket: String,
     pub prefix: String,
     pub region: Option<String>,
+    /// S3-compatible endpoint URL (e.g., Cloudflare R2).
+    /// When set, the AWS SDK sends requests to this endpoint instead of AWS S3.
+    pub endpoint: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]

@@ -7,9 +7,10 @@
 //! 32-byte content IDs to S3 object keys and exposes only the three
 //! operations needed for a content-addressed store: put, get, and exists.
 //!
-//! All objects are stored with `INTELLIGENT_TIERING` storage class so that
-//! infrequently-accessed books automatically migrate to cheaper tiers without
-//! any application-layer coordination.
+//! On AWS S3, objects are stored with `INTELLIGENT_TIERING` storage class so
+//! that infrequently-accessed books automatically migrate to cheaper tiers.
+//! On S3-compatible providers with custom endpoints (e.g., Cloudflare R2),
+//! the storage class is omitted since not all providers support it.
 
 mod error;
 
@@ -35,6 +36,9 @@ pub struct S3Library {
     client: Client,
     bucket: String,
     prefix: String,
+    /// When true, use a custom endpoint (e.g., Cloudflare R2) that may not
+    /// support all S3 storage classes. Omits INTELLIGENT_TIERING on PUTs.
+    custom_endpoint: bool,
 }
 
 impl S3Library {
@@ -42,6 +46,10 @@ impl S3Library {
     ///
     /// Configuration is loaded from the environment (AWS_REGION,
     /// AWS_ACCESS_KEY_ID, etc.) with `region` overriding the ambient region.
+    ///
+    /// Set `endpoint` to point at an S3-compatible provider (e.g., Cloudflare
+    /// R2: `https://<account-id>.r2.cloudflarestorage.com`). When `None`, the
+    /// SDK uses the default AWS S3 endpoints.
     ///
     /// # Errors
     ///
@@ -51,6 +59,7 @@ impl S3Library {
         bucket: impl Into<String>,
         prefix: impl Into<String>,
         region: Option<String>,
+        endpoint: Option<String>,
     ) -> Result<Self, S3Error> {
         let bucket = bucket.into();
         let mut prefix = prefix.into();
@@ -65,6 +74,15 @@ impl S3Library {
         if let Some(ref region) = region {
             config_loader = config_loader.region(aws_config::Region::new(region.clone()));
         }
+        let custom_endpoint = endpoint.is_some();
+        if let Some(ref url) = endpoint {
+            if !url.starts_with("https://") && !url.starts_with("http://") {
+                return Err(S3Error::ConfigError(format!(
+                    "endpoint must begin with http:// or https://, got: {url}"
+                )));
+            }
+            config_loader = config_loader.endpoint_url(url);
+        }
         let config = config_loader.load().await;
         let client = Client::new(&config);
 
@@ -73,6 +91,7 @@ impl S3Library {
             client,
             bucket,
             prefix,
+            custom_endpoint,
         })
     }
 
@@ -85,8 +104,13 @@ impl S3Library {
 
     /// Store a book in S3.
     ///
-    /// Uses `INTELLIGENT_TIERING` storage class. The call is idempotent —
-    /// re-uploading the same content identifier overwrites with identical data.
+    /// On AWS S3, uses `INTELLIGENT_TIERING` storage class so infrequently
+    /// accessed books migrate to cheaper tiers automatically. On custom
+    /// endpoints (e.g., Cloudflare R2), the storage class is omitted since
+    /// R2 only supports STANDARD.
+    ///
+    /// The call is idempotent — re-uploading the same content identifier
+    /// overwrites with identical data.
     ///
     /// # Errors
     ///
@@ -96,13 +120,15 @@ impl S3Library {
         let key = self.object_key(cid_bytes);
         debug!(key, bytes = data.len(), "putting book");
 
-        self.client
+        let mut req = self.client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
-            .storage_class(StorageClass::IntelligentTiering)
-            .body(ByteStream::from(data))
-            .send()
+            .body(ByteStream::from(data));
+        if !self.custom_endpoint {
+            req = req.storage_class(StorageClass::IntelligentTiering);
+        }
+        req.send()
             .await
             .map_err(|e| S3Error::PutFailed(e.to_string()))?;
 
@@ -191,9 +217,7 @@ impl S3Library {
 mod tests {
     use super::*;
 
-    fn make_library(prefix: &str) -> S3Library {
-        // Construct directly without AWS — safe for unit tests that only
-        // exercise pure logic like key formatting.
+    fn make_library_with_endpoint(prefix: &str, custom_endpoint: bool) -> S3Library {
         let config = aws_sdk_s3::config::Builder::new()
             .region(aws_config::Region::new("us-east-1"))
             .behavior_version(BehaviorVersion::latest())
@@ -202,7 +226,12 @@ mod tests {
             client: Client::from_conf(config),
             bucket: "test-bucket".into(),
             prefix: prefix.into(),
+            custom_endpoint,
         }
+    }
+
+    fn make_library(prefix: &str) -> S3Library {
+        make_library_with_endpoint(prefix, false)
     }
 
     #[test]
@@ -230,5 +259,51 @@ mod tests {
             key,
             format!("prod/v2/book/{}", "00".repeat(32)),
         );
+    }
+
+    #[test]
+    fn custom_endpoint_flag_tracks_endpoint_presence() {
+        let aws = make_library_with_endpoint("v1/", false);
+        assert!(!aws.custom_endpoint, "AWS S3 path must not set custom_endpoint");
+
+        let r2 = make_library_with_endpoint("v1/", true);
+        assert!(r2.custom_endpoint, "R2 path must set custom_endpoint");
+    }
+
+    #[tokio::test]
+    async fn new_rejects_malformed_endpoint() {
+        let result = S3Library::new(
+            "bucket",
+            "prefix/",
+            Some("auto".into()),
+            Some("not-a-url".into()),
+        )
+        .await;
+        assert!(result.is_err(), "malformed endpoint must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("must begin with http"),
+            "error must mention URL scheme requirement, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_accepts_valid_endpoint() {
+        let result = S3Library::new(
+            "bucket",
+            "prefix/",
+            Some("auto".into()),
+            Some("https://abc123.r2.cloudflarestorage.com".into()),
+        )
+        .await;
+        assert!(result.is_ok(), "valid https endpoint must be accepted");
+        assert!(result.unwrap().custom_endpoint);
+    }
+
+    #[tokio::test]
+    async fn new_without_endpoint_is_aws() {
+        let result = S3Library::new("bucket", "prefix/", Some("us-east-1".into()), None).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap().custom_endpoint);
     }
 }

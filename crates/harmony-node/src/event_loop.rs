@@ -403,6 +403,7 @@ pub async fn run(
             archivist.bucket.clone(),
             archivist.prefix.clone(),
             archivist.region.clone(),
+            archivist.endpoint.clone(),
         )
         .await
         {
