@@ -79,7 +79,7 @@ On the Windows host, forward a port to WSL's SSH:
 
 ```powershell
 # In an elevated PowerShell prompt
-netsh interface portproxy add v4tov4 listenport=2222 listenaddress=0.0.0.0 connectport=22 connectaddress=$(wsl hostname -I | % { $_.Trim() })
+netsh interface portproxy add v4tov4 listenport=2222 listenaddress=0.0.0.0 connectport=22 connectaddress=((wsl hostname -I).Trim() -split '\s+')[0]
 ```
 
 The client then connects to `<windows-ip>:2222`.
@@ -130,7 +130,7 @@ builders-use-substitutes = true
 |---|---|---|
 | URI | `ssh-ng://zebli@avalon-ip?port=2222` | SSH connection to builder |
 | Platform | `x86_64-linux` | What the builder can build |
-| Features | `-` | SSH key file (- = default) |
+| SSH key file | `-` | Path to SSH key (- = default) |
 | Max jobs | `24` | Concurrent build jobs |
 | Speed factor | `1` | Priority vs other builders |
 | Supported features | `benchmark,big-parallel` | Nix system features |
@@ -166,7 +166,7 @@ sudo systemctl restart nix-daemon
 
 ```bash
 # Check the builder is recognized
-nix show-config | grep builders
+nix config show | grep builders
 
 # Run a build that targets the builder's platform
 nix build .#harmony-node-x86_64-linux --print-build-logs
@@ -196,13 +196,13 @@ and speed factor.
 ### "builder does not support platform"
 
 The builder's `system` and `extra-platforms` in nix.conf must include the
-target platform. Check with: `ssh avalon-builder "nix show-config | grep system"`
+target platform. Check with: `ssh avalon-builder "nix config show | grep system"`
 
 ### Builds still happen locally
 
 - Multi-user Nix: you must restart `nix-daemon` after editing nix.conf
 - The `builders` field must use `ssh-ng://` (not `ssh://`) for the Nix 2.x protocol
-- Check `nix show-config | grep builders` shows the expected value
+- Check `nix config show | grep builders` shows the expected value
 
 ### WSL2 IP changed after reboot
 
