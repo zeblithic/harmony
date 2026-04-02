@@ -35,6 +35,9 @@ pub struct S3Library {
     client: Client,
     bucket: String,
     prefix: String,
+    /// When true, use a custom endpoint (e.g., Cloudflare R2) that may not
+    /// support all S3 storage classes. Omits INTELLIGENT_TIERING on PUTs.
+    custom_endpoint: bool,
 }
 
 impl S3Library {
@@ -42,6 +45,10 @@ impl S3Library {
     ///
     /// Configuration is loaded from the environment (AWS_REGION,
     /// AWS_ACCESS_KEY_ID, etc.) with `region` overriding the ambient region.
+    ///
+    /// Set `endpoint` to point at an S3-compatible provider (e.g., Cloudflare
+    /// R2: `https://<account-id>.r2.cloudflarestorage.com`). When `None`, the
+    /// SDK uses the default AWS S3 endpoints.
     ///
     /// # Errors
     ///
@@ -51,6 +58,7 @@ impl S3Library {
         bucket: impl Into<String>,
         prefix: impl Into<String>,
         region: Option<String>,
+        endpoint: Option<String>,
     ) -> Result<Self, S3Error> {
         let bucket = bucket.into();
         let mut prefix = prefix.into();
@@ -65,6 +73,10 @@ impl S3Library {
         if let Some(ref region) = region {
             config_loader = config_loader.region(aws_config::Region::new(region.clone()));
         }
+        let custom_endpoint = endpoint.is_some();
+        if let Some(ref endpoint) = endpoint {
+            config_loader = config_loader.endpoint_url(endpoint);
+        }
         let config = config_loader.load().await;
         let client = Client::new(&config);
 
@@ -73,6 +85,7 @@ impl S3Library {
             client,
             bucket,
             prefix,
+            custom_endpoint,
         })
     }
 
@@ -85,8 +98,13 @@ impl S3Library {
 
     /// Store a book in S3.
     ///
-    /// Uses `INTELLIGENT_TIERING` storage class. The call is idempotent —
-    /// re-uploading the same content identifier overwrites with identical data.
+    /// On AWS S3, uses `INTELLIGENT_TIERING` storage class so infrequently
+    /// accessed books migrate to cheaper tiers automatically. On custom
+    /// endpoints (e.g., Cloudflare R2), the storage class is omitted since
+    /// R2 only supports STANDARD.
+    ///
+    /// The call is idempotent — re-uploading the same content identifier
+    /// overwrites with identical data.
     ///
     /// # Errors
     ///
@@ -96,13 +114,15 @@ impl S3Library {
         let key = self.object_key(cid_bytes);
         debug!(key, bytes = data.len(), "putting book");
 
-        self.client
+        let mut req = self.client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
-            .storage_class(StorageClass::IntelligentTiering)
-            .body(ByteStream::from(data))
-            .send()
+            .body(ByteStream::from(data));
+        if !self.custom_endpoint {
+            req = req.storage_class(StorageClass::IntelligentTiering);
+        }
+        req.send()
             .await
             .map_err(|e| S3Error::PutFailed(e.to_string()))?;
 
@@ -202,6 +222,7 @@ mod tests {
             client: Client::from_conf(config),
             bucket: "test-bucket".into(),
             prefix: prefix.into(),
+            custom_endpoint: false,
         }
     }
 
