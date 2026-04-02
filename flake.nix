@@ -224,7 +224,15 @@
           pkg-config
           cmake
           openssl
+          sccache
         ];
+
+        # sccache: shared Rust compilation cache via Cloudflare R2.
+        # Credentials live in ~/.config/sccache/config (see docs/sccache-setup.md).
+        # CARGO_INCREMENTAL=0 is required — incremental builds are incompatible
+        # with sccache (each machine's incremental artifacts are host-specific).
+        RUSTC_WRAPPER = "sccache";
+        CARGO_INCREMENTAL = "0";
       };
     });
 }
