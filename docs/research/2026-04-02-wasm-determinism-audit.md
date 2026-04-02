@@ -3,7 +3,7 @@
 **Bead:** harmony-qok2
 **Date:** 2026-04-02
 **Status:** Complete
-**Runtime:** wasmi 1.0.9 (pinned via `Cargo.toml` workspace dependency)
+**Runtime:** wasmi 1.0.9 (resolved version pinned in `Cargo.lock`; `Cargo.toml` workspace constraint is `"1"`)
 
 ## Summary
 
@@ -85,9 +85,10 @@ calls `memory.grow`. All buffer offsets are statically known:
 | Region | Offset | Size | Purpose |
 |--------|--------|------|---------|
 | Input metadata | 0 | 64B | Model CIDs |
+| Prompt length | 64 | 4B | i32: byte length of prompt text |
 | Prompt text | 68 | ~32KB | UTF-8 input |
-| Token buffer | 32768 | 8KB | Tokenized prompt |
 | Scratch slot | 32764 | 4B | Single-token forward |
+| Token buffer | 32768 | 8KB | Tokenized prompt |
 | Generated tokens | 40960 | 8KB | Autoregressive output |
 | Detokenized output | 49152 | 16KB | UTF-8 output |
 
