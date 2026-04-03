@@ -179,6 +179,16 @@ impl WasmtimeRuntime {
         ComputeResult,
         Option<(HostState, u64, Vec<u8>)>, // (host_state, fuel_consumed, memory_snapshot)
     ) {
+        // Reject modules containing float instructions (memo-safe determinism).
+        if let Err(reason) = crate::validate::reject_float_instructions(module_bytes) {
+            return (
+                ComputeResult::Failed {
+                    error: ComputeError::InvalidModule { reason },
+                },
+                None,
+            );
+        }
+
         // Compile the WASM module.
         let module = match wasmtime::Module::new(&self.engine, module_bytes) {
             Ok(m) => m,

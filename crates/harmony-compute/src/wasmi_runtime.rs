@@ -289,6 +289,13 @@ impl ComputeRuntime for WasmiRuntime {
         // Hash the module bytes for identity tracking.
         let module_hash = harmony_crypto::hash::blake3_hash(module_bytes);
 
+        // Reject modules containing float instructions (memo-safe determinism).
+        if let Err(reason) = crate::validate::reject_float_instructions(module_bytes) {
+            return ComputeResult::Failed {
+                error: ComputeError::InvalidModule { reason },
+            };
+        }
+
         // Compile the WASM module.
         let module = match wasmi::Module::new(&self.engine, module_bytes) {
             Ok(m) => m,
@@ -1777,6 +1784,35 @@ mod tests {
                 assert_eq!(code, -1, "expected -1 (no model loaded), got {code}");
             }
             other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_rejects_float_module() {
+        // A WASM binary (not WAT) with float instructions must be rejected
+        // by execute() before compilation.
+        let wasm = wat::parse_str(
+            r#"(module
+              (memory (export "memory") 1)
+              (func (export "compute") (param i32) (param i32) (result i32)
+                (drop (f32.add (f32.const 1.0) (f32.const 2.0)))
+                (i32.const 0)))"#,
+        )
+        .expect("valid WAT");
+
+        let mut rt = WasmiRuntime::new();
+        let result = rt.execute(&wasm, b"", InstructionBudget { fuel: 1_000_000 });
+
+        match &result {
+            ComputeResult::Failed {
+                error: ComputeError::InvalidModule { reason },
+            } => {
+                assert!(
+                    reason.contains("float instruction"),
+                    "error should mention float instruction: {reason}"
+                );
+            }
+            other => panic!("expected Failed with InvalidModule, got: {other:?}"),
         }
     }
 }

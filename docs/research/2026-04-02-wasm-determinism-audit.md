@@ -53,7 +53,15 @@ produce different results on x86_64 vs aarch64. Mitigations:
    IEEE 754 (what EOS-VM does; requires forking wasmi)
 
 Option 2 is simplest and sufficient unless we need float math in WASM.
-See follow-up bead for implementation.
+
+**Implemented:** Option 2 was implemented in `harmony-fp4v` (see
+`crates/harmony-compute/src/validate.rs`). The `reject_float_instructions()`
+function uses `wasmparser` to scan all code section instructions before module
+compilation. All 54 float-related opcodes are rejected (constants, arithmetic,
+comparisons, conversions, reinterprets, and saturating truncations). The
+validator is wired into both `WasmiRuntime::execute()` and
+`WasmtimeRuntime::run_module()`, rejecting float modules before compilation
+to avoid wasting CPU.
 
 ### 2. Fuel Metering Determinism
 
