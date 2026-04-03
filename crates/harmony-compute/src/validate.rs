@@ -1,33 +1,19 @@
 use wasmparser::{Operator, Parser, Payload};
 
-/// Scans a WASM binary for floating-point instructions and rejects the module
-/// if any are found. This prevents non-deterministic execution: wasmi 1.x does
-/// not canonicalize NaN bit-patterns, so float arithmetic produces different
-/// results on x86_64 vs aarch64, breaking memo-safe caching.
+/// Scans a WASM module for floating-point instructions and rejects it if any
+/// are found. Accepts both WASM binary and WAT text (the `wat` crate handles
+/// conversion transparently). This prevents non-deterministic execution: wasmi
+/// 1.x does not canonicalize NaN bit-patterns, so float arithmetic produces
+/// different results on x86_64 vs aarch64, breaking memo-safe caching.
 ///
 /// Precedent: CosmWasm bans floats for the same reason (CWIPs #2).
 pub fn reject_float_instructions(module_bytes: &[u8]) -> Result<(), String> {
-    // If the input is WAT (text format), skip validation here — the runtime
-    // will compile it to WASM first. In production, modules are always WASM
-    // binary (loaded from CAS by hash). WAT is only used in tests.
-    if !module_bytes.starts_with(b"\0asm") {
-        // Not WASM binary — likely WAT text or invalid. Let the runtime
-        // handle parsing errors; we only validate WASM binary.
-        //
-        // Safety note: wasmtime accepts WAT natively, so a WAT-encoded float
-        // module would bypass this check. This is acceptable because production
-        // modules are always WASM binary from CAS. In debug builds, assert that
-        // we're not silently skipping WAT that looks like it contains floats.
-        debug_assert!(
-            !module_bytes.starts_with(b"("),
-            "reject_float_instructions received WAT text input — \
-             float validation is only performed on WASM binary. \
-             Convert to WASM first if validation is needed."
-        );
-        return Ok(());
-    }
+    // wat::parse_bytes handles both WASM binary (passthrough) and WAT text
+    // (conversion). This ensures float validation is never silently bypassed
+    // regardless of input format — both wasmi and wasmtime accept WAT natively.
+    let wasm = wat::parse_bytes(module_bytes).map_err(|e| format!("failed to parse module: {e}"))?;
 
-    for payload in Parser::new(0).parse_all(module_bytes) {
+    for payload in Parser::new(0).parse_all(&wasm) {
         let payload = payload.map_err(|e| format!("failed to parse WASM module: {e}"))?;
         if let Payload::CodeSectionEntry(body) = payload {
             let mut reader = body
@@ -232,12 +218,21 @@ mod tests {
     }
 
     #[test]
-    fn skips_non_wasm_binary_input() {
-        // Non-WASM-binary input is not validated (only WASM binary is).
-        // The runtime handles WAT → WASM conversion and parse errors internally.
-        // Use garbage bytes (not starting with '(' to avoid the debug_assert
-        // that warns about WAT passthrough).
-        assert!(reject_float_instructions(b"not wasm").is_ok());
+    fn rejects_wat_with_floats() {
+        // WAT text containing float instructions is caught — the validator
+        // converts WAT to WASM before scanning.
+        let wat = r#"(module
+          (func (export "f") (result f32) (f32.const 1.0)))"#;
+        let err = reject_float_instructions(wat.as_bytes()).unwrap_err();
+        assert!(err.contains("f32.const"), "error was: {err}");
+    }
+
+    #[test]
+    fn rejects_wat_with_leading_whitespace() {
+        // Leading whitespace is common in WAT literals (e.g., "\n        (module").
+        let wat = b"\n        (module (func (result f32) (f32.const 1.0)))";
+        let err = reject_float_instructions(wat).unwrap_err();
+        assert!(err.contains("f32.const"), "error was: {err}");
     }
 
     #[test]
