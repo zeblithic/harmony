@@ -1881,7 +1881,7 @@ async fn dispatch_action(
             let session = session.clone();
             // Attach ZenohId to capacity publications so desktop clients can
             // determine hop distance by comparing against their peers_zid().
-            let is_capacity = key_expr.starts_with("harmony/compute/capacity/");
+            let is_capacity = key_expr.starts_with(harmony_zenoh::namespace::compute::CAPACITY);
             tokio::spawn(async move {
                 let mut builder = session.put(&key_expr, payload);
                 if is_capacity {
