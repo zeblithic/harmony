@@ -143,6 +143,101 @@ fn float_op_name(op: &Operator) -> Option<&'static str> {
         Operator::I64TruncSatF64S => Some("i64.trunc_sat_f64_s"),
         Operator::I64TruncSatF64U => Some("i64.trunc_sat_f64_u"),
 
+        // ── SIMD float instructions (0xFD prefix) ──
+        // These have identical NaN non-determinism: hardware SIMD lanes
+        // produce architecture-dependent NaN payloads.
+
+        // f32x4 splat/lane access
+        Operator::F32x4Splat => Some("f32x4.splat"),
+        Operator::F32x4ExtractLane { .. } => Some("f32x4.extract_lane"),
+        Operator::F32x4ReplaceLane { .. } => Some("f32x4.replace_lane"),
+
+        // f64x2 splat/lane access
+        Operator::F64x2Splat => Some("f64x2.splat"),
+        Operator::F64x2ExtractLane { .. } => Some("f64x2.extract_lane"),
+        Operator::F64x2ReplaceLane { .. } => Some("f64x2.replace_lane"),
+
+        // f32x4 comparison
+        Operator::F32x4Eq => Some("f32x4.eq"),
+        Operator::F32x4Ne => Some("f32x4.ne"),
+        Operator::F32x4Lt => Some("f32x4.lt"),
+        Operator::F32x4Gt => Some("f32x4.gt"),
+        Operator::F32x4Le => Some("f32x4.le"),
+        Operator::F32x4Ge => Some("f32x4.ge"),
+
+        // f64x2 comparison
+        Operator::F64x2Eq => Some("f64x2.eq"),
+        Operator::F64x2Ne => Some("f64x2.ne"),
+        Operator::F64x2Lt => Some("f64x2.lt"),
+        Operator::F64x2Gt => Some("f64x2.gt"),
+        Operator::F64x2Le => Some("f64x2.le"),
+        Operator::F64x2Ge => Some("f64x2.ge"),
+
+        // f32x4 unary
+        Operator::F32x4Abs => Some("f32x4.abs"),
+        Operator::F32x4Neg => Some("f32x4.neg"),
+        Operator::F32x4Sqrt => Some("f32x4.sqrt"),
+        Operator::F32x4Ceil => Some("f32x4.ceil"),
+        Operator::F32x4Floor => Some("f32x4.floor"),
+        Operator::F32x4Trunc => Some("f32x4.trunc"),
+        Operator::F32x4Nearest => Some("f32x4.nearest"),
+
+        // f32x4 binary
+        Operator::F32x4Add => Some("f32x4.add"),
+        Operator::F32x4Sub => Some("f32x4.sub"),
+        Operator::F32x4Mul => Some("f32x4.mul"),
+        Operator::F32x4Div => Some("f32x4.div"),
+        Operator::F32x4Min => Some("f32x4.min"),
+        Operator::F32x4Max => Some("f32x4.max"),
+        Operator::F32x4PMin => Some("f32x4.pmin"),
+        Operator::F32x4PMax => Some("f32x4.pmax"),
+
+        // f64x2 unary
+        Operator::F64x2Abs => Some("f64x2.abs"),
+        Operator::F64x2Neg => Some("f64x2.neg"),
+        Operator::F64x2Sqrt => Some("f64x2.sqrt"),
+        Operator::F64x2Ceil => Some("f64x2.ceil"),
+        Operator::F64x2Floor => Some("f64x2.floor"),
+        Operator::F64x2Trunc => Some("f64x2.trunc"),
+        Operator::F64x2Nearest => Some("f64x2.nearest"),
+
+        // f64x2 binary
+        Operator::F64x2Add => Some("f64x2.add"),
+        Operator::F64x2Sub => Some("f64x2.sub"),
+        Operator::F64x2Mul => Some("f64x2.mul"),
+        Operator::F64x2Div => Some("f64x2.div"),
+        Operator::F64x2Min => Some("f64x2.min"),
+        Operator::F64x2Max => Some("f64x2.max"),
+        Operator::F64x2PMin => Some("f64x2.pmin"),
+        Operator::F64x2PMax => Some("f64x2.pmax"),
+
+        // SIMD conversions involving floats
+        Operator::F32x4ConvertI32x4S => Some("f32x4.convert_i32x4_s"),
+        Operator::F32x4ConvertI32x4U => Some("f32x4.convert_i32x4_u"),
+        Operator::F64x2ConvertLowI32x4S => Some("f64x2.convert_low_i32x4_s"),
+        Operator::F64x2ConvertLowI32x4U => Some("f64x2.convert_low_i32x4_u"),
+        Operator::I32x4TruncSatF32x4S => Some("i32x4.trunc_sat_f32x4_s"),
+        Operator::I32x4TruncSatF32x4U => Some("i32x4.trunc_sat_f32x4_u"),
+        Operator::I32x4TruncSatF64x2SZero => Some("i32x4.trunc_sat_f64x2_s_zero"),
+        Operator::I32x4TruncSatF64x2UZero => Some("i32x4.trunc_sat_f64x2_u_zero"),
+        Operator::F32x4DemoteF64x2Zero => Some("f32x4.demote_f64x2_zero"),
+        Operator::F64x2PromoteLowF32x4 => Some("f64x2.promote_low_f32x4"),
+
+        // Relaxed SIMD float instructions — explicitly non-deterministic by
+        // spec (implementation may use FMA or separate mul+add).
+        Operator::F32x4RelaxedMadd => Some("f32x4.relaxed_madd"),
+        Operator::F32x4RelaxedNmadd => Some("f32x4.relaxed_nmadd"),
+        Operator::F64x2RelaxedMadd => Some("f64x2.relaxed_madd"),
+        Operator::F64x2RelaxedNmadd => Some("f64x2.relaxed_nmadd"),
+        Operator::F32x4RelaxedMin => Some("f32x4.relaxed_min"),
+        Operator::F32x4RelaxedMax => Some("f32x4.relaxed_max"),
+        Operator::F64x2RelaxedMin => Some("f64x2.relaxed_min"),
+        Operator::F64x2RelaxedMax => Some("f64x2.relaxed_max"),
+        Operator::I32x4RelaxedTruncF32x4S => Some("i32x4.relaxed_trunc_f32x4_s"),
+        Operator::I32x4RelaxedTruncF32x4U => Some("i32x4.relaxed_trunc_f32x4_u"),
+        Operator::I32x4RelaxedTruncF64x2SZero => Some("i32x4.relaxed_trunc_f64x2_s_zero"),
+        Operator::I32x4RelaxedTruncF64x2UZero => Some("i32x4.relaxed_trunc_f64x2_u_zero"),
+
         _ => None,
     }
 }
@@ -215,6 +310,34 @@ mod tests {
         );
         let err = reject_float_instructions(&wasm).unwrap_err();
         assert!(err.contains("f32.const"), "error was: {err}");
+    }
+
+    #[test]
+    fn rejects_simd_f32x4() {
+        let wasm = wat_to_wasm(
+            r#"(module
+              (memory (export "memory") 1)
+              (func (export "compute") (param i32) (param i32) (result i32)
+                (drop (f32x4.add (v128.const f32x4 1.0 2.0 3.0 4.0)
+                                 (v128.const f32x4 5.0 6.0 7.0 8.0)))
+                (i32.const 0)))"#,
+        );
+        let err = reject_float_instructions(&wasm).unwrap_err();
+        assert!(err.contains("f32x4"), "error was: {err}");
+    }
+
+    #[test]
+    fn rejects_simd_f64x2() {
+        let wasm = wat_to_wasm(
+            r#"(module
+              (memory (export "memory") 1)
+              (func (export "compute") (param i32) (param i32) (result i32)
+                (drop (f64x2.mul (v128.const f64x2 1.0 2.0)
+                                 (v128.const f64x2 3.0 4.0)))
+                (i32.const 0)))"#,
+        );
+        let err = reject_float_instructions(&wasm).unwrap_err();
+        assert!(err.contains("f64x2"), "error was: {err}");
     }
 
     #[test]
