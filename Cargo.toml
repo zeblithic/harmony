@@ -95,6 +95,7 @@ ciborium = { version = "0.2", default-features = false }
 
 # WASM runtime
 wasmi = "1"
+wasmparser = "0.228"
 wasmtime = "38"
 wat = "1"
 

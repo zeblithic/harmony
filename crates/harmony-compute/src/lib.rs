@@ -1,6 +1,7 @@
 pub mod error;
 pub mod runtime;
 pub mod types;
+pub mod validate;
 pub mod wasmi_runtime;
 #[cfg(feature = "wasmtime")]
 pub mod wasmtime_runtime;

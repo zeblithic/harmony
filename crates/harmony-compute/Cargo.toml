@@ -17,6 +17,10 @@ inference = ["harmony-inference", "candle-core"]
 harmony-crypto = { workspace = true, features = ["std"] }
 thiserror.workspace = true
 wasmi = { workspace = true }
+wasmparser = { workspace = true }
 wasmtime = { workspace = true, optional = true }
 harmony-inference = { workspace = true, optional = true }
 candle-core = { workspace = true, optional = true }
+
+[dev-dependencies]
+wat = { workspace = true }
