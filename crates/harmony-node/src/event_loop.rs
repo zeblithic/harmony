@@ -1879,8 +1879,16 @@ async fn dispatch_action(
         // ── Tier 2: Zenoh publish (spawned to avoid blocking select loop) ────
         RuntimeAction::Publish { key_expr, payload } => {
             let session = session.clone();
+            // Attach ZenohId to capacity publications so desktop clients can
+            // determine hop distance by comparing against their peers_zid().
+            let is_capacity = key_expr.starts_with("harmony/compute/capacity/");
             tokio::spawn(async move {
-                if let Err(e) = session.put(&key_expr, payload).await {
+                let mut builder = session.put(&key_expr, payload);
+                if is_capacity {
+                    let zid = session.zid().to_string();
+                    builder = builder.attachment(zid.as_bytes());
+                }
+                if let Err(e) = builder.await {
                     tracing::warn!(%key_expr, err = %e, "zenoh put error");
                 }
             });
