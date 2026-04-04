@@ -19,6 +19,11 @@ use harmony_identity::did_document::{did_web_to_url, parse_did_document};
 use harmony_identity::ResolvedDidDocument;
 use tokio::sync::{broadcast, OwnedSemaphorePermit, RwLock, Semaphore};
 
+/// Pending map uses std::sync::RwLock (not tokio) so it can be locked in
+/// Drop for panic-safe cleanup. Operations are fast (HashMap insert/remove)
+/// and never held across await points.
+type PendingMap = std::sync::RwLock<HashMap<String, broadcast::Sender<Option<ResolvedDidDocument>>>>;
+
 /// Cached DID Document with expiry.
 struct CacheEntry {
     document: ResolvedDidDocument,
@@ -44,17 +49,17 @@ const MAX_OUTSTANDING_QUERIES: usize = 256;
 /// Shared state for the concurrent gateway.
 struct GatewayState {
     cache: RwLock<HashMap<String, CacheEntry>>,
-    /// Tracks in-flight fetches. When a DID is being fetched, subsequent
-    /// queries for the same DID subscribe to the broadcast channel instead
-    /// of issuing a duplicate HTTP request.
-    pending: RwLock<HashMap<String, broadcast::Sender<Option<ResolvedDidDocument>>>>,
+    /// Tracks in-flight fetches. Uses std::sync::RwLock (not tokio) so the
+    /// PendingGuard can lock it in Drop for guaranteed panic-safe cleanup.
+    pending: PendingMap,
     client: reqwest::Client,
     ttl: Duration,
     fetch_semaphore: Semaphore,
 }
 
 /// RAII guard that removes a DID from the pending map on drop, even if the
-/// owning task panics. Uses try_write() (non-blocking) since Drop is sync.
+/// owning task panics. Uses std::sync::RwLock::write() which blocks until
+/// the lock is acquired — guaranteed cleanup, no silent channel leaks.
 struct PendingGuard {
     state: Arc<GatewayState>,
     did: String,
@@ -62,12 +67,10 @@ struct PendingGuard {
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.state.pending.try_write() {
-            pending.remove(&self.did);
-        }
-        // If try_write fails (rare: another task holds write lock during our
-        // panic), the entry stays with a dead Sender. The next query for this
-        // DID will find it, fail recv(), and fall through to the cache re-check.
+        // unwrap is safe: pending map operations never panic while holding
+        // the lock, so poisoning cannot occur.
+        let mut pending = self.state.pending.write().unwrap();
+        pending.remove(&self.did);
     }
 }
 
@@ -85,7 +88,7 @@ pub async fn run(
 
     let state = Arc::new(GatewayState {
         cache: RwLock::new(HashMap::new()),
-        pending: RwLock::new(HashMap::new()),
+        pending: std::sync::RwLock::new(HashMap::new()),
         client,
         ttl: Duration::from_secs(cache_ttl_secs),
         fetch_semaphore: Semaphore::new(MAX_CONCURRENT_FETCHES),
@@ -140,48 +143,48 @@ async fn handle_query(
     }
 
     // Check if another task is already fetching this DID.
-    {
-        let pending = state.pending.read().await;
-        if let Some(tx) = pending.get(&did) {
-            let mut rx = tx.subscribe();
-            drop(pending);
-            tracing::debug!(%did, "did:web coalescing with in-flight fetch");
-            if let Ok(Some(doc)) = rx.recv().await {
-                reply_with_document(&query, &doc).await;
-                return;
-            }
-            // Broadcast missed (race) or fetch failed — fall through to cache
-            // re-check. The fetcher may have populated the cache between the
-            // send and our subscribe.
-            if let Some(doc) = try_cache_hit(&state, &did).await {
-                reply_with_document(&query, &doc).await;
-                return;
-            }
-            reply_empty(&query).await;
+    // pending uses std::sync::RwLock — extract receiver while holding the
+    // lock, then drop the lock before any .await.
+    let coalesce_rx = {
+        let pending = state.pending.read().unwrap();
+        pending.get(&did).map(|tx| tx.subscribe())
+    };
+    if let Some(mut rx) = coalesce_rx {
+        tracing::debug!(%did, "did:web coalescing with in-flight fetch");
+        if let Ok(Some(doc)) = rx.recv().await {
+            reply_with_document(&query, &doc).await;
             return;
         }
+        if let Some(doc) = try_cache_hit(&state, &did).await {
+            reply_with_document(&query, &doc).await;
+            return;
+        }
+        reply_empty(&query).await;
+        return;
     }
 
     // Register ourselves as the fetcher for this DID.
     let (tx, _) = broadcast::channel::<Option<ResolvedDidDocument>>(1);
-    {
-        let mut pending = state.pending.write().await;
-        // Double-check: another task may have registered between our read and write.
+    let double_check_rx = {
+        let mut pending = state.pending.write().unwrap();
         if let Some(existing_tx) = pending.get(&did) {
-            let mut rx = existing_tx.subscribe();
-            drop(pending);
-            if let Ok(Some(doc)) = rx.recv().await {
-                reply_with_document(&query, &doc).await;
-                return;
-            }
-            if let Some(doc) = try_cache_hit(&state, &did).await {
-                reply_with_document(&query, &doc).await;
-                return;
-            }
-            reply_empty(&query).await;
+            Some(existing_tx.subscribe())
+        } else {
+            pending.insert(did.clone(), tx.clone());
+            None
+        }
+    };
+    if let Some(mut rx) = double_check_rx {
+        if let Ok(Some(doc)) = rx.recv().await {
+            reply_with_document(&query, &doc).await;
             return;
         }
-        pending.insert(did.clone(), tx.clone());
+        if let Some(doc) = try_cache_hit(&state, &did).await {
+            reply_with_document(&query, &doc).await;
+            return;
+        }
+        reply_empty(&query).await;
+        return;
     }
 
     // RAII guard ensures the pending entry is removed even if we panic.
