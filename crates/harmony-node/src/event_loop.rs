@@ -471,7 +471,7 @@ pub async fn run(
                 };
                 let padded_socket = harmony_rawlink::PaddedSocket::new(
                     socket,
-                    harmony_rawlink::padded_socket::DEFAULT_PAD_BLOCK,
+                    harmony_rawlink::DEFAULT_PAD_BLOCK,
                 );
                 let mut bridge = harmony_rawlink::Bridge::new(
                     padded_socket,

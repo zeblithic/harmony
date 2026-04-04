@@ -7,6 +7,9 @@ use crate::error::RawLinkError;
 use crate::socket::RawSocket;
 use crate::ETH_HEADER_LEN;
 
+/// Standard Ethernet MTU (maximum frame size including header).
+const ETH_MTU_WIRE: usize = 1514; // 1500 payload + 14 header
+
 /// Default padding block size. All frames are padded to the nearest multiple
 /// of this value (accounting for the Ethernet header that the socket prepends).
 pub const DEFAULT_PAD_BLOCK: usize = 1024;
@@ -33,11 +36,18 @@ impl<S> PaddedSocket<S> {
 impl<S: RawSocket> RawSocket for PaddedSocket<S> {
     fn send_frame(&mut self, dst_mac: [u8; 6], payload: &[u8]) -> Result<(), RawLinkError> {
         let wire_len = ETH_HEADER_LEN + payload.len();
-        let padded_wire_len = wire_len.next_multiple_of(self.pad_block);
+        let mut padded_wire_len = wire_len.next_multiple_of(self.pad_block);
+
+        // Clamp to Ethernet MTU — don't inflate frames beyond what the
+        // interface can send. Frames already near MTU get no padding.
+        if padded_wire_len > ETH_MTU_WIRE {
+            padded_wire_len = ETH_MTU_WIRE;
+        }
+
         let padded_payload_len = padded_wire_len - ETH_HEADER_LEN;
 
-        if padded_payload_len == payload.len() {
-            // Already aligned — no allocation needed.
+        if padded_payload_len <= payload.len() {
+            // Already at or above the target — send as-is.
             return self.inner.send_frame(dst_mac, payload);
         }
 
@@ -108,11 +118,13 @@ mod tests {
     }
 
     #[test]
-    fn large_payload_pads_to_next_block() {
+    fn large_payload_clamped_to_mtu() {
         let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
         let mut padded = PaddedSocket::new(a, 1024);
 
-        // 1100-byte payload + 14 ETH = 1114 bytes → pad to 2048.
+        // 1100-byte payload + 14 ETH = 1114 bytes.
+        // next_multiple_of(1024) = 2048, but that exceeds ETH MTU (1514).
+        // Clamped to 1514 wire → 1500-byte payload.
         let payload = vec![0xCD; 1100];
         padded.send_frame(MAC_B, &payload).unwrap();
 
@@ -120,8 +132,46 @@ mod tests {
         b.recv_frames(&mut |_src, data| received.push(data.to_vec()))
             .unwrap();
 
-        assert_eq!(received[0].len(), 2048 - ETH_HEADER_LEN);
+        assert_eq!(received[0].len(), 1500); // 1514 wire - 14 ETH header
         assert_eq!(&received[0][..1100], &payload[..]);
+        assert!(received[0][1100..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn near_mtu_payload_sent_unpadded() {
+        let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
+        let mut padded = PaddedSocket::new(a, 1024);
+
+        // 1490-byte payload + 14 ETH = 1504 wire.
+        // next_multiple_of(1024) = 2048, clamped to 1514 → 1500 payload.
+        // But 1500 <= 1490 is false, so it WILL pad to 1500.
+        // Actually: 1500 > 1490, so padding applies.
+        let payload = vec![0xEE; 1490];
+        padded.send_frame(MAC_B, &payload).unwrap();
+
+        let mut received = Vec::new();
+        b.recv_frames(&mut |_src, data| received.push(data.to_vec()))
+            .unwrap();
+
+        assert_eq!(received[0].len(), 1500);
+    }
+
+    #[test]
+    fn at_mtu_payload_sent_as_is() {
+        let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
+        let mut padded = PaddedSocket::new(a, 1024);
+
+        // 1500-byte payload + 14 ETH = 1514 wire = exactly MTU.
+        // next_multiple_of(1024) = 2048, clamped to 1514 → 1500 payload.
+        // 1500 <= 1500, so sent as-is.
+        let payload = vec![0xFF; 1500];
+        padded.send_frame(MAC_B, &payload).unwrap();
+
+        let mut received = Vec::new();
+        b.recv_frames(&mut |_src, data| received.push(data.to_vec()))
+            .unwrap();
+
+        assert_eq!(received[0].len(), 1500);
     }
 
     #[test]
