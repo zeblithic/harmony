@@ -469,8 +469,12 @@ pub async fn run(
                     reticulum_inbound_tx: Some(ri_tx),
                     ..harmony_rawlink::BridgeConfig::default()
                 };
-                let mut bridge = harmony_rawlink::Bridge::new(
+                let padded_socket = harmony_rawlink::PaddedSocket::new(
                     socket,
+                    harmony_rawlink::padded_socket::DEFAULT_PAD_BLOCK,
+                );
+                let mut bridge = harmony_rawlink::Bridge::new(
+                    padded_socket,
                     session.clone(),
                     bridge_config,
                     Some(ro_rx),
