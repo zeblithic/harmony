@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use futures_util::TryStreamExt as _;
 use harmony_identity::did_document::{did_web_to_url, parse_did_document};
 use harmony_identity::ResolvedDidDocument;
-use tokio::sync::{broadcast, RwLock, Semaphore};
+use tokio::sync::{broadcast, OwnedSemaphorePermit, RwLock, Semaphore};
 
 /// Cached DID Document with expiry.
 struct CacheEntry {
@@ -37,6 +37,10 @@ const MAX_CACHE_ENTRIES: usize = 1_000;
 /// from a burst of cache misses for distinct DIDs.
 const MAX_CONCURRENT_FETCHES: usize = 16;
 
+/// Maximum number of query-handling tasks. Provides back-pressure when the
+/// gateway is flooded with queries.
+const MAX_OUTSTANDING_QUERIES: usize = 256;
+
 /// Shared state for the concurrent gateway.
 struct GatewayState {
     cache: RwLock<HashMap<String, CacheEntry>>,
@@ -46,7 +50,25 @@ struct GatewayState {
     pending: RwLock<HashMap<String, broadcast::Sender<Option<ResolvedDidDocument>>>>,
     client: reqwest::Client,
     ttl: Duration,
-    semaphore: Semaphore,
+    fetch_semaphore: Semaphore,
+}
+
+/// RAII guard that removes a DID from the pending map on drop, even if the
+/// owning task panics. Uses try_write() (non-blocking) since Drop is sync.
+struct PendingGuard {
+    state: Arc<GatewayState>,
+    did: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.state.pending.try_write() {
+            pending.remove(&self.did);
+        }
+        // If try_write fails (rare: another task holds write lock during our
+        // panic), the entry stays with a dead Sender. The next query for this
+        // DID will find it, fail recv(), and fall through to the cache re-check.
+    }
 }
 
 /// Run the did:web gateway loop.
@@ -59,20 +81,29 @@ pub async fn run(
         .build()
         .expect("reqwest client must build (TLS backend unavailable?)");
 
+    let task_semaphore = Arc::new(Semaphore::new(MAX_OUTSTANDING_QUERIES));
+
     let state = Arc::new(GatewayState {
         cache: RwLock::new(HashMap::new()),
         pending: RwLock::new(HashMap::new()),
         client,
         ttl: Duration::from_secs(cache_ttl_secs),
-        semaphore: Semaphore::new(MAX_CONCURRENT_FETCHES),
+        fetch_semaphore: Semaphore::new(MAX_CONCURRENT_FETCHES),
     });
 
-    tracing::info!("did:web gateway started (TTL={cache_ttl_secs}s, max_concurrent={MAX_CONCURRENT_FETCHES})");
+    tracing::info!(
+        "did:web gateway started (TTL={cache_ttl_secs}s, max_concurrent={MAX_CONCURRENT_FETCHES}, max_tasks={MAX_OUTSTANDING_QUERIES})"
+    );
 
     while let Ok(query) = queryable.recv_async().await {
+        // Back-pressure: wait for a task permit before spawning.
+        let permit = match Arc::clone(&task_semaphore).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // Semaphore closed — shutting down.
+        };
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            handle_query(query, &state).await;
+            handle_query(query, state, permit).await;
         });
     }
 
@@ -81,7 +112,11 @@ pub async fn run(
 
 /// Handle a single query, potentially coalescing with other in-flight
 /// requests for the same DID.
-async fn handle_query(query: zenoh::query::Query, state: &GatewayState) {
+async fn handle_query(
+    query: zenoh::query::Query,
+    state: Arc<GatewayState>,
+    _task_permit: OwnedSemaphorePermit,
+) {
     let key_expr = query.key_expr().to_string();
 
     let did = match key_expr_to_did(&key_expr) {
@@ -108,14 +143,21 @@ async fn handle_query(query: zenoh::query::Query, state: &GatewayState) {
     {
         let pending = state.pending.read().await;
         if let Some(tx) = pending.get(&did) {
-            // Subscribe before dropping the lock so we don't miss the send.
             let mut rx = tx.subscribe();
             drop(pending);
             tracing::debug!(%did, "did:web coalescing with in-flight fetch");
-            match rx.recv().await {
-                Ok(Some(doc)) => reply_with_document(&query, &doc).await,
-                _ => reply_empty(&query).await,
+            if let Ok(Some(doc)) = rx.recv().await {
+                reply_with_document(&query, &doc).await;
+                return;
             }
+            // Broadcast missed (race) or fetch failed — fall through to cache
+            // re-check. The fetcher may have populated the cache between the
+            // send and our subscribe.
+            if let Some(doc) = try_cache_hit(&state, &did).await {
+                reply_with_document(&query, &doc).await;
+                return;
+            }
+            reply_empty(&query).await;
             return;
         }
     }
@@ -128,24 +170,34 @@ async fn handle_query(query: zenoh::query::Query, state: &GatewayState) {
         if let Some(existing_tx) = pending.get(&did) {
             let mut rx = existing_tx.subscribe();
             drop(pending);
-            match rx.recv().await {
-                Ok(Some(doc)) => reply_with_document(&query, &doc).await,
-                _ => reply_empty(&query).await,
+            if let Ok(Some(doc)) = rx.recv().await {
+                reply_with_document(&query, &doc).await;
+                return;
             }
+            if let Some(doc) = try_cache_hit(&state, &did).await {
+                reply_with_document(&query, &doc).await;
+                return;
+            }
+            reply_empty(&query).await;
             return;
         }
         pending.insert(did.clone(), tx.clone());
     }
 
-    // Fetch with semaphore limiting concurrent outbound requests.
-    let result = fetch_and_cache(state, &did).await;
+    // RAII guard ensures the pending entry is removed even if we panic.
+    // On the normal path, broadcast fires before the guard drops; on panic,
+    // the guard cleans up the dead Sender so future queries don't hang.
+    let _guard = PendingGuard {
+        state: Arc::clone(&state),
+        did: did.clone(),
+    };
 
-    // Broadcast result to coalesced waiters and clean up.
+    // Fetch with semaphore limiting concurrent outbound requests.
+    let result = fetch_and_cache(&state, &did).await;
+
+    // Broadcast result to coalesced waiters. The guard's Drop will remove
+    // the pending entry (both normal and panic paths).
     let _ = tx.send(result.clone());
-    {
-        let mut pending = state.pending.write().await;
-        pending.remove(&did);
-    }
 
     // Reply to the original query.
     match result {
@@ -154,21 +206,27 @@ async fn handle_query(query: zenoh::query::Query, state: &GatewayState) {
     }
 }
 
+/// Check cache for a valid entry. Used as fallback when a broadcast is missed.
+async fn try_cache_hit(state: &GatewayState, did: &str) -> Option<ResolvedDidDocument> {
+    let cache = state.cache.read().await;
+    let entry = cache.get(did)?;
+    if entry.expires_at > Instant::now() {
+        Some(entry.document.clone())
+    } else {
+        None
+    }
+}
+
 /// Fetch a DID Document over HTTPS, cache it, and return it.
 /// Acquires a semaphore permit to limit concurrent outbound fetches.
 async fn fetch_and_cache(state: &GatewayState, did: &str) -> Option<ResolvedDidDocument> {
-    let _permit = state.semaphore.acquire().await.ok()?;
+    let _permit = state.fetch_semaphore.acquire().await.ok()?;
 
     // Re-check cache — another task may have populated it while we waited
     // for the semaphore.
-    {
-        let cache = state.cache.read().await;
-        if let Some(entry) = cache.get(did) {
-            if entry.expires_at > Instant::now() {
-                tracing::debug!(%did, "did:web cache hit after semaphore wait");
-                return Some(entry.document.clone());
-            }
-        }
+    if let Some(doc) = try_cache_hit(state, did).await {
+        tracing::debug!(%did, "did:web cache hit after semaphore wait");
+        return Some(doc);
     }
 
     let url = match did_web_to_url(did) {
