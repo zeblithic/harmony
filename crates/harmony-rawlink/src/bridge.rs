@@ -132,8 +132,18 @@ impl<S: RawSocket> Bridge<S> {
                 // 5. Drain outbound Reticulum packets → broadcast as L2 frames.
                 if let Some(ref mut rx) = self.reticulum_outbound_rx {
                     while let Ok(packet) = rx.try_recv() {
-                        let mut frame_payload = Vec::with_capacity(1 + packet.len());
+                        if packet.len() > u16::MAX as usize {
+                            warn!(
+                                packet_len = packet.len(),
+                                "reticulum packet exceeds u16 max, dropping"
+                            );
+                            continue;
+                        }
+                        // Frame: [RETICULUM tag][u16 BE packet_len][packet]
+                        // The packet_len field enables receivers to strip padding.
+                        let mut frame_payload = Vec::with_capacity(1 + 2 + packet.len());
                         frame_payload.push(frame_type::RETICULUM);
+                        frame_payload.extend_from_slice(&(packet.len() as u16).to_be_bytes());
                         frame_payload.extend_from_slice(&packet);
                         self.socket.send_frame(frame::BROADCAST_MAC, &frame_payload)?;
                     }
@@ -212,11 +222,25 @@ impl<S: RawSocket> Bridge<S> {
 
             match payload[0] {
                 frame_type::RETICULUM => {
-                    if payload.len() > 1 {
-                        if let Some(ref reticulum_tx) = reticulum_tx {
-                            let packet = payload[1..].to_vec();
-                            let _ = reticulum_tx.try_send(packet);
-                        }
+                    // Frame: [RETICULUM tag][u16 BE packet_len][packet][padding...]
+                    if payload.len() < 1 + 2 {
+                        debug!(len = payload.len(), "reticulum frame too short, ignoring");
+                        return;
+                    }
+                    let packet_len =
+                        u16::from_be_bytes([payload[1], payload[2]]) as usize;
+                    let packet_end = 3 + packet_len;
+                    if payload.len() < packet_end {
+                        debug!(
+                            packet_len,
+                            frame_len = payload.len(),
+                            "reticulum frame truncated, ignoring"
+                        );
+                        return;
+                    }
+                    if let Some(ref reticulum_tx) = reticulum_tx {
+                        let packet = payload[3..packet_end].to_vec();
+                        let _ = reticulum_tx.try_send(packet);
                     }
                 }
                 frame_type::SCOUT => {
@@ -234,7 +258,8 @@ impl<S: RawSocket> Bridge<S> {
                     );
                 }
                 frame_type::DATA => {
-                    // Data payload: [DATA tag][6-byte origin_mac][u16 BE key_len][key][payload]
+                    // Data payload:
+                    //   [DATA tag][6 origin_mac][u16 BE key_len][key][u16 BE payload_len][payload]
                     if payload.len() < 1 + 6 + 2 {
                         debug!(len = payload.len(), "data frame too short, ignoring");
                         return;
@@ -249,11 +274,11 @@ impl<S: RawSocket> Bridge<S> {
                     let key_len = u16::from_be_bytes([payload[7], payload[8]]) as usize;
                     let key_start = 9;
                     let key_end = key_start + key_len;
-                    if payload.len() < key_end {
+                    if payload.len() < key_end + 2 {
                         debug!(
                             key_len,
                             frame_len = payload.len(),
-                            "data frame truncated key_expr, ignoring"
+                            "data frame truncated (key_expr or payload_len), ignoring"
                         );
                         return;
                     }
@@ -276,7 +301,20 @@ impl<S: RawSocket> Bridge<S> {
                         );
                         return;
                     }
-                    let data_payload = payload[key_end..].to_vec();
+                    // Read payload_len to strip any padding bytes.
+                    let payload_len =
+                        u16::from_be_bytes([payload[key_end], payload[key_end + 1]]) as usize;
+                    let data_start = key_end + 2;
+                    let data_end = data_start + payload_len;
+                    if payload.len() < data_end {
+                        debug!(
+                            payload_len,
+                            frame_len = payload.len(),
+                            "data frame truncated payload, ignoring"
+                        );
+                        return;
+                    }
+                    let data_payload = payload[data_start..data_end].to_vec();
                     inbound_data.push((key_expr.to_string(), data_payload));
                 }
                 other => {
@@ -321,7 +359,7 @@ impl<S: RawSocket> Bridge<S> {
         // ETH_HEADER_LEN here. Overhead within the payload:
         //   1 (type tag) + 6 (origin_mac) + 2 (key_len) + key_expr.len()
         const ETH_MTU: usize = 1500;
-        let frame_overhead = 1 + 6 + 2 + key_expr.len();
+        let frame_overhead = 1 + 6 + 2 + key_expr.len() + 2; // +2 for payload_len
         if payload.len() > ETH_MTU.saturating_sub(frame_overhead) {
             trace!(
                 key_expr,
@@ -331,13 +369,18 @@ impl<S: RawSocket> Bridge<S> {
             return Ok(());
         }
 
-        // Build frame payload: [DATA tag][6-byte origin_mac][u16 BE key_len][key_bytes][payload]
+        // Build frame payload:
+        //   [DATA tag][6 origin_mac][u16 BE key_len][key][u16 BE payload_len][payload]
+        // The payload_len field enables receivers to strip padding bytes added
+        // by PaddedSocket for traffic-analysis resistance.
         let local_mac = self.socket.local_mac();
-        let mut frame_payload = Vec::with_capacity(1 + 6 + 2 + key_expr.len() + payload.len());
+        let mut frame_payload =
+            Vec::with_capacity(1 + 6 + 2 + key_expr.len() + 2 + payload.len());
         frame_payload.push(frame_type::DATA);
         frame_payload.extend_from_slice(&local_mac);
         frame_payload.extend_from_slice(&(key_expr.len() as u16).to_be_bytes());
         frame_payload.extend_from_slice(key_expr.as_bytes());
+        frame_payload.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         frame_payload.extend_from_slice(&payload);
 
         self.socket.send_frame(BROADCAST_MAC, &frame_payload)?;
@@ -391,13 +434,15 @@ mod tests {
     }
 
     /// Build a data payload as the bridge would send it (post-Ethernet-header).
+    /// Format: [DATA tag][6 origin_mac][u16 key_len][key][u16 payload_len][data]
     fn make_data_payload(origin_mac: [u8; 6], key_expr: &str, data: &[u8]) -> Vec<u8> {
         let key_bytes = key_expr.as_bytes();
-        let mut buf = Vec::with_capacity(1 + 6 + 2 + key_bytes.len() + data.len());
+        let mut buf = Vec::with_capacity(1 + 6 + 2 + key_bytes.len() + 2 + data.len());
         buf.push(frame_type::DATA);
         buf.extend_from_slice(&origin_mac);
         buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
         buf.extend_from_slice(key_bytes);
+        buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
         buf.extend_from_slice(data);
         buf
     }
@@ -425,10 +470,12 @@ mod tests {
         let key_len = u16::from_be_bytes([payload[7], payload[8]]) as usize;
         assert_eq!(key_len, key.len());
 
-        let decoded_key = std::str::from_utf8(&payload[9..9 + key_len]).expect("valid UTF-8");
+        let key_end = 9 + key_len;
+        let decoded_key = std::str::from_utf8(&payload[9..key_end]).expect("valid UTF-8");
         assert_eq!(decoded_key, key);
 
-        let decoded_data = &payload[9 + key_len..];
+        let payload_len = u16::from_be_bytes([payload[key_end], payload[key_end + 1]]) as usize;
+        let decoded_data = &payload[key_end + 2..key_end + 2 + payload_len];
         assert_eq!(decoded_data, data);
     }
 
@@ -555,14 +602,21 @@ mod tests {
         let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
         let (tx, rx) = std::sync::mpsc::channel();
 
+        // New format: [RETICULUM tag][u16 BE packet_len][packet]
         let reticulum_packet = vec![0xAA; 100];
-        let mut frame_payload = vec![frame_type::RETICULUM];
+        let mut frame_payload = Vec::with_capacity(1 + 2 + reticulum_packet.len());
+        frame_payload.push(frame_type::RETICULUM);
+        frame_payload.extend_from_slice(&(reticulum_packet.len() as u16).to_be_bytes());
         frame_payload.extend_from_slice(&reticulum_packet);
         socket_b.send_frame(MAC_A, &frame_payload).expect("mock send");
 
         socket_a.recv_frames(&mut |_src_mac, payload| {
-            if !payload.is_empty() && payload[0] == frame_type::RETICULUM && payload.len() > 1 {
-                let _ = tx.send(payload[1..].to_vec());
+            if payload.len() < 3 || payload[0] != frame_type::RETICULUM {
+                return;
+            }
+            let pkt_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
+            if payload.len() >= 3 + pkt_len {
+                let _ = tx.send(payload[3..3 + pkt_len].to_vec());
             }
         }).expect("recv");
 
@@ -572,12 +626,16 @@ mod tests {
 
     #[test]
     fn reticulum_outbound_encoding() {
+        // Verify the outbound format: [RETICULUM tag][u16 BE packet_len][packet]
         let packet = vec![0xBB; 200];
-        let mut frame_payload = Vec::with_capacity(1 + packet.len());
+        let mut frame_payload = Vec::with_capacity(1 + 2 + packet.len());
         frame_payload.push(frame_type::RETICULUM);
+        frame_payload.extend_from_slice(&(packet.len() as u16).to_be_bytes());
         frame_payload.extend_from_slice(&packet);
-        assert_eq!(frame_payload[0], 0x00);
-        assert_eq!(&frame_payload[1..], &packet[..]);
+        assert_eq!(frame_payload[0], 0x00); // RETICULUM type tag
+        let decoded_len = u16::from_be_bytes([frame_payload[1], frame_payload[2]]) as usize;
+        assert_eq!(decoded_len, 200);
+        assert_eq!(&frame_payload[3..], &packet[..]);
     }
 
     #[test]
@@ -586,8 +644,11 @@ mod tests {
         let (ret_tx, ret_rx) = std::sync::mpsc::channel();
 
         let scout = make_scout_payload(&IDENTITY);
-        let mut ret_frame = vec![frame_type::RETICULUM];
-        ret_frame.extend_from_slice(&[0xCC; 50]);
+        let ret_data = [0xCC; 50];
+        let mut ret_frame = Vec::with_capacity(1 + 2 + ret_data.len());
+        ret_frame.push(frame_type::RETICULUM);
+        ret_frame.extend_from_slice(&(ret_data.len() as u16).to_be_bytes());
+        ret_frame.extend_from_slice(&ret_data);
         let unknown = vec![0xFF, 0x01, 0x02];
 
         socket_b.send_frame(MAC_A, &scout).unwrap();
@@ -605,8 +666,11 @@ mod tests {
                     hash.copy_from_slice(&payload[1..17]);
                     peer_table.update(hash, *src_mac);
                 }
-                frame_type::RETICULUM if payload.len() > 1 => {
-                    let _ = ret_tx.send(payload[1..].to_vec());
+                frame_type::RETICULUM if payload.len() >= 3 => {
+                    let pkt_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
+                    if payload.len() >= 3 + pkt_len {
+                        let _ = ret_tx.send(payload[3..3 + pkt_len].to_vec());
+                    }
                 }
                 _ => { unknown_count += 1; }
             }

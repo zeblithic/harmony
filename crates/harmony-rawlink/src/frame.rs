@@ -1,7 +1,11 @@
-//! Scout and Data frame encoding/decoding for the Harmony L2 protocol.
+//! Scout, Data, and Reticulum frame encoding/decoding for the Harmony L2 protocol.
 //!
 //! All frames share the layout:
 //! `[6 dst_mac][6 src_mac][2 EtherType=0x88B5][1 frame_type][payload...]`
+//!
+//! Data and Reticulum frames include explicit length fields so receivers
+//! can strip padding bytes added by `PaddedSocket` for traffic-analysis
+//! resistance.
 
 use crate::{error::RawLinkError, frame_type, ETH_HEADER_LEN, FRAME_OVERHEAD, HARMONY_ETHERTYPE};
 
@@ -89,12 +93,14 @@ pub fn decode_scout_frame(frame: &[u8]) -> Result<([u8; 6], [u8; 16]), RawLinkEr
 
 /// Encodes a Data frame.
 ///
-/// Layout after FRAME_OVERHEAD: `[6 origin_mac][2 key_expr_len (BE)][key_expr bytes][payload...]`
+/// Layout after FRAME_OVERHEAD:
+///   `[6 origin_mac][2 key_len (BE)][key_expr][2 payload_len (BE)][payload]`
 ///
 /// The `origin_mac` identifies which bridge originally sent this frame to L2,
-/// enabling cross-node echo prevention.
+/// enabling cross-node echo prevention. The `payload_len` field enables
+/// receivers to strip padding bytes added by `PaddedSocket`.
 ///
-/// Returns `FrameError` if `key_expr` exceeds 65535 bytes.
+/// Returns `FrameError` if `key_expr` or `payload` exceeds 65535 bytes.
 pub fn encode_data_frame(
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
@@ -110,8 +116,15 @@ pub fn encode_data_frame(
             u16::MAX
         )));
     }
+    if payload.len() > u16::MAX as usize {
+        return Err(RawLinkError::FrameError(format!(
+            "payload too long: {} bytes (max {})",
+            payload.len(),
+            u16::MAX
+        )));
+    }
 
-    let total = FRAME_OVERHEAD + 6 + 2 + key_len + payload.len();
+    let total = FRAME_OVERHEAD + 6 + 2 + key_len + 2 + payload.len();
     let mut frame = Vec::with_capacity(total);
 
     // dst_mac, src_mac
@@ -131,7 +144,8 @@ pub fn encode_data_frame(
     frame.extend_from_slice(&(key_len as u16).to_be_bytes());
     frame.extend_from_slice(key_bytes);
 
-    // Payload
+    // Payload length as u16 big-endian, then payload bytes
+    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     frame.extend_from_slice(payload);
 
     Ok(frame)
@@ -139,7 +153,8 @@ pub fn encode_data_frame(
 
 /// Decodes a Data frame.
 ///
-/// Returns `(src_mac, origin_mac, key_expr, payload)`.
+/// Returns `(src_mac, origin_mac, key_expr, payload)`. The payload is
+/// extracted using the `payload_len` field, stripping any trailing padding.
 pub fn decode_data_frame(
     frame: &[u8],
 ) -> Result<([u8; 6], [u8; 6], String, Vec<u8>), RawLinkError> {
@@ -167,10 +182,12 @@ pub fn decode_data_frame(
     let key_start = key_offset + 2;
     let key_end = key_start + key_len;
 
-    if frame.len() < key_end {
+    // Need key_expr bytes + 2 bytes for payload_len
+    if frame.len() < key_end + 2 {
         return Err(RawLinkError::FrameError(format!(
-            "data frame too short for key_expr body: {} < {key_end}",
+            "data frame too short for key_expr + payload_len: {} < {}",
             frame.len(),
+            key_end + 2,
         )));
     }
 
@@ -178,7 +195,19 @@ pub fn decode_data_frame(
         .map_err(|e| RawLinkError::FrameError(format!("invalid UTF-8 in key_expr: {e}")))?
         .to_string();
 
-    let payload = frame[key_end..].to_vec();
+    let payload_len =
+        u16::from_be_bytes([frame[key_end], frame[key_end + 1]]) as usize;
+    let data_start = key_end + 2;
+    let data_end = data_start + payload_len;
+
+    if frame.len() < data_end {
+        return Err(RawLinkError::FrameError(format!(
+            "data frame too short for payload: {} < {data_end}",
+            frame.len(),
+        )));
+    }
+
+    let payload = frame[data_start..data_end].to_vec();
 
     Ok((src_mac, origin_mac, key_expr, payload))
 }
