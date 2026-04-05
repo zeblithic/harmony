@@ -47,4 +47,10 @@ pub enum ZenohError {
 
     #[error("unknown queryable ID: {0}")]
     UnknownQueryableId(u64),
+
+    #[error("unicast channel not open: {0}")]
+    ChannelNotOpen(u16),
+
+    #[error("unicast frame too short: {0} bytes")]
+    UnicastFrameTooShort(usize),
 }
