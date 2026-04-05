@@ -173,14 +173,9 @@ impl UnicastRouter {
         if data.len() < MIN_FRAME_SIZE {
             return Err(ZenohError::UnicastFrameTooShort(data.len()));
         }
-        // Tag byte is data[0] (0x03) — caller may have already stripped it,
-        // but we accept the full frame for symmetry with encode_frame.
-        let offset = if data[0] == FRAME_TAG_UNICAST { 1 } else { 0 };
-        if data.len() < offset + 2 {
-            return Err(ZenohError::UnicastFrameTooShort(data.len()));
-        }
-        let channel_id = u16::from_be_bytes([data[offset], data[offset + 1]]);
-        let payload = &data[offset + 2..];
+        // data[0] is the 0x03 tag byte; always required per wire format.
+        let channel_id = u16::from_be_bytes([data[1], data[2]]);
+        let payload = &data[3..];
         Ok((channel_id, payload))
     }
 }
