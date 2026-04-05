@@ -173,7 +173,9 @@ impl UnicastRouter {
         if data.len() < MIN_FRAME_SIZE {
             return Err(ZenohError::UnicastFrameTooShort(data.len()));
         }
-        // data[0] is the 0x03 tag byte; always required per wire format.
+        if data[0] != FRAME_TAG_UNICAST {
+            return Err(ZenohError::InvalidMessageType(data[0]));
+        }
         let channel_id = u16::from_be_bytes([data[1], data[2]]);
         let payload = &data[3..];
         Ok((channel_id, payload))
@@ -259,6 +261,13 @@ mod tests {
     fn decode_frame_too_short() {
         let result = UnicastRouter::decode_frame(&[0x03]);
         assert!(matches!(result, Err(ZenohError::UnicastFrameTooShort(_))));
+    }
+
+    #[test]
+    fn decode_frame_wrong_tag_rejected() {
+        // A pub/sub frame (tag 0x02) must not be silently misparsed as unicast.
+        let result = UnicastRouter::decode_frame(&[0x02, 0x00, 0x01, 0xFF]);
+        assert!(matches!(result, Err(ZenohError::InvalidMessageType(0x02))));
     }
 
     #[test]
