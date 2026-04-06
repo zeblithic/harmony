@@ -10,7 +10,7 @@
 //! ```ignore
 //! let config = BlockAttnResConfig { num_blocks: 8, layers_per_block: 3, hidden_dim: 1280 };
 //! let attnres = BlockAttnRes::new(&config, &device)?;
-//! // In the forward loop, call attnres.layer_output() after each layer
+//! // In the forward loop, call attnres.notify_layer_output() after each layer
 //! // and attnres.block_input() at each block boundary.
 //! ```
 
@@ -131,6 +131,14 @@ impl BlockAttnRes {
         hidden_state: &Tensor,
         state: &mut BlockAttnResState,
     ) -> Result<()> {
+        if layer_idx >= self.config.total_layers() {
+            candle_core::bail!(
+                "layer_idx {} out of range (total_layers={})",
+                layer_idx,
+                self.config.total_layers()
+            );
+        }
+
         // Accumulate into partial sum
         state.partial_sum = Some(match &state.partial_sum {
             Some(prev) => (prev + hidden_state)?,
@@ -169,6 +177,13 @@ impl BlockAttnRes {
         hidden_state: &Tensor,
         state: &BlockAttnResState,
     ) -> Result<Tensor> {
+        if block_idx >= self.config.num_blocks {
+            candle_core::bail!(
+                "block_idx {} out of range (num_blocks={})",
+                block_idx,
+                self.config.num_blocks
+            );
+        }
         // Block 0 has no preceding blocks — pass through unchanged
         if block_idx == 0 {
             return Ok(hidden_state.clone());
@@ -195,6 +210,10 @@ impl BlockAttnRes {
         // Stack scores: [batch, seq_len, num_candidates]
         let score_refs: Vec<&Tensor> = scores.iter().collect();
         let stacked_scores = Tensor::cat(&score_refs, 2)?;
+
+        // Scale by 1/sqrt(hidden_dim) to prevent softmax saturation at large d
+        let scale = (self.config.hidden_dim as f64).sqrt();
+        let stacked_scores = (stacked_scores / scale)?;
 
         // Softmax over candidates dimension (last dim)
         let weights = candle_nn::ops::softmax_last_dim(&stacked_scores)?;
