@@ -16,6 +16,7 @@ extern crate alloc;
 
 use alloc::{string::String, vec::Vec};
 
+pub mod chronos;
 pub mod error;
 pub mod hash;
 pub mod manifest;
