@@ -22,6 +22,7 @@ target
 
 # Claude Code worktrees (task isolation)
 .claude/worktrees/
+.worktrees/
 
 # Dolt database files (added by bd init)
 .dolt/
