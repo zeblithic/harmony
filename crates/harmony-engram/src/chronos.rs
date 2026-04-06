@@ -61,6 +61,14 @@ impl ChronosTier {
     }
 }
 
+impl TryFrom<u8> for ChronosTier {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::from_u8(value).ok_or(value)
+    }
+}
+
 /// Per-entry metadata for Chronos temporal decay.
 ///
 /// Carries the timestamp and freshness tier needed to compute the decay
@@ -152,7 +160,6 @@ pub fn temporal_decay(entries: &[EngramMetadata], now: u32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
 
     // ── Tier TTL defaults ──
 
