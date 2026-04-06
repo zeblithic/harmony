@@ -26,6 +26,7 @@ pub mod error;
 pub(crate) mod kv_compress;
 pub(crate) mod qwen3_ext;
 pub mod sampling;
+pub mod uq_head;
 
 pub use block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
 pub use engine::EngramContext;
