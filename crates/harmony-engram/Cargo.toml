@@ -13,6 +13,7 @@ std = ["thiserror/std"]
 
 [dependencies]
 half = { workspace = true }
+libm = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }

@@ -95,6 +95,43 @@ impl EngramMetadata {
     }
 }
 
+/// Compute the decay factor for a single Engram entry.
+///
+/// Returns a value in `[0.0, 1.0]`:
+/// - `1.0` — fully fresh (within TTL, or eternal tier)
+/// - `0.0` — fully expired (the embedding should be treated as absent)
+///
+/// Past TTL, decay follows a Gaussian curve:
+/// ```text
+/// staleness = (age - ttl) / ttl
+/// decay     = exp(-staleness² / 2)
+/// ```
+///
+/// This gives a smooth, gradual decline: 0.61 at 2× TTL, 0.14 at 3× TTL,
+/// 0.01 at 4× TTL. Knowledge gracefully dies over ~3–4× its TTL.
+pub fn compute_decay(entry: &EngramMetadata, now: u32) -> f32 {
+    // Eternal knowledge never decays.
+    if matches!(entry.tier, ChronosTier::Eternal) {
+        return 1.0;
+    }
+
+    // Ephemeral (ttl = 0): only fresh at exact timestamp or earlier.
+    if entry.ttl_seconds == 0 {
+        return if now <= entry.timestamp { 1.0 } else { 0.0 };
+    }
+
+    let age = now.saturating_sub(entry.timestamp);
+
+    // Within TTL — fully fresh.
+    if age <= entry.ttl_seconds {
+        return 1.0;
+    }
+
+    // Past TTL — Gaussian decay.
+    let staleness = (age - entry.ttl_seconds) as f64 / entry.ttl_seconds as f64;
+    libm::exp(-staleness * staleness / 2.0) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +199,125 @@ mod tests {
         let meta = EngramMetadata::with_ttl(1_000_000, ChronosTier::Regular, 86_400);
         assert_eq!(meta.ttl_seconds, 86_400);
         assert_eq!(meta.tier, ChronosTier::Regular);
+    }
+
+    // ── Decay: eternal tier ──
+
+    #[test]
+    fn eternal_never_decays() {
+        let meta = EngramMetadata::new(0, ChronosTier::Eternal);
+        // Even 100 years later, eternal knowledge is fully fresh.
+        assert_eq!(compute_decay(&meta, 3_155_760_000), 1.0);
+    }
+
+    // ── Decay: fresh entries (within TTL) ──
+
+    #[test]
+    fn fresh_entry_returns_one() {
+        let meta = EngramMetadata::new(1_000_000, ChronosTier::Regular);
+        // 15 days later (half the 30-day TTL) — still fresh.
+        let now = 1_000_000 + 1_296_000; // +15 days
+        assert_eq!(compute_decay(&meta, now), 1.0);
+    }
+
+    #[test]
+    fn exactly_at_ttl_returns_one() {
+        let meta = EngramMetadata::new(1_000_000, ChronosTier::Regular);
+        // Exactly at TTL boundary (30 days later).
+        let now = 1_000_000 + 2_592_000;
+        assert_eq!(compute_decay(&meta, now), 1.0);
+    }
+
+    // ── Decay: Gaussian curve past TTL ──
+
+    #[test]
+    fn at_two_times_ttl_decay_approx_0_61() {
+        let meta = EngramMetadata::new(0, ChronosTier::Regular);
+        let ttl = 2_592_000_u32; // 30 days
+        let now = 2 * ttl;      // staleness = 1.0
+        let decay = compute_decay(&meta, now);
+        // exp(-0.5) ≈ 0.6065
+        assert!((decay - 0.6065).abs() < 0.001, "got {decay}");
+    }
+
+    #[test]
+    fn at_three_times_ttl_decay_approx_0_14() {
+        let meta = EngramMetadata::new(0, ChronosTier::Regular);
+        let ttl = 2_592_000_u32;
+        let now = 3 * ttl; // staleness = 2.0
+        let decay = compute_decay(&meta, now);
+        // exp(-2.0) ≈ 0.1353
+        assert!((decay - 0.1353).abs() < 0.001, "got {decay}");
+    }
+
+    #[test]
+    fn at_four_times_ttl_decay_approx_0_01() {
+        let meta = EngramMetadata::new(0, ChronosTier::Regular);
+        let ttl = 2_592_000_u32;
+        let now = 4 * ttl; // staleness = 3.0
+        let decay = compute_decay(&meta, now);
+        // exp(-4.5) ≈ 0.0111
+        assert!((decay - 0.0111).abs() < 0.001, "got {decay}");
+    }
+
+    // ── Decay: ephemeral tier ──
+
+    #[test]
+    fn ephemeral_same_second_is_fresh() {
+        let meta = EngramMetadata::new(1_000_000, ChronosTier::Ephemeral);
+        assert_eq!(compute_decay(&meta, 1_000_000), 1.0);
+    }
+
+    #[test]
+    fn ephemeral_one_second_later_is_zero() {
+        let meta = EngramMetadata::new(1_000_000, ChronosTier::Ephemeral);
+        assert_eq!(compute_decay(&meta, 1_000_001), 0.0);
+    }
+
+    // ── Decay: edge cases ──
+
+    #[test]
+    fn future_timestamp_treated_as_fresh() {
+        // Entry from "the future" (clock skew). age = 0 via saturating_sub.
+        let meta = EngramMetadata::new(2_000_000, ChronosTier::Regular);
+        assert_eq!(compute_decay(&meta, 1_000_000), 1.0);
+    }
+
+    #[test]
+    fn decay_is_monotonically_decreasing() {
+        let meta = EngramMetadata::new(0, ChronosTier::Episodic);
+        let ttl = meta.ttl_seconds;
+        let mut prev = 1.0_f32;
+        // Sample from TTL to 5× TTL
+        for multiplier in [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0] {
+            let now = (ttl as f64 * multiplier) as u32;
+            let decay = compute_decay(&meta, now);
+            assert!(
+                decay <= prev,
+                "decay not monotonically decreasing: at {multiplier}×TTL got {decay} > prev {prev}"
+            );
+            prev = decay;
+        }
+    }
+
+    #[test]
+    fn decay_always_in_zero_one_range() {
+        // Spot-check various ages across tiers.
+        for tier in [
+            ChronosTier::Eternal,
+            ChronosTier::NearEternal,
+            ChronosTier::Episodic,
+            ChronosTier::Regular,
+            ChronosTier::Ephemeral,
+        ] {
+            let meta = EngramMetadata::new(0, tier);
+            for now in [0, 1, 1000, 1_000_000, 100_000_000, u32::MAX] {
+                let decay = compute_decay(&meta, now);
+                assert!(
+                    (0.0..=1.0).contains(&decay),
+                    "tier {tier:?} at now={now}: decay {decay} out of range"
+                );
+            }
+        }
     }
 }
