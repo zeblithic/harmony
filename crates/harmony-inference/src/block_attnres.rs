@@ -151,6 +151,67 @@ impl BlockAttnRes {
         Ok(())
     }
 
+    /// Compute the input to a block using depth-wise attention over previous
+    /// block summaries.
+    ///
+    /// For block 0 (no preceding blocks), returns `hidden_state` unchanged.
+    /// For block k > 0, computes:
+    ///   `input = sum_{j=0..k-1} alpha_j * summary_j + alpha_k * hidden_state`
+    ///   where `alpha = softmax(query_k . [summary_0, ..., summary_{k-1}, hidden_state])`
+    ///
+    /// # Arguments
+    /// - `block_idx`: 0-based block index
+    /// - `hidden_state`: current hidden state `[batch, seq_len, hidden_dim]`
+    /// - `state`: forward-pass state with completed block summaries
+    pub fn block_input(
+        &self,
+        block_idx: usize,
+        hidden_state: &Tensor,
+        state: &BlockAttnResState,
+    ) -> Result<Tensor> {
+        // Block 0 has no preceding blocks — pass through unchanged
+        if block_idx == 0 {
+            return Ok(hidden_state.clone());
+        }
+
+        // query_idx: block 1 uses queries[0], block 2 uses queries[1], etc.
+        let query_idx = block_idx - 1;
+        let query = &self.queries[query_idx]; // [1, 1, hidden_dim]
+
+        // Collect candidates: all completed summaries + current hidden_state
+        let num_candidates = state.summaries.len() + 1;
+
+        // Compute attention scores: dot(query, candidate) for each candidate
+        let mut scores = Vec::with_capacity(num_candidates);
+        for summary in &state.summaries {
+            // [batch, seq_len, hidden_dim] * [1, 1, hidden_dim] → sum → [batch, seq_len, 1]
+            let score = summary.broadcast_mul(query)?.sum_keepdim(candle_core::D::Minus1)?;
+            scores.push(score);
+        }
+        // Current hidden state as final candidate
+        let current_score = hidden_state.broadcast_mul(query)?.sum_keepdim(candle_core::D::Minus1)?;
+        scores.push(current_score);
+
+        // Stack scores: [batch, seq_len, num_candidates]
+        let score_refs: Vec<&Tensor> = scores.iter().collect();
+        let stacked_scores = Tensor::cat(&score_refs, 2)?;
+
+        // Softmax over candidates dimension (last dim)
+        let weights = candle_nn::ops::softmax_last_dim(&stacked_scores)?;
+
+        // Weighted sum of candidates
+        let mut result = Tensor::zeros_like(hidden_state)?;
+        for (i, summary) in state.summaries.iter().enumerate() {
+            let w = weights.narrow(2, i, 1)?; // [batch, seq_len, 1]
+            result = (result + w.broadcast_mul(summary)?)?;
+        }
+        // Add weighted current hidden state
+        let w_current = weights.narrow(2, num_candidates - 1, 1)?;
+        result = (result + w_current.broadcast_mul(hidden_state)?)?;
+
+        Ok(result)
+    }
+
     /// Reference to the config.
     pub fn config(&self) -> &BlockAttnResConfig {
         &self.config
@@ -268,5 +329,79 @@ mod tests {
         assert_eq!(state.summaries.len(), 1);
         // Partial sum should be reset for the next block
         assert!(state.partial_sum.is_none());
+    }
+
+    #[test]
+    fn block_input_at_block_0_returns_hidden_state() {
+        let cfg = BlockAttnResConfig {
+            num_blocks: 2,
+            layers_per_block: 2,
+            hidden_dim: 4,
+        };
+        let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
+        let state = module.new_state();
+
+        let h = Tensor::ones((1, 3, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+        // Block 0 has no preceding blocks — should return input unchanged
+        let result = module.block_input(0, &h, &state).unwrap();
+        assert_eq!(result.dims(), &[1, 3, 4]);
+
+        // Should be identical to input
+        let diff: f32 = (&result - &h)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(diff < 1e-6);
+    }
+
+    #[test]
+    fn block_input_at_block_1_uses_attention() {
+        let cfg = BlockAttnResConfig {
+            num_blocks: 2,
+            layers_per_block: 2,
+            hidden_dim: 4,
+        };
+        let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
+        let mut state = module.new_state();
+
+        let h = Tensor::ones((1, 3, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+
+        // Complete block 0
+        module.notify_layer_output(0, &h, &mut state).unwrap();
+        module.notify_layer_output(1, &h, &mut state).unwrap();
+        assert_eq!(state.summaries.len(), 1);
+
+        // Block 1 input: should be a weighted combination of block 0 summary + current h
+        let result = module.block_input(1, &h, &state).unwrap();
+        assert_eq!(result.dims(), &[1, 3, 4]);
+    }
+
+    #[test]
+    fn block_input_preserves_shape_through_all_blocks() {
+        let cfg = BlockAttnResConfig {
+            num_blocks: 4,
+            layers_per_block: 2,
+            hidden_dim: 8,
+        };
+        let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
+        let mut state = module.new_state();
+
+        let h = Tensor::randn(0f32, 1f32, (1, 5, 8), &Device::Cpu).unwrap();
+
+        for block_idx in 0..4 {
+            let input = module.block_input(block_idx, &h, &state).unwrap();
+            assert_eq!(input.dims(), &[1, 5, 8], "block {block_idx} input shape mismatch");
+
+            // Simulate layers within this block
+            let start = block_idx * 2;
+            for layer in start..start + 2 {
+                module.notify_layer_output(layer, &h, &mut state).unwrap();
+            }
+        }
+        assert_eq!(state.summaries.len(), 4);
     }
 }
