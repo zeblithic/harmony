@@ -22,6 +22,7 @@ pub mod hash;
 pub mod manifest;
 pub mod resolve;
 
+pub use chronos::{ChronosTier, EngramMetadata, compute_decay, temporal_decay};
 pub use error::EngramError;
 pub use manifest::ManifestHeader;
 

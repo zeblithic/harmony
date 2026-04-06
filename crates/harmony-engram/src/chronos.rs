@@ -5,6 +5,8 @@
 //! and `EngramGatedResidual` produces zero residual — the model proceeds
 //! as if no Engram entry exists.
 
+use alloc::vec::Vec;
+
 /// Chronos frequency tier — classifies how quickly knowledge expires.
 ///
 /// Tier numbering (1–5) matches the spec and is stored as `u8` in Engram
@@ -86,6 +88,12 @@ impl EngramMetadata {
     }
 
     /// Create metadata with a custom TTL override.
+    ///
+    /// Note: `tier` is only used to identify Eternal entries (which always
+    /// return decay 1.0 regardless of TTL). All other decay behavior is
+    /// driven by `ttl_seconds`. Setting `ttl_seconds = 0` on a non-Eternal
+    /// tier produces ephemeral behavior (instant decay); setting a nonzero
+    /// TTL on an Ephemeral tier produces normal Gaussian decay.
     pub fn with_ttl(timestamp: u32, tier: ChronosTier, ttl_seconds: u32) -> Self {
         Self {
             timestamp,
@@ -132,9 +140,19 @@ pub fn compute_decay(entry: &EngramMetadata, now: u32) -> f32 {
     libm::exp(-staleness * staleness / 2.0) as f32
 }
 
+/// Compute decay factors for a batch of Engram entries.
+///
+/// Returns one `f32` per entry in `[0.0, 1.0]`. The caller multiplies each
+/// resolved embedding by the corresponding decay factor before passing to
+/// `EngramGatedResidual`.
+pub fn temporal_decay(entries: &[EngramMetadata], now: u32) -> Vec<f32> {
+    entries.iter().map(|e| compute_decay(e, now)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     // ── Tier TTL defaults ──
 
@@ -319,5 +337,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Batch temporal_decay ──
+
+    #[test]
+    fn temporal_decay_empty_slice() {
+        let result = temporal_decay(&[], 1_000_000);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn temporal_decay_mixed_tiers() {
+        let now = 1_000_000_u32;
+        let entries = [
+            // Eternal — always 1.0
+            EngramMetadata::new(0, ChronosTier::Eternal),
+            // Regular, fresh (created 10 days ago, TTL = 30 days)
+            EngramMetadata::new(now - 864_000, ChronosTier::Regular),
+            // Ephemeral, stale (created 1 second ago)
+            EngramMetadata::new(now - 1, ChronosTier::Ephemeral),
+        ];
+        let decays = temporal_decay(&entries, now);
+        assert_eq!(decays.len(), 3);
+        assert_eq!(decays[0], 1.0); // eternal
+        assert_eq!(decays[1], 1.0); // fresh
+        assert_eq!(decays[2], 0.0); // ephemeral, 1 second stale
+    }
+
+    #[test]
+    fn temporal_decay_output_length_matches_input() {
+        let entries: Vec<EngramMetadata> = (0..10)
+            .map(|i| EngramMetadata::new(i * 1000, ChronosTier::Episodic))
+            .collect();
+        let decays = temporal_decay(&entries, 100_000_000);
+        assert_eq!(decays.len(), entries.len());
+    }
+
+    #[test]
+    fn temporal_decay_all_eternal_all_ones() {
+        let entries: Vec<EngramMetadata> = (0..5)
+            .map(|_| EngramMetadata::new(0, ChronosTier::Eternal))
+            .collect();
+        let decays = temporal_decay(&entries, u32::MAX);
+        assert!(decays.iter().all(|&d| d == 1.0));
     }
 }
