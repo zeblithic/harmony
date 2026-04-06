@@ -47,14 +47,12 @@ impl BlockAttnResConfig {
 /// Mutable state accumulated during a single forward pass.
 ///
 /// Created fresh for each forward pass via [`BlockAttnRes::new_state()`].
-/// Tracks block summaries and the running partial sum within the current block.
+/// Tracks block summaries: the hidden state at the end of each completed block.
 pub struct BlockAttnResState {
-    /// Completed block summaries. `summaries[k]` is the hidden state at the
-    /// end of block k. Grows as blocks complete.
-    summaries: Vec<Tensor>,
-    /// Accumulated residual within the current (incomplete) block.
-    /// Reset at each block boundary.
-    partial_sum: Option<Tensor>,
+    /// Completed block summaries. `summaries[k]` is the hidden state after
+    /// the final layer of block k (not a sum — just the last layer's output).
+    /// Grows as blocks complete.
+    pub(crate) summaries: Vec<Tensor>,
 }
 
 /// Block Attention Residuals module.
@@ -111,15 +109,15 @@ impl BlockAttnRes {
     pub fn new_state(&self) -> BlockAttnResState {
         BlockAttnResState {
             summaries: Vec::with_capacity(self.config.num_blocks),
-            partial_sum: None,
         }
     }
 
     /// Called after each transformer layer completes.
     ///
-    /// Accumulates the layer's hidden state into the current block's partial
-    /// sum. When the last layer of a block completes, finalizes the block
-    /// summary and resets the partial sum for the next block.
+    /// When the last layer of a block completes, stores the hidden state as
+    /// the block summary. Intermediate layers are ignored — only the final
+    /// hidden state of each block matters, since it already encodes all
+    /// prior residual information within that block.
     ///
     /// # Arguments
     /// - `layer_idx`: 0-based index of the layer that just completed
@@ -139,21 +137,12 @@ impl BlockAttnRes {
             );
         }
 
-        // Accumulate into partial sum
-        state.partial_sum = Some(match &state.partial_sum {
-            Some(prev) => (prev + hidden_state)?,
-            None => hidden_state.clone(),
-        });
-
-        // Check if this is the last layer in the current block
+        // Only store the hidden state at the end of each block.
+        // In a residual transformer, h_last already contains all information
+        // from prior layers (h_last = h_0 + Δ_0 + Δ_1 + ... + Δ_{L-1}).
         let is_last_in_block = (layer_idx + 1) % self.config.layers_per_block == 0;
         if is_last_in_block {
-            // Finalize: move partial_sum into summaries
-            let summary = state
-                .partial_sum
-                .take()
-                .expect("partial_sum must exist after accumulation");
-            state.summaries.push(summary);
+            state.summaries.push(hidden_state.clone());
         }
 
         Ok(())
@@ -187,6 +176,18 @@ impl BlockAttnRes {
         // Block 0 has no preceding blocks — pass through unchanged
         if block_idx == 0 {
             return Ok(hidden_state.clone());
+        }
+
+        // Validate state consistency: we should have exactly block_idx
+        // completed summaries (one per preceding block).
+        if state.summaries.len() != block_idx {
+            candle_core::bail!(
+                "state has {} summaries but block_input called for block_idx={} \
+                 (expected {} completed blocks)",
+                state.summaries.len(),
+                block_idx,
+                block_idx
+            );
         }
 
         // query_idx: block 1 uses queries[0], block 2 uses queries[1], etc.
@@ -289,7 +290,6 @@ mod tests {
         let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
         let state = module.new_state();
         assert!(state.summaries.is_empty());
-        assert!(state.partial_sum.is_none());
     }
 
     #[test]
@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn notify_accumulates_partial_sum() {
+    fn notify_ignores_non_boundary_layers() {
         let cfg = BlockAttnResConfig {
             num_blocks: 2,
             layers_per_block: 2,
@@ -317,17 +317,14 @@ mod tests {
         let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
         let mut state = module.new_state();
 
-        // Layer 0 output: [1, 3, 4] (batch=1, seq=3, dim=4)
+        // Layer 0 output: not the last in block 0, so no summary stored
         let h0 = Tensor::ones((1, 3, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
         module.notify_layer_output(0, &h0, &mut state).unwrap();
-
-        // Partial sum should exist but no summaries yet (block 0 not done)
-        assert!(state.partial_sum.is_some());
         assert!(state.summaries.is_empty());
     }
 
     #[test]
-    fn notify_finalizes_block_summary() {
+    fn notify_stores_last_layer_output_as_summary() {
         let cfg = BlockAttnResConfig {
             num_blocks: 2,
             layers_per_block: 2,
@@ -336,18 +333,30 @@ mod tests {
         let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
         let mut state = module.new_state();
 
-        let h = Tensor::ones((1, 3, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let h0 = Tensor::ones((1, 3, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let h1 = (Tensor::ones((1, 3, 4), candle_core::DType::F32, &Device::Cpu).unwrap() * 5.0)
+            .unwrap();
 
-        // Layer 0 (block 0, position 0)
-        module.notify_layer_output(0, &h, &mut state).unwrap();
+        // Layer 0 (not last in block)
+        module.notify_layer_output(0, &h0, &mut state).unwrap();
         assert!(state.summaries.is_empty());
 
-        // Layer 1 (block 0, position 1 — last in block)
-        module.notify_layer_output(1, &h, &mut state).unwrap();
-        // Block 0 should now be finalized
+        // Layer 1 (last in block 0) — summary should be h1, NOT h0+h1
+        module.notify_layer_output(1, &h1, &mut state).unwrap();
         assert_eq!(state.summaries.len(), 1);
-        // Partial sum should be reset for the next block
-        assert!(state.partial_sum.is_none());
+
+        // Verify the summary is h1 (all 5s), not the accumulated sum (all 6s)
+        let summary_vals: Vec<f32> = state.summaries[0]
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for &v in &summary_vals {
+            assert!(
+                (v - 5.0).abs() < 1e-6,
+                "summary should be last layer output (5.0), got {v}"
+            );
+        }
     }
 
     #[test]
@@ -587,8 +596,6 @@ mod tests {
 
         // All 8 blocks should be finalized
         assert_eq!(state.summaries.len(), 8);
-        // Partial sum should be None (last block was finalized)
-        assert!(state.partial_sum.is_none());
         // Output shape should be preserved
         assert_eq!(h.dims(), &[batch, seq_len, 64]);
     }
