@@ -404,4 +404,134 @@ mod tests {
         }
         assert_eq!(state.summaries.len(), 4);
     }
+
+    #[test]
+    fn block_input_is_convex_combination() {
+        // The output should be a weighted average of the candidates.
+        // Verify by checking it falls within the bounding box of the candidates.
+        let cfg = BlockAttnResConfig {
+            num_blocks: 3,
+            layers_per_block: 1,
+            hidden_dim: 4,
+        };
+        let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
+        let mut state = module.new_state();
+
+        // Block 0: all zeros
+        let h0 = Tensor::zeros((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+        module.notify_layer_output(0, &h0, &mut state).unwrap();
+
+        // Block 1: all ones
+        let h1 = Tensor::ones((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+        module.notify_layer_output(1, &h1, &mut state).unwrap();
+
+        // Block 2 input with hidden_state = all twos
+        let h2 = (Tensor::ones((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap() * 2.0)
+            .unwrap();
+        let result = module.block_input(2, &h2, &state).unwrap();
+        let result_vals: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+
+        // Candidates are: [0,0,0,0], [1,1,1,1], [2,2,2,2]
+        // Convex combination must be in [0, 2] for each element
+        for (i, &v) in result_vals.iter().enumerate() {
+            assert!(
+                v >= -0.01 && v <= 2.01,
+                "element {i} = {v} is outside convex hull [0, 2]"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_query_produces_uniform_weights() {
+        // When the pseudo-query is zero, all dot products are zero,
+        // so softmax produces uniform weights = 1/N for each candidate.
+        let cfg = BlockAttnResConfig {
+            num_blocks: 3,
+            layers_per_block: 1,
+            hidden_dim: 4,
+        };
+        let zero_queries: Vec<Tensor> = (0..2)
+            .map(|_| {
+                Tensor::zeros((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap()
+            })
+            .collect();
+        let module = BlockAttnRes::from_tensors(&cfg, zero_queries).unwrap();
+        let mut state = module.new_state();
+
+        // Block 0 summary: all zeros
+        let h0 = Tensor::zeros((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+        module.notify_layer_output(0, &h0, &mut state).unwrap();
+
+        // Block 1 summary: all threes
+        let h1 = (Tensor::ones((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap() * 3.0)
+            .unwrap();
+        module.notify_layer_output(1, &h1, &mut state).unwrap();
+
+        // Block 2 input with hidden_state = all sixes
+        let h2 = (Tensor::ones((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap() * 6.0)
+            .unwrap();
+        let result = module.block_input(2, &h2, &state).unwrap();
+        let result_vals: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+
+        // Uniform weights = 1/3 for each of [0, 3, 6] → expected = 3.0
+        for (i, &v) in result_vals.iter().enumerate() {
+            assert!(
+                (v - 3.0).abs() < 1e-5,
+                "element {i} = {v}, expected 3.0 (uniform average of 0, 3, 6)"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_and_seq_len_handled_independently() {
+        let cfg = BlockAttnResConfig {
+            num_blocks: 2,
+            layers_per_block: 1,
+            hidden_dim: 4,
+        };
+        let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
+        let mut state = module.new_state();
+
+        // batch=2, seq_len=3
+        let h0 = Tensor::randn(0f32, 1f32, (2, 3, 4), &Device::Cpu).unwrap();
+        module.notify_layer_output(0, &h0, &mut state).unwrap();
+
+        let h1 = Tensor::randn(0f32, 1f32, (2, 3, 4), &Device::Cpu).unwrap();
+        let result = module.block_input(1, &h1, &state).unwrap();
+
+        // Output shape must match input
+        assert_eq!(result.dims(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn single_block_config_has_no_queries() {
+        let cfg = BlockAttnResConfig {
+            num_blocks: 1,
+            layers_per_block: 24,
+            hidden_dim: 64,
+        };
+        let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
+        assert_eq!(module.queries.len(), 0);
+
+        let mut state = module.new_state();
+        let h = Tensor::ones((1, 1, 64), candle_core::DType::F32, &Device::Cpu).unwrap();
+
+        // Block 0 always passes through
+        let result = module.block_input(0, &h, &state).unwrap();
+        let diff: f32 = (&result - &h)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(diff < 1e-6);
+
+        // All 24 layers go into one block
+        for i in 0..24 {
+            module.notify_layer_output(i, &h, &mut state).unwrap();
+        }
+        assert_eq!(state.summaries.len(), 1);
+    }
 }
