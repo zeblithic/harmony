@@ -17,6 +17,7 @@
 //! let next = engine.sample(&logits, &SamplingParams::greedy(), &tokens)?;
 //! ```
 
+pub mod block_attnres;
 pub mod engine;
 pub mod engram_bridge;
 pub mod engram_residual;
@@ -26,6 +27,7 @@ pub(crate) mod kv_compress;
 pub(crate) mod qwen3_ext;
 pub mod sampling;
 
+pub use block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
 pub use engine::EngramContext;
 pub use engine::QwenEngine;
 pub use engram_residual::EngramGatedResidual;
