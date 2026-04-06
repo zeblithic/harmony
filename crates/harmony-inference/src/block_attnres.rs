@@ -534,4 +534,111 @@ mod tests {
         }
         assert_eq!(state.summaries.len(), 1);
     }
+
+    /// Simulates a complete forward pass through a 24-layer, 8-block transformer.
+    #[test]
+    fn full_forward_pass_simulation() {
+        let cfg = BlockAttnResConfig {
+            num_blocks: 8,
+            layers_per_block: 3,
+            hidden_dim: 64,
+        };
+        let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
+        let mut state = module.new_state();
+
+        let batch = 1;
+        let seq_len = 10;
+        let mut h = Tensor::randn(0f32, 1f32, (batch, seq_len, 64), &Device::Cpu).unwrap();
+
+        for layer_idx in 0..24 {
+            // At block boundaries (except block 0), compute weighted input
+            if cfg.is_block_start(layer_idx) {
+                let block_idx = cfg.block_of(layer_idx);
+                h = module.block_input(block_idx, &h, &state).unwrap();
+            }
+
+            // Simulate transformer layer (just add noise — we're testing AttnRes, not the transformer)
+            let layer_out =
+                Tensor::randn(0f32, 0.1f32, (batch, seq_len, 64), &Device::Cpu).unwrap();
+            h = (&h + &layer_out).unwrap();
+
+            // Notify AttnRes of this layer's output
+            module.notify_layer_output(layer_idx, &h, &mut state).unwrap();
+        }
+
+        // All 8 blocks should be finalized
+        assert_eq!(state.summaries.len(), 8);
+        // Partial sum should be None (last block was finalized)
+        assert!(state.partial_sum.is_none());
+        // Output shape should be preserved
+        assert_eq!(h.dims(), &[batch, seq_len, 64]);
+    }
+
+    /// Verifies that block 7 can "see" block 0's summary (the Engram-enriched state).
+    #[test]
+    fn deep_block_can_recall_early_block() {
+        let cfg = BlockAttnResConfig {
+            num_blocks: 4,
+            layers_per_block: 1,
+            hidden_dim: 4,
+        };
+        // Craft a query that strongly prefers the first candidate (block 0 summary)
+        // by making it point in the same direction as block 0's data.
+        let block0_direction =
+            Tensor::new(&[1.0f32, 0.0, 0.0, 0.0], &Device::Cpu).unwrap()
+                .reshape((1, 1, 4)).unwrap();
+        let neutral_query =
+            Tensor::zeros((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+
+        // queries[0] for block 1: neutral
+        // queries[1] for block 2: neutral
+        // queries[2] for block 3: strongly prefers direction [1,0,0,0]
+        let queries = vec![
+            neutral_query.clone(),
+            neutral_query,
+            (block0_direction * 10.0).unwrap(), // large magnitude → strong preference
+        ];
+        let module = BlockAttnRes::from_tensors(&cfg, queries).unwrap();
+        let mut state = module.new_state();
+
+        // Block 0 summary: [10, 0, 0, 0] — high component in direction [1,0,0,0]
+        let h0 = Tensor::new(&[10.0f32, 0.0, 0.0, 0.0], &Device::Cpu)
+            .unwrap()
+            .reshape((1, 1, 4))
+            .unwrap();
+        module.notify_layer_output(0, &h0, &mut state).unwrap();
+
+        // Block 1 summary: [0, 5, 0, 0] — orthogonal
+        let h1 = Tensor::new(&[0.0f32, 5.0, 0.0, 0.0], &Device::Cpu)
+            .unwrap()
+            .reshape((1, 1, 4))
+            .unwrap();
+        module.notify_layer_output(1, &h1, &mut state).unwrap();
+
+        // Block 2 summary: [0, 0, 5, 0] — orthogonal
+        let h2 = Tensor::new(&[0.0f32, 0.0, 5.0, 0.0], &Device::Cpu)
+            .unwrap()
+            .reshape((1, 1, 4))
+            .unwrap();
+        module.notify_layer_output(2, &h2, &mut state).unwrap();
+
+        // Block 3 input with hidden_state [0, 0, 0, 5]
+        let h3 = Tensor::new(&[0.0f32, 0.0, 0.0, 5.0], &Device::Cpu)
+            .unwrap()
+            .reshape((1, 1, 4))
+            .unwrap();
+        let result = module.block_input(3, &h3, &state).unwrap();
+        let vals: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+
+        // The query strongly aligns with block 0's direction [1,0,0,0].
+        // Block 0's summary [10,0,0,0] has dot product 10*10=100 with the query.
+        // Others have dot product ≈ 0.
+        // So the result should be heavily weighted toward block 0.
+        // vals[0] should be much larger than vals[1], vals[2], vals[3]
+        assert!(
+            vals[0] > vals[1] && vals[0] > vals[2] && vals[0] > vals[3],
+            "block 3 should strongly recall block 0; got {:?}",
+            vals
+        );
+    }
 }
