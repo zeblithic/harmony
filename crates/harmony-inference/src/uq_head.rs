@@ -207,6 +207,28 @@ impl UqHead {
         })
     }
 
+    /// Single-sample classification for inference routing.
+    ///
+    /// Takes features of shape `[1, num_features]`. Returns the predicted
+    /// `UqClass` (argmax of class probabilities) and the confidence scalar.
+    pub fn classify(&self, features: &Tensor) -> Result<(UqClass, f32)> {
+        let output = self.forward(features)?;
+
+        let class_idx: u32 = output
+            .class_probs
+            .argmax(candle_core::D::Minus1)?
+            .squeeze(0)?
+            .to_scalar()?;
+
+        let class = UqClass::from_u8(class_idx as u8).ok_or_else(|| {
+            candle_core::Error::Msg(format!("argmax returned invalid class index: {class_idx}"))
+        })?;
+
+        let conf: f32 = output.confidence.squeeze(0)?.squeeze(0)?.to_scalar()?;
+
+        Ok((class, conf))
+    }
+
     /// Reference to the config.
     pub fn config(&self) -> &UqHeadConfig {
         &self.config
@@ -381,6 +403,67 @@ mod tests {
                 "confidence[{i}] = {c}, expected [0, 1]"
             );
         }
+    }
+
+    // ── classify() ──
+
+    #[test]
+    fn classify_returns_valid_class_and_confidence() {
+        let cfg = test_config();
+        let head = UqHead::new(&cfg, &Device::Cpu).unwrap();
+        let features = Tensor::randn(0f32, 1f32, (1, 8), &Device::Cpu).unwrap();
+        let (class, conf) = head.classify(&features).unwrap();
+
+        // Class must be one of the 4 variants
+        let class_u8 = class as u8;
+        assert!(class_u8 <= 3, "class discriminant {class_u8} out of range");
+
+        // Confidence must be in [0, 1] (sigmoid output)
+        assert!(
+            (0.0..=1.0).contains(&conf),
+            "confidence {conf} out of [0, 1]"
+        );
+    }
+
+    #[test]
+    fn classify_with_zero_weights_returns_confident() {
+        // Zero weights → softmax(zeros) = uniform → argmax picks index 0 = Confident
+        let cfg = test_config();
+        let d = &Device::Cpu;
+        let fc1 = Tensor::zeros((8, 32), candle_core::DType::F32, d).unwrap();
+        let b1 = Tensor::zeros(32, candle_core::DType::F32, d).unwrap();
+        let fc2 = Tensor::zeros((32, 4), candle_core::DType::F32, d).unwrap();
+        let b2 = Tensor::zeros(4, candle_core::DType::F32, d).unwrap();
+        let cw = Tensor::zeros((8, 1), candle_core::DType::F32, d).unwrap();
+        let cb = Tensor::zeros(1, candle_core::DType::F32, d).unwrap();
+        let head = UqHead::from_tensors(&cfg, fc1, b1, fc2, b2, cw, cb).unwrap();
+
+        let features = Tensor::zeros((1, 8), candle_core::DType::F32, d).unwrap();
+        let (class, conf) = head.classify(&features).unwrap();
+
+        // argmax of uniform distribution picks first index (0 = Confident)
+        assert_eq!(class, UqClass::Confident);
+        assert!((conf - 0.5).abs() < 1e-5, "confidence = {conf}, expected 0.5");
+    }
+
+    #[test]
+    fn classify_biased_toward_class_2() {
+        // Bias classifier_b2 heavily toward class 2 (SpectralCollapse)
+        let cfg = test_config();
+        let d = &Device::Cpu;
+        let fc1 = Tensor::zeros((8, 32), candle_core::DType::F32, d).unwrap();
+        let b1 = Tensor::zeros(32, candle_core::DType::F32, d).unwrap();
+        let fc2 = Tensor::zeros((32, 4), candle_core::DType::F32, d).unwrap();
+        // b2 = [0, 0, 100, 0] — heavily biased toward class 2
+        let b2 = Tensor::new(&[0.0f32, 0.0, 100.0, 0.0], d).unwrap();
+        let cw = Tensor::zeros((8, 1), candle_core::DType::F32, d).unwrap();
+        let cb = Tensor::zeros(1, candle_core::DType::F32, d).unwrap();
+        let head = UqHead::from_tensors(&cfg, fc1, b1, fc2, b2, cw, cb).unwrap();
+
+        let features = Tensor::zeros((1, 8), candle_core::DType::F32, d).unwrap();
+        let (class, _) = head.classify(&features).unwrap();
+
+        assert_eq!(class, UqClass::SpectralCollapse);
     }
 
     #[test]

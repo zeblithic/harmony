@@ -29,6 +29,7 @@ pub mod sampling;
 pub mod uq_head;
 
 pub use block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
+pub use uq_head::{UqClass, UqHead, UqHeadConfig, UqOutput};
 pub use engine::EngramContext;
 pub use engine::QwenEngine;
 pub use engram_residual::EngramGatedResidual;
