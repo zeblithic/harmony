@@ -115,6 +115,42 @@ impl BlockAttnRes {
         }
     }
 
+    /// Called after each transformer layer completes.
+    ///
+    /// Accumulates the layer's hidden state into the current block's partial
+    /// sum. When the last layer of a block completes, finalizes the block
+    /// summary and resets the partial sum for the next block.
+    ///
+    /// # Arguments
+    /// - `layer_idx`: 0-based index of the layer that just completed
+    /// - `hidden_state`: the layer's output tensor `[batch, seq_len, hidden_dim]`
+    /// - `state`: mutable forward-pass state
+    pub fn notify_layer_output(
+        &self,
+        layer_idx: usize,
+        hidden_state: &Tensor,
+        state: &mut BlockAttnResState,
+    ) -> Result<()> {
+        // Accumulate into partial sum
+        state.partial_sum = Some(match &state.partial_sum {
+            Some(prev) => (prev + hidden_state)?,
+            None => hidden_state.clone(),
+        });
+
+        // Check if this is the last layer in the current block
+        let is_last_in_block = (layer_idx + 1) % self.config.layers_per_block == 0;
+        if is_last_in_block {
+            // Finalize: move partial_sum into summaries
+            let summary = state
+                .partial_sum
+                .take()
+                .expect("partial_sum must exist after accumulation");
+            state.summaries.push(summary);
+        }
+
+        Ok(())
+    }
+
     /// Reference to the config.
     pub fn config(&self) -> &BlockAttnResConfig {
         &self.config
@@ -189,5 +225,48 @@ mod tests {
             .collect();
         let result = BlockAttnRes::from_tensors(&cfg, tensors);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn notify_accumulates_partial_sum() {
+        let cfg = BlockAttnResConfig {
+            num_blocks: 2,
+            layers_per_block: 2,
+            hidden_dim: 4,
+        };
+        let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
+        let mut state = module.new_state();
+
+        // Layer 0 output: [1, 3, 4] (batch=1, seq=3, dim=4)
+        let h0 = Tensor::ones((1, 3, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+        module.notify_layer_output(0, &h0, &mut state).unwrap();
+
+        // Partial sum should exist but no summaries yet (block 0 not done)
+        assert!(state.partial_sum.is_some());
+        assert!(state.summaries.is_empty());
+    }
+
+    #[test]
+    fn notify_finalizes_block_summary() {
+        let cfg = BlockAttnResConfig {
+            num_blocks: 2,
+            layers_per_block: 2,
+            hidden_dim: 4,
+        };
+        let module = BlockAttnRes::new(&cfg, &Device::Cpu).unwrap();
+        let mut state = module.new_state();
+
+        let h = Tensor::ones((1, 3, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+
+        // Layer 0 (block 0, position 0)
+        module.notify_layer_output(0, &h, &mut state).unwrap();
+        assert!(state.summaries.is_empty());
+
+        // Layer 1 (block 0, position 1 — last in block)
+        module.notify_layer_output(1, &h, &mut state).unwrap();
+        // Block 0 should now be finalized
+        assert_eq!(state.summaries.len(), 1);
+        // Partial sum should be reset for the next block
+        assert!(state.partial_sum.is_none());
     }
 }
