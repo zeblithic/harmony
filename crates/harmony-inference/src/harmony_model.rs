@@ -401,7 +401,7 @@ impl HarmonyModel {
         // Transformer layers
         let mut layers = Vec::with_capacity(config.num_layers);
         for _ in 0..config.num_layers {
-            layers.push(TransformerLayer::new(&config, rotary_emb.clone(), device)?);
+            layers.push(TransformerLayer::new(config, rotary_emb.clone(), device)?);
         }
 
         // Final layer norm

@@ -1,7 +1,7 @@
 //! HarmonyEngine: inference engine wrapping HarmonyModel with UQ classification.
 //!
 //! Wraps [`HarmonyModel`] and implements [`InferenceEngine`]. Adds UQ
-//! classification via [`forward_full`] + [`classify_uncertainty`].
+//! classification via [`HarmonyEngine::forward_full`] + [`HarmonyEngine::classify_uncertainty`].
 //!
 //! After initialization (`init_random` or future `load_gguf`), all inference
 //! methods take `&self`. Mutable state lives in the caller-owned
@@ -71,7 +71,7 @@ impl HarmonyEngine {
 
     /// Set the UQ head for uncertainty classification.
     ///
-    /// After setting, calls to [`classify_uncertainty`] will return a
+    /// After setting, calls to [`Self::classify_uncertainty`] will return a
     /// classification result instead of `None`.
     pub fn set_uq_head(&mut self, uq_head: UqHead) {
         self.uq_head = Some(uq_head);
