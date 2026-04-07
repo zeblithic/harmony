@@ -299,13 +299,15 @@ class HarmonyModel(nn.Module):
         - Embedding: normal, std 1/sqrt(hidden_dim)
         - BlockAttnRes queries: small normal, std 0.02 (already done in BlockAttnRes.__init__)
         """
-        std = 1.0 / math.sqrt(self.config.hidden_dim)
-        nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=std)
-
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 fan_in = module.weight.shape[1]
                 nn.init.uniform_(module.weight, -1.0 / math.sqrt(fan_in), 1.0 / math.sqrt(fan_in))
+
+        # Embedding init runs last so it overwrites the Kaiming uniform that
+        # was applied to the tied lm_head weight (which shares this tensor).
+        std = 1.0 / math.sqrt(self.config.hidden_dim)
+        nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=std)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass.
