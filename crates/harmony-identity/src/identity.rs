@@ -568,9 +568,9 @@ mod tests {
 
     #[test]
     fn proof_does_not_verify_for_different_identity() {
-        // Use d=4 to make accidental cross-key validity negligible (1/16 per attempt).
+        // d=8 → 1/256 false-pass probability, safe for CI.
         let params = crate::puzzle::PuzzleParams {
-            difficulty: 4,
+            difficulty: 8,
             ..crate::puzzle::PuzzleParams::TEST
         };
         let (_id1, proof) = PrivateIdentity::generate_with_proof(&mut OsRng, &params);
