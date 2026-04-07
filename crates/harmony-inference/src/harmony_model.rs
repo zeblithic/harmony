@@ -95,7 +95,18 @@ impl HarmonyModelConfig {
     }
 
     /// Derive the number of BlockAttnRes blocks from the layer config.
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts that `num_layers` is evenly divisible by `layers_per_block`.
     pub fn num_blocks(&self) -> usize {
+        debug_assert_eq!(
+            self.num_layers % self.layers_per_block,
+            0,
+            "num_layers ({}) must be divisible by layers_per_block ({})",
+            self.num_layers,
+            self.layers_per_block
+        );
         self.num_layers / self.layers_per_block
     }
 
@@ -230,6 +241,11 @@ impl Attention {
         let q_norm = random_rms_norm(head_dim, rms_norm_eps, device)?;
         let k_norm = random_rms_norm(head_dim, rms_norm_eps, device)?;
 
+        debug_assert_eq!(
+            num_query_heads % num_kv_heads,
+            0,
+            "num_query_heads ({num_query_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        );
         let num_kv_groups = num_query_heads / num_kv_heads;
 
         Ok(Self {
@@ -383,6 +399,14 @@ pub struct HarmonyModel {
 impl HarmonyModel {
     /// Construct a HarmonyModel with randomly-initialized weights (Kaiming init).
     pub fn new(config: &HarmonyModelConfig, device: &Device) -> Result<Self> {
+        if config.engram_injection_layer >= config.num_layers {
+            candle_core::bail!(
+                "engram_injection_layer ({}) must be < num_layers ({})",
+                config.engram_injection_layer,
+                config.num_layers
+            );
+        }
+
         let hidden_dim = config.hidden_dim;
         let vocab_size = config.vocab_size;
 
@@ -453,7 +477,7 @@ impl HarmonyModel {
         cache: &mut InferenceCache,
         engram_fn: Option<EngramFn<'_>>,
     ) -> Result<HarmonyForwardOutput> {
-        let (batch, seq_len) = input.dims2()?;
+        let (_batch, seq_len) = input.dims2()?;
         let offset = cache.position;
 
         // Token embedding: [batch, seq_len, hidden_dim]
@@ -461,7 +485,7 @@ impl HarmonyModel {
 
         // Causal attention mask (only needed for prefill — decode has seq_len=1).
         let mask = if seq_len > 1 {
-            Some(causal_mask(batch, seq_len, offset, input.device())?)
+            Some(causal_mask(seq_len, offset, input.device())?)
         } else {
             None
         };
@@ -517,9 +541,10 @@ impl HarmonyModel {
 
 /// Causal attention mask for prefill (seq_len > 1).
 ///
-/// Returns a `[batch, 1, tgt, tgt + offset]` f32 tensor with 0.0 for
+/// Returns a `[1, 1, tgt, tgt + offset]` f32 tensor with 0.0 for
 /// attending positions and -inf for masked-out positions.
-fn causal_mask(b: usize, tgt: usize, offset: usize, device: &Device) -> Result<Tensor> {
+/// Shape uses batch=1; broadcast handles larger batches in attention.
+fn causal_mask(tgt: usize, offset: usize, device: &Device) -> Result<Tensor> {
     let minf = f32::NEG_INFINITY;
     let mask: Vec<f32> = (0..tgt)
         .flat_map(|i| {
@@ -528,7 +553,7 @@ fn causal_mask(b: usize, tgt: usize, offset: usize, device: &Device) -> Result<T
             })
         })
         .collect();
-    Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), device)
+    Tensor::from_slice(&mask, (1, 1, tgt, tgt + offset), device)
 }
 
 /// L2 norm of the hidden state at the last sequence position.

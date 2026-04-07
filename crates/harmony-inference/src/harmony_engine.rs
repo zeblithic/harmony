@@ -151,13 +151,11 @@ impl HarmonyEngine {
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
 
         let output = if let Some(ctx) = engram {
+            // The model only invokes the callback at config.engram_injection_layer,
+            // so no layer filtering needed here — always inject when called.
             let engram_fn =
-                |layer_idx: usize, hidden_state: &Tensor| -> candle_core::Result<Option<Tensor>> {
-                    if ctx.injection_layers.contains(&layer_idx) {
-                        Ok(Some(ctx.module.forward(hidden_state, &ctx.embeddings)?))
-                    } else {
-                        Ok(None)
-                    }
+                |_layer_idx: usize, hidden_state: &Tensor| -> candle_core::Result<Option<Tensor>> {
+                    Ok(Some(ctx.module.forward(hidden_state, &ctx.embeddings)?))
                 };
             model.forward(&input, cache, Some(&engram_fn as EngramFn<'_>))
         } else {
