@@ -11,6 +11,7 @@ use candle_core::{DType, Device, Tensor};
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod packing;
+pub(crate) mod lloyd_max;
 use packing::{pack_3bit, unpack_3bit};
 
 /// Maximum quantization index (2^3 - 1 = 7, i.e., 8 levels 0..=7).
