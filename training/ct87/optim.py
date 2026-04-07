@@ -102,7 +102,10 @@ class Muon(torch.optim.Optimizer):
         adam_eps: float = 1e-8,
         adam_wd: float = 0.0,
     ):
-        defaults: dict[str, Any] = dict(lr=lr, momentum=momentum)
+        defaults: dict[str, Any] = dict(
+            lr=lr, momentum=momentum,
+            betas=adam_betas, eps=adam_eps, weight_decay=adam_wd, is_muon=False,
+        )
         params = []
 
         if muon_params:
