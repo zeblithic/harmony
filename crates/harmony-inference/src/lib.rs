@@ -22,13 +22,19 @@ pub mod engine;
 pub mod engram_bridge;
 pub mod engram_residual;
 pub mod error;
+pub mod harmony_engine;
+pub mod harmony_model;
 #[cfg(feature = "kv-compress")]
 pub(crate) mod kv_compress;
 pub(crate) mod qwen3_ext;
 pub mod sampling;
+pub mod uq_features;
 pub mod uq_head;
 
 pub use block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
+pub use harmony_engine::HarmonyEngine;
+pub use harmony_model::{HarmonyModel, HarmonyModelConfig, HarmonyForwardOutput};
+pub use uq_features::{extract_uq_features, UqFeatureConfig};
 pub use uq_head::{UqClass, UqHead, UqHeadConfig, UqOutput};
 pub use engine::EngramContext;
 pub use engine::QwenEngine;
@@ -95,6 +101,37 @@ impl InferenceCache {
     pub fn is_empty(&self) -> bool {
         self.position == 0
     }
+}
+
+/// Extract logits as `Vec<f32>` from a 1D or 2D tensor.
+///
+/// Handles both `[vocab_size]` and `[batch, vocab_size]` shapes by
+/// extracting the last row. Shared by `QwenEngine` and `HarmonyEngine`.
+pub(crate) fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>, InferenceError> {
+    let logits = match logits.dims().len() {
+        1 => logits.clone(),
+        2 => {
+            let rows = logits
+                .dim(0)
+                .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+            if rows == 0 {
+                return Err(InferenceError::ForwardFailed(
+                    "model returned empty logits tensor [0, vocab_size]".into(),
+                ));
+            }
+            logits
+                .get(rows - 1)
+                .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?
+        }
+        n => {
+            return Err(InferenceError::ForwardFailed(format!(
+                "unexpected logits dimensionality: {n}D"
+            )))
+        }
+    };
+    logits
+        .to_vec1::<f32>()
+        .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
 }
 
 /// Internal type for postcard serialization of compressed cache state.
