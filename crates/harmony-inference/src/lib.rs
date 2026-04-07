@@ -22,6 +22,7 @@ pub mod engine;
 pub mod engram_bridge;
 pub mod engram_residual;
 pub mod error;
+pub mod harmony_engine;
 pub mod harmony_model;
 #[cfg(feature = "kv-compress")]
 pub(crate) mod kv_compress;
@@ -31,6 +32,7 @@ pub mod uq_features;
 pub mod uq_head;
 
 pub use block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
+pub use harmony_engine::HarmonyEngine;
 pub use harmony_model::{HarmonyModel, HarmonyModelConfig, HarmonyForwardOutput};
 pub use uq_features::{extract_uq_features, UqFeatureConfig};
 pub use uq_head::{UqClass, UqHead, UqHeadConfig, UqOutput};
