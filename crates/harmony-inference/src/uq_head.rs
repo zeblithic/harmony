@@ -56,7 +56,7 @@ pub struct UqHeadConfig {
     pub num_features: usize,
     /// Hidden dimension of the classifier MLP. Default: 32.
     pub hidden_dim: usize,
-    /// Number of output classes. Default: 4.
+    /// Number of output classes. Must be 4 (matching [`UqClass`] variants).
     pub num_classes: usize,
 }
 
@@ -99,6 +99,12 @@ pub struct UqHead {
 impl UqHead {
     /// Create with small random weights (for testing / fresh init).
     pub fn new(config: &UqHeadConfig, device: &Device) -> Result<Self> {
+        if config.num_classes != 4 {
+            candle_core::bail!(
+                "num_classes must be 4 (matching UqClass variants), got {}",
+                config.num_classes
+            );
+        }
         let f = config.num_features;
         let h = config.hidden_dim;
         let c = config.num_classes;
@@ -130,6 +136,12 @@ impl UqHead {
         confidence_w: Tensor,
         confidence_b: Tensor,
     ) -> Result<Self> {
+        if config.num_classes != 4 {
+            candle_core::bail!(
+                "num_classes must be 4 (matching UqClass variants), got {}",
+                config.num_classes
+            );
+        }
         let f = config.num_features;
         let h = config.hidden_dim;
         let c = config.num_classes;
@@ -212,6 +224,13 @@ impl UqHead {
     /// Takes features of shape `[1, num_features]`. Returns the predicted
     /// `UqClass` (argmax of class probabilities) and the confidence scalar.
     pub fn classify(&self, features: &Tensor) -> Result<(UqClass, f32)> {
+        if features.dims() != [1, self.config.num_features] {
+            candle_core::bail!(
+                "classify expects [1, {}] input, got {:?}",
+                self.config.num_features,
+                features.dims()
+            );
+        }
         let output = self.forward(features)?;
 
         let class_idx: u32 = output
@@ -426,14 +445,15 @@ mod tests {
     }
 
     #[test]
-    fn classify_with_zero_weights_returns_confident() {
-        // Zero weights → softmax(zeros) = uniform → argmax picks index 0 = Confident
+    fn classify_biased_toward_class_0_returns_confident() {
+        // Bias b2 toward class 0 to guarantee Confident wins (no tie-breaking dependency).
         let cfg = test_config();
         let d = &Device::Cpu;
         let fc1 = Tensor::zeros((8, 32), candle_core::DType::F32, d).unwrap();
         let b1 = Tensor::zeros(32, candle_core::DType::F32, d).unwrap();
         let fc2 = Tensor::zeros((32, 4), candle_core::DType::F32, d).unwrap();
-        let b2 = Tensor::zeros(4, candle_core::DType::F32, d).unwrap();
+        // b2 = [100, 0, 0, 0] — biased toward class 0 = Confident
+        let b2 = Tensor::new(&[100.0f32, 0.0, 0.0, 0.0], d).unwrap();
         let cw = Tensor::zeros((8, 1), candle_core::DType::F32, d).unwrap();
         let cb = Tensor::zeros(1, candle_core::DType::F32, d).unwrap();
         let head = UqHead::from_tensors(&cfg, fc1, b1, fc2, b2, cw, cb).unwrap();
@@ -441,7 +461,6 @@ mod tests {
         let features = Tensor::zeros((1, 8), candle_core::DType::F32, d).unwrap();
         let (class, conf) = head.classify(&features).unwrap();
 
-        // argmax of uniform distribution picks first index (0 = Confident)
         assert_eq!(class, UqClass::Confident);
         assert!((conf - 0.5).abs() < 1e-5, "confidence = {conf}, expected 0.5");
     }
