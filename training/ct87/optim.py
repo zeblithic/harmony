@@ -69,7 +69,7 @@ def partition_params(model: nn.Module) -> tuple[list[torch.Tensor], list[torch.T
             continue  # Skip tied params (lm_head.weight == embed_tokens.weight)
         seen.add(id(param))
 
-        if param.dim() == 2 and "embed" not in name and "norm" not in name:
+        if param.dim() == 2 and "embed" not in name and "norm" not in name and "lm_head" not in name:
             muon_params.append(param)
         else:
             adam_params.append(param)
