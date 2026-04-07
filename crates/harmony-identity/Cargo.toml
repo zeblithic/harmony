@@ -20,6 +20,7 @@ bs58 = { workspace = true }
 base64 = { workspace = true, features = ["alloc"], optional = true }
 serde_json = { workspace = true, optional = true }
 hashbrown = { workspace = true, optional = true }
+argon2 = { workspace = true }
 
 [features]
 default = ["std"]
@@ -35,6 +36,7 @@ std = [
     "dep:serde_json",
     "dep:base64",
     "base64?/std",
+    "argon2/std",
 ]
 test-utils = ["dep:hashbrown"]
 

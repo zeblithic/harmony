@@ -180,6 +180,31 @@ impl PrivateIdentity {
         }
     }
 
+    /// Generate a new random identity with a proof-of-work puzzle.
+    ///
+    /// Wraps [`generate()`](Self::generate) and then solves an Argon2id
+    /// Hashcash puzzle bound to the public key material. At production
+    /// difficulty this takes ~6.4 seconds.
+    pub fn generate_with_proof(
+        rng: &mut impl CryptoRngCore,
+        params: &crate::puzzle::PuzzleParams,
+    ) -> (Self, crate::puzzle::IdentityProof) {
+        let identity = Self::generate(rng);
+        let pub_bytes = identity.identity.to_public_bytes();
+        let proof = crate::puzzle::solve(&pub_bytes, params, rng);
+        (identity, proof)
+    }
+
+    /// Verify that a proof-of-work is valid for this identity.
+    pub fn verify_proof(
+        &self,
+        proof: &crate::puzzle::IdentityProof,
+        params: &crate::puzzle::PuzzleParams,
+    ) -> bool {
+        let pub_bytes = self.identity.to_public_bytes();
+        crate::puzzle::verify(&pub_bytes, proof, params)
+    }
+
     /// Sign a message with Ed25519, returning a 64-byte signature.
     pub fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_LENGTH] {
         self.signing_key.sign(message).to_bytes()
@@ -528,5 +553,38 @@ mod tests {
         let id1 = PrivateIdentity::generate(&mut OsRng);
         let id2 = PrivateIdentity::generate(&mut OsRng);
         assert_ne!(id1.public_identity(), id2.public_identity());
+    }
+
+    // ── Proof-of-Work ──────────────────────────────────────────────────
+
+    #[test]
+    fn generate_with_proof_produces_valid_proof() {
+        let (id, proof) = PrivateIdentity::generate_with_proof(
+            &mut OsRng,
+            &crate::puzzle::PuzzleParams::TEST,
+        );
+        assert!(id.verify_proof(&proof, &crate::puzzle::PuzzleParams::TEST));
+    }
+
+    #[test]
+    fn proof_does_not_verify_for_different_identity() {
+        // Use d=4 to make accidental cross-key validity negligible (1/16 per attempt).
+        let params = crate::puzzle::PuzzleParams {
+            difficulty: 4,
+            ..crate::puzzle::PuzzleParams::TEST
+        };
+        let (_id1, proof) = PrivateIdentity::generate_with_proof(&mut OsRng, &params);
+        let id2 = PrivateIdentity::generate(&mut OsRng);
+        assert!(!id2.verify_proof(&proof, &params));
+    }
+
+    #[test]
+    fn generate_with_proof_identity_is_functional() {
+        let (id, _proof) = PrivateIdentity::generate_with_proof(
+            &mut OsRng,
+            &crate::puzzle::PuzzleParams::TEST,
+        );
+        let sig = id.sign(b"test");
+        assert!(id.public_identity().verify(b"test", &sig).is_ok());
     }
 }
