@@ -193,14 +193,17 @@ class HarmonyModel(nn.Module):
 **Tied embeddings:** When `config.tie_embeddings` is True, `lm_head.weight`
 is set to `embed_tokens.weight` (same tensor, shared parameter).
 
-**Embedding scale:** Embeddings scaled by `1 / sqrt(hidden_dim)` in the
-forward pass (matching candle).
+**Embedding scale:** The `1 / sqrt(hidden_dim)` scale is baked into the
+weight initialization (normal with `std = 1/sqrt(hidden_dim)`), not
+applied in the forward pass. This matches candle, where
+`scaled_randn(..., 1/sqrt(hidden_dim))` sets the init scale and
+`embed_tokens.forward()` does a plain lookup with no multiplier.
 
 **Forward pass orchestration:**
 
 ```
 def forward(input_ids):                       # [batch, seq_len]
-    h = embed_tokens(input_ids) * scale       # [batch, seq_len, hidden_dim]
+    h = embed_tokens(input_ids)               # [batch, seq_len, hidden_dim]
     attnres_state = []                        # Block summaries accumulate here
 
     for i, layer in enumerate(layers):
