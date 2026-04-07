@@ -54,6 +54,8 @@ the existing Qwen3 loader in `qwen3_ext.rs`). BlockAttnRes queries use the
 | `harmony.vocab_size` | u32 | 32000 | `config.vocab_size` |
 | `harmony.layers_per_block` | u32 | 3 | `config.layers_per_block` |
 | `harmony.tie_embeddings` | bool | true | `config.tie_embeddings` |
+| `harmony.engram_injection_layer` | u32 | 2 | `config.engram_injection_layer` |
+| `harmony.engram_dim` | u32 | 256 | `config.engram_dim` |
 
 The first 11 keys mirror Qwen3's metadata convention (prefix swapped to `harmony`).
 `layers_per_block` and `tie_embeddings` are ct87-specific, needed for BlockAttnRes

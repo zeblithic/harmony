@@ -1,0 +1,162 @@
+"""GGUF exporter for ct87 -- converts safetensors checkpoints to GGUF format.
+
+Usage:
+    python -m ct87.export_gguf --checkpoint model.safetensors --config tiny --output model.gguf
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import torch
+from gguf import GGUFWriter
+from safetensors.torch import load_file
+
+from ct87.model import HarmonyModelConfig
+
+
+def build_naming_map(config: HarmonyModelConfig) -> dict[str, str]:
+    """Build the PyTorch state_dict key -> GGUF tensor name mapping.
+
+    Returns a dict where keys are PyTorch state_dict keys and values are
+    the corresponding GGUF tensor names. When tie_embeddings is True,
+    lm_head.weight is excluded (the loader falls back to token_embd.weight).
+    """
+    mapping: dict[str, str] = {}
+    mapping["embed_tokens.weight"] = "token_embd.weight"
+
+    for i in range(config.num_layers):
+        mapping[f"layers.{i}.attn_norm.weight"] = f"blk.{i}.attn_norm.weight"
+        mapping[f"layers.{i}.attn.q_proj.weight"] = f"blk.{i}.attn_q.weight"
+        mapping[f"layers.{i}.attn.k_proj.weight"] = f"blk.{i}.attn_k.weight"
+        mapping[f"layers.{i}.attn.v_proj.weight"] = f"blk.{i}.attn_v.weight"
+        mapping[f"layers.{i}.attn.o_proj.weight"] = f"blk.{i}.attn_output.weight"
+        mapping[f"layers.{i}.attn.q_norm.weight"] = f"blk.{i}.attn_q_norm.weight"
+        mapping[f"layers.{i}.attn.k_norm.weight"] = f"blk.{i}.attn_k_norm.weight"
+        mapping[f"layers.{i}.ffn_norm.weight"] = f"blk.{i}.ffn_norm.weight"
+        mapping[f"layers.{i}.mlp.gate_proj.weight"] = f"blk.{i}.ffn_gate.weight"
+        mapping[f"layers.{i}.mlp.up_proj.weight"] = f"blk.{i}.ffn_up.weight"
+        mapping[f"layers.{i}.mlp.down_proj.weight"] = f"blk.{i}.ffn_down.weight"
+
+    mapping["final_norm.weight"] = "output_norm.weight"
+
+    if not config.tie_embeddings:
+        mapping["lm_head.weight"] = "output.weight"
+
+    for i in range(config.num_blocks - 1):
+        mapping[f"block_attnres.queries.{i}"] = (
+            f"harmony.block_attnres.query.{i}.weight"
+        )
+
+    return mapping
+
+
+def write_metadata(
+    writer: GGUFWriter, config: HarmonyModelConfig, name: str,
+) -> None:
+    """Write all harmony GGUF metadata keys."""
+    writer.add_name(name)
+    writer.add_uint32("harmony.block_count", config.num_layers)
+    writer.add_uint32("harmony.embedding_length", config.hidden_dim)
+    writer.add_uint32("harmony.attention.head_count", config.num_query_heads)
+    writer.add_uint32("harmony.attention.head_count_kv", config.num_kv_heads)
+    writer.add_uint32("harmony.attention.key_length", config.head_dim)
+    writer.add_uint32("harmony.feed_forward_length", config.ffn_dim)
+    writer.add_uint32("harmony.context_length", config.max_seq_len)
+    writer.add_float32("harmony.rope.freq_base", config.rope_theta)
+    writer.add_float32(
+        "harmony.attention.layer_norm_rms_epsilon", config.rms_norm_eps,
+    )
+    writer.add_uint32("harmony.vocab_size", config.vocab_size)
+    writer.add_uint32("harmony.layers_per_block", config.layers_per_block)
+    writer.add_bool("harmony.tie_embeddings", config.tie_embeddings)
+    writer.add_uint32(
+        "harmony.engram_injection_layer", config.engram_injection_layer,
+    )
+    writer.add_uint32("harmony.engram_dim", config.engram_dim)
+
+
+def export_gguf(
+    state_dict: dict[str, torch.Tensor],
+    config: HarmonyModelConfig,
+    output_path: str | Path,
+    name: str | None = None,
+) -> None:
+    """Export a ct87 state_dict to GGUF format.
+
+    Args:
+        state_dict: Model state_dict (from safetensors or model.state_dict()).
+        config: Model configuration matching the checkpoint.
+        output_path: Path to write the GGUF file.
+        name: Optional model name for metadata. Defaults to "ct87".
+
+    Raises:
+        ValueError: If state_dict keys don't match expected keys for config.
+    """
+    if name is None:
+        name = "ct87"
+
+    naming_map = build_naming_map(config)
+
+    # Validate completeness
+    expected_keys = set(naming_map.keys())
+    actual_keys = set(state_dict.keys())
+
+    # When tied, lm_head.weight exists in state_dict but isn't in naming_map
+    if config.tie_embeddings and "lm_head.weight" in actual_keys:
+        actual_keys = actual_keys - {"lm_head.weight"}
+
+    missing = expected_keys - actual_keys
+    extra = actual_keys - expected_keys
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append(f"Missing keys: {sorted(missing)}")
+        if extra:
+            parts.append(f"Extra keys: {sorted(extra)}")
+        raise ValueError("; ".join(parts))
+
+    writer = GGUFWriter(str(output_path), arch="harmony")
+    write_metadata(writer, config, name)
+
+    for pytorch_key, gguf_name in naming_map.items():
+        tensor = state_dict[pytorch_key]
+        # BlockAttnRes queries: squeeze from [1, 1, hidden] to [hidden]
+        if "block_attnres.queries" in pytorch_key:
+            tensor = tensor.squeeze()
+        arr = tensor.detach().cpu().float().numpy()
+        writer.add_tensor(gguf_name, arr)
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Export ct87 checkpoint to GGUF")
+    parser.add_argument(
+        "--checkpoint", type=str, required=True,
+        help="Path to safetensors checkpoint",
+    )
+    parser.add_argument("--config", choices=["tiny", "target"], required=True)
+    parser.add_argument("--output", type=str, required=True, help="Output GGUF path")
+    parser.add_argument(
+        "--name", type=str, default=None, help="Model name for metadata",
+    )
+    args = parser.parse_args()
+
+    config = (
+        HarmonyModelConfig.tiny()
+        if args.config == "tiny"
+        else HarmonyModelConfig.target()
+    )
+    state_dict = load_file(args.checkpoint)
+    name = args.name or f"ct87-{args.config}"
+    export_gguf(state_dict, config, args.output, name)
+    print(f"Exported to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
