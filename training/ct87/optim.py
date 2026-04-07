@@ -21,6 +21,8 @@ def newton_schulz_orthogonalize(X: torch.Tensor, num_iters: int = 5) -> torch.Te
     """Orthogonalize a matrix via Newton-Schulz iteration.
 
     Approximates the polar decomposition. 5 iterations is sufficient.
+    For tall matrices (rows > cols), transposes before iterating to avoid
+    rank-deficient intermediates, then transposes back.
 
     Args:
         X: matrix to orthogonalize [m, n]
@@ -30,11 +32,20 @@ def newton_schulz_orthogonalize(X: torch.Tensor, num_iters: int = 5) -> torch.Te
         Orthogonalized matrix with same shape.
     """
     a, b, c = 3.4445, -4.7750, 2.0315
+    # Transpose tall matrices so NS operates on wide-or-square input.
+    # X @ X.T must be full-rank for convergence; tall matrices produce
+    # rank-deficient intermediates without this.
+    transposed = False
+    if X.shape[0] > X.shape[1]:
+        X = X.T
+        transposed = True
     # Normalize so spectral norm < 1 (required for convergence)
     X = X / (X.norm() + 1e-7)
     for _ in range(num_iters):
         A = X @ X.T
         X = a * X + b * (A @ X) + c * (A @ (A @ X))
+    if transposed:
+        X = X.T
     return X
 
 
@@ -133,7 +144,12 @@ class Muon(torch.optim.Optimizer):
             buf.mul_(momentum).add_(p.grad)
 
             update = newton_schulz_orthogonalize(buf)
-            p.data.add_(update, alpha=-lr)
+
+            # Aspect-ratio scaling: tall matrices (e.g. gate_proj [ffn_dim, hidden_dim])
+            # need proportionally larger updates. Without this, MLP layers undertrain.
+            # Reference: "Muon is Scalable" (arXiv:2502.16982).
+            aspect = max(1, p.shape[0] / p.shape[1]) ** 0.5
+            p.data.add_(update, alpha=-lr * aspect)
 
     def _adam_step(self, group: dict) -> None:
         lr = group["lr"]
