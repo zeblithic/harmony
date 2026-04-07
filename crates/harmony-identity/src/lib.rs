@@ -8,6 +8,7 @@ pub mod error;
 pub mod identity;
 pub mod identity_ref;
 pub mod pq_identity;
+pub mod puzzle;
 pub mod ucan;
 pub mod verify;
 
@@ -25,6 +26,7 @@ pub use error::IdentityError;
 pub use identity::{Identity, IdentityHash, PrivateIdentity};
 pub use identity_ref::IdentityRef;
 pub use pq_identity::{PqIdentity, PqPrivateIdentity};
+pub use puzzle::{IdentityProof, PuzzleParams};
 pub use ucan::{
     verify_revocation, verify_token, CapabilityType, IdentityResolver, PqUcanToken, ProofResolver,
     Revocation, RevocationSet, UcanError, UcanToken,

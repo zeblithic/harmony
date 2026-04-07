@@ -22,6 +22,9 @@ pub enum IdentityError {
     #[error("decryption failed")]
     DecryptionFailed,
 
+    #[error("invalid puzzle parameters")]
+    InvalidPuzzleParams,
+
     #[error(transparent)]
     Crypto(#[from] harmony_crypto::CryptoError),
 }

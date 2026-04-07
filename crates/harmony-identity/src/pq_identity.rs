@@ -178,6 +178,31 @@ impl PqPrivateIdentity {
         }
     }
 
+    /// Generate a new random PQ identity with a proof-of-work puzzle.
+    ///
+    /// Wraps [`generate()`](Self::generate) and then solves an Argon2id
+    /// Hashcash puzzle bound to the public key material. At production
+    /// difficulty this takes ~6.4 seconds.
+    pub fn generate_with_proof(
+        rng: &mut impl CryptoRngCore,
+        params: &crate::puzzle::PuzzleParams,
+    ) -> (Self, crate::puzzle::IdentityProof) {
+        let identity = Self::generate(rng);
+        let pub_bytes = identity.identity.to_public_bytes();
+        let proof = crate::puzzle::solve(&pub_bytes, params, rng);
+        (identity, proof)
+    }
+
+    /// Verify that a proof-of-work is valid for this identity.
+    pub fn verify_proof(
+        &self,
+        proof: &crate::puzzle::IdentityProof,
+        params: &crate::puzzle::PuzzleParams,
+    ) -> bool {
+        let pub_bytes = self.identity.to_public_bytes();
+        crate::puzzle::verify(&pub_bytes, proof, params)
+    }
+
     /// Get the public identity.
     pub fn public_identity(&self) -> &PqIdentity {
         &self.identity
@@ -680,5 +705,38 @@ mod tests {
         let h1 = token.content_hash();
         let h2 = token.content_hash();
         assert_eq!(h1, h2);
+    }
+
+    // ── Proof-of-Work ──────────────────────────────────────────────────
+
+    #[test]
+    fn pq_generate_with_proof_produces_valid_proof() {
+        let (id, proof) = PqPrivateIdentity::generate_with_proof(
+            &mut OsRng,
+            &crate::puzzle::PuzzleParams::TEST,
+        );
+        assert!(id.verify_proof(&proof, &crate::puzzle::PuzzleParams::TEST));
+    }
+
+    #[test]
+    fn pq_proof_does_not_verify_for_different_identity() {
+        // d=8 → 1/256 false-pass probability, safe for CI.
+        let params = crate::puzzle::PuzzleParams {
+            difficulty: 8,
+            ..crate::puzzle::PuzzleParams::TEST
+        };
+        let (_id1, proof) = PqPrivateIdentity::generate_with_proof(&mut OsRng, &params);
+        let id2 = PqPrivateIdentity::generate(&mut OsRng);
+        assert!(!id2.verify_proof(&proof, &params));
+    }
+
+    #[test]
+    fn pq_generate_with_proof_identity_is_functional() {
+        let (id, _proof) = PqPrivateIdentity::generate_with_proof(
+            &mut OsRng,
+            &crate::puzzle::PuzzleParams::TEST,
+        );
+        let sig = id.sign(b"test").unwrap();
+        assert!(id.public_identity().verify(b"test", &sig).is_ok());
     }
 }
