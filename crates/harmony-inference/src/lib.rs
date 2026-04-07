@@ -103,6 +103,37 @@ impl InferenceCache {
     }
 }
 
+/// Extract logits as `Vec<f32>` from a 1D or 2D tensor.
+///
+/// Handles both `[vocab_size]` and `[batch, vocab_size]` shapes by
+/// extracting the last row. Shared by `QwenEngine` and `HarmonyEngine`.
+pub(crate) fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>, InferenceError> {
+    let logits = match logits.dims().len() {
+        1 => logits.clone(),
+        2 => {
+            let rows = logits
+                .dim(0)
+                .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+            if rows == 0 {
+                return Err(InferenceError::ForwardFailed(
+                    "model returned empty logits tensor [0, vocab_size]".into(),
+                ));
+            }
+            logits
+                .get(rows - 1)
+                .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?
+        }
+        n => {
+            return Err(InferenceError::ForwardFailed(format!(
+                "unexpected logits dimensionality: {n}D"
+            )))
+        }
+    };
+    logits
+        .to_vec1::<f32>()
+        .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
+}
+
 /// Internal type for postcard serialization of compressed cache state.
 #[cfg(feature = "kv-compress")]
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -15,7 +15,7 @@ use crate::error::InferenceError;
 use crate::harmony_model::{EngramFn, HarmonyForwardOutput, HarmonyModel, HarmonyModelConfig};
 use crate::uq_features::{extract_uq_features, UqFeatureConfig};
 use crate::uq_head::{UqClass, UqHead};
-use crate::{InferenceCache, InferenceEngine, SamplingParams};
+use crate::{logits_to_vec, InferenceCache, InferenceEngine, SamplingParams};
 
 /// Inference engine wrapping the ct87 HarmonyModel.
 ///
@@ -132,7 +132,7 @@ impl HarmonyEngine {
 
         let seq_len = tokens.len();
 
-        // Validate engram embedding size matches token count.
+        // Validate engram context.
         if let Some(ctx) = engram {
             let emb_len = ctx
                 .embeddings
@@ -142,6 +142,20 @@ impl HarmonyEngine {
                 return Err(InferenceError::ForwardFailed(format!(
                     "engram embeddings have {emb_len} positions but tokens.len()={seq_len}; \
                      caller must provide embeddings matching the current token batch"
+                )));
+            }
+            // Unlike QwenEngine (which invokes the callback at every layer and
+            // relies on injection_layers for filtering), HarmonyModel only
+            // invokes the callback at config.engram_injection_layer. Validate
+            // that the caller's injection_layers includes that layer so the
+            // intent is consistent.
+            let inj = self.config.engram_injection_layer;
+            if !ctx.injection_layers.contains(&inj) {
+                return Err(InferenceError::ForwardFailed(format!(
+                    "EngramContext.injection_layers {:?} does not contain the model's \
+                     engram_injection_layer ({inj}); HarmonyEngine injects at the \
+                     model-configured layer, not at injection_layers",
+                    ctx.injection_layers
                 )));
             }
         }
@@ -281,35 +295,7 @@ impl InferenceEngine for HarmonyEngine {
 // ---------------------------------------------------------------------------
 
 /// Extract a `Vec<f32>` from a logits tensor.
-///
-/// Handles both 1D `[vocab_size]` tensors and 2D `[batch, vocab_size]` tensors
-/// by extracting the last row. Mirrors `QwenEngine::forward_impl` logic.
-fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>, InferenceError> {
-    let logits = match logits.dims().len() {
-        1 => logits.clone(),
-        2 => {
-            let rows = logits
-                .dim(0)
-                .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
-            if rows == 0 {
-                return Err(InferenceError::ForwardFailed(
-                    "model returned empty logits tensor [0, vocab_size]".into(),
-                ));
-            }
-            logits
-                .get(rows - 1)
-                .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?
-        }
-        n => {
-            return Err(InferenceError::ForwardFailed(format!(
-                "unexpected logits dimensionality: {n}D"
-            )))
-        }
-    };
-    logits
-        .to_vec1::<f32>()
-        .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
-}
+// logits_to_vec is now shared: crate::logits_to_vec
 
 // ---------------------------------------------------------------------------
 // Tests

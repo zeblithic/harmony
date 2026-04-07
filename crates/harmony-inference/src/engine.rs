@@ -232,32 +232,7 @@ impl QwenEngine {
             .forward_with_engram(&input, cache, engram_fn)
             .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
 
-        // Extract last logit row.
-        let logits = match logits.dims().len() {
-            1 => logits,
-            2 => {
-                let rows = logits
-                    .dim(0)
-                    .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
-                if rows == 0 {
-                    return Err(InferenceError::ForwardFailed(
-                        "model returned empty logits tensor [0, vocab_size]".into(),
-                    ));
-                }
-                logits
-                    .get(rows - 1)
-                    .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?
-            }
-            n => {
-                return Err(InferenceError::ForwardFailed(format!(
-                    "unexpected logits dimensionality: {n}D"
-                )))
-            }
-        };
-
-        logits
-            .to_vec1::<f32>()
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
+        crate::logits_to_vec(&logits)
     }
 }
 
