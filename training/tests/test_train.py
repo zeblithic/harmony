@@ -1,0 +1,91 @@
+"""Tests for the training loop."""
+
+import os
+import tempfile
+
+import torch
+import pytest
+from ct87.model import HarmonyModel, HarmonyModelConfig
+from ct87.optim import Muon, WSDSchedule, partition_params
+from ct87.train import save_checkpoint, load_checkpoint, make_synthetic_dataloader
+
+
+def _tiny_config() -> HarmonyModelConfig:
+    return HarmonyModelConfig(
+        num_layers=4, hidden_dim=32, num_query_heads=4, num_kv_heads=2,
+        head_dim=8, ffn_dim=64, vocab_size=128, max_seq_len=64,
+        rope_theta=10000.0, rms_norm_eps=1e-6, layers_per_block=2,
+        engram_injection_layer=1, engram_dim=16, tie_embeddings=True,
+    )
+
+
+class TestOverfit:
+    def test_loss_decreases_on_tiny_batch(self):
+        """Tiny model overfits a small batch -- loss drops below 2.0 in 50 steps."""
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+
+        muon_params, adam_params = partition_params(model)
+        optimizer = Muon(muon_params, adam_params, lr=1e-3, adam_lr=1e-3)
+
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 17))
+        x = input_ids[:, :-1]
+        targets = input_ids[:, 1:]
+
+        initial_loss = None
+        final_loss = None
+
+        for step in range(50):
+            logits = model(x)
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, cfg.vocab_size), targets.reshape(-1),
+            )
+            if step == 0:
+                initial_loss = loss.item()
+            final_loss = loss.item()
+
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+        assert final_loss < initial_loss, f"Loss should decrease: {initial_loss} -> {final_loss}"
+        assert final_loss < 2.0, f"Loss should drop below 2.0 after 50 steps, got {final_loss}"
+
+
+class TestCheckpoint:
+    def test_save_load_roundtrip(self):
+        """Save and load a checkpoint -- logits should match exactly."""
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+
+        input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
+        logits_before = model(input_ids).detach()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_checkpoint(model, None, 0, tmpdir)
+
+            model2 = HarmonyModel(cfg)
+            load_checkpoint(model2, tmpdir, step=0)
+            logits_after = model2(input_ids).detach()
+
+        assert torch.allclose(logits_before, logits_after, atol=1e-6)
+
+
+class TestSyntheticDataloader:
+    def test_batch_shape(self):
+        dl = make_synthetic_dataloader(vocab_size=128, seq_len=16, batch_size=4, seed=42)
+        batch = next(dl)
+        assert batch.shape == (4, 17)  # seq_len + 1
+
+    def test_values_in_range(self):
+        dl = make_synthetic_dataloader(vocab_size=128, seq_len=16, batch_size=4, seed=42)
+        batch = next(dl)
+        assert batch.min().item() >= 0
+        assert batch.max().item() < 128
+
+    def test_reproducible(self):
+        dl1 = make_synthetic_dataloader(vocab_size=128, seq_len=16, batch_size=4, seed=42)
+        dl2 = make_synthetic_dataloader(vocab_size=128, seq_len=16, batch_size=4, seed=42)
+        assert torch.equal(next(dl1), next(dl2))
