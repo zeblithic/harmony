@@ -193,3 +193,143 @@ class TransformerLayer(nn.Module):
         h = x + self.attn(self.attn_norm(x))
         h = h + self.mlp(self.ffn_norm(h))
         return h
+
+
+# ---------------------------------------------------------------------------
+# Block Attention Residuals + top-level model
+# ---------------------------------------------------------------------------
+
+
+class BlockAttnRes(nn.Module):
+    """Block Attention Residuals -- learned depth-wise attention at block boundaries.
+
+    At block boundaries, computes attention over previous block summaries to let
+    deep layers recall early-layer features. Solves PreNorm dilution.
+
+    Matches crates/harmony-inference/src/block_attnres.rs.
+    """
+
+    def __init__(self, num_blocks: int, hidden_dim: int):
+        super().__init__()
+        # num_blocks - 1 queries: block 0 has no preceding boundary
+        self.queries = nn.ParameterList([
+            nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            for _ in range(num_blocks - 1)
+        ])
+        self.hidden_dim = hidden_dim
+        self.scale = math.sqrt(hidden_dim)
+
+    def notify_layer_output(
+        self, layer_idx: int, hidden_state: torch.Tensor,
+        state: list[torch.Tensor], layers_per_block: int,
+    ) -> None:
+        """Store block summary at block boundaries."""
+        if (layer_idx + 1) % layers_per_block == 0:
+            state.append(hidden_state)
+
+    def block_input(
+        self, block_idx: int, hidden_state: torch.Tensor,
+        state: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Mix previous block summaries at block boundary.
+
+        Block 0: passthrough. Block k>0: attention-weighted sum of all
+        preceding summaries + current hidden state.
+        """
+        if block_idx == 0:
+            return hidden_state
+
+        query = self.queries[block_idx - 1]  # [1, 1, hidden_dim]
+
+        # Collect candidates: all completed summaries + current hidden state
+        candidates = state + [hidden_state]
+
+        # Score each candidate: dot(query, candidate) / sqrt(hidden_dim)
+        scores = []
+        for candidate in candidates:
+            score = (candidate * query).sum(dim=-1, keepdim=True) / self.scale
+            scores.append(score)
+
+        # [batch, seq_len, num_candidates]
+        stacked = torch.cat(scores, dim=-1)
+        weights = F.softmax(stacked, dim=-1)
+
+        # Weighted sum: [batch, seq_len, hidden_dim]
+        result = torch.zeros_like(hidden_state)
+        for i, candidate in enumerate(candidates):
+            result = result + weights[..., i : i + 1] * candidate
+
+        return result
+
+
+class HarmonyModel(nn.Module):
+    """The ct87 custom model -- Qwen3-derived transformer with BlockAttnRes.
+
+    Forward pass mirrors crates/harmony-inference/src/harmony_model.rs:473-534.
+    Training only -- no KV cache, no Engram injection, no UQ collection.
+    """
+
+    def __init__(self, config: HarmonyModelConfig):
+        super().__init__()
+        self.config = config
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_dim)
+        self.embed_scale = 1.0 / math.sqrt(config.hidden_dim)
+
+        rotary_emb = RotaryEmbedding(config.head_dim, config.max_seq_len, config.rope_theta)
+        self.layers = nn.ModuleList([
+            TransformerLayer(config, rotary_emb) for _ in range(config.num_layers)
+        ])
+
+        self.final_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
+        self.block_attnres = BlockAttnRes(config.num_blocks, config.hidden_dim)
+
+        # Tied embeddings
+        if config.tie_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights matching candle HarmonyModel::new().
+
+        - Linear: Kaiming uniform, scale 1/sqrt(fan_in)
+        - RMSNorm: ones (already done in RMSNorm.__init__)
+        - Embedding: normal, std 1/sqrt(hidden_dim)
+        - BlockAttnRes queries: small normal, std 0.02 (already done in BlockAttnRes.__init__)
+        """
+        std = 1.0 / math.sqrt(self.config.hidden_dim)
+        nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=std)
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                fan_in = module.weight.shape[1]
+                nn.init.uniform_(module.weight, -1.0 / math.sqrt(fan_in), 1.0 / math.sqrt(fan_in))
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            input_ids: [batch, seq_len] token IDs
+
+        Returns:
+            logits: [batch, seq_len, vocab_size]
+        """
+        h = self.embed_tokens(input_ids) * self.embed_scale
+        attnres_state: list[torch.Tensor] = []
+        layers_per_block = self.config.layers_per_block
+
+        for i, layer in enumerate(self.layers):
+            # Block boundary mixing (blocks > 0)
+            if i > 0 and i % layers_per_block == 0:
+                block_idx = i // layers_per_block
+                h = self.block_attnres.block_input(block_idx, h, attnres_state)
+
+            # Standard transformer layer
+            h = layer(h)
+
+            # Store block summary at block end
+            self.block_attnres.notify_layer_output(i, h, attnres_state, layers_per_block)
+
+        return self.lm_head(self.final_norm(h))
