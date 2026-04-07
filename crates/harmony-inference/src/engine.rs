@@ -341,9 +341,15 @@ mod tests {
     #[test]
     #[cfg(feature = "kv-compress")]
     fn forward_while_compressed_errors() {
+        use crate::kv_compress;
         let engine = QwenEngine::new(Device::Cpu);
+        let tq = kv_compress::TurboQuantState::new(&kv_compress::TurboQuantConfig {
+            head_dim: 128,
+            seed: 42,
+        })
+        .unwrap();
         let mut cache = InferenceCache::new(28, 128, 8);
-        cache.compress().unwrap();
+        cache.compress(&tq).unwrap();
         assert!(cache.is_compressed());
 
         let result = engine.forward(&[1, 2, 3], &mut cache);

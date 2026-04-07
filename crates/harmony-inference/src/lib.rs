@@ -116,13 +116,36 @@ impl InferenceCache {
     /// Frees full-precision tensors to reclaim memory.
     /// No-op if already compressed.
     /// Atomic: on error, cache remains in uncompressed state.
-    ///
-    /// TODO(Task 6): Wire up TurboQuantState — compress_tensor is now a method.
-    pub fn compress(&mut self) -> Result<(), InferenceError> {
+    pub fn compress(&mut self, tq: &kv_compress::TurboQuantState) -> Result<(), InferenceError> {
         if self.is_compressed {
             return Ok(());
         }
-        todo!("Task 6: wire TurboQuantState into compress()")
+
+        // Phase 1: compress into a staging buffer (no mutation yet)
+        let mut staging: Vec<Option<kv_compress::CompressedKvLayer>> =
+            Vec::with_capacity(self.num_layers);
+        for layer in self.layers.iter() {
+            match layer {
+                Some((k, v)) => {
+                    let (k_vecs, seq_len) = tq.compress_tensor(k)?;
+                    let (v_vecs, _) = tq.compress_tensor(v)?;
+                    staging.push(Some(kv_compress::CompressedKvLayer {
+                        k: k_vecs,
+                        v: v_vecs,
+                        seq_len,
+                    }));
+                }
+                None => staging.push(None),
+            }
+        }
+
+        // Phase 2: commit — swap staging into self, free tensors
+        self.compressed = staging;
+        for layer in self.layers.iter_mut() {
+            *layer = None;
+        }
+        self.is_compressed = true;
+        Ok(())
     }
 
     /// Approximate memory usage in bytes (accounts for compression state).
@@ -147,13 +170,43 @@ impl InferenceCache {
     /// # Device limitation
     /// Decompressed tensors are always placed on `Device::Cpu`. Do not use
     /// with CUDA/Metal engines until harmony-51dy resolves device threading.
-    ///
-    /// TODO(Task 6): Wire up TurboQuantState — decompress_tensor is now a method.
-    pub fn decompress(&mut self) -> Result<(), InferenceError> {
+    pub fn decompress(&mut self, tq: &kv_compress::TurboQuantState) -> Result<(), InferenceError> {
         if !self.is_compressed {
             return Ok(());
         }
-        todo!("Task 6: wire TurboQuantState into decompress()")
+
+        // Phase 1: decompress into a staging buffer (no mutation yet)
+        let mut staging: Vec<Option<(Tensor, Tensor)>> = Vec::with_capacity(self.num_layers);
+        for comp in self.compressed.iter() {
+            match comp {
+                Some(layer) => {
+                    let k = tq.decompress_tensor(
+                        &layer.k,
+                        self.num_kv_heads,
+                        layer.seq_len,
+                        self.head_dim,
+                        &candle_core::Device::Cpu,
+                    )?;
+                    let v = tq.decompress_tensor(
+                        &layer.v,
+                        self.num_kv_heads,
+                        layer.seq_len,
+                        self.head_dim,
+                        &candle_core::Device::Cpu,
+                    )?;
+                    staging.push(Some((k, v)));
+                }
+                None => staging.push(None),
+            }
+        }
+
+        // Phase 2: commit — swap staging into self, free compressed data
+        self.layers = staging;
+        for comp in self.compressed.iter_mut() {
+            *comp = None;
+        }
+        self.is_compressed = false;
+        Ok(())
     }
 
     /// Serialize the compressed cache to bytes.
@@ -367,6 +420,14 @@ mod kv_compress_cache_tests {
     use super::*;
     use candle_core::{DType, Device, Tensor};
 
+    fn test_tq_state(head_dim: usize) -> kv_compress::TurboQuantState {
+        kv_compress::TurboQuantState::new(&kv_compress::TurboQuantConfig {
+            head_dim,
+            seed: 42,
+        })
+        .unwrap()
+    }
+
     /// Create a cache with `n_tokens` of random f16 KV tensors in layer 0.
     fn cache_with_data(
         num_layers: usize,
@@ -393,25 +454,28 @@ mod kv_compress_cache_tests {
 
     #[test]
     fn compress_empty_cache_succeeds() {
-        let mut cache = InferenceCache::new(2, 128, 8);
-        assert!(cache.compress().is_ok());
+        let tq = test_tq_state(80);
+        let mut cache = InferenceCache::new(2, 80, 8);
+        assert!(cache.compress(&tq).is_ok());
         assert!(cache.is_compressed());
     }
 
     #[test]
     fn compress_noop_when_already_compressed() {
-        let mut cache = InferenceCache::new(2, 128, 8);
-        cache.compress().unwrap();
-        assert!(cache.compress().is_ok());
+        let tq = test_tq_state(80);
+        let mut cache = InferenceCache::new(2, 80, 8);
+        cache.compress(&tq).unwrap();
+        assert!(cache.compress(&tq).is_ok());
         assert!(cache.is_compressed());
     }
 
     #[test]
     fn compress_frees_full_precision_tensors() {
-        let mut cache = cache_with_data(2, 8, 128, 16);
+        let tq = test_tq_state(80);
+        let mut cache = cache_with_data(2, 8, 80, 16);
         assert!(cache.layers[0].is_some());
 
-        cache.compress().unwrap();
+        cache.compress(&tq).unwrap();
 
         assert!(cache.is_compressed());
         assert!(cache.layers[0].is_none());
@@ -422,15 +486,17 @@ mod kv_compress_cache_tests {
 
     #[test]
     fn decompress_noop_when_uncompressed() {
-        let mut cache = cache_with_data(2, 8, 128, 16);
-        assert!(cache.decompress().is_ok());
+        let tq = test_tq_state(80);
+        let mut cache = cache_with_data(2, 8, 80, 16);
+        assert!(cache.decompress(&tq).is_ok());
         assert!(!cache.is_compressed());
         assert!(cache.layers[0].is_some());
     }
 
     #[test]
     fn compress_decompress_roundtrip() {
-        let mut cache = cache_with_data(2, 8, 128, 16);
+        let tq = test_tq_state(80);
+        let mut cache = cache_with_data(2, 8, 80, 16);
         let orig_k = cache.layers[0]
             .as_ref()
             .unwrap()
@@ -442,15 +508,15 @@ mod kv_compress_cache_tests {
             .to_vec1::<f32>()
             .unwrap();
 
-        cache.compress().unwrap();
-        cache.decompress().unwrap();
+        cache.compress(&tq).unwrap();
+        cache.decompress(&tq).unwrap();
         assert!(!cache.is_compressed());
 
         let (k, v) = cache.layers[0]
             .as_ref()
             .expect("layer 0 should be restored");
-        assert_eq!(k.dims4().unwrap(), (1, 8, 16, 128));
-        assert_eq!(v.dims4().unwrap(), (1, 8, 16, 128));
+        assert_eq!(k.dims4().unwrap(), (1, 8, 16, 80));
+        assert_eq!(v.dims4().unwrap(), (1, 8, 16, 80));
         assert_eq!(k.dtype(), DType::F16);
 
         let restored_k = k
@@ -466,69 +532,73 @@ mod kv_compress_cache_tests {
             .zip(restored_k.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
-        // 3-bit on [0,1]: step=1/7≈0.143, max error < half step + f16 rounding
+        // TurboQuant: rotation + Lloyd-Max + QJL has different error profile
         assert!(
-            max_err < 0.15,
+            max_err < 0.5,
             "max reconstruction error {max_err} too large"
         );
     }
 
     #[test]
     fn is_compressed_state_tracking() {
-        let mut cache = cache_with_data(2, 8, 128, 4);
+        let tq = test_tq_state(80);
+        let mut cache = cache_with_data(2, 8, 80, 4);
         assert!(!cache.is_compressed());
-        cache.compress().unwrap();
+        cache.compress(&tq).unwrap();
         assert!(cache.is_compressed());
-        cache.decompress().unwrap();
+        cache.decompress(&tq).unwrap();
         assert!(!cache.is_compressed());
-        cache.compress().unwrap();
+        cache.compress(&tq).unwrap();
         assert!(cache.is_compressed());
     }
 
     #[test]
     fn memory_bytes_empty_cache() {
-        let cache = InferenceCache::new(2, 128, 8);
+        let cache = InferenceCache::new(2, 80, 8);
         assert_eq!(cache.memory_bytes(), 0);
     }
 
     #[test]
     fn memory_bytes_uncompressed() {
-        let cache = cache_with_data(2, 8, 128, 16);
+        let cache = cache_with_data(2, 8, 80, 16);
         let bytes = cache.memory_bytes();
-        // Layer 0: K + V = 2 * 1 * 8 * 16 * 128 * 2 bytes = 65536
-        assert_eq!(bytes, 65536);
+        // Layer 0: K + V = 2 * 1 * 8 * 16 * 80 * 2 bytes = 40960
+        assert_eq!(bytes, 40960);
     }
 
     #[test]
     fn compress_reduces_memory() {
-        let mut cache = cache_with_data(2, 8, 128, 16);
+        let tq = test_tq_state(80);
+        let mut cache = cache_with_data(2, 8, 80, 16);
         let before = cache.memory_bytes();
-        cache.compress().unwrap();
+        cache.compress(&tq).unwrap();
         let after = cache.memory_bytes();
         assert!(
             after < before,
             "compressed {after} should be < uncompressed {before}"
         );
         let ratio = before as f64 / after as f64;
-        // 3-bit uniform: 56 bytes/vec vs 256 bytes/vec ≈ 4.6x
-        assert!(ratio > 3.0, "compression ratio {ratio:.1}x too low");
+        // TurboQuant at 80-dim: 44 bytes/vec vs 160 bytes/vec f16 ≈ 3.6x
+        assert!(ratio > 2.5, "compression ratio {ratio:.1}x too low");
     }
 
     #[test]
     fn memory_bytes_restored_matches_original() {
-        let mut cache = cache_with_data(2, 8, 128, 16);
+        let tq = test_tq_state(80);
+        let mut cache = cache_with_data(2, 8, 80, 16);
         let original = cache.memory_bytes();
-        cache.compress().unwrap();
-        cache.decompress().unwrap();
+        cache.compress(&tq).unwrap();
+        cache.decompress(&tq).unwrap();
         assert_eq!(cache.memory_bytes(), original);
     }
 
     #[test]
     fn compress_atomic_on_error() {
-        let mut cache = InferenceCache::new(2, 128, 8);
+        let tq = test_tq_state(80);
+        let mut cache = InferenceCache::new(2, 80, 8);
 
-        // Layer 0: correct shape [1, 8, 4, 128] f16
-        let shape_ok = (1, 8, 4, 128);
+        // Layer 0: correct shape [1, 8, 4, 80] f16
+        let shape_ok = (1, 8, 4, 80);
         let k0 = Tensor::rand(0f32, 1f32, shape_ok, &Device::Cpu)
             .unwrap()
             .to_dtype(DType::F16)
@@ -540,17 +610,17 @@ mod kv_compress_cache_tests {
         cache.layers[0] = Some((k0, v0));
 
         // Layer 1: 3D tensor (wrong rank) — will fail dims4()
-        let k1 = Tensor::rand(0f32, 1f32, (8, 4, 128), &Device::Cpu)
+        let k1 = Tensor::rand(0f32, 1f32, (8, 4, 80), &Device::Cpu)
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();
-        let v1 = Tensor::rand(0f32, 1f32, (8, 4, 128), &Device::Cpu)
+        let v1 = Tensor::rand(0f32, 1f32, (8, 4, 80), &Device::Cpu)
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();
         cache.layers[1] = Some((k1, v1));
 
-        let result = cache.compress();
+        let result = cache.compress(&tq);
         assert!(result.is_err(), "should fail on malformed tensor");
 
         // Atomic: cache must remain fully uncompressed
@@ -562,24 +632,26 @@ mod kv_compress_cache_tests {
 
     #[test]
     fn double_roundtrip_preserves_shape() {
-        let mut cache = cache_with_data(2, 8, 128, 8);
+        let tq = test_tq_state(80);
+        let mut cache = cache_with_data(2, 8, 80, 8);
 
-        cache.compress().unwrap();
-        cache.decompress().unwrap();
-        cache.compress().unwrap();
-        cache.decompress().unwrap();
+        cache.compress(&tq).unwrap();
+        cache.decompress(&tq).unwrap();
+        cache.compress(&tq).unwrap();
+        cache.decompress(&tq).unwrap();
 
         assert!(!cache.is_compressed());
         let (k, v) = cache.layers[0].as_ref().unwrap();
-        assert_eq!(k.dims4().unwrap(), (1, 8, 8, 128));
-        assert_eq!(v.dims4().unwrap(), (1, 8, 8, 128));
+        assert_eq!(k.dims4().unwrap(), (1, 8, 8, 80));
+        assert_eq!(v.dims4().unwrap(), (1, 8, 8, 80));
         assert_eq!(k.dtype(), DType::F16);
     }
 
     #[test]
     fn compress_with_partial_layers() {
-        let mut cache = InferenceCache::new(4, 128, 8);
-        let shape = (1, 8, 4, 128);
+        let tq = test_tq_state(80);
+        let mut cache = InferenceCache::new(4, 80, 8);
+        let shape = (1, 8, 4, 80);
         let k = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
             .unwrap()
             .to_dtype(DType::F16)
@@ -591,13 +663,13 @@ mod kv_compress_cache_tests {
         cache.layers[0] = Some((k.clone(), v.clone()));
         cache.layers[2] = Some((k, v));
 
-        cache.compress().unwrap();
+        cache.compress(&tq).unwrap();
         assert!(cache.compressed[0].is_some());
         assert!(cache.compressed[1].is_none());
         assert!(cache.compressed[2].is_some());
         assert!(cache.compressed[3].is_none());
 
-        cache.decompress().unwrap();
+        cache.decompress(&tq).unwrap();
         assert!(cache.layers[0].is_some());
         assert!(cache.layers[1].is_none());
         assert!(cache.layers[2].is_some());
@@ -606,11 +678,12 @@ mod kv_compress_cache_tests {
 
     #[test]
     fn serialize_deserialize_roundtrip() {
-        let mut cache = cache_with_data(2, 8, 128, 16);
-        cache.compress().unwrap();
+        let tq = test_tq_state(80);
+        let mut cache = cache_with_data(2, 8, 80, 16);
+        cache.compress(&tq).unwrap();
 
         let bytes = cache.serialize_compressed().unwrap();
-        let restored = InferenceCache::deserialize_compressed(&bytes, 2, 128, 8).unwrap();
+        let restored = InferenceCache::deserialize_compressed(&bytes, 2, 80, 8).unwrap();
 
         assert!(restored.is_compressed());
         assert_eq!(restored.position, 16);
@@ -621,7 +694,7 @@ mod kv_compress_cache_tests {
 
     #[test]
     fn serialize_uncompressed_errors() {
-        let cache = cache_with_data(2, 8, 128, 16);
+        let cache = cache_with_data(2, 8, 80, 16);
         let result = cache.serialize_compressed();
         assert!(matches!(
             result,
@@ -631,11 +704,12 @@ mod kv_compress_cache_tests {
 
     #[test]
     fn deserialize_validates_num_layers() {
-        let mut cache = cache_with_data(2, 8, 128, 4);
-        cache.compress().unwrap();
+        let tq = test_tq_state(80);
+        let mut cache = cache_with_data(2, 8, 80, 4);
+        cache.compress(&tq).unwrap();
         let bytes = cache.serialize_compressed().unwrap();
 
-        let result = InferenceCache::deserialize_compressed(&bytes, 99, 128, 8);
+        let result = InferenceCache::deserialize_compressed(&bytes, 99, 80, 8);
         assert!(matches!(
             result,
             Err(InferenceError::SerializationFailed(_))
@@ -644,11 +718,12 @@ mod kv_compress_cache_tests {
 
     #[test]
     fn serialize_empty_compressed_cache() {
-        let mut cache = InferenceCache::new(2, 128, 8);
-        cache.compress().unwrap();
+        let tq = test_tq_state(80);
+        let mut cache = InferenceCache::new(2, 80, 8);
+        cache.compress(&tq).unwrap();
 
         let bytes = cache.serialize_compressed().unwrap();
-        let restored = InferenceCache::deserialize_compressed(&bytes, 2, 128, 8).unwrap();
+        let restored = InferenceCache::deserialize_compressed(&bytes, 2, 80, 8).unwrap();
 
         assert!(restored.is_compressed());
         assert_eq!(restored.position, 0);
@@ -657,12 +732,13 @@ mod kv_compress_cache_tests {
 
     #[test]
     fn serialize_preserves_position() {
-        let mut cache = cache_with_data(2, 8, 128, 42);
+        let tq = test_tq_state(80);
+        let mut cache = cache_with_data(2, 8, 80, 42);
         cache.position = 42;
-        cache.compress().unwrap();
+        cache.compress(&tq).unwrap();
 
         let bytes = cache.serialize_compressed().unwrap();
-        let restored = InferenceCache::deserialize_compressed(&bytes, 2, 128, 8).unwrap();
+        let restored = InferenceCache::deserialize_compressed(&bytes, 2, 80, 8).unwrap();
         assert_eq!(restored.position, 42);
     }
 }
