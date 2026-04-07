@@ -274,7 +274,6 @@ class HarmonyModel(nn.Module):
         self.config = config
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_dim)
-        self.embed_scale = 1.0 / math.sqrt(config.hidden_dim)
 
         rotary_emb = RotaryEmbedding(config.head_dim, config.max_seq_len, config.rope_theta)
         self.layers = nn.ModuleList([
@@ -318,7 +317,7 @@ class HarmonyModel(nn.Module):
         Returns:
             logits: [batch, seq_len, vocab_size]
         """
-        h = self.embed_tokens(input_ids) * self.embed_scale
+        h = self.embed_tokens(input_ids)
         attnres_state: list[torch.Tensor] = []
         layers_per_block = self.config.layers_per_block
 

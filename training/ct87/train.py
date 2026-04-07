@@ -56,7 +56,7 @@ def make_hf_dataloader(
     rng.manual_seed(seed)
 
     while True:
-        starts = torch.randint(0, total - window, (batch_size,), generator=rng)
+        starts = torch.randint(0, total - window + 1, (batch_size,), generator=rng)
         batch = torch.stack([all_tokens_t[s : s + window] for s in starts])
         yield batch
 
@@ -88,10 +88,10 @@ def load_checkpoint(
     from safetensors.torch import load_model
 
     weights_path = os.path.join(output_dir, f"model_step_{step}.safetensors")
-    load_model(model, weights_path, strict=False)
+    load_model(model, weights_path)
 
 
-def set_lr(optimizer: torch.optim.Optimizer, multiplier: float, base_lr: float) -> None:
+def set_lr(optimizer: torch.optim.Optimizer, multiplier: float) -> None:
     """Set learning rate for all param groups based on schedule multiplier."""
     for group in optimizer.param_groups:
         if "_base_lr" not in group:
@@ -152,7 +152,7 @@ def main() -> None:
 
     for step in range(args.steps):
         lr_mult = schedule.get_lr_multiplier(step)
-        set_lr(optimizer, lr_mult, args.lr)
+        set_lr(optimizer, lr_mult)
 
         batch = next(dataloader).to(device)
         input_ids = batch[:, :-1]
