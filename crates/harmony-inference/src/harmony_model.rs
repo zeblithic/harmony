@@ -96,17 +96,9 @@ impl HarmonyModelConfig {
 
     /// Derive the number of BlockAttnRes blocks from the layer config.
     ///
-    /// # Panics
-    ///
-    /// Debug-asserts that `num_layers` is evenly divisible by `layers_per_block`.
+    /// Assumes `num_layers` is divisible by `layers_per_block` (validated
+    /// in [`HarmonyModel::new`]).
     pub fn num_blocks(&self) -> usize {
-        debug_assert_eq!(
-            self.num_layers % self.layers_per_block,
-            0,
-            "num_layers ({}) must be divisible by layers_per_block ({})",
-            self.num_layers,
-            self.layers_per_block
-        );
         self.num_layers / self.layers_per_block
     }
 
@@ -399,6 +391,13 @@ pub struct HarmonyModel {
 impl HarmonyModel {
     /// Construct a HarmonyModel with randomly-initialized weights (Kaiming init).
     pub fn new(config: &HarmonyModelConfig, device: &Device) -> Result<Self> {
+        if config.layers_per_block == 0 || config.num_layers % config.layers_per_block != 0 {
+            candle_core::bail!(
+                "num_layers ({}) must be divisible by layers_per_block ({})",
+                config.num_layers,
+                config.layers_per_block
+            );
+        }
         if config.engram_injection_layer >= config.num_layers {
             candle_core::bail!(
                 "engram_injection_layer ({}) must be < num_layers ({})",
