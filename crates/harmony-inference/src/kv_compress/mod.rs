@@ -10,6 +10,9 @@ use crate::error::InferenceError;
 use candle_core::{DType, Device, Tensor};
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod packing;
+use packing::{pack_3bit, unpack_3bit};
+
 /// Maximum quantization index (2^3 - 1 = 7, i.e., 8 levels 0..=7).
 const MAX_INDEX: u8 = 7;
 
@@ -49,49 +52,6 @@ impl CompressedKvLayer {
         self.k.iter().map(|q| q.byte_size()).sum::<usize>()
             + self.v.iter().map(|q| q.byte_size()).sum::<usize>()
     }
-}
-
-// ── 3-bit packing ────────────────────────────────────────────────────
-
-/// Pack 3-bit values (each 0..7) into bytes, 8 values per 3 bytes.
-///
-/// Bit layout within each 3-byte group (little-endian):
-/// ```text
-/// byte 0: [v0₂ v0₁ v0₀ | v1₂ v1₁ v1₀ | v2₁ v2₀]
-/// byte 1: [v2₂ | v3₂ v3₁ v3₀ | v4₂ v4₁ v4₀ | v5₀]
-/// byte 2: [v5₂ v5₁ | v6₂ v6₁ v6₀ | v7₂ v7₁ v7₀]
-/// ```
-fn pack_3bit(values: &[u8]) -> Vec<u8> {
-    let num_bytes = (values.len() * 3).div_ceil(8);
-    let mut packed = vec![0u8; num_bytes];
-    for (i, &v) in values.iter().enumerate() {
-        let bit_offset = i * 3;
-        let byte_idx = bit_offset / 8;
-        let bit_idx = bit_offset % 8;
-        packed[byte_idx] |= (v & 0x7) << bit_idx;
-        // Handle straddling a byte boundary (bit_idx > 5)
-        if bit_idx > 5 && byte_idx + 1 < packed.len() {
-            packed[byte_idx + 1] |= (v & 0x7) >> (8 - bit_idx);
-        }
-    }
-    packed
-}
-
-/// Unpack 3-bit values from packed bytes.
-fn unpack_3bit(packed: &[u8], count: usize) -> Vec<u8> {
-    let mut values = Vec::with_capacity(count);
-    for i in 0..count {
-        let bit_offset = i * 3;
-        let byte_idx = bit_offset / 8;
-        let bit_idx = bit_offset % 8;
-        let mut v = (packed[byte_idx] >> bit_idx) & 0x7;
-        // Handle straddling
-        if bit_idx > 5 && byte_idx + 1 < packed.len() {
-            v |= (packed[byte_idx + 1] << (8 - bit_idx)) & 0x7;
-        }
-        values.push(v);
-    }
-    values
 }
 
 // ── Per-vector quantize/dequantize ───────────────────────────────────
@@ -204,31 +164,6 @@ pub(crate) fn decompress_tensor(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pack_unpack_roundtrip() {
-        let values: Vec<u8> = (0..16).map(|i| i % 8).collect();
-        let packed = pack_3bit(&values);
-        let unpacked = unpack_3bit(&packed, values.len());
-        assert_eq!(values, unpacked);
-    }
-
-    #[test]
-    fn pack_unpack_all_sevens() {
-        let values = vec![7u8; 24];
-        let packed = pack_3bit(&values);
-        let unpacked = unpack_3bit(&packed, 24);
-        assert_eq!(values, unpacked);
-    }
-
-    #[test]
-    fn pack_unpack_all_zeros() {
-        let values = vec![0u8; 128];
-        let packed = pack_3bit(&values);
-        assert_eq!(packed.len(), 48); // 128 * 3 / 8 = 48
-        let unpacked = unpack_3bit(&packed, 128);
-        assert_eq!(values, unpacked);
-    }
 
     #[test]
     fn quantize_dequantize_roundtrip() {
