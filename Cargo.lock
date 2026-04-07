@@ -3175,6 +3175,7 @@ name = "harmony-engram"
 version = "0.1.0"
 dependencies = [
  "half",
+ "libm",
  "postcard",
  "serde",
  "thiserror 2.0.18",
