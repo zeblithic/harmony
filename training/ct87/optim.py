@@ -225,4 +225,5 @@ class WSDSchedule:
             return 1.0
         else:
             progress = (step - self.decay_start) / self.decay_steps if self.decay_steps > 0 else 1.0
+            progress = min(progress, 1.0)
             return 1.0 - (1.0 - self.min_lr_ratio) * progress

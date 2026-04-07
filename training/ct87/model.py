@@ -212,8 +212,10 @@ class BlockAttnRes(nn.Module):
     def __init__(self, num_blocks: int, hidden_dim: int):
         super().__init__()
         # num_blocks - 1 queries: block 0 has no preceding boundary
+        # Scale matches Rust block_attnres.rs:77-78: 1/sqrt(hidden_dim)
+        query_scale = 1.0 / math.sqrt(hidden_dim)
         self.queries = nn.ParameterList([
-            nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            nn.Parameter(torch.randn(1, 1, hidden_dim) * query_scale)
             for _ in range(num_blocks - 1)
         ])
         self.hidden_dim = hidden_dim
