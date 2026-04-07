@@ -24,7 +24,16 @@ pub fn pack_3bit(values: &[u8]) -> Vec<u8> {
 }
 
 /// Unpack 3-bit values from packed bytes.
+///
+/// # Panics
+/// Panics if `packed` is shorter than `ceil(count * 3 / 8)` bytes.
 pub fn unpack_3bit(packed: &[u8], count: usize) -> Vec<u8> {
+    let required = (count * 3).div_ceil(8);
+    assert!(
+        packed.len() >= required,
+        "unpack_3bit: buffer too short ({} bytes for {count} values, need {required})",
+        packed.len()
+    );
     let mut values = Vec::with_capacity(count);
     for i in 0..count {
         let bit_offset = i * 3;
@@ -52,7 +61,16 @@ pub fn pack_1bit(values: &[bool]) -> Vec<u8> {
 }
 
 /// Unpack boolean values from packed bytes (LSB first).
+///
+/// # Panics
+/// Panics if `packed` is shorter than `ceil(count / 8)` bytes.
 pub fn unpack_1bit(packed: &[u8], count: usize) -> Vec<bool> {
+    let required = count.div_ceil(8);
+    assert!(
+        packed.len() >= required,
+        "unpack_1bit: buffer too short ({} bytes for {count} values, need {required})",
+        packed.len()
+    );
     let mut values = Vec::with_capacity(count);
     for i in 0..count {
         values.push((packed[i / 8] >> (i % 8)) & 1 == 1);

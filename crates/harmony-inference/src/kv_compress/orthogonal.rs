@@ -46,8 +46,15 @@ pub fn generate_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
                 }
             }
             let norm = col_norm(&m, dim, i);
-            for row in 0..dim {
-                m[row * dim + i] /= norm;
+            if norm < 1e-12 {
+                // Truly degenerate twice — fall back to standard basis vector
+                for row in 0..dim {
+                    m[row * dim + i] = if row == i { 1.0 } else { 0.0 };
+                }
+            } else {
+                for row in 0..dim {
+                    m[row * dim + i] /= norm;
+                }
             }
         } else {
             for row in 0..dim {

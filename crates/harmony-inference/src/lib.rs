@@ -128,7 +128,8 @@ impl InferenceCache {
             match layer {
                 Some((k, v)) => {
                     let (k_vecs, seq_len) = tq.compress_tensor(k)?;
-                    let (v_vecs, _) = tq.compress_tensor(v)?;
+                    let (v_vecs, v_seq_len) = tq.compress_tensor(v)?;
+                    debug_assert_eq!(seq_len, v_seq_len, "K and V seq_len mismatch in layer");
                     staging.push(Some(kv_compress::CompressedKvLayer {
                         k: k_vecs,
                         v: v_vecs,
