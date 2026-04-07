@@ -1,11 +1,12 @@
 //! ct87 custom model: a Qwen3-derived transformer with BlockAttnRes, Engram
 //! injection, and UQ feature collection.
 //!
-//! This module defines the model configuration, internal layer types, and
-//! random-weight construction. The forward pass is implemented in Task 3.
+//! This module defines the model configuration, internal layer types,
+//! random-weight construction, and the full forward pass.
 
-use crate::block_attnres::{BlockAttnRes, BlockAttnResConfig};
-use candle_core::{Device, Result, Tensor};
+use crate::block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
+use crate::InferenceCache;
+use candle_core::{Device, Module, Result, Tensor};
 use candle_nn::{Embedding, Linear, RmsNorm};
 use std::sync::Arc;
 
@@ -183,6 +184,14 @@ impl Mlp {
     }
 }
 
+impl Module for Mlp {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = candle_nn::Activation::Silu.forward(&self.gate_proj.forward(x)?)?;
+        let up = self.up_proj.forward(x)?;
+        self.down_proj.forward(&(gate * up)?)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Attention
 // ---------------------------------------------------------------------------
@@ -237,6 +246,73 @@ impl Attention {
             rotary_emb,
         })
     }
+
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+        kv_slot: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let (b, l, _) = x.dims3()?;
+
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+
+        let q = q
+            .reshape((b, l, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // Per-head QK norm: flatten heads into batch dim, normalize, reshape back.
+        let q_flat = q.flatten(0, 2)?;
+        let k_flat = k.flatten(0, 2)?;
+
+        let q_flat = self.q_norm.forward(&q_flat)?;
+        let k_flat = self.k_norm.forward(&k_flat)?;
+        let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
+        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+
+        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+
+        // Externalized KV cache: append to existing tensors or start fresh.
+        let (k, v) = match kv_slot.take() {
+            Some((prev_k, prev_v)) => (
+                Tensor::cat(&[&prev_k, &k], 2)?,
+                Tensor::cat(&[&prev_v, &v], 2)?,
+            ),
+            None => (k, v),
+        };
+        *kv_slot = Some((k.clone(), v.clone()));
+
+        let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
+        let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        if let Some(m) = mask {
+            let m_dtype = m.dtype();
+            let scores_dtype = scores.dtype();
+            let mask_cast = if m_dtype != scores_dtype {
+                m.to_dtype(scores_dtype)?
+            } else {
+                m.clone()
+            };
+            scores = scores.broadcast_add(&mask_cast)?;
+        }
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let ctx = probs.matmul(&v)?; // (B, H, L, D)
+        let reshaped_ctx = ctx
+            .transpose(1, 2)?
+            .reshape((b, l, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&reshaped_ctx)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +345,21 @@ impl TransformerLayer {
         let ffn_norm = random_rms_norm(config.hidden_dim, config.rms_norm_eps, device)?;
         let mlp = Mlp::new(config.hidden_dim, config.ffn_dim, device)?;
         Ok(Self { attn_norm, attn, ffn_norm, mlp })
+    }
+
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+        kv_slot: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let h = self.attn_norm.forward(x)?;
+        let h = self.attn.forward(&h, mask, offset, kv_slot)?;
+        let x = (x + h)?;
+        let h2 = self.ffn_norm.forward(&x)?;
+        let h2 = self.mlp.forward(&h2)?;
+        x + h2
     }
 }
 
@@ -350,6 +441,101 @@ impl HarmonyModel {
     pub fn block_attnres(&self) -> &BlockAttnRes {
         &self.block_attnres
     }
+
+    /// Run one forward pass of the model.
+    ///
+    /// `input` is a `[1, seq_len]` u32 token-ID tensor.
+    /// `cache` holds per-layer KV tensors and position offset.
+    /// `engram_fn` is an optional callback called after the configured injection layer.
+    pub fn forward(
+        &self,
+        input: &Tensor,
+        cache: &mut InferenceCache,
+        engram_fn: Option<EngramFn<'_>>,
+    ) -> Result<HarmonyForwardOutput> {
+        let (batch, seq_len) = input.dims2()?;
+        let offset = cache.position;
+
+        // Token embedding: [batch, seq_len, hidden_dim]
+        let mut h = self.embed_tokens.forward(input)?;
+
+        // Causal attention mask (only needed for prefill — decode has seq_len=1).
+        let mask = if seq_len > 1 {
+            Some(causal_mask(batch, seq_len, offset, input.device())?)
+        } else {
+            None
+        };
+
+        let mut state: BlockAttnResState = self.block_attnres.new_state();
+        let layers_per_block = self.config.layers_per_block;
+        let mut layer_norms: Vec<f32> = Vec::with_capacity(self.config.num_layers);
+
+        for i in 0..self.layers.len() {
+            // At block boundaries (except the very first layer) apply BlockAttnRes mixing.
+            if i > 0 && i % layers_per_block == 0 {
+                h = self.block_attnres.block_input(i / layers_per_block, &h, &state)?;
+            }
+
+            h = self.layers[i].forward(&h, mask.as_ref(), offset, &mut cache.layers[i])?;
+
+            // Engram injection at the configured layer.
+            if let Some(f) = engram_fn {
+                if i == self.config.engram_injection_layer {
+                    if let Some(residual) = f(i, &h)? {
+                        h = (h + residual)?;
+                    }
+                }
+            }
+
+            // Record L2 norm at last sequence position.
+            layer_norms.push(l2_norm_last_position(&h)?);
+
+            // Notify BlockAttnRes of this layer's output (stores summary at block ends).
+            if (i + 1) % layers_per_block == 0 {
+                self.block_attnres.notify_layer_output(i, &h, &mut state)?;
+            }
+        }
+
+        // Final norm → narrow to last token → lm_head logits.
+        h = self.final_norm.forward(&h)?;
+        // [batch, 1, hidden_dim]
+        let last = h.narrow(1, seq_len - 1, 1)?;
+        // [batch, hidden_dim]
+        let last = last.squeeze(1)?;
+        // [batch, vocab_size]
+        let logits = self.lm_head.forward(&last)?;
+
+        cache.position += seq_len;
+
+        Ok(HarmonyForwardOutput { logits, layer_norms })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forward-pass helpers
+// ---------------------------------------------------------------------------
+
+/// Causal attention mask for prefill (seq_len > 1).
+///
+/// Returns a `[batch, 1, tgt, tgt + offset]` f32 tensor with 0.0 for
+/// attending positions and -inf for masked-out positions.
+fn causal_mask(b: usize, tgt: usize, offset: usize, device: &Device) -> Result<Tensor> {
+    let minf = f32::NEG_INFINITY;
+    let mask: Vec<f32> = (0..tgt)
+        .flat_map(|i| {
+            (0..(tgt + offset)).map(move |j| {
+                if j <= i + offset { 0.0 } else { minf }
+            })
+        })
+        .collect();
+    Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), device)
+}
+
+/// L2 norm of the hidden state at the last sequence position.
+fn l2_norm_last_position(h: &Tensor) -> Result<f32> {
+    let (_, seq_len, _) = h.dims3()?;
+    let last = h.narrow(1, seq_len - 1, 1)?;
+    last.sqr()?.sum_all()?.sqrt()?.to_scalar()
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +544,6 @@ impl HarmonyModel {
 
 /// Repeats key/value tensors for grouped query attention.
 /// Input shape: `(batch, num_kv_heads, seq_len, head_dim)`.
-#[allow(dead_code)]
 fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         Ok(xs)
@@ -401,6 +586,7 @@ fn random_rms_norm(size: usize, eps: f64, device: &Device) -> Result<RmsNorm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::InferenceCache;
     use candle_core::Device;
 
     fn test_config() -> HarmonyModelConfig {
@@ -489,5 +675,157 @@ mod tests {
         // test_config: 2 blocks → 1 boundary query
         let state = model.block_attnres().new_state();
         assert!(state.summaries.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Forward pass tests (Task 3)
+    // -----------------------------------------------------------------------
+
+    fn make_input_3tokens() -> candle_core::Result<Tensor> {
+        Tensor::new(&[1u32, 2, 3], &Device::Cpu)?.reshape((1, 3))
+    }
+
+    fn make_input_1token() -> candle_core::Result<Tensor> {
+        Tensor::new(&[4u32], &Device::Cpu)?.reshape((1, 1))
+    }
+
+    #[test]
+    fn forward_output_shape() {
+        let cfg = test_config();
+        let model = HarmonyModel::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = InferenceCache::new(cfg.num_layers, cfg.head_dim, cfg.num_kv_heads);
+        let input = make_input_3tokens().unwrap();
+        let out = model.forward(&input, &mut cache, None).unwrap();
+        // logits must be [1, vocab_size]
+        assert_eq!(out.logits.dims(), &[1, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn forward_layer_norms_length() {
+        let cfg = test_config();
+        let model = HarmonyModel::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = InferenceCache::new(cfg.num_layers, cfg.head_dim, cfg.num_kv_heads);
+        let input = make_input_3tokens().unwrap();
+        let out = model.forward(&input, &mut cache, None).unwrap();
+        assert_eq!(out.layer_norms.len(), cfg.num_layers);
+    }
+
+    #[test]
+    fn forward_advances_cache_position() {
+        let cfg = test_config();
+        let model = HarmonyModel::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = InferenceCache::new(cfg.num_layers, cfg.head_dim, cfg.num_kv_heads);
+
+        // Prefill 3 tokens → position should be 3
+        let input3 = make_input_3tokens().unwrap();
+        model.forward(&input3, &mut cache, None).unwrap();
+        assert_eq!(cache.position, 3);
+
+        // Decode 1 token → position should be 4
+        let input1 = make_input_1token().unwrap();
+        model.forward(&input1, &mut cache, None).unwrap();
+        assert_eq!(cache.position, 4);
+    }
+
+    #[test]
+    fn forward_with_engram_modifies_output() {
+        let cfg = test_config();
+        let model = HarmonyModel::new(&cfg, &Device::Cpu).unwrap();
+        let input = make_input_3tokens().unwrap();
+
+        // Baseline: no engram
+        let mut cache_base = InferenceCache::new(cfg.num_layers, cfg.head_dim, cfg.num_kv_heads);
+        let out_base = model.forward(&input, &mut cache_base, None).unwrap();
+
+        // With engram injection: inject a ones residual at the injection layer
+        let hidden_dim = cfg.hidden_dim;
+        let engram_fn: EngramFn<'_> = &|_layer_idx: usize, h: &Tensor| {
+            let shape = h.dims().to_vec();
+            Ok(Some(Tensor::ones(shape.as_slice(), candle_core::DType::F32, h.device())?))
+        };
+        let mut cache_engram = InferenceCache::new(cfg.num_layers, cfg.head_dim, cfg.num_kv_heads);
+        let out_engram = model
+            .forward(&input, &mut cache_engram, Some(engram_fn))
+            .unwrap();
+
+        // logits should differ because we injected a residual
+        let base_vals: Vec<f32> = out_base.logits.flatten_all().unwrap().to_vec1().unwrap();
+        let eng_vals: Vec<f32> = out_engram.logits.flatten_all().unwrap().to_vec1().unwrap();
+        let max_diff = base_vals
+            .iter()
+            .zip(eng_vals.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-6,
+            "logits should differ with engram injection; max_diff={max_diff}"
+        );
+        let _ = hidden_dim; // silence unused warning
+    }
+
+    #[test]
+    fn forward_layer_norms_are_positive() {
+        let cfg = test_config();
+        let model = HarmonyModel::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = InferenceCache::new(cfg.num_layers, cfg.head_dim, cfg.num_kv_heads);
+        let input = make_input_3tokens().unwrap();
+        let out = model.forward(&input, &mut cache, None).unwrap();
+        for (i, &norm) in out.layer_norms.iter().enumerate() {
+            assert!(norm >= 0.0, "layer {i} norm should be non-negative, got {norm}");
+        }
+    }
+
+    #[test]
+    fn forward_populates_kv_cache_slots() {
+        let cfg = test_config();
+        let model = HarmonyModel::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = InferenceCache::new(cfg.num_layers, cfg.head_dim, cfg.num_kv_heads);
+        let input = make_input_3tokens().unwrap(); // seq_len = 3
+
+        model.forward(&input, &mut cache, None).unwrap();
+
+        // All layers should have a populated KV slot with shape [1, num_kv_heads, 3, head_dim]
+        for (i, slot) in cache.layers.iter().enumerate() {
+            let (k, v) = slot
+                .as_ref()
+                .unwrap_or_else(|| panic!("layer {i} KV slot should be populated"));
+            assert_eq!(
+                k.dims(),
+                &[1, cfg.num_kv_heads, 3, cfg.head_dim],
+                "layer {i} K shape mismatch"
+            );
+            assert_eq!(
+                v.dims(),
+                &[1, cfg.num_kv_heads, 3, cfg.head_dim],
+                "layer {i} V shape mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_decode_extends_kv_cache() {
+        let cfg = test_config();
+        let model = HarmonyModel::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = InferenceCache::new(cfg.num_layers, cfg.head_dim, cfg.num_kv_heads);
+
+        // Prefill 3 tokens
+        let input3 = make_input_3tokens().unwrap();
+        model.forward(&input3, &mut cache, None).unwrap();
+
+        // Decode 1 more token
+        let input1 = make_input_1token().unwrap();
+        model.forward(&input1, &mut cache, None).unwrap();
+
+        // KV cache seq_len should now be 4
+        for (i, slot) in cache.layers.iter().enumerate() {
+            let (k, _v) = slot
+                .as_ref()
+                .unwrap_or_else(|| panic!("layer {i} KV slot should be populated"));
+            assert_eq!(
+                k.dims(),
+                &[1, cfg.num_kv_heads, 4, cfg.head_dim],
+                "layer {i} K should have seq_len=4 after prefill+decode"
+            );
+        }
     }
 }
