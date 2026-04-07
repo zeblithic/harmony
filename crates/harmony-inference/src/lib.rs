@@ -112,40 +112,17 @@ impl InferenceCache {
         self.is_compressed
     }
 
-    /// Compress all populated layers to 3-bit quantized format.
+    /// Compress all populated layers via TurboQuant pipeline.
     /// Frees full-precision tensors to reclaim memory.
     /// No-op if already compressed.
     /// Atomic: on error, cache remains in uncompressed state.
+    ///
+    /// TODO(Task 6): Wire up TurboQuantState — compress_tensor is now a method.
     pub fn compress(&mut self) -> Result<(), InferenceError> {
         if self.is_compressed {
             return Ok(());
         }
-
-        // Phase 1: compress all populated layers into a temporary vec.
-        // If any layer fails, self is untouched.
-        let mut new_compressed = Vec::with_capacity(self.num_layers);
-        for layer in &self.layers {
-            match layer {
-                Some((k, v)) => {
-                    let (k_vecs, seq_len) = kv_compress::compress_tensor(k)?;
-                    let (v_vecs, _) = kv_compress::compress_tensor(v)?;
-                    new_compressed.push(Some(kv_compress::CompressedKvLayer {
-                        k: k_vecs,
-                        v: v_vecs,
-                        seq_len,
-                    }));
-                }
-                None => new_compressed.push(None),
-            }
-        }
-
-        // Phase 2: commit (cannot fail — just moving data).
-        self.compressed = new_compressed;
-        for layer in &mut self.layers {
-            *layer = None;
-        }
-        self.is_compressed = true;
-        Ok(())
+        todo!("Task 6: wire TurboQuantState into compress()")
     }
 
     /// Approximate memory usage in bytes (accounts for compression state).
@@ -170,46 +147,13 @@ impl InferenceCache {
     /// # Device limitation
     /// Decompressed tensors are always placed on `Device::Cpu`. Do not use
     /// with CUDA/Metal engines until harmony-51dy resolves device threading.
+    ///
+    /// TODO(Task 6): Wire up TurboQuantState — decompress_tensor is now a method.
     pub fn decompress(&mut self) -> Result<(), InferenceError> {
         if !self.is_compressed {
             return Ok(());
         }
-
-        // TODO(harmony-51dy): thread device from engine instead of hardcoding Cpu
-        let device = candle_core::Device::Cpu;
-
-        // Phase 1: decompress into temporary vec.
-        let mut new_layers: Vec<Option<(Tensor, Tensor)>> = Vec::with_capacity(self.num_layers);
-        for comp in &self.compressed {
-            match comp {
-                Some(c) => {
-                    let k = kv_compress::decompress_tensor(
-                        &c.k,
-                        self.num_kv_heads,
-                        c.seq_len,
-                        self.head_dim,
-                        &device,
-                    )?;
-                    let v = kv_compress::decompress_tensor(
-                        &c.v,
-                        self.num_kv_heads,
-                        c.seq_len,
-                        self.head_dim,
-                        &device,
-                    )?;
-                    new_layers.push(Some((k, v)));
-                }
-                None => new_layers.push(None),
-            }
-        }
-
-        // Phase 2: commit.
-        self.layers = new_layers;
-        for comp in &mut self.compressed {
-            *comp = None;
-        }
-        self.is_compressed = false;
-        Ok(())
+        todo!("Task 6: wire TurboQuantState into decompress()")
     }
 
     /// Serialize the compressed cache to bytes.
