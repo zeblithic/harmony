@@ -299,17 +299,17 @@ class TestHarmonyModel:
         assert torch.allclose(logits1[0, :4], logits2[0, :4], atol=1e-5)
 
     def test_weight_init_linear_scale(self):
-        """Linear weights should have std approximately 1/(sqrt(3) * sqrt(fan_in)).
+        """Linear weights should have std approximately 1/sqrt(fan_in).
 
-        _init_weights uses uniform [-1/sqrt(fan_in), 1/sqrt(fan_in)].
-        For uniform [-a, a], std = a / sqrt(3), so expected_std = 1/(sqrt(3*fan_in)).
+        _init_weights uses normal(0, 1/sqrt(fan_in)), matching Rust
+        random_linear() which uses scaled_randn with scale=1/sqrt(fan_in).
         """
         cfg = _tiny_config()
         model = HarmonyModel(cfg)
         layer = model.layers[0]
         q_weight = layer.attn.q_proj.weight
         fan_in = q_weight.shape[1]  # [out, in]
-        expected_std = 1.0 / math.sqrt(3.0 * fan_in)
+        expected_std = 1.0 / math.sqrt(fan_in)
         actual_std = q_weight.std().item()
         # Allow 30% tolerance for random init
         assert abs(actual_std - expected_std) / expected_std < 0.3

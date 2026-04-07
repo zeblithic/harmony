@@ -302,8 +302,9 @@ class HarmonyModel(nn.Module):
         """
         for module in self.modules():
             if isinstance(module, nn.Linear):
+                # Matches Rust random_linear(): scaled_randn with std=1/sqrt(fan_in)
                 fan_in = module.weight.shape[1]
-                nn.init.uniform_(module.weight, -1.0 / math.sqrt(fan_in), 1.0 / math.sqrt(fan_in))
+                nn.init.normal_(module.weight, mean=0.0, std=1.0 / math.sqrt(fan_in))
 
         # Embedding init runs last so it overwrites the Kaiming uniform that
         # was applied to the tied lm_head weight (which shares this tensor).
