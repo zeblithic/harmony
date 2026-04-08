@@ -118,10 +118,13 @@ def compute_validation_loss(
     vocab_size: int,
     device: torch.device,
     num_batches: int = 10,
+    amp_dtype: torch.dtype | None = None,
 ) -> float:
     """Run validation and return average cross-entropy loss."""
     was_training = model.training
     model.train(False)
+    use_amp = amp_dtype is not None
+    device_type = device.type
     try:
         total_loss = 0.0
         with torch.no_grad():
@@ -129,8 +132,9 @@ def compute_validation_loss(
                 batch = next(val_loader).to(device)
                 input_ids = batch[:, :-1]
                 targets = batch[:, 1:]
-                logits = model(input_ids)
-                loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+                with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(input_ids)
+                    loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
                 total_loss += loss.item()
     finally:
         model.train(was_training)
@@ -163,6 +167,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default="training/checkpoints")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -174,7 +179,10 @@ def main() -> None:
 
     device = detect_device(args.device)
     torch.manual_seed(args.seed)
-    print(f"Config: {args.config}, device: {device}, seq_len: {seq_len}")
+    amp_dtype = torch.bfloat16 if args.dtype == "bfloat16" else None
+    use_amp = amp_dtype is not None
+    device_type = device.type
+    print(f"Config: {args.config}, device: {device}, seq_len: {seq_len}, dtype: {args.dtype}")
 
     model = HarmonyModel(config).to(device)
     param_count = sum(p.numel() for p in model.parameters())
@@ -202,8 +210,9 @@ def main() -> None:
         input_ids = batch[:, :-1]
         targets = batch[:, 1:]
 
-        logits = model(input_ids)
-        loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
+        with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
+            logits = model(input_ids)
+            loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
 
         loss.backward()
         optimizer.step()
@@ -217,12 +226,12 @@ def main() -> None:
             save_checkpoint(model, optimizer, step, args.output_dir)
             print(f"  -> checkpoint saved at step {step}")
             if val_loader is not None:
-                val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device)
+                val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype)
                 print(f"  -> val_loss={val_loss:.4f}")
 
     save_checkpoint(model, optimizer, args.steps, args.output_dir)
     if val_loader is not None:
-        val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device)
+        val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype)
         print(f"Final val_loss={val_loss:.4f}")
     print(f"Training complete. Final checkpoint at step {args.steps}")
 

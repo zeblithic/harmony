@@ -7,7 +7,10 @@ import torch
 import pytest
 from ct87.model import HarmonyModel, HarmonyModelConfig
 from ct87.optim import Muon, WSDSchedule, partition_params
-from ct87.train import save_checkpoint, load_checkpoint, make_synthetic_dataloader
+from ct87.train import (
+    save_checkpoint, load_checkpoint, make_synthetic_dataloader,
+    compute_validation_loss,
+)
 
 
 def _tiny_config() -> HarmonyModelConfig:
@@ -139,3 +142,43 @@ class TestValidation:
 
         for name, param in model.named_parameters():
             assert torch.equal(param, params_before[name]), f"param {name} changed during validation"
+
+
+class TestMixedPrecision:
+    def test_bf16_autocast_finite_loss(self):
+        """Forward + backward under bf16 autocast produces finite loss, weights stay fp32."""
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+
+        batch = torch.randint(0, cfg.vocab_size, (2, 17))
+        x, targets = batch[:, :-1], batch[:, 1:]
+
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            logits = model(x)
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, cfg.vocab_size), targets.reshape(-1),
+            )
+
+        loss.backward()
+
+        assert torch.isfinite(loss), f"Loss not finite: {loss.item()}"
+        for name, p in model.named_parameters():
+            assert p.dtype == torch.float32, f"{name} dtype is {p.dtype}"
+
+    def test_validation_with_amp_dtype(self):
+        """compute_validation_loss accepts amp_dtype parameter for bf16."""
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        device = torch.device("cpu")
+        val_loader = make_synthetic_dataloader(cfg.vocab_size, 16, batch_size=2, seed=99)
+
+        val_loss = compute_validation_loss(
+            model, val_loader, cfg.vocab_size, device,
+            num_batches=3, amp_dtype=torch.bfloat16,
+        )
+
+        assert isinstance(val_loss, float)
+        assert val_loss > 0.0
+        assert not torch.isnan(torch.tensor(val_loss))
