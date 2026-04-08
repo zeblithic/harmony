@@ -89,3 +89,39 @@ class TestSyntheticDataloader:
         dl1 = make_synthetic_dataloader(vocab_size=128, seq_len=16, batch_size=4, seed=42)
         dl2 = make_synthetic_dataloader(vocab_size=128, seq_len=16, batch_size=4, seed=42)
         assert torch.equal(next(dl1), next(dl2))
+
+
+class TestValidation:
+    def test_returns_finite_float(self):
+        """compute_validation_loss returns a finite float loss value."""
+        from ct87.train import compute_validation_loss, make_synthetic_dataloader
+
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        device = torch.device("cpu")
+
+        val_loader = make_synthetic_dataloader(cfg.vocab_size, 16, batch_size=2, seed=99)
+        val_loss = compute_validation_loss(model, val_loader, cfg.vocab_size, device, num_batches=3)
+
+        assert isinstance(val_loss, float)
+        assert val_loss > 0.0
+        assert not torch.isnan(torch.tensor(val_loss))
+        assert not torch.isinf(torch.tensor(val_loss))
+
+    def test_no_grad_change(self):
+        """Validation does not modify model weights."""
+        from ct87.train import compute_validation_loss, make_synthetic_dataloader
+
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        device = torch.device("cpu")
+
+        params_before = {n: p.clone() for n, p in model.named_parameters()}
+
+        val_loader = make_synthetic_dataloader(cfg.vocab_size, 16, batch_size=2, seed=99)
+        compute_validation_loss(model, val_loader, cfg.vocab_size, device, num_batches=3)
+
+        for name, param in model.named_parameters():
+            assert torch.equal(param, params_before[name]), f"param {name} changed during validation"

@@ -99,6 +99,31 @@ def set_lr(optimizer: torch.optim.Optimizer, multiplier: float) -> None:
         group["lr"] = group["_base_lr"] * multiplier
 
 
+def compute_validation_loss(
+    model: HarmonyModel,
+    val_loader: Iterator[torch.Tensor],
+    vocab_size: int,
+    device: torch.device,
+    num_batches: int = 10,
+) -> float:
+    """Run validation and return average cross-entropy loss."""
+    was_training = model.training
+    # Switch to inference mode (no gradient tracking, batchnorm uses running stats)
+    model.train(False)
+    total_loss = 0.0
+    with torch.no_grad():
+        for _ in range(num_batches):
+            batch = next(val_loader).to(device)
+            input_ids = batch[:, :-1]
+            targets = batch[:, 1:]
+            logits = model(input_ids)
+            loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+            total_loss += loss.item()
+    if was_training:
+        model.train(True)
+    return total_loss / num_batches
+
+
 def detect_device(requested: str | None) -> torch.device:
     """Auto-detect best available device."""
     if requested:
@@ -114,6 +139,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train ct87 model")
     parser.add_argument("--config", choices=["tiny", "target"], default="tiny")
     parser.add_argument("--data", type=str, default=None, help="Path to pre-tokenized HF dataset")
+    parser.add_argument("--val-data", type=str, default=None, help="Path to validation HF dataset (optional)")
     parser.add_argument("--synthetic", action="store_true", help="Use synthetic random data")
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -150,6 +176,11 @@ def main() -> None:
     else:
         dataloader = make_hf_dataloader(args.data, seq_len, args.batch_size, args.seed)
 
+    val_loader = None
+    if args.val_data is not None:
+        val_loader = make_hf_dataloader(args.val_data, seq_len, args.batch_size, args.seed + 1)
+        print(f"Validation data loaded from {args.val_data}")
+
     for step in range(args.steps):
         lr_mult = schedule.get_lr_multiplier(step)
         set_lr(optimizer, lr_mult)
@@ -172,6 +203,10 @@ def main() -> None:
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             save_checkpoint(model, optimizer, step, args.output_dir)
             print(f"  -> checkpoint saved at step {step}")
+
+        if val_loader is not None and args.save_every > 0 and step > 0 and step % args.save_every == 0:
+            val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device)
+            print(f"  -> val_loss={val_loss:.4f}")
 
     save_checkpoint(model, optimizer, args.steps, args.output_dir)
     print(f"Training complete. Final checkpoint at step {args.steps}")
