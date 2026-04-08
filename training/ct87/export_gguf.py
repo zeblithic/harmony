@@ -64,9 +64,12 @@ def write_metadata(
     writer.add_uint32("harmony.attention.key_length", config.head_dim)
     writer.add_uint32("harmony.feed_forward_length", config.ffn_dim)
     writer.add_uint32("harmony.context_length", config.max_seq_len)
-    writer.add_float32("harmony.rope.freq_base", config.rope_theta)
+    # Explicit float() downcast: these f64 config values are stored as f32 in
+    # GGUF metadata. The precision loss is negligible (~3e-13 for rms_norm_eps)
+    # but means a GGUF-loaded model isn't bit-identical to the original config.
+    writer.add_float32("harmony.rope.freq_base", float(config.rope_theta))
     writer.add_float32(
-        "harmony.attention.layer_norm_rms_epsilon", config.rms_norm_eps,
+        "harmony.attention.layer_norm_rms_epsilon", float(config.rms_norm_eps),
     )
     writer.add_uint32("harmony.vocab_size", config.vocab_size)
     writer.add_uint32("harmony.layers_per_block", config.layers_per_block)

@@ -489,7 +489,7 @@ mod tests {
 
         let mut cache = engine.new_cache().unwrap();
         let logits = engine.forward(&[1, 2, 3], &mut cache).unwrap();
-        assert_eq!(logits.len(), 128);
+        assert_eq!(logits.len(), engine.config.vocab_size);
     }
 
     #[test]
