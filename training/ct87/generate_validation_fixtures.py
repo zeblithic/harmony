@@ -79,6 +79,7 @@ def main() -> None:
     json_path = FIXTURE_DIR / "validation_reference.json"
     with open(json_path, "w") as f:
         json.dump(reference, f, indent=2)
+        f.write("\n")
     print(f"Generated {json_path}")
     print(f"Logit vector length: {len(last_logits)}")
     print("Done!")
