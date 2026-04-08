@@ -108,19 +108,19 @@ def compute_validation_loss(
 ) -> float:
     """Run validation and return average cross-entropy loss."""
     was_training = model.training
-    # Switch to inference mode (no gradient tracking, batchnorm uses running stats)
     model.train(False)
-    total_loss = 0.0
-    with torch.no_grad():
-        for _ in range(num_batches):
-            batch = next(val_loader).to(device)
-            input_ids = batch[:, :-1]
-            targets = batch[:, 1:]
-            logits = model(input_ids)
-            loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
-            total_loss += loss.item()
-    if was_training:
-        model.train(True)
+    try:
+        total_loss = 0.0
+        with torch.no_grad():
+            for _ in range(num_batches):
+                batch = next(val_loader).to(device)
+                input_ids = batch[:, :-1]
+                targets = batch[:, 1:]
+                logits = model(input_ids)
+                loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+                total_loss += loss.item()
+    finally:
+        model.train(was_training)
     return total_loss / num_batches
 
 
@@ -203,12 +203,14 @@ def main() -> None:
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             save_checkpoint(model, optimizer, step, args.output_dir)
             print(f"  -> checkpoint saved at step {step}")
-
-        if val_loader is not None and args.save_every > 0 and step > 0 and step % args.save_every == 0:
-            val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device)
-            print(f"  -> val_loss={val_loss:.4f}")
+            if val_loader is not None:
+                val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device)
+                print(f"  -> val_loss={val_loss:.4f}")
 
     save_checkpoint(model, optimizer, args.steps, args.output_dir)
+    if val_loader is not None:
+        val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device)
+        print(f"Final val_loss={val_loss:.4f}")
     print(f"Training complete. Final checkpoint at step {args.steps}")
 
 
