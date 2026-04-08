@@ -282,6 +282,36 @@ impl InferenceEngine for HarmonyEngine {
             .map_err(|e| InferenceError::InvalidGguf(e.to_string()))?;
         self.config = model.config().clone();
         self.uq_feature_config = UqFeatureConfig::for_num_layers(self.config.num_layers);
+
+        // Load continuous thought config from GGUF metadata.
+        let enabled = content
+            .metadata
+            .get("harmony.continuous_thought.enabled")
+            .and_then(|v| v.to_bool().ok())
+            .unwrap_or(false);
+        if enabled {
+            let max_steps = content
+                .metadata
+                .get("harmony.continuous_thought.max_steps")
+                .and_then(|v| v.to_u32().ok())
+                .unwrap_or(4);
+            let threshold = content
+                .metadata
+                .get("harmony.continuous_thought.confidence_threshold")
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(0.85);
+            self.thought_config = ContinuousThoughtConfig {
+                think_token_id: self.config.think_token_id,
+                max_think_steps: max_steps,
+                confidence_threshold: threshold,
+            };
+        } else {
+            self.thought_config = ContinuousThoughtConfig {
+                think_token_id: None,
+                ..ContinuousThoughtConfig::default()
+            };
+        }
+
         self.model = Some(model);
         Ok(())
     }

@@ -37,6 +37,7 @@ class HarmonyModelConfig:
     engram_injection_layer: int
     engram_dim: int
     tie_embeddings: bool
+    think_token_id: int | None = None
 
     @property
     def num_blocks(self) -> int:
