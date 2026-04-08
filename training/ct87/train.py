@@ -179,6 +179,10 @@ def main() -> None:
         print("Error: must provide --data <path> or --synthetic", file=sys.stderr)
         sys.exit(1)
 
+    if args.grad_accum_steps < 1:
+        print("Error: --grad-accum-steps must be >= 1", file=sys.stderr)
+        sys.exit(1)
+
     config = HarmonyModelConfig.tiny() if args.config == "tiny" else HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config == "tiny" else 2048)
 
