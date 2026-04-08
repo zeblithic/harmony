@@ -216,3 +216,29 @@ class TestGradientAccumulation:
         assert final_loss < initial_loss, (
             f"Loss should decrease: {initial_loss:.4f} -> {final_loss:.4f}"
         )
+
+
+class TestGradientClipping:
+    def test_clipping_caps_gradient_norm(self):
+        """clip_grad_norm_ with very small max_norm clips gradients effectively."""
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+
+        batch = torch.randint(0, cfg.vocab_size, (2, 17))
+        x, targets = batch[:, :-1], batch[:, 1:]
+        logits = model(x)
+        loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, cfg.vocab_size), targets.reshape(-1),
+        )
+        loss.backward()
+
+        max_norm = 0.01  # Very small — will definitely clip
+        pre_clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+        # Pre-clipping norm should have been larger than max_norm
+        assert pre_clip_norm.item() > max_norm
+
+        # Post-clipping: all gradients should now be scaled down
+        post_clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
+        assert post_clip_norm.item() <= max_norm * 1.01  # tiny float slack

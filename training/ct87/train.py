@@ -169,6 +169,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -217,6 +218,12 @@ def main() -> None:
                 logits = model(input_ids)
                 loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
             (loss / args.grad_accum_steps).backward()
+
+        grad_norm = None
+        if args.max_grad_norm > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.max_grad_norm,
+            ).item()
 
         optimizer.step()
 
