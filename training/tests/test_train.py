@@ -182,3 +182,37 @@ class TestMixedPrecision:
         assert isinstance(val_loss, float)
         assert val_loss > 0.0
         assert not torch.isnan(torch.tensor(val_loss))
+
+
+class TestGradientAccumulation:
+    def test_loss_decreases_with_accumulation(self):
+        """Model learns when training with gradient accumulation."""
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        muon_params, adam_params = partition_params(model)
+        optimizer = Muon(muon_params, adam_params, lr=1e-3, adam_lr=1e-3)
+        dataloader = make_synthetic_dataloader(cfg.vocab_size, 16, batch_size=2, seed=42)
+
+        grad_accum_steps = 2
+        initial_loss = None
+        final_loss = None
+
+        for step in range(30):
+            optimizer.zero_grad()
+            for _ in range(grad_accum_steps):
+                batch = next(dataloader)
+                x, targets = batch[:, :-1], batch[:, 1:]
+                logits = model(x)
+                loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, cfg.vocab_size), targets.reshape(-1),
+                )
+                (loss / grad_accum_steps).backward()
+            optimizer.step()
+            if step == 0:
+                initial_loss = loss.item()
+            final_loss = loss.item()
+
+        assert final_loss < initial_loss, (
+            f"Loss should decrease: {initial_loss:.4f} -> {final_loss:.4f}"
+        )

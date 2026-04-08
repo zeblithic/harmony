@@ -168,6 +168,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -205,18 +206,19 @@ def main() -> None:
     for step in range(args.steps):
         lr_mult = schedule.get_lr_multiplier(step)
         set_lr(optimizer, lr_mult)
-
-        batch = next(dataloader).to(device)
-        input_ids = batch[:, :-1]
-        targets = batch[:, 1:]
-
-        with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-            logits = model(input_ids)
-            loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
-
-        loss.backward()
-        optimizer.step()
         optimizer.zero_grad()
+
+        for micro_step in range(args.grad_accum_steps):
+            batch = next(dataloader).to(device)
+            input_ids = batch[:, :-1]
+            targets = batch[:, 1:]
+
+            with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
+                logits = model(input_ids)
+                loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
+            (loss / args.grad_accum_steps).backward()
+
+        optimizer.step()
 
         if step % 10 == 0:
             current_lr = optimizer.param_groups[0]["lr"]
