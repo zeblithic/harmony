@@ -80,3 +80,65 @@ class TestSplitChunks:
         train, val = split_chunks(chunks, val_fraction=0.0)
         assert len(train) == 10
         assert len(val) == 0
+
+
+import tempfile
+import os
+
+
+class TestEndToEnd:
+    @pytest.mark.network
+    def test_smoke_prepare_data(self):
+        """Run the full pipeline on a tiny slice and verify output loads."""
+        from ct87.prepare_data import run_prepare_data
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = os.path.join(tmpdir, "test_output")
+            stats = run_prepare_data(
+                output_dir=output_dir,
+                seq_len=64,
+                max_tokens=5000,
+                val_fraction=0.1,
+            )
+
+            assert stats["total_tokens"] >= 5000
+            assert stats["num_train_chunks"] > 0
+            assert stats["num_val_chunks"] >= 0
+            assert stats["num_documents"] > 0
+
+            # Verify train split loads and has correct format
+            from datasets import load_from_disk
+
+            train_ds = load_from_disk(os.path.join(output_dir, "train"))
+            assert len(train_ds) == stats["num_train_chunks"]
+            assert "input_ids" in train_ds.column_names
+            assert len(train_ds[0]["input_ids"]) == 64
+
+            # Verify val split loads if it exists
+            val_path = os.path.join(output_dir, "val")
+            if os.path.exists(val_path):
+                val_ds = load_from_disk(val_path)
+                assert len(val_ds) == stats["num_val_chunks"]
+                assert len(val_ds[0]["input_ids"]) == 64
+
+    @pytest.mark.network
+    def test_output_compatible_with_dataloader(self):
+        """Output loads via make_hf_dataloader and produces correct batch shapes."""
+        from ct87.prepare_data import run_prepare_data
+        from ct87.train import make_hf_dataloader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = os.path.join(tmpdir, "test_output")
+            run_prepare_data(
+                output_dir=output_dir,
+                seq_len=64,
+                max_tokens=5000,
+                val_fraction=0.0,
+            )
+
+            train_path = os.path.join(output_dir, "train")
+            dl = make_hf_dataloader(train_path, seq_len=32, batch_size=2, seed=42)
+            batch = next(dl)
+            assert batch.shape == (2, 33)  # batch_size, seq_len + 1
+            assert batch.min().item() >= 0
+            assert batch.max().item() < 32000
