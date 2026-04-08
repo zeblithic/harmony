@@ -812,4 +812,96 @@ mod tests {
         let action = engine.route_thought(&output, 3).unwrap();
         assert_eq!(action, ThoughtAction::Think);
     }
+
+    // ── Integration: generation loop with thinking ───────────────────────
+
+    #[test]
+    fn generation_loop_with_thinking() {
+        // Engine biased toward Uncertain — will Think until safety cap.
+        let engine = engine_with_biased_uq(3); // Uncertain, conf=0.5 < 0.85
+        let think_id = engine.think_token_id().unwrap();
+        let mut cache = engine.new_cache().unwrap();
+
+        let mut history: Vec<u32> = vec![1, 2, 3];
+        let mut tokens: Vec<u32> = vec![1, 2, 3];
+        let mut emitted: Vec<u32> = Vec::new();
+        let mut think_count = 0u32;
+
+        // Generate one output token (will think max_think_steps=4 times first).
+        let mut consecutive_thinks = 0u32;
+        loop {
+            let output = engine
+                .forward_full(&tokens, &mut cache, None)
+                .unwrap();
+
+            match engine.route_thought(&output, consecutive_thinks).unwrap() {
+                ThoughtAction::Emit => {
+                    let logits = logits_to_vec(&output.logits).unwrap();
+                    let token = engine
+                        .sample(&logits, &SamplingParams::greedy(), &history)
+                        .unwrap();
+                    history.push(token);
+                    emitted.push(token);
+                    tokens = vec![token];
+                    consecutive_thinks = 0;
+                    break; // Generated one token
+                }
+                ThoughtAction::Think => {
+                    consecutive_thinks += 1;
+                    think_count += 1;
+                    history.push(think_id);
+                    tokens = vec![think_id];
+                }
+                ThoughtAction::Abort => {
+                    panic!("unexpected Abort");
+                }
+            }
+        }
+
+        // Should have thought exactly max_think_steps=4 times before emit.
+        assert_eq!(think_count, 4, "expected 4 think steps before safety cap");
+        assert_eq!(emitted.len(), 1, "expected 1 emitted token");
+
+        // Think tokens are in history but not in emitted output.
+        let think_in_history = history.iter().filter(|&&t| t == think_id).count();
+        assert_eq!(think_in_history, 4);
+        assert!(!emitted.contains(&think_id), "<think> should not be in output");
+
+        // KV cache advanced by: 3 (prefill) + 4 (think forward passes) = 7
+        // (the emit samples from the last think's logits, no extra forward pass)
+        assert_eq!(cache.position, 7);
+    }
+
+    #[test]
+    fn generation_loop_confident_skips_thinking() {
+        // Engine biased toward Confident — should never think.
+        let engine = engine_with_biased_uq(0); // Confident
+        let mut cache = engine.new_cache().unwrap();
+
+        let mut history: Vec<u32> = vec![1, 2, 3];
+        let mut tokens: Vec<u32> = vec![1, 2, 3];
+        let mut think_count = 0u32;
+
+        let mut consecutive_thinks = 0u32;
+        let output = engine.forward_full(&tokens, &mut cache, None).unwrap();
+        match engine.route_thought(&output, consecutive_thinks).unwrap() {
+            ThoughtAction::Emit => {
+                let logits = logits_to_vec(&output.logits).unwrap();
+                let token = engine
+                    .sample(&logits, &SamplingParams::greedy(), &history)
+                    .unwrap();
+                history.push(token);
+                tokens = vec![token];
+                consecutive_thinks = 0;
+            }
+            ThoughtAction::Think => {
+                think_count += 1;
+                consecutive_thinks += 1;
+            }
+            ThoughtAction::Abort => panic!("unexpected Abort"),
+        }
+
+        assert_eq!(think_count, 0, "confident model should not think");
+        assert_eq!(cache.position, 3, "only prefill, no extra steps");
+    }
 }
