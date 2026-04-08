@@ -7,8 +7,10 @@
 //! methods take `&self`. Mutable state lives in the caller-owned
 //! [`InferenceCache`].
 
+use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use rand::thread_rng;
+use std::io::Cursor;
 
 use crate::engine::EngramContext;
 use crate::error::InferenceError;
@@ -210,10 +212,16 @@ impl HarmonyEngine {
 }
 
 impl InferenceEngine for HarmonyEngine {
-    fn load_gguf(&mut self, _gguf_data: &[u8]) -> Result<(), InferenceError> {
-        Err(InferenceError::InvalidGguf(
-            "harmony GGUF loading not yet implemented (Phase 0g)".into(),
-        ))
+    fn load_gguf(&mut self, gguf_data: &[u8]) -> Result<(), InferenceError> {
+        let mut cursor = Cursor::new(gguf_data);
+        let content = gguf_file::Content::read(&mut cursor)
+            .map_err(|e| InferenceError::InvalidGguf(e.to_string()))?;
+        let model = HarmonyModel::from_gguf(&content, &mut cursor, &self.device)
+            .map_err(|e| InferenceError::InvalidGguf(e.to_string()))?;
+        self.config = model.config().clone();
+        self.uq_feature_config = UqFeatureConfig::for_num_layers(self.config.num_layers);
+        self.model = Some(model);
+        Ok(())
     }
 
     fn load_tokenizer(&mut self, tokenizer_json: &[u8]) -> Result<(), InferenceError> {
@@ -438,15 +446,65 @@ mod tests {
         );
     }
 
-    // 9. load_gguf_returns_not_implemented — InvalidGguf
+    // 9. load_gguf rejects invalid GGUF data
     #[test]
-    fn load_gguf_returns_not_implemented() {
+    fn load_gguf_invalid_bytes_returns_error() {
         let mut engine = HarmonyEngine::new(test_config(), Device::Cpu);
         let result = engine.load_gguf(b"some bytes");
         assert!(
             matches!(result, Err(InferenceError::InvalidGguf(_))),
             "expected InvalidGguf, got {result:?}"
         );
+    }
+
+    #[test]
+    fn load_gguf_creates_model() {
+        let data = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/tiny_harmony.gguf"),
+        )
+        .expect("test fixture missing");
+
+        let dummy_config = test_config();
+        let mut engine = HarmonyEngine::new(dummy_config, Device::Cpu);
+        engine.load_gguf(&data).expect("load_gguf should succeed");
+
+        assert!(engine.model.is_some());
+        let cache = engine.new_cache().unwrap();
+        assert_eq!(cache.num_layers, 4);
+        assert_eq!(cache.head_dim, 8);
+        assert_eq!(cache.num_kv_heads, 2);
+    }
+
+    #[test]
+    fn load_gguf_then_forward() {
+        let data = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/tiny_harmony.gguf"),
+        )
+        .expect("test fixture missing");
+
+        let mut engine = HarmonyEngine::new(test_config(), Device::Cpu);
+        engine.load_gguf(&data).unwrap();
+
+        let mut cache = engine.new_cache().unwrap();
+        let logits = engine.forward(&[1, 2, 3], &mut cache).unwrap();
+        assert_eq!(logits.len(), 128);
+    }
+
+    #[test]
+    fn load_gguf_replaces_not_implemented() {
+        let mut engine = HarmonyEngine::new(test_config(), Device::Cpu);
+        let result = engine.load_gguf(b"not valid gguf");
+        match result {
+            Err(InferenceError::InvalidGguf(msg)) => {
+                assert!(
+                    !msg.contains("not yet implemented"),
+                    "placeholder should be replaced: {msg}"
+                );
+            }
+            _ => panic!("expected InvalidGguf error, got {result:?}"),
+        }
     }
 
     // 10. new_cache_matches_config — num_layers, head_dim, num_kv_heads

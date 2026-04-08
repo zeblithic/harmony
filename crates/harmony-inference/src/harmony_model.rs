@@ -6,8 +6,10 @@
 
 use crate::block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
 use crate::InferenceCache;
+use candle_core::quantized::gguf_file;
 use candle_core::{Device, Module, Result, Tensor};
 use candle_nn::{Embedding, Linear, RmsNorm};
+use std::io::{Read, Seek};
 use std::sync::Arc;
 
 /// Callback type for Engram injection in the HarmonyModel forward pass.
@@ -185,6 +187,27 @@ impl Mlp {
         let down_proj = random_linear(hidden_dim, ffn_dim, device)?;
         Ok(Self { gate_proj, up_proj, down_proj })
     }
+
+    fn from_gguf<R: Read + Seek>(
+        ct: &gguf_file::Content,
+        reader: &mut R,
+        prefix: &str,
+        device: &Device,
+    ) -> Result<Self> {
+        let gate_proj = Linear::new(
+            load_tensor(ct, reader, &format!("{prefix}.ffn_gate.weight"), device)?,
+            None,
+        );
+        let up_proj = Linear::new(
+            load_tensor(ct, reader, &format!("{prefix}.ffn_up.weight"), device)?,
+            None,
+        );
+        let down_proj = Linear::new(
+            load_tensor(ct, reader, &format!("{prefix}.ffn_down.weight"), device)?,
+            None,
+        );
+        Ok(Self { gate_proj, up_proj, down_proj })
+    }
 }
 
 impl Module for Mlp {
@@ -232,6 +255,61 @@ impl Attention {
 
         let q_norm = random_rms_norm(head_dim, rms_norm_eps, device)?;
         let k_norm = random_rms_norm(head_dim, rms_norm_eps, device)?;
+
+        debug_assert_eq!(
+            num_query_heads % num_kv_heads,
+            0,
+            "num_query_heads ({num_query_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        );
+        let num_kv_groups = num_query_heads / num_kv_heads;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_heads: num_query_heads,
+            num_kv_heads,
+            num_kv_groups,
+            head_dim,
+            rotary_emb,
+        })
+    }
+
+    fn from_gguf<R: Read + Seek>(
+        ct: &gguf_file::Content,
+        reader: &mut R,
+        num_query_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rms_norm_eps: f64,
+        rotary_emb: Arc<RotaryEmbedding>,
+        prefix: &str,
+        device: &Device,
+    ) -> Result<Self> {
+        let q_proj = Linear::new(
+            load_tensor(ct, reader, &format!("{prefix}.attn_q.weight"), device)?,
+            None,
+        );
+        let k_proj = Linear::new(
+            load_tensor(ct, reader, &format!("{prefix}.attn_k.weight"), device)?,
+            None,
+        );
+        let v_proj = Linear::new(
+            load_tensor(ct, reader, &format!("{prefix}.attn_v.weight"), device)?,
+            None,
+        );
+        let o_proj = Linear::new(
+            load_tensor(ct, reader, &format!("{prefix}.attn_output.weight"), device)?,
+            None,
+        );
+
+        let q_norm_w = load_tensor(ct, reader, &format!("{prefix}.attn_q_norm.weight"), device)?;
+        let k_norm_w = load_tensor(ct, reader, &format!("{prefix}.attn_k_norm.weight"), device)?;
+        let q_norm = RmsNorm::new(q_norm_w, rms_norm_eps);
+        let k_norm = RmsNorm::new(k_norm_w, rms_norm_eps);
 
         debug_assert_eq!(
             num_query_heads % num_kv_heads,
@@ -355,6 +433,34 @@ impl TransformerLayer {
         Ok(Self { attn_norm, attn, ffn_norm, mlp })
     }
 
+    fn from_gguf<R: Read + Seek>(
+        ct: &gguf_file::Content,
+        reader: &mut R,
+        config: &HarmonyModelConfig,
+        rotary_emb: Arc<RotaryEmbedding>,
+        layer_idx: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+
+        let attn_norm_w = load_tensor(ct, reader, &format!("{prefix}.attn_norm.weight"), device)?;
+        let attn_norm = RmsNorm::new(attn_norm_w, config.rms_norm_eps);
+
+        let ffn_norm_w = load_tensor(ct, reader, &format!("{prefix}.ffn_norm.weight"), device)?;
+        let ffn_norm = RmsNorm::new(ffn_norm_w, config.rms_norm_eps);
+
+        let attn = Attention::from_gguf(
+            ct, reader,
+            config.num_query_heads, config.num_kv_heads,
+            config.head_dim, config.rms_norm_eps,
+            rotary_emb, &prefix, device,
+        )?;
+
+        let mlp = Mlp::from_gguf(ct, reader, &prefix, device)?;
+
+        Ok(Self { attn_norm, attn, ffn_norm, mlp })
+    }
+
     fn forward(
         &self,
         x: &Tensor,
@@ -446,6 +552,125 @@ impl HarmonyModel {
 
         Ok(Self {
             config: config.clone(),
+            embed_tokens,
+            layers,
+            final_norm,
+            lm_head,
+            block_attnres,
+            device: device.clone(),
+        })
+    }
+
+    /// Load a HarmonyModel from GGUF data.
+    ///
+    /// Reads metadata to reconstruct [`HarmonyModelConfig`], then loads all
+    /// tensors by their GGUF names. Verifies `general.architecture == "harmony"`.
+    pub fn from_gguf<R: Read + Seek>(
+        ct: &gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Self> {
+        // Verify architecture
+        let arch = match ct.metadata.get("general.architecture") {
+            Some(gguf_file::Value::String(s)) => s.as_str(),
+            _ => "",
+        };
+        if arch != "harmony" {
+            candle_core::bail!("expected architecture 'harmony', got '{arch}'");
+        }
+
+        let md = |key: &str| -> Result<&gguf_file::Value> {
+            ct.metadata.get(key).ok_or_else(|| {
+                candle_core::Error::Msg(format!("missing GGUF metadata key: {key}"))
+            })
+        };
+
+        let num_layers = md("harmony.block_count")?.to_u32()? as usize;
+        let hidden_dim = md("harmony.embedding_length")?.to_u32()? as usize;
+        let num_query_heads = md("harmony.attention.head_count")?.to_u32()? as usize;
+        let num_kv_heads = md("harmony.attention.head_count_kv")?.to_u32()? as usize;
+        let head_dim = md("harmony.attention.key_length")?.to_u32()? as usize;
+        let ffn_dim = md("harmony.feed_forward_length")?.to_u32()? as usize;
+        let vocab_size = md("harmony.vocab_size")?.to_u32()? as usize;
+        let max_seq_len = md("harmony.context_length")?.to_u32()? as usize;
+        let rope_theta = md("harmony.rope.freq_base")?.to_f32()? as f64;
+        let rms_norm_eps =
+            md("harmony.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
+        let layers_per_block = md("harmony.layers_per_block")?.to_u32()? as usize;
+        let tie_embeddings = md("harmony.tie_embeddings")?.to_bool()?;
+        let engram_injection_layer =
+            md("harmony.engram_injection_layer")?.to_u32()? as usize;
+        let engram_dim = md("harmony.engram_dim")?.to_u32()? as usize;
+
+        let config = HarmonyModelConfig {
+            num_layers,
+            hidden_dim,
+            num_query_heads,
+            num_kv_heads,
+            head_dim,
+            ffn_dim,
+            vocab_size,
+            max_seq_len,
+            rope_theta,
+            rms_norm_eps,
+            layers_per_block,
+            engram_injection_layer,
+            engram_dim,
+            tie_embeddings,
+        };
+
+        if layers_per_block == 0 || num_layers % layers_per_block != 0 {
+            candle_core::bail!(
+                "num_layers ({num_layers}) must be divisible by layers_per_block ({layers_per_block})"
+            );
+        }
+        if engram_injection_layer >= num_layers {
+            candle_core::bail!(
+                "engram_injection_layer ({engram_injection_layer}) must be < num_layers ({num_layers})"
+            );
+        }
+
+        let embed_weight = load_tensor(ct, reader, "token_embd.weight", device)?;
+        let embed_tokens = Embedding::new(embed_weight.clone(), hidden_dim);
+
+        let rotary_emb = Arc::new(RotaryEmbedding::new(
+            head_dim, max_seq_len, rope_theta, device,
+        )?);
+
+        let mut layers = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            layers.push(TransformerLayer::from_gguf(
+                ct, reader, &config, rotary_emb.clone(), i, device,
+            )?);
+        }
+
+        let final_norm_w = load_tensor(ct, reader, "output_norm.weight", device)?;
+        let final_norm = RmsNorm::new(final_norm_w, rms_norm_eps);
+
+        let lm_head = if tie_embeddings {
+            Linear::new(embed_weight, None)
+        } else {
+            let w = load_tensor(ct, reader, "output.weight", device)?;
+            Linear::new(w, None)
+        };
+
+        let num_blocks = num_layers / layers_per_block;
+        let bar_config = BlockAttnResConfig {
+            num_blocks,
+            layers_per_block,
+            hidden_dim,
+        };
+        let mut query_tensors = Vec::with_capacity(num_blocks.saturating_sub(1));
+        for i in 0..num_blocks.saturating_sub(1) {
+            let name = format!("harmony.block_attnres.query.{i}.weight");
+            let q = load_tensor(ct, reader, &name, device)?;
+            let q = q.reshape((1, 1, hidden_dim))?;
+            query_tensors.push(q);
+        }
+        let block_attnres = BlockAttnRes::from_tensors(&bar_config, query_tensors)?;
+
+        Ok(Self {
+            config,
             embed_tokens,
             layers,
             final_norm,
@@ -601,6 +826,17 @@ fn random_linear(out_features: usize, in_features: usize, device: &Device) -> Re
 fn random_rms_norm(size: usize, eps: f64, device: &Device) -> Result<RmsNorm> {
     let weight = Tensor::ones(&[size], candle_core::DType::F32, device)?;
     Ok(RmsNorm::new(weight, eps))
+}
+
+/// Load a tensor from GGUF content and dequantize to f32.
+fn load_tensor<R: Read + Seek>(
+    ct: &gguf_file::Content,
+    reader: &mut R,
+    name: &str,
+    device: &Device,
+) -> Result<Tensor> {
+    let qtensor = ct.tensor(reader, name, device)?;
+    qtensor.dequantize(device)
 }
 
 // ---------------------------------------------------------------------------
@@ -851,5 +1087,108 @@ mod tests {
                 "layer {i} K should have seq_len=4 after prefill+decode"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // GGUF loading tests (Task 2)
+    // -----------------------------------------------------------------------
+
+    fn load_test_gguf() -> Vec<u8> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_harmony.gguf");
+        std::fs::read(&path)
+            .expect("test fixture not found; run `python -m ct87.generate_test_fixtures` from training/")
+    }
+
+    fn load_test_gguf_untied() -> Vec<u8> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_harmony_untied.gguf");
+        std::fs::read(&path)
+            .expect("test fixture not found; run `python -m ct87.generate_test_fixtures` from training/")
+    }
+
+    #[test]
+    fn from_gguf_loads_tied_model() {
+        let data = load_test_gguf();
+        let mut cursor = std::io::Cursor::new(&data);
+        let content =
+            candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
+        let model =
+            HarmonyModel::from_gguf(&content, &mut cursor, &Device::Cpu).unwrap();
+        assert_eq!(model.config().num_layers, 4);
+        assert_eq!(model.config().hidden_dim, 32);
+        assert_eq!(model.config().num_query_heads, 4);
+        assert_eq!(model.config().num_kv_heads, 2);
+        assert_eq!(model.config().head_dim, 8);
+        assert_eq!(model.config().ffn_dim, 64);
+        assert_eq!(model.config().vocab_size, 128);
+        assert!(model.config().tie_embeddings);
+        assert_eq!(model.config().max_seq_len, 64);
+        assert!((model.config().rope_theta - 10000.0_f64).abs() < 1e-6);
+        assert!((model.config().rms_norm_eps - 1e-6_f64).abs() < 1e-12);
+        assert_eq!(model.config().layers_per_block, 2);
+        assert_eq!(model.config().engram_injection_layer, 1);
+        assert_eq!(model.config().engram_dim, 16);
+        assert_eq!(model.layers.len(), 4);
+    }
+
+    #[test]
+    fn from_gguf_forward_produces_logits() {
+        let data = load_test_gguf();
+        let mut cursor = std::io::Cursor::new(&data);
+        let content =
+            candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
+        let model =
+            HarmonyModel::from_gguf(&content, &mut cursor, &Device::Cpu).unwrap();
+
+        let cfg = model.config();
+        let mut cache = InferenceCache::new(cfg.num_layers, cfg.head_dim, cfg.num_kv_heads);
+        let input = Tensor::new(&[1u32, 2, 3], &Device::Cpu)
+            .unwrap()
+            .reshape((1, 3))
+            .unwrap();
+        let output = model.forward(&input, &mut cache, None).unwrap();
+        assert_eq!(output.logits.dims(), &[1, cfg.vocab_size]);
+        assert_eq!(output.layer_norms.len(), cfg.num_layers);
+    }
+
+    #[test]
+    fn from_gguf_untied_model() {
+        let data = load_test_gguf_untied();
+        let mut cursor = std::io::Cursor::new(&data);
+        let content =
+            candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
+        let model =
+            HarmonyModel::from_gguf(&content, &mut cursor, &Device::Cpu).unwrap();
+        assert!(!model.config().tie_embeddings);
+
+        let cfg = model.config();
+        let mut cache = InferenceCache::new(cfg.num_layers, cfg.head_dim, cfg.num_kv_heads);
+        let input = Tensor::new(&[1u32, 2, 3], &Device::Cpu)
+            .unwrap()
+            .reshape((1, 3))
+            .unwrap();
+        let output = model.forward(&input, &mut cache, None).unwrap();
+        assert_eq!(output.logits.dims(), &[1, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn from_gguf_wrong_architecture_errors() {
+        let data = load_test_gguf();
+        let mut cursor = std::io::Cursor::new(&data);
+        let mut content =
+            candle_core::quantized::gguf_file::Content::read(&mut cursor).unwrap();
+        content.metadata.insert(
+            "general.architecture".to_string(),
+            candle_core::quantized::gguf_file::Value::String("wrong".to_string()),
+        );
+        cursor.set_position(0);
+        let result = HarmonyModel::from_gguf(&content, &mut cursor, &Device::Cpu);
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("harmony"),
+            "error should mention 'harmony': {err}"
+        );
     }
 }
