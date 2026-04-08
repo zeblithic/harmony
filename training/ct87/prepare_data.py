@@ -13,10 +13,6 @@ Run from the training/ directory:
 
 from __future__ import annotations
 
-import argparse
-import os
-import sys
-
 
 def concatenate_and_chunk(
     documents: list[list[int]],
@@ -49,8 +45,6 @@ def split_chunks(
     Validation chunks are taken from the end (deterministic, no shuffle).
     """
     n_val = int(len(chunks) * val_fraction)
-    if n_val == 0 and val_fraction > 0 and len(chunks) > 0:
-        n_val = 0  # not enough chunks for even 1 val sample
     train = chunks[: len(chunks) - n_val] if n_val > 0 else list(chunks)
     val = chunks[len(chunks) - n_val :] if n_val > 0 else []
     return train, val
