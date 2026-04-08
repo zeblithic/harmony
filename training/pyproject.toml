@@ -12,6 +12,7 @@ dependencies = [
     "safetensors>=0.4",
     "datasets>=2.16",
     "gguf>=0.6",
+    "transformers>=4.38",
 ]
 
 [project.optional-dependencies]
@@ -21,3 +22,6 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "network: tests that require network access",
+]
