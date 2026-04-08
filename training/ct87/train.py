@@ -9,8 +9,10 @@ For testing without a real dataset, use --synthetic to generate random tokens.
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
+import time
 from typing import Iterator
 
 import torch
@@ -170,6 +172,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--log-file", type=str, default=None, help="Path to CSV log file")
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -204,7 +207,15 @@ def main() -> None:
         val_loader = make_hf_dataloader(args.val_data, seq_len, args.batch_size, args.seed + 1)
         print(f"Validation data loaded from {args.val_data}")
 
+    csv_file = None
+    csv_writer = None
+    if args.log_file:
+        csv_file = open(args.log_file, "a", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["step", "loss", "val_loss", "lr", "grad_norm", "dt_ms"])
+
     for step in range(args.steps):
+        step_start = time.time()
         lr_mult = schedule.get_lr_multiplier(step)
         set_lr(optimizer, lr_mult)
         optimizer.zero_grad()
@@ -227,16 +238,37 @@ def main() -> None:
 
         optimizer.step()
 
-        if step % 10 == 0:
-            current_lr = optimizer.param_groups[0]["lr"]
-            print(f"step={step:5d}  loss={loss.item():.4f}  lr={current_lr:.6f}")
+        dt_ms = (time.time() - step_start) * 1000
+        raw_loss = loss.item()
+        current_lr = optimizer.param_groups[0]["lr"]
 
+        if step % 10 == 0:
+            print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}")
+
+        val_loss_str = ""
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             save_checkpoint(model, optimizer, step, args.output_dir)
             print(f"  -> checkpoint saved at step {step}")
             if val_loader is not None:
-                val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype)
+                val_loss = compute_validation_loss(
+                    model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype,
+                )
+                val_loss_str = f"{val_loss:.6f}"
                 print(f"  -> val_loss={val_loss:.4f}")
+
+        if step % 10 == 0 and csv_writer is not None:
+            csv_writer.writerow([
+                step,
+                f"{raw_loss:.6f}",
+                val_loss_str,
+                f"{current_lr:.8f}",
+                f"{grad_norm:.6f}" if grad_norm is not None else "",
+                f"{dt_ms:.1f}",
+            ])
+            csv_file.flush()
+
+    if csv_file is not None:
+        csv_file.close()
 
     save_checkpoint(model, optimizer, args.steps, args.output_dir)
     if val_loader is not None:

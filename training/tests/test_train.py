@@ -1,6 +1,9 @@
 """Tests for the training loop."""
 
+import csv
 import os
+import subprocess
+import sys
 import tempfile
 
 import torch
@@ -242,3 +245,44 @@ class TestGradientClipping:
         # Post-clipping: all gradients should now be scaled down
         post_clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
         assert post_clip_norm.item() <= max_norm * 1.01  # tiny float slack
+
+
+class TestCsvLogging:
+    def test_csv_file_structure(self):
+        """CSV log file has correct headers and parseable numeric values."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = os.path.join(tmpdir, "train.csv")
+            checkpoint_dir = os.path.join(tmpdir, "ckpt")
+            training_dir = os.path.join(os.path.dirname(__file__), "..")
+
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "ct87.train",
+                    "--synthetic", "--config", "tiny",
+                    "--steps", "30", "--save-every", "0",
+                    "--log-file", log_path,
+                    "--dtype", "float32",
+                    "--output-dir", checkpoint_dir,
+                ],
+                capture_output=True,
+                text=True,
+                cwd=training_dir,
+            )
+            assert result.returncode == 0, f"Training failed:\n{result.stderr}"
+
+            with open(log_path) as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+
+            assert rows[0] == ["step", "loss", "val_loss", "lr", "grad_norm", "dt_ms"]
+            data_rows = rows[1:]
+            # Steps 0, 10, 20 -> 3 data rows (print every 10 steps)
+            assert len(data_rows) == 3
+            for row in data_rows:
+                assert len(row) == 6
+                int(row[0])    # step is an integer
+                float(row[1])  # loss
+                assert row[2] == ""  # val_loss empty (no --val-data)
+                float(row[3])  # lr
+                float(row[4])  # grad_norm
+                float(row[5])  # dt_ms
