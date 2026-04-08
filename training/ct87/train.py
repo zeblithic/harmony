@@ -212,69 +212,71 @@ def main() -> None:
     if args.log_file:
         csv_file = open(args.log_file, "a", newline="")
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["step", "loss", "val_loss", "lr", "grad_norm", "dt_ms"])
+        if csv_file.tell() == 0:
+            csv_writer.writerow(["step", "loss", "val_loss", "lr", "grad_norm", "dt_ms"])
 
-    for step in range(args.steps):
-        step_start = time.time()
-        lr_mult = schedule.get_lr_multiplier(step)
-        set_lr(optimizer, lr_mult)
-        optimizer.zero_grad()
+    try:
+        for step in range(args.steps):
+            step_start = time.time()
+            lr_mult = schedule.get_lr_multiplier(step)
+            set_lr(optimizer, lr_mult)
+            optimizer.zero_grad()
 
-        for micro_step in range(args.grad_accum_steps):
-            batch = next(dataloader).to(device)
-            input_ids = batch[:, :-1]
-            targets = batch[:, 1:]
+            for micro_step in range(args.grad_accum_steps):
+                batch = next(dataloader).to(device)
+                input_ids = batch[:, :-1]
+                targets = batch[:, 1:]
 
-            with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-                logits = model(input_ids)
-                loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
-            (loss / args.grad_accum_steps).backward()
+                with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(input_ids)
+                    loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
+                (loss / args.grad_accum_steps).backward()
 
-        grad_norm = None
-        if args.max_grad_norm > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), args.max_grad_norm,
-            ).item()
+            grad_norm = None
+            if args.max_grad_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.max_grad_norm,
+                ).item()
 
-        optimizer.step()
+            optimizer.step()
 
-        dt_ms = (time.time() - step_start) * 1000
-        raw_loss = loss.item()
-        current_lr = optimizer.param_groups[0]["lr"]
+            dt_ms = (time.time() - step_start) * 1000
+            raw_loss = loss.item()
+            current_lr = optimizer.param_groups[0]["lr"]
 
-        if step % 10 == 0:
-            print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}")
+            if step % 10 == 0:
+                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}")
 
-        val_loss_str = ""
-        if args.save_every > 0 and step > 0 and step % args.save_every == 0:
-            save_checkpoint(model, optimizer, step, args.output_dir)
-            print(f"  -> checkpoint saved at step {step}")
-            if val_loader is not None:
-                val_loss = compute_validation_loss(
-                    model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype,
-                )
-                val_loss_str = f"{val_loss:.6f}"
-                print(f"  -> val_loss={val_loss:.4f}")
+            val_loss_str = ""
+            if args.save_every > 0 and step > 0 and step % args.save_every == 0:
+                save_checkpoint(model, optimizer, step, args.output_dir)
+                print(f"  -> checkpoint saved at step {step}")
+                if val_loader is not None:
+                    val_loss = compute_validation_loss(
+                        model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype,
+                    )
+                    val_loss_str = f"{val_loss:.6f}"
+                    print(f"  -> val_loss={val_loss:.4f}")
 
-        if step % 10 == 0 and csv_writer is not None:
-            csv_writer.writerow([
-                step,
-                f"{raw_loss:.6f}",
-                val_loss_str,
-                f"{current_lr:.8f}",
-                f"{grad_norm:.6f}" if grad_norm is not None else "",
-                f"{dt_ms:.1f}",
-            ])
-            csv_file.flush()
+            if step % 10 == 0 and csv_writer is not None:
+                csv_writer.writerow([
+                    step,
+                    f"{raw_loss:.6f}",
+                    val_loss_str,
+                    f"{current_lr:.8f}",
+                    f"{grad_norm:.6f}" if grad_norm is not None else "",
+                    f"{dt_ms:.1f}",
+                ])
+                csv_file.flush()
 
-    if csv_file is not None:
-        csv_file.close()
-
-    save_checkpoint(model, optimizer, args.steps, args.output_dir)
-    if val_loader is not None:
-        val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype)
-        print(f"Final val_loss={val_loss:.4f}")
-    print(f"Training complete. Final checkpoint at step {args.steps}")
+        save_checkpoint(model, optimizer, args.steps, args.output_dir)
+        if val_loader is not None:
+            val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype)
+            print(f"Final val_loss={val_loss:.4f}")
+        print(f"Training complete. Final checkpoint at step {args.steps}")
+    finally:
+        if csv_file is not None:
+            csv_file.close()
 
 
 if __name__ == "__main__":
