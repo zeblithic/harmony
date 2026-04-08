@@ -39,4 +39,4 @@ result
 .beads-credential-key
 
 # Tokenized training datasets (large binary files)
-data/
+/data/
