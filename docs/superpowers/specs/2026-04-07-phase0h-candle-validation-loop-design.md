@@ -83,7 +83,8 @@ New file: `crates/harmony-inference/tests/validate_candle.rs`
 
 ### Flow
 
-1. Load `validation_model.gguf` via `include_bytes!`.
+1. Load `validation_model.gguf` via `std::fs::read` with `CARGO_MANIFEST_DIR`
+   (avoids embedding ~168KB into the test binary).
 2. Parse `validation_reference.json` via `serde_json` into:
    ```rust
    struct ValidationReference {

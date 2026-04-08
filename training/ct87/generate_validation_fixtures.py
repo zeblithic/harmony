@@ -71,10 +71,17 @@ def main() -> None:
         logits = model(input_ids)  # [1, 8, 128]
     last_logits = logits[0, -1, :].tolist()  # 128 float values
 
-    # Write reference JSON
+    # Write reference JSON -- config fields included as a staleness guard
+    # so the Rust test can detect if fixtures are out of sync with the model.
     reference = {
         "input_tokens": INPUT_TOKENS,
         "last_logits": last_logits,
+        "config": {
+            "num_layers": MICRO_CONFIG.num_layers,
+            "hidden_dim": MICRO_CONFIG.hidden_dim,
+            "vocab_size": MICRO_CONFIG.vocab_size,
+            "layers_per_block": MICRO_CONFIG.layers_per_block,
+        },
     }
     json_path = FIXTURE_DIR / "validation_reference.json"
     with open(json_path, "w") as f:

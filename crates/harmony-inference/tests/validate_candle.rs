@@ -12,9 +12,18 @@ use harmony_inference::{HarmonyModel, InferenceCache};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
+struct ValidationConfig {
+    num_layers: usize,
+    hidden_dim: usize,
+    vocab_size: usize,
+    layers_per_block: usize,
+}
+
+#[derive(Deserialize)]
 struct ValidationReference {
     input_tokens: Vec<u32>,
     last_logits: Vec<f64>,
+    config: ValidationConfig,
 }
 
 /// Load the validation GGUF fixture.
@@ -64,6 +73,26 @@ fn candle_matches_pytorch_logits() {
         .expect("failed to load model");
 
     let config = model.config();
+
+    // Staleness guard: verify fixture config matches GGUF-loaded model config.
+    // Catches stale fixtures if MICRO_CONFIG or model architecture changes.
+    assert_eq!(
+        reference.config.num_layers, config.num_layers,
+        "fixture config.num_layers stale — regenerate with: python3 -m ct87.generate_validation_fixtures"
+    );
+    assert_eq!(
+        reference.config.hidden_dim, config.hidden_dim,
+        "fixture config.hidden_dim stale — regenerate with: python3 -m ct87.generate_validation_fixtures"
+    );
+    assert_eq!(
+        reference.config.vocab_size, config.vocab_size,
+        "fixture config.vocab_size stale — regenerate with: python3 -m ct87.generate_validation_fixtures"
+    );
+    assert_eq!(
+        reference.config.layers_per_block, config.layers_per_block,
+        "fixture config.layers_per_block stale — regenerate with: python3 -m ct87.generate_validation_fixtures"
+    );
+
     assert_eq!(
         reference.last_logits.len(),
         config.vocab_size,
