@@ -17,6 +17,17 @@ import argparse
 import os
 
 
+def chunk_stream(stream: list[int], seq_len: int) -> list[list[int]]:
+    """Slice a token stream into non-overlapping fixed-length chunks.
+
+    The final partial chunk (if any) is discarded.
+    """
+    chunks = []
+    for start in range(0, len(stream) - seq_len + 1, seq_len):
+        chunks.append(stream[start : start + seq_len])
+    return chunks
+
+
 def concatenate_and_chunk(
     documents: list[list[int]],
     seq_len: int,
@@ -33,10 +44,7 @@ def concatenate_and_chunk(
         stream.extend(doc)
         stream.append(eos_token_id)
 
-    chunks = []
-    for start in range(0, len(stream) - seq_len + 1, seq_len):
-        chunks.append(stream[start : start + seq_len])
-    return chunks
+    return chunk_stream(stream, seq_len)
 
 
 def split_chunks(
@@ -64,8 +72,8 @@ def run_prepare_data(
     Streams documents, tokenizes into a single token stream with EOS
     separators (avoiding a separate documents list), then chunks and splits.
 
-    Returns a stats dict with total_tokens, num_documents,
-    num_train_chunks, and num_val_chunks.
+    Returns a stats dict with content_tokens, stream_tokens,
+    num_documents, num_train_chunks, and num_val_chunks.
     """
     from datasets import Dataset, load_dataset
     from transformers import AutoTokenizer
@@ -110,13 +118,10 @@ def run_prepare_data(
             print(f"  reached max_tokens={max_tokens:,}, stopping")
             break
 
-    print(f"Tokenization complete: {num_documents:,} documents, {total_tokens:,} tokens")
+    stream_tokens = total_tokens + num_documents  # includes EOS separators
+    print(f"Tokenization complete: {num_documents:,} documents, {total_tokens:,} content tokens ({stream_tokens:,} with EOS)")
 
-    # Chunk the flat stream directly (same logic as concatenate_and_chunk,
-    # but we already have the stream built inline).
-    chunks = []
-    for start in range(0, len(token_stream) - seq_len + 1, seq_len):
-        chunks.append(token_stream[start : start + seq_len])
+    chunks = chunk_stream(token_stream, seq_len)
     print(f"Chunked into {len(chunks):,} sequences of {seq_len} tokens")
 
     train_chunks, val_chunks = split_chunks(chunks, val_fraction=val_fraction)
@@ -134,7 +139,8 @@ def run_prepare_data(
         print(f"Saved val split to {output_dir}/val/")
 
     stats = {
-        "total_tokens": total_tokens,
+        "content_tokens": total_tokens,
+        "stream_tokens": stream_tokens,
         "num_documents": num_documents,
         "num_train_chunks": len(train_chunks),
         "num_val_chunks": len(val_chunks),

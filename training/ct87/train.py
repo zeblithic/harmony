@@ -38,8 +38,12 @@ def make_hf_dataloader(
 ) -> Iterator[torch.Tensor]:
     """Infinite dataloader from a pre-tokenized HuggingFace dataset.
 
-    Loads the dataset, concatenates all token sequences into one long stream,
-    then yields random windows of [seq_len + 1] tokens packed into batches.
+    Loads the dataset eagerly, concatenates all token sequences into one
+    long stream, then returns an iterator that yields random windows of
+    [seq_len + 1] tokens packed into batches.
+
+    Raises ValueError if the dataset has fewer tokens than seq_len + 1
+    (the minimum needed for one input/target pair).
     """
     from datasets import load_from_disk
 
@@ -52,13 +56,22 @@ def make_hf_dataloader(
     total = len(all_tokens_t)
     window = seq_len + 1
 
-    rng = torch.Generator()
-    rng.manual_seed(seed)
+    if total < window:
+        raise ValueError(
+            f"Dataset at {data_path} has {total} tokens, but seq_len+1={window} "
+            f"tokens are needed for at least one training window. "
+            f"Use a larger dataset or reduce --seq-len."
+        )
 
-    while True:
-        starts = torch.randint(0, total - window + 1, (batch_size,), generator=rng)
-        batch = torch.stack([all_tokens_t[s : s + window] for s in starts])
-        yield batch
+    def _iter() -> Iterator[torch.Tensor]:
+        rng = torch.Generator()
+        rng.manual_seed(seed)
+        while True:
+            starts = torch.randint(0, total - window + 1, (batch_size,), generator=rng)
+            batch = torch.stack([all_tokens_t[s : s + window] for s in starts])
+            yield batch
+
+    return _iter()
 
 
 def save_checkpoint(

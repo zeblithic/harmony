@@ -91,6 +91,20 @@ class TestSyntheticDataloader:
         assert torch.equal(next(dl1), next(dl2))
 
 
+class TestHfDataloaderGuard:
+    def test_too_few_tokens_raises(self):
+        """make_hf_dataloader raises ValueError when dataset is too small."""
+        from ct87.train import make_hf_dataloader
+        from datasets import Dataset
+
+        # Create a tiny dataset with only 5 tokens — less than seq_len+1=17
+        ds = Dataset.from_dict({"input_ids": [[1, 2, 3, 4, 5]]})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ds.save_to_disk(tmpdir)
+            with pytest.raises(ValueError, match="tokens are needed"):
+                make_hf_dataloader(tmpdir, seq_len=16, batch_size=1)
+
+
 class TestValidation:
     def test_returns_finite_float(self):
         """compute_validation_loss returns a finite float loss value."""

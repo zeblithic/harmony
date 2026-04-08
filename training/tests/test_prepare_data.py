@@ -100,9 +100,10 @@ class TestEndToEnd:
                 val_fraction=0.1,
             )
 
-            # Early-exit fires when total_tokens >= max_tokens, so we get
+            # Early-exit fires when content_tokens >= max_tokens, so we get
             # at least 5000 but not wildly more (one doc overshoot).
-            assert 5000 <= stats["total_tokens"] < 50_000
+            assert 5000 <= stats["content_tokens"] < 50_000
+            assert stats["stream_tokens"] > stats["content_tokens"]
             assert stats["num_train_chunks"] > 0
             assert stats["num_val_chunks"] >= 0
             assert stats["num_documents"] > 0
