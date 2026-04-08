@@ -37,3 +37,6 @@ result
 
 # Beads / Dolt files (added by bd init)
 .beads-credential-key
+
+# Tokenized training datasets (large binary files)
+data/
