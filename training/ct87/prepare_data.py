@@ -13,6 +13,9 @@ Run from the training/ directory:
 
 from __future__ import annotations
 
+import argparse
+import os
+
 
 def concatenate_and_chunk(
     documents: list[list[int]],
@@ -50,17 +53,16 @@ def split_chunks(
     return train, val
 
 
-import argparse
-import os
-
-
 def run_prepare_data(
     output_dir: str,
     seq_len: int = 2048,
     max_tokens: int | None = None,
     val_fraction: float = 0.01,
-) -> dict:
+) -> dict[str, int]:
     """Run the full preprocessing pipeline.
+
+    Streams documents, tokenizes into a single token stream with EOS
+    separators (avoiding a separate documents list), then chunks and splits.
 
     Returns a stats dict with total_tokens, num_documents,
     num_train_chunks, and num_val_chunks.
@@ -81,7 +83,9 @@ def run_prepare_data(
         streaming=True,
     )
 
-    documents: list[list[int]] = []
+    # Stream directly into a flat token stream (avoids accumulating a
+    # separate documents list — one fewer full copy in memory).
+    token_stream: list[int] = []
     total_tokens = 0
     num_documents = 0
 
@@ -94,7 +98,8 @@ def run_prepare_data(
         if not tokens:
             continue
 
-        documents.append(tokens)
+        token_stream.extend(tokens)
+        token_stream.append(eos_token_id)
         total_tokens += len(tokens)
         num_documents += 1
 
@@ -107,7 +112,11 @@ def run_prepare_data(
 
     print(f"Tokenization complete: {num_documents:,} documents, {total_tokens:,} tokens")
 
-    chunks = concatenate_and_chunk(documents, seq_len=seq_len, eos_token_id=eos_token_id)
+    # Chunk the flat stream directly (same logic as concatenate_and_chunk,
+    # but we already have the stream built inline).
+    chunks = []
+    for start in range(0, len(token_stream) - seq_len + 1, seq_len):
+        chunks.append(token_stream[start : start + seq_len])
     print(f"Chunked into {len(chunks):,} sequences of {seq_len} tokens")
 
     train_chunks, val_chunks = split_chunks(chunks, val_fraction=val_fraction)
