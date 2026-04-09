@@ -152,7 +152,7 @@ def main() -> None:
         sys.exit(1)
 
     config = HarmonyModelConfig.tiny() if args.config == "tiny" else HarmonyModelConfig.target()
-    seq_len = args.seq_len or (512 if args.config == "tiny" else 2048)
+    seq_len = args.seq_len if args.seq_len is not None else (512 if args.config == "tiny" else 2048)
 
     if seq_len < 1 or seq_len > config.max_seq_len:
         print(
