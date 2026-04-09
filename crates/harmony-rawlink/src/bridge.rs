@@ -325,6 +325,13 @@ impl<S: RawSocket> Bridge<S> {
                     }
                     let mut identity_hash = [0u8; 16];
                     identity_hash.copy_from_slice(&body[..16]);
+                    // Identity churn detection: if this MAC already has a
+                    // different identity in the peer table, record a violation.
+                    if let Some(prev) = peer_table.identity_for_mac(src_mac) {
+                        if prev != identity_hash {
+                            violations.push((*src_mac, ViolationCategory::IdentityChurn));
+                        }
+                    }
                     peer_table.update(identity_hash, *src_mac);
                     debug!(
                         identity = hex::encode(identity_hash),
@@ -1110,5 +1117,61 @@ mod tests {
             .expect("recv should succeed");
 
         assert_eq!(peer_table.peer_count(), 1, "unbanned MAC traffic should resume");
+    }
+
+    #[test]
+    fn identity_churn_triggers_blacklist() {
+        use crate::blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory};
+
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+
+        let mut blacklist = MacBlacklist::new(BlacklistConfig {
+            thresholds: [20, 500, 3, 10], // IdentityChurn threshold = 3
+            ..Default::default()
+        });
+        let mut peer_table = PeerTable::new(Duration::from_secs(30));
+        let local_mac = MAC_A;
+        let now = Instant::now();
+
+        // Send 4 scout frames from MAC_B with different identity hashes.
+        // The first establishes the identity; the next 3 are churn violations.
+        for i in 0u8..4 {
+            let identity = [i + 1; 16];
+            let scout = make_scout_payload(&identity);
+            socket_b.send_frame(MAC_A, &scout).expect("mock send");
+        }
+
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if src_mac == &local_mac || payload.is_empty() {
+                    return;
+                }
+                if blacklist.is_blocked(src_mac, now) {
+                    return;
+                }
+                if payload[0] == frame_type::SCOUT && payload.len() >= 17 {
+                    let mut identity_hash = [0u8; 16];
+                    identity_hash.copy_from_slice(&payload[1..17]);
+
+                    // Identity churn detection: different identity for same MAC.
+                    if let Some(prev) = peer_table.identity_for_mac(src_mac) {
+                        if prev != identity_hash {
+                            blacklist.record_violation(
+                                src_mac,
+                                ViolationCategory::IdentityChurn,
+                                now,
+                            );
+                        }
+                    }
+                    peer_table.update(identity_hash, *src_mac);
+                }
+            })
+            .expect("recv should succeed");
+
+        // 3 churn violations (scouts 2, 3, 4 each differ from the previous) → banned.
+        assert!(
+            blacklist.is_blocked(&MAC_B, now),
+            "3 identity changes should trigger ban"
+        );
     }
 }
