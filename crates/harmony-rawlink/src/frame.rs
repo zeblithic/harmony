@@ -164,8 +164,7 @@ pub fn decode_data_frame(
     origin_mac.copy_from_slice(&frame[FRAME_OVERHEAD..FRAME_OVERHEAD + 6]);
 
     let key_offset = FRAME_OVERHEAD + 6;
-    let key_len =
-        u16::from_be_bytes([frame[key_offset], frame[key_offset + 1]]) as usize;
+    let key_len = u16::from_be_bytes([frame[key_offset], frame[key_offset + 1]]) as usize;
 
     let key_start = key_offset + 2;
     let key_end = key_start + key_len;

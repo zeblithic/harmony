@@ -3,12 +3,18 @@
 //! The bridge runs a continuous loop that:
 //! 1. Broadcasts Scout frames on a jittered timer.
 //! 2. Receives inbound L2 frames and publishes Data payloads into zenoh.
+//!    Frames from banned MACs are silently dropped at the top of the callback.
+//!    Validation failures record violations toward per-MAC ban thresholds.
 //! 3. Flushes the accumulated batch (gated by the jitter hold timer).
 //! 4. Arms a jitter hold when inbound traffic was received (100-500ms delay).
 //! 5. Drains the zenoh subscriber and broadcasts outbound Data frames.
 //!
 //! Steps 3-4 are ordered so expired holds flush before being replaced,
 //! preventing indefinite batch starvation under continuous inbound traffic.
+//!
+//! MAC blacklisting detects 4 violation categories: malformed frames, rate
+//! flooding, identity churn, and namespace violations. Bans escalate with
+//! each offense (60s → 4min → 16min → 1h cap). See [`crate::blacklist`].
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -181,8 +187,7 @@ impl<S: RawSocket> Bridge<S> {
                 }
 
                 // 3. Process inbound L2 frames → publish to zenoh.
-                let (inbound_hashes, had_inbound) =
-                    self.process_inbound_frames(&local_mac).await?;
+                let (inbound_hashes, had_inbound) = self.process_inbound_frames(&local_mac).await?;
 
                 // 4. Flush accumulated batch (jitter-gated).
                 //
@@ -225,7 +230,10 @@ impl<S: RawSocket> Bridge<S> {
                 if let Some(ref mut rx) = self.reticulum_outbound_rx {
                     while let Ok(packet) = rx.try_recv() {
                         if packet.len() > u16::MAX as usize {
-                            warn!(len = packet.len(), "reticulum packet exceeds u16 max, dropping");
+                            warn!(
+                                len = packet.len(),
+                                "reticulum packet exceeds u16 max, dropping"
+                            );
                             continue;
                         }
                         if let Some(flushed) = batch.push(frame_type::RETICULUM, &packet) {
@@ -287,12 +295,19 @@ impl<S: RawSocket> Bridge<S> {
     /// Buffers frames during the sync `recv_frames` callback, then publishes
     /// to zenoh asynchronously after the callback returns. Returns the key
     /// expressions that were published (for echo prevention).
-    async fn process_inbound_frames(&mut self, local_mac: &[u8; 6]) -> Result<(HashSet<u64>, bool), RawLinkError> {
+    async fn process_inbound_frames(
+        &mut self,
+        local_mac: &[u8; 6],
+    ) -> Result<(HashSet<u64>, bool), RawLinkError> {
         let mut inbound_data: Vec<(String, Vec<u8>)> = Vec::new();
         let mut had_inbound = false;
 
         let Self {
-            socket, peer_table, blacklist, config, ..
+            socket,
+            peer_table,
+            blacklist,
+            config,
+            ..
         } = self;
         let allowed_prefix = &config.subscribe_pattern;
         let reticulum_tx = &config.reticulum_inbound_tx;
@@ -304,96 +319,100 @@ impl<S: RawSocket> Bridge<S> {
         // Dispatch a single sub-frame (type byte already stripped).
         // Violations are appended to `violations` rather than returned, to avoid
         // a second mutable borrow of `blacklist` within the recv_frames callback.
-        let mut dispatch = |src_mac: &[u8; 6],
-                            frame_type_byte: u8,
-                            body: &[u8],
-                            violations: &mut Vec<([u8; 6], ViolationCategory)>| {
-            match frame_type_byte {
-                frame_type::RETICULUM => {
-                    if !body.is_empty() {
-                        if let Some(ref reticulum_tx) = reticulum_tx {
-                            let packet = body.to_vec();
-                            let _ = reticulum_tx.try_send(packet);
+        let mut dispatch =
+            |src_mac: &[u8; 6],
+             frame_type_byte: u8,
+             body: &[u8],
+             violations: &mut Vec<([u8; 6], ViolationCategory)>| {
+                match frame_type_byte {
+                    frame_type::RETICULUM => {
+                        if !body.is_empty() {
+                            if let Some(ref reticulum_tx) = reticulum_tx {
+                                let packet = body.to_vec();
+                                let _ = reticulum_tx.try_send(packet);
+                            }
                         }
                     }
-                }
-                frame_type::SCOUT => {
-                    if body.len() < 16 {
-                        debug!(len = body.len(), "scout frame too short, ignoring");
-                        violations.push((*src_mac, ViolationCategory::MalformedFrame));
-                        return;
-                    }
-                    let mut identity_hash = [0u8; 16];
-                    identity_hash.copy_from_slice(&body[..16]);
-                    // Identity churn detection: if this MAC already has a
-                    // different identity in the peer table, record a violation.
-                    if let Some(prev) = peer_table.identity_for_mac(src_mac) {
-                        if prev != identity_hash {
-                            violations.push((*src_mac, ViolationCategory::IdentityChurn));
-                        }
-                    }
-                    peer_table.update(identity_hash, *src_mac);
-                    debug!(
-                        identity = hex::encode(identity_hash),
-                        src_mac = hex::encode(src_mac),
-                        "peer scouted"
-                    );
-                }
-                frame_type::DATA => {
-                    // Data body: [6-byte origin_mac][u16 BE key_len][key][payload]
-                    if body.len() < 6 + 2 {
-                        debug!(len = body.len(), "data frame too short, ignoring");
-                        violations.push((*src_mac, ViolationCategory::MalformedFrame));
-                        return;
-                    }
-                    let mut origin_mac = [0u8; 6];
-                    origin_mac.copy_from_slice(&body[..6]);
-                    // Discard frames we sent ourselves (L2 loopback).
-                    if &origin_mac == local_mac {
-                        trace!("discarding self-originated data frame");
-                        return;
-                    }
-                    let key_len = u16::from_be_bytes([body[6], body[7]]) as usize;
-                    let key_start = 8;
-                    let key_end = key_start + key_len;
-                    if body.len() < key_end {
-                        debug!(
-                            key_len,
-                            frame_len = body.len(),
-                            "data frame truncated key_expr, ignoring"
-                        );
-                        violations.push((*src_mac, ViolationCategory::MalformedFrame));
-                        return;
-                    }
-                    let key_expr = match std::str::from_utf8(&body[key_start..key_end]) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            debug!("data frame has invalid UTF-8 key_expr, ignoring");
+                    frame_type::SCOUT => {
+                        if body.len() < 16 {
+                            debug!(len = body.len(), "scout frame too short, ignoring");
                             violations.push((*src_mac, ViolationCategory::MalformedFrame));
                             return;
                         }
-                    };
-                    // Validate key expression against allowed namespace to prevent
-                    // unauthenticated injection into arbitrary zenoh key spaces.
-                    // Ensure prefix ends with '/' to prevent "harmony_evil" matching "harmony/".
-                    let mut prefix = allowed_prefix.trim_end_matches("**").trim_end_matches('/').to_string();
-                    prefix.push('/');
-                    if !key_expr.starts_with(&prefix) {
+                        let mut identity_hash = [0u8; 16];
+                        identity_hash.copy_from_slice(&body[..16]);
+                        // Identity churn detection: if this MAC already has a
+                        // different identity in the peer table, record a violation.
+                        if let Some(prev) = peer_table.identity_for_mac(src_mac) {
+                            if prev != identity_hash {
+                                violations.push((*src_mac, ViolationCategory::IdentityChurn));
+                            }
+                        }
+                        peer_table.update(identity_hash, *src_mac);
                         debug!(
-                            key_expr,
-                            "data frame key_expr outside allowed namespace, ignoring"
+                            identity = hex::encode(identity_hash),
+                            src_mac = hex::encode(src_mac),
+                            "peer scouted"
                         );
-                        violations.push((*src_mac, ViolationCategory::NamespaceViolation));
-                        return;
                     }
-                    let data_payload = body[key_end..].to_vec();
-                    inbound_data.push((key_expr.to_string(), data_payload));
+                    frame_type::DATA => {
+                        // Data body: [6-byte origin_mac][u16 BE key_len][key][payload]
+                        if body.len() < 6 + 2 {
+                            debug!(len = body.len(), "data frame too short, ignoring");
+                            violations.push((*src_mac, ViolationCategory::MalformedFrame));
+                            return;
+                        }
+                        let mut origin_mac = [0u8; 6];
+                        origin_mac.copy_from_slice(&body[..6]);
+                        // Discard frames we sent ourselves (L2 loopback).
+                        if &origin_mac == local_mac {
+                            trace!("discarding self-originated data frame");
+                            return;
+                        }
+                        let key_len = u16::from_be_bytes([body[6], body[7]]) as usize;
+                        let key_start = 8;
+                        let key_end = key_start + key_len;
+                        if body.len() < key_end {
+                            debug!(
+                                key_len,
+                                frame_len = body.len(),
+                                "data frame truncated key_expr, ignoring"
+                            );
+                            violations.push((*src_mac, ViolationCategory::MalformedFrame));
+                            return;
+                        }
+                        let key_expr = match std::str::from_utf8(&body[key_start..key_end]) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                debug!("data frame has invalid UTF-8 key_expr, ignoring");
+                                violations.push((*src_mac, ViolationCategory::MalformedFrame));
+                                return;
+                            }
+                        };
+                        // Validate key expression against allowed namespace to prevent
+                        // unauthenticated injection into arbitrary zenoh key spaces.
+                        // Ensure prefix ends with '/' to prevent "harmony_evil" matching "harmony/".
+                        let mut prefix = allowed_prefix
+                            .trim_end_matches("**")
+                            .trim_end_matches('/')
+                            .to_string();
+                        prefix.push('/');
+                        if !key_expr.starts_with(&prefix) {
+                            debug!(
+                                key_expr,
+                                "data frame key_expr outside allowed namespace, ignoring"
+                            );
+                            violations.push((*src_mac, ViolationCategory::NamespaceViolation));
+                            return;
+                        }
+                        let data_payload = body[key_end..].to_vec();
+                        inbound_data.push((key_expr.to_string(), data_payload));
+                    }
+                    other => {
+                        trace!(frame_type = other, "ignoring unknown frame type");
+                    }
                 }
-                other => {
-                    trace!(frame_type = other, "ignoring unknown frame type");
-                }
-            }
-        };
+            };
 
         socket.recv_frames(&mut |src_mac, payload| {
             // Skip frames from ourselves (loopback on the interface).
@@ -455,22 +474,23 @@ impl<S: RawSocket> Bridge<S> {
     /// Returns `None` if the sample should be dropped (key too long, payload
     /// exceeds MTU). The returned bytes are the DATA sub-frame payload:
     /// `[6 origin_mac][2 key_len BE][key bytes][payload]`.
-    fn build_outbound_data_payload(
-        &self,
-        sample: &zenoh::sample::Sample,
-    ) -> Option<Vec<u8>> {
+    fn build_outbound_data_payload(&self, sample: &zenoh::sample::Sample) -> Option<Vec<u8>> {
         let key_expr = sample.key_expr().as_str();
         let payload = sample.payload().to_bytes();
 
         if key_expr.len() > u16::MAX as usize {
-            warn!(key_expr, "outbound key_expr exceeds u16 max length, dropping frame");
+            warn!(
+                key_expr,
+                "outbound key_expr exceeds u16 max length, dropping frame"
+            );
             return None;
         }
 
         // Guard against oversized sub-frames.
         // Sub-frame overhead within DATA: 6 (origin_mac) + 2 (key_len) + key_expr.len()
         // Max sub-frame payload: 1500 (send_frame limit) - 3 (batch header) - 3 (sub-frame header) = 1494
-        const MAX_SUB_PAYLOAD: usize = 1500 - crate::batch::BATCH_HEADER - crate::batch::SUB_FRAME_HEADER;
+        const MAX_SUB_PAYLOAD: usize =
+            1500 - crate::batch::BATCH_HEADER - crate::batch::SUB_FRAME_HEADER;
         let data_overhead = 6 + 2 + key_expr.len();
         if payload.len() > MAX_SUB_PAYLOAD.saturating_sub(data_overhead) {
             trace!(
@@ -488,7 +508,11 @@ impl<S: RawSocket> Bridge<S> {
         buf.extend_from_slice(key_expr.as_bytes());
         buf.extend_from_slice(&payload);
 
-        trace!(key_expr, payload_len = payload.len(), "queued outbound data frame");
+        trace!(
+            key_expr,
+            payload_len = payload.len(),
+            "queued outbound data frame"
+        );
         Some(buf)
     }
 
@@ -701,13 +725,17 @@ mod tests {
         let reticulum_packet = vec![0xAA; 100];
         let mut frame_payload = vec![frame_type::RETICULUM];
         frame_payload.extend_from_slice(&reticulum_packet);
-        socket_b.send_frame(MAC_A, &frame_payload).expect("mock send");
+        socket_b
+            .send_frame(MAC_A, &frame_payload)
+            .expect("mock send");
 
-        socket_a.recv_frames(&mut |_src_mac, payload| {
-            if !payload.is_empty() && payload[0] == frame_type::RETICULUM && payload.len() > 1 {
-                let _ = tx.send(payload[1..].to_vec());
-            }
-        }).expect("recv");
+        socket_a
+            .recv_frames(&mut |_src_mac, payload| {
+                if !payload.is_empty() && payload[0] == frame_type::RETICULUM && payload.len() > 1 {
+                    let _ = tx.send(payload[1..].to_vec());
+                }
+            })
+            .expect("recv");
 
         let received = rx.try_recv().expect("should receive packet");
         assert_eq!(received, reticulum_packet);
@@ -740,20 +768,26 @@ mod tests {
         let mut peer_table = PeerTable::new(Duration::from_secs(30));
         let mut unknown_count = 0usize;
 
-        socket_a.recv_frames(&mut |src_mac, payload| {
-            if payload.is_empty() { return; }
-            match payload[0] {
-                frame_type::SCOUT if payload.len() >= 17 => {
-                    let mut hash = [0u8; 16];
-                    hash.copy_from_slice(&payload[1..17]);
-                    peer_table.update(hash, *src_mac);
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if payload.is_empty() {
+                    return;
                 }
-                frame_type::RETICULUM if payload.len() > 1 => {
-                    let _ = ret_tx.send(payload[1..].to_vec());
+                match payload[0] {
+                    frame_type::SCOUT if payload.len() >= 17 => {
+                        let mut hash = [0u8; 16];
+                        hash.copy_from_slice(&payload[1..17]);
+                        peer_table.update(hash, *src_mac);
+                    }
+                    frame_type::RETICULUM if payload.len() > 1 => {
+                        let _ = ret_tx.send(payload[1..].to_vec());
+                    }
+                    _ => {
+                        unknown_count += 1;
+                    }
                 }
-                _ => { unknown_count += 1; }
-            }
-        }).unwrap();
+            })
+            .unwrap();
 
         assert_eq!(peer_table.peer_count(), 1);
         assert!(ret_rx.try_recv().is_ok());
@@ -952,10 +986,7 @@ mod tests {
         // Step 2: arm sees None (cleared) and sets new hold.
         jitter.arm(t1, Duration::from_millis(300));
         assert!(jitter.is_active(), "new hold should be armed");
-        assert!(
-            !jitter.should_flush(t1),
-            "new hold should suppress flush"
-        );
+        assert!(!jitter.should_flush(t1), "new hold should suppress flush");
         assert!(
             jitter.should_flush(t1 + Duration::from_millis(300)),
             "new hold should expire at t1+300ms"
@@ -977,7 +1008,10 @@ mod tests {
             );
             let mut jitter = JitterHold::new();
             jitter.arm(now, Duration::from_millis(delay_ms));
-            assert!(!jitter.should_flush(now), "hold should suppress at arm time");
+            assert!(
+                !jitter.should_flush(now),
+                "hold should suppress at arm time"
+            );
         }
     }
 
@@ -1023,7 +1057,11 @@ mod tests {
             .expect("recv should succeed");
 
         // Scout from banned MAC must be silently dropped.
-        assert_eq!(peer_table.peer_count(), 0, "banned MAC's scout must be dropped");
+        assert_eq!(
+            peer_table.peer_count(),
+            0,
+            "banned MAC's scout must be dropped"
+        );
     }
 
     #[test]
@@ -1068,7 +1106,11 @@ mod tests {
             .expect("recv should succeed");
 
         // MAC_B is not banned — scout should be processed.
-        assert_eq!(peer_table.peer_count(), 1, "unbanned MAC should be processed");
+        assert_eq!(
+            peer_table.peer_count(),
+            1,
+            "unbanned MAC should be processed"
+        );
     }
 
     #[test]
@@ -1116,7 +1158,11 @@ mod tests {
             })
             .expect("recv should succeed");
 
-        assert_eq!(peer_table.peer_count(), 1, "unbanned MAC traffic should resume");
+        assert_eq!(
+            peer_table.peer_count(),
+            1,
+            "unbanned MAC traffic should resume"
+        );
     }
 
     #[test]

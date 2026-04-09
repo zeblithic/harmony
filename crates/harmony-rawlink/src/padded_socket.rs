@@ -28,7 +28,10 @@ pub struct PaddedSocket<S> {
 
 impl<S> PaddedSocket<S> {
     pub fn new(inner: S, pad_block: usize) -> Self {
-        assert!(pad_block > ETH_HEADER_LEN, "pad_block must exceed Ethernet header");
+        assert!(
+            pad_block > ETH_HEADER_LEN,
+            "pad_block must exceed Ethernet header"
+        );
         Self { inner, pad_block }
     }
 }
