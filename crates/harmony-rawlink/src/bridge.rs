@@ -3,9 +3,12 @@
 //! The bridge runs a continuous loop that:
 //! 1. Broadcasts Scout frames on a jittered timer.
 //! 2. Receives inbound L2 frames and publishes Data payloads into zenoh.
-//! 3. Drains the zenoh subscriber and broadcasts outbound Data frames.
-//! 4. Applies stochastic jitter to outbound flushes when inbound traffic
-//!    was received, breaking timing correlation for traffic analysis resistance.
+//! 3. Flushes the accumulated batch (gated by the jitter hold timer).
+//! 4. Arms a jitter hold when inbound traffic was received (100-500ms delay).
+//! 5. Drains the zenoh subscriber and broadcasts outbound Data frames.
+//!
+//! Steps 3-4 are ordered so expired holds flush before being replaced,
+//! preventing indefinite batch starvation under continuous inbound traffic.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -176,16 +179,28 @@ impl<S: RawSocket> Bridge<S> {
                 let (inbound_hashes, had_inbound) =
                     self.process_inbound_frames(&local_mac).await?;
 
-                // Arm jitter hold on inbound traffic to break timing correlation.
-                // Use a fresh timestamp — `now` was captured before the async
-                // process_inbound_frames call and may be stale.
+                // 4. Flush accumulated batch (jitter-gated).
+                //
+                // ORDERING: flush BEFORE arming a new hold. This ensures
+                // expired holds always flush before being replaced. Without
+                // this ordering, continuous inbound traffic would chain holds
+                // back-to-back, starving partial-batch flushes indefinitely.
+                if jitter.should_flush(Instant::now()) {
+                    if let Some(flushed) = batch.flush() {
+                        self.socket.send_frame(BROADCAST_MAC, &flushed)?;
+                    }
+                }
+
+                // 5. Arm jitter hold on inbound traffic to break timing
+                //    correlation. Runs AFTER flush so expired holds are
+                //    cleared before a new hold takes effect.
                 if had_inbound {
                     let delay_ms = rand::thread_rng().gen_range(100u64..=500);
                     jitter.arm(Instant::now(), Duration::from_millis(delay_ms));
                     trace!(delay_ms, "jitter hold armed on inbound traffic");
                 }
 
-                // 4. Drain outbound zenoh samples → push into batch accumulator.
+                // 6. Drain outbound zenoh samples → push into batch accumulator.
                 //    Skip samples whose content hash matches something we just
                 //    published from inbound L2 (echo prevention).
                 while let Ok(Some(sample)) = subscriber.try_recv() {
@@ -201,7 +216,7 @@ impl<S: RawSocket> Bridge<S> {
                     }
                 }
 
-                // 5. Drain outbound Reticulum packets → push into batch accumulator.
+                // 7. Drain outbound Reticulum packets → push into batch accumulator.
                 if let Some(ref mut rx) = self.reticulum_outbound_rx {
                     while let Ok(packet) = rx.try_recv() {
                         if packet.len() > u16::MAX as usize {
@@ -211,13 +226,6 @@ impl<S: RawSocket> Bridge<S> {
                         if let Some(flushed) = batch.push(frame_type::RETICULUM, &packet) {
                             self.socket.send_frame(BROADCAST_MAC, &flushed)?;
                         }
-                    }
-                }
-
-                // 6. Flush remaining batch (jitter-gated).
-                if jitter.should_flush(Instant::now()) {
-                    if let Some(flushed) = batch.flush() {
-                        self.socket.send_frame(BROADCAST_MAC, &flushed)?;
                     }
                 }
 
@@ -876,10 +884,10 @@ mod tests {
     }
 
     #[test]
-    fn jitter_hold_arms_over_expired_deadline() {
-        // Regression: arm() must re-arm when the existing deadline has expired
-        // but should_flush() hasn't cleared it yet. This happens when arm() is
-        // called before should_flush() in the same loop iteration.
+    fn jitter_hold_flush_before_rearm_under_continuous_inbound() {
+        // The bridge loop calls should_flush() BEFORE arm() to ensure
+        // expired holds flush before being replaced. This test verifies
+        // the correct sequence under continuous inbound traffic.
         let mut jitter = JitterHold::new();
         let t0 = Instant::now();
 
@@ -887,17 +895,24 @@ mod tests {
         jitter.arm(t0, Duration::from_millis(100));
         assert!(jitter.is_active());
 
-        // Time advances past the deadline. arm() is called again with new
-        // inbound traffic BEFORE should_flush() clears the stale deadline.
+        // Time advances past the deadline. Continuous inbound arrives.
+        // Bridge loop order: should_flush first, then arm.
         let t1 = t0 + Duration::from_millis(200);
-        jitter.arm(t1, Duration::from_millis(300));
 
-        // The expired deadline should have been replaced, not preserved.
-        // should_flush at t1 should suppress (new deadline is t1+300ms).
-        assert!(!jitter.should_flush(t1), "re-armed hold should suppress flush");
+        // Step 1: should_flush clears expired hold and allows flush.
+        assert!(jitter.should_flush(t1), "expired hold must flush");
+        assert!(!jitter.is_active(), "hold should be cleared after flush");
+
+        // Step 2: arm sees None (cleared) and sets new hold.
+        jitter.arm(t1, Duration::from_millis(300));
+        assert!(jitter.is_active(), "new hold should be armed");
+        assert!(
+            !jitter.should_flush(t1),
+            "new hold should suppress flush"
+        );
         assert!(
             jitter.should_flush(t1 + Duration::from_millis(300)),
-            "new deadline should expire at t1+300ms"
+            "new hold should expire at t1+300ms"
         );
     }
 
