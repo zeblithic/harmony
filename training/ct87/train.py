@@ -296,6 +296,10 @@ def main() -> None:
             )
             sys.exit(1)
 
+    if args.uq_loss_weight < 0:
+        print("Error: --uq-loss-weight must be >= 0", file=sys.stderr)
+        sys.exit(1)
+
     device = detect_device(args.device)
     torch.manual_seed(args.seed)
     amp_dtype = torch.bfloat16 if args.dtype == "bfloat16" else None
@@ -372,10 +376,20 @@ def main() -> None:
     csv_file = None
     csv_writer = None
     if args.log_file:
+        expected_header = ["step", "loss", "uq_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
+        if os.path.exists(args.log_file) and os.path.getsize(args.log_file) > 0:
+            with open(args.log_file, newline="") as existing:
+                header = next(csv.reader(existing), [])
+            if header and header != expected_header:
+                print(
+                    f"Error: incompatible CSV header in {args.log_file}: {header}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         csv_file = open(args.log_file, "a", newline="")
         csv_writer = csv.writer(csv_file)
         if os.path.getsize(args.log_file) == 0:
-            csv_writer.writerow(["step", "loss", "uq_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"])
+            csv_writer.writerow(expected_header)
 
     try:
         for step in range(args.steps):
@@ -435,7 +449,7 @@ def main() -> None:
                     # UQ auxiliary loss
                     if uq_head is not None:
                         with torch.no_grad():
-                            uq_features = extract_uq_features(
+                            uq_features, uq_probs = extract_uq_features(
                                 uq_norms, logits.detach(), uq_feature_config,
                             )
                             # For COCONUT: use 0 as target at think positions
@@ -447,6 +461,7 @@ def main() -> None:
                             uq_class_labels, uq_conf_targets = compute_pseudo_labels(
                                 logits.detach(), uq_targets, uq_features,
                                 top_k=uq_feature_config.top_k,
+                                probs=uq_probs,
                             )
 
                         uq_class_logits, uq_confidence = uq_head(uq_features)

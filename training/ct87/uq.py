@@ -93,7 +93,7 @@ def extract_uq_features(
     layer_norms: dict[int, torch.Tensor],
     logits: torch.Tensor,
     config: UqFeatureConfig,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract 8-dim UQ feature vectors at all sequence positions.
 
     Mirrors Rust ``extract_uq_features()`` from ``uq_features.rs:98-136``.
@@ -105,7 +105,10 @@ def extract_uq_features(
         config: Feature extraction config.
 
     Returns:
-        ``[batch, seq_len, 8]`` feature tensor.
+        Tuple of:
+        - ``[batch, seq_len, 8]`` feature tensor.
+        - ``[batch, seq_len, vocab_size]`` softmax probabilities (reusable
+          by :func:`compute_pseudo_labels` to avoid redundant softmax).
     """
     # f1-f4: L2 norms at sampled layers
     f1 = layer_norms[config.norm_layers[0]]
@@ -129,7 +132,7 @@ def extract_uq_features(
     # f8: stub (attention lookback, deferred)
     f8 = torch.zeros_like(f1)
 
-    return torch.stack([f1, f2, f3, f4, f5, f6, f7, f8], dim=-1)
+    return torch.stack([f1, f2, f3, f4, f5, f6, f7, f8], dim=-1), probs
 
 
 def compute_pseudo_labels(
@@ -139,6 +142,7 @@ def compute_pseudo_labels(
     collapse_threshold: float = 0.1,
     confident_threshold: float = 0.5,
     top_k: int = 10,
+    probs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Derive pseudo-labels from model behavior.
 
@@ -151,6 +155,7 @@ def compute_pseudo_labels(
         collapse_threshold: max norm threshold for SpectralCollapse
         confident_threshold: P(target) threshold for Confident
         top_k: top-k value used in feature extraction (for entropy threshold)
+        probs: optional precomputed ``softmax(logits)`` to avoid recomputation
 
     Returns:
         class_labels: ``[batch, seq_len]`` long, values in {0,1,2,3}
@@ -170,15 +175,19 @@ def compute_pseudo_labels(
     labels = torch.full((batch, seq_len), 3, dtype=torch.long, device=targets.device)
 
     # HighVolume (1): high entropy AND dispersed probability
-    entropy_threshold = math.log(float(top_k))
+    # Use effective_k consistent with extract_uq_features (k = min(top_k, vocab))
+    vocab_size = logits.shape[-1]
+    effective_k = min(top_k, vocab_size)
+    entropy_threshold = math.log(float(effective_k))
     high_volume = (f6 > entropy_threshold) & (f7 < 0.5)
     labels[high_volume] = 1
 
     # Confident (0): model assigns high prob to correct token (overrides HighVolume)
-    probs = F.softmax(logits, dim=-1)
+    if probs is None:
+        probs = F.softmax(logits, dim=-1)
     # Clamp targets to valid range for gather (callers should replace ignore
     # indices like -100 before calling, but clamp defensively)
-    safe_targets = targets.clamp(min=0, max=logits.shape[-1] - 1)
+    safe_targets = targets.clamp(min=0, max=vocab_size - 1)
     target_probs = probs.gather(dim=-1, index=safe_targets.unsqueeze(-1)).squeeze(-1)
     confident = target_probs > confident_threshold
     labels[confident] = 0

@@ -152,7 +152,7 @@ class TestExtractUqFeatures:
         norms = collector.get_norms()
 
         with torch.no_grad():
-            features = extract_uq_features(norms, logits, uq_cfg)
+            features, _probs = extract_uq_features(norms, logits, uq_cfg)
         assert features.shape == (2, 8, 8)
 
     def test_slope_formula(self):
@@ -165,7 +165,7 @@ class TestExtractUqFeatures:
         }
         logits = torch.zeros(1, 2, 10)
         cfg = UqFeatureConfig(norm_layers=[0, 1, 2, 3], top_k=5)
-        features = extract_uq_features(norms, logits, cfg)
+        features, _probs = extract_uq_features(norms, logits, cfg)
 
         f1, f4 = 1.0, 4.0
         f2, f3 = 2.0, 3.0
@@ -178,7 +178,7 @@ class TestExtractUqFeatures:
         logits = torch.zeros(1, 1, vocab)
         norms = {i: torch.ones(1, 1) for i in range(4)}
         cfg = UqFeatureConfig(norm_layers=[0, 1, 2, 3], top_k=10)
-        features = extract_uq_features(norms, logits, cfg)
+        features, _probs = extract_uq_features(norms, logits, cfg)
         expected = math.log(vocab)
         assert features[0, 0, 5].item() == pytest.approx(expected, abs=1e-3)
 
@@ -188,14 +188,14 @@ class TestExtractUqFeatures:
         logits[0, 0, 0] = 1000.0
         norms = {i: torch.ones(1, 1) for i in range(4)}
         cfg = UqFeatureConfig(norm_layers=[0, 1, 2, 3], top_k=10)
-        features = extract_uq_features(norms, logits, cfg)
+        features, _probs = extract_uq_features(norms, logits, cfg)
         assert features[0, 0, 5].item() < 1e-3
 
     def test_f8_always_zero(self):
         logits = torch.randn(2, 4, 50)
         norms = {i: torch.ones(2, 4) for i in range(4)}
         cfg = UqFeatureConfig(norm_layers=[0, 1, 2, 3], top_k=10)
-        features = extract_uq_features(norms, logits, cfg)
+        features, _probs = extract_uq_features(norms, logits, cfg)
         assert (features[..., 7] == 0).all()
 
 
@@ -390,12 +390,12 @@ class TestEndToEnd:
             norms = collector.get_norms()
 
             with torch.no_grad():
-                features = extract_uq_features(norms, logits.detach(), uq_cfg)
+                features, uq_probs = extract_uq_features(norms, logits.detach(), uq_cfg)
                 class_labels, conf_targets = compute_pseudo_labels(
-                    logits.detach(), targets, features,
+                    logits.detach(), targets, features, probs=uq_probs,
                 )
 
-            class_logits, confidence = uq_head(features.detach())
+            class_logits, confidence = uq_head(features)
             loss = compute_uq_loss(
                 class_logits, confidence, class_labels, conf_targets,
             )
@@ -439,12 +439,12 @@ class TestEndToEnd:
 
         # UQ features and loss on augmented sequence
         with torch.no_grad():
-            features = extract_uq_features(norms, logits.detach(), uq_cfg)
+            features, uq_probs = extract_uq_features(norms, logits.detach(), uq_cfg)
             # Use real targets for non-think positions, 0 for think positions
             uq_targets = aug_targets.clone()
             uq_targets[uq_targets == -100] = 0
             class_labels, conf_targets = compute_pseudo_labels(
-                logits.detach(), uq_targets, features,
+                logits.detach(), uq_targets, features, probs=uq_probs,
             )
 
         class_logits, confidence = uq_head(features.detach())
