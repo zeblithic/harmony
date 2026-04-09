@@ -295,7 +295,6 @@ mod tests {
         assert!(bl.is_blocked(&MAC_A, t0));
     }
 
-    // Note: MAC_B is defined but used in later tests (Task 2+). Suppress dead_code warning.
     #[test]
     fn different_macs_tracked_independently() {
         let config = BlacklistConfig {
