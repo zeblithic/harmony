@@ -290,6 +290,13 @@ impl InferenceEngine for HarmonyEngine {
             .and_then(|v| v.to_bool().ok())
             .unwrap_or(false);
         if enabled {
+            let think_token_id = self.config.think_token_id.ok_or_else(|| {
+                InferenceError::InvalidGguf(
+                    "harmony.continuous_thought.enabled=true but \
+                     think_token_id key is missing from GGUF metadata"
+                        .into(),
+                )
+            })?;
             let max_steps = content
                 .metadata
                 .get("harmony.continuous_thought.max_steps")
@@ -301,7 +308,7 @@ impl InferenceEngine for HarmonyEngine {
                 .and_then(|v| v.to_f32().ok())
                 .unwrap_or(0.85);
             self.thought_config = ContinuousThoughtConfig {
-                think_token_id: self.config.think_token_id,
+                think_token_id: Some(think_token_id),
                 max_think_steps: max_steps,
                 confidence_threshold: threshold,
             };
