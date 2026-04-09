@@ -108,6 +108,17 @@ def _save_thought_norm(
     torch.save(thought_norm.state_dict(), path)
 
 
+def _save_uq_head(
+    uq_head: torch.nn.Module,
+    step: int,
+    output_dir: str,
+) -> None:
+    """Save UQ head weights alongside the model checkpoint."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"uq_head_step_{step}.pt")
+    torch.save(uq_head.state_dict(), path)
+
+
 def load_checkpoint(
     model: HarmonyModel,
     output_dir: str,
@@ -238,6 +249,14 @@ def main() -> None:
         "--ct-max-steps", type=int, default=4,
         help="Max thought steps for COCONUT curriculum (default: 4)",
     )
+    parser.add_argument(
+        "--uq-head", action="store_true",
+        help="Enable UQ head training (auxiliary uncertainty classification task)",
+    )
+    parser.add_argument(
+        "--uq-loss-weight", type=float, default=0.1,
+        help="Weight for UQ auxiliary loss (default: 0.1)",
+    )
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -319,9 +338,21 @@ def main() -> None:
             f"ct_max_steps={args.ct_max_steps}"
         )
 
+    # UQ head setup
+    uq_head = None
+    uq_feature_config = None
+    if args.uq_head:
+        from ct87.uq import UqHead, UqFeatureConfig
+        uq_head = UqHead().to(device)
+        uq_feature_config = UqFeatureConfig.for_num_layers(config.num_layers)
+        uq_param_count = sum(p.numel() for p in uq_head.parameters())
+        print(f"UQ head enabled: {uq_param_count} params, loss_weight={args.uq_loss_weight}")
+
     muon_params, adam_params = partition_params(model)
     if thought_norm is not None:
         adam_params.extend(thought_norm.parameters())
+    if uq_head is not None:
+        adam_params.extend(uq_head.parameters())
     optimizer = Muon(muon_params, adam_params, lr=args.lr, adam_lr=args.lr)
     schedule = WSDSchedule(warmup_steps=args.warmup, total_steps=args.steps)
 
@@ -341,7 +372,7 @@ def main() -> None:
         csv_file = open(args.log_file, "a", newline="")
         csv_writer = csv.writer(csv_file)
         if os.path.getsize(args.log_file) == 0:
-            csv_writer.writerow(["step", "loss", "val_loss", "lr", "grad_norm", "dt_ms"])
+            csv_writer.writerow(["step", "loss", "uq_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"])
 
     try:
         for step in range(args.steps):
@@ -351,6 +382,7 @@ def main() -> None:
             optimizer.zero_grad()
 
             accum_loss = 0.0
+            accum_uq_loss = 0.0
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
             for micro_step in range(args.grad_accum_steps):
                 batch = next(dataloader).to(device)
@@ -364,14 +396,36 @@ def main() -> None:
                         engram_emb = engram_table.lookup_batch(input_ids)
 
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-                    if args.coconut and num_thoughts > 0:
+                    # Forward pass (optionally with LayerNormCollector for UQ)
+                    think_mask = None
+                    if uq_head is not None:
+                        from ct87.uq import (
+                            LayerNormCollector, extract_uq_features,
+                            compute_pseudo_labels, compute_uq_loss,
+                        )
+                        with LayerNormCollector(model, uq_feature_config.norm_layers) as collector:
+                            if args.coconut and num_thoughts > 0:
+                                from ct87.coconut import coconut_forward, coconut_loss
+                                logits, think_mask = coconut_forward(
+                                    model, thought_norm, input_ids,
+                                    args.think_token_id, num_thoughts,
+                                    engram_embeddings=engram_emb,
+                                )
+                            else:
+                                logits = model(input_ids, engram_embeddings=engram_emb)
+                        uq_norms = collector.get_norms()
+                    elif args.coconut and num_thoughts > 0:
                         from ct87.coconut import coconut_forward, coconut_loss
                         logits, think_mask = coconut_forward(
                             model, thought_norm, input_ids,
                             args.think_token_id, num_thoughts,
                             engram_embeddings=engram_emb,
                         )
-                        # Prepend ignore targets for think positions
+                    else:
+                        logits = model(input_ids, engram_embeddings=engram_emb)
+
+                    # Compute main LM loss
+                    if args.coconut and num_thoughts > 0:
                         think_targets = torch.full(
                             (targets.shape[0], num_thoughts), -100,
                             dtype=targets.dtype, device=targets.device,
@@ -379,8 +433,33 @@ def main() -> None:
                         aug_targets = torch.cat([think_targets, targets], dim=1)
                         loss = coconut_loss(logits, aug_targets, think_mask)
                     else:
-                        logits = model(input_ids, engram_embeddings=engram_emb)
                         loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
+
+                    # UQ auxiliary loss
+                    if uq_head is not None:
+                        with torch.no_grad():
+                            uq_features = extract_uq_features(
+                                uq_norms, logits.detach(), uq_feature_config,
+                            )
+                            # For COCONUT: use 0 as target at think positions
+                            if args.coconut and num_thoughts > 0:
+                                uq_targets = aug_targets.clone()
+                                uq_targets[uq_targets == -100] = 0
+                            else:
+                                uq_targets = targets
+                            uq_class_labels, uq_conf_targets = compute_pseudo_labels(
+                                logits.detach(), uq_targets, uq_features,
+                            )
+
+                        uq_class_logits, uq_confidence = uq_head(uq_features.detach())
+                        uq_loss_val = compute_uq_loss(
+                            uq_class_logits, uq_confidence,
+                            uq_class_labels, uq_conf_targets,
+                            think_mask=think_mask,
+                        )
+                        loss = loss + args.uq_loss_weight * uq_loss_val
+                        accum_uq_loss += uq_loss_val.item()
+
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
 
@@ -389,6 +468,8 @@ def main() -> None:
                 all_params = list(model.parameters())
                 if thought_norm is not None:
                     all_params.extend(thought_norm.parameters())
+                if uq_head is not None:
+                    all_params.extend(uq_head.parameters())
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     all_params, args.max_grad_norm,
                 ).item()
@@ -401,13 +482,19 @@ def main() -> None:
 
             if step % 10 == 0:
                 ct_str = f"  thoughts={num_thoughts}" if args.coconut else ""
-                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}{ct_str}")
+                uq_str = ""
+                if uq_head is not None:
+                    raw_uq = accum_uq_loss / args.grad_accum_steps
+                    uq_str = f"  uq_loss={raw_uq:.4f}"
+                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}{ct_str}{uq_str}")
 
             val_loss_str = ""
             if args.save_every > 0 and step > 0 and step % args.save_every == 0:
                 save_checkpoint(model, optimizer, step, args.output_dir)
                 if thought_norm is not None:
                     _save_thought_norm(thought_norm, step, args.output_dir)
+                if uq_head is not None:
+                    _save_uq_head(uq_head, step, args.output_dir)
                 print(f"  -> checkpoint saved at step {step}")
                 if val_loader is not None:
                     val_loss = compute_validation_loss(
@@ -421,12 +508,17 @@ def main() -> None:
                     print(f"  -> val_loss={val_loss:.4f}")
 
             if step % 10 == 0 and csv_writer is not None:
+                uq_loss_str = ""
+                if uq_head is not None:
+                    uq_loss_str = f"{accum_uq_loss / args.grad_accum_steps:.6f}"
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
+                    uq_loss_str,
                     val_loss_str,
                     f"{current_lr:.8f}",
                     f"{grad_norm:.6f}" if grad_norm is not None else "",
+                    num_thoughts,
                     f"{dt_ms:.1f}",
                 ])
                 csv_file.flush()
@@ -434,6 +526,8 @@ def main() -> None:
         save_checkpoint(model, optimizer, args.steps, args.output_dir)
         if thought_norm is not None:
             _save_thought_norm(thought_norm, args.steps, args.output_dir)
+        if uq_head is not None:
+            _save_uq_head(uq_head, args.steps, args.output_dir)
         if val_loader is not None:
             val_loss = compute_validation_loss(
                 model, val_loader, config.vocab_size, device,
