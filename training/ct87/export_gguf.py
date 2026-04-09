@@ -67,6 +67,23 @@ def build_thought_norm_map() -> dict[str, str]:
     }
 
 
+def build_uq_head_map() -> dict[str, str]:
+    """Build naming map for UQ head weights (uncertainty quantification).
+
+    Weight tensors are transposed during export to match the Rust UqHead's
+    ``[in_features, out_features]`` matmul convention (``features.matmul(&weight)``).
+    PyTorch stores ``[out_features, in_features]``.
+    """
+    return {
+        "classifier_fc1.weight": "harmony.uq.classifier.fc1.weight",
+        "classifier_fc1.bias": "harmony.uq.classifier.fc1.bias",
+        "classifier_fc2.weight": "harmony.uq.classifier.fc2.weight",
+        "classifier_fc2.bias": "harmony.uq.classifier.fc2.bias",
+        "confidence_linear.weight": "harmony.uq.confidence.weight",
+        "confidence_linear.bias": "harmony.uq.confidence.bias",
+    }
+
+
 def write_metadata(
     writer: GGUFWriter, config: HarmonyModelConfig, name: str,
 ) -> None:
@@ -123,6 +140,7 @@ def export_gguf(
     output_path: str | Path,
     name: str | None = None,
     thought_norm_state: dict[str, torch.Tensor] | None = None,
+    uq_head_state: dict[str, torch.Tensor] | None = None,
 ) -> None:
     """Export a ct87 state_dict to GGUF format.
 
@@ -133,6 +151,8 @@ def export_gguf(
         name: Optional model name for metadata. Defaults to "ct87".
         thought_norm_state: Optional ThoughtNorm state_dict for COCONUT
             continuous thought. Only provided for CT-trained models.
+        uq_head_state: Optional UQ head state_dict for uncertainty
+            quantification. Only provided for UQ-trained models.
 
     Raises:
         ValueError: If state_dict keys don't match expected keys for config.
@@ -187,6 +207,43 @@ def export_gguf(
             arr = t.numpy() if t.ndim > 0 else t.unsqueeze(0).numpy()
             writer.add_tensor(gguf_name, arr)
 
+    # UQ head weights (uncertainty quantification)
+    if uq_head_state is not None:
+        uq_map = build_uq_head_map()
+        expected_uq = set(uq_map.keys())
+        actual_uq = set(uq_head_state.keys())
+        if expected_uq != actual_uq:
+            raise ValueError(
+                f"UQ head state_dict mismatch. "
+                f"Expected: {sorted(expected_uq)}, got: {sorted(actual_uq)}"
+            )
+        expected_shapes = {
+            "classifier_fc1.weight": (32, 8),
+            "classifier_fc1.bias": (32,),
+            "classifier_fc2.weight": (4, 32),
+            "classifier_fc2.bias": (4,),
+            "confidence_linear.weight": (1, 8),
+            "confidence_linear.bias": (1,),
+        }
+        for key, expected_shape in expected_shapes.items():
+            actual_shape = tuple(uq_head_state[key].shape)
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"UQ head tensor {key} has shape {actual_shape}, "
+                    f"expected {expected_shape}"
+                )
+        writer.add_bool("harmony.uq.enabled", True)
+        writer.add_uint32("harmony.uq.num_features", 8)
+        writer.add_uint32("harmony.uq.hidden_dim", 32)
+        writer.add_uint32("harmony.uq.num_classes", 4)
+        for pytorch_key, gguf_name in uq_map.items():
+            t = uq_head_state[pytorch_key].detach().cpu().float()
+            # Transpose 2D weights: PyTorch [out, in] -> Rust [in, out]
+            if t.ndim == 2:
+                t = t.T.contiguous()
+            arr = t.numpy()
+            writer.add_tensor(gguf_name, arr)
+
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -220,6 +277,10 @@ def main() -> None:
         "--ct-confidence-threshold", type=float, default=0.85,
         help="Confidence threshold for continuous thought (default: 0.85)",
     )
+    parser.add_argument(
+        "--uq-head", type=str, default=None,
+        help="Path to UQ head checkpoint (uq_head_step_*.pt) for export",
+    )
     args = parser.parse_args()
 
     if args.thought_norm is not None and args.think_token_id is None:
@@ -246,7 +307,15 @@ def main() -> None:
     if args.thought_norm is not None:
         thought_norm_state = torch.load(args.thought_norm, map_location="cpu", weights_only=True)
 
-    export_gguf(state_dict, config, args.output, name, thought_norm_state=thought_norm_state)
+    uq_head_state = None
+    if args.uq_head is not None:
+        uq_head_state = torch.load(args.uq_head, map_location="cpu", weights_only=True)
+
+    export_gguf(
+        state_dict, config, args.output, name,
+        thought_norm_state=thought_norm_state,
+        uq_head_state=uq_head_state,
+    )
     print(f"Exported to {args.output}")
 
 

@@ -274,15 +274,50 @@ class TestCsvLogging:
                 reader = csv.reader(f)
                 rows = list(reader)
 
-            assert rows[0] == ["step", "loss", "val_loss", "lr", "grad_norm", "dt_ms"]
+            assert rows[0] == ["step", "loss", "uq_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
             data_rows = rows[1:]
             # Steps 0, 10, 20 -> 3 data rows (print every 10 steps)
             assert len(data_rows) == 3
             for row in data_rows:
-                assert len(row) == 6
+                assert len(row) == 8
                 int(row[0])    # step is an integer
                 float(row[1])  # loss
-                assert row[2] == ""  # val_loss empty (no --val-data)
-                float(row[3])  # lr
-                float(row[4])  # grad_norm
-                float(row[5])  # dt_ms
+                assert row[2] == ""  # uq_loss empty (no --uq-head)
+                assert row[3] == ""  # val_loss empty (no --val-data)
+                float(row[4])  # lr
+                float(row[5])  # grad_norm
+                int(row[6])    # num_thoughts
+                float(row[7])  # dt_ms
+
+    def test_csv_with_uq_head(self):
+        """CSV log file has populated uq_loss when --uq-head is enabled."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = os.path.join(tmpdir, "train.csv")
+            checkpoint_dir = os.path.join(tmpdir, "ckpt")
+            training_dir = os.path.join(os.path.dirname(__file__), "..")
+
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "ct87.train",
+                    "--synthetic", "--config", "tiny",
+                    "--steps", "30", "--save-every", "0",
+                    "--log-file", log_path,
+                    "--dtype", "float32",
+                    "--output-dir", checkpoint_dir,
+                    "--uq-head",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=training_dir,
+            )
+            assert result.returncode == 0, f"Training failed:\n{result.stderr}"
+
+            with open(log_path) as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+
+            data_rows = rows[1:]
+            assert len(data_rows) == 3
+            for row in data_rows:
+                assert len(row) == 8
+                float(row[2])  # uq_loss should be a real number
