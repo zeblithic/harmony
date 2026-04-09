@@ -33,6 +33,12 @@ class UqFeatureConfig:
     norm_layers: list[int]  # 4 layer indices for L2 norm sampling
     top_k: int = 10  # top-k for probability mass feature (f7)
 
+    def __post_init__(self) -> None:
+        if len(self.norm_layers) != 4:
+            raise ValueError("norm_layers must contain exactly 4 indices")
+        if self.top_k < 1:
+            raise ValueError("top_k must be >= 1")
+
     @staticmethod
     def for_num_layers(n: int) -> UqFeatureConfig:
         """Derive config from layer count. Matches Rust for_num_layers."""

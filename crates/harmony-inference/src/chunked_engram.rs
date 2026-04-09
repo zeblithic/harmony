@@ -107,9 +107,10 @@ impl ChunkedEngramScheduler {
     ///
     /// # Panics
     ///
-    /// Panics if `config.chunk_size` is 0.
+    /// Panics if `config.chunk_size` is 0 or `config.max_window` is 0.
     pub fn new(config: ChunkedEngramConfig) -> Self {
         assert!(config.chunk_size >= 1, "chunk_size must be >= 1");
+        assert!(config.max_window >= 1, "max_window must be >= 1");
         Self {
             config,
             token_buffer: VecDeque::new(),
@@ -202,13 +203,14 @@ impl ChunkedEngramScheduler {
 
         // Extract last position: [1, 1, engram_dim].
         let seq_len = request.seq_len;
-        let last_embedding = if seq_len > 0 {
-            embeddings
-                .narrow(1, seq_len - 1, 1)
-                .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))?
-        } else {
-            embeddings
-        };
+        if seq_len == 0 {
+            return Err(InferenceError::EngramResolutionFailed(
+                "empty token window — cannot resolve embedding".into(),
+            ));
+        }
+        let last_embedding = embeddings
+            .narrow(1, seq_len - 1, 1)
+            .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))?;
 
         self.cached_embedding = Some(last_embedding);
         self.steps_since_refresh = 0;
@@ -315,6 +317,15 @@ mod tests {
     #[should_panic(expected = "chunk_size must be >= 1")]
     fn chunk_size_zero_panics() {
         ChunkedEngramConfig::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_window must be >= 1")]
+    fn max_window_zero_panics() {
+        ChunkedEngramScheduler::new(ChunkedEngramConfig {
+            chunk_size: 4,
+            max_window: 0,
+        });
     }
 
     #[test]

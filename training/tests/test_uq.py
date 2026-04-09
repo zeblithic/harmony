@@ -3,7 +3,6 @@
 import math
 
 import torch
-import torch.nn.functional as F
 import pytest
 
 from ct87.model import HarmonyModel, HarmonyModelConfig
@@ -380,10 +379,10 @@ class TestEndToEnd:
 
         optimizer = torch.optim.Adam(uq_head.parameters(), lr=1e-3)
 
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+        targets = torch.randint(0, cfg.vocab_size, (2, 8))
         losses = []
         for _ in range(20):
-            input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
-            targets = torch.randint(0, cfg.vocab_size, (2, 8))
 
             with LayerNormCollector(model, uq_cfg.norm_layers) as collector:
                 logits = model(input_ids=input_ids)

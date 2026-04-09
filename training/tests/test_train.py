@@ -267,6 +267,7 @@ class TestCsvLogging:
                 capture_output=True,
                 text=True,
                 cwd=training_dir,
+                timeout=120,
             )
             assert result.returncode == 0, f"Training failed:\n{result.stderr}"
 
@@ -309,6 +310,7 @@ class TestCsvLogging:
                 capture_output=True,
                 text=True,
                 cwd=training_dir,
+                timeout=120,
             )
             assert result.returncode == 0, f"Training failed:\n{result.stderr}"
 

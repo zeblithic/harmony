@@ -14,6 +14,7 @@ from gguf import GGUFWriter
 from safetensors.torch import load_file
 
 from ct87.model import HarmonyModelConfig
+from ct87.uq import UqHead
 
 
 def build_naming_map(config: HarmonyModelConfig) -> dict[str, str]:
@@ -218,11 +219,11 @@ def export_gguf(
                 f"Expected: {sorted(expected_uq)}, got: {sorted(actual_uq)}"
             )
         expected_shapes = {
-            "classifier_fc1.weight": (32, 8),
-            "classifier_fc1.bias": (32,),
-            "classifier_fc2.weight": (4, 32),
-            "classifier_fc2.bias": (4,),
-            "confidence_linear.weight": (1, 8),
+            "classifier_fc1.weight": (UqHead.HIDDEN_DIM, UqHead.NUM_FEATURES),
+            "classifier_fc1.bias": (UqHead.HIDDEN_DIM,),
+            "classifier_fc2.weight": (UqHead.NUM_CLASSES, UqHead.HIDDEN_DIM),
+            "classifier_fc2.bias": (UqHead.NUM_CLASSES,),
+            "confidence_linear.weight": (1, UqHead.NUM_FEATURES),
             "confidence_linear.bias": (1,),
         }
         for key, expected_shape in expected_shapes.items():
@@ -233,9 +234,9 @@ def export_gguf(
                     f"expected {expected_shape}"
                 )
         writer.add_bool("harmony.uq.enabled", True)
-        writer.add_uint32("harmony.uq.num_features", 8)
-        writer.add_uint32("harmony.uq.hidden_dim", 32)
-        writer.add_uint32("harmony.uq.num_classes", 4)
+        writer.add_uint32("harmony.uq.num_features", UqHead.NUM_FEATURES)
+        writer.add_uint32("harmony.uq.hidden_dim", UqHead.HIDDEN_DIM)
+        writer.add_uint32("harmony.uq.num_classes", UqHead.NUM_CLASSES)
         for pytorch_key, gguf_name in uq_map.items():
             t = uq_head_state[pytorch_key].detach().cpu().float()
             # Transpose 2D weights: PyTorch [out, in] -> Rust [in, out]
