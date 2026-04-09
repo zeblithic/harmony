@@ -379,142 +379,168 @@ mod tests {
 
     #[test]
     fn initiator_emits_tunnel_init_on_creation() {
-        let (initiator_id, responder_id) = create_test_identities();
-        let responder_pub = responder_id.public_identity();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (initiator_id, responder_id) = create_test_identities();
+                let responder_pub = responder_id.public_identity();
 
-        let (session, actions) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0).unwrap();
+                let (session, actions) =
+                    TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0)
+                        .unwrap();
 
-        assert_eq!(session.state(), TunnelState::Initiating);
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], TunnelAction::OutboundBytes { .. }));
+                assert_eq!(session.state(), TunnelState::Initiating);
+                assert_eq!(actions.len(), 1);
+                assert!(matches!(&actions[0], TunnelAction::OutboundBytes { .. }));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     #[test]
     fn initiator_completes_handshake_on_valid_accept() {
-        let (initiator_id, responder_id) = create_test_identities();
-        let responder_pub = responder_id.public_identity();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (initiator_id, responder_id) = create_test_identities();
+                let responder_pub = responder_id.public_identity();
 
-        // Initiator sends TunnelInit
-        let (mut initiator, init_actions) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0).unwrap();
+                // Initiator sends TunnelInit
+                let (mut initiator, init_actions) =
+                    TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0)
+                        .unwrap();
 
-        // Extract the TunnelInit bytes
-        let init_bytes = match &init_actions[0] {
-            TunnelAction::OutboundBytes { data } => data.clone(),
-            _ => panic!("expected OutboundBytes"),
-        };
+                // Extract the TunnelInit bytes
+                let init_bytes = match &init_actions[0] {
+                    TunnelAction::OutboundBytes { data } => data.clone(),
+                    _ => panic!("expected OutboundBytes"),
+                };
 
-        // Responder processes TunnelInit and creates TunnelAccept
-        let (responder, accept_actions) =
-            TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes, 0).unwrap();
+                // Responder processes TunnelInit and creates TunnelAccept
+                let (responder, accept_actions) =
+                    TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes, 0)
+                        .unwrap();
 
-        assert_eq!(responder.state(), TunnelState::Active);
+                assert_eq!(responder.state(), TunnelState::Active);
 
-        // Extract the TunnelAccept bytes
-        let accept_bytes = accept_actions
-            .iter()
-            .find_map(|a| match a {
-                TunnelAction::OutboundBytes { data } => Some(data.clone()),
-                _ => None,
+                // Extract the TunnelAccept bytes
+                let accept_bytes = accept_actions
+                    .iter()
+                    .find_map(|a| match a {
+                        TunnelAction::OutboundBytes { data } => Some(data.clone()),
+                        _ => None,
+                    })
+                    .expect("responder should emit OutboundBytes");
+
+                // Initiator processes TunnelAccept
+                let actions = initiator
+                    .handle_event(TunnelEvent::InboundBytes {
+                        data: accept_bytes,
+                        now_ms: 0,
+                    })
+                    .unwrap();
+
+                assert_eq!(initiator.state(), TunnelState::Active);
+                assert!(actions
+                    .iter()
+                    .any(|a| matches!(a, TunnelAction::HandshakeComplete { .. })));
             })
-            .expect("responder should emit OutboundBytes");
-
-        // Initiator processes TunnelAccept
-        let actions = initiator
-            .handle_event(TunnelEvent::InboundBytes {
-                data: accept_bytes,
-                now_ms: 0,
-            })
-            .unwrap();
-
-        assert_eq!(initiator.state(), TunnelState::Active);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, TunnelAction::HandshakeComplete { .. })));
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     #[test]
     fn paired_machines_exchange_data() {
-        let (initiator_id, responder_id) = create_test_identities();
-        let responder_pub = responder_id.public_identity().clone();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (initiator_id, responder_id) = create_test_identities();
+                let responder_pub = responder_id.public_identity().clone();
 
-        // Complete handshake
-        let (mut initiator, init_actions) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, &responder_pub, 0).unwrap();
+                // Complete handshake
+                let (mut initiator, init_actions) =
+                    TunnelSession::new_initiator(&mut OsRng, &initiator_id, &responder_pub, 0)
+                        .unwrap();
 
-        let init_bytes = match &init_actions[0] {
-            TunnelAction::OutboundBytes { data } => data.clone(),
-            _ => panic!("expected OutboundBytes"),
-        };
+                let init_bytes = match &init_actions[0] {
+                    TunnelAction::OutboundBytes { data } => data.clone(),
+                    _ => panic!("expected OutboundBytes"),
+                };
 
-        let (mut responder, accept_actions) =
-            TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes, 0).unwrap();
+                let (mut responder, accept_actions) =
+                    TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes, 0)
+                        .unwrap();
 
-        let accept_bytes = accept_actions
-            .iter()
-            .find_map(|a| match a {
-                TunnelAction::OutboundBytes { data } => Some(data.clone()),
-                _ => None,
+                let accept_bytes = accept_actions
+                    .iter()
+                    .find_map(|a| match a {
+                        TunnelAction::OutboundBytes { data } => Some(data.clone()),
+                        _ => None,
+                    })
+                    .unwrap();
+
+                initiator
+                    .handle_event(TunnelEvent::InboundBytes {
+                        data: accept_bytes,
+                        now_ms: 0,
+                    })
+                    .unwrap();
+
+                // Initiator sends Reticulum packet to responder
+                let actions = initiator
+                    .handle_event(TunnelEvent::SendReticulum {
+                        packet: b"hello-reticulum".to_vec(),
+                        now_ms: 0,
+                    })
+                    .unwrap();
+
+                let encrypted = match &actions[0] {
+                    TunnelAction::OutboundBytes { data } => data.clone(),
+                    _ => panic!("expected OutboundBytes"),
+                };
+
+                let actions = responder
+                    .handle_event(TunnelEvent::InboundBytes {
+                        data: encrypted,
+                        now_ms: 0,
+                    })
+                    .unwrap();
+
+                assert!(matches!(
+                    &actions[0],
+                    TunnelAction::ReticulumReceived { packet } if packet == b"hello-reticulum"
+                ));
+
+                // Responder sends Zenoh message back to initiator
+                let actions = responder
+                    .handle_event(TunnelEvent::SendZenoh {
+                        message: b"hello-zenoh".to_vec(),
+                        now_ms: 0,
+                    })
+                    .unwrap();
+
+                let encrypted = match &actions[0] {
+                    TunnelAction::OutboundBytes { data } => data.clone(),
+                    _ => panic!("expected OutboundBytes"),
+                };
+
+                let actions = initiator
+                    .handle_event(TunnelEvent::InboundBytes {
+                        data: encrypted,
+                        now_ms: 0,
+                    })
+                    .unwrap();
+
+                assert!(matches!(
+                    &actions[0],
+                    TunnelAction::ZenohReceived { message } if message == b"hello-zenoh"
+                ));
             })
-            .unwrap();
-
-        initiator
-            .handle_event(TunnelEvent::InboundBytes {
-                data: accept_bytes,
-                now_ms: 0,
-            })
-            .unwrap();
-
-        // Initiator sends Reticulum packet to responder
-        let actions = initiator
-            .handle_event(TunnelEvent::SendReticulum {
-                packet: b"hello-reticulum".to_vec(),
-                now_ms: 0,
-            })
-            .unwrap();
-
-        let encrypted = match &actions[0] {
-            TunnelAction::OutboundBytes { data } => data.clone(),
-            _ => panic!("expected OutboundBytes"),
-        };
-
-        let actions = responder
-            .handle_event(TunnelEvent::InboundBytes {
-                data: encrypted,
-                now_ms: 0,
-            })
-            .unwrap();
-
-        assert!(matches!(
-            &actions[0],
-            TunnelAction::ReticulumReceived { packet } if packet == b"hello-reticulum"
-        ));
-
-        // Responder sends Zenoh message back to initiator
-        let actions = responder
-            .handle_event(TunnelEvent::SendZenoh {
-                message: b"hello-zenoh".to_vec(),
-                now_ms: 0,
-            })
-            .unwrap();
-
-        let encrypted = match &actions[0] {
-            TunnelAction::OutboundBytes { data } => data.clone(),
-            _ => panic!("expected OutboundBytes"),
-        };
-
-        let actions = initiator
-            .handle_event(TunnelEvent::InboundBytes {
-                data: encrypted,
-                now_ms: 0,
-            })
-            .unwrap();
-
-        assert!(matches!(
-            &actions[0],
-            TunnelAction::ZenohReceived { message } if message == b"hello-zenoh"
-        ));
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     /// Helper: perform a full handshake and return (initiator, responder) both in Active state.
@@ -563,194 +589,248 @@ mod tests {
 
     #[test]
     fn truncated_tunnel_init_rejected() {
-        let (_initiator_id, responder_id) = create_test_identities();
-        let result = TunnelSession::new_responder(&mut OsRng, &responder_id, &[0u8; 100], 0);
-        assert!(result.is_err(), "expected error for truncated/garbage init");
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (_initiator_id, responder_id) = create_test_identities();
+                let result =
+                    TunnelSession::new_responder(&mut OsRng, &responder_id, &[0u8; 100], 0);
+                assert!(result.is_err(), "expected error for truncated/garbage init");
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     #[test]
     fn wrong_responder_identity_rejected() {
-        let (initiator_id, responder_id) = create_test_identities();
-        let responder_pub = responder_id.public_identity().clone();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (initiator_id, responder_id) = create_test_identities();
+                let responder_pub = responder_id.public_identity().clone();
 
-        // Initiator expects `responder_id` to respond
-        let (mut initiator, init_actions) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, &responder_pub, 0).unwrap();
+                // Initiator expects `responder_id` to respond
+                let (mut initiator, init_actions) =
+                    TunnelSession::new_initiator(&mut OsRng, &initiator_id, &responder_pub, 0)
+                        .unwrap();
 
-        let init_bytes = match &init_actions[0] {
-            TunnelAction::OutboundBytes { data } => data.clone(),
-            _ => panic!("expected OutboundBytes"),
-        };
+                let init_bytes = match &init_actions[0] {
+                    TunnelAction::OutboundBytes { data } => data.clone(),
+                    _ => panic!("expected OutboundBytes"),
+                };
 
-        // Impersonator intercepts and replies with its own identity
-        let impersonator_id = harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
-        let (_impersonator_session, accept_actions) =
-            TunnelSession::new_responder(&mut OsRng, &impersonator_id, &init_bytes, 0).unwrap();
+                // Impersonator intercepts and replies with its own identity
+                let impersonator_id =
+                    harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
+                let (_impersonator_session, accept_actions) =
+                    TunnelSession::new_responder(&mut OsRng, &impersonator_id, &init_bytes, 0)
+                        .unwrap();
 
-        let impersonator_accept_bytes = accept_actions
-            .iter()
-            .find_map(|a| match a {
-                TunnelAction::OutboundBytes { data } => Some(data.clone()),
-                _ => None,
+                let impersonator_accept_bytes = accept_actions
+                    .iter()
+                    .find_map(|a| match a {
+                        TunnelAction::OutboundBytes { data } => Some(data.clone()),
+                        _ => None,
+                    })
+                    .unwrap();
+
+                // Initiator must reject — pubkey doesn't match expected responder
+                let result = initiator.handle_event(TunnelEvent::InboundBytes {
+                    data: impersonator_accept_bytes,
+                    now_ms: 0,
+                });
+                assert!(
+                    result.is_err(),
+                    "initiator must reject impersonator's accept"
+                );
             })
-            .unwrap();
-
-        // Initiator must reject — pubkey doesn't match expected responder
-        let result = initiator.handle_event(TunnelEvent::InboundBytes {
-            data: impersonator_accept_bytes,
-            now_ms: 0,
-        });
-        assert!(
-            result.is_err(),
-            "initiator must reject impersonator's accept"
-        );
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     #[test]
     fn send_before_handshake_fails() {
-        let (initiator_id, responder_id) = create_test_identities();
-        let responder_pub = responder_id.public_identity();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (initiator_id, responder_id) = create_test_identities();
+                let responder_pub = responder_id.public_identity();
 
-        let (mut initiator, _) =
-            TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0).unwrap();
+                let (mut initiator, _) =
+                    TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0)
+                        .unwrap();
 
-        // State is Initiating — sending data must fail
-        let result = initiator.handle_event(TunnelEvent::SendReticulum {
-            packet: b"early".to_vec(),
-            now_ms: 0,
-        });
-        assert!(
-            result.is_err(),
-            "SendReticulum before handshake must return error"
-        );
-        assert_eq!(initiator.state(), TunnelState::Initiating);
+                // State is Initiating — sending data must fail
+                let result = initiator.handle_event(TunnelEvent::SendReticulum {
+                    packet: b"early".to_vec(),
+                    now_ms: 0,
+                });
+                assert!(
+                    result.is_err(),
+                    "SendReticulum before handshake must return error"
+                );
+                assert_eq!(initiator.state(), TunnelState::Initiating);
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     // ── Task 7: Keepalive and Timeout Tests ──────────────────────────────────
 
     #[test]
     fn keepalive_sent_after_jittered_interval() {
-        let (mut initiator, _responder, _iid, _rid) = complete_handshake();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut initiator, _responder, _iid, _rid) = complete_handshake();
 
-        // Session created with now_ms=0, so last_sent_ms=0.
-        // Jitter is session-unique (mixed with remote_node_id), so the exact
-        // interval is unpredictable. The range is always [25_000, 35_000]ms.
+                // Session created with now_ms=0, so last_sent_ms=0.
+                // Jitter is session-unique (mixed with remote_node_id), so the exact
+                // interval is unpredictable. The range is always [25_000, 35_000]ms.
 
-        // Tick at t=0: 0ms elapsed, no keepalive
-        let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 0 })
-            .unwrap();
-        assert!(
-            actions.is_empty(),
-            "tick at t=0 with last_sent=0 should NOT send keepalive (0ms elapsed)"
-        );
+                // Tick at t=0: 0ms elapsed, no keepalive
+                let actions = initiator
+                    .handle_event(TunnelEvent::Tick { now_ms: 0 })
+                    .unwrap();
+                assert!(
+                    actions.is_empty(),
+                    "tick at t=0 with last_sent=0 should NOT send keepalive (0ms elapsed)"
+                );
 
-        // Tick at t=15000: only 15s elapsed → no keepalive (below minimum 25s)
-        let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 15_000 })
-            .unwrap();
-        assert!(actions.is_empty(), "tick at 15s should not send keepalive");
+                // Tick at t=15000: only 15s elapsed -> no keepalive (below minimum 25s)
+                let actions = initiator
+                    .handle_event(TunnelEvent::Tick { now_ms: 15_000 })
+                    .unwrap();
+                assert!(actions.is_empty(), "tick at 15s should not send keepalive");
 
-        // Tick at t=35001: 35001ms >= max possible jittered interval (35000ms)
-        // → keepalive must be sent regardless of session-specific jitter
-        let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 35_001 })
-            .unwrap();
-        assert_eq!(
-            actions.len(),
-            1,
-            "tick at 35001ms must emit exactly one keepalive (past max jitter)"
-        );
-        assert!(
-            matches!(&actions[0], TunnelAction::OutboundBytes { .. }),
-            "keepalive must be OutboundBytes"
-        );
-        assert_eq!(initiator.last_sent_ms, 35_001);
+                // Tick at t=35001: 35001ms >= max possible jittered interval (35000ms)
+                // -> keepalive must be sent regardless of session-specific jitter
+                let actions = initiator
+                    .handle_event(TunnelEvent::Tick { now_ms: 35_001 })
+                    .unwrap();
+                assert_eq!(
+                    actions.len(),
+                    1,
+                    "tick at 35001ms must emit exactly one keepalive (past max jitter)"
+                );
+                assert!(
+                    matches!(&actions[0], TunnelAction::OutboundBytes { .. }),
+                    "keepalive must be OutboundBytes"
+                );
+                assert_eq!(initiator.last_sent_ms, 35_001);
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     #[test]
     fn dead_peer_timeout() {
-        let (mut initiator, _responder, _iid, _rid) = complete_handshake();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut initiator, _responder, _iid, _rid) = complete_handshake();
 
-        // Session created with now_ms=0, so last_received_ms=0
-        // Tick at t=110001: 110001 - 0 = 110001 >= DEAD_TIMEOUT_MS (110000)
-        let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 110_001 })
-            .unwrap();
+                // Session created with now_ms=0, so last_received_ms=0
+                // Tick at t=110001: 110001 - 0 = 110001 >= DEAD_TIMEOUT_MS (110000)
+                let actions = initiator
+                    .handle_event(TunnelEvent::Tick { now_ms: 110_001 })
+                    .unwrap();
 
-        assert_eq!(initiator.state(), TunnelState::Closed);
-        assert!(
-            actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
-            "dead peer timeout must emit Closed"
-        );
+                assert_eq!(initiator.state(), TunnelState::Closed);
+                assert!(
+                    actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
+                    "dead peer timeout must emit Closed"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     #[test]
     fn close_transitions_to_closed() {
-        let (mut initiator, _responder, _iid, _rid) = complete_handshake();
-        assert_eq!(initiator.state(), TunnelState::Active);
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut initiator, _responder, _iid, _rid) = complete_handshake();
+                assert_eq!(initiator.state(), TunnelState::Active);
 
-        let actions = initiator.handle_event(TunnelEvent::Close).unwrap();
+                let actions = initiator.handle_event(TunnelEvent::Close).unwrap();
 
-        assert_eq!(initiator.state(), TunnelState::Closed);
-        assert!(
-            actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
-            "Close must emit TunnelAction::Closed"
-        );
+                assert_eq!(initiator.state(), TunnelState::Closed);
+                assert!(
+                    actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
+                    "Close must emit TunnelAction::Closed"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     // ── Task 8: Timestamp Tracking ────────────────────────────────────────────
 
     #[test]
     fn inbound_data_resets_keepalive_timer() {
-        let (mut initiator, mut responder, _iid, _rid) = complete_handshake();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut initiator, mut responder, _iid, _rid) = complete_handshake();
 
-        // Artificially set last_received_ms as if we last heard from peer at t=1000
-        initiator.last_received_ms = 1000;
+                // Artificially set last_received_ms as if we last heard from peer at t=1000
+                initiator.last_received_ms = 1000;
 
-        // Responder sends a packet
-        let send_actions = responder
-            .handle_event(TunnelEvent::SendReticulum {
-                packet: b"ping".to_vec(),
-                now_ms: 0,
+                // Responder sends a packet
+                let send_actions = responder
+                    .handle_event(TunnelEvent::SendReticulum {
+                        packet: b"ping".to_vec(),
+                        now_ms: 0,
+                    })
+                    .unwrap();
+                let encrypted = match &send_actions[0] {
+                    TunnelAction::OutboundBytes { data } => data.clone(),
+                    _ => panic!("expected OutboundBytes"),
+                };
+
+                // Initiator receives it at now_ms=50_000 -- resets last_received_ms to 50_000
+                initiator
+                    .handle_event(TunnelEvent::InboundBytes {
+                        data: encrypted,
+                        now_ms: 50_000,
+                    })
+                    .unwrap();
+                assert_eq!(initiator.last_received_ms, 50_000);
+
+                // Tick at 50000 + 109999 = 159999: 109999ms < DEAD_TIMEOUT_MS (110000) -- NO timeout
+                let actions = initiator
+                    .handle_event(TunnelEvent::Tick { now_ms: 159_999 })
+                    .unwrap();
+                assert_ne!(
+                    initiator.state(),
+                    TunnelState::Closed,
+                    "should not timeout at 159999ms"
+                );
+                assert!(
+                    !actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
+                    "must not be closed at 159999ms"
+                );
+
+                // Tick at 50000 + 110001 = 160001: 110001ms >= DEAD_TIMEOUT_MS (110000) -- timeout
+                let actions = initiator
+                    .handle_event(TunnelEvent::Tick { now_ms: 160_001 })
+                    .unwrap();
+                assert_eq!(initiator.state(), TunnelState::Closed);
+                assert!(
+                    actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
+                    "must timeout at 160001ms"
+                );
             })
-            .unwrap();
-        let encrypted = match &send_actions[0] {
-            TunnelAction::OutboundBytes { data } => data.clone(),
-            _ => panic!("expected OutboundBytes"),
-        };
-
-        // Initiator receives it at now_ms=50_000 — resets last_received_ms to 50_000
-        initiator
-            .handle_event(TunnelEvent::InboundBytes {
-                data: encrypted,
-                now_ms: 50_000,
-            })
-            .unwrap();
-        assert_eq!(initiator.last_received_ms, 50_000);
-
-        // Tick at 50000 + 109999 = 159999: 109999ms < DEAD_TIMEOUT_MS (110000) — NO timeout
-        let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 159_999 })
-            .unwrap();
-        assert_ne!(
-            initiator.state(),
-            TunnelState::Closed,
-            "should not timeout at 159999ms"
-        );
-        assert!(
-            !actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
-            "must not be closed at 159999ms"
-        );
-
-        // Tick at 50000 + 110001 = 160001: 110001ms >= DEAD_TIMEOUT_MS (110000) — timeout
-        let actions = initiator
-            .handle_event(TunnelEvent::Tick { now_ms: 160_001 })
-            .unwrap();
-        assert_eq!(initiator.state(), TunnelState::Closed);
-        assert!(
-            actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
-            "must timeout at 160001ms"
-        );
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 }

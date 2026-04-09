@@ -14,8 +14,9 @@ use rand::Rng;
 use tracing::{debug, trace, warn};
 
 use crate::{
+    batch::{decode_batch, BatchAccumulator},
     error::RawLinkError,
-    frame::{self, BROADCAST_MAC},
+    frame::BROADCAST_MAC,
     frame_type,
     peer_table::PeerTable,
     socket::RawSocket,
@@ -95,6 +96,7 @@ impl<S: RawSocket> Bridge<S> {
         let local_mac = self.socket.local_mac();
 
         let mut consecutive_errors: u32 = 0;
+        let mut batch = BatchAccumulator::new(1500);
 
         loop {
             let now = Instant::now();
@@ -117,7 +119,7 @@ impl<S: RawSocket> Bridge<S> {
                 // 3. Process inbound L2 frames → publish to zenoh.
                 let inbound_hashes = self.process_inbound_frames(&local_mac).await?;
 
-                // 4. Drain outbound zenoh samples → broadcast as Data frames.
+                // 4. Drain outbound zenoh samples → push into batch accumulator.
                 //    Skip samples whose content hash matches something we just
                 //    published from inbound L2 (echo prevention).
                 while let Ok(Some(sample)) = subscriber.try_recv() {
@@ -126,27 +128,29 @@ impl<S: RawSocket> Bridge<S> {
                         trace!("skipping echo of L2-originated publish");
                         continue;
                     }
-                    self.process_outbound_sample(&sample)?;
+                    if let Some(payload) = self.build_outbound_data_payload(&sample) {
+                        if let Some(flushed) = batch.push(frame_type::DATA, &payload) {
+                            self.socket.send_frame(BROADCAST_MAC, &flushed)?;
+                        }
+                    }
                 }
 
-                // 5. Drain outbound Reticulum packets → broadcast as L2 frames.
+                // 5. Drain outbound Reticulum packets → push into batch accumulator.
                 if let Some(ref mut rx) = self.reticulum_outbound_rx {
                     while let Ok(packet) = rx.try_recv() {
                         if packet.len() > u16::MAX as usize {
-                            warn!(
-                                packet_len = packet.len(),
-                                "reticulum packet exceeds u16 max, dropping"
-                            );
+                            warn!(len = packet.len(), "reticulum packet exceeds u16 max, dropping");
                             continue;
                         }
-                        // Frame: [RETICULUM tag][u16 BE packet_len][packet]
-                        // The packet_len field enables receivers to strip padding.
-                        let mut frame_payload = Vec::with_capacity(1 + 2 + packet.len());
-                        frame_payload.push(frame_type::RETICULUM);
-                        frame_payload.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-                        frame_payload.extend_from_slice(&packet);
-                        self.socket.send_frame(frame::BROADCAST_MAC, &frame_payload)?;
+                        if let Some(flushed) = batch.push(frame_type::RETICULUM, &packet) {
+                            self.socket.send_frame(BROADCAST_MAC, &flushed)?;
+                        }
                     }
+                }
+
+                // 6. Flush remaining batch.
+                if let Some(flushed) = batch.flush() {
+                    self.socket.send_frame(BROADCAST_MAC, &flushed)?;
                 }
 
                 Ok(())
@@ -211,45 +215,24 @@ impl<S: RawSocket> Bridge<S> {
         let allowed_prefix = &config.subscribe_pattern;
         let reticulum_tx = &config.reticulum_inbound_tx;
 
-        socket.recv_frames(&mut |src_mac, payload| {
-            // Skip frames from ourselves (loopback on the interface).
-            if src_mac == local_mac {
-                return;
-            }
-            if payload.is_empty() {
-                return;
-            }
-
-            match payload[0] {
+        // Dispatch a single sub-frame (type byte already stripped).
+        let mut dispatch = |src_mac: &[u8; 6], frame_type_byte: u8, body: &[u8]| {
+            match frame_type_byte {
                 frame_type::RETICULUM => {
-                    // Frame: [RETICULUM tag][u16 BE packet_len][packet][padding...]
-                    if payload.len() < 1 + 2 {
-                        debug!(len = payload.len(), "reticulum frame too short, ignoring");
-                        return;
-                    }
-                    let packet_len =
-                        u16::from_be_bytes([payload[1], payload[2]]) as usize;
-                    let packet_end = 3 + packet_len;
-                    if payload.len() < packet_end {
-                        debug!(
-                            packet_len,
-                            frame_len = payload.len(),
-                            "reticulum frame truncated, ignoring"
-                        );
-                        return;
-                    }
-                    if let Some(ref reticulum_tx) = reticulum_tx {
-                        let packet = payload[3..packet_end].to_vec();
-                        let _ = reticulum_tx.try_send(packet);
+                    if !body.is_empty() {
+                        if let Some(ref reticulum_tx) = reticulum_tx {
+                            let packet = body.to_vec();
+                            let _ = reticulum_tx.try_send(packet);
+                        }
                     }
                 }
                 frame_type::SCOUT => {
-                    if payload.len() < 1 + 16 {
-                        debug!(len = payload.len(), "scout frame too short, ignoring");
+                    if body.len() < 16 {
+                        debug!(len = body.len(), "scout frame too short, ignoring");
                         return;
                     }
                     let mut identity_hash = [0u8; 16];
-                    identity_hash.copy_from_slice(&payload[1..17]);
+                    identity_hash.copy_from_slice(&body[..16]);
                     peer_table.update(identity_hash, *src_mac);
                     debug!(
                         identity = hex::encode(identity_hash),
@@ -258,31 +241,30 @@ impl<S: RawSocket> Bridge<S> {
                     );
                 }
                 frame_type::DATA => {
-                    // Data payload:
-                    //   [DATA tag][6 origin_mac][u16 BE key_len][key][u16 BE payload_len][payload]
-                    if payload.len() < 1 + 6 + 2 {
-                        debug!(len = payload.len(), "data frame too short, ignoring");
+                    // Data body: [6-byte origin_mac][u16 BE key_len][key][payload]
+                    if body.len() < 6 + 2 {
+                        debug!(len = body.len(), "data frame too short, ignoring");
                         return;
                     }
                     let mut origin_mac = [0u8; 6];
-                    origin_mac.copy_from_slice(&payload[1..7]);
+                    origin_mac.copy_from_slice(&body[..6]);
                     // Discard frames we sent ourselves (L2 loopback).
                     if &origin_mac == local_mac {
                         trace!("discarding self-originated data frame");
                         return;
                     }
-                    let key_len = u16::from_be_bytes([payload[7], payload[8]]) as usize;
-                    let key_start = 9;
+                    let key_len = u16::from_be_bytes([body[6], body[7]]) as usize;
+                    let key_start = 8;
                     let key_end = key_start + key_len;
-                    if payload.len() < key_end + 2 {
+                    if body.len() < key_end {
                         debug!(
                             key_len,
-                            frame_len = payload.len(),
-                            "data frame truncated (key_expr or payload_len), ignoring"
+                            frame_len = body.len(),
+                            "data frame truncated key_expr, ignoring"
                         );
                         return;
                     }
-                    let key_expr = match std::str::from_utf8(&payload[key_start..key_end]) {
+                    let key_expr = match std::str::from_utf8(&body[key_start..key_end]) {
                         Ok(s) => s,
                         Err(_) => {
                             debug!("data frame has invalid UTF-8 key_expr, ignoring");
@@ -301,25 +283,30 @@ impl<S: RawSocket> Bridge<S> {
                         );
                         return;
                     }
-                    // Read payload_len to strip any padding bytes.
-                    let payload_len =
-                        u16::from_be_bytes([payload[key_end], payload[key_end + 1]]) as usize;
-                    let data_start = key_end + 2;
-                    let data_end = data_start + payload_len;
-                    if payload.len() < data_end {
-                        debug!(
-                            payload_len,
-                            frame_len = payload.len(),
-                            "data frame truncated payload, ignoring"
-                        );
-                        return;
-                    }
-                    let data_payload = payload[data_start..data_end].to_vec();
+                    let data_payload = body[key_end..].to_vec();
                     inbound_data.push((key_expr.to_string(), data_payload));
                 }
                 other => {
                     trace!(frame_type = other, "ignoring unknown frame type");
                 }
+            }
+        };
+
+        socket.recv_frames(&mut |src_mac, payload| {
+            // Skip frames from ourselves (loopback on the interface).
+            if src_mac == local_mac {
+                return;
+            }
+            if payload.is_empty() {
+                return;
+            }
+
+            if payload[0] == frame_type::BATCH {
+                for (sub_type, sub_body) in decode_batch(payload) {
+                    dispatch(src_mac, sub_type, sub_body);
+                }
+            } else {
+                dispatch(src_mac, payload[0], &payload[1..]);
             }
         })?;
 
@@ -339,57 +326,46 @@ impl<S: RawSocket> Bridge<S> {
         Ok(published_hashes)
     }
 
-    /// Encode and broadcast a zenoh sample as a Data frame.
-    fn process_outbound_sample(
-        &mut self,
+    /// Build the sub-frame payload for an outbound zenoh sample.
+    ///
+    /// Returns `None` if the sample should be dropped (key too long, payload
+    /// exceeds MTU). The returned bytes are the DATA sub-frame payload:
+    /// `[6 origin_mac][2 key_len BE][key bytes][payload]`.
+    fn build_outbound_data_payload(
+        &self,
         sample: &zenoh::sample::Sample,
-    ) -> Result<(), RawLinkError> {
+    ) -> Option<Vec<u8>> {
         let key_expr = sample.key_expr().as_str();
         let payload = sample.payload().to_bytes();
 
-        // Guard against key expression length overflow (u16 max = 65535).
         if key_expr.len() > u16::MAX as usize {
             warn!(key_expr, "outbound key_expr exceeds u16 max length, dropping frame");
-            return Ok(());
+            return None;
         }
 
-        // Guard against oversized frames (standard Ethernet MTU = 1500 bytes).
-        // ETH_MTU is the max Ethernet PAYLOAD (excludes the 14-byte header).
-        // send_frame receives only the post-header payload, so we don't count
-        // ETH_HEADER_LEN here. Overhead within the payload:
-        //   1 (type tag) + 6 (origin_mac) + 2 (key_len) + key_expr.len()
-        const ETH_MTU: usize = 1500;
-        let frame_overhead = 1 + 6 + 2 + key_expr.len() + 2; // +2 for payload_len
-        if payload.len() > ETH_MTU.saturating_sub(frame_overhead) {
+        // Guard against oversized sub-frames.
+        // Sub-frame overhead within DATA: 6 (origin_mac) + 2 (key_len) + key_expr.len()
+        // Max sub-frame payload: 1500 (send_frame limit) - 3 (batch header) - 3 (sub-frame header) = 1494
+        const MAX_SUB_PAYLOAD: usize = 1500 - crate::batch::BATCH_HEADER - crate::batch::SUB_FRAME_HEADER;
+        let data_overhead = 6 + 2 + key_expr.len();
+        if payload.len() > MAX_SUB_PAYLOAD.saturating_sub(data_overhead) {
             trace!(
                 key_expr,
                 payload_len = payload.len(),
-                "outbound payload exceeds Ethernet MTU, dropping frame"
+                "outbound payload exceeds batch sub-frame limit, dropping"
             );
-            return Ok(());
+            return None;
         }
 
-        // Build frame payload:
-        //   [DATA tag][6 origin_mac][u16 BE key_len][key][u16 BE payload_len][payload]
-        // The payload_len field enables receivers to strip padding bytes added
-        // by PaddedSocket for traffic-analysis resistance.
         let local_mac = self.socket.local_mac();
-        let mut frame_payload =
-            Vec::with_capacity(1 + 6 + 2 + key_expr.len() + 2 + payload.len());
-        frame_payload.push(frame_type::DATA);
-        frame_payload.extend_from_slice(&local_mac);
-        frame_payload.extend_from_slice(&(key_expr.len() as u16).to_be_bytes());
-        frame_payload.extend_from_slice(key_expr.as_bytes());
-        frame_payload.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        frame_payload.extend_from_slice(&payload);
+        let mut buf = Vec::with_capacity(6 + 2 + key_expr.len() + payload.len());
+        buf.extend_from_slice(&local_mac);
+        buf.extend_from_slice(&(key_expr.len() as u16).to_be_bytes());
+        buf.extend_from_slice(key_expr.as_bytes());
+        buf.extend_from_slice(&payload);
 
-        self.socket.send_frame(BROADCAST_MAC, &frame_payload)?;
-        trace!(
-            key_expr,
-            payload_len = payload.len(),
-            "outbound data frame sent"
-        );
-        Ok(())
+        trace!(key_expr, payload_len = payload.len(), "queued outbound data frame");
+        Some(buf)
     }
 
     /// Returns a jittered scout interval between 1x and 2x the configured base.
@@ -434,15 +410,13 @@ mod tests {
     }
 
     /// Build a data payload as the bridge would send it (post-Ethernet-header).
-    /// Format: [DATA tag][6 origin_mac][u16 key_len][key][u16 payload_len][data]
     fn make_data_payload(origin_mac: [u8; 6], key_expr: &str, data: &[u8]) -> Vec<u8> {
         let key_bytes = key_expr.as_bytes();
-        let mut buf = Vec::with_capacity(1 + 6 + 2 + key_bytes.len() + 2 + data.len());
+        let mut buf = Vec::with_capacity(1 + 6 + 2 + key_bytes.len() + data.len());
         buf.push(frame_type::DATA);
         buf.extend_from_slice(&origin_mac);
         buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
         buf.extend_from_slice(key_bytes);
-        buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
         buf.extend_from_slice(data);
         buf
     }
@@ -470,12 +444,10 @@ mod tests {
         let key_len = u16::from_be_bytes([payload[7], payload[8]]) as usize;
         assert_eq!(key_len, key.len());
 
-        let key_end = 9 + key_len;
-        let decoded_key = std::str::from_utf8(&payload[9..key_end]).expect("valid UTF-8");
+        let decoded_key = std::str::from_utf8(&payload[9..9 + key_len]).expect("valid UTF-8");
         assert_eq!(decoded_key, key);
 
-        let payload_len = u16::from_be_bytes([payload[key_end], payload[key_end + 1]]) as usize;
-        let decoded_data = &payload[key_end + 2..key_end + 2 + payload_len];
+        let decoded_data = &payload[9 + key_len..];
         assert_eq!(decoded_data, data);
     }
 
@@ -602,21 +574,14 @@ mod tests {
         let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
         let (tx, rx) = std::sync::mpsc::channel();
 
-        // New format: [RETICULUM tag][u16 BE packet_len][packet]
         let reticulum_packet = vec![0xAA; 100];
-        let mut frame_payload = Vec::with_capacity(1 + 2 + reticulum_packet.len());
-        frame_payload.push(frame_type::RETICULUM);
-        frame_payload.extend_from_slice(&(reticulum_packet.len() as u16).to_be_bytes());
+        let mut frame_payload = vec![frame_type::RETICULUM];
         frame_payload.extend_from_slice(&reticulum_packet);
         socket_b.send_frame(MAC_A, &frame_payload).expect("mock send");
 
         socket_a.recv_frames(&mut |_src_mac, payload| {
-            if payload.len() < 3 || payload[0] != frame_type::RETICULUM {
-                return;
-            }
-            let pkt_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
-            if payload.len() >= 3 + pkt_len {
-                let _ = tx.send(payload[3..3 + pkt_len].to_vec());
+            if !payload.is_empty() && payload[0] == frame_type::RETICULUM && payload.len() > 1 {
+                let _ = tx.send(payload[1..].to_vec());
             }
         }).expect("recv");
 
@@ -626,16 +591,12 @@ mod tests {
 
     #[test]
     fn reticulum_outbound_encoding() {
-        // Verify the outbound format: [RETICULUM tag][u16 BE packet_len][packet]
         let packet = vec![0xBB; 200];
-        let mut frame_payload = Vec::with_capacity(1 + 2 + packet.len());
+        let mut frame_payload = Vec::with_capacity(1 + packet.len());
         frame_payload.push(frame_type::RETICULUM);
-        frame_payload.extend_from_slice(&(packet.len() as u16).to_be_bytes());
         frame_payload.extend_from_slice(&packet);
-        assert_eq!(frame_payload[0], 0x00); // RETICULUM type tag
-        let decoded_len = u16::from_be_bytes([frame_payload[1], frame_payload[2]]) as usize;
-        assert_eq!(decoded_len, 200);
-        assert_eq!(&frame_payload[3..], &packet[..]);
+        assert_eq!(frame_payload[0], 0x00);
+        assert_eq!(&frame_payload[1..], &packet[..]);
     }
 
     #[test]
@@ -644,11 +605,8 @@ mod tests {
         let (ret_tx, ret_rx) = std::sync::mpsc::channel();
 
         let scout = make_scout_payload(&IDENTITY);
-        let ret_data = [0xCC; 50];
-        let mut ret_frame = Vec::with_capacity(1 + 2 + ret_data.len());
-        ret_frame.push(frame_type::RETICULUM);
-        ret_frame.extend_from_slice(&(ret_data.len() as u16).to_be_bytes());
-        ret_frame.extend_from_slice(&ret_data);
+        let mut ret_frame = vec![frame_type::RETICULUM];
+        ret_frame.extend_from_slice(&[0xCC; 50]);
         let unknown = vec![0xFF, 0x01, 0x02];
 
         socket_b.send_frame(MAC_A, &scout).unwrap();
@@ -666,11 +624,8 @@ mod tests {
                     hash.copy_from_slice(&payload[1..17]);
                     peer_table.update(hash, *src_mac);
                 }
-                frame_type::RETICULUM if payload.len() >= 3 => {
-                    let pkt_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
-                    if payload.len() >= 3 + pkt_len {
-                        let _ = ret_tx.send(payload[3..3 + pkt_len].to_vec());
-                    }
+                frame_type::RETICULUM if payload.len() > 1 => {
+                    let _ = ret_tx.send(payload[1..].to_vec());
                 }
                 _ => { unknown_count += 1; }
             }
@@ -679,5 +634,102 @@ mod tests {
         assert_eq!(peer_table.peer_count(), 1);
         assert!(ret_rx.try_recv().is_ok());
         assert_eq!(unknown_count, 1);
+    }
+
+    #[test]
+    fn batch_frame_dispatches_sub_frames() {
+        use crate::batch::BatchAccumulator;
+
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+        let (ret_tx, ret_rx) = std::sync::mpsc::channel();
+
+        // Build a batch containing a Reticulum packet and a Scout.
+        let mut acc = BatchAccumulator::new(1500);
+        let ret_packet = vec![0xDD; 80];
+        acc.push(frame_type::RETICULUM, &ret_packet);
+
+        let mut scout_body = vec![0u8; 16];
+        scout_body.copy_from_slice(&IDENTITY);
+        acc.push(frame_type::SCOUT, &scout_body);
+
+        let batch = acc.flush().unwrap();
+        socket_b.send_frame(MAC_A, &batch).expect("mock send");
+
+        let local_mac = MAC_A;
+        let mut peer_table = PeerTable::new(Duration::from_secs(30));
+
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if src_mac == &local_mac || payload.is_empty() {
+                    return;
+                }
+                if payload[0] == frame_type::BATCH {
+                    for (sub_type, sub_payload) in crate::batch::decode_batch(payload) {
+                        match sub_type {
+                            frame_type::RETICULUM if !sub_payload.is_empty() => {
+                                let _ = ret_tx.send(sub_payload.to_vec());
+                            }
+                            frame_type::SCOUT if sub_payload.len() >= 16 => {
+                                let mut hash = [0u8; 16];
+                                hash.copy_from_slice(&sub_payload[..16]);
+                                peer_table.update(hash, *src_mac);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            })
+            .expect("recv");
+
+        let received_ret = ret_rx.try_recv().expect("should receive Reticulum packet");
+        assert_eq!(received_ret, ret_packet);
+        assert_eq!(peer_table.peer_count(), 1);
+        assert_eq!(peer_table.lookup(&IDENTITY), Some(MAC_B));
+    }
+
+    #[test]
+    fn standalone_and_batch_frames_coexist() {
+        use crate::batch::BatchAccumulator;
+
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+
+        // Send a standalone Reticulum frame.
+        let standalone_packet = vec![0x11; 30];
+        let mut standalone_payload = vec![frame_type::RETICULUM];
+        standalone_payload.extend_from_slice(&standalone_packet);
+        socket_b
+            .send_frame(MAC_A, &standalone_payload)
+            .expect("mock send");
+
+        // Send a batch containing another Reticulum frame.
+        let mut acc = BatchAccumulator::new(1500);
+        let batch_packet = vec![0x22; 40];
+        acc.push(frame_type::RETICULUM, &batch_packet);
+        let batch = acc.flush().unwrap();
+        socket_b.send_frame(MAC_A, &batch).expect("mock send");
+
+        let local_mac = MAC_A;
+        let mut received: Vec<Vec<u8>> = Vec::new();
+
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if src_mac == &local_mac || payload.is_empty() {
+                    return;
+                }
+                if payload[0] == frame_type::BATCH {
+                    for (sub_type, sub_payload) in crate::batch::decode_batch(payload) {
+                        if sub_type == frame_type::RETICULUM {
+                            received.push(sub_payload.to_vec());
+                        }
+                    }
+                } else if payload[0] == frame_type::RETICULUM && payload.len() > 1 {
+                    received.push(payload[1..].to_vec());
+                }
+            })
+            .expect("recv");
+
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0], standalone_packet);
+        assert_eq!(received[1], batch_packet);
     }
 }
