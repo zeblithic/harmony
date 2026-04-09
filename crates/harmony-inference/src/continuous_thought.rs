@@ -41,8 +41,11 @@ pub struct ContinuousThoughtConfig {
     /// Maximum consecutive think steps before forcing token emission.
     /// Prevents infinite loops. Default: 4.
     pub max_think_steps: u32,
-    /// UQ confidence threshold above which the model is considered confident
-    /// enough to emit a token. Below this threshold, the model thinks more.
+    /// UQ confidence threshold for the `Uncertain` and `HighVolume` classes.
+    /// When the UQ class is `Uncertain` or `HighVolume` but the confidence
+    /// score exceeds this threshold, the router trusts the score and emits
+    /// instead of thinking.  The `Confident` class always emits regardless
+    /// of this threshold — it trusts the class label directly.
     /// Default: 0.85.
     pub confidence_threshold: f32,
 }

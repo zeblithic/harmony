@@ -197,6 +197,18 @@ class TestExportGguf:
             with pytest.raises(ValueError, match="Extra keys"):
                 export_gguf(state_dict, config, gguf_path)
 
+    def test_think_token_id_out_of_range_raises(self):
+        """Exporter rejects think_token_id >= vocab_size."""
+        config = _test_config()
+        config.think_token_id = 128  # == vocab_size, invalid
+        torch.manual_seed(42)
+        model = HarmonyModel(config)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gguf_path = Path(tmpdir) / "test.gguf"
+            with pytest.raises(ValueError, match="think_token_id"):
+                export_gguf(model.state_dict(), config, gguf_path)
+
     def test_continuous_thought_metadata_absent_when_disabled(self):
         """No continuous thought metadata when think_token_id is None."""
         from gguf import GGUFReader

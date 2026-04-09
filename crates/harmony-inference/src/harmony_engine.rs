@@ -238,9 +238,10 @@ impl HarmonyEngine {
     /// is `None`), always returns [`ThoughtAction::Emit`].
     ///
     /// Otherwise, evaluates the UQ output:
-    /// - `Confident` above threshold → `Emit`
+    /// - `Confident` → `Emit` (trusts the class label, ignores confidence score)
     /// - `SpectralCollapse` → `Abort`
-    /// - `Uncertain` / `HighVolume` → `Think` (up to `max_think_steps`)
+    /// - `Uncertain` / `HighVolume` with confidence > threshold → `Emit`
+    /// - `Uncertain` / `HighVolume` with confidence ≤ threshold → `Think`
     /// - At the safety cap → `Emit` (force output after N consecutive thinks)
     pub fn route_thought(
         &self,
@@ -764,6 +765,38 @@ mod tests {
         engine
     }
 
+    /// Helper: engine with UQ Head biased toward a class AND high confidence.
+    ///
+    /// Unlike `engine_with_biased_uq` (which pins confidence to ~0.5 via zero
+    /// bias), this sets the confidence bias to a large positive value so that
+    /// sigmoid(bias) ≈ 1.0, exceeding the 0.85 threshold.
+    fn engine_with_biased_uq_high_confidence(class_idx: usize) -> HarmonyEngine {
+        let mut config = test_config();
+        config.think_token_id = Some(100);
+        let mut engine = HarmonyEngine::new(config, Device::Cpu);
+        engine.init_random().unwrap();
+        engine.set_thought_config(ContinuousThoughtConfig {
+            think_token_id: Some(100),
+            max_think_steps: 4,
+            confidence_threshold: 0.85,
+        });
+
+        let cfg = UqHeadConfig::default();
+        let d = &Device::Cpu;
+        let fc1 = Tensor::zeros((8, 32), candle_core::DType::F32, d).unwrap();
+        let b1 = Tensor::zeros(32, candle_core::DType::F32, d).unwrap();
+        let fc2 = Tensor::zeros((32, 4), candle_core::DType::F32, d).unwrap();
+        let mut b2_data = [0.0f32; 4];
+        b2_data[class_idx] = 100.0;
+        let b2 = Tensor::new(&b2_data, d).unwrap();
+        // Confidence: bias toward ~1.0 (sigmoid(10) ≈ 0.99995, above 0.85)
+        let cw = Tensor::zeros((8, 1), candle_core::DType::F32, d).unwrap();
+        let cb = Tensor::new(&[10.0f32], d).unwrap();
+        let uq_head = UqHead::from_tensors(&cfg, fc1, b1, fc2, b2, cw, cb).unwrap();
+        engine.set_uq_head(uq_head);
+        engine
+    }
+
     #[test]
     fn route_thought_emits_for_confident() {
         let engine = engine_with_biased_uq(0); // Confident
@@ -807,6 +840,26 @@ mod tests {
         let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
         // At max_think_steps (4), should force Emit
         let action = engine.route_thought(&output, 4).unwrap();
+        assert_eq!(action, ThoughtAction::Emit);
+    }
+
+    #[test]
+    fn route_thought_uncertain_high_confidence_emits() {
+        // Uncertain class but confidence > 0.85 threshold → trust the score, Emit.
+        let engine = engine_with_biased_uq_high_confidence(3); // Uncertain, conf≈1.0
+        let mut cache = engine.new_cache().unwrap();
+        let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
+        let action = engine.route_thought(&output, 0).unwrap();
+        assert_eq!(action, ThoughtAction::Emit);
+    }
+
+    #[test]
+    fn route_thought_high_volume_high_confidence_emits() {
+        // HighVolume class but confidence > 0.85 threshold → trust the score, Emit.
+        let engine = engine_with_biased_uq_high_confidence(1); // HighVolume, conf≈1.0
+        let mut cache = engine.new_cache().unwrap();
+        let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
+        let action = engine.route_thought(&output, 0).unwrap();
         assert_eq!(action, ThoughtAction::Emit);
     }
 
