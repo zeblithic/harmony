@@ -4,6 +4,8 @@
 //! 1. Broadcasts Scout frames on a jittered timer.
 //! 2. Receives inbound L2 frames and publishes Data payloads into zenoh.
 //! 3. Drains the zenoh subscriber and broadcasts outbound Data frames.
+//! 4. Applies stochastic jitter to outbound flushes when inbound traffic
+//!    was received, breaking timing correlation for traffic analysis resistance.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -21,6 +23,53 @@ use crate::{
     peer_table::PeerTable,
     socket::RawSocket,
 };
+
+/// Transmission jitter hold timer.
+///
+/// When armed, suppresses explicit batch flushes for a random delay to break
+/// timing correlation between inbound queries and outbound responses. See
+/// `docs/specs/2026-04-09-transmission-jitter-design.md` in harmony-openwrt.
+struct JitterHold {
+    deadline: Option<Instant>,
+}
+
+impl JitterHold {
+    fn new() -> Self {
+        Self { deadline: None }
+    }
+
+    /// Arm the jitter hold if not already active.
+    ///
+    /// If a hold is already active, the call is ignored — the existing deadline
+    /// is preserved. This prevents indefinite suppression under continuous
+    /// inbound traffic.
+    fn arm(&mut self, now: Instant, delay: Duration) {
+        if self.deadline.is_none() {
+            self.deadline = Some(now + delay);
+        }
+    }
+
+    /// Returns `true` if the explicit flush should proceed.
+    ///
+    /// - No active hold → `true` (flush normally).
+    /// - Hold expired → `true` (resets the hold).
+    /// - Hold still active → `false` (suppress flush).
+    fn should_flush(&mut self, now: Instant) -> bool {
+        match self.deadline {
+            None => true,
+            Some(deadline) if now >= deadline => {
+                self.deadline = None;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Returns `true` if a jitter hold is currently active (deadline set).
+    fn is_active(&self) -> bool {
+        self.deadline.is_some()
+    }
+}
 
 /// Configuration for the [`Bridge`].
 pub struct BridgeConfig {
@@ -97,6 +146,7 @@ impl<S: RawSocket> Bridge<S> {
 
         let mut consecutive_errors: u32 = 0;
         let mut batch = BatchAccumulator::new(1500);
+        let mut jitter = JitterHold::new();
 
         loop {
             let now = Instant::now();
@@ -117,7 +167,14 @@ impl<S: RawSocket> Bridge<S> {
                 }
 
                 // 3. Process inbound L2 frames → publish to zenoh.
-                let inbound_hashes = self.process_inbound_frames(&local_mac).await?;
+                let (inbound_hashes, had_inbound) =
+                    self.process_inbound_frames(&local_mac).await?;
+
+                // Arm jitter hold on inbound traffic to break timing correlation.
+                if had_inbound {
+                    let delay_ms = rand::thread_rng().gen_range(100u64..=500);
+                    jitter.arm(now, Duration::from_millis(delay_ms));
+                }
 
                 // 4. Drain outbound zenoh samples → push into batch accumulator.
                 //    Skip samples whose content hash matches something we just
@@ -148,9 +205,11 @@ impl<S: RawSocket> Bridge<S> {
                     }
                 }
 
-                // 6. Flush remaining batch.
-                if let Some(flushed) = batch.flush() {
-                    self.socket.send_frame(BROADCAST_MAC, &flushed)?;
+                // 6. Flush remaining batch (jitter-gated).
+                if jitter.should_flush(now) {
+                    if let Some(flushed) = batch.flush() {
+                        self.socket.send_frame(BROADCAST_MAC, &flushed)?;
+                    }
                 }
 
                 Ok(())
@@ -206,8 +265,9 @@ impl<S: RawSocket> Bridge<S> {
     /// Buffers frames during the sync `recv_frames` callback, then publishes
     /// to zenoh asynchronously after the callback returns. Returns the key
     /// expressions that were published (for echo prevention).
-    async fn process_inbound_frames(&mut self, local_mac: &[u8; 6]) -> Result<HashSet<u64>, RawLinkError> {
+    async fn process_inbound_frames(&mut self, local_mac: &[u8; 6]) -> Result<(HashSet<u64>, bool), RawLinkError> {
         let mut inbound_data: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut had_inbound = false;
 
         let Self {
             socket, peer_table, config, ..
@@ -300,6 +360,7 @@ impl<S: RawSocket> Bridge<S> {
             if payload.is_empty() {
                 return;
             }
+            had_inbound = true;
 
             if payload[0] == frame_type::BATCH {
                 for (sub_type, sub_body) in decode_batch(payload) {
@@ -323,7 +384,7 @@ impl<S: RawSocket> Bridge<S> {
             }
         }
 
-        Ok(published_hashes)
+        Ok((published_hashes, had_inbound))
     }
 
     /// Build the sub-frame payload for an outbound zenoh sample.
@@ -731,5 +792,89 @@ mod tests {
         assert_eq!(received.len(), 2);
         assert_eq!(received[0], standalone_packet);
         assert_eq!(received[1], batch_packet);
+    }
+
+    #[test]
+    fn jitter_hold_no_jitter_by_default() {
+        let mut jitter = JitterHold::new();
+        let now = Instant::now();
+        assert!(!jitter.is_active());
+        assert!(jitter.should_flush(now), "no hold → flush immediately");
+    }
+
+    #[test]
+    fn jitter_hold_arm_suppresses_flush() {
+        let mut jitter = JitterHold::new();
+        let now = Instant::now();
+        jitter.arm(now, Duration::from_millis(200));
+        assert!(jitter.is_active());
+        assert!(!jitter.should_flush(now), "armed → suppress flush");
+        assert!(
+            !jitter.should_flush(now + Duration::from_millis(100)),
+            "before deadline → still suppressed"
+        );
+    }
+
+    #[test]
+    fn jitter_hold_expires_and_flushes() {
+        let mut jitter = JitterHold::new();
+        let now = Instant::now();
+        jitter.arm(now, Duration::from_millis(200));
+        assert!(
+            jitter.should_flush(now + Duration::from_millis(200)),
+            "at deadline → flush"
+        );
+        assert!(!jitter.is_active(), "hold should reset after expiry");
+        assert!(
+            jitter.should_flush(now + Duration::from_millis(300)),
+            "after reset → flush normally"
+        );
+    }
+
+    #[test]
+    fn jitter_hold_not_rearmed_during_active() {
+        let mut jitter = JitterHold::new();
+        let now = Instant::now();
+        jitter.arm(now, Duration::from_millis(200));
+        // Second arm with longer delay is ignored.
+        jitter.arm(now, Duration::from_millis(500));
+        // Original 200ms deadline still applies.
+        assert!(
+            jitter.should_flush(now + Duration::from_millis(200)),
+            "original deadline should apply, not 500ms"
+        );
+    }
+
+    #[test]
+    fn jitter_hold_rearms_after_expiry() {
+        let mut jitter = JitterHold::new();
+        let now = Instant::now();
+        jitter.arm(now, Duration::from_millis(100));
+        // Expire it.
+        assert!(jitter.should_flush(now + Duration::from_millis(100)));
+        // Arm again with new delay.
+        let t2 = now + Duration::from_millis(100);
+        jitter.arm(t2, Duration::from_millis(200));
+        assert!(jitter.is_active());
+        assert!(
+            !jitter.should_flush(t2 + Duration::from_millis(100)),
+            "new hold should suppress"
+        );
+        assert!(
+            jitter.should_flush(t2 + Duration::from_millis(200)),
+            "new hold should expire at t2+200ms"
+        );
+    }
+
+    #[test]
+    fn jitter_delay_range_100_to_500ms() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..1000 {
+            let delay_ms: u64 = rng.gen_range(100..=500);
+            assert!(
+                (100..=500).contains(&delay_ms),
+                "delay {delay_ms}ms out of range"
+            );
+        }
     }
 }
