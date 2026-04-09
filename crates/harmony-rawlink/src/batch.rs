@@ -129,6 +129,8 @@ impl<'a> Iterator for BatchIter<'a> {
     }
 }
 
+impl std::iter::FusedIterator for BatchIter<'_> {}
+
 /// Decodes a BATCH frame payload into an iterator of sub-frames.
 ///
 /// The input `payload` must include the leading `0x03` batch type byte
@@ -137,6 +139,10 @@ impl<'a> Iterator for BatchIter<'a> {
 ///
 /// Stops cleanly on truncated data — already-yielded sub-frames are valid.
 pub fn decode_batch(payload: &[u8]) -> BatchIter<'_> {
+    debug_assert!(
+        payload.is_empty() || payload.first() == Some(&crate::frame_type::BATCH),
+        "decode_batch expects BATCH frame (0x03 prefix)"
+    );
     // Skip the 0x03 batch type byte.
     let start = if payload.first() == Some(&crate::frame_type::BATCH) {
         1
@@ -361,5 +367,25 @@ mod tests {
     fn decode_completely_empty_slice() {
         let subs: Vec<_> = decode_batch(&[]).collect();
         assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn decode_trailing_header_fragment_ignored() {
+        // A batch with a valid sub-frame followed by only 2 bytes (incomplete header).
+        let mut batch = vec![frame_type::BATCH];
+        // Valid sub-frame: DATA, 4 bytes
+        batch.push(frame_type::DATA);
+        batch.extend_from_slice(&4u16.to_be_bytes());
+        batch.extend_from_slice(&[0xAA; 4]);
+        // Trailing fragment: only 2 bytes (need 3 for a header)
+        batch.extend_from_slice(&[0xFF, 0x00]);
+
+        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch)
+            .map(|(t, p)| (t, p.to_vec()))
+            .collect();
+
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].0, frame_type::DATA);
+        assert_eq!(subs[0].1, vec![0xAA; 4]);
     }
 }
