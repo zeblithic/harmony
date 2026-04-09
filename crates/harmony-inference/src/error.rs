@@ -29,6 +29,10 @@ pub enum InferenceError {
     #[error("cache mismatch: expected {expected} layers, got {actual}")]
     CacheMismatch { expected: usize, actual: usize },
 
+    /// Engram resolution failed (shard data missing or tensor error).
+    #[error("engram resolution failed: {0}")]
+    EngramResolutionFailed(String),
+
     /// KV cache compression or decompression failed.
     #[cfg(feature = "kv-compress")]
     #[error("compression failed: {0}")]

@@ -18,6 +18,7 @@
 //! ```
 
 pub mod block_attnres;
+pub mod chunked_engram;
 pub mod continuous_thought;
 pub mod engine;
 pub mod engram_bridge;
@@ -33,6 +34,7 @@ pub mod uq_features;
 pub mod uq_head;
 
 pub use block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
+pub use chunked_engram::{ChunkedEngramConfig, ChunkedEngramScheduler, ShardFetcher, StepResult};
 pub use continuous_thought::{ContinuousThoughtConfig, ThoughtAction};
 pub use harmony_engine::HarmonyEngine;
 pub use harmony_model::{HarmonyModel, HarmonyModelConfig, HarmonyForwardOutput};
