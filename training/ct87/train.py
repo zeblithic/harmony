@@ -216,7 +216,7 @@ def main() -> None:
     if args.log_file:
         csv_file = open(args.log_file, "a", newline="")
         csv_writer = csv.writer(csv_file)
-        if csv_file.tell() == 0:
+        if os.path.getsize(args.log_file) == 0:
             csv_writer.writerow(["step", "loss", "val_loss", "lr", "grad_norm", "dt_ms"])
 
     try:
@@ -226,6 +226,7 @@ def main() -> None:
             set_lr(optimizer, lr_mult)
             optimizer.zero_grad()
 
+            accum_loss = 0.0
             for micro_step in range(args.grad_accum_steps):
                 batch = next(dataloader).to(device)
                 input_ids = batch[:, :-1]
@@ -234,6 +235,7 @@ def main() -> None:
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
                     logits = model(input_ids)
                     loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
+                accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
 
             grad_norm = None
@@ -245,7 +247,7 @@ def main() -> None:
             optimizer.step()
 
             dt_ms = (time.time() - step_start) * 1000
-            raw_loss = loss.item()
+            raw_loss = accum_loss / args.grad_accum_steps
             current_lr = optimizer.param_groups[0]["lr"]
 
             if step % 10 == 0:
