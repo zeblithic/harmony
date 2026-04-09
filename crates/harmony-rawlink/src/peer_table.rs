@@ -70,6 +70,17 @@ impl PeerTable {
         })
     }
 
+    /// Look up the identity hash associated with a MAC address.
+    ///
+    /// Returns `None` if the MAC is unknown or the entry has expired.
+    /// Scans all entries (O(n)) — suitable for the small peer tables in mesh networks.
+    pub fn identity_for_mac(&self, mac: &[u8; 6]) -> Option<[u8; 16]> {
+        self.entries
+            .iter()
+            .find(|(_, entry)| entry.mac == *mac && entry.last_seen.elapsed() < self.ttl)
+            .map(|(identity_hash, _)| *identity_hash)
+    }
+
     /// Remove all expired entries from the table.
     pub fn purge_expired(&mut self) {
         let ttl = self.ttl;
@@ -144,5 +155,33 @@ mod tests {
 
         table.update(identity_hash2, mac2);
         assert_eq!(table.peer_count(), 2);
+    }
+
+    #[test]
+    fn identity_for_mac_returns_hash() {
+        let mut table = PeerTable::new(Duration::from_secs(60));
+        let identity_hash = [1u8; 16];
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+        table.update(identity_hash, mac);
+        assert_eq!(table.identity_for_mac(&mac), Some(identity_hash));
+    }
+
+    #[test]
+    fn identity_for_mac_unknown_returns_none() {
+        let table = PeerTable::new(Duration::from_secs(60));
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        assert_eq!(table.identity_for_mac(&mac), None);
+    }
+
+    #[test]
+    fn identity_for_mac_expired_returns_none() {
+        let mut table = PeerTable::new(Duration::from_millis(1));
+        let identity_hash = [1u8; 16];
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+        table.update(identity_hash, mac);
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(table.identity_for_mac(&mac), None);
     }
 }
