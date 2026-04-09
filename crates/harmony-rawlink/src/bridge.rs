@@ -160,7 +160,9 @@ impl<S: RawSocket> Bridge<S> {
             .map_err(|e| RawLinkError::SocketError(format!("zenoh subscribe failed: {e}")))?;
 
         let mut next_scout = Instant::now();
-        let mut next_purge = Instant::now() + self.config.peer_ttl;
+        let mut next_peer_purge = Instant::now() + self.config.peer_ttl;
+        let blacklist_purge_interval = self.blacklist.purge_interval();
+        let mut next_blacklist_purge = Instant::now() + blacklist_purge_interval;
         let local_mac = self.socket.local_mac();
 
         let mut consecutive_errors: u32 = 0;
@@ -179,11 +181,14 @@ impl<S: RawSocket> Bridge<S> {
                     next_scout = now + scout_delay;
                 }
 
-                // 2. Purge expired peer table entries periodically.
-                if now >= next_purge {
+                // 2. Purge expired entries periodically.
+                if now >= next_peer_purge {
                     self.peer_table.purge_expired();
+                    next_peer_purge = now + self.config.peer_ttl;
+                }
+                if now >= next_blacklist_purge {
                     self.blacklist.purge_expired(now);
-                    next_purge = now + self.config.peer_ttl;
+                    next_blacklist_purge = now + blacklist_purge_interval;
                 }
 
                 // 3. Process inbound L2 frames → publish to zenoh.
@@ -419,13 +424,14 @@ impl<S: RawSocket> Bridge<S> {
             if src_mac == local_mac {
                 return;
             }
-            if payload.is_empty() {
-                return;
-            }
-
             // Reject frames from banned MACs (silent drop — no logging).
             let now = Instant::now();
             if blacklist.is_blocked(src_mac, now) {
+                return;
+            }
+
+            if payload.is_empty() {
+                pending_violations.push((*src_mac, ViolationCategory::MalformedFrame));
                 return;
             }
 

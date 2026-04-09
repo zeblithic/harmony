@@ -166,6 +166,13 @@ impl MacBlacklist {
         });
     }
 
+    /// Recommended interval between `purge_expired` calls.
+    ///
+    /// Returns the window duration, which is the minimum useful purge cadence.
+    pub fn purge_interval(&self) -> Duration {
+        self.config.window_duration
+    }
+
     /// Returns the number of tracked MAC entries (for testing).
     #[cfg(test)]
     fn entry_count(&self) -> usize {
