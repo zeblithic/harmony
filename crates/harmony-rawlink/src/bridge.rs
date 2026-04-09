@@ -345,8 +345,8 @@ impl<S: RawSocket> Bridge<S> {
 
         // Guard against oversized sub-frames.
         // Sub-frame overhead within DATA: 6 (origin_mac) + 2 (key_len) + key_expr.len()
-        // Max sub-frame payload in a batch: max_payload - 3 (sub-frame header) = 1480
-        const MAX_SUB_PAYLOAD: usize = 1500 - crate::ETH_HEADER_LEN - crate::batch::BATCH_HEADER - crate::batch::SUB_FRAME_HEADER;
+        // Max sub-frame payload: 1500 (send_frame limit) - 3 (batch header) - 3 (sub-frame header) = 1494
+        const MAX_SUB_PAYLOAD: usize = 1500 - crate::batch::BATCH_HEADER - crate::batch::SUB_FRAME_HEADER;
         let data_overhead = 6 + 2 + key_expr.len();
         if payload.len() > MAX_SUB_PAYLOAD.saturating_sub(data_overhead) {
             trace!(

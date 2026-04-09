@@ -32,12 +32,14 @@ pub struct BatchAccumulator {
 }
 
 impl BatchAccumulator {
-    /// Creates a new accumulator for the given Ethernet MTU.
+    /// Creates a new accumulator for the given max `send_frame` payload size.
     ///
-    /// `max_payload` is computed as `mtu - 14 (ETH_HEADER_LEN) - 3 (BATCH_HEADER)`.
-    /// For standard 1500-byte MTU, this is 1483.
-    pub fn new(mtu: usize) -> Self {
-        let max_payload = mtu.saturating_sub(crate::ETH_HEADER_LEN + BATCH_HEADER);
+    /// `max_payload` is computed as `max_frame_payload - BATCH_HEADER`.
+    /// For standard Ethernet (1500-byte payload after header), this is 1497.
+    /// The caller passes the max payload that `send_frame` can accept (1500),
+    /// NOT the wire MTU (1514) — the socket prepends the Ethernet header.
+    pub fn new(max_frame_payload: usize) -> Self {
+        let max_payload = max_frame_payload.saturating_sub(BATCH_HEADER);
         Self {
             buf: Vec::new(),
             max_payload,
@@ -184,8 +186,8 @@ mod tests {
     fn new_accumulator_is_empty() {
         let acc = BatchAccumulator::new(1500);
         assert!(acc.is_empty());
-        // max_payload = 1500 - 14 (ETH_HEADER) - 3 (BATCH_HEADER) = 1483
-        assert_eq!(acc.max_payload, 1483);
+        // max_payload = 1500 - 3 (BATCH_HEADER) = 1497
+        assert_eq!(acc.max_payload, 1497);
     }
 
     #[test]
@@ -241,12 +243,16 @@ mod tests {
 
     #[test]
     fn auto_flush_on_overflow() {
-        // Use a tiny MTU to force overflow quickly.
-        // MTU=50 → max_payload = 50 - 14 - 3 = 33
-        // Batch buf can hold: 3 (header) + 33 = 36 bytes total.
+        // Use a tiny max_frame_payload to force overflow quickly.
+        // max_frame_payload=50 → max_payload = 50 - 3 = 47
+        // Batch buf can hold: 3 (header) + 47 = 50 bytes total.
         // First push: 3 (header) + 3 (sub-header) + 20 (payload) = 26 bytes — fits.
-        // Second push: 26 + 3 + 20 = 49 > 36 — triggers auto-flush.
-        let mut acc = BatchAccumulator::new(50);
+        // Second push: 26 + 3 + 20 = 49 < 50 — still fits!
+        // Use max_frame_payload=30 instead:
+        // max_payload = 30 - 3 = 27. Buf limit = 3 + 27 = 30.
+        // First push: 3 + 3 + 20 = 26 — fits.
+        // Second push: 26 + 3 + 20 = 49 > 30 — triggers auto-flush.
+        let mut acc = BatchAccumulator::new(30);
         let payload = vec![0xBB; 20];
 
         assert!(acc.push(frame_type::DATA, &payload).is_none());
@@ -282,17 +288,17 @@ mod tests {
     #[test]
     fn max_size_sub_frame() {
         let acc = BatchAccumulator::new(1500);
-        // Max sub-frame payload: max_payload - SUB_FRAME_HEADER = 1483 - 3 = 1480
+        // Max sub-frame payload: max_payload - SUB_FRAME_HEADER = 1497 - 3 = 1494
         let max_sub_payload = acc.max_payload - SUB_FRAME_HEADER;
-        assert_eq!(max_sub_payload, 1480);
+        assert_eq!(max_sub_payload, 1494);
 
         let mut acc = BatchAccumulator::new(1500);
-        let payload = vec![0xCC; 1480];
+        let payload = vec![0xCC; 1494];
         assert!(acc.push(frame_type::DATA, &payload).is_none());
 
         let batch = acc.flush().expect("should produce batch");
-        // 3 (batch header) + 3 (sub header) + 1480 (payload) = 1486
-        assert_eq!(batch.len(), BATCH_HEADER + SUB_FRAME_HEADER + 1480);
+        // 3 (batch header) + 3 (sub header) + 1494 (payload) = 1500
+        assert_eq!(batch.len(), BATCH_HEADER + SUB_FRAME_HEADER + 1494);
     }
 
     #[test]
