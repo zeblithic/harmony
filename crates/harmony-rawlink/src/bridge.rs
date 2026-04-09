@@ -3,12 +3,18 @@
 //! The bridge runs a continuous loop that:
 //! 1. Broadcasts Scout frames on a jittered timer.
 //! 2. Receives inbound L2 frames and publishes Data payloads into zenoh.
+//!    Frames from banned MACs are silently dropped at the top of the callback.
+//!    Validation failures record violations toward per-MAC ban thresholds.
 //! 3. Flushes the accumulated batch (gated by the jitter hold timer).
 //! 4. Arms a jitter hold when inbound traffic was received (100-500ms delay).
 //! 5. Drains the zenoh subscriber and broadcasts outbound Data frames.
 //!
 //! Steps 3-4 are ordered so expired holds flush before being replaced,
 //! preventing indefinite batch starvation under continuous inbound traffic.
+//!
+//! MAC blacklisting detects 4 violation categories: malformed frames, rate
+//! flooding, identity churn, and namespace violations. Bans escalate with
+//! each offense (60s → 4min → 16min → 1h cap). See [`crate::blacklist`].
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -20,6 +26,7 @@ use tracing::{debug, trace, warn};
 
 use crate::{
     batch::{decode_batch, BatchAccumulator},
+    blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory},
     error::RawLinkError,
     frame::BROADCAST_MAC,
     frame_type,
@@ -112,6 +119,7 @@ pub struct Bridge<S: RawSocket> {
     session: zenoh::Session,
     config: BridgeConfig,
     peer_table: PeerTable,
+    blacklist: MacBlacklist,
     reticulum_outbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 }
 
@@ -130,11 +138,13 @@ impl<S: RawSocket> Bridge<S> {
         reticulum_outbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     ) -> Self {
         let peer_table = PeerTable::new(config.peer_ttl);
+        let blacklist = MacBlacklist::new(BlacklistConfig::default());
         Self {
             socket,
             session,
             config,
             peer_table,
+            blacklist,
             reticulum_outbound_rx,
         }
     }
@@ -150,7 +160,9 @@ impl<S: RawSocket> Bridge<S> {
             .map_err(|e| RawLinkError::SocketError(format!("zenoh subscribe failed: {e}")))?;
 
         let mut next_scout = Instant::now();
-        let mut next_purge = Instant::now() + self.config.peer_ttl;
+        let mut next_peer_purge = Instant::now() + self.config.peer_ttl;
+        let blacklist_purge_interval = self.blacklist.purge_interval();
+        let mut next_blacklist_purge = Instant::now() + blacklist_purge_interval;
         let local_mac = self.socket.local_mac();
 
         let mut consecutive_errors: u32 = 0;
@@ -169,15 +181,18 @@ impl<S: RawSocket> Bridge<S> {
                     next_scout = now + scout_delay;
                 }
 
-                // 2. Purge expired peer table entries periodically.
-                if now >= next_purge {
+                // 2. Purge expired entries periodically.
+                if now >= next_peer_purge {
                     self.peer_table.purge_expired();
-                    next_purge = now + self.config.peer_ttl;
+                    next_peer_purge = now + self.config.peer_ttl;
+                }
+                if now >= next_blacklist_purge {
+                    self.blacklist.purge_expired(now);
+                    next_blacklist_purge = now + blacklist_purge_interval;
                 }
 
                 // 3. Process inbound L2 frames → publish to zenoh.
-                let (inbound_hashes, had_inbound) =
-                    self.process_inbound_frames(&local_mac).await?;
+                let (inbound_hashes, had_inbound) = self.process_inbound_frames(&local_mac).await?;
 
                 // 4. Flush accumulated batch (jitter-gated).
                 //
@@ -220,7 +235,10 @@ impl<S: RawSocket> Bridge<S> {
                 if let Some(ref mut rx) = self.reticulum_outbound_rx {
                     while let Ok(packet) = rx.try_recv() {
                         if packet.len() > u16::MAX as usize {
-                            warn!(len = packet.len(), "reticulum packet exceeds u16 max, dropping");
+                            warn!(
+                                len = packet.len(),
+                                "reticulum packet exceeds u16 max, dropping"
+                            );
                             continue;
                         }
                         if let Some(flushed) = batch.push(frame_type::RETICULUM, &packet) {
@@ -282,111 +300,166 @@ impl<S: RawSocket> Bridge<S> {
     /// Buffers frames during the sync `recv_frames` callback, then publishes
     /// to zenoh asynchronously after the callback returns. Returns the key
     /// expressions that were published (for echo prevention).
-    async fn process_inbound_frames(&mut self, local_mac: &[u8; 6]) -> Result<(HashSet<u64>, bool), RawLinkError> {
+    async fn process_inbound_frames(
+        &mut self,
+        local_mac: &[u8; 6],
+    ) -> Result<(HashSet<u64>, bool), RawLinkError> {
         let mut inbound_data: Vec<(String, Vec<u8>)> = Vec::new();
         let mut had_inbound = false;
 
         let Self {
-            socket, peer_table, config, ..
+            socket,
+            peer_table,
+            blacklist,
+            config,
+            ..
         } = self;
         let allowed_prefix = &config.subscribe_pattern;
         let reticulum_tx = &config.reticulum_inbound_tx;
 
+        // Pending violations collected during recv_frames; applied afterwards
+        // to avoid two mutable borrows of `blacklist` through simultaneous closures.
+        let mut pending_violations: Vec<([u8; 6], ViolationCategory)> = Vec::new();
+
         // Dispatch a single sub-frame (type byte already stripped).
-        let mut dispatch = |src_mac: &[u8; 6], frame_type_byte: u8, body: &[u8]| {
-            match frame_type_byte {
-                frame_type::RETICULUM => {
-                    if !body.is_empty() {
-                        if let Some(ref reticulum_tx) = reticulum_tx {
-                            let packet = body.to_vec();
-                            let _ = reticulum_tx.try_send(packet);
+        // Violations are appended to `violations` rather than returned, to avoid
+        // a second mutable borrow of `blacklist` within the recv_frames callback.
+        let mut dispatch =
+            |src_mac: &[u8; 6],
+             frame_type_byte: u8,
+             body: &[u8],
+             violations: &mut Vec<([u8; 6], ViolationCategory)>| {
+                match frame_type_byte {
+                    frame_type::RETICULUM => {
+                        if !body.is_empty() {
+                            if let Some(ref reticulum_tx) = reticulum_tx {
+                                let packet = body.to_vec();
+                                let _ = reticulum_tx.try_send(packet);
+                            }
                         }
                     }
-                }
-                frame_type::SCOUT => {
-                    if body.len() < 16 {
-                        debug!(len = body.len(), "scout frame too short, ignoring");
-                        return;
-                    }
-                    let mut identity_hash = [0u8; 16];
-                    identity_hash.copy_from_slice(&body[..16]);
-                    peer_table.update(identity_hash, *src_mac);
-                    debug!(
-                        identity = hex::encode(identity_hash),
-                        src_mac = hex::encode(src_mac),
-                        "peer scouted"
-                    );
-                }
-                frame_type::DATA => {
-                    // Data body: [6-byte origin_mac][u16 BE key_len][key][payload]
-                    if body.len() < 6 + 2 {
-                        debug!(len = body.len(), "data frame too short, ignoring");
-                        return;
-                    }
-                    let mut origin_mac = [0u8; 6];
-                    origin_mac.copy_from_slice(&body[..6]);
-                    // Discard frames we sent ourselves (L2 loopback).
-                    if &origin_mac == local_mac {
-                        trace!("discarding self-originated data frame");
-                        return;
-                    }
-                    let key_len = u16::from_be_bytes([body[6], body[7]]) as usize;
-                    let key_start = 8;
-                    let key_end = key_start + key_len;
-                    if body.len() < key_end {
-                        debug!(
-                            key_len,
-                            frame_len = body.len(),
-                            "data frame truncated key_expr, ignoring"
-                        );
-                        return;
-                    }
-                    let key_expr = match std::str::from_utf8(&body[key_start..key_end]) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            debug!("data frame has invalid UTF-8 key_expr, ignoring");
+                    frame_type::SCOUT => {
+                        if body.len() < 16 {
+                            debug!(len = body.len(), "scout frame too short, ignoring");
+                            violations.push((*src_mac, ViolationCategory::MalformedFrame));
                             return;
                         }
-                    };
-                    // Validate key expression against allowed namespace to prevent
-                    // unauthenticated injection into arbitrary zenoh key spaces.
-                    // Ensure prefix ends with '/' to prevent "harmony_evil" matching "harmony/".
-                    let mut prefix = allowed_prefix.trim_end_matches("**").trim_end_matches('/').to_string();
-                    prefix.push('/');
-                    if !key_expr.starts_with(&prefix) {
+                        let mut identity_hash = [0u8; 16];
+                        identity_hash.copy_from_slice(&body[..16]);
+                        // Identity churn detection: if this MAC already has a
+                        // different identity in the peer table, record a violation.
+                        if let Some(prev) = peer_table.identity_for_mac(src_mac) {
+                            if prev != identity_hash {
+                                violations.push((*src_mac, ViolationCategory::IdentityChurn));
+                            }
+                        }
+                        peer_table.update(identity_hash, *src_mac);
                         debug!(
-                            key_expr,
-                            "data frame key_expr outside allowed namespace, ignoring"
+                            identity = hex::encode(identity_hash),
+                            src_mac = hex::encode(src_mac),
+                            "peer scouted"
                         );
-                        return;
                     }
-                    let data_payload = body[key_end..].to_vec();
-                    inbound_data.push((key_expr.to_string(), data_payload));
+                    frame_type::DATA => {
+                        // Data body: [6-byte origin_mac][u16 BE key_len][key][payload]
+                        if body.len() < 6 + 2 {
+                            debug!(len = body.len(), "data frame too short, ignoring");
+                            violations.push((*src_mac, ViolationCategory::MalformedFrame));
+                            return;
+                        }
+                        let mut origin_mac = [0u8; 6];
+                        origin_mac.copy_from_slice(&body[..6]);
+                        // Discard frames we sent ourselves (L2 loopback).
+                        if &origin_mac == local_mac {
+                            trace!("discarding self-originated data frame");
+                            return;
+                        }
+                        let key_len = u16::from_be_bytes([body[6], body[7]]) as usize;
+                        let key_start = 8;
+                        let key_end = key_start + key_len;
+                        if body.len() < key_end {
+                            debug!(
+                                key_len,
+                                frame_len = body.len(),
+                                "data frame truncated key_expr, ignoring"
+                            );
+                            violations.push((*src_mac, ViolationCategory::MalformedFrame));
+                            return;
+                        }
+                        let key_expr = match std::str::from_utf8(&body[key_start..key_end]) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                debug!("data frame has invalid UTF-8 key_expr, ignoring");
+                                violations.push((*src_mac, ViolationCategory::MalformedFrame));
+                                return;
+                            }
+                        };
+                        // Validate key expression against allowed namespace to prevent
+                        // unauthenticated injection into arbitrary zenoh key spaces.
+                        // Ensure prefix ends with '/' to prevent "harmony_evil" matching "harmony/".
+                        let mut prefix = allowed_prefix
+                            .trim_end_matches("**")
+                            .trim_end_matches('/')
+                            .to_string();
+                        prefix.push('/');
+                        if !key_expr.starts_with(&prefix) {
+                            debug!(
+                                key_expr,
+                                "data frame key_expr outside allowed namespace, ignoring"
+                            );
+                            violations.push((*src_mac, ViolationCategory::NamespaceViolation));
+                            return;
+                        }
+                        let data_payload = body[key_end..].to_vec();
+                        inbound_data.push((key_expr.to_string(), data_payload));
+                    }
+                    other => {
+                        trace!(frame_type = other, "ignoring unknown frame type");
+                    }
                 }
-                other => {
-                    trace!(frame_type = other, "ignoring unknown frame type");
-                }
-            }
-        };
+            };
 
         socket.recv_frames(&mut |src_mac, payload| {
             // Skip frames from ourselves (loopback on the interface).
             if src_mac == local_mac {
                 return;
             }
-            if payload.is_empty() {
+            // Reject frames from banned MACs (silent drop — no logging).
+            let now = Instant::now();
+            if blacklist.is_blocked(src_mac, now) {
                 return;
             }
+
+            if payload.is_empty() {
+                pending_violations.push((*src_mac, ViolationCategory::MalformedFrame));
+                return;
+            }
+
             had_inbound = true;
 
+            // Count each logical frame (sub-frame for batches) toward rate flood
+            // detection. Counting only outer frames would let an attacker pack
+            // many sub-frames into BATCH payloads to stay under the threshold.
             if payload[0] == frame_type::BATCH {
                 for (sub_type, sub_body) in decode_batch(payload) {
-                    dispatch(src_mac, sub_type, sub_body);
+                    pending_violations.push((*src_mac, ViolationCategory::RateFlood));
+                    dispatch(src_mac, sub_type, sub_body, &mut pending_violations);
                 }
             } else {
-                dispatch(src_mac, payload[0], &payload[1..]);
+                pending_violations.push((*src_mac, ViolationCategory::RateFlood));
+                dispatch(src_mac, payload[0], &payload[1..], &mut pending_violations);
             }
         })?;
+
+        // Apply all collected violations now that recv_frames has returned.
+        // Note: violations share a single post-callback timestamp. A MAC that
+        // crosses its threshold mid-batch is not rejected until the *next*
+        // recv_frames call — an inherent property of the deferred pattern
+        // required by the borrow checker.
+        let violation_now = Instant::now();
+        for (mac, category) in pending_violations {
+            blacklist.record_violation(&mac, category, violation_now);
+        }
 
         // Publish buffered inbound data to zenoh (async, non-blocking).
         // Track content hashes for echo prevention on the outbound path.
@@ -409,22 +482,23 @@ impl<S: RawSocket> Bridge<S> {
     /// Returns `None` if the sample should be dropped (key too long, payload
     /// exceeds MTU). The returned bytes are the DATA sub-frame payload:
     /// `[6 origin_mac][2 key_len BE][key bytes][payload]`.
-    fn build_outbound_data_payload(
-        &self,
-        sample: &zenoh::sample::Sample,
-    ) -> Option<Vec<u8>> {
+    fn build_outbound_data_payload(&self, sample: &zenoh::sample::Sample) -> Option<Vec<u8>> {
         let key_expr = sample.key_expr().as_str();
         let payload = sample.payload().to_bytes();
 
         if key_expr.len() > u16::MAX as usize {
-            warn!(key_expr, "outbound key_expr exceeds u16 max length, dropping frame");
+            warn!(
+                key_expr,
+                "outbound key_expr exceeds u16 max length, dropping frame"
+            );
             return None;
         }
 
         // Guard against oversized sub-frames.
         // Sub-frame overhead within DATA: 6 (origin_mac) + 2 (key_len) + key_expr.len()
         // Max sub-frame payload: 1500 (send_frame limit) - 3 (batch header) - 3 (sub-frame header) = 1494
-        const MAX_SUB_PAYLOAD: usize = 1500 - crate::batch::BATCH_HEADER - crate::batch::SUB_FRAME_HEADER;
+        const MAX_SUB_PAYLOAD: usize =
+            1500 - crate::batch::BATCH_HEADER - crate::batch::SUB_FRAME_HEADER;
         let data_overhead = 6 + 2 + key_expr.len();
         if payload.len() > MAX_SUB_PAYLOAD.saturating_sub(data_overhead) {
             trace!(
@@ -442,7 +516,11 @@ impl<S: RawSocket> Bridge<S> {
         buf.extend_from_slice(key_expr.as_bytes());
         buf.extend_from_slice(&payload);
 
-        trace!(key_expr, payload_len = payload.len(), "queued outbound data frame");
+        trace!(
+            key_expr,
+            payload_len = payload.len(),
+            "queued outbound data frame"
+        );
         Some(buf)
     }
 
@@ -655,13 +733,17 @@ mod tests {
         let reticulum_packet = vec![0xAA; 100];
         let mut frame_payload = vec![frame_type::RETICULUM];
         frame_payload.extend_from_slice(&reticulum_packet);
-        socket_b.send_frame(MAC_A, &frame_payload).expect("mock send");
+        socket_b
+            .send_frame(MAC_A, &frame_payload)
+            .expect("mock send");
 
-        socket_a.recv_frames(&mut |_src_mac, payload| {
-            if !payload.is_empty() && payload[0] == frame_type::RETICULUM && payload.len() > 1 {
-                let _ = tx.send(payload[1..].to_vec());
-            }
-        }).expect("recv");
+        socket_a
+            .recv_frames(&mut |_src_mac, payload| {
+                if !payload.is_empty() && payload[0] == frame_type::RETICULUM && payload.len() > 1 {
+                    let _ = tx.send(payload[1..].to_vec());
+                }
+            })
+            .expect("recv");
 
         let received = rx.try_recv().expect("should receive packet");
         assert_eq!(received, reticulum_packet);
@@ -694,20 +776,26 @@ mod tests {
         let mut peer_table = PeerTable::new(Duration::from_secs(30));
         let mut unknown_count = 0usize;
 
-        socket_a.recv_frames(&mut |src_mac, payload| {
-            if payload.is_empty() { return; }
-            match payload[0] {
-                frame_type::SCOUT if payload.len() >= 17 => {
-                    let mut hash = [0u8; 16];
-                    hash.copy_from_slice(&payload[1..17]);
-                    peer_table.update(hash, *src_mac);
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if payload.is_empty() {
+                    return;
                 }
-                frame_type::RETICULUM if payload.len() > 1 => {
-                    let _ = ret_tx.send(payload[1..].to_vec());
+                match payload[0] {
+                    frame_type::SCOUT if payload.len() >= 17 => {
+                        let mut hash = [0u8; 16];
+                        hash.copy_from_slice(&payload[1..17]);
+                        peer_table.update(hash, *src_mac);
+                    }
+                    frame_type::RETICULUM if payload.len() > 1 => {
+                        let _ = ret_tx.send(payload[1..].to_vec());
+                    }
+                    _ => {
+                        unknown_count += 1;
+                    }
                 }
-                _ => { unknown_count += 1; }
-            }
-        }).unwrap();
+            })
+            .unwrap();
 
         assert_eq!(peer_table.peer_count(), 1);
         assert!(ret_rx.try_recv().is_ok());
@@ -906,10 +994,7 @@ mod tests {
         // Step 2: arm sees None (cleared) and sets new hold.
         jitter.arm(t1, Duration::from_millis(300));
         assert!(jitter.is_active(), "new hold should be armed");
-        assert!(
-            !jitter.should_flush(t1),
-            "new hold should suppress flush"
-        );
+        assert!(!jitter.should_flush(t1), "new hold should suppress flush");
         assert!(
             jitter.should_flush(t1 + Duration::from_millis(300)),
             "new hold should expire at t1+300ms"
@@ -931,7 +1016,216 @@ mod tests {
             );
             let mut jitter = JitterHold::new();
             jitter.arm(now, Duration::from_millis(delay_ms));
-            assert!(!jitter.should_flush(now), "hold should suppress at arm time");
+            assert!(
+                !jitter.should_flush(now),
+                "hold should suppress at arm time"
+            );
         }
+    }
+
+    #[test]
+    fn blacklist_blocks_banned_mac() {
+        use crate::blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory};
+
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+        let mut blacklist = MacBlacklist::new(BlacklistConfig {
+            thresholds: [3, 500, 5, 10],
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Ban MAC_B by recording 3 malformed frame violations.
+        for _ in 0..3 {
+            blacklist.record_violation(&MAC_B, ViolationCategory::MalformedFrame, now);
+        }
+        assert!(blacklist.is_blocked(&MAC_B, now));
+
+        // B sends a valid scout frame.
+        let scout = make_scout_payload(&IDENTITY);
+        socket_b.send_frame(MAC_A, &scout).expect("mock send");
+
+        let local_mac = MAC_A;
+        let mut peer_table = PeerTable::new(Duration::from_secs(30));
+
+        // Simulate recv_frames with blacklist check (mirrors bridge logic).
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if blacklist.is_blocked(src_mac, now) {
+                    return; // Dropped — banned MAC.
+                }
+                if src_mac == &local_mac || payload.is_empty() {
+                    return;
+                }
+                if payload[0] == frame_type::SCOUT && payload.len() >= 17 {
+                    let mut identity_hash = [0u8; 16];
+                    identity_hash.copy_from_slice(&payload[1..17]);
+                    peer_table.update(identity_hash, *src_mac);
+                }
+            })
+            .expect("recv should succeed");
+
+        // Scout from banned MAC must be silently dropped.
+        assert_eq!(
+            peer_table.peer_count(),
+            0,
+            "banned MAC's scout must be dropped"
+        );
+    }
+
+    #[test]
+    fn blacklist_does_not_affect_other_macs() {
+        use crate::blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory};
+
+        let mac_c: [u8; 6] = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+
+        let mut blacklist = MacBlacklist::new(BlacklistConfig {
+            thresholds: [3, 500, 5, 10],
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Ban MAC_C (not MAC_B).
+        for _ in 0..3 {
+            blacklist.record_violation(&mac_c, ViolationCategory::MalformedFrame, now);
+        }
+
+        // B sends a scout (B is not banned).
+        let scout = make_scout_payload(&IDENTITY);
+        socket_b.send_frame(MAC_A, &scout).expect("mock send");
+
+        let local_mac = MAC_A;
+        let mut peer_table = PeerTable::new(Duration::from_secs(30));
+
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if blacklist.is_blocked(src_mac, now) {
+                    return;
+                }
+                if src_mac == &local_mac || payload.is_empty() {
+                    return;
+                }
+                if payload[0] == frame_type::SCOUT && payload.len() >= 17 {
+                    let mut identity_hash = [0u8; 16];
+                    identity_hash.copy_from_slice(&payload[1..17]);
+                    peer_table.update(identity_hash, *src_mac);
+                }
+            })
+            .expect("recv should succeed");
+
+        // MAC_B is not banned — scout should be processed.
+        assert_eq!(
+            peer_table.peer_count(),
+            1,
+            "unbanned MAC should be processed"
+        );
+    }
+
+    #[test]
+    fn blacklist_ban_expires_traffic_resumes() {
+        use crate::blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory};
+
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+        let mut blacklist = MacBlacklist::new(BlacklistConfig {
+            thresholds: [3, 500, 5, 10],
+            base_ban: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let t0 = Instant::now();
+
+        // Ban MAC_B.
+        for _ in 0..3 {
+            blacklist.record_violation(&MAC_B, ViolationCategory::MalformedFrame, t0);
+        }
+        assert!(blacklist.is_blocked(&MAC_B, t0));
+
+        // After ban expires...
+        let t1 = t0 + Duration::from_secs(61);
+        assert!(!blacklist.is_blocked(&MAC_B, t1));
+
+        // B sends a scout.
+        let scout = make_scout_payload(&IDENTITY);
+        socket_b.send_frame(MAC_A, &scout).expect("mock send");
+
+        let local_mac = MAC_A;
+        let mut peer_table = PeerTable::new(Duration::from_secs(30));
+
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if blacklist.is_blocked(src_mac, t1) {
+                    return;
+                }
+                if src_mac == &local_mac || payload.is_empty() {
+                    return;
+                }
+                if payload[0] == frame_type::SCOUT && payload.len() >= 17 {
+                    let mut identity_hash = [0u8; 16];
+                    identity_hash.copy_from_slice(&payload[1..17]);
+                    peer_table.update(identity_hash, *src_mac);
+                }
+            })
+            .expect("recv should succeed");
+
+        assert_eq!(
+            peer_table.peer_count(),
+            1,
+            "unbanned MAC traffic should resume"
+        );
+    }
+
+    #[test]
+    fn identity_churn_triggers_blacklist() {
+        use crate::blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory};
+
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+
+        let mut blacklist = MacBlacklist::new(BlacklistConfig {
+            thresholds: [20, 500, 3, 10], // IdentityChurn threshold = 3
+            ..Default::default()
+        });
+        let mut peer_table = PeerTable::new(Duration::from_secs(30));
+        let local_mac = MAC_A;
+        let now = Instant::now();
+
+        // Send 4 scout frames from MAC_B with different identity hashes.
+        // The first establishes the identity; the next 3 are churn violations.
+        for i in 0u8..4 {
+            let identity = [i + 1; 16];
+            let scout = make_scout_payload(&identity);
+            socket_b.send_frame(MAC_A, &scout).expect("mock send");
+        }
+
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if src_mac == &local_mac || payload.is_empty() {
+                    return;
+                }
+                if blacklist.is_blocked(src_mac, now) {
+                    return;
+                }
+                if payload[0] == frame_type::SCOUT && payload.len() >= 17 {
+                    let mut identity_hash = [0u8; 16];
+                    identity_hash.copy_from_slice(&payload[1..17]);
+
+                    // Identity churn detection: different identity for same MAC.
+                    if let Some(prev) = peer_table.identity_for_mac(src_mac) {
+                        if prev != identity_hash {
+                            blacklist.record_violation(
+                                src_mac,
+                                ViolationCategory::IdentityChurn,
+                                now,
+                            );
+                        }
+                    }
+                    peer_table.update(identity_hash, *src_mac);
+                }
+            })
+            .expect("recv should succeed");
+
+        // 3 churn violations (scouts 2, 3, 4 each differ from the previous) → banned.
+        assert!(
+            blacklist.is_blocked(&MAC_B, now),
+            "3 identity changes should trigger ban"
+        );
     }
 }

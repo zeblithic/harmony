@@ -57,7 +57,11 @@ impl BatchAccumulator {
     /// to make room. The returned batch is ready to pass to `send_frame()`.
     /// Returns `None` if the frame fit in the current batch.
     pub fn push(&mut self, frame_type: u8, payload: &[u8]) -> Option<Vec<u8>> {
-        debug_assert_ne!(frame_type, crate::frame_type::BATCH, "batch frames cannot be nested");
+        debug_assert_ne!(
+            frame_type,
+            crate::frame_type::BATCH,
+            "batch frames cannot be nested"
+        );
         let entry_size = SUB_FRAME_HEADER + payload.len();
 
         // If the buffer is empty, start a new batch with the header.
@@ -72,7 +76,9 @@ impl BatchAccumulator {
         // Only auto-flush if there are already sub-frames in the batch (buf.len() > BATCH_HEADER);
         // an oversized first entry is placed in a solo batch and will be dropped by the
         // kernel — matching existing behavior for oversized standalone frames.
-        if self.buf.len() > BATCH_HEADER && self.buf.len() + entry_size > BATCH_HEADER + self.max_payload {
+        if self.buf.len() > BATCH_HEADER
+            && self.buf.len() + entry_size > BATCH_HEADER + self.max_payload
+        {
             // Auto-flush: finalize current batch, start fresh with this entry.
             let completed = self.finalize();
             self.buf.reserve(BATCH_HEADER + entry_size);
@@ -107,7 +113,10 @@ impl BatchAccumulator {
 
     /// Appends a sub-frame entry `[type][len BE][payload]` to the buffer.
     fn append_entry(&mut self, frame_type: u8, payload: &[u8]) {
-        debug_assert!(payload.len() <= u16::MAX as usize, "sub-frame payload too large for u16 length field");
+        debug_assert!(
+            payload.len() <= u16::MAX as usize,
+            "sub-frame payload too large for u16 length field"
+        );
         self.buf.push(frame_type);
         self.buf
             .extend_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -135,8 +144,7 @@ impl<'a> Iterator for BatchIter<'a> {
         }
 
         let frame_type = self.data[self.pos];
-        let len =
-            u16::from_be_bytes([self.data[self.pos + 1], self.data[self.pos + 2]]) as usize;
+        let len = u16::from_be_bytes([self.data[self.pos + 1], self.data[self.pos + 2]]) as usize;
         let payload_start = self.pos + SUB_FRAME_HEADER;
         let payload_end = payload_start + len;
 
@@ -166,7 +174,11 @@ pub fn decode_batch(payload: &[u8]) -> BatchIter<'_> {
         "decode_batch expects BATCH frame (0x03 prefix)"
     );
     if payload.len() < BATCH_HEADER {
-        return BatchIter { data: payload, pos: 0, end: 0 };
+        return BatchIter {
+            data: payload,
+            pos: 0,
+            end: 0,
+        };
     }
     let content_len = u16::from_be_bytes([payload[1], payload[2]]) as usize;
     let end = (BATCH_HEADER + content_len).min(payload.len());
@@ -195,7 +207,10 @@ mod tests {
         let mut acc = BatchAccumulator::new(1500);
         let payload = b"hello";
         let auto_flush = acc.push(frame_type::DATA, payload);
-        assert!(auto_flush.is_none(), "single small frame should not auto-flush");
+        assert!(
+            auto_flush.is_none(),
+            "single small frame should not auto-flush"
+        );
         assert!(!acc.is_empty());
 
         let batch = acc.flush().expect("should produce a batch");
@@ -324,9 +339,7 @@ mod tests {
         acc.push(frame_type::RETICULUM, &[0xBB; 10]);
         let batch = acc.flush().unwrap();
 
-        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch)
-            .map(|(t, p)| (t, p.to_vec()))
-            .collect();
+        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch).map(|(t, p)| (t, p.to_vec())).collect();
 
         assert_eq!(subs.len(), 3);
         assert_eq!(subs[0].0, frame_type::RETICULUM);
@@ -347,9 +360,7 @@ mod tests {
         // Truncate the second sub-frame's payload (chop 10 bytes off the end).
         batch.truncate(batch.len() - 10);
 
-        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch)
-            .map(|(t, p)| (t, p.to_vec()))
-            .collect();
+        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch).map(|(t, p)| (t, p.to_vec())).collect();
 
         // Only the first sub-frame should be yielded.
         assert_eq!(subs.len(), 1);
@@ -376,9 +387,7 @@ mod tests {
         batch.extend_from_slice(&2u16.to_be_bytes());
         batch.extend_from_slice(&[0xBB; 2]);
 
-        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch)
-            .map(|(t, p)| (t, p.to_vec()))
-            .collect();
+        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch).map(|(t, p)| (t, p.to_vec())).collect();
 
         // All three should be yielded — the caller decides what to do with unknown types.
         assert_eq!(subs.len(), 3);
@@ -416,9 +425,7 @@ mod tests {
         // Trailing fragment: only 2 bytes (need 3 for a header)
         batch.extend_from_slice(&[0xFF, 0x00]);
 
-        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch)
-            .map(|(t, p)| (t, p.to_vec()))
-            .collect();
+        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch).map(|(t, p)| (t, p.to_vec())).collect();
 
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].0, frame_type::DATA);
@@ -438,9 +445,7 @@ mod tests {
         assert_eq!(batch.len(), 1010);
         assert!(real_len < 1010, "batch should be smaller than padded size");
 
-        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch)
-            .map(|(t, p)| (t, p.to_vec()))
-            .collect();
+        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch).map(|(t, p)| (t, p.to_vec())).collect();
 
         // Only the real sub-frame should be yielded, not phantom 0x00 padding.
         assert_eq!(subs.len(), 1);
