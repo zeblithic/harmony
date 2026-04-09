@@ -124,10 +124,25 @@ def main() -> None:
         print("Error: must provide --data <path> or --synthetic", file=sys.stderr)
         sys.exit(1)
 
+    if args.batch_size < 1:
+        print("Error: --batch-size must be >= 1", file=sys.stderr)
+        sys.exit(1)
+
     config = HarmonyModelConfig.tiny() if args.config == "tiny" else HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config == "tiny" else 2048)
 
+    if seq_len < 1 or seq_len > config.max_seq_len:
+        print(
+            f"Error: --seq-len must be between 1 and {config.max_seq_len} "
+            f"for config '{args.config}'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     device = detect_device(args.device)
+    if args.dtype == "bfloat16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        print("Error: --dtype bfloat16 not supported on this CUDA device", file=sys.stderr)
+        sys.exit(1)
     amp_dtype = torch.bfloat16 if args.dtype == "bfloat16" else None
     print(f"Config: {args.config}, device: {device}, seq_len: {seq_len}, dtype: {args.dtype}")
 
