@@ -9,8 +9,10 @@ For testing without a real dataset, use --synthetic to generate random tokens.
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
+import time
 from typing import Iterator
 
 import torch
@@ -118,10 +120,13 @@ def compute_validation_loss(
     vocab_size: int,
     device: torch.device,
     num_batches: int = 10,
+    amp_dtype: torch.dtype | None = None,
 ) -> float:
     """Run validation and return average cross-entropy loss."""
     was_training = model.training
     model.train(False)
+    use_amp = amp_dtype is not None
+    device_type = device.type
     try:
         total_loss = 0.0
         with torch.no_grad():
@@ -129,8 +134,9 @@ def compute_validation_loss(
                 batch = next(val_loader).to(device)
                 input_ids = batch[:, :-1]
                 targets = batch[:, 1:]
-                logits = model(input_ids)
-                loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+                with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(input_ids)
+                    loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
                 total_loss += loss.item()
     finally:
         model.train(was_training)
@@ -163,10 +169,18 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default="training/checkpoints")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--log-file", type=str, default=None, help="Path to CSV log file")
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
         print("Error: must provide --data <path> or --synthetic", file=sys.stderr)
+        sys.exit(1)
+
+    if args.grad_accum_steps < 1:
+        print("Error: --grad-accum-steps must be >= 1", file=sys.stderr)
         sys.exit(1)
 
     config = HarmonyModelConfig.tiny() if args.config == "tiny" else HarmonyModelConfig.target()
@@ -174,7 +188,10 @@ def main() -> None:
 
     device = detect_device(args.device)
     torch.manual_seed(args.seed)
-    print(f"Config: {args.config}, device: {device}, seq_len: {seq_len}")
+    amp_dtype = torch.bfloat16 if args.dtype == "bfloat16" else None
+    use_amp = amp_dtype is not None
+    device_type = device.type
+    print(f"Config: {args.config}, device: {device}, seq_len: {seq_len}, dtype: {args.dtype}")
 
     model = HarmonyModel(config).to(device)
     param_count = sum(p.numel() for p in model.parameters())
@@ -194,37 +211,78 @@ def main() -> None:
         val_loader = make_hf_dataloader(args.val_data, seq_len, args.batch_size, args.seed + 1)
         print(f"Validation data loaded from {args.val_data}")
 
-    for step in range(args.steps):
-        lr_mult = schedule.get_lr_multiplier(step)
-        set_lr(optimizer, lr_mult)
+    csv_file = None
+    csv_writer = None
+    if args.log_file:
+        csv_file = open(args.log_file, "a", newline="")
+        csv_writer = csv.writer(csv_file)
+        if os.path.getsize(args.log_file) == 0:
+            csv_writer.writerow(["step", "loss", "val_loss", "lr", "grad_norm", "dt_ms"])
 
-        batch = next(dataloader).to(device)
-        input_ids = batch[:, :-1]
-        targets = batch[:, 1:]
+    try:
+        for step in range(args.steps):
+            step_start = time.time()
+            lr_mult = schedule.get_lr_multiplier(step)
+            set_lr(optimizer, lr_mult)
+            optimizer.zero_grad()
 
-        logits = model(input_ids)
-        loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
+            accum_loss = 0.0
+            for micro_step in range(args.grad_accum_steps):
+                batch = next(dataloader).to(device)
+                input_ids = batch[:, :-1]
+                targets = batch[:, 1:]
 
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+                with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(input_ids)
+                    loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
+                accum_loss += loss.item()
+                (loss / args.grad_accum_steps).backward()
 
-        if step % 10 == 0:
+            grad_norm = None
+            if args.max_grad_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.max_grad_norm,
+                ).item()
+
+            optimizer.step()
+
+            dt_ms = (time.time() - step_start) * 1000
+            raw_loss = accum_loss / args.grad_accum_steps
             current_lr = optimizer.param_groups[0]["lr"]
-            print(f"step={step:5d}  loss={loss.item():.4f}  lr={current_lr:.6f}")
 
-        if args.save_every > 0 and step > 0 and step % args.save_every == 0:
-            save_checkpoint(model, optimizer, step, args.output_dir)
-            print(f"  -> checkpoint saved at step {step}")
-            if val_loader is not None:
-                val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device)
-                print(f"  -> val_loss={val_loss:.4f}")
+            if step % 10 == 0:
+                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}")
 
-    save_checkpoint(model, optimizer, args.steps, args.output_dir)
-    if val_loader is not None:
-        val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device)
-        print(f"Final val_loss={val_loss:.4f}")
-    print(f"Training complete. Final checkpoint at step {args.steps}")
+            val_loss_str = ""
+            if args.save_every > 0 and step > 0 and step % args.save_every == 0:
+                save_checkpoint(model, optimizer, step, args.output_dir)
+                print(f"  -> checkpoint saved at step {step}")
+                if val_loader is not None:
+                    val_loss = compute_validation_loss(
+                        model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype,
+                    )
+                    val_loss_str = f"{val_loss:.6f}"
+                    print(f"  -> val_loss={val_loss:.4f}")
+
+            if step % 10 == 0 and csv_writer is not None:
+                csv_writer.writerow([
+                    step,
+                    f"{raw_loss:.6f}",
+                    val_loss_str,
+                    f"{current_lr:.8f}",
+                    f"{grad_norm:.6f}" if grad_norm is not None else "",
+                    f"{dt_ms:.1f}",
+                ])
+                csv_file.flush()
+
+        save_checkpoint(model, optimizer, args.steps, args.output_dir)
+        if val_loader is not None:
+            val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype)
+            print(f"Final val_loss={val_loss:.4f}")
+        print(f"Training complete. Final checkpoint at step {args.steps}")
+    finally:
+        if csv_file is not None:
+            csv_file.close()
 
 
 if __name__ == "__main__":
