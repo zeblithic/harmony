@@ -3,13 +3,17 @@
 //!
 //! # Security
 //!
-//! **V1 limitation:** Announce verification checks signature validity
-//! but does NOT verify that the included `public_key` hashes to the
-//! claimed `identity_ref.hash`. This means an attacker with a valid
-//! keypair can forge announces for arbitrary identity addresses. Do
-//! not rely on announce records as proof of identity ownership until
-//! address re-derivation is implemented in a future version. See
-//! [`verify_announce`] for details.
+//! Announce verification includes:
+//! 1. Signature validity (cryptographic proof of authorship)
+//! 2. Address-to-pubkey binding (`SHA256(enc_key || sig_key)[:16] == identity_hash`)
+//! 3. Timestamp freshness (expiry + clock skew tolerance)
+//!
+//! The binding check prevents forged announces where an attacker substitutes
+//! their own keys while claiming someone else's identity address. An announce
+//! is rejected with [`DiscoveryError::AddressMismatch`] if the included
+//! public keys do not hash to the claimed identity address.
+//!
+//! See [`verify_announce`] for the full verification pipeline.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
