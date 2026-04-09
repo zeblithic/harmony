@@ -30,6 +30,11 @@ impl PeerTable {
     /// * `identity_hash` - 128-bit identity hash
     /// * `mac` - 48-bit MAC address
     pub fn update(&mut self, identity_hash: [u8; 16], mac: [u8; 6]) {
+        // Remove stale entries where this MAC was associated with a different
+        // identity. Without this, identity_for_mac() could return an arbitrary
+        // match from HashMap iteration, causing false IdentityChurn violations.
+        self.entries
+            .retain(|existing_hash, entry| *existing_hash == identity_hash || entry.mac != mac);
         self.entries.insert(
             identity_hash,
             PeerEntry {
@@ -184,5 +189,25 @@ mod tests {
         table.update(identity_hash, mac);
         thread::sleep(Duration::from_millis(10));
         assert_eq!(table.identity_for_mac(&mac), None);
+    }
+
+    #[test]
+    fn update_removes_stale_entries_for_same_mac() {
+        // Regression: after a legitimate identity change (A→B), the table
+        // must not retain the stale A entry. Otherwise identity_for_mac()
+        // returns a non-deterministic result from HashMap iteration.
+        let mut table = PeerTable::new(Duration::from_secs(60));
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let identity_a = [1u8; 16];
+        let identity_b = [2u8; 16];
+
+        table.update(identity_a, mac);
+        table.update(identity_b, mac);
+
+        // Only the new identity should be found.
+        assert_eq!(table.identity_for_mac(&mac), Some(identity_b));
+        // Old identity should be removed.
+        assert_eq!(table.lookup(&identity_a), None);
+        assert_eq!(table.peer_count(), 1);
     }
 }

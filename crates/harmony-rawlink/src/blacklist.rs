@@ -99,6 +99,13 @@ impl MacBlacklist {
         category: ViolationCategory,
         now: Instant,
     ) -> bool {
+        // Don't accumulate violations while already banned. Without this guard,
+        // a burst of N > threshold frames in one recv_frames drain would trigger
+        // multiple bans back-to-back, immediately escalating offense_count.
+        if self.is_blocked(mac, now) {
+            return false;
+        }
+
         let config = &self.config;
         let record = self.entries.entry(*mac).or_insert_with(|| ViolationRecord {
             counts: [0; 4],
@@ -435,5 +442,33 @@ mod tests {
         // If escalation were preserved, ban would last 240s. After purge, it's 60s.
         assert!(bl.is_blocked(&MAC_A, t2 + Duration::from_secs(59)));
         assert!(!bl.is_blocked(&MAC_A, t2 + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn no_double_escalation_from_single_burst() {
+        // Regression: a burst of N > threshold violations in one drain must
+        // produce exactly one ban at the current offense level, not escalate
+        // multiple times.
+        let config = BlacklistConfig {
+            thresholds: [20, 500, 5, 10],
+            base_ban: Duration::from_secs(60),
+            escalation_factor: 4,
+            ..Default::default()
+        };
+        let mut bl = MacBlacklist::new(config);
+        let t0 = Instant::now();
+
+        // Simulate 1000 RateFlood violations in one burst (threshold is 500).
+        for _ in 0..1000 {
+            bl.record_violation(&MAC_A, ViolationCategory::RateFlood, t0);
+        }
+
+        // Should be first-offense ban (60s), NOT escalated to 240s.
+        assert!(bl.is_blocked(&MAC_A, t0));
+        assert!(bl.is_blocked(&MAC_A, t0 + Duration::from_secs(59)));
+        assert!(
+            !bl.is_blocked(&MAC_A, t0 + Duration::from_secs(60)),
+            "ban should be 60s (first offense), not escalated"
+        );
     }
 }

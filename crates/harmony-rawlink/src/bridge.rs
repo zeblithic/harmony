@@ -429,16 +429,18 @@ impl<S: RawSocket> Bridge<S> {
                 return;
             }
 
-            // Every frame from a non-blocked MAC counts toward rate flood detection.
-            pending_violations.push((*src_mac, ViolationCategory::RateFlood));
-
             had_inbound = true;
 
+            // Count each logical frame (sub-frame for batches) toward rate flood
+            // detection. Counting only outer frames would let an attacker pack
+            // many sub-frames into BATCH payloads to stay under the threshold.
             if payload[0] == frame_type::BATCH {
                 for (sub_type, sub_body) in decode_batch(payload) {
+                    pending_violations.push((*src_mac, ViolationCategory::RateFlood));
                     dispatch(src_mac, sub_type, sub_body, &mut pending_violations);
                 }
             } else {
+                pending_violations.push((*src_mac, ViolationCategory::RateFlood));
                 dispatch(src_mac, payload[0], &payload[1..], &mut pending_violations);
             }
         })?;
