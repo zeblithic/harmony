@@ -59,6 +59,14 @@ def build_naming_map(config: HarmonyModelConfig) -> dict[str, str]:
     return mapping
 
 
+def build_thought_norm_map() -> dict[str, str]:
+    """Build naming map for ThoughtNorm weights (COCONUT continuous thought)."""
+    return {
+        "norm.weight": "harmony.continuous_thought.norm.weight",
+        "gate_bias": "harmony.continuous_thought.gate_bias",
+    }
+
+
 def write_metadata(
     writer: GGUFWriter, config: HarmonyModelConfig, name: str,
 ) -> None:
@@ -114,6 +122,7 @@ def export_gguf(
     config: HarmonyModelConfig,
     output_path: str | Path,
     name: str | None = None,
+    thought_norm_state: dict[str, torch.Tensor] | None = None,
 ) -> None:
     """Export a ct87 state_dict to GGUF format.
 
@@ -122,6 +131,8 @@ def export_gguf(
         config: Model configuration matching the checkpoint.
         output_path: Path to write the GGUF file.
         name: Optional model name for metadata. Defaults to "ct87".
+        thought_norm_state: Optional ThoughtNorm state_dict for COCONUT
+            continuous thought. Only provided for CT-trained models.
 
     Raises:
         ValueError: If state_dict keys don't match expected keys for config.
@@ -159,6 +170,13 @@ def export_gguf(
             tensor = tensor.squeeze()
         arr = tensor.detach().cpu().float().numpy()
         writer.add_tensor(gguf_name, arr)
+
+    # ThoughtNorm weights (COCONUT continuous thought)
+    if thought_norm_state is not None:
+        tn_map = build_thought_norm_map()
+        for pytorch_key, gguf_name in tn_map.items():
+            arr = thought_norm_state[pytorch_key].detach().cpu().float().numpy()
+            writer.add_tensor(gguf_name, arr)
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()

@@ -97,6 +97,17 @@ def save_checkpoint(
         torch.save(optimizer.state_dict(), opt_path)
 
 
+def _save_thought_norm(
+    thought_norm: torch.nn.Module,
+    step: int,
+    output_dir: str,
+) -> None:
+    """Save ThoughtNorm weights alongside the model checkpoint."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"thought_norm_step_{step}.pt")
+    torch.save(thought_norm.state_dict(), path)
+
+
 def load_checkpoint(
     model: HarmonyModel,
     output_dir: str,
@@ -192,6 +203,18 @@ def main() -> None:
         "--engram-seeds", type=str, default="42,99,137,251",
         help="Comma-separated xxhash64 seeds for Engram table lookup (default: 42,99,137,251)",
     )
+    parser.add_argument(
+        "--coconut", action="store_true",
+        help="Enable COCONUT continuous thought training",
+    )
+    parser.add_argument(
+        "--think-token-id", type=int, default=None,
+        help="Token ID for <think> (required with --coconut)",
+    )
+    parser.add_argument(
+        "--ct-max-steps", type=int, default=4,
+        help="Max thought steps for COCONUT curriculum (default: 4)",
+    )
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -202,8 +225,28 @@ def main() -> None:
         print("Error: --grad-accum-steps must be >= 1", file=sys.stderr)
         sys.exit(1)
 
+    if args.coconut and args.think_token_id is None:
+        print("Error: --think-token-id is required with --coconut", file=sys.stderr)
+        sys.exit(1)
+
     config = HarmonyModelConfig.tiny() if args.config == "tiny" else HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config == "tiny" else 2048)
+
+    if args.coconut:
+        if args.think_token_id >= config.vocab_size:
+            print(
+                f"Error: --think-token-id ({args.think_token_id}) must be "
+                f"< vocab_size ({config.vocab_size})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if seq_len + args.ct_max_steps > config.max_seq_len:
+            print(
+                f"Error: seq_len ({seq_len}) + ct_max_steps ({args.ct_max_steps}) "
+                f"exceeds max_seq_len ({config.max_seq_len})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     device = detect_device(args.device)
     torch.manual_seed(args.seed)
@@ -232,7 +275,24 @@ def main() -> None:
             f"dim={engram_table.engram_dim}, heads={engram_table.num_heads}"
         )
 
+    # COCONUT continuous thought setup
+    thought_norm = None
+    coconut_curriculum = None
+    if args.coconut:
+        from ct87.coconut import ThoughtNorm, CurriculumSchedule
+
+        config.think_token_id = args.think_token_id
+        config.ct_max_steps = args.ct_max_steps
+        thought_norm = ThoughtNorm(config.hidden_dim, eps=config.rms_norm_eps).to(device)
+        coconut_curriculum = CurriculumSchedule(args.ct_max_steps, args.steps)
+        print(
+            f"COCONUT enabled: think_token_id={args.think_token_id}, "
+            f"ct_max_steps={args.ct_max_steps}"
+        )
+
     muon_params, adam_params = partition_params(model)
+    if thought_norm is not None:
+        adam_params.extend(thought_norm.parameters())
     optimizer = Muon(muon_params, adam_params, lr=args.lr, adam_lr=args.lr)
     schedule = WSDSchedule(warmup_steps=args.warmup, total_steps=args.steps)
 
@@ -262,6 +322,7 @@ def main() -> None:
             optimizer.zero_grad()
 
             accum_loss = 0.0
+            num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
             for micro_step in range(args.grad_accum_steps):
                 batch = next(dataloader).to(device)
                 input_ids = batch[:, :-1]
@@ -274,15 +335,33 @@ def main() -> None:
                         engram_emb = engram_table.lookup_batch(input_ids)
 
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-                    logits = model(input_ids, engram_embeddings=engram_emb)
-                    loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
+                    if args.coconut and num_thoughts > 0:
+                        from ct87.coconut import coconut_forward, coconut_loss
+                        logits, think_mask = coconut_forward(
+                            model, thought_norm, input_ids,
+                            args.think_token_id, num_thoughts,
+                            engram_embeddings=engram_emb,
+                        )
+                        # Prepend ignore targets for think positions
+                        think_targets = torch.full(
+                            (targets.shape[0], num_thoughts), -100,
+                            dtype=targets.dtype, device=targets.device,
+                        )
+                        aug_targets = torch.cat([think_targets, targets], dim=1)
+                        loss = coconut_loss(logits, aug_targets, think_mask, config.vocab_size)
+                    else:
+                        logits = model(input_ids, engram_embeddings=engram_emb)
+                        loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
 
             grad_norm = None
             if args.max_grad_norm > 0:
+                all_params = list(model.parameters())
+                if thought_norm is not None:
+                    all_params.extend(thought_norm.parameters())
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), args.max_grad_norm,
+                    all_params, args.max_grad_norm,
                 ).item()
 
             optimizer.step()
@@ -292,11 +371,14 @@ def main() -> None:
             current_lr = optimizer.param_groups[0]["lr"]
 
             if step % 10 == 0:
-                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}")
+                ct_str = f"  thoughts={num_thoughts}" if args.coconut else ""
+                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}{ct_str}")
 
             val_loss_str = ""
             if args.save_every > 0 and step > 0 and step % args.save_every == 0:
                 save_checkpoint(model, optimizer, step, args.output_dir)
+                if thought_norm is not None:
+                    _save_thought_norm(thought_norm, step, args.output_dir)
                 print(f"  -> checkpoint saved at step {step}")
                 if val_loader is not None:
                     val_loss = compute_validation_loss(
@@ -318,6 +400,8 @@ def main() -> None:
                 csv_file.flush()
 
         save_checkpoint(model, optimizer, args.steps, args.output_dir)
+        if thought_norm is not None:
+            _save_thought_norm(thought_norm, args.steps, args.output_dir)
         if val_loader is not None:
             val_loss = compute_validation_loss(
                 model, val_loader, config.vocab_size, device,

@@ -344,22 +344,39 @@ class HarmonyModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         engram_embeddings: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        input_embeds: torch.Tensor | None = None,
+        return_hidden_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
-            input_ids: [batch, seq_len] token IDs
+            input_ids: [batch, seq_len] token IDs. Mutually exclusive with
+                input_embeds.
             engram_embeddings: optional [batch, seq_len, engram_dim] Engram
                 embeddings from an EngramTable lookup. When provided, the
                 EngramGatedResidual module injects them after the configured
                 engram_injection_layer.
+            input_embeds: optional [batch, seq_len, hidden_dim] embeddings to
+                use instead of token lookup. Used by COCONUT continuous thought
+                to feed hidden states back as input.
+            return_hidden_states: if True, return (logits, hidden_states) where
+                hidden_states is the pre-final_norm output of the last layer.
 
         Returns:
-            logits: [batch, seq_len, vocab_size]
+            logits: [batch, seq_len, vocab_size], or
+            (logits, hidden_states) if return_hidden_states=True.
         """
-        h = self.embed_tokens(input_ids)
+        if input_embeds is not None:
+            if input_ids is not None:
+                raise ValueError("Cannot provide both input_ids and input_embeds")
+            h = input_embeds
+        elif input_ids is not None:
+            h = self.embed_tokens(input_ids)
+        else:
+            raise ValueError("Must provide either input_ids or input_embeds")
+
         attnres_state: list[torch.Tensor] = []
         layers_per_block = self.config.layers_per_block
 
@@ -382,4 +399,7 @@ class HarmonyModel(nn.Module):
             # Store block summary at block end
             self.block_attnres.notify_layer_output(i, h, attnres_state, layers_per_block)
 
-        return self.lm_head(self.final_norm(h))
+        logits = self.lm_head(self.final_norm(h))
+        if return_hidden_states:
+            return logits, h
+        return logits
