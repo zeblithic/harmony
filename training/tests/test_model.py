@@ -315,3 +315,103 @@ class TestHarmonyModel:
         actual_std = q_weight.std().item()
         # Allow 30% tolerance for random init
         assert abs(actual_std - expected_std) / expected_std < 0.3
+
+
+class TestGradientCheckpointing:
+    def test_default_disabled(self):
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        assert model.gradient_checkpointing is False
+
+    def test_enable_disable(self):
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        model.set_gradient_checkpointing(True)
+        assert model.gradient_checkpointing is True
+        model.set_gradient_checkpointing(False)
+        assert model.gradient_checkpointing is False
+
+    def test_same_output_as_normal(self):
+        """Gradient checkpointing produces identical forward pass outputs."""
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        model.train()
+
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+
+        logits_normal = model(input_ids).detach().clone()
+
+        model.set_gradient_checkpointing(True)
+        logits_ckpt = model(input_ids).detach().clone()
+
+        assert torch.allclose(logits_normal, logits_ckpt, atol=1e-6)
+
+    def test_backward_works(self):
+        """Backward pass succeeds with gradient checkpointing enabled."""
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        model.set_gradient_checkpointing(True)
+        model.train()
+
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+        logits = model(input_ids)
+        loss = logits.sum()
+        loss.backward()
+
+        # All parameters should have gradients (except engram_residual,
+        # which only participates when engram_embeddings are provided)
+        for name, p in model.named_parameters():
+            if p.requires_grad and not name.startswith("engram_residual."):
+                assert p.grad is not None, f"{name} has no gradient"
+
+    def test_gradients_match_normal(self):
+        """Gradients with checkpointing should match normal training."""
+        cfg = _tiny_config()
+
+        torch.manual_seed(42)
+        model_normal = HarmonyModel(cfg)
+        model_normal.train()
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+        targets = torch.randint(0, cfg.vocab_size, (2, 8))
+        logits = model_normal(input_ids)
+        loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, cfg.vocab_size), targets.reshape(-1),
+        )
+        loss.backward()
+        grads_normal = {n: p.grad.clone() for n, p in model_normal.named_parameters() if p.grad is not None}
+
+        torch.manual_seed(42)
+        model_ckpt = HarmonyModel(cfg)
+        model_ckpt.set_gradient_checkpointing(True)
+        model_ckpt.train()
+        logits = model_ckpt(input_ids)
+        loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, cfg.vocab_size), targets.reshape(-1),
+        )
+        loss.backward()
+
+        for name, grad in grads_normal.items():
+            ckpt_grad = dict(model_ckpt.named_parameters())[name].grad
+            assert ckpt_grad is not None, f"{name} missing gradient with checkpointing"
+            assert torch.allclose(grad, ckpt_grad, atol=1e-5), (
+                f"{name} gradient mismatch: max diff={torch.abs(grad - ckpt_grad).max():.2e}"
+            )
+
+    def test_no_effect_during_eval(self):
+        """Checkpointing flag has no effect during eval — identical outputs."""
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        model.eval()
+
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+        with torch.no_grad():
+            logits_normal = model(input_ids)
+
+        model.set_gradient_checkpointing(True)
+        with torch.no_grad():
+            logits_ckpt = model(input_ids)
+
+        assert torch.allclose(logits_normal, logits_ckpt, atol=1e-6)
