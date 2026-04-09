@@ -18,6 +18,7 @@
 //! ```
 
 pub mod block_attnres;
+pub mod continuous_thought;
 pub mod engine;
 pub mod engram_bridge;
 pub mod engram_residual;
@@ -32,6 +33,7 @@ pub mod uq_features;
 pub mod uq_head;
 
 pub use block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
+pub use continuous_thought::{ContinuousThoughtConfig, ThoughtAction};
 pub use harmony_engine::HarmonyEngine;
 pub use harmony_model::{HarmonyModel, HarmonyModelConfig, HarmonyForwardOutput};
 pub use uq_features::{extract_uq_features, UqFeatureConfig};

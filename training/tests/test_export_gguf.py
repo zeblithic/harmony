@@ -196,3 +196,58 @@ class TestExportGguf:
             gguf_path = Path(tmpdir) / "test.gguf"
             with pytest.raises(ValueError, match="Extra keys"):
                 export_gguf(state_dict, config, gguf_path)
+
+    def test_think_token_id_out_of_range_raises(self):
+        """Exporter rejects think_token_id >= vocab_size."""
+        config = _test_config()
+        config.think_token_id = 128  # == vocab_size, invalid
+        torch.manual_seed(42)
+        model = HarmonyModel(config)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gguf_path = Path(tmpdir) / "test.gguf"
+            with pytest.raises(ValueError, match="think_token_id"):
+                export_gguf(model.state_dict(), config, gguf_path)
+
+    def test_continuous_thought_metadata_absent_when_disabled(self):
+        """No continuous thought metadata when think_token_id is None."""
+        from gguf import GGUFReader
+
+        config = _test_config()
+        assert config.think_token_id is None
+        torch.manual_seed(42)
+        model = HarmonyModel(config)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gguf_path = Path(tmpdir) / "test.gguf"
+            export_gguf(model.state_dict(), config, gguf_path)
+
+            reader = GGUFReader(str(gguf_path))
+            fields = reader.fields
+            assert "harmony.continuous_thought.enabled" not in fields
+            assert "harmony.continuous_thought.think_token_id" not in fields
+
+    def test_continuous_thought_metadata_present_when_enabled(self):
+        """Continuous thought metadata written when think_token_id is set."""
+        from gguf import GGUFReader
+
+        config = _test_config()
+        config.think_token_id = 127  # within vocab_size=128
+        torch.manual_seed(42)
+        model = HarmonyModel(config)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gguf_path = Path(tmpdir) / "test.gguf"
+            export_gguf(model.state_dict(), config, gguf_path)
+
+            reader = GGUFReader(str(gguf_path))
+            fields = reader.fields
+
+            ct_keys = [
+                "harmony.continuous_thought.enabled",
+                "harmony.continuous_thought.think_token_id",
+                "harmony.continuous_thought.max_steps",
+                "harmony.continuous_thought.confidence_threshold",
+            ]
+            for key in ct_keys:
+                assert key in fields, f"Missing continuous thought key: {key}"

@@ -79,6 +79,28 @@ def write_metadata(
     )
     writer.add_uint32("harmony.engram_dim", config.engram_dim)
 
+    # Continuous thought metadata (optional — only written when enabled).
+    if config.think_token_id is not None:
+        if config.think_token_id >= config.vocab_size:
+            raise ValueError(
+                f"think_token_id ({config.think_token_id}) must be "
+                f"< vocab_size ({config.vocab_size})"
+            )
+        writer.add_bool("harmony.continuous_thought.enabled", True)
+        writer.add_uint32(
+            "harmony.continuous_thought.think_token_id", config.think_token_id,
+        )
+        max_steps = config.ct_max_steps if config.ct_max_steps is not None else 4
+        threshold = (
+            config.ct_confidence_threshold
+            if config.ct_confidence_threshold is not None
+            else 0.85
+        )
+        writer.add_uint32("harmony.continuous_thought.max_steps", max_steps)
+        writer.add_float32(
+            "harmony.continuous_thought.confidence_threshold", threshold,
+        )
+
 
 def export_gguf(
     state_dict: dict[str, torch.Tensor],
