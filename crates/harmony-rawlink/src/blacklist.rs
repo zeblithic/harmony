@@ -144,6 +144,26 @@ impl MacBlacklist {
             false
         }
     }
+
+    /// Remove entries whose ban has expired AND whose last activity is older
+    /// than the window duration. Called periodically to bound memory growth.
+    ///
+    /// This discards `offense_count` — a MAC that went quiet for a full window
+    /// gets a fresh start. Intentional: forgiveness for transient issues.
+    pub fn purge_expired(&mut self, now: Instant) {
+        let window = self.config.window_duration;
+        self.entries.retain(|_, record| {
+            let ban_active = matches!(record.banned_until, Some(deadline) if now < deadline);
+            let window_active = now.duration_since(record.window_start) <= window;
+            ban_active || window_active
+        });
+    }
+
+    /// Returns the number of tracked MAC entries (for testing).
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[cfg(test)]
@@ -277,5 +297,143 @@ mod tests {
         }
         assert!(bl.is_blocked(&MAC_A, t0));
         assert!(!bl.is_blocked(&MAC_B, t0), "MAC_B should not be affected");
+    }
+
+    #[test]
+    fn ban_expiry() {
+        let config = BlacklistConfig {
+            thresholds: [3, 500, 5, 10],
+            base_ban: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let mut bl = MacBlacklist::new(config);
+        let t0 = Instant::now();
+
+        // Trigger a ban.
+        for _ in 0..3 {
+            bl.record_violation(&MAC_A, ViolationCategory::MalformedFrame, t0);
+        }
+        assert!(bl.is_blocked(&MAC_A, t0));
+
+        // Still banned at 59 seconds.
+        assert!(bl.is_blocked(&MAC_A, t0 + Duration::from_secs(59)));
+
+        // Expired at 60 seconds.
+        assert!(!bl.is_blocked(&MAC_A, t0 + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn escalating_bans() {
+        let config = BlacklistConfig {
+            thresholds: [3, 500, 5, 10],
+            base_ban: Duration::from_secs(60),
+            escalation_factor: 4,
+            max_ban: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let mut bl = MacBlacklist::new(config);
+        let t0 = Instant::now();
+
+        // 1st offense: 60s ban.
+        for _ in 0..3 {
+            bl.record_violation(&MAC_A, ViolationCategory::MalformedFrame, t0);
+        }
+        assert!(bl.is_blocked(&MAC_A, t0));
+        assert!(bl.is_blocked(&MAC_A, t0 + Duration::from_secs(59)));
+        assert!(!bl.is_blocked(&MAC_A, t0 + Duration::from_secs(60)));
+
+        // 2nd offense: 60 * 4 = 240s ban.
+        let t1 = t0 + Duration::from_secs(61);
+        for _ in 0..3 {
+            bl.record_violation(&MAC_A, ViolationCategory::MalformedFrame, t1);
+        }
+        assert!(bl.is_blocked(&MAC_A, t1));
+        assert!(bl.is_blocked(&MAC_A, t1 + Duration::from_secs(239)));
+        assert!(!bl.is_blocked(&MAC_A, t1 + Duration::from_secs(240)));
+
+        // 3rd offense: 60 * 16 = 960s ban.
+        let t2 = t1 + Duration::from_secs(241);
+        for _ in 0..3 {
+            bl.record_violation(&MAC_A, ViolationCategory::MalformedFrame, t2);
+        }
+        assert!(bl.is_blocked(&MAC_A, t2));
+        assert!(bl.is_blocked(&MAC_A, t2 + Duration::from_secs(959)));
+        assert!(!bl.is_blocked(&MAC_A, t2 + Duration::from_secs(960)));
+
+        // 4th offense: 60 * 64 = 3840s → capped at 3600s.
+        let t3 = t2 + Duration::from_secs(961);
+        for _ in 0..3 {
+            bl.record_violation(&MAC_A, ViolationCategory::MalformedFrame, t3);
+        }
+        assert!(bl.is_blocked(&MAC_A, t3));
+        assert!(bl.is_blocked(&MAC_A, t3 + Duration::from_secs(3599)));
+        assert!(!bl.is_blocked(&MAC_A, t3 + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn purge_cleans_stale_entries() {
+        let config = BlacklistConfig {
+            thresholds: [3, 500, 5, 10],
+            window_duration: Duration::from_secs(10),
+            base_ban: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let mut bl = MacBlacklist::new(config);
+        let t0 = Instant::now();
+
+        // MAC_A: trigger a ban (60s).
+        for _ in 0..3 {
+            bl.record_violation(&MAC_A, ViolationCategory::MalformedFrame, t0);
+        }
+
+        // MAC_B: record some violations but no ban.
+        bl.record_violation(&MAC_B, ViolationCategory::MalformedFrame, t0);
+
+        assert_eq!(bl.entry_count(), 2);
+
+        // At t0 + 15s: MAC_B's window has expired (10s), no ban → purgeable.
+        // MAC_A's ban is still active (60s) → NOT purgeable.
+        let t1 = t0 + Duration::from_secs(15);
+        bl.purge_expired(t1);
+        assert_eq!(bl.entry_count(), 1);
+        assert!(bl.is_blocked(&MAC_A, t1), "active ban must survive purge");
+
+        // At t0 + 70s: MAC_A's ban has expired (60s) and window has expired → purgeable.
+        let t2 = t0 + Duration::from_secs(70);
+        bl.purge_expired(t2);
+        assert_eq!(bl.entry_count(), 0);
+    }
+
+    #[test]
+    fn offense_count_resets_after_purge() {
+        let config = BlacklistConfig {
+            thresholds: [3, 500, 5, 10],
+            window_duration: Duration::from_secs(10),
+            base_ban: Duration::from_secs(60),
+            escalation_factor: 4,
+            ..Default::default()
+        };
+        let mut bl = MacBlacklist::new(config);
+        let t0 = Instant::now();
+
+        // 1st offense: 60s ban.
+        for _ in 0..3 {
+            bl.record_violation(&MAC_A, ViolationCategory::MalformedFrame, t0);
+        }
+        assert!(bl.is_blocked(&MAC_A, t0));
+
+        // Let ban expire and window expire, then purge.
+        let t1 = t0 + Duration::from_secs(70);
+        bl.purge_expired(t1);
+
+        // 2nd offense after purge: should be 60s again (not 240s).
+        let t2 = t1 + Duration::from_secs(1);
+        for _ in 0..3 {
+            bl.record_violation(&MAC_A, ViolationCategory::MalformedFrame, t2);
+        }
+        assert!(bl.is_blocked(&MAC_A, t2));
+        // If escalation were preserved, ban would last 240s. After purge, it's 60s.
+        assert!(bl.is_blocked(&MAC_A, t2 + Duration::from_secs(59)));
+        assert!(!bl.is_blocked(&MAC_A, t2 + Duration::from_secs(60)));
     }
 }
