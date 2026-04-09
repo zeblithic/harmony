@@ -83,13 +83,9 @@ impl MacBlacklist {
     ///
     /// Expired bans return false (lazy expiry — no cleanup needed at check time).
     pub fn is_blocked(&self, mac: &[u8; 6], now: Instant) -> bool {
-        match self.entries.get(mac) {
-            Some(record) => match record.banned_until {
-                Some(deadline) if now < deadline => true,
-                _ => false,
-            },
-            None => false,
-        }
+        self.entries
+            .get(mac)
+            .is_some_and(|r| matches!(r.banned_until, Some(deadline) if now < deadline))
     }
 
     /// Record a violation from a source MAC.
