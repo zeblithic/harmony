@@ -59,6 +59,14 @@ def build_naming_map(config: HarmonyModelConfig) -> dict[str, str]:
     return mapping
 
 
+def build_thought_norm_map() -> dict[str, str]:
+    """Build naming map for ThoughtNorm weights (COCONUT continuous thought)."""
+    return {
+        "norm.weight": "harmony.continuous_thought.norm.weight",
+        "gate_bias": "harmony.continuous_thought.gate_bias",
+    }
+
+
 def write_metadata(
     writer: GGUFWriter, config: HarmonyModelConfig, name: str,
 ) -> None:
@@ -114,6 +122,7 @@ def export_gguf(
     config: HarmonyModelConfig,
     output_path: str | Path,
     name: str | None = None,
+    thought_norm_state: dict[str, torch.Tensor] | None = None,
 ) -> None:
     """Export a ct87 state_dict to GGUF format.
 
@@ -122,6 +131,8 @@ def export_gguf(
         config: Model configuration matching the checkpoint.
         output_path: Path to write the GGUF file.
         name: Optional model name for metadata. Defaults to "ct87".
+        thought_norm_state: Optional ThoughtNorm state_dict for COCONUT
+            continuous thought. Only provided for CT-trained models.
 
     Raises:
         ValueError: If state_dict keys don't match expected keys for config.
@@ -160,6 +171,22 @@ def export_gguf(
         arr = tensor.detach().cpu().float().numpy()
         writer.add_tensor(gguf_name, arr)
 
+    # ThoughtNorm weights (COCONUT continuous thought)
+    if thought_norm_state is not None:
+        tn_map = build_thought_norm_map()
+        expected_tn = set(tn_map.keys())
+        actual_tn = set(thought_norm_state.keys())
+        if expected_tn != actual_tn:
+            raise ValueError(
+                f"ThoughtNorm state_dict mismatch. "
+                f"Expected: {sorted(expected_tn)}, got: {sorted(actual_tn)}"
+            )
+        for pytorch_key, gguf_name in tn_map.items():
+            t = thought_norm_state[pytorch_key].detach().cpu().float()
+            # GGUF requires >= 1 dimension; gate_bias is a 0-d scalar
+            arr = t.numpy() if t.ndim > 0 else t.unsqueeze(0).numpy()
+            writer.add_tensor(gguf_name, arr)
+
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -177,16 +204,49 @@ def main() -> None:
     parser.add_argument(
         "--name", type=str, default=None, help="Model name for metadata",
     )
+    parser.add_argument(
+        "--thought-norm", type=str, default=None,
+        help="Path to ThoughtNorm checkpoint (thought_norm_step_*.pt) for COCONUT exports",
+    )
+    parser.add_argument(
+        "--think-token-id", type=int, default=None,
+        help="Token ID for <think> (required with --thought-norm)",
+    )
+    parser.add_argument(
+        "--ct-max-steps", type=int, default=4,
+        help="Max continuous thought steps (default: 4)",
+    )
+    parser.add_argument(
+        "--ct-confidence-threshold", type=float, default=0.85,
+        help="Confidence threshold for continuous thought (default: 0.85)",
+    )
     args = parser.parse_args()
+
+    if args.thought_norm is not None and args.think_token_id is None:
+        parser.error("--think-token-id is required when --thought-norm is provided")
+    if args.think_token_id is not None and args.thought_norm is None:
+        parser.error("--thought-norm is required when --think-token-id is provided")
 
     config = (
         HarmonyModelConfig.tiny()
         if args.config == "tiny"
         else HarmonyModelConfig.target()
     )
+
+    # Set CT config fields when exporting with continuous thought
+    if args.think_token_id is not None:
+        config.think_token_id = args.think_token_id
+        config.ct_max_steps = args.ct_max_steps
+        config.ct_confidence_threshold = args.ct_confidence_threshold
+
     state_dict = load_file(args.checkpoint)
     name = args.name or f"ct87-{args.config}"
-    export_gguf(state_dict, config, args.output, name)
+
+    thought_norm_state = None
+    if args.thought_norm is not None:
+        thought_norm_state = torch.load(args.thought_norm, map_location="cpu", weights_only=True)
+
+    export_gguf(state_dict, config, args.output, name, thought_norm_state=thought_norm_state)
     print(f"Exported to {args.output}")
 
 
