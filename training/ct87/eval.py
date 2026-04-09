@@ -13,13 +13,17 @@ import argparse
 import math
 import sys
 import time
-from typing import Iterator
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
 from ct87.model import HarmonyModel, HarmonyModelConfig
 from ct87.train import detect_device, make_hf_dataloader, make_synthetic_dataloader
+
+if TYPE_CHECKING:
+    from ct87.engram import EngramTable
 
 
 def load_checkpoint_path(model: HarmonyModel, path: str) -> None:
@@ -36,7 +40,7 @@ def evaluate(
     device: torch.device,
     num_batches: int,
     amp_dtype: torch.dtype | None = None,
-    engram_table: object | None = None,
+    engram_table: EngramTable | None = None,
 ) -> dict[str, float | int]:
     """Run evaluation and return metrics dict.
 
@@ -143,6 +147,10 @@ def main() -> None:
         print("Error: --batch-size must be >= 1", file=sys.stderr)
         sys.exit(1)
 
+    if args.num_batches < 1:
+        print("Error: --num-batches must be >= 1", file=sys.stderr)
+        sys.exit(1)
+
     config = HarmonyModelConfig.tiny() if args.config == "tiny" else HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config == "tiny" else 2048)
 
@@ -170,7 +178,15 @@ def main() -> None:
     if args.engram_table is not None:
         from ct87.engram import EngramTable
 
-        seeds = [int(s) for s in args.engram_seeds.split(",")]
+        try:
+            seeds = [int(s) for s in args.engram_seeds.split(",")]
+        except ValueError:
+            print(
+                f"Error: invalid --engram-seeds value: must be comma-separated "
+                f"integers, got '{args.engram_seeds}'",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         engram_table = EngramTable.from_safetensors(
             args.engram_table, hash_seeds=seeds, device=str(device),
         )
