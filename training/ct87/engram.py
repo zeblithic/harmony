@@ -246,7 +246,9 @@ class EngramTable:
             hash_seeds: per-head xxhash64 seeds (length = num_heads)
             device: device to place embeddings on
         """
-        self.table = table.to(device).float()
+        # Keep table on CPU for hash-and-index phase to avoid per-row CUDA
+        # kernel launches. Only the aggregated result is moved to device.
+        self.table = table.cpu().float()
         self.total_entries = table.shape[0]
         self.engram_dim = table.shape[1]
         self.hash_seeds = hash_seeds
@@ -280,6 +282,10 @@ class EngramTable:
         aggregates embeddings per position. Position 0 always gets zero
         embeddings (no N-gram coverage).
 
+        All table lookups are collected into a single batched index_select
+        on the CPU table, then scatter-added to the output and moved to
+        the target device — avoiding per-row CUDA kernel launches.
+
         Args:
             input_ids: [batch, seq_len] token IDs
 
@@ -287,42 +293,56 @@ class EngramTable:
             [batch, seq_len, engram_dim] embedding tensor
         """
         batch_size, seq_len = input_ids.shape
-        result = torch.zeros(
-            batch_size, seq_len, self.engram_dim,
-            dtype=torch.float32, device=self.device,
-        )
+        # Collect all (batch, position, table_index) triples
+        batch_indices: list[int] = []
+        positions: list[int] = []
+        table_indices: list[int] = []
 
         for b in range(batch_size):
             tokens = input_ids[b].tolist()
-            self._lookup_sequence(tokens, result[b])
+            self._collect_indices(tokens, b, batch_indices, positions, table_indices)
 
-        return result
+        # Build result on CPU, then move to device once
+        result = torch.zeros(
+            batch_size, seq_len, self.engram_dim, dtype=torch.float32,
+        )
 
-    def _lookup_sequence(
-        self, tokens: list[int], out: torch.Tensor,
+        if table_indices:
+            # Single batched lookup on CPU table
+            idx_t = torch.tensor(table_indices, dtype=torch.long)
+            embs = self.table[idx_t]  # [n, engram_dim]
+
+            # Scatter-add into result
+            for i, (b, pos) in enumerate(zip(batch_indices, positions)):
+                result[b, pos] += embs[i]
+
+        return result.to(self.device)
+
+    def _collect_indices(
+        self,
+        tokens: list[int],
+        batch_idx: int,
+        batch_indices: list[int],
+        positions: list[int],
+        table_indices: list[int],
     ) -> None:
-        """Fill embeddings for a single sequence (in-place)."""
+        """Collect all N-gram table indices for a single sequence."""
         seq_len = len(tokens)
 
         # Bigrams: [t[i], t[i+1]] attributed to position i+1
         for i in range(seq_len - 1):
             bigram = [tokens[i], tokens[i + 1]]
-            emb = self._lookup_ngram(bigram)
-            out[i + 1] += emb
+            for seed in self.hash_seeds:
+                idx = _hash_ngram(bigram, seed) % self.total_entries
+                batch_indices.append(batch_idx)
+                positions.append(i + 1)
+                table_indices.append(idx)
 
         # Trigrams: [t[i], t[i+1], t[i+2]] attributed to position i+2
         for i in range(seq_len - 2):
             trigram = [tokens[i], tokens[i + 1], tokens[i + 2]]
-            emb = self._lookup_ngram(trigram)
-            out[i + 2] += emb
-
-    def _lookup_ngram(self, ngram_tokens: list[int]) -> torch.Tensor:
-        """Hash an N-gram and aggregate embeddings across heads."""
-        result = torch.zeros(self.engram_dim, dtype=torch.float32, device=self.device)
-
-        for seed in self.hash_seeds:
-            raw_hash = _hash_ngram(ngram_tokens, seed)
-            table_index = raw_hash % self.total_entries
-            result += self.table[table_index]
-
-        return result
+            for seed in self.hash_seeds:
+                idx = _hash_ngram(trigram, seed) % self.total_entries
+                batch_indices.append(batch_idx)
+                positions.append(i + 2)
+                table_indices.append(idx)

@@ -289,6 +289,13 @@ class HarmonyModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
         self.block_attnres = BlockAttnRes(config.num_blocks, config.hidden_dim)
 
+        # Validate engram_injection_layer (matches Rust harmony_model.rs:511-516)
+        if config.engram_injection_layer >= config.num_layers:
+            raise ValueError(
+                f"engram_injection_layer ({config.engram_injection_layer}) must be "
+                f"< num_layers ({config.num_layers})"
+            )
+
         # Engram gated residual injection module
         from ct87.engram import EngramGatedResidual
         self.engram_residual = EngramGatedResidual(config)

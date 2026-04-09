@@ -13,13 +13,16 @@ import csv
 import os
 import sys
 import time
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 import torch.nn.functional as F
 
 from ct87.model import HarmonyModel, HarmonyModelConfig
 from ct87.optim import Muon, WSDSchedule, partition_params
+
+if TYPE_CHECKING:
+    from ct87.engram import EngramTable
 
 
 def make_synthetic_dataloader(
@@ -121,7 +124,7 @@ def compute_validation_loss(
     device: torch.device,
     num_batches: int = 10,
     amp_dtype: torch.dtype | None = None,
-    engram_table: object | None = None,
+    engram_table: EngramTable | None = None,
 ) -> float:
     """Run validation and return average cross-entropy loss."""
     was_training = model.training
