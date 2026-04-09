@@ -59,13 +59,24 @@ def evaluate(
     try:
         with torch.no_grad():
             for i in range(num_batches):
-                batch = next(dataloader).to(device)
+                try:
+                    batch = next(dataloader)
+                except StopIteration as exc:
+                    raise ValueError(
+                        f"dataloader exhausted after {i} batches; "
+                        f"requested num_batches={num_batches}"
+                    ) from exc
                 input_ids = batch[:, :-1]
                 targets = batch[:, 1:]
 
+                # Engram lookup on CPU tensors to avoid device-host sync
+                # (lookup_batch calls .tolist() internally)
                 engram_emb = None
                 if engram_table is not None:
                     engram_emb = engram_table.lookup_batch(input_ids)
+
+                input_ids = input_ids.to(device)
+                targets = targets.to(device)
 
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
                     logits = model(input_ids, engram_embeddings=engram_emb)
@@ -122,6 +133,10 @@ def main() -> None:
 
     if args.data is None and not args.synthetic:
         print("Error: must provide --data <path> or --synthetic", file=sys.stderr)
+        sys.exit(1)
+
+    if args.data is not None and args.synthetic:
+        print("Error: --data and --synthetic are mutually exclusive", file=sys.stderr)
         sys.exit(1)
 
     if args.batch_size < 1:
