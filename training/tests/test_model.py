@@ -400,14 +400,18 @@ class TestGradientCheckpointing:
             )
 
     def test_no_effect_during_eval(self):
-        """Checkpointing flag has no effect during eval (no recomputation)."""
+        """Checkpointing flag has no effect during eval — identical outputs."""
         torch.manual_seed(42)
         cfg = _tiny_config()
         model = HarmonyModel(cfg)
-        model.set_gradient_checkpointing(True)
         model.eval()
 
         input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
         with torch.no_grad():
-            logits = model(input_ids)
-        assert logits.shape == (2, 8, cfg.vocab_size)
+            logits_normal = model(input_ids)
+
+        model.set_gradient_checkpointing(True)
+        with torch.no_grad():
+            logits_ckpt = model(input_ids)
+
+        assert torch.allclose(logits_normal, logits_ckpt, atol=1e-6)

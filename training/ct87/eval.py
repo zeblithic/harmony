@@ -37,12 +37,17 @@ def evaluate(
     num_batches: int,
     amp_dtype: torch.dtype | None = None,
     engram_table: object | None = None,
-) -> dict[str, float]:
+) -> dict[str, float | int]:
     """Run evaluation and return metrics dict.
 
     Returns:
-        Dict with keys: loss, perplexity, total_tokens, tokens_per_sec, elapsed_sec.
+        Dict with keys: loss, perplexity, total_tokens (int),
+        tokens_per_sec, elapsed_sec.
     """
+    if num_batches < 1:
+        raise ValueError("num_batches must be >= 1")
+
+    was_training = model.training
     model.eval()
     use_amp = amp_dtype is not None
     device_type = device.type
@@ -51,30 +56,33 @@ def evaluate(
     total_tokens = 0
     start_time = time.time()
 
-    with torch.no_grad():
-        for i in range(num_batches):
-            batch = next(dataloader).to(device)
-            input_ids = batch[:, :-1]
-            targets = batch[:, 1:]
+    try:
+        with torch.no_grad():
+            for i in range(num_batches):
+                batch = next(dataloader).to(device)
+                input_ids = batch[:, :-1]
+                targets = batch[:, 1:]
 
-            engram_emb = None
-            if engram_table is not None:
-                engram_emb = engram_table.lookup_batch(input_ids)
+                engram_emb = None
+                if engram_table is not None:
+                    engram_emb = engram_table.lookup_batch(input_ids)
 
-            with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-                logits = model(input_ids, engram_embeddings=engram_emb)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, vocab_size),
-                    targets.reshape(-1),
-                )
+                with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(input_ids, engram_embeddings=engram_emb)
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, vocab_size),
+                        targets.reshape(-1),
+                    )
 
-            batch_tokens = targets.numel()
-            total_loss += loss.item() * batch_tokens
-            total_tokens += batch_tokens
+                batch_tokens = targets.numel()
+                total_loss += loss.item() * batch_tokens
+                total_tokens += batch_tokens
 
-            if (i + 1) % 10 == 0:
-                avg = total_loss / total_tokens
-                print(f"  batch {i + 1}/{num_batches}  loss={avg:.4f}  ppl={math.exp(avg):.2f}")
+                if (i + 1) % 10 == 0:
+                    avg = total_loss / total_tokens
+                    print(f"  batch {i + 1}/{num_batches}  loss={avg:.4f}  ppl={math.exp(avg):.2f}")
+    finally:
+        model.train(was_training)
 
     elapsed = time.time() - start_time
     avg_loss = total_loss / total_tokens
@@ -154,7 +162,7 @@ def main() -> None:
         engram_table=engram_table,
     )
 
-    print(f"\nResults:")
+    print("\nResults:")
     print(f"  loss:       {metrics['loss']:.4f}")
     print(f"  perplexity: {metrics['perplexity']:.2f}")
     print(f"  tokens:     {metrics['total_tokens']:,}")

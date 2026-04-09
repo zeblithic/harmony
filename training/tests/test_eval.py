@@ -120,6 +120,28 @@ class TestEvaluate:
         for name, param in model.named_parameters():
             assert torch.equal(param, params_before[name]), f"param {name} changed during eval"
 
+    def test_restores_training_mode(self):
+        """evaluate() must restore the model's original training state."""
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        model.train()
+        assert model.training is True
+
+        dataloader = make_synthetic_dataloader(cfg.vocab_size, 16, batch_size=2, seed=99)
+        evaluate(model, dataloader, cfg.vocab_size, torch.device("cpu"), num_batches=3)
+
+        assert model.training is True, "evaluate() did not restore training mode"
+
+    def test_num_batches_zero_raises(self):
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+        dataloader = make_synthetic_dataloader(cfg.vocab_size, 16, batch_size=2, seed=99)
+
+        with pytest.raises(ValueError, match="num_batches must be >= 1"):
+            evaluate(model, dataloader, cfg.vocab_size, torch.device("cpu"), num_batches=0)
+
 
 class TestLoadCheckpointPath:
     def test_load_from_explicit_path(self):
