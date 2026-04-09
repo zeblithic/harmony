@@ -113,6 +113,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Row index is packed as uint32 in SHA-256 seed — validate range.
+    if args.entries > 2**32:
+        parser.error(f"--entries {args.entries} exceeds uint32 max (2**32)")
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

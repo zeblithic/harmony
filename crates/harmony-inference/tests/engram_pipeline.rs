@@ -289,14 +289,28 @@ fn inject_position_zero_unchanged() {
     let engram_embeddings =
         resolve_engram_embeddings(&client, &request, &shard_data, &device).unwrap();
 
-    let module = EngramGatedResidual::new(EMBEDDING_DIM, hidden_dim, 3, &device).unwrap();
+    // Use from_tensors with non-zero conv weights so the module is active —
+    // ::new() zero-inits the conv, which would make all positions zero and
+    // the test vacuously true.
+    let module = EngramGatedResidual::from_tensors(
+        Tensor::randn(0f32, 1f32, (hidden_dim, EMBEDDING_DIM), &device).unwrap(),
+        Tensor::randn(0f32, 1f32, (hidden_dim, EMBEDDING_DIM), &device).unwrap(),
+        Tensor::ones(hidden_dim, candle_core::DType::F32, &device).unwrap(),
+        Tensor::ones(hidden_dim, candle_core::DType::F32, &device).unwrap(),
+        Tensor::ones((hidden_dim, 1, 3), candle_core::DType::F32, &device).unwrap(),
+        hidden_dim,
+        1e-6,
+    )
+    .unwrap();
+
     let hidden_state =
         Tensor::randn(0f32, 1f32, (1, tokens.len(), hidden_dim), &device).unwrap();
 
     let residual = module.forward(&hidden_state, &engram_embeddings).unwrap();
 
-    // Position 0 residual should be zero (zero engram → zero value projection →
-    // zero gated value → zero conv output → silu(0) = 0)
+    // Position 0 has zero engram embedding (no N-gram coverage) → zero value
+    // projection → zero gated value → zero conv input at this position →
+    // silu(0) = 0.
     let res0 = residual
         .i((0, 0, ..))
         .unwrap()
@@ -306,6 +320,21 @@ fn inject_position_zero_unchanged() {
     assert!(
         max_at_0 < 1e-6,
         "position 0 residual should be zero, got max abs {max_at_0}"
+    );
+
+    // Verify the module IS active at later positions (proves the test is
+    // discriminative — position 0 is zero because of the zero engram, not
+    // because the module is dead).
+    let last_pos = tokens.len() - 1;
+    let res_last = residual
+        .i((0, last_pos, ..))
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let max_at_last: f32 = res_last.iter().map(|v: &f32| v.abs()).fold(0f32, f32::max);
+    assert!(
+        max_at_last > 1e-6,
+        "last position should be non-zero (module is active), got max abs {max_at_last}"
     );
 }
 
