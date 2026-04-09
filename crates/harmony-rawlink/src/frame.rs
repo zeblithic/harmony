@@ -155,6 +155,7 @@ pub fn encode_data_frame(
 ///
 /// Returns `(src_mac, origin_mac, key_expr, payload)`. The payload is
 /// extracted using the `payload_len` field, stripping any trailing padding.
+#[allow(clippy::type_complexity)]
 pub fn decode_data_frame(
     frame: &[u8],
 ) -> Result<([u8; 6], [u8; 6], String, Vec<u8>), RawLinkError> {

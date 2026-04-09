@@ -8,6 +8,7 @@
 pub mod af_packet;
 pub mod bridge;
 pub mod error;
+pub mod batch;
 pub mod frame;
 pub mod padded_socket;
 pub mod peer_table;
@@ -27,6 +28,8 @@ pub mod frame_type {
     pub const SCOUT: u8 = 0x01;
     /// Zenoh data — carries key expression + payload.
     pub const DATA: u8 = 0x02;
+    /// Batch container — multiple sub-frames in one Ethernet frame.
+    pub const BATCH: u8 = 0x03;
 }
 
 /// Ethernet header size: 6 dst + 6 src + 2 EtherType.
