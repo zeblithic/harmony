@@ -302,7 +302,8 @@ impl<S: RawSocket> Bridge<S> {
         let mut pending_violations: Vec<([u8; 6], ViolationCategory)> = Vec::new();
 
         // Dispatch a single sub-frame (type byte already stripped).
-        // Returns `Some(category)` when a violation should be recorded for `src_mac`.
+        // Violations are appended to `violations` rather than returned, to avoid
+        // a second mutable borrow of `blacklist` within the recv_frames callback.
         let mut dispatch = |src_mac: &[u8; 6],
                             frame_type_byte: u8,
                             body: &[u8],
@@ -417,9 +418,13 @@ impl<S: RawSocket> Bridge<S> {
         })?;
 
         // Apply all collected violations now that recv_frames has returned.
-        let now = Instant::now();
+        // Note: violations share a single post-callback timestamp. A MAC that
+        // crosses its threshold mid-batch is not rejected until the *next*
+        // recv_frames call — an inherent property of the deferred pattern
+        // required by the borrow checker.
+        let violation_now = Instant::now();
         for (mac, category) in pending_violations {
-            blacklist.record_violation(&mac, category, now);
+            blacklist.record_violation(&mac, category, violation_now);
         }
 
         // Publish buffered inbound data to zenoh (async, non-blocking).
