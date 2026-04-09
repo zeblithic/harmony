@@ -14,8 +14,9 @@ use rand::Rng;
 use tracing::{debug, trace, warn};
 
 use crate::{
+    batch::BatchAccumulator,
     error::RawLinkError,
-    frame::{self, BROADCAST_MAC},
+    frame::BROADCAST_MAC,
     frame_type,
     peer_table::PeerTable,
     socket::RawSocket,
@@ -95,6 +96,7 @@ impl<S: RawSocket> Bridge<S> {
         let local_mac = self.socket.local_mac();
 
         let mut consecutive_errors: u32 = 0;
+        let mut batch = BatchAccumulator::new(1500);
 
         loop {
             let now = Instant::now();
@@ -117,7 +119,7 @@ impl<S: RawSocket> Bridge<S> {
                 // 3. Process inbound L2 frames → publish to zenoh.
                 let inbound_hashes = self.process_inbound_frames(&local_mac).await?;
 
-                // 4. Drain outbound zenoh samples → broadcast as Data frames.
+                // 4. Drain outbound zenoh samples → push into batch accumulator.
                 //    Skip samples whose content hash matches something we just
                 //    published from inbound L2 (echo prevention).
                 while let Ok(Some(sample)) = subscriber.try_recv() {
@@ -126,27 +128,25 @@ impl<S: RawSocket> Bridge<S> {
                         trace!("skipping echo of L2-originated publish");
                         continue;
                     }
-                    self.process_outbound_sample(&sample)?;
+                    if let Some(payload) = self.build_outbound_data_payload(&sample) {
+                        if let Some(flushed) = batch.push(frame_type::DATA, &payload) {
+                            self.socket.send_frame(BROADCAST_MAC, &flushed)?;
+                        }
+                    }
                 }
 
-                // 5. Drain outbound Reticulum packets → broadcast as L2 frames.
+                // 5. Drain outbound Reticulum packets → push into batch accumulator.
                 if let Some(ref mut rx) = self.reticulum_outbound_rx {
                     while let Ok(packet) = rx.try_recv() {
-                        if packet.len() > u16::MAX as usize {
-                            warn!(
-                                packet_len = packet.len(),
-                                "reticulum packet exceeds u16 max, dropping"
-                            );
-                            continue;
+                        if let Some(flushed) = batch.push(frame_type::RETICULUM, &packet) {
+                            self.socket.send_frame(BROADCAST_MAC, &flushed)?;
                         }
-                        // Frame: [RETICULUM tag][u16 BE packet_len][packet]
-                        // The packet_len field enables receivers to strip padding.
-                        let mut frame_payload = Vec::with_capacity(1 + 2 + packet.len());
-                        frame_payload.push(frame_type::RETICULUM);
-                        frame_payload.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-                        frame_payload.extend_from_slice(&packet);
-                        self.socket.send_frame(frame::BROADCAST_MAC, &frame_payload)?;
                     }
+                }
+
+                // 6. Flush remaining batch.
+                if let Some(flushed) = batch.flush() {
+                    self.socket.send_frame(BROADCAST_MAC, &flushed)?;
                 }
 
                 Ok(())
@@ -339,57 +339,46 @@ impl<S: RawSocket> Bridge<S> {
         Ok(published_hashes)
     }
 
-    /// Encode and broadcast a zenoh sample as a Data frame.
-    fn process_outbound_sample(
-        &mut self,
+    /// Build the sub-frame payload for an outbound zenoh sample.
+    ///
+    /// Returns `None` if the sample should be dropped (key too long, payload
+    /// exceeds MTU). The returned bytes are the DATA sub-frame payload:
+    /// `[6 origin_mac][2 key_len BE][key bytes][payload]`.
+    fn build_outbound_data_payload(
+        &self,
         sample: &zenoh::sample::Sample,
-    ) -> Result<(), RawLinkError> {
+    ) -> Option<Vec<u8>> {
         let key_expr = sample.key_expr().as_str();
         let payload = sample.payload().to_bytes();
 
-        // Guard against key expression length overflow (u16 max = 65535).
         if key_expr.len() > u16::MAX as usize {
             warn!(key_expr, "outbound key_expr exceeds u16 max length, dropping frame");
-            return Ok(());
+            return None;
         }
 
-        // Guard against oversized frames (standard Ethernet MTU = 1500 bytes).
-        // ETH_MTU is the max Ethernet PAYLOAD (excludes the 14-byte header).
-        // send_frame receives only the post-header payload, so we don't count
-        // ETH_HEADER_LEN here. Overhead within the payload:
-        //   1 (type tag) + 6 (origin_mac) + 2 (key_len) + key_expr.len()
-        const ETH_MTU: usize = 1500;
-        let frame_overhead = 1 + 6 + 2 + key_expr.len() + 2; // +2 for payload_len
-        if payload.len() > ETH_MTU.saturating_sub(frame_overhead) {
+        // Guard against oversized sub-frames.
+        // Sub-frame overhead within DATA: 6 (origin_mac) + 2 (key_len) + key_expr.len()
+        // Max sub-frame payload in a batch: max_payload - 3 (sub-frame header) = 1482
+        const MAX_SUB_PAYLOAD: usize = 1500 - 14 - 1 - 3;
+        let data_overhead = 6 + 2 + key_expr.len();
+        if payload.len() > MAX_SUB_PAYLOAD.saturating_sub(data_overhead) {
             trace!(
                 key_expr,
                 payload_len = payload.len(),
-                "outbound payload exceeds Ethernet MTU, dropping frame"
+                "outbound payload exceeds batch sub-frame limit, dropping"
             );
-            return Ok(());
+            return None;
         }
 
-        // Build frame payload:
-        //   [DATA tag][6 origin_mac][u16 BE key_len][key][u16 BE payload_len][payload]
-        // The payload_len field enables receivers to strip padding bytes added
-        // by PaddedSocket for traffic-analysis resistance.
         let local_mac = self.socket.local_mac();
-        let mut frame_payload =
-            Vec::with_capacity(1 + 6 + 2 + key_expr.len() + 2 + payload.len());
-        frame_payload.push(frame_type::DATA);
-        frame_payload.extend_from_slice(&local_mac);
-        frame_payload.extend_from_slice(&(key_expr.len() as u16).to_be_bytes());
-        frame_payload.extend_from_slice(key_expr.as_bytes());
-        frame_payload.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        frame_payload.extend_from_slice(&payload);
+        let mut buf = Vec::with_capacity(6 + 2 + key_expr.len() + payload.len());
+        buf.extend_from_slice(&local_mac);
+        buf.extend_from_slice(&(key_expr.len() as u16).to_be_bytes());
+        buf.extend_from_slice(key_expr.as_bytes());
+        buf.extend_from_slice(&payload);
 
-        self.socket.send_frame(BROADCAST_MAC, &frame_payload)?;
-        trace!(
-            key_expr,
-            payload_len = payload.len(),
-            "outbound data frame sent"
-        );
-        Ok(())
+        trace!(key_expr, payload_len = payload.len(), "queued outbound data frame");
+        Some(buf)
     }
 
     /// Returns a jittered scout interval between 1x and 2x the configured base.
