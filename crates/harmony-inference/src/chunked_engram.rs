@@ -191,14 +191,15 @@ impl ChunkedEngramScheduler {
         client: &EngramClient,
         device: &Device,
     ) -> Result<(), InferenceError> {
-        // Merge new shard data into the persistent cache.
+        // Stage merged shard data so self.shard_cache is unchanged on error.
+        let mut merged = self.shard_cache.clone();
         for (idx, data) in new_shards {
-            self.shard_cache.insert(idx, data);
+            merged.insert(idx, data);
         }
 
         // Resolve full embeddings: [1, window_len, engram_dim].
         let embeddings =
-            engram_bridge::resolve_engram_embeddings(client, request, &self.shard_cache, device)
+            engram_bridge::resolve_engram_embeddings(client, request, &merged, device)
                 .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))?;
 
         // Extract last position: [1, 1, engram_dim].
@@ -212,6 +213,8 @@ impl ChunkedEngramScheduler {
             .narrow(1, seq_len - 1, 1)
             .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))?;
 
+        // Commit: resolution succeeded, update all mutable state.
+        self.shard_cache = merged;
         self.cached_embedding = Some(last_embedding);
         self.steps_since_refresh = 0;
         Ok(())
