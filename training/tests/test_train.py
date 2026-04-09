@@ -274,15 +274,17 @@ class TestCsvLogging:
                 reader = csv.reader(f)
                 rows = list(reader)
 
-            assert rows[0] == ["step", "loss", "val_loss", "lr", "grad_norm", "dt_ms"]
+            assert rows[0] == ["step", "loss", "uq_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
             data_rows = rows[1:]
             # Steps 0, 10, 20 -> 3 data rows (print every 10 steps)
             assert len(data_rows) == 3
             for row in data_rows:
-                assert len(row) == 6
+                assert len(row) == 8
                 int(row[0])    # step is an integer
                 float(row[1])  # loss
-                assert row[2] == ""  # val_loss empty (no --val-data)
-                float(row[3])  # lr
-                float(row[4])  # grad_norm
-                float(row[5])  # dt_ms
+                assert row[2] == ""  # uq_loss empty (no --uq-head)
+                assert row[3] == ""  # val_loss empty (no --val-data)
+                float(row[4])  # lr
+                float(row[5])  # grad_norm
+                int(row[6])    # num_thoughts
+                float(row[7])  # dt_ms

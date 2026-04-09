@@ -123,7 +123,7 @@ class TestLayerNormCollector:
         num_thoughts = 2
 
         with LayerNormCollector(model, [0, 1, 2, 3]) as collector:
-            logits, think_mask = coconut_forward(
+            _logits, _think_mask = coconut_forward(
                 model, tn, input_ids,
                 think_token_id=127, num_thoughts=num_thoughts,
             )

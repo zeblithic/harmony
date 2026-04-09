@@ -283,6 +283,9 @@ def compute_uq_loss(
         valid = ~think_mask.reshape(-1)
         conf_flat = conf_flat[valid]
         target_flat = target_flat[valid]
-    bce = F.binary_cross_entropy(conf_flat, target_flat)
+    if conf_flat.numel() == 0:
+        bce = conf_flat.new_tensor(0.0)
+    else:
+        bce = F.binary_cross_entropy(conf_flat, target_flat)
 
     return ce + bce

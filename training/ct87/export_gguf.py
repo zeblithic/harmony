@@ -225,7 +225,7 @@ def export_gguf(
             t = uq_head_state[pytorch_key].detach().cpu().float()
             # Transpose 2D weights: PyTorch [out, in] -> Rust [in, out]
             if t.ndim == 2:
-                t = t.T
+                t = t.T.contiguous()
             arr = t.numpy()
             writer.add_tensor(gguf_name, arr)
 
