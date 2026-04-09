@@ -13,7 +13,7 @@
 //! ```
 
 /// Overhead per sub-frame entry: 1 byte type + 2 bytes length (big-endian).
-const SUB_FRAME_HEADER: usize = 3;
+pub const SUB_FRAME_HEADER: usize = 3;
 
 /// Accumulates outgoing sub-frames into a single BATCH frame payload.
 ///
@@ -88,6 +88,7 @@ impl BatchAccumulator {
 
     /// Appends a sub-frame entry `[type][len BE][payload]` to the buffer.
     fn append_entry(&mut self, frame_type: u8, payload: &[u8]) {
+        debug_assert!(payload.len() <= u16::MAX as usize, "sub-frame payload too large for u16 length field");
         self.buf.push(frame_type);
         self.buf
             .extend_from_slice(&(payload.len() as u16).to_be_bytes());

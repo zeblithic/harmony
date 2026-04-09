@@ -138,6 +138,10 @@ impl<S: RawSocket> Bridge<S> {
                 // 5. Drain outbound Reticulum packets → push into batch accumulator.
                 if let Some(ref mut rx) = self.reticulum_outbound_rx {
                     while let Ok(packet) = rx.try_recv() {
+                        if packet.len() > u16::MAX as usize {
+                            warn!(len = packet.len(), "reticulum packet exceeds u16 max, dropping");
+                            continue;
+                        }
                         if let Some(flushed) = batch.push(frame_type::RETICULUM, &packet) {
                             self.socket.send_frame(BROADCAST_MAC, &flushed)?;
                         }
@@ -342,7 +346,7 @@ impl<S: RawSocket> Bridge<S> {
         // Guard against oversized sub-frames.
         // Sub-frame overhead within DATA: 6 (origin_mac) + 2 (key_len) + key_expr.len()
         // Max sub-frame payload in a batch: max_payload - 3 (sub-frame header) = 1482
-        const MAX_SUB_PAYLOAD: usize = 1500 - 14 - 1 - 3;
+        const MAX_SUB_PAYLOAD: usize = 1500 - crate::ETH_HEADER_LEN - 1 - crate::batch::SUB_FRAME_HEADER;
         let data_overhead = 6 + 2 + key_expr.len();
         if payload.len() > MAX_SUB_PAYLOAD.saturating_sub(data_overhead) {
             trace!(
