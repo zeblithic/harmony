@@ -182,7 +182,9 @@ def export_gguf(
                 f"Expected: {sorted(expected_tn)}, got: {sorted(actual_tn)}"
             )
         for pytorch_key, gguf_name in tn_map.items():
-            arr = thought_norm_state[pytorch_key].detach().cpu().float().numpy()
+            t = thought_norm_state[pytorch_key].detach().cpu().float()
+            # GGUF requires >= 1 dimension; gate_bias is a 0-d scalar
+            arr = t.numpy() if t.ndim > 0 else t.unsqueeze(0).numpy()
             writer.add_tensor(gguf_name, arr)
 
     writer.write_header_to_file()
@@ -222,6 +224,8 @@ def main() -> None:
 
     if args.thought_norm is not None and args.think_token_id is None:
         parser.error("--think-token-id is required when --thought-norm is provided")
+    if args.think_token_id is not None and args.thought_norm is None:
+        parser.error("--thought-norm is required when --think-token-id is provided")
 
     config = (
         HarmonyModelConfig.tiny()

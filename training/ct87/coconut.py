@@ -146,13 +146,14 @@ def coconut_forward(
         return_hidden_states=True,
     )
     del bootstrap_logits
+    # Detach hidden: gradients only flow through Pass 2 via ThoughtNorm
+    hidden = hidden.detach()
 
-    # Build input embeddings: token embeddings everywhere, then replace
-    # think positions with ThoughtNorm(hidden_states)
-    embeds = model.embed_tokens(augmented_ids)
+    # Build input embeddings: ThoughtNorm(hidden) at think positions,
+    # token embeddings at real positions
     normed_hidden = thought_norm(hidden[:, :num_thoughts, :])
-    embeds = embeds.clone()
-    embeds[:, :num_thoughts, :] = normed_hidden
+    embeds_suffix = model.embed_tokens(augmented_ids[:, num_thoughts:])
+    embeds = torch.cat([normed_hidden, embeds_suffix], dim=1)
 
     # Pass 2: COCONUT forward with continuous thought embeddings
     logits = model(

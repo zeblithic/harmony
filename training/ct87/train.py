@@ -136,12 +136,22 @@ def compute_validation_loss(
     num_batches: int = 10,
     amp_dtype: torch.dtype | None = None,
     engram_table: EngramTable | None = None,
+    thought_norm: torch.nn.Module | None = None,
+    think_token_id: int | None = None,
+    num_thoughts: int = 0,
 ) -> float:
-    """Run validation and return average cross-entropy loss."""
+    """Run validation and return average cross-entropy loss.
+
+    When thought_norm and think_token_id are provided with num_thoughts > 0,
+    uses COCONUT forward/loss so val_loss matches the training objective.
+    """
     was_training = model.training
     model.train(False)
     use_amp = amp_dtype is not None
     device_type = device.type
+    use_coconut = thought_norm is not None and num_thoughts > 0
+    if use_coconut:
+        from ct87.coconut import coconut_forward, coconut_loss
     try:
         total_loss = 0.0
         with torch.no_grad():
@@ -153,8 +163,21 @@ def compute_validation_loss(
                 if engram_table is not None:
                     engram_emb = engram_table.lookup_batch(input_ids)
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-                    logits = model(input_ids, engram_embeddings=engram_emb)
-                    loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+                    if use_coconut:
+                        logits, think_mask = coconut_forward(
+                            model, thought_norm, input_ids,
+                            think_token_id, num_thoughts,
+                            engram_embeddings=engram_emb,
+                        )
+                        think_targets = torch.full(
+                            (targets.shape[0], num_thoughts), -100,
+                            dtype=targets.dtype, device=targets.device,
+                        )
+                        aug_targets = torch.cat([think_targets, targets], dim=1)
+                        loss = coconut_loss(logits, aug_targets, think_mask)
+                    else:
+                        logits = model(input_ids, engram_embeddings=engram_emb)
+                        loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
                 total_loss += loss.item()
     finally:
         model.train(was_training)
@@ -233,6 +256,12 @@ def main() -> None:
     seq_len = args.seq_len or (512 if args.config == "tiny" else 2048)
 
     if args.coconut:
+        if args.think_token_id < 0:
+            print("Error: --think-token-id must be >= 0", file=sys.stderr)
+            sys.exit(1)
+        if args.ct_max_steps < 0:
+            print("Error: --ct-max-steps must be >= 0", file=sys.stderr)
+            sys.exit(1)
         if args.think_token_id >= config.vocab_size:
             print(
                 f"Error: --think-token-id ({args.think_token_id}) must be "
@@ -384,6 +413,9 @@ def main() -> None:
                     val_loss = compute_validation_loss(
                         model, val_loader, config.vocab_size, device,
                         amp_dtype=amp_dtype, engram_table=engram_table,
+                        thought_norm=thought_norm,
+                        think_token_id=args.think_token_id if args.coconut else None,
+                        num_thoughts=num_thoughts,
                     )
                     val_loss_str = f"{val_loss:.6f}"
                     print(f"  -> val_loss={val_loss:.4f}")
@@ -406,6 +438,9 @@ def main() -> None:
             val_loss = compute_validation_loss(
                 model, val_loader, config.vocab_size, device,
                 amp_dtype=amp_dtype, engram_table=engram_table,
+                thought_norm=thought_norm,
+                think_token_id=args.think_token_id if args.coconut else None,
+                num_thoughts=num_thoughts,
             )
             print(f"Final val_loss={val_loss:.4f}")
         print(f"Training complete. Final checkpoint at step {args.steps}")
