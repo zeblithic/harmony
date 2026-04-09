@@ -46,11 +46,12 @@ class CurriculumSchedule:
     def __init__(self, max_steps: int, total_train_steps: int):
         self.max_steps = max_steps
         self.total_train_steps = total_train_steps
-        self.stage_length = total_train_steps // (max_steps + 1) if max_steps > 0 else total_train_steps
+        if max_steps > 0:
+            self.stage_length = max(1, total_train_steps // (max_steps + 1))
+        else:
+            self.stage_length = total_train_steps
 
     def num_thoughts(self, train_step: int) -> int:
-        if self.stage_length == 0:
-            return self.max_steps
         return min(train_step // self.stage_length, self.max_steps)
 
 
@@ -120,6 +121,13 @@ def coconut_forward(
         think_mask = torch.zeros(input_ids.shape, dtype=torch.bool, device=input_ids.device)
         return logits, think_mask
 
+    augmented_len = input_ids.shape[1] + num_thoughts
+    if augmented_len > model.config.max_seq_len:
+        raise ValueError(
+            f"augmented sequence length ({augmented_len}) exceeds "
+            f"model max_seq_len ({model.config.max_seq_len})"
+        )
+
     augmented_ids, think_mask = insert_think_tokens(input_ids, think_token_id, num_thoughts)
 
     # Align engram embeddings: zero-pad at front for think positions
@@ -131,12 +139,13 @@ def coconut_forward(
                           dtype=engram_embeddings.dtype, device=engram_embeddings.device)
         padded_engram = torch.cat([pad, engram_embeddings], dim=1)
 
-    # Pass 1: bootstrap forward to get hidden states
-    _, hidden = model(
+    # Pass 1: bootstrap forward to get hidden states (discard logits to free VRAM)
+    bootstrap_logits, hidden = model(
         input_ids=augmented_ids,
         engram_embeddings=padded_engram,
         return_hidden_states=True,
     )
+    del bootstrap_logits
 
     # Build input embeddings: token embeddings everywhere, then replace
     # think positions with ThoughtNorm(hidden_states)

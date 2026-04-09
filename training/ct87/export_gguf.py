@@ -174,6 +174,13 @@ def export_gguf(
     # ThoughtNorm weights (COCONUT continuous thought)
     if thought_norm_state is not None:
         tn_map = build_thought_norm_map()
+        expected_tn = set(tn_map.keys())
+        actual_tn = set(thought_norm_state.keys())
+        if expected_tn != actual_tn:
+            raise ValueError(
+                f"ThoughtNorm state_dict mismatch. "
+                f"Expected: {sorted(expected_tn)}, got: {sorted(actual_tn)}"
+            )
         for pytorch_key, gguf_name in tn_map.items():
             arr = thought_norm_state[pytorch_key].detach().cpu().float().numpy()
             writer.add_tensor(gguf_name, arr)
@@ -195,6 +202,10 @@ def main() -> None:
     parser.add_argument(
         "--name", type=str, default=None, help="Model name for metadata",
     )
+    parser.add_argument(
+        "--thought-norm", type=str, default=None,
+        help="Path to ThoughtNorm checkpoint (thought_norm_step_*.pt) for COCONUT exports",
+    )
     args = parser.parse_args()
 
     config = (
@@ -204,7 +215,12 @@ def main() -> None:
     )
     state_dict = load_file(args.checkpoint)
     name = args.name or f"ct87-{args.config}"
-    export_gguf(state_dict, config, args.output, name)
+
+    thought_norm_state = None
+    if args.thought_norm is not None:
+        thought_norm_state = torch.load(args.thought_norm, map_location="cpu", weights_only=True)
+
+    export_gguf(state_dict, config, args.output, name, thought_norm_state=thought_norm_state)
     print(f"Exported to {args.output}")
 
 

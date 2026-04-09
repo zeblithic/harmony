@@ -142,6 +142,12 @@ class TestCurriculumSchedule:
         assert sched.num_thoughts(600) == 3
         assert sched.num_thoughts(800) == 4
 
+    def test_short_run_still_ramps(self):
+        """Short runs (total_steps < max_steps+1) should still start at 0."""
+        sched = CurriculumSchedule(max_steps=4, total_train_steps=3)
+        assert sched.num_thoughts(0) == 0
+        assert sched.stage_length >= 1
+
 
 # ---------------------------------------------------------------------------
 # insert_think_tokens
@@ -234,7 +240,7 @@ class TestCoconutForward:
         input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
         engram_emb = engram_table.lookup_batch(input_ids)
 
-        logits, mask = coconut_forward(
+        logits, _ = coconut_forward(
             model, tn, input_ids, think_token_id=127, num_thoughts=2,
             engram_embeddings=engram_emb,
         )
