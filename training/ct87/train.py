@@ -449,6 +449,7 @@ def main() -> None:
                                 uq_targets = targets
                             uq_class_labels, uq_conf_targets = compute_pseudo_labels(
                                 logits.detach(), uq_targets, uq_features,
+                                top_k=uq_feature_config.top_k,
                             )
 
                         uq_class_logits, uq_confidence = uq_head(uq_features.detach())

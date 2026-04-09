@@ -293,12 +293,16 @@ class TestUqHead:
         assert class_logits.shape == (2, 8, 4)
         assert confidence.shape == (2, 8, 1)
 
-    def test_confidence_in_zero_one(self):
+    def test_confidence_logits_shape(self):
         head = UqHead()
         features = torch.randn(3, 5, 8)
-        _, confidence = head(features)
-        assert (confidence >= 0).all()
-        assert (confidence <= 1).all()
+        _, confidence_logits = head(features)
+        # Raw logits, sigmoid applied in loss function
+        assert confidence_logits.shape == (3, 5, 1)
+        # Verify sigmoid produces valid probabilities
+        probs = torch.sigmoid(confidence_logits)
+        assert (probs >= 0).all()
+        assert (probs <= 1).all()
 
     def test_gradient_flows(self):
         head = UqHead()
@@ -319,28 +323,43 @@ class TestUqHead:
 class TestComputeUqLoss:
     def test_finite_loss(self):
         class_logits = torch.randn(2, 6, 4)
-        confidence = torch.sigmoid(torch.randn(2, 6, 1))
+        confidence_logits = torch.randn(2, 6, 1)
         class_labels = torch.randint(0, 4, (2, 6))
         conf_targets = torch.randint(0, 2, (2, 6)).float()
-        loss = compute_uq_loss(class_logits, confidence, class_labels, conf_targets)
+        loss = compute_uq_loss(class_logits, confidence_logits, class_labels, conf_targets)
         assert torch.isfinite(loss)
 
     def test_think_mask_excludes_positions(self):
         torch.manual_seed(42)
         class_logits = torch.randn(1, 5, 4, requires_grad=True)
-        confidence = torch.sigmoid(torch.randn(1, 5, 1, requires_grad=True))
+        confidence_logits = torch.randn(1, 5, 1, requires_grad=True)
         class_labels = torch.randint(0, 4, (1, 5))
         conf_targets = torch.randint(0, 2, (1, 5)).float()
         think_mask = torch.tensor([[True, True, False, False, False]])
 
         loss = compute_uq_loss(
-            class_logits, confidence, class_labels, conf_targets,
+            class_logits, confidence_logits, class_labels, conf_targets,
             think_mask=think_mask,
         )
         loss.backward()
 
         # Gradients at think positions should be zero
         assert (class_logits.grad[0, :2, :] == 0).all()
+
+    def test_fully_masked_returns_zero(self):
+        """When think_mask excludes all positions, loss is zero (not NaN)."""
+        class_logits = torch.randn(1, 4, 4, requires_grad=True)
+        confidence_logits = torch.randn(1, 4, 1, requires_grad=True)
+        class_labels = torch.randint(0, 4, (1, 4))
+        conf_targets = torch.randint(0, 2, (1, 4)).float()
+        think_mask = torch.ones(1, 4, dtype=torch.bool)  # all masked
+
+        loss = compute_uq_loss(
+            class_logits, confidence_logits, class_labels, conf_targets,
+            think_mask=think_mask,
+        )
+        assert torch.isfinite(loss)
+        assert loss.item() == 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -217,6 +217,21 @@ def export_gguf(
                 f"UQ head state_dict mismatch. "
                 f"Expected: {sorted(expected_uq)}, got: {sorted(actual_uq)}"
             )
+        expected_shapes = {
+            "classifier_fc1.weight": (32, 8),
+            "classifier_fc1.bias": (32,),
+            "classifier_fc2.weight": (4, 32),
+            "classifier_fc2.bias": (4,),
+            "confidence_linear.weight": (1, 8),
+            "confidence_linear.bias": (1,),
+        }
+        for key, expected_shape in expected_shapes.items():
+            actual_shape = tuple(uq_head_state[key].shape)
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"UQ head tensor {key} has shape {actual_shape}, "
+                    f"expected {expected_shape}"
+                )
         writer.add_bool("harmony.uq.enabled", True)
         writer.add_uint32("harmony.uq.num_features", 8)
         writer.add_uint32("harmony.uq.hidden_dim", 32)

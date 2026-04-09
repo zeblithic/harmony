@@ -138,6 +138,7 @@ def compute_pseudo_labels(
     features: torch.Tensor,
     collapse_threshold: float = 0.1,
     confident_threshold: float = 0.5,
+    top_k: int = 10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Derive pseudo-labels from model behavior.
 
@@ -149,6 +150,7 @@ def compute_pseudo_labels(
         features: ``[batch, seq_len, 8]`` from :func:`extract_uq_features`
         collapse_threshold: max norm threshold for SpectralCollapse
         confident_threshold: P(target) threshold for Confident
+        top_k: top-k value used in feature extraction (for entropy threshold)
 
     Returns:
         class_labels: ``[batch, seq_len]`` long, values in {0,1,2,3}
@@ -168,7 +170,7 @@ def compute_pseudo_labels(
     labels = torch.full((batch, seq_len), 3, dtype=torch.long, device=targets.device)
 
     # HighVolume (1): high entropy AND dispersed probability
-    entropy_threshold = math.log(10.0)  # ln(top_k=10)
+    entropy_threshold = math.log(float(top_k))
     high_volume = (f6 > entropy_threshold) & (f7 < 0.5)
     labels[high_volume] = 1
 
@@ -195,11 +197,12 @@ class UqHead(nn.Module):
 
     Two-path classifier operating on 8 pre-extracted features:
     - Classifier: Linear(8->32) -> ReLU -> Linear(32->4) -> raw logits
-    - Confidence: Linear(8->1) -> sigmoid
+    - Confidence: Linear(8->1) -> raw logit
 
-    Forward returns raw class logits (no softmax) because PyTorch's
-    ``F.cross_entropy`` expects raw logits. The Rust side applies softmax
-    in its forward because candle uses separate softmax + argmax.
+    Forward returns raw logits for both paths. The Rust side applies
+    softmax/sigmoid in its forward; here we defer activation to the loss
+    functions (``F.cross_entropy`` and ``F.binary_cross_entropy_with_logits``)
+    for numerical stability under autocast.
 
     Total parameters: 429.
     """
@@ -235,26 +238,29 @@ class UqHead(nn.Module):
 
         Returns:
             class_logits: ``[..., 4]`` raw logits (no softmax).
-            confidence: ``[..., 1]`` sigmoid output in [0, 1].
+            confidence_logits: ``[..., 1]`` raw logits (no sigmoid).
         """
         h = F.relu(self.classifier_fc1(features))
         class_logits = self.classifier_fc2(h)
-        confidence = torch.sigmoid(self.confidence_linear(features))
-        return class_logits, confidence
+        confidence_logits = self.confidence_linear(features)
+        return class_logits, confidence_logits
 
 
 def compute_uq_loss(
     class_logits: torch.Tensor,
-    confidence: torch.Tensor,
+    confidence_logits: torch.Tensor,
     class_labels: torch.Tensor,
     confidence_targets: torch.Tensor,
     think_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Combined UQ loss: classification CE + confidence BCE.
 
+    Uses ``binary_cross_entropy_with_logits`` on raw confidence logits
+    for numerical stability under bfloat16 autocast.
+
     Args:
         class_logits: ``[batch, seq_len, 4]``
-        confidence: ``[batch, seq_len, 1]``
+        confidence_logits: ``[batch, seq_len, 1]`` raw logits (pre-sigmoid)
         class_labels: ``[batch, seq_len]`` long
         confidence_targets: ``[batch, seq_len]`` float
         think_mask: optional ``[batch, seq_len]`` bool — positions to exclude
@@ -262,30 +268,22 @@ def compute_uq_loss(
     Returns:
         Scalar loss.
     """
-    masked_labels = class_labels.clone()
-    masked_conf_targets = confidence_targets.clone()
-    if think_mask is not None:
-        masked_labels[think_mask] = -100
-        masked_conf_targets[think_mask] = 0.0
+    logits_flat = class_logits.reshape(-1, 4)
+    labels_flat = class_labels.reshape(-1)
+    conf_flat = confidence_logits.squeeze(-1).reshape(-1)
+    target_flat = confidence_targets.reshape(-1)
 
-    # Classification CE (ignore_index=-100 excludes think positions)
-    ce = F.cross_entropy(
-        class_logits.reshape(-1, 4),
-        masked_labels.reshape(-1),
-        ignore_index=-100,
-    )
-
-    # Confidence BCE
-    conf_flat = confidence.squeeze(-1).reshape(-1)
-    target_flat = masked_conf_targets.reshape(-1)
     if think_mask is not None:
-        # Only compute BCE at non-think positions
         valid = ~think_mask.reshape(-1)
+        logits_flat = logits_flat[valid]
+        labels_flat = labels_flat[valid]
         conf_flat = conf_flat[valid]
         target_flat = target_flat[valid]
-    if conf_flat.numel() == 0:
-        bce = conf_flat.new_tensor(0.0)
-    else:
-        bce = F.binary_cross_entropy(conf_flat, target_flat)
+
+    if labels_flat.numel() == 0:
+        return class_logits.new_tensor(0.0)
+
+    ce = F.cross_entropy(logits_flat, labels_flat)
+    bce = F.binary_cross_entropy_with_logits(conf_flat, target_flat)
 
     return ce + bce
