@@ -327,7 +327,7 @@ def main() -> None:
     thought_norm = None
     coconut_curriculum = None
     if args.coconut:
-        from ct87.coconut import ThoughtNorm, CurriculumSchedule
+        from ct87.coconut import ThoughtNorm, CurriculumSchedule, coconut_forward, coconut_loss
 
         config.think_token_id = args.think_token_id
         config.ct_max_steps = args.ct_max_steps
@@ -342,7 +342,10 @@ def main() -> None:
     uq_head = None
     uq_feature_config = None
     if args.uq_head:
-        from ct87.uq import UqHead, UqFeatureConfig
+        from ct87.uq import (
+            UqHead, UqFeatureConfig, LayerNormCollector,
+            extract_uq_features, compute_pseudo_labels, compute_uq_loss,
+        )
         uq_head = UqHead().to(device)
         uq_feature_config = UqFeatureConfig.for_num_layers(config.num_layers)
         uq_param_count = sum(p.numel() for p in uq_head.parameters())
@@ -399,13 +402,8 @@ def main() -> None:
                     # Forward pass (optionally with LayerNormCollector for UQ)
                     think_mask = None
                     if uq_head is not None:
-                        from ct87.uq import (
-                            LayerNormCollector, extract_uq_features,
-                            compute_pseudo_labels, compute_uq_loss,
-                        )
                         with LayerNormCollector(model, uq_feature_config.norm_layers) as collector:
                             if args.coconut and num_thoughts > 0:
-                                from ct87.coconut import coconut_forward, coconut_loss
                                 logits, think_mask = coconut_forward(
                                     model, thought_norm, input_ids,
                                     args.think_token_id, num_thoughts,
@@ -415,7 +413,6 @@ def main() -> None:
                                 logits = model(input_ids, engram_embeddings=engram_emb)
                         uq_norms = collector.get_norms()
                     elif args.coconut and num_thoughts > 0:
-                        from ct87.coconut import coconut_forward, coconut_loss
                         logits, think_mask = coconut_forward(
                             model, thought_norm, input_ids,
                             args.think_token_id, num_thoughts,
@@ -452,7 +449,7 @@ def main() -> None:
                                 top_k=uq_feature_config.top_k,
                             )
 
-                        uq_class_logits, uq_confidence = uq_head(uq_features.detach())
+                        uq_class_logits, uq_confidence = uq_head(uq_features)
                         uq_loss_val = compute_uq_loss(
                             uq_class_logits, uq_confidence,
                             uq_class_labels, uq_conf_targets,

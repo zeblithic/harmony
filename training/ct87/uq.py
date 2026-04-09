@@ -176,7 +176,10 @@ def compute_pseudo_labels(
 
     # Confident (0): model assigns high prob to correct token (overrides HighVolume)
     probs = F.softmax(logits, dim=-1)
-    target_probs = probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    # Clamp targets to valid range for gather (callers should replace ignore
+    # indices like -100 before calling, but clamp defensively)
+    safe_targets = targets.clamp(min=0, max=logits.shape[-1] - 1)
+    target_probs = probs.gather(dim=-1, index=safe_targets.unsqueeze(-1)).squeeze(-1)
     confident = target_probs > confident_threshold
     labels[confident] = 0
 
@@ -187,7 +190,7 @@ def compute_pseudo_labels(
 
     # Confidence target: was the top prediction correct?
     predicted = logits.argmax(dim=-1)
-    confidence_targets = (predicted == targets).float()
+    confidence_targets = (predicted == safe_targets).float()
 
     return labels, confidence_targets
 
