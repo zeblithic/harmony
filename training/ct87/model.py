@@ -271,7 +271,7 @@ class HarmonyModel(nn.Module):
     """The ct87 custom model -- Qwen3-derived transformer with BlockAttnRes.
 
     Forward pass mirrors crates/harmony-inference/src/harmony_model.rs:473-534.
-    Training only -- no KV cache, no Engram injection, no UQ collection.
+    Training only -- no KV cache, no UQ collection.
     """
 
     def __init__(self, config: HarmonyModelConfig):
@@ -289,6 +289,17 @@ class HarmonyModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
         self.block_attnres = BlockAttnRes(config.num_blocks, config.hidden_dim)
 
+        # Validate engram_injection_layer (matches Rust harmony_model.rs:511-516)
+        if config.engram_injection_layer >= config.num_layers:
+            raise ValueError(
+                f"engram_injection_layer ({config.engram_injection_layer}) must be "
+                f"< num_layers ({config.num_layers})"
+            )
+
+        # Engram gated residual injection module
+        from ct87.engram import EngramGatedResidual
+        self.engram_residual = EngramGatedResidual(config)
+
         # Tied embeddings
         if config.tie_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -299,6 +310,7 @@ class HarmonyModel(nn.Module):
         """Initialize weights matching candle HarmonyModel::new().
 
         - Linear: Kaiming uniform, scale 1/sqrt(fan_in)
+        - Conv1d: zeros (Engram conv1d starts zeroed, matching Rust new())
         - RMSNorm: ones (already done in RMSNorm.__init__)
         - Embedding: normal, std 1/sqrt(hidden_dim)
         - BlockAttnRes queries: small normal, std 0.02 (already done in BlockAttnRes.__init__)
@@ -308,17 +320,28 @@ class HarmonyModel(nn.Module):
                 # Matches Rust random_linear(): scaled_randn with std=1/sqrt(fan_in)
                 fan_in = module.weight.shape[1]
                 nn.init.normal_(module.weight, mean=0.0, std=1.0 / math.sqrt(fan_in))
+            elif isinstance(module, nn.Conv1d):
+                # Engram depthwise conv1d starts zeroed (matches Rust new())
+                nn.init.zeros_(module.weight)
 
         # Embedding init runs last so it overwrites the Kaiming uniform that
         # was applied to the tied lm_head weight (which shares this tensor).
         std = 1.0 / math.sqrt(self.config.hidden_dim)
         nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=std)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        engram_embeddings: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Forward pass.
 
         Args:
             input_ids: [batch, seq_len] token IDs
+            engram_embeddings: optional [batch, seq_len, engram_dim] Engram
+                embeddings from an EngramTable lookup. When provided, the
+                EngramGatedResidual module injects them after the configured
+                engram_injection_layer.
 
         Returns:
             logits: [batch, seq_len, vocab_size]
@@ -335,6 +358,10 @@ class HarmonyModel(nn.Module):
 
             # Standard transformer layer
             h = layer(h)
+
+            # Engram injection at the configured layer
+            if engram_embeddings is not None and i == self.config.engram_injection_layer:
+                h = h + self.engram_residual(h, engram_embeddings)
 
             # Store block summary at block end
             self.block_attnres.notify_layer_output(i, h, attnres_state, layers_per_block)

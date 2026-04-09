@@ -49,6 +49,13 @@ def build_naming_map(config: HarmonyModelConfig) -> dict[str, str]:
             f"harmony.block_attnres.query.{i}.weight"
         )
 
+    # Engram gated residual weights
+    mapping["engram_residual.key_proj.weight"] = "harmony.engram_residual.key_proj.weight"
+    mapping["engram_residual.value_proj.weight"] = "harmony.engram_residual.value_proj.weight"
+    mapping["engram_residual.gate_norm.weight"] = "harmony.engram_residual.gate_norm.weight"
+    mapping["engram_residual.key_norm.weight"] = "harmony.engram_residual.key_norm.weight"
+    mapping["engram_residual.conv1d.weight"] = "harmony.engram_residual.conv1d.weight"
+
     return mapping
 
 

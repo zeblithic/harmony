@@ -13,13 +13,16 @@ import csv
 import os
 import sys
 import time
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 import torch.nn.functional as F
 
 from ct87.model import HarmonyModel, HarmonyModelConfig
 from ct87.optim import Muon, WSDSchedule, partition_params
+
+if TYPE_CHECKING:
+    from ct87.engram import EngramTable
 
 
 def make_synthetic_dataloader(
@@ -121,6 +124,7 @@ def compute_validation_loss(
     device: torch.device,
     num_batches: int = 10,
     amp_dtype: torch.dtype | None = None,
+    engram_table: EngramTable | None = None,
 ) -> float:
     """Run validation and return average cross-entropy loss."""
     was_training = model.training
@@ -134,8 +138,11 @@ def compute_validation_loss(
                 batch = next(val_loader).to(device)
                 input_ids = batch[:, :-1]
                 targets = batch[:, 1:]
+                engram_emb = None
+                if engram_table is not None:
+                    engram_emb = engram_table.lookup_batch(input_ids)
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-                    logits = model(input_ids)
+                    logits = model(input_ids, engram_embeddings=engram_emb)
                     loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
                 total_loss += loss.item()
     finally:
@@ -173,6 +180,14 @@ def main() -> None:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-file", type=str, default=None, help="Path to CSV log file")
+    parser.add_argument(
+        "--engram-table", type=str, default=None,
+        help="Path to Engram safetensors table (enables Engram injection during training)",
+    )
+    parser.add_argument(
+        "--engram-seeds", type=str, default="42,99,137,251",
+        help="Comma-separated xxhash64 seeds for Engram table lookup (default: 42,99,137,251)",
+    )
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -196,6 +211,19 @@ def main() -> None:
     model = HarmonyModel(config).to(device)
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
+
+    # Load Engram table if provided
+    engram_table = None
+    if args.engram_table is not None:
+        from ct87.engram import EngramTable
+        seeds = [int(s) for s in args.engram_seeds.split(",")]
+        engram_table = EngramTable.from_safetensors(
+            args.engram_table, hash_seeds=seeds, device=str(device),
+        )
+        print(
+            f"Engram table loaded: {engram_table.total_entries:,} entries, "
+            f"dim={engram_table.engram_dim}, heads={engram_table.num_heads}"
+        )
 
     muon_params, adam_params = partition_params(model)
     optimizer = Muon(muon_params, adam_params, lr=args.lr, adam_lr=args.lr)
@@ -232,8 +260,14 @@ def main() -> None:
                 input_ids = batch[:, :-1]
                 targets = batch[:, 1:]
 
+                # Compute Engram embeddings if table is loaded
+                engram_emb = None
+                if engram_table is not None:
+                    with torch.no_grad():
+                        engram_emb = engram_table.lookup_batch(input_ids)
+
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-                    logits = model(input_ids)
+                    logits = model(input_ids, engram_embeddings=engram_emb)
                     loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
@@ -259,7 +293,8 @@ def main() -> None:
                 print(f"  -> checkpoint saved at step {step}")
                 if val_loader is not None:
                     val_loss = compute_validation_loss(
-                        model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype,
+                        model, val_loader, config.vocab_size, device,
+                        amp_dtype=amp_dtype, engram_table=engram_table,
                     )
                     val_loss_str = f"{val_loss:.6f}"
                     print(f"  -> val_loss={val_loss:.4f}")
@@ -277,7 +312,10 @@ def main() -> None:
 
         save_checkpoint(model, optimizer, args.steps, args.output_dir)
         if val_loader is not None:
-            val_loss = compute_validation_loss(model, val_loader, config.vocab_size, device, amp_dtype=amp_dtype)
+            val_loss = compute_validation_loss(
+                model, val_loader, config.vocab_size, device,
+                amp_dtype=amp_dtype, engram_table=engram_table,
+            )
             print(f"Final val_loss={val_loss:.4f}")
         print(f"Training complete. Final checkpoint at step {args.steps}")
     finally:
