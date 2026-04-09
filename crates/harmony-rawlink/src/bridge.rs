@@ -20,6 +20,7 @@ use tracing::{debug, trace, warn};
 
 use crate::{
     batch::{decode_batch, BatchAccumulator},
+    blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory},
     error::RawLinkError,
     frame::BROADCAST_MAC,
     frame_type,
@@ -112,6 +113,7 @@ pub struct Bridge<S: RawSocket> {
     session: zenoh::Session,
     config: BridgeConfig,
     peer_table: PeerTable,
+    blacklist: MacBlacklist,
     reticulum_outbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 }
 
@@ -130,11 +132,13 @@ impl<S: RawSocket> Bridge<S> {
         reticulum_outbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     ) -> Self {
         let peer_table = PeerTable::new(config.peer_ttl);
+        let blacklist = MacBlacklist::new(BlacklistConfig::default());
         Self {
             socket,
             session,
             config,
             peer_table,
+            blacklist,
             reticulum_outbound_rx,
         }
     }
@@ -172,6 +176,7 @@ impl<S: RawSocket> Bridge<S> {
                 // 2. Purge expired peer table entries periodically.
                 if now >= next_purge {
                     self.peer_table.purge_expired();
+                    self.blacklist.purge_expired(now);
                     next_purge = now + self.config.peer_ttl;
                 }
 
@@ -287,13 +292,21 @@ impl<S: RawSocket> Bridge<S> {
         let mut had_inbound = false;
 
         let Self {
-            socket, peer_table, config, ..
+            socket, peer_table, blacklist, config, ..
         } = self;
         let allowed_prefix = &config.subscribe_pattern;
         let reticulum_tx = &config.reticulum_inbound_tx;
 
+        // Pending violations collected during recv_frames; applied afterwards
+        // to avoid two mutable borrows of `blacklist` through simultaneous closures.
+        let mut pending_violations: Vec<([u8; 6], ViolationCategory)> = Vec::new();
+
         // Dispatch a single sub-frame (type byte already stripped).
-        let mut dispatch = |src_mac: &[u8; 6], frame_type_byte: u8, body: &[u8]| {
+        // Returns `Some(category)` when a violation should be recorded for `src_mac`.
+        let mut dispatch = |src_mac: &[u8; 6],
+                            frame_type_byte: u8,
+                            body: &[u8],
+                            violations: &mut Vec<([u8; 6], ViolationCategory)>| {
             match frame_type_byte {
                 frame_type::RETICULUM => {
                     if !body.is_empty() {
@@ -306,6 +319,7 @@ impl<S: RawSocket> Bridge<S> {
                 frame_type::SCOUT => {
                     if body.len() < 16 {
                         debug!(len = body.len(), "scout frame too short, ignoring");
+                        violations.push((*src_mac, ViolationCategory::MalformedFrame));
                         return;
                     }
                     let mut identity_hash = [0u8; 16];
@@ -321,6 +335,7 @@ impl<S: RawSocket> Bridge<S> {
                     // Data body: [6-byte origin_mac][u16 BE key_len][key][payload]
                     if body.len() < 6 + 2 {
                         debug!(len = body.len(), "data frame too short, ignoring");
+                        violations.push((*src_mac, ViolationCategory::MalformedFrame));
                         return;
                     }
                     let mut origin_mac = [0u8; 6];
@@ -339,12 +354,14 @@ impl<S: RawSocket> Bridge<S> {
                             frame_len = body.len(),
                             "data frame truncated key_expr, ignoring"
                         );
+                        violations.push((*src_mac, ViolationCategory::MalformedFrame));
                         return;
                     }
                     let key_expr = match std::str::from_utf8(&body[key_start..key_end]) {
                         Ok(s) => s,
                         Err(_) => {
                             debug!("data frame has invalid UTF-8 key_expr, ignoring");
+                            violations.push((*src_mac, ViolationCategory::MalformedFrame));
                             return;
                         }
                     };
@@ -358,6 +375,7 @@ impl<S: RawSocket> Bridge<S> {
                             key_expr,
                             "data frame key_expr outside allowed namespace, ignoring"
                         );
+                        violations.push((*src_mac, ViolationCategory::NamespaceViolation));
                         return;
                     }
                     let data_payload = body[key_end..].to_vec();
@@ -377,16 +395,32 @@ impl<S: RawSocket> Bridge<S> {
             if payload.is_empty() {
                 return;
             }
+
+            // Reject frames from banned MACs (silent drop — no logging).
+            let now = Instant::now();
+            if blacklist.is_blocked(src_mac, now) {
+                return;
+            }
+
+            // Every frame from a non-blocked MAC counts toward rate flood detection.
+            pending_violations.push((*src_mac, ViolationCategory::RateFlood));
+
             had_inbound = true;
 
             if payload[0] == frame_type::BATCH {
                 for (sub_type, sub_body) in decode_batch(payload) {
-                    dispatch(src_mac, sub_type, sub_body);
+                    dispatch(src_mac, sub_type, sub_body, &mut pending_violations);
                 }
             } else {
-                dispatch(src_mac, payload[0], &payload[1..]);
+                dispatch(src_mac, payload[0], &payload[1..], &mut pending_violations);
             }
         })?;
+
+        // Apply all collected violations now that recv_frames has returned.
+        let now = Instant::now();
+        for (mac, category) in pending_violations {
+            blacklist.record_violation(&mac, category, now);
+        }
 
         // Publish buffered inbound data to zenoh (async, non-blocking).
         // Track content hashes for echo prevention on the outbound path.
@@ -933,5 +967,143 @@ mod tests {
             jitter.arm(now, Duration::from_millis(delay_ms));
             assert!(!jitter.should_flush(now), "hold should suppress at arm time");
         }
+    }
+
+    #[test]
+    fn blacklist_blocks_banned_mac() {
+        use crate::blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory};
+
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+        let mut blacklist = MacBlacklist::new(BlacklistConfig {
+            thresholds: [3, 500, 5, 10],
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Ban MAC_B by recording 3 malformed frame violations.
+        for _ in 0..3 {
+            blacklist.record_violation(&MAC_B, ViolationCategory::MalformedFrame, now);
+        }
+        assert!(blacklist.is_blocked(&MAC_B, now));
+
+        // B sends a valid scout frame.
+        let scout = make_scout_payload(&IDENTITY);
+        socket_b.send_frame(MAC_A, &scout).expect("mock send");
+
+        let local_mac = MAC_A;
+        let mut peer_table = PeerTable::new(Duration::from_secs(30));
+
+        // Simulate recv_frames with blacklist check (mirrors bridge logic).
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if blacklist.is_blocked(src_mac, now) {
+                    return; // Dropped — banned MAC.
+                }
+                if src_mac == &local_mac || payload.is_empty() {
+                    return;
+                }
+                if payload[0] == frame_type::SCOUT && payload.len() >= 17 {
+                    let mut identity_hash = [0u8; 16];
+                    identity_hash.copy_from_slice(&payload[1..17]);
+                    peer_table.update(identity_hash, *src_mac);
+                }
+            })
+            .expect("recv should succeed");
+
+        // Scout from banned MAC must be silently dropped.
+        assert_eq!(peer_table.peer_count(), 0, "banned MAC's scout must be dropped");
+    }
+
+    #[test]
+    fn blacklist_does_not_affect_other_macs() {
+        use crate::blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory};
+
+        let mac_c: [u8; 6] = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+
+        let mut blacklist = MacBlacklist::new(BlacklistConfig {
+            thresholds: [3, 500, 5, 10],
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Ban MAC_C (not MAC_B).
+        for _ in 0..3 {
+            blacklist.record_violation(&mac_c, ViolationCategory::MalformedFrame, now);
+        }
+
+        // B sends a scout (B is not banned).
+        let scout = make_scout_payload(&IDENTITY);
+        socket_b.send_frame(MAC_A, &scout).expect("mock send");
+
+        let local_mac = MAC_A;
+        let mut peer_table = PeerTable::new(Duration::from_secs(30));
+
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if blacklist.is_blocked(src_mac, now) {
+                    return;
+                }
+                if src_mac == &local_mac || payload.is_empty() {
+                    return;
+                }
+                if payload[0] == frame_type::SCOUT && payload.len() >= 17 {
+                    let mut identity_hash = [0u8; 16];
+                    identity_hash.copy_from_slice(&payload[1..17]);
+                    peer_table.update(identity_hash, *src_mac);
+                }
+            })
+            .expect("recv should succeed");
+
+        // MAC_B is not banned — scout should be processed.
+        assert_eq!(peer_table.peer_count(), 1, "unbanned MAC should be processed");
+    }
+
+    #[test]
+    fn blacklist_ban_expires_traffic_resumes() {
+        use crate::blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory};
+
+        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
+        let mut blacklist = MacBlacklist::new(BlacklistConfig {
+            thresholds: [3, 500, 5, 10],
+            base_ban: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let t0 = Instant::now();
+
+        // Ban MAC_B.
+        for _ in 0..3 {
+            blacklist.record_violation(&MAC_B, ViolationCategory::MalformedFrame, t0);
+        }
+        assert!(blacklist.is_blocked(&MAC_B, t0));
+
+        // After ban expires...
+        let t1 = t0 + Duration::from_secs(61);
+        assert!(!blacklist.is_blocked(&MAC_B, t1));
+
+        // B sends a scout.
+        let scout = make_scout_payload(&IDENTITY);
+        socket_b.send_frame(MAC_A, &scout).expect("mock send");
+
+        let local_mac = MAC_A;
+        let mut peer_table = PeerTable::new(Duration::from_secs(30));
+
+        socket_a
+            .recv_frames(&mut |src_mac, payload| {
+                if blacklist.is_blocked(src_mac, t1) {
+                    return;
+                }
+                if src_mac == &local_mac || payload.is_empty() {
+                    return;
+                }
+                if payload[0] == frame_type::SCOUT && payload.len() >= 17 {
+                    let mut identity_hash = [0u8; 16];
+                    identity_hash.copy_from_slice(&payload[1..17]);
+                    peer_table.update(identity_hash, *src_mac);
+                }
+            })
+            .expect("recv should succeed");
+
+        assert_eq!(peer_table.peer_count(), 1, "unbanned MAC traffic should resume");
     }
 }
