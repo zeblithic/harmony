@@ -95,6 +95,60 @@ impl BatchAccumulator {
     }
 }
 
+/// Iterator over sub-frames in a BATCH payload.
+///
+/// Yields `(frame_type, sub_payload)` for each sub-frame. Stops when the
+/// payload is exhausted or a sub-frame header is truncated.
+pub struct BatchIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for BatchIter<'a> {
+    type Item = (u8, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let remaining = self.data.len() - self.pos;
+        if remaining < SUB_FRAME_HEADER {
+            return None;
+        }
+
+        let frame_type = self.data[self.pos];
+        let len =
+            u16::from_be_bytes([self.data[self.pos + 1], self.data[self.pos + 2]]) as usize;
+        let payload_start = self.pos + SUB_FRAME_HEADER;
+        let payload_end = payload_start + len;
+
+        if payload_end > self.data.len() {
+            // Truncated sub-frame — stop iteration.
+            return None;
+        }
+
+        self.pos = payload_end;
+        Some((frame_type, &self.data[payload_start..payload_end]))
+    }
+}
+
+/// Decodes a BATCH frame payload into an iterator of sub-frames.
+///
+/// The input `payload` must include the leading `0x03` batch type byte
+/// (as produced by [`BatchAccumulator::flush`]). The iterator skips the
+/// first byte and yields `(frame_type, sub_payload)` for each sub-frame.
+///
+/// Stops cleanly on truncated data — already-yielded sub-frames are valid.
+pub fn decode_batch(payload: &[u8]) -> BatchIter<'_> {
+    // Skip the 0x03 batch type byte.
+    let start = if payload.first() == Some(&crate::frame_type::BATCH) {
+        1
+    } else {
+        0
+    };
+    BatchIter {
+        data: payload,
+        pos: start,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +277,89 @@ mod tests {
         assert_eq!(batch[0], frame_type::BATCH);
         // 1 (batch) + 3 (header) + 1500 (payload) = 1504, exceeds MTU
         assert_eq!(batch.len(), 1 + 3 + 1500);
+    }
+
+    #[test]
+    fn decode_roundtrip() {
+        let mut acc = BatchAccumulator::new(1500);
+        acc.push(frame_type::RETICULUM, &[0xAA; 50]);
+        acc.push(frame_type::DATA, b"harmony/topic/data-payload-here");
+        acc.push(frame_type::RETICULUM, &[0xBB; 10]);
+        let batch = acc.flush().unwrap();
+
+        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch)
+            .map(|(t, p)| (t, p.to_vec()))
+            .collect();
+
+        assert_eq!(subs.len(), 3);
+        assert_eq!(subs[0].0, frame_type::RETICULUM);
+        assert_eq!(subs[0].1, vec![0xAA; 50]);
+        assert_eq!(subs[1].0, frame_type::DATA);
+        assert_eq!(subs[1].1, b"harmony/topic/data-payload-here");
+        assert_eq!(subs[2].0, frame_type::RETICULUM);
+        assert_eq!(subs[2].1, vec![0xBB; 10]);
+    }
+
+    #[test]
+    fn decode_truncated_stops_cleanly() {
+        let mut acc = BatchAccumulator::new(1500);
+        acc.push(frame_type::DATA, b"valid");
+        acc.push(frame_type::RETICULUM, &[0xCC; 40]);
+        let mut batch = acc.flush().unwrap();
+
+        // Truncate the second sub-frame's payload (chop 10 bytes off the end).
+        batch.truncate(batch.len() - 10);
+
+        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch)
+            .map(|(t, p)| (t, p.to_vec()))
+            .collect();
+
+        // Only the first sub-frame should be yielded.
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].0, frame_type::DATA);
+        assert_eq!(subs[0].1, b"valid");
+    }
+
+    #[test]
+    fn decode_unknown_type_skipped_by_length() {
+        // Manually build a batch with an unknown type (0xFF) between two valid ones.
+        let mut batch = vec![frame_type::BATCH];
+        // Sub-frame 1: RETICULUM, 3 bytes
+        batch.push(frame_type::RETICULUM);
+        batch.extend_from_slice(&3u16.to_be_bytes());
+        batch.extend_from_slice(&[0xAA; 3]);
+        // Sub-frame 2: unknown type 0xFF, 5 bytes
+        batch.push(0xFF);
+        batch.extend_from_slice(&5u16.to_be_bytes());
+        batch.extend_from_slice(&[0x00; 5]);
+        // Sub-frame 3: DATA, 2 bytes
+        batch.push(frame_type::DATA);
+        batch.extend_from_slice(&2u16.to_be_bytes());
+        batch.extend_from_slice(&[0xBB; 2]);
+
+        let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch)
+            .map(|(t, p)| (t, p.to_vec()))
+            .collect();
+
+        // All three should be yielded — the caller decides what to do with unknown types.
+        assert_eq!(subs.len(), 3);
+        assert_eq!(subs[0].0, frame_type::RETICULUM);
+        assert_eq!(subs[1].0, 0xFF);
+        assert_eq!(subs[2].0, frame_type::DATA);
+        assert_eq!(subs[2].1, vec![0xBB; 2]);
+    }
+
+    #[test]
+    fn decode_empty_batch() {
+        // Just the batch type byte, no sub-frames.
+        let batch = vec![frame_type::BATCH];
+        let subs: Vec<_> = decode_batch(&batch).collect();
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn decode_completely_empty_slice() {
+        let subs: Vec<_> = decode_batch(&[]).collect();
+        assert!(subs.is_empty());
     }
 }
