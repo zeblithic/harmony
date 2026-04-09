@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# push-and-trigger.sh — Push current branch and trigger both reviewers.
+# push-and-trigger.sh — Push current branch and check review state.
 #
 # Usage: ./scripts/push-and-trigger.sh [PR_NUMBER]
 #   If no PR number given, infers from current branch.
 #
-# Gates on cargo test + clippy before pushing. Triggers both Bugbot and
-# Greptile after push, then runs review-state.sh to confirm REVIEWS_PENDING.
+# Gates on cargo test + clippy before pushing. Bugbot auto-reviews every
+# commit (no trigger needed). Greptile only runs on PR creation — re-runs
+# are a manual human decision ($1/review).
 
 set -euo pipefail
 
@@ -66,13 +67,10 @@ echo ""
 echo "Pushing to origin/${BRANCH}..."
 git push
 
-# ── Trigger both reviewers ─────────────────────────────────────────
+# ── Reviewers ──────────────────────────────────────────────────────
 echo ""
-echo "Triggering reviewers..."
-gh pr comment "$PR" --body "bugbot run"
-echo "  Bugbot triggered."
-gh pr comment "$PR" --body "@greptile"
-echo "  Greptile triggered."
+echo "Bugbot will auto-review this commit (no trigger needed)."
+echo "Greptile: only auto-triggers on PR creation. Re-runs are manual (\$1/review)."
 
 # ── Confirm state ──────────────────────────────────────────────────
 echo ""

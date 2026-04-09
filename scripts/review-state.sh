@@ -363,14 +363,14 @@ if [[ "$HAS_BUGBOT_TRIGGER" == "false" && "$HAS_GREPTILE_TRIGGER" == "false" ]];
   STATE="NO_TRIGGERS"
   BUGBOT_STATE_LABEL="not triggered"
   GREPTILE_STATE_LABEL="not triggered"
-  ACTION="Trigger reviews: comment 'bugbot run' and '@greptile' on the PR."
+  ACTION="Bugbot will auto-review. Greptile auto-triggers on PR creation only."
 
 elif [[ "$LAST_COMMIT_EPOCH" -gt "$LATEST_TRIGGER_EPOCH" ]]; then
   # Rule 2: Commit newer than triggers -> STALE
   STATE="STALE"
   BUGBOT_STATE_LABEL="stale (commit after trigger)"
   GREPTILE_STATE_LABEL="stale (commit after trigger)"
-  ACTION="Re-trigger reviews: comment 'bugbot run' and '@greptile' on the PR."
+  ACTION="Bugbot will auto-review new commit. Greptile re-run is manual (human only, \$1/review)."
 
 elif [[ "$HAS_BUGBOT_TRIGGER" == "true" && "$BUGBOT_HAS_RESPONSE" == "false" ]]; then
   # Check rule 3: Bugbot stuck? (BUGBOT_TRIGGER_EPOCH computed above)
@@ -385,7 +385,7 @@ elif [[ "$HAS_BUGBOT_TRIGGER" == "true" && "$BUGBOT_HAS_RESPONSE" == "false" ]];
     else
       GREPTILE_STATE_LABEL="not triggered"
     fi
-    ACTION="Bugbot may be stuck. Re-trigger with 'bugbot run' comment."
+    ACTION="Bugbot may be stuck. Check PR Checks section — Bugbot auto-reviews every commit."
   fi
 fi
 
@@ -398,7 +398,7 @@ if [[ -z "$STATE" ]]; then
       STATE="REVIEWS_COMPLETE_WITH_FEEDBACK"
       BUGBOT_STATE_LABEL="complete (${BUGBOT_ISSUE_COUNT} issues)"
       GREPTILE_STATE_LABEL="complete (${GREPTILE_ISSUE_COUNT} issues)"
-      ACTION="Fix issues locally, then push + re-trigger when ready. Safe to use bd commands."
+      ACTION="Fix issues locally, then push when ready (Bugbot auto-reviews). Safe to use bd commands."
     else
       # Rule 6: Both responded, no issues
       STATE="REVIEWS_COMPLETE_ALL_CLEAR"

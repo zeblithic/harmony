@@ -49,7 +49,7 @@ The review cycle lives in the gap between `/delivertask` and `/finishtask`. Use 
 /delivertask
   ├── close bead (BEFORE push — bd auto-pushes!)
   ├── commit + push
-  ├── "bugbot run" + (first run: automatic greptile / re-run: "@greptile")
+  ├── (Bugbot auto-reviews; Greptile auto-triggers on PR creation)
   └── STOP → enters REVIEWS_PENDING
 
   ┌─── REVIEWS_PENDING ─────────────────────────┐
@@ -60,7 +60,7 @@ The review cycle lives in the gap between `/delivertask` and `/finishtask`. Use 
   │ - thumbs-up on trigger comment = all clear   │
   │                                              │
   │ Rules:                                       │
-  │ - NO git push (cancels Bugbot)               │
+  │ - NO git push (wait for reviews)             │
   │ - NO bd commands (bd auto-pushes)            │
   │ - Local edits only                           │
   └──────────────┬──────────────┬────────────────┘
@@ -72,7 +72,7 @@ The review cycle lives in the gap between `/delivertask` and `/finishtask`. Use 
                │
                ▼
           push fixes
-          "bugbot run" + "@greptile"
+          (Bugbot auto-reviews new commit)
                │
                ▼
          REVIEWS_PENDING (again)
@@ -80,40 +80,38 @@ The review cycle lives in the gap between `/delivertask` and `/finishtask`. Use 
 
 ### Reviewer Behavior
 
-| Reviewer | First run trigger | Re-run trigger | Canceled by push? | Completion signal |
-|----------|-------------------|----------------|--------------------|--------------------|
-| **Cursor Bugbot** | `gh pr comment N --body "bugbot run"` | Same | **YES** — any push cancels it | `cursor[bot]` posts review; thumbs-up on "bugbot run" comment |
-| **Greptile** | Automatic on PR creation | `gh pr comment N --body "@greptile"` | No — runs asynchronously | `greptile-apps[bot]` posts review; thumbs-up on PR description (first) or trigger comment (re-run) |
+| Reviewer | Trigger | Re-run | Cost | Completion signal |
+|----------|---------|--------|------|-------------------|
+| **Cursor Bugbot** | Automatic on every PR and every commit | Automatic | $40/month flat | `cursor[bot]` posts review |
+| **Greptile** | Automatic on PR creation only | **ONLY the human** comments `@greptile` — agent must NEVER do this | **$1 per review** | `greptile-apps[bot]` posts review |
+
+**CRITICAL: The agent must NEVER comment "bugbot run" or "@greptile" on any PR.** Bugbot triggers automatically. Greptile re-runs are a spending decision that only the human makes.
 
 ### Signal Detection
 
 | What to look for | Where | Meaning |
 |------------------|-------|---------|
-| "eyes" emoji on "bugbot run" comment | Comment reactions | Bugbot acknowledged, working |
-| "eyes" emoji on "@greptile" comment | Comment reactions | Greptile acknowledged, working |
-| `cursor[bot]` review with inline comments | PR reviews | Bugbot finished — check for issues |
-| `greptile-apps[bot]` review with analysis | PR reviews | Greptile finished — check for issues |
-| Thumbs-up on trigger comment (with formal review) | Comment reactions | Reviewer finished — read review for issues |
-| Thumbs-up on trigger comment (no formal review, no eyes) | Comment reactions | Reviewer finished with no issues (trivial change) |
-| Commits newer than latest reviewer response | PR commits vs review timestamps | Reviewer results are **stale** — need re-trigger |
-| "bugbot run" as last comment, >3 min, no response | PR comments | Bugbot may be stuck — re-trigger |
+| Bugbot check status (pending/success/failure) | PR Checks section (`gh pr checks`) | Bugbot auto-reviewing or complete |
+| `cursor[bot]` review with inline comments | PR reviews + inline comments | Bugbot findings — check for issues |
+| `greptile-apps[bot]` review with analysis | PR reviews + inline comments | Greptile finished — check for issues |
+| Commits newer than latest reviewer response | PR commits vs review timestamps | Bugbot will auto-review new commit; Greptile results may be stale (only human can re-trigger) |
 
 ### Ordering Rules (Critical)
 
-1. **Close beads BEFORE push** — `bd close` auto-commits and pushes; if done after pushing, it cancels Bugbot
-2. **Push once, trigger once** — after pushing, immediately trigger "bugbot run" (and "@greptile" on re-runs)
-3. **Freeze during REVIEWS_PENDING** — no pushes, no `bd` commands, local edits only
-4. **Safe to use `bd` during WORKING_ON_FEEDBACK** — reviews are complete, you're fixing code
-5. **Each push resets the cycle** — fix → push → trigger → wait → check
-6. **Both reviewers must clear** for automation to proceed — OR human explicitly overrides ("merge it", "good enough")
+1. **Close beads BEFORE push** — `bd close` auto-commits and pushes; if done after pushing, it creates noise during review
+2. **Push once, wait** — after pushing, Bugbot auto-reviews. Do NOT trigger anything.
+3. **NEVER comment "bugbot run" or "@greptile"** — Bugbot is automatic; Greptile re-runs are the human's spending decision ($1/review)
+4. **Freeze during REVIEWS_PENDING** — no pushes, no `bd` commands, local edits only
+5. **Safe to use `bd` during WORKING_ON_FEEDBACK** — reviews are complete, you're fixing code
+6. **Each push resets Bugbot** — fix → push → Bugbot auto-reviews → wait → check
+7. **Both reviewers must clear** for automation to proceed — OR human explicitly overrides ("merge it", "good enough")
 
 ### Recovery from Accidental Push During Review
 
 If you accidentally push while reviews are pending:
-1. Bugbot's run was canceled — results are stale
-2. Greptile is fine — it runs asynchronously
-3. Re-trigger Bugbot: `gh pr comment N --body "bugbot run"`
-4. You do NOT need to re-trigger Greptile unless you want fresh analysis of the new changes
+1. Bugbot will auto-review the new commit — no action needed
+2. Greptile's initial review is unaffected — it runs asynchronously
+3. Do NOT trigger any reviewers — wait for Bugbot to pick up the new commit automatically
 
 ## Context Window Management
 

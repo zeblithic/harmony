@@ -92,28 +92,16 @@ EOF
 )"
 ```
 
-### 7. Trigger reviews
+### 7. Stop and report
 
-After the PR is created, immediately trigger Bugbot:
-
-```
-gh pr comment <pr-number> --body "bugbot run"
-```
-
-**First delivery:** Greptile triggers automatically on PR creation — no action needed.
-**Re-delivery (pushing fixes after feedback):** Greptile does NOT auto-trigger on subsequent pushes. Trigger it explicitly:
-
-```
-gh pr comment <pr-number> --body "@greptile"
-```
-
-### 8. Stop and report
+**Do NOT trigger any reviewers.** Bugbot auto-reviews every commit (appears in PR Checks section). Greptile auto-triggers on PR creation. The agent must NEVER comment "bugbot run" or "@greptile".
 
 - Print the PR URL
 - Print this reminder:
 
 > **Waiting for reviews.** The PR is now in `REVIEWS_PENDING` state.
-> - Do NOT push or run `bd` commands — pushing cancels Bugbot.
+> - Do NOT push or run `bd` commands while reviews are pending.
+> - Bugbot auto-reviews (check PR Checks section). Greptile auto-triggered on PR creation.
 > - Use `/monitorreviews` to check review status.
 > - When reviews are complete and any feedback is addressed, use `/finishtask` to merge.
 > - **Good time to `/compact`** — reviews take a few minutes, reclaim context while waiting.

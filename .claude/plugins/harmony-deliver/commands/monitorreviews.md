@@ -22,23 +22,28 @@ If no PR number is provided, infer from the current branch's associated PR.
 
 ### 1. Gather review signals
 
-Check all three endpoints where review findings appear. **You must check all three** — Greptile posts an empty review body in `reviews` and puts actual findings as inline PR comments in `pulls/{n}/comments`.
+Bugbot and Greptile report in different places:
+
+- **Bugbot**: Appears in the PR **Checks** section (like CI). Also posts inline review comments on the PR.
+- **Greptile**: Posts an empty review body in the `reviews` endpoint, actual findings as inline PR review comments in `pulls/{n}/comments`, and a summary in `issues/{n}/comments`.
+
+**NEVER trigger either reviewer.** Bugbot auto-reviews every commit. Greptile auto-triggers on PR creation. Only the human can re-trigger Greptile ($1/review).
 
 ```bash
-# Latest commit on the PR
-gh pr view <number> --json headRefOid,title --jq '{title: .title, sha: .headRefOid}'
+# PR metadata + checks status (Bugbot appears here)
+gh pr view <number> --json headRefOid,title,statusCheckRollup --jq '{title: .title, sha: .headRefOid, checks: [.statusCheckRollup[] | select(.name | test("bugbot|cursor"; "i")) | {name: .name, status: .status, conclusion: .conclusion}]}'
 
-# Reviews (Bugbot posts here; Greptile posts empty body here)
+# Bugbot inline review comments on the PR
 gh api "repos/{owner}/{repo}/pulls/<number>/reviews?per_page=100" --paginate \
-  --jq '.[] | select(.user.login == "cursor[bot]" or .user.login == "greptile-apps[bot]") | {user: .user.login, state: .state, submitted_at: .submitted_at, body: .body[:500]}'
+  --jq '.[] | select(.user.login == "cursor[bot]") | {user: .user.login, state: .state, submitted_at: .submitted_at, body: .body[:500]}'
 
-# Inline PR review comments (Greptile findings live HERE)
+# Inline PR review comments (Bugbot findings + Greptile findings)
 gh api "repos/{owner}/{repo}/pulls/<number>/comments?per_page=100" --paginate \
   --jq '.[] | select(.user.login == "cursor[bot]" or .user.login == "greptile-apps[bot]") | {user: .user.login, path: .path, line: .line, created_at: .created_at, body: .body[:500]}'
 
-# Issue-level comments (trigger comments, Greptile summary)
+# Issue-level comments (Greptile summary)
 gh api "repos/{owner}/{repo}/issues/<number>/comments?per_page=100" --paginate \
-  --jq '.[] | select(.user.login == "cursor[bot]" or .user.login == "greptile-apps[bot]") | {user: .user.login, created_at: .created_at, body: .body[:500]}'
+  --jq '.[] | select(.user.login == "greptile-apps[bot]") | {user: .user.login, created_at: .created_at, body: .body[:500]}'
 ```
 
 ### 2. Determine state
