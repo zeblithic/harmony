@@ -7,6 +7,7 @@
 #[cfg(target_os = "linux")]
 pub mod af_packet;
 pub mod batch;
+pub mod blacklist;
 pub mod bridge;
 pub mod error;
 pub mod frame;
@@ -14,6 +15,7 @@ pub mod padded_socket;
 pub mod peer_table;
 pub mod socket;
 
+pub use blacklist::{BlacklistConfig, MacBlacklist, ViolationCategory};
 pub use bridge::{Bridge, BridgeConfig};
 pub use padded_socket::{PaddedSocket, DEFAULT_PAD_BLOCK};
 
