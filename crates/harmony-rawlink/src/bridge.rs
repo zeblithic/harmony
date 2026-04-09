@@ -222,25 +222,11 @@ impl<S: RawSocket> Bridge<S> {
 
             match payload[0] {
                 frame_type::RETICULUM => {
-                    // Frame: [RETICULUM tag][u16 BE packet_len][packet][padding...]
-                    if payload.len() < 1 + 2 {
-                        debug!(len = payload.len(), "reticulum frame too short, ignoring");
-                        return;
-                    }
-                    let packet_len =
-                        u16::from_be_bytes([payload[1], payload[2]]) as usize;
-                    let packet_end = 3 + packet_len;
-                    if payload.len() < packet_end {
-                        debug!(
-                            packet_len,
-                            frame_len = payload.len(),
-                            "reticulum frame truncated, ignoring"
-                        );
-                        return;
-                    }
-                    if let Some(ref reticulum_tx) = reticulum_tx {
-                        let packet = payload[3..packet_end].to_vec();
-                        let _ = reticulum_tx.try_send(packet);
+                    if payload.len() > 1 {
+                        if let Some(ref reticulum_tx) = reticulum_tx {
+                            let packet = payload[1..].to_vec();
+                            let _ = reticulum_tx.try_send(packet);
+                        }
                     }
                 }
                 frame_type::SCOUT => {
@@ -258,8 +244,7 @@ impl<S: RawSocket> Bridge<S> {
                     );
                 }
                 frame_type::DATA => {
-                    // Data payload:
-                    //   [DATA tag][6 origin_mac][u16 BE key_len][key][u16 BE payload_len][payload]
+                    // Data payload: [DATA tag][6-byte origin_mac][u16 BE key_len][key][payload]
                     if payload.len() < 1 + 6 + 2 {
                         debug!(len = payload.len(), "data frame too short, ignoring");
                         return;
@@ -274,11 +259,11 @@ impl<S: RawSocket> Bridge<S> {
                     let key_len = u16::from_be_bytes([payload[7], payload[8]]) as usize;
                     let key_start = 9;
                     let key_end = key_start + key_len;
-                    if payload.len() < key_end + 2 {
+                    if payload.len() < key_end {
                         debug!(
                             key_len,
                             frame_len = payload.len(),
-                            "data frame truncated (key_expr or payload_len), ignoring"
+                            "data frame truncated key_expr, ignoring"
                         );
                         return;
                     }
@@ -301,20 +286,7 @@ impl<S: RawSocket> Bridge<S> {
                         );
                         return;
                     }
-                    // Read payload_len to strip any padding bytes.
-                    let payload_len =
-                        u16::from_be_bytes([payload[key_end], payload[key_end + 1]]) as usize;
-                    let data_start = key_end + 2;
-                    let data_end = data_start + payload_len;
-                    if payload.len() < data_end {
-                        debug!(
-                            payload_len,
-                            frame_len = payload.len(),
-                            "data frame truncated payload, ignoring"
-                        );
-                        return;
-                    }
-                    let data_payload = payload[data_start..data_end].to_vec();
+                    let data_payload = payload[key_end..].to_vec();
                     inbound_data.push((key_expr.to_string(), data_payload));
                 }
                 other => {
