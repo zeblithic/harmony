@@ -30,7 +30,7 @@ impl BatchAccumulator {
     /// `max_payload` is computed as `mtu - 14 (ETH_HEADER_LEN) - 1 (batch type byte)`.
     /// For standard 1500-byte MTU, this is 1485.
     pub fn new(mtu: usize) -> Self {
-        let max_payload = mtu.saturating_sub(14 + 1);
+        let max_payload = mtu.saturating_sub(crate::ETH_HEADER_LEN + 1);
         Self {
             buf: Vec::new(),
             max_payload,
@@ -48,6 +48,7 @@ impl BatchAccumulator {
     /// to make room. The returned batch is ready to pass to `send_frame()`.
     /// Returns `None` if the frame fit in the current batch.
     pub fn push(&mut self, frame_type: u8, payload: &[u8]) -> Option<Vec<u8>> {
+        debug_assert_ne!(frame_type, crate::frame_type::BATCH, "batch frames cannot be nested");
         let entry_size = SUB_FRAME_HEADER + payload.len();
 
         // If the buffer is empty, start a new batch with the type byte.
@@ -58,7 +59,10 @@ impl BatchAccumulator {
 
         // Check if this entry fits in the current batch.
         // buf already contains the 0x03 prefix + previous entries.
-        if self.buf.len() + entry_size > 1 + self.max_payload {
+        // Only auto-flush if there are already sub-frames in the batch (buf.len() > 1);
+        // an oversized first entry is placed in a solo batch and will be dropped by the
+        // kernel — matching existing behavior for oversized standalone frames.
+        if self.buf.len() > 1 && self.buf.len() + entry_size > 1 + self.max_payload {
             // Auto-flush: take current batch, start fresh with this entry.
             let completed = std::mem::take(&mut self.buf);
             self.buf.reserve(1 + entry_size);
@@ -94,6 +98,7 @@ impl BatchAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame_type;
 
     #[test]
     fn new_accumulator_is_empty() {
@@ -203,5 +208,20 @@ mod tests {
         let batch = acc.flush().expect("should produce batch");
         // 1 (batch type) + 3 (sub header) + 1482 (payload) = 1486
         assert_eq!(batch.len(), 1 + 3 + 1482);
+    }
+
+    #[test]
+    fn oversized_sub_frame_produces_solo_batch() {
+        // A sub-frame larger than max_payload is placed in a solo batch.
+        // The kernel will drop the oversized Ethernet frame — this matches
+        // existing behavior for oversized standalone frames.
+        let mut acc = BatchAccumulator::new(1500);
+        let oversized = vec![0xDD; 1500]; // way bigger than 1482 max
+        assert!(acc.push(frame_type::DATA, &oversized).is_none());
+
+        let batch = acc.flush().expect("should produce oversized batch");
+        assert_eq!(batch[0], frame_type::BATCH);
+        // 1 (batch) + 3 (header) + 1500 (payload) = 1504, exceeds MTU
+        assert_eq!(batch.len(), 1 + 3 + 1500);
     }
 }
