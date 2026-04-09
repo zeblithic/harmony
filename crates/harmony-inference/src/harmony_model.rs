@@ -53,6 +53,8 @@ pub struct HarmonyModelConfig {
     pub engram_dim: usize,
     /// Whether lm_head shares the embedding weight (tied embeddings).
     pub tie_embeddings: bool,
+    /// Token ID for the `<think>` pause token. `None` = continuous thought disabled.
+    pub think_token_id: Option<u32>,
 }
 
 impl HarmonyModelConfig {
@@ -73,6 +75,7 @@ impl HarmonyModelConfig {
             engram_injection_layer: 2,
             engram_dim: 256,
             tie_embeddings: true,
+            think_token_id: None,
         }
     }
 
@@ -93,6 +96,7 @@ impl HarmonyModelConfig {
             engram_injection_layer: 2,
             engram_dim: 128,
             tie_embeddings: true,
+            think_token_id: None,
         }
     }
 
@@ -602,6 +606,21 @@ impl HarmonyModel {
             md("harmony.engram_injection_layer")?.to_u32()? as usize;
         let engram_dim = md("harmony.engram_dim")?.to_u32()? as usize;
 
+        // Continuous thought metadata (optional — absent means disabled).
+        let think_token_id = ct
+            .metadata
+            .get("harmony.continuous_thought.think_token_id")
+            .and_then(|v| v.to_u32().ok())
+            .map(|id| {
+                if (id as usize) >= vocab_size {
+                    candle_core::bail!(
+                        "think_token_id ({id}) must be < vocab_size ({vocab_size})"
+                    );
+                }
+                Ok(id)
+            })
+            .transpose()?;
+
         let config = HarmonyModelConfig {
             num_layers,
             hidden_dim,
@@ -617,6 +636,7 @@ impl HarmonyModel {
             engram_injection_layer,
             engram_dim,
             tie_embeddings,
+            think_token_id,
         };
 
         if layers_per_block == 0 || num_layers % layers_per_block != 0 {
@@ -865,6 +885,7 @@ mod tests {
             engram_injection_layer: 1,
             engram_dim: 16,
             tie_embeddings: true,
+            think_token_id: None,
         }
     }
 

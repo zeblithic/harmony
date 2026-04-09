@@ -36,6 +36,7 @@ class TestHarmonyModelConfig:
         assert c.engram_injection_layer == 2
         assert c.engram_dim == 256
         assert c.tie_embeddings is True
+        assert c.think_token_id is None
 
     def test_tiny_config_values(self):
         c = HarmonyModelConfig.tiny()
@@ -53,6 +54,7 @@ class TestHarmonyModelConfig:
         assert c.engram_injection_layer == 2
         assert c.engram_dim == 128
         assert c.tie_embeddings is True
+        assert c.think_token_id is None
 
     def test_num_blocks_target(self):
         c = HarmonyModelConfig.target()
