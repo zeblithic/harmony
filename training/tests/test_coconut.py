@@ -206,7 +206,7 @@ class TestCoconutForward:
 
         logits, mask = coconut_forward(model, tn, input_ids, think_token_id=127, num_thoughts=2)
         targets = torch.randint(0, cfg.vocab_size, (2, 10))
-        loss = coconut_loss(logits, targets, mask, cfg.vocab_size)
+        loss = coconut_loss(logits, targets, mask)
         loss.backward()
 
         assert tn.gate_bias.grad is not None
@@ -261,7 +261,7 @@ class TestCoconutLoss:
         think_mask = torch.zeros(2, 6, dtype=torch.bool)
         think_mask[:, :2] = True  # first 2 positions are think
 
-        loss = coconut_loss(logits, targets, think_mask, vocab_size)
+        loss = coconut_loss(logits, targets, think_mask)
         loss.backward()
 
         # Gradients should be zero at think positions
@@ -276,7 +276,7 @@ class TestCoconutLoss:
         targets = torch.randint(0, vocab_size, (2, 6))
         think_mask = torch.zeros(2, 6, dtype=torch.bool)
 
-        loss_coconut = coconut_loss(logits, targets, think_mask, vocab_size)
+        loss_coconut = coconut_loss(logits, targets, think_mask)
         loss_standard = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
 
         assert loss_coconut.item() == pytest.approx(loss_standard.item(), rel=1e-6)
@@ -288,7 +288,7 @@ class TestCoconutLoss:
         targets = torch.randint(0, vocab_size, (1, 5))
         think_mask = torch.tensor([[True, True, False, False, False]])
 
-        loss = coconut_loss(logits, targets, think_mask, vocab_size)
+        loss = coconut_loss(logits, targets, think_mask)
         loss.backward()
 
         assert (logits.grad[0, :2, :] == 0).all()

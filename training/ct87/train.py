@@ -348,7 +348,7 @@ def main() -> None:
                             dtype=targets.dtype, device=targets.device,
                         )
                         aug_targets = torch.cat([think_targets, targets], dim=1)
-                        loss = coconut_loss(logits, aug_targets, think_mask, config.vocab_size)
+                        loss = coconut_loss(logits, aug_targets, think_mask)
                     else:
                         logits = model(input_ids, engram_embeddings=engram_emb)
                         loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))

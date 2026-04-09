@@ -206,13 +206,35 @@ def main() -> None:
         "--thought-norm", type=str, default=None,
         help="Path to ThoughtNorm checkpoint (thought_norm_step_*.pt) for COCONUT exports",
     )
+    parser.add_argument(
+        "--think-token-id", type=int, default=None,
+        help="Token ID for <think> (required with --thought-norm)",
+    )
+    parser.add_argument(
+        "--ct-max-steps", type=int, default=4,
+        help="Max continuous thought steps (default: 4)",
+    )
+    parser.add_argument(
+        "--ct-confidence-threshold", type=float, default=0.85,
+        help="Confidence threshold for continuous thought (default: 0.85)",
+    )
     args = parser.parse_args()
+
+    if args.thought_norm is not None and args.think_token_id is None:
+        parser.error("--think-token-id is required when --thought-norm is provided")
 
     config = (
         HarmonyModelConfig.tiny()
         if args.config == "tiny"
         else HarmonyModelConfig.target()
     )
+
+    # Set CT config fields when exporting with continuous thought
+    if args.think_token_id is not None:
+        config.think_token_id = args.think_token_id
+        config.ct_max_steps = args.ct_max_steps
+        config.ct_confidence_threshold = args.ct_confidence_threshold
+
     state_dict = load_file(args.checkpoint)
     name = args.name or f"ct87-{args.config}"
 

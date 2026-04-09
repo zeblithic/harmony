@@ -167,7 +167,6 @@ def coconut_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     think_mask: torch.Tensor,
-    vocab_size: int,
 ) -> torch.Tensor:
     """Cross-entropy loss excluding think positions.
 
@@ -184,7 +183,7 @@ def coconut_loss(
     masked_targets[think_mask] = -100
 
     return F.cross_entropy(
-        logits.reshape(-1, vocab_size),
+        logits.reshape(-1, logits.size(-1)),
         masked_targets.reshape(-1),
         ignore_index=-100,
     )
