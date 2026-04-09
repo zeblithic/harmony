@@ -40,3 +40,6 @@ result
 
 # Tokenized training datasets (large binary files)
 /data/
+
+# Generated Engram test tables (from ct87.generate_engram_table)
+/engram_test/
