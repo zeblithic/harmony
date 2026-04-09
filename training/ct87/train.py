@@ -181,6 +181,10 @@ def main() -> None:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-file", type=str, default=None, help="Path to CSV log file")
     parser.add_argument(
+        "--gradient-checkpoint", action="store_true",
+        help="Enable gradient checkpointing (recompute activations to save VRAM)",
+    )
+    parser.add_argument(
         "--engram-table", type=str, default=None,
         help="Path to Engram safetensors table (enables Engram injection during training)",
     )
@@ -209,6 +213,9 @@ def main() -> None:
     print(f"Config: {args.config}, device: {device}, seq_len: {seq_len}, dtype: {args.dtype}")
 
     model = HarmonyModel(config).to(device)
+    if args.gradient_checkpoint:
+        model.set_gradient_checkpointing(True)
+        print("Gradient checkpointing enabled")
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
 

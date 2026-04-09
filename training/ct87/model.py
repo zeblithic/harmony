@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _gradient_checkpoint
 
 
 @dataclass
@@ -304,6 +305,8 @@ class HarmonyModel(nn.Module):
         if config.tie_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
+        self.gradient_checkpointing = False
+
         self._init_weights()
 
     def _init_weights(self):
@@ -328,6 +331,16 @@ class HarmonyModel(nn.Module):
         # was applied to the tied lm_head weight (which shares this tensor).
         std = 1.0 / math.sqrt(self.config.hidden_dim)
         nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=std)
+
+    def set_gradient_checkpointing(self, enable: bool = True) -> None:
+        """Enable or disable gradient checkpointing for transformer layers.
+
+        When enabled, intermediate activations inside each TransformerLayer are
+        recomputed during the backward pass instead of stored, trading ~30%
+        extra compute for significant VRAM savings. Only effective during
+        training (model.training=True).
+        """
+        self.gradient_checkpointing = enable
 
     def forward(
         self,
@@ -356,8 +369,11 @@ class HarmonyModel(nn.Module):
                 block_idx = i // layers_per_block
                 h = self.block_attnres.block_input(block_idx, h, attnres_state)
 
-            # Standard transformer layer
-            h = layer(h)
+            # Standard transformer layer (with optional gradient checkpointing)
+            if self.gradient_checkpointing and self.training:
+                h = _gradient_checkpoint(layer, h, use_reentrant=False)
+            else:
+                h = layer(h)
 
             # Engram injection at the configured layer
             if engram_embeddings is not None and i == self.config.engram_injection_layer:
