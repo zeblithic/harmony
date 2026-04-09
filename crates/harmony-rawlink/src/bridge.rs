@@ -66,6 +66,7 @@ impl JitterHold {
     }
 
     /// Returns `true` if a jitter hold is currently active (deadline set).
+    #[cfg(test)]
     fn is_active(&self) -> bool {
         self.deadline.is_some()
     }
@@ -174,6 +175,7 @@ impl<S: RawSocket> Bridge<S> {
                 if had_inbound {
                     let delay_ms = rand::thread_rng().gen_range(100u64..=500);
                     jitter.arm(now, Duration::from_millis(delay_ms));
+                    trace!(delay_ms, "jitter hold armed on inbound traffic");
                 }
 
                 // 4. Drain outbound zenoh samples → push into batch accumulator.
