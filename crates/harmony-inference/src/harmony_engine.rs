@@ -12,6 +12,7 @@ use candle_core::{Device, Tensor};
 use rand::thread_rng;
 use std::io::Cursor;
 
+use crate::continuous_thought::{ContinuousThoughtConfig, ThoughtAction};
 use crate::engine::EngramContext;
 use crate::error::InferenceError;
 use crate::harmony_model::{EngramFn, HarmonyForwardOutput, HarmonyModel, HarmonyModelConfig};
@@ -40,6 +41,7 @@ pub struct HarmonyEngine {
     tokenizer: Option<tokenizers::Tokenizer>,
     uq_head: Option<UqHead>,
     uq_feature_config: UqFeatureConfig,
+    thought_config: ContinuousThoughtConfig,
     config: HarmonyModelConfig,
     device: Device,
 }
@@ -51,11 +53,16 @@ impl HarmonyEngine {
     /// called. The UQ feature config is derived from `config.num_layers`.
     pub fn new(config: HarmonyModelConfig, device: Device) -> Self {
         let uq_feature_config = UqFeatureConfig::for_num_layers(config.num_layers);
+        let thought_config = ContinuousThoughtConfig {
+            think_token_id: config.think_token_id,
+            ..ContinuousThoughtConfig::default()
+        };
         Self {
             model: None,
             tokenizer: None,
             uq_head: None,
             uq_feature_config,
+            thought_config,
             config,
             device,
         }
@@ -209,6 +216,61 @@ impl HarmonyEngine {
 
         Ok(Some((class, conf)))
     }
+
+    /// Set the continuous thought configuration.
+    pub fn set_thought_config(&mut self, config: ContinuousThoughtConfig) {
+        self.thought_config = config;
+    }
+
+    /// Reference to the continuous thought configuration.
+    pub fn thought_config(&self) -> &ContinuousThoughtConfig {
+        &self.thought_config
+    }
+
+    /// The `<think>` token ID, if continuous thought is enabled.
+    pub fn think_token_id(&self) -> Option<u32> {
+        self.thought_config.think_token_id
+    }
+
+    /// Determine the routing action based on UQ classification.
+    ///
+    /// If no UQ head is set or continuous thought is disabled (`think_token_id`
+    /// is `None`), always returns [`ThoughtAction::Emit`].
+    ///
+    /// Otherwise, evaluates the UQ output:
+    /// - `Confident` above threshold → `Emit`
+    /// - `SpectralCollapse` → `Abort`
+    /// - `Uncertain` / `HighVolume` → `Think` (up to `max_think_steps`)
+    /// - At the safety cap → `Emit` (force output after N consecutive thinks)
+    pub fn route_thought(
+        &self,
+        output: &HarmonyForwardOutput,
+        consecutive_thinks: u32,
+    ) -> Result<ThoughtAction, InferenceError> {
+        // Disabled: no think token or no UQ head → always emit.
+        if self.thought_config.think_token_id.is_none() || self.uq_head.is_none() {
+            return Ok(ThoughtAction::Emit);
+        }
+
+        let (class, confidence) = self
+            .classify_uncertainty(output)?
+            .expect("uq_head is Some, classify_uncertainty should return Some");
+
+        match class {
+            UqClass::SpectralCollapse => Ok(ThoughtAction::Abort),
+            UqClass::Confident => Ok(ThoughtAction::Emit),
+            UqClass::HighVolume | UqClass::Uncertain => {
+                if consecutive_thinks >= self.thought_config.max_think_steps {
+                    Ok(ThoughtAction::Emit)
+                } else if confidence > self.thought_config.confidence_threshold {
+                    // High confidence despite uncertain class — trust the confidence.
+                    Ok(ThoughtAction::Emit)
+                } else {
+                    Ok(ThoughtAction::Think)
+                }
+            }
+        }
+    }
 }
 
 impl InferenceEngine for HarmonyEngine {
@@ -220,6 +282,43 @@ impl InferenceEngine for HarmonyEngine {
             .map_err(|e| InferenceError::InvalidGguf(e.to_string()))?;
         self.config = model.config().clone();
         self.uq_feature_config = UqFeatureConfig::for_num_layers(self.config.num_layers);
+
+        // Load continuous thought config from GGUF metadata.
+        let enabled = content
+            .metadata
+            .get("harmony.continuous_thought.enabled")
+            .and_then(|v| v.to_bool().ok())
+            .unwrap_or(false);
+        if enabled {
+            let think_token_id = self.config.think_token_id.ok_or_else(|| {
+                InferenceError::InvalidGguf(
+                    "harmony.continuous_thought.enabled=true but \
+                     think_token_id key is missing from GGUF metadata"
+                        .into(),
+                )
+            })?;
+            let max_steps = content
+                .metadata
+                .get("harmony.continuous_thought.max_steps")
+                .and_then(|v| v.to_u32().ok())
+                .unwrap_or(4);
+            let threshold = content
+                .metadata
+                .get("harmony.continuous_thought.confidence_threshold")
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(0.85);
+            self.thought_config = ContinuousThoughtConfig {
+                think_token_id: Some(think_token_id),
+                max_think_steps: max_steps,
+                confidence_threshold: threshold,
+            };
+        } else {
+            self.thought_config = ContinuousThoughtConfig {
+                think_token_id: None,
+                ..ContinuousThoughtConfig::default()
+            };
+        }
+
         self.model = Some(model);
         Ok(())
     }
@@ -330,6 +429,7 @@ mod tests {
             engram_injection_layer: 1,
             engram_dim: 16,
             tie_embeddings: true,
+            think_token_id: None,
         }
     }
 
@@ -603,5 +703,212 @@ mod tests {
             (next_token as usize) < vocab_size,
             "sampled token {next_token} out of vocab range"
         );
+    }
+
+    // ── route_thought tests ──────────────────────────────────────────────
+
+    #[test]
+    fn route_thought_emits_when_no_uq_head() {
+        let mut engine = HarmonyEngine::new(test_config(), Device::Cpu);
+        engine.init_random().unwrap();
+        // Enable think token but don't set UQ head
+        engine.set_thought_config(ContinuousThoughtConfig {
+            think_token_id: Some(100),
+            ..ContinuousThoughtConfig::default()
+        });
+        let mut cache = engine.new_cache().unwrap();
+        let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
+        let action = engine.route_thought(&output, 0).unwrap();
+        assert_eq!(action, ThoughtAction::Emit);
+    }
+
+    #[test]
+    fn route_thought_emits_when_think_token_none() {
+        let mut engine = HarmonyEngine::new(test_config(), Device::Cpu);
+        engine.init_random().unwrap();
+        let uq_head = UqHead::new(&UqHeadConfig::default(), &Device::Cpu).unwrap();
+        engine.set_uq_head(uq_head);
+        // think_token_id is None (default)
+        let mut cache = engine.new_cache().unwrap();
+        let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
+        let action = engine.route_thought(&output, 0).unwrap();
+        assert_eq!(action, ThoughtAction::Emit);
+    }
+
+    /// Helper: create an engine with a UQ Head biased toward a specific class.
+    fn engine_with_biased_uq(class_idx: usize) -> HarmonyEngine {
+        let mut config = test_config();
+        config.think_token_id = Some(100);
+        let mut engine = HarmonyEngine::new(config, Device::Cpu);
+        engine.init_random().unwrap();
+        engine.set_thought_config(ContinuousThoughtConfig {
+            think_token_id: Some(100),
+            max_think_steps: 4,
+            confidence_threshold: 0.85,
+        });
+
+        // Build UQ Head biased toward the target class.
+        let cfg = UqHeadConfig::default();
+        let d = &Device::Cpu;
+        let fc1 = Tensor::zeros((8, 32), candle_core::DType::F32, d).unwrap();
+        let b1 = Tensor::zeros(32, candle_core::DType::F32, d).unwrap();
+        let fc2 = Tensor::zeros((32, 4), candle_core::DType::F32, d).unwrap();
+        let mut b2_data = [0.0f32; 4];
+        b2_data[class_idx] = 100.0;
+        let b2 = Tensor::new(&b2_data, d).unwrap();
+        // Confidence: bias toward 0.5 (sigmoid(0) = 0.5, below threshold)
+        let cw = Tensor::zeros((8, 1), candle_core::DType::F32, d).unwrap();
+        let cb = Tensor::zeros(1, candle_core::DType::F32, d).unwrap();
+        let uq_head = UqHead::from_tensors(&cfg, fc1, b1, fc2, b2, cw, cb).unwrap();
+        engine.set_uq_head(uq_head);
+        engine
+    }
+
+    #[test]
+    fn route_thought_emits_for_confident() {
+        let engine = engine_with_biased_uq(0); // Confident
+        let mut cache = engine.new_cache().unwrap();
+        let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
+        let action = engine.route_thought(&output, 0).unwrap();
+        assert_eq!(action, ThoughtAction::Emit);
+    }
+
+    #[test]
+    fn route_thought_thinks_for_uncertain() {
+        let engine = engine_with_biased_uq(3); // Uncertain
+        let mut cache = engine.new_cache().unwrap();
+        let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
+        let action = engine.route_thought(&output, 0).unwrap();
+        assert_eq!(action, ThoughtAction::Think);
+    }
+
+    #[test]
+    fn route_thought_thinks_for_high_volume() {
+        let engine = engine_with_biased_uq(1); // HighVolume
+        let mut cache = engine.new_cache().unwrap();
+        let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
+        let action = engine.route_thought(&output, 0).unwrap();
+        assert_eq!(action, ThoughtAction::Think);
+    }
+
+    #[test]
+    fn route_thought_aborts_for_spectral_collapse() {
+        let engine = engine_with_biased_uq(2); // SpectralCollapse
+        let mut cache = engine.new_cache().unwrap();
+        let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
+        let action = engine.route_thought(&output, 0).unwrap();
+        assert_eq!(action, ThoughtAction::Abort);
+    }
+
+    #[test]
+    fn route_thought_safety_cap_forces_emit() {
+        let engine = engine_with_biased_uq(3); // Uncertain
+        let mut cache = engine.new_cache().unwrap();
+        let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
+        // At max_think_steps (4), should force Emit
+        let action = engine.route_thought(&output, 4).unwrap();
+        assert_eq!(action, ThoughtAction::Emit);
+    }
+
+    #[test]
+    fn route_thought_under_safety_cap_thinks() {
+        let engine = engine_with_biased_uq(3); // Uncertain
+        let mut cache = engine.new_cache().unwrap();
+        let output = engine.forward_full(&[1, 2, 3], &mut cache, None).unwrap();
+        // At max_think_steps - 1 (3), should still Think
+        let action = engine.route_thought(&output, 3).unwrap();
+        assert_eq!(action, ThoughtAction::Think);
+    }
+
+    // ── Integration: generation loop with thinking ───────────────────────
+
+    #[test]
+    fn generation_loop_with_thinking() {
+        // Engine biased toward Uncertain — will Think until safety cap.
+        let engine = engine_with_biased_uq(3); // Uncertain, conf=0.5 < 0.85
+        let think_id = engine.think_token_id().unwrap();
+        let mut cache = engine.new_cache().unwrap();
+
+        let mut history: Vec<u32> = vec![1, 2, 3];
+        let mut tokens: Vec<u32> = vec![1, 2, 3];
+        let mut emitted: Vec<u32> = Vec::new();
+        let mut think_count = 0u32;
+
+        // Generate one output token (will think max_think_steps=4 times first).
+        let mut consecutive_thinks = 0u32;
+        loop {
+            let output = engine
+                .forward_full(&tokens, &mut cache, None)
+                .unwrap();
+
+            match engine.route_thought(&output, consecutive_thinks).unwrap() {
+                ThoughtAction::Emit => {
+                    let logits = logits_to_vec(&output.logits).unwrap();
+                    let token = engine
+                        .sample(&logits, &SamplingParams::greedy(), &history)
+                        .unwrap();
+                    history.push(token);
+                    emitted.push(token);
+                    tokens = vec![token];
+                    consecutive_thinks = 0;
+                    break; // Generated one token
+                }
+                ThoughtAction::Think => {
+                    consecutive_thinks += 1;
+                    think_count += 1;
+                    history.push(think_id);
+                    tokens = vec![think_id];
+                }
+                ThoughtAction::Abort => {
+                    panic!("unexpected Abort");
+                }
+            }
+        }
+
+        // Should have thought exactly max_think_steps=4 times before emit.
+        assert_eq!(think_count, 4, "expected 4 think steps before safety cap");
+        assert_eq!(emitted.len(), 1, "expected 1 emitted token");
+
+        // Think tokens are in history but not in emitted output.
+        let think_in_history = history.iter().filter(|&&t| t == think_id).count();
+        assert_eq!(think_in_history, 4);
+        assert!(!emitted.contains(&think_id), "<think> should not be in output");
+
+        // KV cache advanced by: 3 (prefill) + 4 (think forward passes) = 7
+        // (the emit samples from the last think's logits, no extra forward pass)
+        assert_eq!(cache.position, 7);
+    }
+
+    #[test]
+    fn generation_loop_confident_skips_thinking() {
+        // Engine biased toward Confident — should never think.
+        let engine = engine_with_biased_uq(0); // Confident
+        let mut cache = engine.new_cache().unwrap();
+
+        let mut history: Vec<u32> = vec![1, 2, 3];
+        let mut tokens: Vec<u32> = vec![1, 2, 3];
+        let mut think_count = 0u32;
+
+        let mut consecutive_thinks = 0u32;
+        let output = engine.forward_full(&tokens, &mut cache, None).unwrap();
+        match engine.route_thought(&output, consecutive_thinks).unwrap() {
+            ThoughtAction::Emit => {
+                let logits = logits_to_vec(&output.logits).unwrap();
+                let token = engine
+                    .sample(&logits, &SamplingParams::greedy(), &history)
+                    .unwrap();
+                history.push(token);
+                tokens = vec![token];
+                consecutive_thinks = 0;
+            }
+            ThoughtAction::Think => {
+                think_count += 1;
+                consecutive_thinks += 1;
+            }
+            ThoughtAction::Abort => panic!("unexpected Abort"),
+        }
+
+        assert_eq!(think_count, 0, "confident model should not think");
+        assert_eq!(cache.position, 3, "only prefill, no extra steps");
     }
 }
