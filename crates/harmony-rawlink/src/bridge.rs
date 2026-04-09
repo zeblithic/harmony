@@ -40,12 +40,17 @@ impl JitterHold {
 
     /// Arm the jitter hold if not already active.
     ///
-    /// If a hold is already active, the call is ignored — the existing deadline
-    /// is preserved. This prevents indefinite suppression under continuous
-    /// inbound traffic.
+    /// If a hold is already active (deadline in the future), the call is
+    /// ignored — the existing deadline is preserved. This prevents indefinite
+    /// suppression under continuous inbound traffic.
+    ///
+    /// If the deadline has already expired (past `now`), the hold is
+    /// re-armed — this handles the case where `arm()` is called before
+    /// `should_flush()` clears a stale deadline.
     fn arm(&mut self, now: Instant, delay: Duration) {
-        if self.deadline.is_none() {
-            self.deadline = Some(now + delay);
+        match self.deadline {
+            Some(deadline) if now < deadline => {} // Active hold — preserve
+            _ => self.deadline = Some(now + delay), // No hold or expired → arm
         }
     }
 
@@ -157,8 +162,8 @@ impl<S: RawSocket> Bridge<S> {
                 // 1. Scout — broadcast presence if timer expired.
                 if now >= next_scout {
                     self.send_scout()?;
-                    let jitter = self.jittered_scout_interval();
-                    next_scout = now + jitter;
+                    let scout_delay = self.jittered_scout_interval();
+                    next_scout = now + scout_delay;
                 }
 
                 // 2. Purge expired peer table entries periodically.
@@ -172,9 +177,11 @@ impl<S: RawSocket> Bridge<S> {
                     self.process_inbound_frames(&local_mac).await?;
 
                 // Arm jitter hold on inbound traffic to break timing correlation.
+                // Use a fresh timestamp — `now` was captured before the async
+                // process_inbound_frames call and may be stale.
                 if had_inbound {
                     let delay_ms = rand::thread_rng().gen_range(100u64..=500);
-                    jitter.arm(now, Duration::from_millis(delay_ms));
+                    jitter.arm(Instant::now(), Duration::from_millis(delay_ms));
                     trace!(delay_ms, "jitter hold armed on inbound traffic");
                 }
 
@@ -208,7 +215,7 @@ impl<S: RawSocket> Bridge<S> {
                 }
 
                 // 6. Flush remaining batch (jitter-gated).
-                if jitter.should_flush(now) {
+                if jitter.should_flush(Instant::now()) {
                     if let Some(flushed) = batch.flush() {
                         self.socket.send_frame(BROADCAST_MAC, &flushed)?;
                     }
@@ -869,14 +876,47 @@ mod tests {
     }
 
     #[test]
+    fn jitter_hold_arms_over_expired_deadline() {
+        // Regression: arm() must re-arm when the existing deadline has expired
+        // but should_flush() hasn't cleared it yet. This happens when arm() is
+        // called before should_flush() in the same loop iteration.
+        let mut jitter = JitterHold::new();
+        let t0 = Instant::now();
+
+        // Arm with 100ms hold.
+        jitter.arm(t0, Duration::from_millis(100));
+        assert!(jitter.is_active());
+
+        // Time advances past the deadline. arm() is called again with new
+        // inbound traffic BEFORE should_flush() clears the stale deadline.
+        let t1 = t0 + Duration::from_millis(200);
+        jitter.arm(t1, Duration::from_millis(300));
+
+        // The expired deadline should have been replaced, not preserved.
+        // should_flush at t1 should suppress (new deadline is t1+300ms).
+        assert!(!jitter.should_flush(t1), "re-armed hold should suppress flush");
+        assert!(
+            jitter.should_flush(t1 + Duration::from_millis(300)),
+            "new deadline should expire at t1+300ms"
+        );
+    }
+
+    #[test]
     fn jitter_delay_range_100_to_500ms() {
+        // Smoke test: verify the gen_range expression used in the bridge
+        // produces values within the expected window, and that arming
+        // JitterHold with those values produces a valid hold.
         let mut rng = rand::thread_rng();
+        let now = Instant::now();
         for _ in 0..1000 {
             let delay_ms: u64 = rng.gen_range(100..=500);
             assert!(
                 (100..=500).contains(&delay_ms),
                 "delay {delay_ms}ms out of range"
             );
+            let mut jitter = JitterHold::new();
+            jitter.arm(now, Duration::from_millis(delay_ms));
+            assert!(!jitter.should_flush(now), "hold should suppress at arm time");
         }
     }
 }
