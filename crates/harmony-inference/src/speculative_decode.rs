@@ -26,13 +26,13 @@
 //!     // Draft loop
 //!     loop {
 //!         // ... run forward, get draft_token and draft_confidence ...
-//!         if scheduler.push_draft(draft_token, draft_confidence) == DraftAction::Halt {
+//!         if scheduler.push_draft(draft_token, draft_confidence)? == DraftAction::Halt {
 //!             break;
 //!         }
 //!     }
 //!     let bypass = scheduler.bypass_indices();
 //!     // ... verify draft tokens against full model ...
-//!     scheduler.complete(accepted_count);
+//!     scheduler.complete(accepted_count)?;
 //! }
 //! ```
 //!
@@ -44,6 +44,8 @@
 //! References: ConfSpec (arXiv 2602.18447), TALON (arXiv 2601.07353)
 
 use candle_core::{Device, Tensor};
+
+use crate::error::InferenceError;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -63,7 +65,7 @@ pub struct SpecDecConfig {
     pub tau_chain: f32,
     /// Confidence above this bypasses verification (ConfSpec). In `(tau_generate, 1]`.
     pub tau_accept: f32,
-    /// Maximum draft length (safety cap). Must be >= 1.
+    /// Maximum draft length (safety cap). Must be >= 2.
     pub max_draft_len: usize,
 }
 
@@ -82,7 +84,7 @@ impl SpecDecConfig {
             tau_accept > tau_generate && tau_accept <= 1.0,
             "tau_accept must be in (tau_generate, 1], got {tau_accept}"
         );
-        assert!(max_draft_len >= 1, "max_draft_len must be >= 1");
+        assert!(max_draft_len >= 2, "max_draft_len must be >= 2");
         Self {
             tau_generate,
             tau_chain,
@@ -260,10 +262,14 @@ impl SpeculativeDecodeScheduler {
     /// or [`DraftAction::Halt`] if the draft should stop (max length,
     /// cumulative confidence below tau_chain).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called when not in the `Drafting` state.
-    pub fn push_draft(&mut self, token: u32, confidence: f32) -> DraftAction {
+    /// Returns [`InferenceError::SpeculativeDecodeFailed`] if called while idle.
+    pub fn push_draft(
+        &mut self,
+        token: u32,
+        confidence: f32,
+    ) -> Result<DraftAction, InferenceError> {
         let (tokens, confidences, cumulative, effective_max_len) = match &mut self.state {
             SpecDecState::Drafting {
                 tokens,
@@ -271,7 +277,11 @@ impl SpeculativeDecodeScheduler {
                 cumulative_confidence,
                 effective_max_len,
             } => (tokens, confidences, cumulative_confidence, *effective_max_len),
-            SpecDecState::Idle => panic!("push_draft called while idle — call begin_draft first"),
+            SpecDecState::Idle => {
+                return Err(InferenceError::SpeculativeDecodeFailed(
+                    "push_draft called while idle — call begin_draft first".into(),
+                ))
+            }
         };
 
         *cumulative *= confidence;
@@ -280,9 +290,9 @@ impl SpeculativeDecodeScheduler {
 
         // Halt conditions: max length or cumulative confidence drop
         if tokens.len() >= effective_max_len || *cumulative < self.config.tau_chain {
-            DraftAction::Halt
+            Ok(DraftAction::Halt)
         } else {
-            DraftAction::Continue
+            Ok(DraftAction::Continue)
         }
     }
 
@@ -296,7 +306,7 @@ impl SpeculativeDecodeScheduler {
             SpecDecState::Drafting { confidences, .. } => confidences
                 .iter()
                 .enumerate()
-                .filter(|(_, &c)| c > self.config.tau_accept)
+                .filter(|(_, &c)| c >= self.config.tau_accept)
                 .map(|(i, _)| i)
                 .collect(),
             SpecDecState::Idle => Vec::new(),
@@ -308,18 +318,30 @@ impl SpeculativeDecodeScheduler {
     /// `accepted` is the number of draft tokens the full model accepted
     /// (the longest matching prefix). Updates metrics and resets to Idle.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called when not in the `Drafting` state.
-    pub fn complete(&mut self, accepted: usize) {
+    /// Returns [`InferenceError::SpeculativeDecodeFailed`] if called while
+    /// idle or if `accepted` exceeds the number of drafted tokens.
+    pub fn complete(&mut self, accepted: usize) -> Result<(), InferenceError> {
         let (tokens, confidences) = match &self.state {
             SpecDecState::Drafting {
                 tokens,
                 confidences,
                 ..
             } => (tokens.clone(), confidences.clone()),
-            SpecDecState::Idle => panic!("complete called while idle — no active draft"),
+            SpecDecState::Idle => {
+                return Err(InferenceError::SpeculativeDecodeFailed(
+                    "complete called while idle — no active draft".into(),
+                ))
+            }
         };
+
+        if accepted > tokens.len() {
+            return Err(InferenceError::SpeculativeDecodeFailed(format!(
+                "accepted count {accepted} exceeds draft length {}",
+                tokens.len()
+            )));
+        }
 
         let draft_len = tokens.len() as u64;
         self.metrics.completed_speculations += 1;
@@ -331,11 +353,12 @@ impl SpeculativeDecodeScheduler {
         let bypassed = confidences
             .iter()
             .take(accepted)
-            .filter(|&&c| c > self.config.tau_accept)
+            .filter(|&&c| c >= self.config.tau_accept)
             .count() as u64;
         self.metrics.bypassed_verifications += bypassed;
 
         self.state = SpecDecState::Idle;
+        Ok(())
     }
 
     /// Cancel the current draft without verification.
@@ -346,7 +369,6 @@ impl SpeculativeDecodeScheduler {
         if let SpecDecState::Drafting { tokens, .. } = &self.state {
             self.metrics.canceled_speculations += 1;
             self.metrics.total_drafts += tokens.len() as u64;
-            self.metrics.total_draft_length += tokens.len() as u64;
         }
         self.state = SpecDecState::Idle;
     }
@@ -534,6 +556,12 @@ mod tests {
         SpecDecConfig::new(0.5, 0.2, 0.4, 8); // tau_accept < tau_generate
     }
 
+    #[test]
+    #[should_panic(expected = "max_draft_len must be >= 2")]
+    fn config_rejects_max_draft_len_one() {
+        SpecDecConfig::new(0.3, 0.2, 0.95, 1);
+    }
+
     // -- Draft flow --
 
     #[test]
@@ -575,9 +603,9 @@ mod tests {
         };
         assert!(sched.begin_draft(0.9, &ctx));
 
-        assert_eq!(sched.push_draft(1, 0.9), DraftAction::Continue); // len=1 < 3
-        assert_eq!(sched.push_draft(2, 0.9), DraftAction::Continue); // len=2 < 3
-        assert_eq!(sched.push_draft(3, 0.9), DraftAction::Halt); // len=3 = effective_max
+        assert_eq!(sched.push_draft(1, 0.9).unwrap(), DraftAction::Continue); // len=1 < 3
+        assert_eq!(sched.push_draft(2, 0.9).unwrap(), DraftAction::Continue); // len=2 < 3
+        assert_eq!(sched.push_draft(3, 0.9).unwrap(), DraftAction::Halt); // len=3 = effective_max
     }
 
     #[test]
@@ -586,13 +614,13 @@ mod tests {
         assert!(sched.begin_draft(0.9, &default_context()));
 
         // cumulative: 1.0 * 0.8 = 0.8 > 0.2
-        assert_eq!(sched.push_draft(10, 0.8), DraftAction::Continue);
+        assert_eq!(sched.push_draft(10, 0.8).unwrap(), DraftAction::Continue);
         // cumulative: 0.8 * 0.7 = 0.56 > 0.2
-        assert_eq!(sched.push_draft(11, 0.7), DraftAction::Continue);
+        assert_eq!(sched.push_draft(11, 0.7).unwrap(), DraftAction::Continue);
         // cumulative: 0.56 * 0.5 = 0.28 > 0.2
-        assert_eq!(sched.push_draft(12, 0.5), DraftAction::Continue);
+        assert_eq!(sched.push_draft(12, 0.5).unwrap(), DraftAction::Continue);
         // cumulative: 0.28 * 0.5 = 0.14 < 0.2 → halt
-        assert_eq!(sched.push_draft(13, 0.5), DraftAction::Halt);
+        assert_eq!(sched.push_draft(13, 0.5).unwrap(), DraftAction::Halt);
     }
 
     #[test]
@@ -601,9 +629,15 @@ mod tests {
         let mut sched = SpeculativeDecodeScheduler::new(config);
         assert!(sched.begin_draft(0.9, &default_context()));
 
-        assert_eq!(sched.push_draft(1, 0.9), DraftAction::Continue);
-        assert_eq!(sched.push_draft(2, 0.9), DraftAction::Continue);
-        assert_eq!(sched.push_draft(3, 0.9), DraftAction::Halt); // 3rd = max
+        assert_eq!(sched.push_draft(1, 0.9).unwrap(), DraftAction::Continue);
+        assert_eq!(sched.push_draft(2, 0.9).unwrap(), DraftAction::Continue);
+        assert_eq!(sched.push_draft(3, 0.9).unwrap(), DraftAction::Halt); // 3rd = max
+    }
+
+    #[test]
+    fn push_draft_errors_while_idle() {
+        let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
+        assert!(sched.push_draft(1, 0.9).is_err());
     }
 
     // -- Verification --
@@ -612,9 +646,9 @@ mod tests {
     fn bypass_indices_empty_below_threshold() {
         let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
         assert!(sched.begin_draft(0.9, &default_context()));
-        sched.push_draft(1, 0.5);
-        sched.push_draft(2, 0.8);
-        sched.push_draft(3, 0.9); // 0.9 < 0.95
+        sched.push_draft(1, 0.5).unwrap();
+        sched.push_draft(2, 0.8).unwrap();
+        sched.push_draft(3, 0.9).unwrap(); // 0.9 < 0.95
 
         assert!(sched.bypass_indices().is_empty());
     }
@@ -623,24 +657,49 @@ mod tests {
     fn bypass_indices_includes_high_confidence() {
         let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
         assert!(sched.begin_draft(0.9, &default_context()));
-        sched.push_draft(1, 0.5);
-        sched.push_draft(2, 0.99); // > 0.95
-        sched.push_draft(3, 0.97); // > 0.95
+        sched.push_draft(1, 0.5).unwrap();
+        sched.push_draft(2, 0.99).unwrap(); // >= 0.95
+        sched.push_draft(3, 0.97).unwrap(); // >= 0.95
 
         assert_eq!(sched.bypass_indices(), vec![1, 2]);
+    }
+
+    #[test]
+    fn bypass_at_exact_tau_accept() {
+        let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
+        assert!(sched.begin_draft(0.9, &default_context()));
+        sched.push_draft(1, 0.95).unwrap(); // exactly tau_accept — should bypass
+
+        assert_eq!(sched.bypass_indices(), vec![0]);
     }
 
     #[test]
     fn complete_transitions_to_idle() {
         let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
         assert!(sched.begin_draft(0.9, &default_context()));
-        sched.push_draft(1, 0.8);
-        sched.push_draft(2, 0.7);
+        sched.push_draft(1, 0.8).unwrap();
+        sched.push_draft(2, 0.7).unwrap();
         assert!(!sched.is_idle());
 
-        sched.complete(2);
+        sched.complete(2).unwrap();
         assert!(sched.is_idle());
         assert!(sched.draft_tokens().is_none());
+    }
+
+    #[test]
+    fn complete_errors_while_idle() {
+        let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
+        assert!(sched.complete(0).is_err());
+    }
+
+    #[test]
+    fn complete_errors_on_accepted_exceeds_draft() {
+        let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
+        assert!(sched.begin_draft(0.9, &default_context()));
+        sched.push_draft(1, 0.8).unwrap();
+        sched.push_draft(2, 0.7).unwrap();
+
+        assert!(sched.complete(3).is_err()); // only 2 drafted
     }
 
     // -- Cancel / Reset --
@@ -649,8 +708,8 @@ mod tests {
     fn cancel_resets_state_and_tracks_metric() {
         let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
         assert!(sched.begin_draft(0.9, &default_context()));
-        sched.push_draft(1, 0.8);
-        sched.push_draft(2, 0.7);
+        sched.push_draft(1, 0.8).unwrap();
+        sched.push_draft(2, 0.7).unwrap();
 
         sched.cancel();
         assert!(sched.is_idle());
@@ -659,11 +718,34 @@ mod tests {
     }
 
     #[test]
+    fn cancel_does_not_inflate_avg_draft_length() {
+        let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
+
+        // Complete one 3-token draft
+        assert!(sched.begin_draft(0.9, &default_context()));
+        sched.push_draft(1, 0.8).unwrap();
+        sched.push_draft(2, 0.7).unwrap();
+        sched.push_draft(3, 0.6).unwrap();
+        sched.complete(2).unwrap();
+
+        // Cancel a 5-token draft
+        assert!(sched.begin_draft(0.8, &default_context()));
+        for i in 0..5 {
+            sched.push_draft(10 + i, 0.9).unwrap();
+        }
+        sched.cancel();
+
+        // avg_draft_length should be 3.0 (only the completed speculation),
+        // not 8.0 (if cancel had added to total_draft_length)
+        assert!((sched.metrics().avg_draft_length() - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
     fn reset_clears_everything() {
         let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
         assert!(sched.begin_draft(0.9, &default_context()));
-        sched.push_draft(1, 0.8);
-        sched.complete(1);
+        sched.push_draft(1, 0.8).unwrap();
+        sched.complete(1).unwrap();
 
         sched.reset();
         assert!(sched.is_idle());
@@ -679,16 +761,16 @@ mod tests {
 
         // Speculation 1: 3 tokens, 2 accepted
         assert!(sched.begin_draft(0.9, &default_context()));
-        sched.push_draft(1, 0.8);
-        sched.push_draft(2, 0.7);
-        sched.push_draft(3, 0.6);
-        sched.complete(2);
+        sched.push_draft(1, 0.8).unwrap();
+        sched.push_draft(2, 0.7).unwrap();
+        sched.push_draft(3, 0.6).unwrap();
+        sched.complete(2).unwrap();
 
         // Speculation 2: 2 tokens, 2 accepted
         assert!(sched.begin_draft(0.8, &default_context()));
-        sched.push_draft(4, 0.9);
-        sched.push_draft(5, 0.8);
-        sched.complete(2);
+        sched.push_draft(4, 0.9).unwrap();
+        sched.push_draft(5, 0.8).unwrap();
+        sched.complete(2).unwrap();
 
         let m = sched.metrics();
         assert_eq!(m.total_speculations, 2);
@@ -702,13 +784,13 @@ mod tests {
     fn computed_ratios_correct() {
         let mut sched = SpeculativeDecodeScheduler::new(SpecDecConfig::default());
 
-        // 4 tokens drafted, 3 accepted, 1 bypassed (confidence > 0.95)
+        // 4 tokens drafted, 3 accepted, 1 bypassed (confidence >= 0.95)
         assert!(sched.begin_draft(0.9, &default_context()));
-        sched.push_draft(1, 0.8);
-        sched.push_draft(2, 0.99); // bypass
-        sched.push_draft(3, 0.7);
-        sched.push_draft(4, 0.6);
-        sched.complete(3); // accept first 3
+        sched.push_draft(1, 0.8).unwrap();
+        sched.push_draft(2, 0.99).unwrap(); // bypass
+        sched.push_draft(3, 0.7).unwrap();
+        sched.push_draft(4, 0.6).unwrap();
+        sched.complete(3).unwrap(); // accept first 3
 
         let m = sched.metrics();
         assert!((m.acceptance_rate() - 0.75).abs() < 1e-10); // 3/4
