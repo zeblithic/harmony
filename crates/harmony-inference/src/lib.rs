@@ -47,6 +47,7 @@ pub use harmony_model::{HarmonyModel, HarmonyModelConfig, HarmonyForwardOutput};
 pub use uq_features::{extract_uq_features, UqFeatureConfig};
 pub use uq_head::{UqClass, UqHead, UqHeadConfig, UqOutput};
 pub use latent_projection::LatentProjection;
+pub use latent_projection::contrastive_loss;
 pub use engine::EngramContext;
 pub use engine::QwenEngine;
 pub use engram_residual::EngramGatedResidual;
