@@ -146,7 +146,7 @@ fn quantize_vec(values: &[f32]) -> (f32, Vec<i8>) {
     let inv_scale = 127.0 / absmax;
     let quantized: Vec<i8> = values
         .iter()
-        .map(|&v| (v * inv_scale).round().clamp(-128.0, 127.0) as i8)
+        .map(|&v| (v * inv_scale).round().clamp(-127.0, 127.0) as i8)
         .collect();
     (scale, quantized)
 }

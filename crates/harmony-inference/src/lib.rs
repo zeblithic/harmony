@@ -149,8 +149,13 @@ impl InferenceCache {
             return Ok(());
         }
         if let Some(q8) = self.q8_layers[i].take() {
-            let (k, v) = q8.dequantize(device)?;
-            self.layers[i] = Some((k, v));
+            match q8.dequantize(device) {
+                Ok((k, v)) => self.layers[i] = Some((k, v)),
+                Err(e) => {
+                    self.q8_layers[i] = Some(q8); // restore on error
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -164,9 +169,13 @@ impl InferenceCache {
             return Ok(());
         }
         if let Some((k, v)) = self.layers[i].take() {
-            let q8 = Q8KvLayer::quantize(&k, &v)?;
-            self.q8_layers[i] = Some(q8);
-            // k, v dropped here — F16 memory freed
+            match Q8KvLayer::quantize(&k, &v) {
+                Ok(q8) => self.q8_layers[i] = Some(q8),
+                Err(e) => {
+                    self.layers[i] = Some((k, v)); // restore on error
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
