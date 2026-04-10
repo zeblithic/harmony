@@ -239,6 +239,11 @@ impl ChunkedEngramScheduler {
         self.steps_since_refresh
     }
 
+    /// Steps remaining until the next chunk boundary Engram refresh.
+    pub fn steps_until_boundary(&self) -> usize {
+        self.config.chunk_size.saturating_sub(self.steps_since_refresh)
+    }
+
     /// Clear all state (token buffer, cached embedding, shard cache).
     pub fn reset(&mut self) {
         self.token_buffer.clear();

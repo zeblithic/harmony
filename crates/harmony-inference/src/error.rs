@@ -33,6 +33,10 @@ pub enum InferenceError {
     #[error("engram resolution failed: {0}")]
     EngramResolutionFailed(String),
 
+    /// Speculative decode state machine error (e.g. push_draft while idle).
+    #[error("speculative decode error: {0}")]
+    SpeculativeDecodeFailed(String),
+
     /// KV cache compression or decompression failed.
     #[cfg(feature = "kv-compress")]
     #[error("compression failed: {0}")]

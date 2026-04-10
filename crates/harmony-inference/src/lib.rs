@@ -31,6 +31,7 @@ pub(crate) mod kv_compress;
 pub(crate) mod kv_quantize;
 pub(crate) mod qwen3_ext;
 pub mod sampling;
+pub mod speculative_decode;
 pub mod uq_features;
 pub mod uq_head;
 
@@ -47,6 +48,10 @@ pub use engine::EngramContext;
 pub use engine::QwenEngine;
 pub use engram_residual::EngramGatedResidual;
 pub use error::InferenceError;
+pub use speculative_decode::{
+    DraftAction, DraftTree, SpecContext, SpecDecConfig, SpecDecMetrics,
+    SpeculativeDecodeScheduler,
+};
 
 use candle_core::{Device, Tensor};
 
