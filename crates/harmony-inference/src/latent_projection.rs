@@ -309,9 +309,12 @@ mod tests {
 
     #[test]
     fn contrastive_loss_decreases_with_aligned_projections() {
-        let original = Tensor::randn(0f32, 1.0, (1, 16, HIDDEN_DIM), &Device::Cpu).unwrap();
-        let random_proj = Tensor::randn(0f32, 1.0, (1, 16, LATENT_DIM), &Device::Cpu).unwrap();
-        let aligned_proj = original.narrow(2, 0, LATENT_DIM).unwrap();
+        // Use larger dimensions for statistical stability
+        let hidden = 128;
+        let latent = 32;
+        let original = Tensor::randn(0f32, 1.0, (1, 16, hidden), &Device::Cpu).unwrap();
+        let random_proj = Tensor::randn(0f32, 1.0, (1, 16, latent), &Device::Cpu).unwrap();
+        let aligned_proj = original.narrow(2, 0, latent).unwrap();
 
         let loss_random = contrastive_loss(&original, &random_proj, 0.07, 4).unwrap();
         let loss_aligned = contrastive_loss(&original, &aligned_proj, 0.07, 4).unwrap();

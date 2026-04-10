@@ -253,7 +253,7 @@ impl ChunkedEngramScheduler {
             .project_ngrams(embeddings, window_len)
             .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))?;
         engram_bridge::prepare_engram_request_latent(
-            client.config(),
+            client,
             &keys,
             &positions,
             window_len,

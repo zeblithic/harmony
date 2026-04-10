@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use candle_core::{Device, Result, Tensor};
-use harmony_engram::{EngramClient, EngramConfig, EngramLookup};
+use harmony_engram::{EngramClient, EngramLookup};
 
 /// A shard that needs to be fetched by the caller.
 #[derive(Debug, Clone)]
@@ -97,7 +97,7 @@ pub fn prepare_engram_request(client: &EngramClient, tokens: &[u32]) -> Result<E
 /// (last token of the N-gram window, matching the convention in
 /// [`prepare_engram_request`]).
 pub fn prepare_engram_request_latent(
-    config: &EngramConfig,
+    client: &EngramClient,
     binary_keys: &[Vec<u8>],
     positions: &[usize],
     seq_len: usize,
@@ -113,19 +113,8 @@ pub fn prepare_engram_request_latent(
     let mut required_shards = Vec::new();
 
     for (key, &pos) in binary_keys.iter().zip(positions.iter()) {
-        let lookup = harmony_engram::hash::compute_lookup_from_bytes(config, key);
-        // Collect unique shard requests — same dedup logic as prepare_engram_request
-        for &shard_idx in &lookup.shard_indices {
-            if seen_shards.insert(shard_idx) {
-                // No CID resolution for latent keys — set placeholder CID.
-                // The caller (event loop) fetches shards by index from the
-                // already-loaded shard data in the ChunkedEngramScheduler cache.
-                required_shards.push(ShardRequest {
-                    shard_index: shard_idx,
-                    cid: [0u8; 32],
-                });
-            }
-        }
+        let lookup = harmony_engram::hash::compute_lookup_from_bytes(client.config(), key);
+        collect_shards(client, &lookup, &mut seen_shards, &mut required_shards)?;
         lookups.push(NgramLookup {
             token_position: pos,
             lookup,
@@ -385,7 +374,7 @@ mod tests {
         let keys = vec![vec![0xABu8, 0xCD], vec![0x12, 0x34], vec![0xFF, 0x00]];
         let positions = vec![1, 2, 2];
         let request =
-            prepare_engram_request_latent(client.config(), &keys, &positions, 3).unwrap();
+            prepare_engram_request_latent(&client, &keys, &positions, 3).unwrap();
 
         assert_eq!(request.lookups.len(), 3);
         assert_eq!(request.seq_len, 3);
@@ -408,7 +397,7 @@ mod tests {
         let keys = vec![vec![0x00u8], vec![0xFF]];
         let positions = vec![1, 1];
         let request =
-            prepare_engram_request_latent(client.config(), &keys, &positions, 5).unwrap();
+            prepare_engram_request_latent(&client, &keys, &positions, 5).unwrap();
 
         assert_eq!(request.seq_len, 5);
         assert_eq!(request.lookups.len(), 2);

@@ -1512,7 +1512,7 @@ pub async fn run(
                                     engine.token_embeddings(&tokens).ok().and_then(|emb| {
                                         proj.project_ngrams(&emb, tokens.len()).ok().and_then(|(keys, positions)| {
                                             harmony_inference::engram_bridge::prepare_engram_request_latent(
-                                                client.config(), &keys, &positions, tokens.len(),
+                                                client, &keys, &positions, tokens.len(),
                                             ).ok()
                                         })
                                     }).or_else(|| {
@@ -2768,7 +2768,7 @@ fn run_inference_loop(
                         engine.token_embeddings(window).ok().and_then(|emb| {
                             proj.project_ngrams(&emb, window.len()).ok().and_then(|(keys, positions)| {
                                 harmony_inference::engram_bridge::prepare_engram_request_latent(
-                                    ep.client.config(), &keys, &positions, window.len(),
+                                    &ep.client, &keys, &positions, window.len(),
                                 ).ok()
                             })
                         }).or_else(|| {
