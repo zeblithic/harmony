@@ -50,6 +50,11 @@ pub fn compute_lookup(config: &EngramConfig, ngram_tokens: &[u32]) -> EngramLook
     }
 }
 
+/// Hash arbitrary bytes with a single seed.
+fn hash_bytes(bytes: &[u8], seed: u64) -> u64 {
+    xxhash_rust::xxh64::xxh64(bytes, seed)
+}
+
 /// Hash an N-gram's token bytes with a single seed.
 ///
 /// Tokens are encoded as contiguous little-endian u32 bytes.
@@ -60,10 +65,44 @@ fn hash_ngram(tokens: &[u32], seed: u64) -> u64 {
         for (i, t) in tokens.iter().enumerate() {
             buf[i * 4..(i + 1) * 4].copy_from_slice(&t.to_le_bytes());
         }
-        xxhash_rust::xxh64::xxh64(&buf[..byte_len], seed)
+        hash_bytes(&buf[..byte_len], seed)
     } else {
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
-        xxhash_rust::xxh64::xxh64(&bytes, seed)
+        hash_bytes(&bytes, seed)
+    }
+}
+
+/// Compute the [`EngramLookup`] for arbitrary key bytes.
+///
+/// Same hashing logic as [`compute_lookup`] but accepts raw bytes instead of
+/// token N-grams. Used by latent projection to hash binary LSH codes.
+pub fn compute_lookup_from_bytes(config: &EngramConfig, key_bytes: &[u8]) -> EngramLookup {
+    debug_assert!(config.total_entries > 0, "total_entries must be positive");
+    debug_assert!(config.shard_size > 0, "shard_size must be positive");
+    debug_assert_eq!(
+        config.hash_seeds.len(),
+        config.num_heads as usize,
+        "hash_seeds length must match num_heads"
+    );
+
+    let vector_bytes = config.vector_bytes();
+    let mut shard_indices = Vec::with_capacity(config.num_heads as usize);
+    let mut entry_offsets = Vec::with_capacity(config.num_heads as usize);
+
+    for seed in &config.hash_seeds {
+        let raw_hash = hash_bytes(key_bytes, *seed);
+        let table_index = raw_hash % config.total_entries;
+        let shard_index = table_index / config.shard_size as u64;
+        let entry_within_shard = (table_index % config.shard_size as u64) as usize;
+        let byte_offset = entry_within_shard * vector_bytes;
+
+        shard_indices.push(shard_index);
+        entry_offsets.push(byte_offset);
+    }
+
+    EngramLookup {
+        shard_indices,
+        entry_offsets,
     }
 }
 
@@ -166,5 +205,33 @@ mod tests {
         let config = test_config();
         let lookup = compute_lookup(&config, &[]);
         assert_eq!(lookup.shard_indices.len(), 2);
+    }
+
+    #[test]
+    fn compute_lookup_refactor_preserves_existing_hashes() {
+        let config = test_config();
+        let lookup_before = compute_lookup(&config, &[1, 2, 3]);
+        let expected_shard_0 = lookup_before.shard_indices[0];
+        let expected_shard_1 = lookup_before.shard_indices[1];
+        let expected_offset_0 = lookup_before.entry_offsets[0];
+        let expected_offset_1 = lookup_before.entry_offsets[1];
+        let lookup_after = compute_lookup(&config, &[1, 2, 3]);
+        assert_eq!(lookup_after.shard_indices[0], expected_shard_0);
+        assert_eq!(lookup_after.shard_indices[1], expected_shard_1);
+        assert_eq!(lookup_after.entry_offsets[0], expected_offset_0);
+        assert_eq!(lookup_after.entry_offsets[1], expected_offset_1);
+    }
+
+    #[test]
+    fn compute_lookup_from_bytes_matches_manual() {
+        let config = test_config();
+        let bytes: Vec<u8> = [1u32, 2, 3]
+            .iter()
+            .flat_map(|t| t.to_le_bytes())
+            .collect();
+        let from_bytes = compute_lookup_from_bytes(&config, &bytes);
+        let from_tokens = compute_lookup(&config, &[1, 2, 3]);
+        assert_eq!(from_bytes.shard_indices, from_tokens.shard_indices);
+        assert_eq!(from_bytes.entry_offsets, from_tokens.entry_offsets);
     }
 }
