@@ -110,7 +110,7 @@ Draft token KV entries are negligible relative to the main cache:
 | 8 | 252 KB | 0.19% |
 
 Speculative decoding is **not memory-constrained**. The MTP head itself
-(ZEB-61) adds ~13.1M parameters (~7 MB at Q8, ~14 MB at F16) — the MLP portion
+(ZEB-61) adds ~13.1M parameters (~14 MB at Q8, ~26 MB at F16) — the MLP portion
 of a transformer layer, still negligible vs. the KV cache at long contexts.
 
 ## Deployment Scenarios
@@ -182,8 +182,8 @@ Priority: **Medium** for single-session. **High** if serving concurrent sessions
 ### 5. Speculative decoding has ample headroom
 
 Draft token KV overhead (K=4-8) is < 0.3 MB — negligible. The MTP head
-(ZEB-61) adds ~10 MB of parameters. No memory-based constraints on speculative
-decoding depth.
+(ZEB-61) adds ~13.1M parameters (~14 MB at Q8, ~26 MB at F16). No memory-based
+constraints on speculative decoding depth.
 
 ### 6. Q8_0 KV should be the default for all inference
 

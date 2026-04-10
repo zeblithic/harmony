@@ -93,6 +93,7 @@ class MtpHead(nn.Module):
 
         h = hidden_states[:, :S, :]
         total_loss = torch.tensor(0.0, device=hidden_states.device)
+        valid_steps = 0
 
         for k in range(K):
             # Token embedding at offset k (the "known" token for this draft step)
@@ -110,11 +111,18 @@ class MtpHead(nn.Module):
                 draft_targets = draft_targets.clone()
                 draft_targets[mask_slice] = -100
 
+            # Skip fully-masked steps to avoid NaN from 0/0 in CE mean reduction
+            if draft_targets.eq(-100).all():
+                continue
+
             step_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 draft_targets.reshape(-1),
                 ignore_index=-100,
             )
             total_loss = total_loss + step_loss
+            valid_steps += 1
 
-        return total_loss / K
+        if valid_steps == 0:
+            return torch.tensor(0.0, device=hidden_states.device, requires_grad=True)
+        return total_loss / valid_steps
