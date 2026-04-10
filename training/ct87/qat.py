@@ -89,6 +89,13 @@ def enable_qat(model: nn.Module) -> None:
 
     Only pass the base model -- auxiliary modules (UQ head, ThoughtNorm,
     MTP head) should NOT be instrumented.
+
+    Note on tied embeddings: with tie_embeddings=True, lm_head.weight and
+    embed_tokens.weight are the same tensor. QAT patches lm_head (nn.Linear)
+    but not embed_tokens (nn.Embedding). This is intentional -- embedding
+    lookup is a table index, not a matmul, so quantization noise doesn't
+    apply. The lm_head projection path sees fake-quantized weights, matching
+    inference behavior where the output projection is quantized.
     """
     for module in model.modules():
         if isinstance(module, nn.Linear):

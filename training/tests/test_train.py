@@ -592,7 +592,8 @@ class TestQatCsvLogging:
                 timeout=120,
             )
             assert result.returncode == 0, f"Training failed:\n{result.stderr}"
-            assert "QAT enabled" in result.stdout
+            # ceil(0.5 * 30) = 15
+            assert "QAT enabled at step 15" in result.stdout
 
             with open(log_path) as f:
                 reader = csv.reader(f)
