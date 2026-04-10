@@ -964,4 +964,143 @@ mod tests {
         assert_eq!(think_count, 0, "confident model should not think");
         assert_eq!(cache.position, 3, "only prefill, no extra steps");
     }
+
+    // --- Q8 KV cache tests ---
+
+    // 19. q8_forward_produces_finite_logits
+    #[test]
+    fn q8_forward_produces_finite_logits() {
+        let cfg = test_config();
+        let vocab_size = cfg.vocab_size;
+        let mut engine = HarmonyEngine::new(cfg, Device::Cpu);
+        engine.init_random().unwrap();
+        let mut cache = engine.new_cache().unwrap().with_q8();
+        assert!(cache.is_q8());
+
+        let logits = engine.forward(&[1, 2, 3], &mut cache).unwrap();
+        assert_eq!(logits.len(), vocab_size);
+        assert!(logits.iter().all(|v| v.is_finite()), "logits should be finite");
+    }
+
+    // 20. q8_decode_extends_cache
+    #[test]
+    fn q8_decode_extends_cache() {
+        let mut engine = HarmonyEngine::new(test_config(), Device::Cpu);
+        engine.init_random().unwrap();
+        let mut cache = engine.new_cache().unwrap().with_q8();
+
+        // Prefill
+        engine.forward(&[1, 2, 3], &mut cache).unwrap();
+        assert_eq!(cache.position, 3);
+
+        // Decode step
+        engine.forward(&[4], &mut cache).unwrap();
+        assert_eq!(cache.position, 4);
+
+        // After forward, q8 layers should be populated (not F16)
+        assert!(
+            cache.q8_layers.iter().all(|l| l.is_some()),
+            "all layers should have q8 data after forward"
+        );
+        assert!(
+            cache.layers.iter().all(|l| l.is_none()),
+            "F16 layers should be freed after q8 quantization"
+        );
+    }
+
+    // 21. q8_logits_approximately_match_f16
+    #[test]
+    fn q8_logits_approximately_match_f16() {
+        let cfg = test_config();
+        let mut engine = HarmonyEngine::new(cfg, Device::Cpu);
+        engine.init_random().unwrap();
+
+        // F16 baseline
+        let mut f16_cache = engine.new_cache().unwrap();
+        let f16_logits = engine.forward(&[1, 2, 3], &mut f16_cache).unwrap();
+
+        // Q8 run
+        let mut q8_cache = engine.new_cache().unwrap().with_q8();
+        let q8_logits = engine.forward(&[1, 2, 3], &mut q8_cache).unwrap();
+
+        // First forward should match exactly — no KV cache to quantize yet
+        // (KV is only quantized AFTER the layer forward, so the first prefill
+        // computes identically to F16).
+        assert_eq!(f16_logits.len(), q8_logits.len());
+        for (f16_val, q8_val) in f16_logits.iter().zip(q8_logits.iter()) {
+            assert!(
+                (f16_val - q8_val).abs() < 1e-4,
+                "first forward should match: f16={f16_val}, q8={q8_val}"
+            );
+        }
+
+        // Second forward (decode) — now q8 cache is in use, expect small divergence
+        let f16_logits2 = engine.forward(&[4], &mut f16_cache).unwrap();
+        let q8_logits2 = engine.forward(&[4], &mut q8_cache).unwrap();
+
+        // Logits should be close but not identical due to quantization noise.
+        let max_diff: f32 = f16_logits2
+            .iter()
+            .zip(q8_logits2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 5.0,
+            "q8 decode logits should be close to f16: max_diff={max_diff}"
+        );
+    }
+
+    // 22. q8_memory_savings
+    #[test]
+    fn q8_memory_savings() {
+        let mut engine = HarmonyEngine::new(test_config(), Device::Cpu);
+        engine.init_random().unwrap();
+
+        let mut q8_cache = engine.new_cache().unwrap().with_q8();
+        engine.forward(&[1, 2, 3, 4, 5], &mut q8_cache).unwrap();
+
+        let q8_bytes = q8_cache.q8_memory_bytes();
+        assert!(q8_bytes > 0, "q8 cache should have data");
+
+        // F16 equivalent memory for comparison
+        let num_layers = q8_cache.num_layers;
+        let num_kv_heads = q8_cache.num_kv_heads;
+        let head_dim = q8_cache.head_dim;
+        let seq_len = q8_cache.position;
+        let f16_bytes = num_layers * 2 * num_kv_heads * seq_len * head_dim * 2; // F16=2 bytes
+
+        assert!(
+            q8_bytes < f16_bytes,
+            "q8 ({q8_bytes}) should be less than f16 ({f16_bytes})"
+        );
+        let ratio = q8_bytes as f64 / f16_bytes as f64;
+        // With test head_dim=8 the f32 scale overhead is proportionally large
+        // (ratio ~0.75). With target head_dim=80 this drops to ~0.525.
+        assert!(
+            ratio < 0.80,
+            "compression ratio {ratio:.2} should be < 0.80"
+        );
+    }
+
+    // 23. q8_multi_step_decode
+    #[test]
+    fn q8_multi_step_decode() {
+        let mut engine = HarmonyEngine::new(test_config(), Device::Cpu);
+        engine.init_random().unwrap();
+        let mut cache = engine.new_cache().unwrap().with_q8();
+
+        // Prefill
+        let logits = engine.forward(&[1, 2, 3], &mut cache).unwrap();
+        assert!(logits.iter().all(|v| v.is_finite()));
+
+        // 10 decode steps
+        for token in 4..14u32 {
+            let logits = engine.forward(&[token], &mut cache).unwrap();
+            assert!(
+                logits.iter().all(|v| v.is_finite()),
+                "logits not finite at token {token}"
+            );
+        }
+        assert_eq!(cache.position, 13); // 3 prefill + 10 decode
+    }
 }

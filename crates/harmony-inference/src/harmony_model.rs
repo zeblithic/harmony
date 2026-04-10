@@ -723,13 +723,14 @@ impl HarmonyModel {
     ) -> Result<HarmonyForwardOutput> {
         let (_batch, seq_len) = input.dims2()?;
         let offset = cache.position;
+        let device = input.device();
 
         // Token embedding: [batch, seq_len, hidden_dim]
         let mut h = self.embed_tokens.forward(input)?;
 
         // Causal attention mask (only needed for prefill — decode has seq_len=1).
         let mask = if seq_len > 1 {
-            Some(causal_mask(seq_len, offset, input.device())?)
+            Some(causal_mask(seq_len, offset, device)?)
         } else {
             None
         };
@@ -744,7 +745,13 @@ impl HarmonyModel {
                 h = self.block_attnres.block_input(i / layers_per_block, &h, &state)?;
             }
 
+            // Q8 KV cache: dequantize this layer's cached KV before attention.
+            cache.dequantize_layer(i, device)?;
+
             h = self.layers[i].forward(&h, mask.as_ref(), offset, &mut cache.layers[i])?;
+
+            // Q8 KV cache: quantize this layer's KV back to INT8, freeing F16.
+            cache.quantize_layer(i)?;
 
             // Engram injection at the configured layer.
             if let Some(f) = engram_fn {
