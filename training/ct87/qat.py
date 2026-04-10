@@ -103,10 +103,14 @@ def enable_qat(model: nn.Module) -> None:
 
 
 def disable_qat(model: nn.Module) -> None:
-    """Remove QAT from all nn.Linear layers, restoring original forward."""
+    """Remove QAT from all nn.Linear layers, restoring original forward.
+
+    Deletes the instance-level forward override so Python's attribute
+    resolution falls back to the class-level nn.Linear.forward method.
+    """
     for module in model.modules():
         if isinstance(module, nn.Linear) and hasattr(module, "_qat_original_forward"):
-            module.forward = module._qat_original_forward
+            del module.forward
             del module._qat_original_forward
 
 

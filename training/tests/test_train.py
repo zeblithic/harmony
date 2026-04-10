@@ -532,6 +532,41 @@ class TestQat:
         assert not hasattr(mtp.gate_proj, "_qat_original_forward")
         assert not hasattr(mtp.up_proj, "_qat_original_forward")
 
+    def test_qat_tied_embeddings(self):
+        """QAT patches lm_head but not embed_tokens, even with tied weights."""
+        from ct87.qat import enable_qat, fake_quantize_q8_0
+
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        model = HarmonyModel(cfg)
+
+        # Verify weights are tied
+        assert model.lm_head.weight is model.embed_tokens.weight
+
+        x = torch.randint(0, cfg.vocab_size, (1, 8))
+        embeds_before = model.embed_tokens(x).detach().clone()
+
+        enable_qat(model)
+
+        # lm_head should be patched, embed_tokens should NOT
+        assert hasattr(model.lm_head, "_qat_original_forward")
+        assert not hasattr(model.embed_tokens, "_qat_original_forward")
+
+        # Embedding lookup is unchanged (table index, not matmul)
+        embeds_after = model.embed_tokens(x).detach()
+        assert torch.equal(embeds_before, embeds_after), \
+            "embed_tokens output should be unchanged by QAT"
+
+        # lm_head output should differ (fake-quantized weight matmul)
+        h = torch.randn(1, 8, cfg.hidden_dim)
+        lm_out_qat = model.lm_head(h).detach()
+        lm_out_exact = torch.nn.functional.linear(h, model.lm_head.weight).detach()
+        # QAT forward uses fake_quantize_q8_0(weight), so it should differ
+        # from exact weight matmul (unless weight happens to be exactly
+        # representable in q8_0, which is astronomically unlikely)
+        assert not torch.equal(lm_out_qat, lm_out_exact), \
+            "lm_head should use fake-quantized weights under QAT"
+
     def test_qat_training_converges(self):
         """Model still converges when QAT is enabled from the start."""
         from ct87.qat import enable_qat

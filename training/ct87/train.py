@@ -344,6 +344,9 @@ def main() -> None:
         print("Error: --qat-start-pct must be in [0.0, 1.0)", file=sys.stderr)
         sys.exit(1)
 
+    if args.qat_start_pct != 0.9 and not args.qat:
+        print("Warning: --qat-start-pct has no effect without --qat", file=sys.stderr)
+
     device = detect_device(args.device)
     torch.manual_seed(args.seed)
     amp_dtype = torch.bfloat16 if args.dtype == "bfloat16" else None
