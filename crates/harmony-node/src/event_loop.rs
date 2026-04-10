@@ -2691,6 +2691,10 @@ fn run_inference_loop(
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut sequence = 0u32;
     let eos = engine.eos_token_id();
+    // Circuit breaker: once latent projection fails during decode, stop
+    // retrying and use the token-hash path directly for the rest of the
+    // request. Projection weights won't self-heal mid-generation.
+    let mut latent_failed = false;
 
     loop {
         let next_token = match engine.sample(&logits, &sampling_params, &history) {
@@ -2750,8 +2754,21 @@ fn run_inference_loop(
             if let Some(ref ep) = engram {
                 if history.len() >= 2 {
                     let window = &history[history.len().saturating_sub(3)..];
-                    let req_result = prepare_engram_request_auto(&engine, &ep.client, window).ok();
-                    if let Some(req) = req_result
+                    let req_result = if latent_failed {
+                        // Latent path already failed this request — go straight
+                        // to token hash without retrying or re-logging.
+                        harmony_inference::engram_bridge::prepare_engram_request(
+                            &ep.client, window,
+                        )
+                        .map_err(|e| e.to_string())
+                    } else {
+                        let r = prepare_engram_request_auto(&engine, &ep.client, window);
+                        if r.is_err() {
+                            latent_failed = true;
+                        }
+                        r
+                    };
+                    if let Ok(req) = req_result
                     {
                         let all_cached = req
                             .required_shards
