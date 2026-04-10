@@ -130,6 +130,16 @@ pub struct HarmonyForwardOutput {
     pub layer_norms: Vec<f32>,
 }
 
+impl HarmonyForwardOutput {
+    /// Extract logits as a flat `Vec<f32>` for sampling.
+    ///
+    /// Handles both 1D `[vocab_size]` and 2D `[batch, vocab_size]` tensors
+    /// (taking the last row for batched output).
+    pub fn logits_vec(&self) -> std::result::Result<Vec<f32>, crate::error::InferenceError> {
+        crate::logits_to_vec(&self.logits)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rotary embedding (f32, no dtype parameter)
 // ---------------------------------------------------------------------------
@@ -1218,5 +1228,17 @@ mod tests {
             err.contains("harmony"),
             "error should mention 'harmony': {err}"
         );
+    }
+
+    #[test]
+    fn forward_output_logits_vec() {
+        let logits = Tensor::new(&[0.1f32, 0.2, 0.3], &Device::Cpu).unwrap();
+        let output = HarmonyForwardOutput {
+            logits,
+            layer_norms: vec![1.0],
+        };
+        let v = output.logits_vec().unwrap();
+        assert_eq!(v.len(), 3);
+        assert!((v[0] - 0.1).abs() < 1e-6);
     }
 }
