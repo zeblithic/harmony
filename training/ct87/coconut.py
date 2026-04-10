@@ -96,7 +96,8 @@ def coconut_forward(
     think_token_id: int,
     num_thoughts: int,
     engram_embeddings: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_hidden_states: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """COCONUT 2-pass forward with continuous thought.
 
     Pass 1 (bootstrap): standard forward to get hidden states.
@@ -111,14 +112,25 @@ def coconut_forward(
         num_thoughts: number of think tokens to prepend (0 = standard forward)
         engram_embeddings: optional [batch, seq_len, engram_dim] Engram
             embeddings (aligned to original input_ids, NOT augmented)
+        return_hidden_states: if True, also return the pre-final_norm hidden
+            states from Pass 2 (for MTP head training).
 
     Returns:
         logits: [batch, augmented_seq_len, vocab_size]
         think_mask: [batch, augmented_seq_len] bool
+        hidden_states: (only if return_hidden_states=True)
+            [batch, augmented_seq_len, hidden_dim]
     """
     if num_thoughts == 0:
-        logits = model(input_ids=input_ids, engram_embeddings=engram_embeddings)
         think_mask = torch.zeros(input_ids.shape, dtype=torch.bool, device=input_ids.device)
+        if return_hidden_states:
+            logits, hidden = model(
+                input_ids=input_ids,
+                engram_embeddings=engram_embeddings,
+                return_hidden_states=True,
+            )
+            return logits, think_mask, hidden
+        logits = model(input_ids=input_ids, engram_embeddings=engram_embeddings)
         return logits, think_mask
 
     augmented_len = input_ids.shape[1] + num_thoughts
@@ -156,11 +168,18 @@ def coconut_forward(
     embeds = torch.cat([normed_hidden, embeds_suffix], dim=1)
 
     # Pass 2: COCONUT forward with continuous thought embeddings
+    if return_hidden_states:
+        logits, hidden = model(
+            input_embeds=embeds,
+            engram_embeddings=padded_engram,
+            return_hidden_states=True,
+        )
+        return logits, think_mask, hidden
+
     logits = model(
         input_embeds=embeds,
         engram_embeddings=padded_engram,
     )
-
     return logits, think_mask
 
 

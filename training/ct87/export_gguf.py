@@ -85,6 +85,21 @@ def build_uq_head_map() -> dict[str, str]:
     }
 
 
+def build_mtp_head_map() -> dict[str, str]:
+    """Build naming map for MTP head weights (multi-token prediction).
+
+    Weight tensors are transposed during export to match the Rust matmul
+    convention (``[in_features, out_features]``).
+    """
+    return {
+        "input_norm.weight": "harmony.mtp.input_norm.weight",
+        "output_norm.weight": "harmony.mtp.output_norm.weight",
+        "gate_proj.weight": "harmony.mtp.ffn_gate.weight",
+        "up_proj.weight": "harmony.mtp.ffn_up.weight",
+        "down_proj.weight": "harmony.mtp.ffn_down.weight",
+    }
+
+
 def write_metadata(
     writer: GGUFWriter, config: HarmonyModelConfig, name: str,
 ) -> None:
@@ -142,6 +157,8 @@ def export_gguf(
     name: str | None = None,
     thought_norm_state: dict[str, torch.Tensor] | None = None,
     uq_head_state: dict[str, torch.Tensor] | None = None,
+    mtp_head_state: dict[str, torch.Tensor] | None = None,
+    mtp_depth: int = 4,
 ) -> None:
     """Export a ct87 state_dict to GGUF format.
 
@@ -154,6 +171,10 @@ def export_gguf(
             continuous thought. Only provided for CT-trained models.
         uq_head_state: Optional UQ head state_dict for uncertainty
             quantification. Only provided for UQ-trained models.
+        mtp_head_state: Optional MTP head state_dict for multi-token
+            prediction. Only provided for MTP-trained models.
+        mtp_depth: MTP draft depth (default: 4). Only used when
+            mtp_head_state is provided.
 
     Raises:
         ValueError: If state_dict keys don't match expected keys for config.
@@ -245,6 +266,36 @@ def export_gguf(
             arr = t.numpy()
             writer.add_tensor(gguf_name, arr)
 
+    # MTP head weights (multi-token prediction)
+    if mtp_head_state is not None:
+        mtp_map = build_mtp_head_map()
+        expected_mtp = set(mtp_map.keys())
+        actual_mtp = set(mtp_head_state.keys())
+        if expected_mtp != actual_mtp:
+            raise ValueError(
+                f"MTP head state_dict mismatch. "
+                f"Expected: {sorted(expected_mtp)}, got: {sorted(actual_mtp)}"
+            )
+        if mtp_depth < 1:
+            raise ValueError("mtp_depth must be >= 1 when exporting MTP head")
+        writer.add_bool("harmony.mtp.enabled", True)
+        writer.add_uint32("harmony.mtp.depth", mtp_depth)
+        for pytorch_key, gguf_name in mtp_map.items():
+            t = mtp_head_state[pytorch_key].detach().cpu().float()
+            if "norm" in pytorch_key and t.ndim != 1:
+                raise ValueError(
+                    f"MTP tensor {pytorch_key} expected 1D, got {t.ndim}D"
+                )
+            if "proj" in pytorch_key and t.ndim != 2:
+                raise ValueError(
+                    f"MTP tensor {pytorch_key} expected 2D, got {t.ndim}D"
+                )
+            # Transpose 2D weights: PyTorch [out, in] -> Rust [in, out]
+            if t.ndim == 2:
+                t = t.T.contiguous()
+            arr = t.numpy()
+            writer.add_tensor(gguf_name, arr)
+
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -282,6 +333,14 @@ def main() -> None:
         "--uq-head", type=str, default=None,
         help="Path to UQ head checkpoint (uq_head_step_*.pt) for export",
     )
+    parser.add_argument(
+        "--mtp-head", type=str, default=None,
+        help="Path to MTP head checkpoint (mtp_head_step_*.pt) for export",
+    )
+    parser.add_argument(
+        "--mtp-depth", type=int, default=4,
+        help="MTP draft depth (default: 4, must match training --mtp-depth)",
+    )
     args = parser.parse_args()
 
     if args.thought_norm is not None and args.think_token_id is None:
@@ -312,10 +371,16 @@ def main() -> None:
     if args.uq_head is not None:
         uq_head_state = torch.load(args.uq_head, map_location="cpu", weights_only=True)
 
+    mtp_head_state = None
+    if args.mtp_head is not None:
+        mtp_head_state = torch.load(args.mtp_head, map_location="cpu", weights_only=True)
+
     export_gguf(
         state_dict, config, args.output, name,
         thought_norm_state=thought_norm_state,
         uq_head_state=uq_head_state,
+        mtp_head_state=mtp_head_state,
+        mtp_depth=args.mtp_depth,
     )
     print(f"Exported to {args.output}")
 
