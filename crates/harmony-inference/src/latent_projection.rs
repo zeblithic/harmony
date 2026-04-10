@@ -54,6 +54,55 @@ impl LatentProjection {
         h.tanh()
     }
 
+    /// Extract N-gram windows, average embeddings, project, and binarize.
+    ///
+    /// Mirrors the bi/trigram extraction in `engram_bridge::prepare_engram_request`:
+    /// - Bigrams at positions `1..seq_len`, trigrams at positions `2..seq_len`
+    /// - Each N-gram's embeddings are averaged before projection
+    ///
+    /// Returns `(binary_keys, positions)` suitable for `prepare_engram_request_latent`.
+    pub fn project_ngrams(
+        &self,
+        embeddings: &Tensor, // [1, seq_len, hidden_dim]
+        seq_len: usize,
+    ) -> Result<(Vec<Vec<u8>>, Vec<usize>)> {
+        if seq_len < 2 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let emb = embeddings.squeeze(0)?; // [seq_len, hidden_dim]
+        let mut averaged = Vec::new();
+        let mut positions = Vec::new();
+
+        // Bigrams
+        for i in 0..seq_len - 1 {
+            let a = emb.get(i)?;
+            let b = emb.get(i + 1)?;
+            let avg = ((&a + &b)? * 0.5)?;
+            averaged.push(avg);
+            positions.push(i + 1);
+        }
+
+        // Trigrams
+        for i in 0..seq_len.saturating_sub(2) {
+            let a = emb.get(i)?;
+            let b = emb.get(i + 1)?;
+            let c = emb.get(i + 2)?;
+            let sum = (&a + &b)?;
+            let sum = (&sum + &c)?;
+            let avg = (sum * (1.0 / 3.0))?;
+            averaged.push(avg);
+            positions.push(i + 2);
+        }
+
+        // Stack into [1, num_ngrams, hidden_dim] and project
+        let stacked = Tensor::stack(&averaged, 0)?.unsqueeze(0)?;
+        let latent = self.project(&stacked)?;
+        let keys = self.to_binary_keys(&latent)?;
+
+        Ok((keys, positions))
+    }
+
     pub fn to_binary_keys(&self, latent: &Tensor) -> Result<Vec<Vec<u8>>> {
         let squeezed = latent.squeeze(0)?;
         let seq_len = squeezed.dim(0)?;
@@ -136,5 +185,38 @@ mod tests {
         let keys_a = proj.to_binary_keys(&proj.project(&a).unwrap()).unwrap();
         let keys_b = proj.to_binary_keys(&proj.project(&b).unwrap()).unwrap();
         assert_ne!(keys_a[0], keys_b[0], "very different inputs should produce different binary keys");
+    }
+
+    #[test]
+    fn project_ngrams_bigrams_and_trigrams() {
+        let proj = test_projection();
+        // 4 positions → 3 bigrams + 2 trigrams = 5 keys
+        let embeddings = Tensor::randn(0f32, 1.0, (1, 4, HIDDEN_DIM), &Device::Cpu).unwrap();
+        let (keys, positions) = proj.project_ngrams(&embeddings, 4).unwrap();
+
+        assert_eq!(keys.len(), 5, "3 bigrams + 2 trigrams = 5");
+        assert_eq!(positions.len(), 5);
+
+        // Bigrams at positions 1, 2, 3
+        assert_eq!(positions[0], 1);
+        assert_eq!(positions[1], 2);
+        assert_eq!(positions[2], 3);
+        // Trigrams at positions 2, 3
+        assert_eq!(positions[3], 2);
+        assert_eq!(positions[4], 3);
+
+        // Each key has correct byte length
+        for key in &keys {
+            assert_eq!(key.len(), LATENT_DIM.div_ceil(8));
+        }
+    }
+
+    #[test]
+    fn project_ngrams_single_token_returns_empty() {
+        let proj = test_projection();
+        let embeddings = Tensor::randn(0f32, 1.0, (1, 1, HIDDEN_DIM), &Device::Cpu).unwrap();
+        let (keys, positions) = proj.project_ngrams(&embeddings, 1).unwrap();
+        assert!(keys.is_empty());
+        assert!(positions.is_empty());
     }
 }
