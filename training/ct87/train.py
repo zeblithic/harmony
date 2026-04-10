@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import sys
 import time
@@ -280,6 +281,14 @@ def main() -> None:
         "--mtp-loss-weight", type=float, default=1.0,
         help="Weight for MTP auxiliary loss (default: 1.0)",
     )
+    parser.add_argument(
+        "--qat", action="store_true",
+        help="Enable quantization-aware training (q8_0 fake quantization on base model Linear layers)",
+    )
+    parser.add_argument(
+        "--qat-start-pct", type=float, default=0.9,
+        help="Fraction of total steps at which to activate QAT (default: 0.9 = last 10%%)",
+    )
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -330,6 +339,17 @@ def main() -> None:
     if args.mtp_loss_weight < 0:
         print("Error: --mtp-loss-weight must be >= 0", file=sys.stderr)
         sys.exit(1)
+
+    if args.qat and (
+        not math.isfinite(args.qat_start_pct)
+        or args.qat_start_pct < 0
+        or args.qat_start_pct >= 1.0
+    ):
+        print("Error: --qat-start-pct must be finite and in [0.0, 1.0)", file=sys.stderr)
+        sys.exit(1)
+
+    if args.qat_start_pct != 0.9 and not args.qat:
+        print("Warning: --qat-start-pct has no effect without --qat", file=sys.stderr)
 
     device = detect_device(args.device)
     torch.manual_seed(args.seed)
@@ -432,8 +452,22 @@ def main() -> None:
         if os.path.getsize(args.log_file) == 0:
             csv_writer.writerow(expected_header)
 
+    qat_enabled = False
+    if args.qat and args.steps > 0:
+        qat_start_step = min(math.ceil(args.qat_start_pct * args.steps), args.steps - 1)
+    else:
+        qat_start_step = args.steps + 1
+
     try:
         for step in range(args.steps):
+            # Activate QAT at the configured step (base model only —
+            # UQ head, ThoughtNorm, MTP head are separate modules)
+            if args.qat and not qat_enabled and step >= qat_start_step:
+                from ct87.qat import enable_qat
+                enable_qat(model)
+                qat_enabled = True
+                print(f"  -> QAT enabled at step {step} (q8_0 fake quantization)")
+
             step_start = time.time()
             lr_mult = schedule.get_lr_multiplier(step)
             set_lr(optimizer, lr_mult)
