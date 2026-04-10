@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-
+import math
 import os
 import sys
 import time
@@ -340,8 +340,12 @@ def main() -> None:
         print("Error: --mtp-loss-weight must be >= 0", file=sys.stderr)
         sys.exit(1)
 
-    if args.qat and (args.qat_start_pct < 0 or args.qat_start_pct >= 1.0):
-        print("Error: --qat-start-pct must be in [0.0, 1.0)", file=sys.stderr)
+    if args.qat and (
+        not math.isfinite(args.qat_start_pct)
+        or args.qat_start_pct < 0
+        or args.qat_start_pct >= 1.0
+    ):
+        print("Error: --qat-start-pct must be finite and in [0.0, 1.0)", file=sys.stderr)
         sys.exit(1)
 
     if args.qat_start_pct != 0.9 and not args.qat:
@@ -450,7 +454,7 @@ def main() -> None:
 
     qat_enabled = False
     if args.qat and args.steps > 0:
-        qat_start_step = min(round(args.qat_start_pct * args.steps), args.steps - 1)
+        qat_start_step = min(math.ceil(args.qat_start_pct * args.steps), args.steps - 1)
     else:
         qat_start_step = args.steps + 1
 
