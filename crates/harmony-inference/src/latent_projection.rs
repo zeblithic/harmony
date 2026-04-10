@@ -122,6 +122,82 @@ impl LatentProjection {
     }
 }
 
+/// Cosine similarity between all pairs of vectors in a 2D tensor.
+///
+/// Input: `[N, D]`. Returns: `[N, N]` similarity matrix.
+fn cosine_similarity_matrix(x: &Tensor) -> Result<Tensor> {
+    let norm = x.sqr()?.sum_keepdim(1)?.sqrt()?;
+    let normalized = x.broadcast_div(&norm)?;
+    normalized.matmul(&normalized.t()?)
+}
+
+/// InfoNCE contrastive loss preserving nearest-neighbor topology.
+///
+/// Ensures tokens that are nearest neighbors in the original embedding space
+/// remain nearest neighbors in the projected latent space.
+///
+/// - `original`: `[batch, seq_len, hidden_dim]` — raw token embeddings
+/// - `projected`: `[batch, seq_len, latent_dim]` — MLP output (post-tanh)
+/// - `temperature`: scaling factor for logits (default: 0.07)
+/// - `k`: number of top neighbors to preserve (default: 4)
+///
+/// Returns a scalar loss tensor.
+pub fn contrastive_loss(
+    original: &Tensor,
+    projected: &Tensor,
+    temperature: f32,
+    k: usize,
+) -> Result<Tensor> {
+    // Flatten batch: [B, S, D] → [B*S, D]
+    let (b, s, _) = original.dims3()?;
+    let n = b * s;
+    let orig_flat = original.reshape((n, ()))?;
+    let proj_flat = projected.reshape((n, ()))?;
+
+    // Cosine similarity matrices [N, N]
+    let sim_orig = cosine_similarity_matrix(&orig_flat)?;
+    let sim_proj = cosine_similarity_matrix(&proj_flat)?;
+
+    // For each anchor, find top-k neighbors in original space
+    let k = k.min(n - 1);
+    if k == 0 {
+        return Tensor::new(0.0f32, original.device());
+    }
+
+    // Scale projected similarities by temperature
+    let logits = (sim_proj / temperature as f64)?;
+
+    // Build soft target distribution from original similarities:
+    // For each row, keep only the top-k values (excluding self), zero others,
+    // then softmax to get a probability distribution.
+    let neg_inf = f32::NEG_INFINITY;
+    let orig_data = sim_orig.to_vec2::<f32>()?;
+    let mut target_data = vec![vec![neg_inf; n]; n];
+
+    for i in 0..n {
+        let mut indexed: Vec<(usize, f32)> = orig_data[i]
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != i)
+            .map(|(j, &v)| (j, v))
+            .collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        for &(j, _) in indexed.iter().take(k) {
+            target_data[i][j] = orig_data[i][j];
+        }
+    }
+
+    let target_tensor =
+        Tensor::from_vec(target_data.into_iter().flatten().collect::<Vec<f32>>(), (n, n), original.device())?;
+    let targets = candle_nn::ops::softmax(&target_tensor, 1)?;
+
+    // Cross-entropy: -sum(targets * log_softmax(logits))
+    let log_probs = candle_nn::ops::log_softmax(&logits, 1)?;
+    let loss = (targets * log_probs)?.neg()?.sum_all()?;
+    loss / n as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +294,33 @@ mod tests {
         let (keys, positions) = proj.project_ngrams(&embeddings, 1).unwrap();
         assert!(keys.is_empty());
         assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn contrastive_loss_shape_and_finite() {
+        let original = Tensor::randn(0f32, 1.0, (1, 8, HIDDEN_DIM), &Device::Cpu).unwrap();
+        let projected = Tensor::randn(0f32, 1.0, (1, 8, LATENT_DIM), &Device::Cpu).unwrap();
+        let loss = contrastive_loss(&original, &projected, 0.07, 4).unwrap();
+        assert_eq!(loss.dims(), &[] as &[usize]);
+        let val: f32 = loss.to_scalar().unwrap();
+        assert!(val.is_finite(), "loss must be finite, got {val}");
+        assert!(val >= 0.0, "loss must be non-negative, got {val}");
+    }
+
+    #[test]
+    fn contrastive_loss_decreases_with_aligned_projections() {
+        let original = Tensor::randn(0f32, 1.0, (1, 16, HIDDEN_DIM), &Device::Cpu).unwrap();
+        let random_proj = Tensor::randn(0f32, 1.0, (1, 16, LATENT_DIM), &Device::Cpu).unwrap();
+        let aligned_proj = original.narrow(2, 0, LATENT_DIM).unwrap();
+
+        let loss_random = contrastive_loss(&original, &random_proj, 0.07, 4).unwrap();
+        let loss_aligned = contrastive_loss(&original, &aligned_proj, 0.07, 4).unwrap();
+
+        let v_random: f32 = loss_random.to_scalar().unwrap();
+        let v_aligned: f32 = loss_aligned.to_scalar().unwrap();
+        assert!(
+            v_aligned < v_random,
+            "aligned projection should have lower loss: {v_aligned} vs {v_random}"
+        );
     }
 }
