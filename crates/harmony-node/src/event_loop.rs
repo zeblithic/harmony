@@ -1507,18 +1507,32 @@ pub async fn run(
                                 runtime.engram_module().map(|module| (client, module))
                             })
                             .and_then(|(client, module)| {
-                                match harmony_inference::engram_bridge::prepare_engram_request(
-                                    client, &tokens,
-                                ) {
-                                    Ok(request) if !request.required_shards.is_empty() => {
+                                // Try latent projection first, fall back to token hash
+                                let request = if let Some(proj) = engine.latent_projection() {
+                                    engine.token_embeddings(&tokens).ok().and_then(|emb| {
+                                        proj.project_ngrams(&emb, tokens.len()).ok().and_then(|(keys, positions)| {
+                                            harmony_inference::engram_bridge::prepare_engram_request_latent(
+                                                client.config(), &keys, &positions, tokens.len(),
+                                            ).ok()
+                                        })
+                                    }).or_else(|| {
+                                        tracing::debug!("latent projection failed — falling back to token hash");
+                                        harmony_inference::engram_bridge::prepare_engram_request(client, &tokens).ok()
+                                    })
+                                } else {
+                                    harmony_inference::engram_bridge::prepare_engram_request(client, &tokens).ok()
+                                };
+
+                                match request {
+                                    Some(request) if !request.required_shards.is_empty() => {
                                         Some((client.clone(), module.clone(), request))
                                     }
-                                    Ok(_) => {
+                                    Some(_) => {
                                         tracing::debug!("engram: no shards needed (short sequence)");
                                         None
                                     }
-                                    Err(e) => {
-                                        tracing::warn!(err = %e, "engram prepare failed — skipping");
+                                    None => {
+                                        tracing::warn!("engram prepare failed — skipping");
                                         None
                                     }
                                 }
@@ -2750,8 +2764,21 @@ fn run_inference_loop(
             if let Some(ref ep) = engram {
                 if history.len() >= 2 {
                     let window = &history[history.len().saturating_sub(3)..];
-                    if let Ok(req) =
-                        harmony_inference::engram_bridge::prepare_engram_request(&ep.client, window)
+                    let req_result = if let Some(proj) = engine.latent_projection() {
+                        engine.token_embeddings(window).ok().and_then(|emb| {
+                            proj.project_ngrams(&emb, window.len()).ok().and_then(|(keys, positions)| {
+                                harmony_inference::engram_bridge::prepare_engram_request_latent(
+                                    ep.client.config(), &keys, &positions, window.len(),
+                                ).ok()
+                            })
+                        }).or_else(|| {
+                            tracing::debug!("latent projection failed in decode — falling back");
+                            harmony_inference::engram_bridge::prepare_engram_request(&ep.client, window).ok()
+                        })
+                    } else {
+                        harmony_inference::engram_bridge::prepare_engram_request(&ep.client, window).ok()
+                    };
+                    if let Some(req) = req_result
                     {
                         let all_cached = req
                             .required_shards
