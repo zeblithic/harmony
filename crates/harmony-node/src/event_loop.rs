@@ -78,14 +78,14 @@ enum InferenceResult {
         query_id: u64,
         task_id: String,
         output: crate::inference::InferenceOutput,
-        engine: harmony_inference::QwenEngine,
+        engine: harmony_inference::HarmonyEngine,
     },
     /// Inference failed — send error reply and return engine.
     Failed {
         query_id: u64,
         task_id: String,
         error: String,
-        engine: harmony_inference::QwenEngine,
+        engine: harmony_inference::HarmonyEngine,
     },
     /// Inference task panicked — engine is lost, need to recreate.
     Panicked { query_id: u64, task_id: String },
@@ -2531,7 +2531,7 @@ struct EngramPrefill {
 /// When `engram` is `Some`, the prefill forward uses Engram-augmented inference.
 #[cfg(feature = "inference")]
 fn run_inference_loop(
-    engine: harmony_inference::QwenEngine,
+    engine: harmony_inference::HarmonyEngine,
     tx: mpsc::Sender<InferenceResult>,
     query_id: u64,
     task_id: String,
