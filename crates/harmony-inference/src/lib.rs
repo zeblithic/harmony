@@ -28,6 +28,7 @@ pub mod harmony_engine;
 pub mod harmony_model;
 #[cfg(feature = "kv-compress")]
 pub(crate) mod kv_compress;
+pub(crate) mod kv_quantize;
 pub(crate) mod qwen3_ext;
 pub mod sampling;
 pub mod uq_features;
@@ -47,20 +48,26 @@ pub use engine::QwenEngine;
 pub use engram_residual::EngramGatedResidual;
 pub use error::InferenceError;
 
-use candle_core::Tensor;
+use candle_core::{Device, Tensor};
+
+use crate::kv_quantize::Q8KvLayer;
 
 /// Externalized KV cache state for transformer inference.
 ///
 /// Created via [`InferenceEngine::new_cache()`]. Passed to `forward()` on each
 /// call. The engine appends new K/V tensors; the caller owns the lifecycle.
 ///
+/// # Q8 quantized mode
+///
+/// Call [`InferenceCache::with_q8`] to enable per-layer INT8 quantization.
+/// During a forward pass only one layer is dequantized to F16 at a time;
+/// the remaining layers stay in q8 storage, yielding ~45% KV memory savings.
+///
 /// # Lifecycle
 ///
 /// ```ignore
-/// let cache = engine.new_cache()?;
+/// let mut cache = engine.new_cache()?.with_q8();
 /// let logits = engine.forward(&tokens, &mut cache)?;
-/// // cache.layers now contains populated K/V tensors
-/// // Drop cache to start a new conversation
 /// ```
 pub struct InferenceCache {
     /// Per-layer Key/Value tensor pairs. `None` = layer not yet populated.
@@ -74,6 +81,11 @@ pub struct InferenceCache {
     pub head_dim: usize,
     /// Expected KV head count (for downstream consumers).
     pub num_kv_heads: usize,
+    /// Per-layer q8_0 quantized KV storage. Populated after each layer when
+    /// `q8_enabled` is true.
+    pub(crate) q8_layers: Vec<Option<Q8KvLayer>>,
+    /// Whether to quantize KV cache entries after each layer forward.
+    q8_enabled: bool,
     /// Per-layer compressed K/V state. Populated by compress(), consumed by decompress().
     #[cfg(feature = "kv-compress")]
     pub(crate) compressed: Vec<Option<kv_compress::CompressedKvLayer>>,
@@ -91,11 +103,28 @@ impl InferenceCache {
             num_layers,
             head_dim,
             num_kv_heads,
+            q8_layers: (0..num_layers).map(|_| None).collect(),
+            q8_enabled: false,
             #[cfg(feature = "kv-compress")]
             compressed: (0..num_layers).map(|_| None).collect(),
             #[cfg(feature = "kv-compress")]
             is_compressed: false,
         }
+    }
+
+    /// Enable q8_0 KV cache quantization.
+    ///
+    /// When enabled, each layer's KV tensors are quantized to INT8 after the
+    /// layer forward and dequantized before the next use. Only one layer is
+    /// in F16 form at a time.
+    pub fn with_q8(mut self) -> Self {
+        self.q8_enabled = true;
+        self
+    }
+
+    /// Whether this cache uses q8_0 quantized KV storage.
+    pub fn is_q8(&self) -> bool {
+        self.q8_enabled
     }
 
     /// Number of tokens in the cache.
@@ -106,6 +135,63 @@ impl InferenceCache {
     /// Whether the cache is empty (no tokens consumed).
     pub fn is_empty(&self) -> bool {
         self.position == 0
+    }
+
+    /// Dequantize layer `i` from q8 storage into `self.layers[i]`.
+    ///
+    /// No-op if q8 is disabled or the layer has no q8 data.
+    pub(crate) fn dequantize_layer(
+        &mut self,
+        i: usize,
+        device: &Device,
+    ) -> candle_core::Result<()> {
+        if !self.q8_enabled {
+            return Ok(());
+        }
+        if let Some(q8) = self.q8_layers[i].take() {
+            match q8.dequantize(device) {
+                Ok((k, v)) => self.layers[i] = Some((k, v)),
+                Err(e) => {
+                    self.q8_layers[i] = Some(q8); // restore on error
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Quantize layer `i` from `self.layers[i]` into q8 storage.
+    ///
+    /// Frees the F16 tensors after quantization. No-op if q8 is disabled or
+    /// the layer has no data.
+    pub(crate) fn quantize_layer(&mut self, i: usize) -> candle_core::Result<()> {
+        if !self.q8_enabled {
+            return Ok(());
+        }
+        if let Some((k, v)) = self.layers[i].take() {
+            match Q8KvLayer::quantize(&k, &v) {
+                Ok(q8) => self.q8_layers[i] = Some(q8),
+                Err(e) => {
+                    self.layers[i] = Some((k, v)); // restore on error
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Approximate memory usage in bytes for q8 KV storage.
+    ///
+    /// Returns 0 if q8 is disabled.
+    pub fn q8_memory_bytes(&self) -> usize {
+        if !self.q8_enabled {
+            return 0;
+        }
+        self.q8_layers
+            .iter()
+            .filter_map(|l| l.as_ref())
+            .map(|q8| q8.memory_bytes())
+            .sum()
     }
 }
 
@@ -159,15 +245,45 @@ impl InferenceCache {
     /// Frees full-precision tensors to reclaim memory.
     /// No-op if already compressed.
     /// Atomic: on error, cache remains in uncompressed state.
+    ///
+    /// If q8 quantization is active, layers are dequantized to F16 first
+    /// (TurboQuant operates on F16 tensors).
     pub fn compress(&mut self, tq: &kv_compress::TurboQuantState) -> Result<(), InferenceError> {
         if self.is_compressed {
             return Ok(());
         }
 
-        // Phase 1: compress into a staging buffer (no mutation yet)
+        // Phase 1: build F16 source tensors for compression.
+        // If q8 is active, dequantize into a staging vec (no mutation of self).
+        // If not q8, borrow from self.layers directly.
+        let dequantized: Vec<Option<(Tensor, Tensor)>>;
+        let source: &[Option<(Tensor, Tensor)>] = if self.q8_enabled {
+            let mut buf: Vec<Option<(Tensor, Tensor)>> =
+                Vec::with_capacity(self.num_layers);
+            for i in 0..self.num_layers {
+                match (&self.q8_layers[i], &self.layers[i]) {
+                    (Some(q8), _) => {
+                        let (k, v) = q8
+                            .dequantize(&candle_core::Device::Cpu)
+                            .map_err(|e| {
+                                InferenceError::CompressionFailed(e.to_string())
+                            })?;
+                        buf.push(Some((k, v)));
+                    }
+                    (None, Some((k, v))) => buf.push(Some((k.clone(), v.clone()))),
+                    _ => buf.push(None),
+                }
+            }
+            dequantized = buf;
+            &dequantized
+        } else {
+            &self.layers
+        };
+
+        // Phase 2: compress into a staging buffer (no mutation yet).
         let mut staging: Vec<Option<kv_compress::CompressedKvLayer>> =
             Vec::with_capacity(self.num_layers);
-        for layer in self.layers.iter() {
+        for layer in source.iter() {
             match layer {
                 Some((k, v)) => {
                     let (k_vecs, seq_len) = tq.compress_tensor(k)?;
@@ -183,22 +299,28 @@ impl InferenceCache {
             }
         }
 
-        // Phase 2: commit — swap staging into self, free tensors
+        // Phase 3: commit — swap staging into self, free tensors and q8 data.
         self.compressed = staging;
         for layer in self.layers.iter_mut() {
             *layer = None;
+        }
+        for q8 in self.q8_layers.iter_mut() {
+            *q8 = None;
         }
         self.is_compressed = true;
         Ok(())
     }
 
-    /// Approximate memory usage in bytes (accounts for compression state).
+    /// Approximate memory usage in bytes (accounts for compression and q8 state).
     /// Unpopulated layers contribute 0 bytes.
     pub fn memory_bytes(&self) -> usize {
         let mut total = 0;
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some((k, v)) = layer {
                 total += (k.elem_count() + v.elem_count()) * k.dtype().size_in_bytes();
+            }
+            if let Some(q8) = &self.q8_layers[i] {
+                total += q8.memory_bytes();
             }
             if let Some(comp) = &self.compressed[i] {
                 total += comp.byte_size();
@@ -314,6 +436,8 @@ impl InferenceCache {
             num_layers,
             head_dim,
             num_kv_heads,
+            q8_layers: (0..num_layers).map(|_| None).collect(),
+            q8_enabled: false,
             compressed: payload.layers,
             is_compressed: true,
         })
