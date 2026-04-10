@@ -358,6 +358,10 @@ impl PagedKvCache {
     /// Returns `(K, V)` with shape `[1, num_kv_heads, seq_len, head_dim]`
     /// in F32, matching the convention expected by attention.
     ///
+    /// This materializes the full sequence from pages on every call (O(seq_len)
+    /// copy). Intended to be called once per layer per forward pass — the same
+    /// frequency as the existing `InferenceCache` dequantize path.
+    ///
     /// # Errors
     ///
     /// Returns `InferenceError` if the layer index is out of range.
@@ -407,9 +411,9 @@ impl PagedKvCache {
 
         let shape = (1, num_kv_heads, total_tokens, head_dim);
         let k = Tensor::from_vec(k_out, shape, device)
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+            .map_err(|e| InferenceError::PagedKvCacheFailed(format!("gather tensor: {e}")))?;
         let v = Tensor::from_vec(v_out, shape, device)
-            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))?;
+            .map_err(|e| InferenceError::PagedKvCacheFailed(format!("gather tensor: {e}")))?;
 
         Ok((k, v))
     }
@@ -420,6 +424,15 @@ impl PagedKvCache {
     /// draft tokens, truncate to the last accepted position. Freed blocks
     /// retain their heap allocations for zero-cost reuse on the next append.
     ///
+    /// Also serves as a normalization tool: calling `truncate(position())`
+    /// after a partial append failure (some layers appended, others failed)
+    /// will discard any uncommitted tokens and restore layer consistency.
+    ///
+    /// # Call ordering
+    ///
+    /// Must be called with `new_position <= self.position`. Safe to call
+    /// between `append()` and `advance()` to recover from partial failures.
+    ///
     /// # Errors
     ///
     /// Returns `InferenceError` if `new_position > self.position`.
@@ -429,9 +442,6 @@ impl PagedKvCache {
                 "truncate position {new_position} exceeds current position {}",
                 self.position,
             )));
-        }
-        if new_position == self.position {
-            return Ok(());
         }
 
         let page_size = self.config.page_size;
@@ -476,7 +486,8 @@ impl PagedKvCache {
         self.position
     }
 
-    /// Whether the cache is empty (no tokens appended).
+    /// Whether the cache has no committed tokens (i.e. `advance()` has never
+    /// been called, or the cache has been truncated/reset to position 0).
     pub fn is_empty(&self) -> bool {
         self.position == 0
     }
@@ -494,12 +505,27 @@ impl PagedKvCache {
     /// Total memory used by actively assigned blocks (bytes).
     ///
     /// Only counts blocks currently in page tables, not freed blocks
-    /// retained in the pool for reuse.
+    /// retained in the pool for reuse. See [`Self::pool_memory_bytes`] for
+    /// the full heap footprint including retained blocks.
     pub fn memory_bytes(&self) -> usize {
         self.layer_tables
             .iter()
             .flat_map(|table| table.iter())
             .map(|&id| self.pool[id].as_ref().unwrap().memory_bytes())
+            .sum()
+    }
+
+    /// Total memory owned by the pool (bytes), including freed-but-retained
+    /// blocks.
+    ///
+    /// Reflects actual heap usage. After `truncate()` or `reset()`, this may
+    /// be larger than [`Self::memory_bytes`] because freed blocks keep their
+    /// `Vec<f32>` allocations for zero-cost reuse.
+    pub fn pool_memory_bytes(&self) -> usize {
+        self.pool
+            .iter()
+            .filter_map(|b| b.as_ref())
+            .map(|b| b.memory_bytes())
             .sum()
     }
 
@@ -860,8 +886,48 @@ mod tests {
         cache.append(0, &k, &v).unwrap();
         cache.advance(1).unwrap();
 
-        cache.truncate(1).unwrap(); // no-op
+        cache.truncate(1).unwrap();
         assert_eq!(cache.position(), 1);
+    }
+
+    #[test]
+    fn truncate_normalizes_partial_appends() {
+        // 3 total pages, 2 layers, page_size=2 → layers share the pool.
+        let config = PagedKvConfig::new(2, 3);
+        let (heads, dim) = (1, 2);
+        let mut cache = PagedKvCache::new(config, 2, dim, heads);
+        let (k, v) = token_kv(heads, dim, 1.0);
+
+        // Append 2 tokens to both layers → 2 pages used (1 per layer).
+        for _ in 0..2 {
+            cache.append(0, &k, &v).unwrap();
+            cache.append(1, &k, &v).unwrap();
+            cache.advance(1).unwrap();
+        }
+        assert_eq!(cache.pages_allocated(), 2);
+        assert_eq!(cache.pages_free(), 1);
+
+        // Append to layer 0 succeeds (takes the last free page).
+        cache.append(0, &k, &v).unwrap();
+
+        // Layer 1 fails — pool exhausted.
+        let err = cache.append(1, &k, &v).unwrap_err();
+        assert!(err.to_string().contains("exhausted"));
+
+        // Layer 0 has 3 tokens, layer 1 has 2 — advance() would fail.
+        assert!(cache.advance(1).is_err());
+
+        // truncate(position) normalizes: discards layer 0's uncommitted token.
+        cache.truncate(cache.position()).unwrap();
+
+        // Both layers now consistent at position 2.
+        let (kt0, _) = cache.gather(0, &Device::Cpu).unwrap();
+        let (kt1, _) = cache.gather(1, &Device::Cpu).unwrap();
+        assert_eq!(kt0.dims(), &[1, 1, 2, dim]);
+        assert_eq!(kt1.dims(), &[1, 1, 2, dim]);
+
+        // The extra page from layer 0 was freed, so we have a free page again.
+        assert_eq!(cache.pages_free(), 1);
     }
 
     #[test]
@@ -967,6 +1033,28 @@ mod tests {
         let cache = PagedKvCache::new(config, 32, 64, 4);
         // 2048 pages / 32 layers = 64 pages per layer × 16 tokens = 1024
         assert_eq!(cache.max_token_capacity(), 1024);
+    }
+
+    #[test]
+    fn pool_memory_tracks_retained_blocks() {
+        let config = PagedKvConfig::new(4, 100);
+        let (heads, dim) = (2, 8);
+        let mut cache = PagedKvCache::new(config, 1, dim, heads);
+
+        let (k, v) = token_kv(heads, dim, 0.0);
+        cache.append(0, &k, &v).unwrap();
+        cache.advance(1).unwrap();
+
+        let active = cache.memory_bytes();
+        let pool = cache.pool_memory_bytes();
+        assert_eq!(active, pool); // Before truncation, they match.
+
+        cache.truncate(0).unwrap();
+
+        // Active memory is 0 (no blocks in page tables).
+        assert_eq!(cache.memory_bytes(), 0);
+        // Pool memory still holds the retained block.
+        assert_eq!(cache.pool_memory_bytes(), active);
     }
 
     // -- Reuse after truncation --
