@@ -78,14 +78,14 @@ enum InferenceResult {
         query_id: u64,
         task_id: String,
         output: crate::inference::InferenceOutput,
-        engine: harmony_inference::QwenEngine,
+        engine: harmony_inference::HarmonyEngine,
     },
     /// Inference failed — send error reply and return engine.
     Failed {
         query_id: u64,
         task_id: String,
         error: String,
-        engine: harmony_inference::QwenEngine,
+        engine: harmony_inference::HarmonyEngine,
     },
     /// Inference task panicked — engine is lost, need to recreate.
     Panicked { query_id: u64, task_id: String },
@@ -357,6 +357,7 @@ pub async fn run(
     archivist_config: Option<crate::config::ArchivistConfig>,
     data_dir: Option<std::path::PathBuf>,
     archive_dir: Option<std::path::PathBuf>,
+    speculation_config: Option<crate::config::SpeculationConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── UDP socket ────────────────────────────────────────────────────────────
     let udp = UdpSocket::bind(listen_addr).await?;
@@ -636,6 +637,39 @@ pub async fn run(
     // spawn_blocking inference tasks stream tokens and final results back here.
     #[cfg(feature = "inference")]
     let (inference_tx, mut inference_rx) = mpsc::channel::<InferenceResult>(64);
+
+    // Create speculation config from node config (if enabled).
+    // Validates thresholds before constructing SpecDecConfig to avoid panics
+    // from invalid user-provided values.
+    #[cfg(feature = "inference")]
+    let spec_dec_config: Option<harmony_inference::SpecDecConfig> = speculation_config
+        .as_ref()
+        .and_then(|spec| {
+            let d = harmony_inference::SpecDecConfig::default();
+            let tg = spec.tau_generate.unwrap_or(d.tau_generate);
+            let tc = spec.tau_chain.unwrap_or(d.tau_chain);
+            let ta = spec.tau_accept.unwrap_or(d.tau_accept);
+            let mdl = spec.max_draft_len.unwrap_or(d.max_draft_len);
+
+            if !(tg.is_finite() && tg >= 0.0 && tg < 1.0) {
+                tracing::warn!(tau_generate = tg, "invalid tau_generate — disabling speculation");
+                return None;
+            }
+            if !(tc.is_finite() && tc > 0.0 && tc < 1.0) {
+                tracing::warn!(tau_chain = tc, "invalid tau_chain — disabling speculation");
+                return None;
+            }
+            if !(ta.is_finite() && ta > tg && ta <= 1.0) {
+                tracing::warn!(tau_accept = ta, tau_generate = tg, "invalid tau_accept — disabling speculation");
+                return None;
+            }
+            if mdl < 2 {
+                tracing::warn!(max_draft_len = mdl, "invalid max_draft_len — disabling speculation");
+                return None;
+            }
+
+            Some(harmony_inference::SpecDecConfig::new(tg, tc, ta, mdl))
+        });
 
     // ── Execute startup actions (declare queryables + subscribers) ────────────
     for action in startup_actions {
@@ -1490,6 +1524,9 @@ pub async fn run(
                                 }
                             });
 
+                        #[cfg(feature = "inference")]
+                        let spec_config_clone = spec_dec_config.clone();
+
                         if let Some((client, module, request)) = engram_prep {
                             // Step 4a: Engram branch — fetch shards async, then spawn blocking.
                             let injection_layers = runtime.engram_injection_layers().to_vec();
@@ -1559,6 +1596,9 @@ pub async fn run(
                                         params,
                                         max_tokens,
                                         engram_prefill,
+                                        spec_config_clone.as_ref().map(|c| {
+                                            harmony_inference::SpeculativeDecodeScheduler::new(c.clone())
+                                        }),
                                     );
                                 });
                                 if let Err(e) = handle.await {
@@ -1597,6 +1637,7 @@ pub async fn run(
                             let panic_tx = inference_tx.clone();
                             let panic_query_id = query_id;
                             let panic_task_id = task_id.clone();
+                            let spec_config_clone2 = spec_config_clone.clone();
                             let handle = tokio::task::spawn_blocking(move || {
                                 run_inference_loop(
                                     engine,
@@ -1608,6 +1649,9 @@ pub async fn run(
                                     params,
                                     max_tokens,
                                     None,
+                                    spec_config_clone2.as_ref().map(|c| {
+                                        harmony_inference::SpeculativeDecodeScheduler::new(c.clone())
+                                    }),
                                 );
                             });
                             tokio::spawn(async move {
@@ -2531,7 +2575,7 @@ struct EngramPrefill {
 /// When `engram` is `Some`, the prefill forward uses Engram-augmented inference.
 #[cfg(feature = "inference")]
 fn run_inference_loop(
-    engine: harmony_inference::QwenEngine,
+    engine: harmony_inference::HarmonyEngine,
     tx: mpsc::Sender<InferenceResult>,
     query_id: u64,
     task_id: String,
@@ -2540,6 +2584,7 @@ fn run_inference_loop(
     sampling_params: harmony_inference::SamplingParams,
     max_tokens: u32,
     engram: Option<EngramPrefill>,
+    mut spec_scheduler: Option<harmony_inference::SpeculativeDecodeScheduler>,
 ) {
     use harmony_inference::InferenceEngine;
 
@@ -2701,7 +2746,7 @@ fn run_inference_loop(
 
         // Opportunistic decode-step Engram injection: reuse cached shards from
         // prefill. Falls back to plain forward on any miss or error.
-        logits = 'decode_fwd: {
+        let (new_logits, decode_output) = 'decode_fwd: {
             if let Some(ref ep) = engram {
                 if history.len() >= 2 {
                     let window = &history[history.len().saturating_sub(3)..];
@@ -2732,7 +2777,7 @@ fn run_inference_loop(
                                     match engine
                                         .forward_with_engram(&[next_token], &mut cache, &ctx)
                                     {
-                                        Ok(l) => break 'decode_fwd l,
+                                        Ok(l) => break 'decode_fwd (l, None),
                                         Err(e) => {
                                             // Warn (not trace) — this is an unexpected
                                             // engine error, not a normal cache miss.
@@ -2752,8 +2797,21 @@ fn run_inference_loop(
                     tracing::trace!("engram decode miss — using plain forward");
                 }
             }
-            match engine.forward(&[next_token], &mut cache) {
-                Ok(l) => l,
+            match engine.forward_full(&[next_token], &mut cache, None) {
+                Ok(output) => {
+                    match output.logits_vec() {
+                        Ok(l) => (l, Some(output)),
+                        Err(e) => {
+                            let _ = tx.blocking_send(InferenceResult::Failed {
+                                query_id,
+                                task_id,
+                                error: format!("logits extraction failed: {e}"),
+                                engine,
+                            });
+                            return;
+                        }
+                    }
+                }
                 Err(e) => {
                     let _ = tx.blocking_send(InferenceResult::Failed {
                         query_id,
@@ -2765,6 +2823,32 @@ fn run_inference_loop(
                 }
             }
         };
+        logits = new_logits;
+
+        // UQ classification + speculation tracking (non-Engram path only).
+        if let (Some(ref mut scheduler), Some(ref output)) = (&mut spec_scheduler, &decode_output) {
+            match engine.classify_uncertainty(output) {
+                Ok(Some((_class, confidence))) => {
+                    let context = harmony_inference::SpecContext {
+                        is_thinking: false,
+                        engram_steps_remaining: None,
+                    };
+                    if scheduler.begin_draft(confidence, &context) {
+                        // Draft loop deferred until MTP or lightweight draft model.
+                        // Record as completed with 0 drafts for telemetry.
+                        if let Err(e) = scheduler.complete(0) {
+                            tracing::warn!(err = %e, "spec scheduler complete(0) failed");
+                            scheduler.cancel();
+                        }
+                    }
+                    // If begin_draft returned false, scheduler recorded a skip internally.
+                }
+                Ok(None) => {} // No UQ head loaded — expected.
+                Err(e) => {
+                    tracing::debug!(err = %e, "UQ classification failed — skipping speculation tracking");
+                }
+            }
+        }
     }
 
     let output = if is_token_mode {
@@ -2772,6 +2856,20 @@ fn run_inference_loop(
     } else {
         crate::inference::InferenceOutput::Text(full_text)
     };
+    // Log speculation metrics at end of generation.
+    if let Some(ref scheduler) = spec_scheduler {
+        let m = scheduler.metrics();
+        tracing::debug!(
+            total_speculations = m.total_speculations,
+            skipped = m.skipped_speculations,
+            canceled = m.canceled_speculations,
+            acceptance_rate = %format!("{:.2}", m.acceptance_rate()),
+            avg_draft_length = %format!("{:.1}", m.avg_draft_length()),
+            bypass_rate = %format!("{:.2}", m.verification_bypass_rate()),
+            "speculation metrics"
+        );
+    }
+
     let _ = tx.blocking_send(InferenceResult::Complete {
         query_id,
         task_id,

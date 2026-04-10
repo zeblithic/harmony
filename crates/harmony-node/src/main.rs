@@ -822,6 +822,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 archivist_config,
                 config_file.data_dir.clone(),
                 config_file.archive_dir.clone(),
+                config_file.speculation.clone(),
             )
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;

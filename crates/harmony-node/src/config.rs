@@ -93,6 +93,8 @@ pub struct ConfigFile {
     /// Enables this node to act as a passive archivist for eviction-pushed CAS blobs.
     pub archive_ingest: Option<bool>,
     pub archivist: Option<ArchivistConfig>,
+    /// Speculation config for UQ-gated speculative decoding.
+    pub speculation: Option<SpeculationConfig>,
     /// Hex-encoded 32-byte CID of the GGUF model file in CAS.
     pub inference_model_gguf_cid: Option<String>,
     /// Hex-encoded 32-byte CID of the tokenizer.json file in CAS.
@@ -115,6 +117,21 @@ pub struct ArchivistConfig {
     /// S3-compatible endpoint URL (e.g., Cloudflare R2).
     /// When set, the AWS SDK sends requests to this endpoint instead of AWS S3.
     pub endpoint: Option<String>,
+}
+
+/// Speculation thresholds for UQ-gated speculative decoding.
+/// All fields are optional — defaults come from `SpecDecConfig::default()`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculationConfig {
+    /// Confidence below this skips speculation entirely.
+    pub tau_generate: Option<f32>,
+    /// Cumulative product below this stops drafting.
+    pub tau_chain: Option<f32>,
+    /// Confidence above this bypasses verification (ConfSpec).
+    pub tau_accept: Option<f32>,
+    /// Maximum draft length.
+    pub max_draft_len: Option<usize>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -451,5 +468,46 @@ node_id = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
     #[test]
     fn resolve_default_when_both_none() {
         assert_eq!(resolve::<i32>(None, None, 7), 7);
+    }
+
+    #[test]
+    fn speculation_config_parses() {
+        let toml = r#"
+[speculation]
+tau_generate = 0.4
+tau_chain = 0.25
+tau_accept = 0.9
+max_draft_len = 6
+"#;
+        let (_f, path) = write_temp(toml);
+        let cfg = load(&path, false).expect("should parse speculation config");
+        let spec = cfg.speculation.expect("speculation section present");
+        assert!((spec.tau_generate.unwrap() - 0.4).abs() < 1e-6);
+        assert!((spec.tau_chain.unwrap() - 0.25).abs() < 1e-6);
+        assert!((spec.tau_accept.unwrap() - 0.9).abs() < 1e-6);
+        assert_eq!(spec.max_draft_len.unwrap(), 6);
+    }
+
+    #[test]
+    fn speculation_config_defaults_to_none() {
+        let toml = r#"listen_address = "127.0.0.1:4242""#;
+        let (_f, path) = write_temp(toml);
+        let cfg = load(&path, false).expect("should parse without speculation");
+        assert!(cfg.speculation.is_none());
+    }
+
+    #[test]
+    fn speculation_config_partial_fields() {
+        let toml = r#"
+[speculation]
+tau_generate = 0.5
+"#;
+        let (_f, path) = write_temp(toml);
+        let cfg = load(&path, false).expect("should parse partial speculation");
+        let spec = cfg.speculation.expect("speculation section present");
+        assert!((spec.tau_generate.unwrap() - 0.5).abs() < 1e-6);
+        assert!(spec.tau_chain.is_none());
+        assert!(spec.tau_accept.is_none());
+        assert!(spec.max_draft_len.is_none());
     }
 }

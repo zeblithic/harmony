@@ -782,10 +782,10 @@ pub struct NodeRuntime<B: BookStore> {
     /// Used only when the `inference` feature is enabled.
     #[allow(dead_code)]
     inference_request_nonce: u64,
-    /// QwenEngine for native verification (DSD target side).
+    /// HarmonyEngine for native inference, UQ classification, and DSD verification.
     /// Separate from the WasmiRuntime's persisted engine used by WASM workflows.
     #[cfg(feature = "inference")]
-    verification_engine: Option<harmony_inference::QwenEngine>,
+    verification_engine: Option<harmony_inference::HarmonyEngine>,
     /// Whether the inference engine is currently running a streaming task.
     /// Used by DSD paths to distinguish "engine busy" from "engine not loaded".
     #[cfg(feature = "inference")]
@@ -3028,7 +3028,7 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Borrow the inference engine for read-only operations (e.g. tokenization)
     /// without taking ownership.
     #[cfg(feature = "inference")]
-    pub fn inference_engine_ref(&self) -> Option<&harmony_inference::QwenEngine> {
+    pub fn inference_engine_ref(&self) -> Option<&harmony_inference::HarmonyEngine> {
         self.verification_engine.as_ref()
     }
 
@@ -3053,7 +3053,7 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Take the inference engine for an async streaming task.
     /// Returns `None` if the engine is already in use or not loaded.
     #[cfg(feature = "inference")]
-    pub fn take_inference_engine(&mut self) -> Option<harmony_inference::QwenEngine> {
+    pub fn take_inference_engine(&mut self) -> Option<harmony_inference::HarmonyEngine> {
         let engine = self.verification_engine.take();
         if engine.is_some() {
             self.inference_running = true;
@@ -3063,7 +3063,7 @@ impl<B: BookStore> NodeRuntime<B> {
 
     /// Return the inference engine after an async streaming task completes.
     #[cfg(feature = "inference")]
-    pub fn return_inference_engine(&mut self, engine: harmony_inference::QwenEngine) {
+    pub fn return_inference_engine(&mut self, engine: harmony_inference::HarmonyEngine) {
         self.verification_engine = Some(engine);
         self.inference_running = false;
     }
@@ -3097,7 +3097,7 @@ impl<B: BookStore> NodeRuntime<B> {
                     self.inference_tokenizer_data.as_ref(),
                 ) {
                     use harmony_inference::InferenceEngine;
-                    let mut engine = harmony_inference::QwenEngine::new(candle_core::Device::Cpu);
+                    let mut engine = harmony_inference::HarmonyEngine::new(harmony_inference::HarmonyModelConfig::tiny(), candle_core::Device::Cpu);
                     match engine.load_gguf(gguf_data) {
                         Ok(()) => match engine.load_tokenizer(tok_data) {
                             Ok(()) => {
@@ -3281,7 +3281,7 @@ impl<B: BookStore> NodeRuntime<B> {
     /// 5. Return `VerifyResponse` with `accepted_count` + `bonus_token` + `bonus_logprob`
     #[cfg(feature = "inference")]
     fn run_verification(
-        engine: &harmony_inference::QwenEngine,
+        engine: &harmony_inference::HarmonyEngine,
         request: &harmony_speculative::VerifyRequest,
     ) -> Result<harmony_speculative::VerifyResponse, String> {
         use harmony_inference::InferenceEngine;
