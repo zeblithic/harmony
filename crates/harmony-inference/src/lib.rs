@@ -35,6 +35,7 @@ pub mod sampling;
 pub mod speculative_decode;
 pub mod uq_features;
 pub mod uq_head;
+pub mod latent_projection;
 
 pub use block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
 pub use chunked_engram::{
@@ -45,6 +46,7 @@ pub use harmony_engine::HarmonyEngine;
 pub use harmony_model::{HarmonyModel, HarmonyModelConfig, HarmonyForwardOutput};
 pub use uq_features::{extract_uq_features, UqFeatureConfig};
 pub use uq_head::{UqClass, UqHead, UqHeadConfig, UqOutput};
+pub use latent_projection::LatentProjection;
 pub use engine::EngramContext;
 pub use engine::QwenEngine;
 pub use engram_residual::EngramGatedResidual;
