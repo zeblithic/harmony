@@ -360,6 +360,7 @@ impl InferenceEngine for HarmonyEngine {
                 .map_err(|e| InferenceError::InvalidGguf(format!("latent projection layer2.bias: {e}")))?;
             let proj = LatentProjection::from_tensors(w1, b1, w2, b2)
                 .map_err(|e| InferenceError::InvalidGguf(format!("latent projection: {e}")))?;
+            tracing::info!(latent_dim = proj.latent_dim(), "latent projection weights loaded from GGUF");
             self.latent_projection = Some(proj);
         } else {
             self.latent_projection = None;

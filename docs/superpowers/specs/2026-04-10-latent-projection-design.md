@@ -116,7 +116,7 @@ pub struct HarmonyEngine {
 
 ```rust
 impl HarmonyModel {
-    pub fn token_embeddings(&self, token_ids: &[u32], device: &Device) -> Result<Tensor>
+    pub fn token_embeddings(&self, token_ids: &[u32]) -> Result<Tensor>
 }
 ```
 

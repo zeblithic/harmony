@@ -21,33 +21,7 @@ use alloc::vec::Vec;
 /// builds the modulo/division will panic.  Callers must ensure the config is
 /// constructed from a valid [`ManifestHeader`](crate::ManifestHeader).
 pub fn compute_lookup(config: &EngramConfig, ngram_tokens: &[u32]) -> EngramLookup {
-    debug_assert!(config.total_entries > 0, "total_entries must be positive");
-    debug_assert!(config.shard_size > 0, "shard_size must be positive");
-    debug_assert_eq!(
-        config.hash_seeds.len(),
-        config.num_heads as usize,
-        "hash_seeds length must match num_heads"
-    );
-
-    let vector_bytes = config.vector_bytes();
-    let mut shard_indices = Vec::with_capacity(config.num_heads as usize);
-    let mut entry_offsets = Vec::with_capacity(config.num_heads as usize);
-
-    for seed in &config.hash_seeds {
-        let raw_hash = hash_ngram(ngram_tokens, *seed);
-        let table_index = raw_hash % config.total_entries;
-        let shard_index = table_index / config.shard_size as u64;
-        let entry_within_shard = (table_index % config.shard_size as u64) as usize;
-        let byte_offset = entry_within_shard * vector_bytes;
-
-        shard_indices.push(shard_index);
-        entry_offsets.push(byte_offset);
-    }
-
-    EngramLookup {
-        shard_indices,
-        entry_offsets,
-    }
+    lookup_from_hash(config, |seed| hash_ngram(ngram_tokens, seed))
 }
 
 /// Hash arbitrary bytes with a single seed.
@@ -77,6 +51,13 @@ fn hash_ngram(tokens: &[u32], seed: u64) -> u64 {
 /// Same hashing logic as [`compute_lookup`] but accepts raw bytes instead of
 /// token N-grams. Used by latent projection to hash binary LSH codes.
 pub fn compute_lookup_from_bytes(config: &EngramConfig, key_bytes: &[u8]) -> EngramLookup {
+    lookup_from_hash(config, |seed| hash_bytes(key_bytes, seed))
+}
+
+/// Shared shard/offset computation. `hash_fn(seed)` produces the raw hash
+/// for a given head seed — the rest of the arithmetic is identical regardless
+/// of whether the input was token bytes or raw LSH codes.
+fn lookup_from_hash(config: &EngramConfig, hash_fn: impl Fn(u64) -> u64) -> EngramLookup {
     debug_assert!(config.total_entries > 0, "total_entries must be positive");
     debug_assert!(config.shard_size > 0, "shard_size must be positive");
     debug_assert_eq!(
@@ -90,7 +71,7 @@ pub fn compute_lookup_from_bytes(config: &EngramConfig, key_bytes: &[u8]) -> Eng
     let mut entry_offsets = Vec::with_capacity(config.num_heads as usize);
 
     for seed in &config.hash_seeds {
-        let raw_hash = hash_bytes(key_bytes, *seed);
+        let raw_hash = hash_fn(*seed);
         let table_index = raw_hash % config.total_entries;
         let shard_index = table_index / config.shard_size as u64;
         let entry_within_shard = (table_index % config.shard_size as u64) as usize;

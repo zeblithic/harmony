@@ -106,7 +106,13 @@ impl LatentProjection {
 
     pub fn to_binary_keys(&self, latent: &Tensor) -> Result<Vec<Vec<u8>>> {
         let squeezed = latent.squeeze(0)?;
-        let seq_len = squeezed.dim(0)?;
+        let (seq_len, row_dim) = squeezed.dims2()?;
+        if row_dim != self.latent_dim {
+            candle_core::bail!(
+                "latent width ({row_dim}) must match projection latent_dim ({})",
+                self.latent_dim
+            );
+        }
         let data = squeezed.to_vec2::<f32>()?;
         let key_bytes = self.latent_dim.div_ceil(8);
         let mut keys = Vec::with_capacity(seq_len);
@@ -153,6 +159,12 @@ pub fn contrastive_loss(
 ) -> Result<Tensor> {
     // Flatten batch: [B, S, D] → [B*S, D]
     let (b, s, _) = original.dims3()?;
+    let (pb, ps, _) = projected.dims3()?;
+    if (pb, ps) != (b, s) {
+        candle_core::bail!(
+            "projected batch/seq ({pb}, {ps}) must match original ({b}, {s})"
+        );
+    }
     let n = b * s;
 
     // Need at least 2 vectors for contrastive loss (anchor + neighbor).
