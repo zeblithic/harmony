@@ -639,16 +639,36 @@ pub async fn run(
     let (inference_tx, mut inference_rx) = mpsc::channel::<InferenceResult>(64);
 
     // Create speculation config from node config (if enabled).
+    // Validates thresholds before constructing SpecDecConfig to avoid panics
+    // from invalid user-provided values.
     #[cfg(feature = "inference")]
     let spec_dec_config: Option<harmony_inference::SpecDecConfig> = speculation_config
         .as_ref()
-        .map(|spec| {
-            harmony_inference::SpecDecConfig::new(
-                spec.tau_generate.unwrap_or(0.3),
-                spec.tau_chain.unwrap_or(0.2),
-                spec.tau_accept.unwrap_or(0.95),
-                spec.max_draft_len.unwrap_or(8),
-            )
+        .and_then(|spec| {
+            let d = harmony_inference::SpecDecConfig::default();
+            let tg = spec.tau_generate.unwrap_or(d.tau_generate);
+            let tc = spec.tau_chain.unwrap_or(d.tau_chain);
+            let ta = spec.tau_accept.unwrap_or(d.tau_accept);
+            let mdl = spec.max_draft_len.unwrap_or(d.max_draft_len);
+
+            if !(tg.is_finite() && tg >= 0.0 && tg < 1.0) {
+                tracing::warn!(tau_generate = tg, "invalid tau_generate — disabling speculation");
+                return None;
+            }
+            if !(tc.is_finite() && tc > 0.0 && tc < 1.0) {
+                tracing::warn!(tau_chain = tc, "invalid tau_chain — disabling speculation");
+                return None;
+            }
+            if !(ta.is_finite() && ta > tg && ta <= 1.0) {
+                tracing::warn!(tau_accept = ta, tau_generate = tg, "invalid tau_accept — disabling speculation");
+                return None;
+            }
+            if mdl < 2 {
+                tracing::warn!(max_draft_len = mdl, "invalid max_draft_len — disabling speculation");
+                return None;
+            }
+
+            Some(harmony_inference::SpecDecConfig::new(tg, tc, ta, mdl))
         });
 
     // ── Execute startup actions (declare queryables + subscribers) ────────────
@@ -1617,6 +1637,7 @@ pub async fn run(
                             let panic_tx = inference_tx.clone();
                             let panic_query_id = query_id;
                             let panic_task_id = task_id.clone();
+                            let spec_config_clone2 = spec_config_clone.clone();
                             let handle = tokio::task::spawn_blocking(move || {
                                 run_inference_loop(
                                     engine,
@@ -1628,7 +1649,7 @@ pub async fn run(
                                     params,
                                     max_tokens,
                                     None,
-                                    spec_dec_config.as_ref().map(|c| {
+                                    spec_config_clone2.as_ref().map(|c| {
                                         harmony_inference::SpeculativeDecodeScheduler::new(c.clone())
                                     }),
                                 );
@@ -2806,17 +2827,26 @@ fn run_inference_loop(
 
         // UQ classification + speculation tracking (non-Engram path only).
         if let (Some(ref mut scheduler), Some(ref output)) = (&mut spec_scheduler, &decode_output) {
-            if let Ok(Some((_class, confidence))) = engine.classify_uncertainty(output) {
-                let context = harmony_inference::SpecContext {
-                    is_thinking: false,
-                    engram_steps_remaining: None,
-                };
-                if scheduler.begin_draft(confidence, &context) {
-                    // Draft loop deferred until MTP or lightweight draft model is available.
-                    // Cancel to record the would-have-speculated metric and return to Idle.
-                    scheduler.cancel();
+            match engine.classify_uncertainty(output) {
+                Ok(Some((_class, confidence))) => {
+                    let context = harmony_inference::SpecContext {
+                        is_thinking: false,
+                        engram_steps_remaining: None,
+                    };
+                    if scheduler.begin_draft(confidence, &context) {
+                        // Draft loop deferred until MTP or lightweight draft model.
+                        // Record as completed with 0 drafts for telemetry.
+                        if let Err(e) = scheduler.complete(0) {
+                            tracing::warn!(err = %e, "spec scheduler complete(0) failed");
+                            scheduler.cancel();
+                        }
+                    }
+                    // If begin_draft returned false, scheduler recorded a skip internally.
                 }
-                // If begin_draft returned false, scheduler recorded a skip internally.
+                Ok(None) => {} // No UQ head loaded — expected.
+                Err(e) => {
+                    tracing::debug!(err = %e, "UQ classification failed — skipping speculation tracking");
+                }
             }
         }
     }
