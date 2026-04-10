@@ -110,8 +110,8 @@ Draft token KV entries are negligible relative to the main cache:
 | 8 | 252 KB | 0.19% |
 
 Speculative decoding is **not memory-constrained**. The MTP head itself
-(ZEB-61) will add parameters comparable to one transformer layer (~18M params,
-~10 MB at Q8) — still negligible vs. the KV cache at long contexts.
+(ZEB-61) adds ~13.1M parameters (~7 MB at Q8, ~14 MB at F16) — the MLP portion
+of a transformer layer, still negligible vs. the KV cache at long contexts.
 
 ## Deployment Scenarios
 

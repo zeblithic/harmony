@@ -338,7 +338,7 @@ class TestMtpHead:
         batch = torch.randint(0, cfg.vocab_size, (2, 17))
         x, targets = batch[:, :-1], batch[:, 1:]
 
-        logits, hidden = model(x, return_hidden_states=True)
+        _logits, hidden = model(x, return_hidden_states=True)
         mtp_loss = mtp(hidden, targets, model.embed_tokens, model.lm_head)
 
         assert torch.isfinite(mtp_loss), f"MTP loss not finite: {mtp_loss.item()}"
@@ -399,11 +399,11 @@ class TestMtpHead:
         from ct87.mtp import MtpHead
 
         mtp = MtpHead(cfg, depth=4)
-        # seq_len=4 tokens, after shift targets has 3 positions, depth=4 → S=3-4<0
+        # x has 4 tokens, hidden has 4 positions, depth=4 → S=4-4=0
         batch = torch.randint(0, cfg.vocab_size, (1, 5))
         x, targets = batch[:, :-1], batch[:, 1:]
 
-        logits, hidden = model(x, return_hidden_states=True)
+        _logits, hidden = model(x, return_hidden_states=True)
         mtp_loss = mtp(hidden, targets, model.embed_tokens, model.lm_head)
 
         assert mtp_loss.item() == 0.0
@@ -419,7 +419,7 @@ class TestMtpHead:
         batch = torch.randint(0, cfg.vocab_size, (2, 17))
         x, targets = batch[:, :-1], batch[:, 1:]
 
-        _, hidden = model(x, return_hidden_states=True)
+        _logits, hidden = model(x, return_hidden_states=True)
 
         loss_no_mask = mtp(hidden, targets, model.embed_tokens, model.lm_head)
 

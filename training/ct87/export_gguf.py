@@ -276,10 +276,20 @@ def export_gguf(
                 f"MTP head state_dict mismatch. "
                 f"Expected: {sorted(expected_mtp)}, got: {sorted(actual_mtp)}"
             )
+        if mtp_depth < 1:
+            raise ValueError("mtp_depth must be >= 1 when exporting MTP head")
         writer.add_bool("harmony.mtp.enabled", True)
         writer.add_uint32("harmony.mtp.depth", mtp_depth)
         for pytorch_key, gguf_name in mtp_map.items():
             t = mtp_head_state[pytorch_key].detach().cpu().float()
+            if "norm" in pytorch_key and t.ndim != 1:
+                raise ValueError(
+                    f"MTP tensor {pytorch_key} expected 1D, got {t.ndim}D"
+                )
+            if "proj" in pytorch_key and t.ndim != 2:
+                raise ValueError(
+                    f"MTP tensor {pytorch_key} expected 2D, got {t.ndim}D"
+                )
             # Transpose 2D weights: PyTorch [out, in] -> Rust [in, out]
             if t.ndim == 2:
                 t = t.T.contiguous()

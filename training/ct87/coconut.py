@@ -122,8 +122,15 @@ def coconut_forward(
             [batch, augmented_seq_len, hidden_dim]
     """
     if num_thoughts == 0:
-        logits = model(input_ids=input_ids, engram_embeddings=engram_embeddings)
         think_mask = torch.zeros(input_ids.shape, dtype=torch.bool, device=input_ids.device)
+        if return_hidden_states:
+            logits, hidden = model(
+                input_ids=input_ids,
+                engram_embeddings=engram_embeddings,
+                return_hidden_states=True,
+            )
+            return logits, think_mask, hidden
+        logits = model(input_ids=input_ids, engram_embeddings=engram_embeddings)
         return logits, think_mask
 
     augmented_len = input_ids.shape[1] + num_thoughts

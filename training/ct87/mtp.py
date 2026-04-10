@@ -83,7 +83,7 @@ class MtpHead(nn.Module):
         Returns:
             Scalar MTP loss averaged across draft depths and valid positions.
         """
-        batch, seq_len, _ = hidden_states.shape
+        _batch, seq_len, _ = hidden_states.shape
         K = self.depth
 
         # Truncate so all K draft targets exist
