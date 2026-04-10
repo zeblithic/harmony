@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use candle_core::{Device, Result, Tensor};
-use harmony_engram::{EngramClient, EngramLookup};
+use harmony_engram::{EngramClient, EngramConfig, EngramLookup};
 
 /// A shard that needs to be fetched by the caller.
 #[derive(Debug, Clone)]
@@ -75,6 +75,59 @@ pub fn prepare_engram_request(client: &EngramClient, tokens: &[u32]) -> Result<E
         collect_shards(client, &lookup, &mut seen_shards, &mut required_shards)?;
         lookups.push(NgramLookup {
             token_position: i + 2, // last token of trigram
+            lookup,
+        });
+    }
+
+    Ok(EngramRequest {
+        required_shards,
+        lookups,
+        seq_len,
+    })
+}
+
+/// Phase 1 (latent): Build an [`EngramRequest`] from pre-computed binary keys.
+///
+/// Used when latent projection is active. Each binary key (from
+/// [`LatentProjection::to_binary_keys`]) is hashed via
+/// `compute_lookup_from_bytes` to get shard indices, producing the same
+/// `EngramRequest` that the resolve path consumes.
+///
+/// `positions[i]` is the token position attributed to `binary_keys[i]`
+/// (last token of the N-gram window, matching the convention in
+/// [`prepare_engram_request`]).
+pub fn prepare_engram_request_latent(
+    config: &EngramConfig,
+    binary_keys: &[Vec<u8>],
+    positions: &[usize],
+    seq_len: usize,
+) -> Result<EngramRequest> {
+    debug_assert_eq!(
+        binary_keys.len(),
+        positions.len(),
+        "binary_keys and positions must have the same length"
+    );
+
+    let mut lookups = Vec::with_capacity(binary_keys.len());
+    let mut seen_shards = HashSet::new();
+    let mut required_shards = Vec::new();
+
+    for (key, &pos) in binary_keys.iter().zip(positions.iter()) {
+        let lookup = harmony_engram::hash::compute_lookup_from_bytes(config, key);
+        // Collect unique shard requests — same dedup logic as prepare_engram_request
+        for &shard_idx in &lookup.shard_indices {
+            if seen_shards.insert(shard_idx) {
+                // No CID resolution for latent keys — set placeholder CID.
+                // The caller (event loop) fetches shards by index from the
+                // already-loaded shard data in the ChunkedEngramScheduler cache.
+                required_shards.push(ShardRequest {
+                    shard_index: shard_idx,
+                    cid: [0u8; 32],
+                });
+            }
+        }
+        lookups.push(NgramLookup {
+            token_position: pos,
             lookup,
         });
     }
@@ -324,5 +377,42 @@ mod tests {
             max_val < 1e-6,
             "zero shards should produce zero embeddings, got {max_val}"
         );
+    }
+
+    #[test]
+    fn prepare_latent_request_produces_valid_lookups() {
+        let client = test_client();
+        let keys = vec![vec![0xABu8, 0xCD], vec![0x12, 0x34], vec![0xFF, 0x00]];
+        let positions = vec![1, 2, 2];
+        let request =
+            prepare_engram_request_latent(client.config(), &keys, &positions, 3).unwrap();
+
+        assert_eq!(request.lookups.len(), 3);
+        assert_eq!(request.seq_len, 3);
+
+        for lookup in &request.lookups {
+            assert_eq!(lookup.lookup.shard_indices.len(), 2);
+            assert_eq!(lookup.lookup.entry_offsets.len(), 2);
+        }
+
+        for lookup in &request.lookups {
+            for &idx in &lookup.lookup.shard_indices {
+                assert!(idx < client.config().num_shards, "shard index out of bounds");
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_latent_request_matches_token_count() {
+        let client = test_client();
+        let keys = vec![vec![0x00u8], vec![0xFF]];
+        let positions = vec![1, 1];
+        let request =
+            prepare_engram_request_latent(client.config(), &keys, &positions, 5).unwrap();
+
+        assert_eq!(request.seq_len, 5);
+        assert_eq!(request.lookups.len(), 2);
+        assert_eq!(request.lookups[0].token_position, 1);
+        assert_eq!(request.lookups[1].token_position, 1);
     }
 }
