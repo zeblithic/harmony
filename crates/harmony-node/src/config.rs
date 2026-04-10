@@ -121,7 +121,7 @@ pub struct ArchivistConfig {
 
 /// Speculation thresholds for UQ-gated speculative decoding.
 /// All fields are optional — defaults come from `SpecDecConfig::default()`.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SpeculationConfig {
     /// Confidence below this skips speculation entirely.
