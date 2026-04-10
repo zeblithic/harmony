@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
+
 import os
 import sys
 import time
@@ -446,7 +446,10 @@ def main() -> None:
             csv_writer.writerow(expected_header)
 
     qat_enabled = False
-    qat_start_step = math.ceil(args.qat_start_pct * args.steps) if args.qat else args.steps + 1
+    if args.qat and args.steps > 0:
+        qat_start_step = min(round(args.qat_start_pct * args.steps), args.steps - 1)
+    else:
+        qat_start_step = args.steps + 1
 
     try:
         for step in range(args.steps):
