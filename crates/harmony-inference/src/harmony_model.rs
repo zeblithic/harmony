@@ -720,6 +720,16 @@ impl HarmonyModel {
         &self.block_attnres
     }
 
+    /// Look up token embeddings without running the transformer.
+    ///
+    /// Returns `[1, seq_len, hidden_dim]`. Used by latent projection to
+    /// compute semantic keys from the raw embedding layer.
+    pub fn token_embeddings(&self, token_ids: &[u32]) -> Result<Tensor> {
+        let device = &self.device;
+        let input = Tensor::new(token_ids, device)?.unsqueeze(0)?;
+        self.embed_tokens.forward(&input)
+    }
+
     /// Run one forward pass of the model.
     ///
     /// `input` is a `[1, seq_len]` u32 token-ID tensor.
@@ -1240,5 +1250,20 @@ mod tests {
         let v = output.logits_vec().unwrap();
         assert_eq!(v.len(), 3);
         assert!((v[0] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn token_embeddings_accessor_shape() {
+        let config = HarmonyModelConfig::tiny();
+        let model = HarmonyModel::new(&config, &Device::Cpu).unwrap();
+
+        let tokens = [1u32, 2, 3, 4];
+        let embeddings = model.token_embeddings(&tokens).unwrap();
+
+        assert_eq!(
+            embeddings.dims(),
+            &[1, 4, config.hidden_dim],
+            "should be [1, seq_len, hidden_dim]"
+        );
     }
 }
