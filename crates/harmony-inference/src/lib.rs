@@ -49,7 +49,7 @@ pub use engine::EngramContext;
 pub use engine::QwenEngine;
 pub use engram_residual::EngramGatedResidual;
 pub use error::InferenceError;
-pub use paged_kv::{BlockAllocator, PagedKvCache, PagedKvConfig};
+pub use paged_kv::{PagedKvCache, PagedKvConfig};
 pub use speculative_decode::{
     DraftAction, DraftTree, SpecContext, SpecDecConfig, SpecDecMetrics,
     SpeculativeDecodeScheduler,

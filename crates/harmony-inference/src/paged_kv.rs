@@ -37,6 +37,9 @@
 //! let (k, v) = cache.gather(layer, &device)?;
 //! // ... compute attention with (k, v) ...
 //!
+//! // After all layers, advance position:
+//! cache.advance(1)?;
+//!
 //! // Speculative decode rollback:
 //! cache.truncate(cache.position() - rejected_count)?;
 //! ```
@@ -87,50 +90,60 @@ impl Default for PagedKvConfig {
 ///
 /// Manages a pool of `total` block indices `[0, total)`. Allocation pops
 /// from the free list (LIFO for temporal locality); freeing pushes back.
+///
+/// An allocation bitmap prevents double-free corruption — `free()` panics
+/// if the block is not currently allocated.
 #[derive(Debug)]
-pub struct BlockAllocator {
+pub(crate) struct BlockAllocator {
     free_list: Vec<usize>,
+    in_use: Vec<bool>,
     total: usize,
 }
 
 impl BlockAllocator {
     /// Create an allocator with `total` blocks, all initially free.
-    pub fn new(total: usize) -> Self {
+    pub(crate) fn new(total: usize) -> Self {
         // Reverse so pop() yields 0, 1, 2, ... in order.
         Self {
             free_list: (0..total).rev().collect(),
+            in_use: vec![false; total],
             total,
         }
     }
 
     /// Allocate one block. Returns `None` if the pool is exhausted.
-    pub fn alloc(&mut self) -> Option<usize> {
-        self.free_list.pop()
+    pub(crate) fn alloc(&mut self) -> Option<usize> {
+        let id = self.free_list.pop()?;
+        self.in_use[id] = true;
+        Some(id)
     }
 
     /// Return a block to the pool.
     ///
-    /// # Safety
+    /// # Panics
     ///
-    /// Caller must ensure `id < total` and the block is not already free.
-    /// Debug builds assert this.
-    pub fn free(&mut self, id: usize) {
-        debug_assert!(id < self.total, "block id {id} out of range [0, {})", self.total);
+    /// Panics if `id >= total` or the block is not currently allocated
+    /// (double-free).
+    pub(crate) fn free(&mut self, id: usize) {
+        assert!(id < self.total, "block id {id} out of range [0, {})", self.total);
+        assert!(self.in_use[id], "double free of block id {id}");
+        self.in_use[id] = false;
         self.free_list.push(id);
     }
 
     /// Number of currently allocated blocks.
-    pub fn allocated(&self) -> usize {
+    pub(crate) fn allocated(&self) -> usize {
         self.total - self.free_list.len()
     }
 
     /// Number of available blocks.
-    pub fn free_count(&self) -> usize {
+    pub(crate) fn free_count(&self) -> usize {
         self.free_list.len()
     }
 
     /// Total pool size.
-    pub fn total(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn total(&self) -> usize {
         self.total
     }
 }
@@ -206,15 +219,21 @@ impl KvBlock {
 /// Each transformer layer has its own page table (list of block IDs in
 /// logical order). The `gather()` method assembles pages into contiguous
 /// tensors matching the `[1, num_kv_heads, seq_len, head_dim]` convention.
+///
+/// Per-layer token counts are tracked internally to detect caller errors
+/// (e.g. forgetting to append to a layer before calling `advance()`).
 pub struct PagedKvCache {
     config: PagedKvConfig,
     allocator: BlockAllocator,
-    /// Physical block storage indexed by block ID.
+    /// Physical block storage indexed by block ID. Freed blocks are retained
+    /// with `used = 0` to avoid reallocation on reuse.
     pool: Vec<Option<KvBlock>>,
     /// Per-layer page tables: `layer_tables[layer]` = block IDs in order.
     layer_tables: Vec<Vec<usize>>,
-    /// Total tokens appended (position offset for RoPE).
+    /// Total tokens committed via `advance()` (position offset for RoPE).
     position: usize,
+    /// Per-layer token counts (incremented by `append()`, validated by `advance()`).
+    per_layer_tokens: Vec<usize>,
     num_layers: usize,
     head_dim: usize,
     num_kv_heads: usize,
@@ -235,6 +254,7 @@ impl PagedKvCache {
             pool: (0..max_pages).map(|_| None).collect(),
             layer_tables: (0..num_layers).map(|_| Vec::new()).collect(),
             position: 0,
+            per_layer_tokens: vec![0; num_layers],
             num_layers,
             head_dim,
             num_kv_heads,
@@ -245,7 +265,7 @@ impl PagedKvCache {
     ///
     /// `k_data` and `v_data` each have `num_kv_heads * head_dim` f32 values,
     /// laid out as `[head][dim]`. Allocates a new page if the current one is
-    /// full.
+    /// full. Freed pages are reused without reallocation.
     ///
     /// # Errors
     ///
@@ -258,7 +278,7 @@ impl PagedKvCache {
         v_data: &[f32],
     ) -> Result<(), InferenceError> {
         if layer >= self.num_layers {
-            return Err(InferenceError::SpeculativeDecodeFailed(format!(
+            return Err(InferenceError::PagedKvCacheFailed(format!(
                 "layer index {layer} out of range [0, {})",
                 self.num_layers,
             )));
@@ -266,7 +286,7 @@ impl PagedKvCache {
 
         let expected = self.num_kv_heads * self.head_dim;
         if k_data.len() != expected || v_data.len() != expected {
-            return Err(InferenceError::SpeculativeDecodeFailed(format!(
+            return Err(InferenceError::PagedKvCacheFailed(format!(
                 "append data length mismatch: expected {expected}, got k={} v={}",
                 k_data.len(),
                 v_data.len(),
@@ -284,13 +304,17 @@ impl PagedKvCache {
 
         if need_new_page {
             let block_id = self.allocator.alloc().ok_or_else(|| {
-                InferenceError::SpeculativeDecodeFailed(format!(
+                InferenceError::PagedKvCacheFailed(format!(
                     "block pool exhausted ({} pages allocated)",
                     self.allocator.allocated(),
                 ))
             })?;
-            self.pool[block_id] =
-                Some(KvBlock::new(self.num_kv_heads, page_size, self.head_dim));
+            // Reuse existing block allocation if available (freed blocks
+            // retain their Vec capacity), otherwise create a new one.
+            if self.pool[block_id].is_none() {
+                self.pool[block_id] =
+                    Some(KvBlock::new(self.num_kv_heads, page_size, self.head_dim));
+            }
             table.push(block_id);
         }
 
@@ -300,15 +324,33 @@ impl PagedKvCache {
             .unwrap()
             .append_token(k_data, v_data, self.num_kv_heads, page_size, self.head_dim);
 
+        self.per_layer_tokens[layer] += 1;
+
         Ok(())
     }
 
     /// Advance the position counter after all layers have been appended.
     ///
     /// Call this once per decoded token (after appending to every layer),
-    /// not once per layer.
-    pub fn advance(&mut self, count: usize) {
-        self.position += count;
+    /// not once per layer. Validates that every layer has exactly
+    /// `position + count` tokens appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InferenceError` if any layer's token count doesn't match
+    /// the expected `position + count`.
+    pub fn advance(&mut self, count: usize) -> Result<(), InferenceError> {
+        let expected = self.position + count;
+        for (i, &layer_count) in self.per_layer_tokens.iter().enumerate() {
+            if layer_count != expected {
+                return Err(InferenceError::PagedKvCacheFailed(format!(
+                    "advance({count}): layer {i} has {layer_count} tokens, \
+                     expected {expected}",
+                )));
+            }
+        }
+        self.position = expected;
+        Ok(())
     }
 
     /// Gather all pages for a layer into contiguous K/V tensors.
@@ -325,7 +367,7 @@ impl PagedKvCache {
         device: &Device,
     ) -> Result<(Tensor, Tensor), InferenceError> {
         if layer >= self.num_layers {
-            return Err(InferenceError::SpeculativeDecodeFailed(format!(
+            return Err(InferenceError::PagedKvCacheFailed(format!(
                 "layer index {layer} out of range [0, {})",
                 self.num_layers,
             )));
@@ -333,7 +375,7 @@ impl PagedKvCache {
 
         let table = &self.layer_tables[layer];
         if table.is_empty() {
-            return Err(InferenceError::SpeculativeDecodeFailed(
+            return Err(InferenceError::PagedKvCacheFailed(
                 "gather called on empty layer — no tokens appended".into(),
             ));
         }
@@ -375,14 +417,15 @@ impl PagedKvCache {
     /// Truncate the cache to `new_position` tokens, freeing trailing pages.
     ///
     /// Used for speculative decode rollback: after verification rejects some
-    /// draft tokens, truncate to the last accepted position.
+    /// draft tokens, truncate to the last accepted position. Freed blocks
+    /// retain their heap allocations for zero-cost reuse on the next append.
     ///
     /// # Errors
     ///
     /// Returns `InferenceError` if `new_position > self.position`.
     pub fn truncate(&mut self, new_position: usize) -> Result<(), InferenceError> {
         if new_position > self.position {
-            return Err(InferenceError::SpeculativeDecodeFailed(format!(
+            return Err(InferenceError::PagedKvCacheFailed(format!(
                 "truncate position {new_position} exceeds current position {}",
                 self.position,
             )));
@@ -403,21 +446,27 @@ impl PagedKvCache {
         };
 
         for table in &mut self.layer_tables {
-            // Free pages beyond the keep range.
+            // Free pages beyond the keep range. Retain block allocations.
             while table.len() > keep_pages {
                 let block_id = table.pop().unwrap();
-                self.pool[block_id] = None;
+                if let Some(block) = self.pool[block_id].as_mut() {
+                    block.used = 0;
+                }
                 self.allocator.free(block_id);
             }
 
             // Adjust `used` on the new last page (if any).
+            // Never increase `used` beyond its current value.
             if let Some(&last_id) = table.last() {
                 if let Some(block) = self.pool[last_id].as_mut() {
-                    block.used = last_page_used;
+                    block.used = last_page_used.min(block.used);
                 }
             }
         }
 
+        for count in &mut self.per_layer_tokens {
+            *count = new_position;
+        }
         self.position = new_position;
         Ok(())
     }
@@ -442,12 +491,15 @@ impl PagedKvCache {
         self.allocator.free_count()
     }
 
-    /// Total memory used by allocated blocks (bytes).
+    /// Total memory used by actively assigned blocks (bytes).
+    ///
+    /// Only counts blocks currently in page tables, not freed blocks
+    /// retained in the pool for reuse.
     pub fn memory_bytes(&self) -> usize {
-        self.pool
+        self.layer_tables
             .iter()
-            .filter_map(|b| b.as_ref())
-            .map(|b| b.memory_bytes())
+            .flat_map(|table| table.iter())
+            .map(|&id| self.pool[id].as_ref().unwrap().memory_bytes())
             .sum()
     }
 
@@ -468,13 +520,20 @@ impl PagedKvCache {
     }
 
     /// Reset the cache: free all blocks and reset position to 0.
+    ///
+    /// Freed blocks retain their heap allocations for reuse.
     pub fn reset(&mut self) {
         for table in &mut self.layer_tables {
             for &block_id in table.iter() {
-                self.pool[block_id] = None;
+                if let Some(block) = self.pool[block_id].as_mut() {
+                    block.used = 0;
+                }
                 self.allocator.free(block_id);
             }
             table.clear();
+        }
+        for count in &mut self.per_layer_tokens {
+            *count = 0;
         }
         self.position = 0;
     }
@@ -570,6 +629,22 @@ mod tests {
         assert!(alloc.alloc().is_none());
     }
 
+    #[test]
+    #[should_panic(expected = "double free")]
+    fn allocator_rejects_double_free() {
+        let mut alloc = BlockAllocator::new(3);
+        let a = alloc.alloc().unwrap();
+        alloc.free(a);
+        alloc.free(a);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn allocator_rejects_out_of_range_free() {
+        let mut alloc = BlockAllocator::new(3);
+        alloc.free(5);
+    }
+
     // -- PagedKvCache core tests --
 
     /// Helper: create flat K/V data for one token with a recognizable pattern.
@@ -587,7 +662,7 @@ mod tests {
         let (k, v) = token_kv(heads, dim, 1.0);
         cache.append(0, &k, &v).unwrap();
         cache.append(1, &k, &v).unwrap();
-        cache.advance(1);
+        cache.advance(1).unwrap();
 
         assert_eq!(cache.position(), 1);
         assert!(!cache.is_empty());
@@ -614,7 +689,7 @@ mod tests {
         for i in 0..5 {
             let (k, v) = token_kv(heads, dim, i as f32);
             cache.append(0, &k, &v).unwrap();
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
 
         assert_eq!(cache.position(), 5);
@@ -678,12 +753,41 @@ mod tests {
         // 4 tokens fit in 2 pages.
         for _ in 0..4 {
             cache.append(0, &k, &v).unwrap();
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
 
         // 5th token needs a 3rd page → exhaustion.
         let err = cache.append(0, &k, &v).unwrap_err();
         assert!(err.to_string().contains("exhausted"));
+    }
+
+    // -- Advance validation tests --
+
+    #[test]
+    fn advance_validates_layer_tokens() {
+        let config = PagedKvConfig::new(4, 100);
+        let mut cache = PagedKvCache::new(config, 2, 4, 2);
+        let (k, v) = token_kv(2, 4, 1.0);
+
+        // Only append to layer 0, not layer 1.
+        cache.append(0, &k, &v).unwrap();
+
+        // advance should fail because layer 1 hasn't been appended.
+        let err = cache.advance(1).unwrap_err();
+        assert!(err.to_string().contains("layer 1"));
+    }
+
+    #[test]
+    fn advance_succeeds_when_all_layers_match() {
+        let config = PagedKvConfig::new(4, 100);
+        let mut cache = PagedKvCache::new(config, 3, 4, 2);
+        let (k, v) = token_kv(2, 4, 1.0);
+
+        for layer in 0..3 {
+            cache.append(layer, &k, &v).unwrap();
+        }
+        cache.advance(1).unwrap();
+        assert_eq!(cache.position(), 1);
     }
 
     // -- Truncation tests --
@@ -697,7 +801,7 @@ mod tests {
         for i in 0..3 {
             let (k, v) = token_kv(heads, dim, i as f32);
             cache.append(0, &k, &v).unwrap();
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
         assert_eq!(cache.position(), 3);
 
@@ -718,7 +822,7 @@ mod tests {
         for i in 0..4 {
             let (k, v) = token_kv(heads, dim, i as f32);
             cache.append(0, &k, &v).unwrap();
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
         assert_eq!(cache.pages_allocated(), 2);
 
@@ -738,7 +842,7 @@ mod tests {
         for i in 0..3 {
             let (k, v) = token_kv(heads, dim, i as f32);
             cache.append(0, &k, &v).unwrap();
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
 
         cache.truncate(0).unwrap();
@@ -754,7 +858,7 @@ mod tests {
         let mut cache = PagedKvCache::new(config, 1, 2, 1);
         let (k, v) = token_kv(1, 2, 0.0);
         cache.append(0, &k, &v).unwrap();
-        cache.advance(1);
+        cache.advance(1).unwrap();
 
         cache.truncate(1).unwrap(); // no-op
         assert_eq!(cache.position(), 1);
@@ -778,7 +882,7 @@ mod tests {
         for i in 0..4 {
             let (k, v) = token_kv(heads, dim, i as f32);
             cache.append(0, &k, &v).unwrap();
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
 
         // Truncate to exactly 2 → keep first page, free second.
@@ -803,7 +907,7 @@ mod tests {
             for layer in 0..layers {
                 cache.append(layer, &k, &v).unwrap();
             }
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
 
         // Each layer should have 2 pages (page_size=2, 3 tokens).
@@ -828,7 +932,7 @@ mod tests {
         for _ in 0..3 {
             cache.append(0, &k, &v).unwrap();
             cache.append(1, &k, &v).unwrap();
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
 
         cache.reset();
@@ -850,7 +954,7 @@ mod tests {
 
         let (k, v) = token_kv(heads, dim, 0.0);
         cache.append(0, &k, &v).unwrap();
-        cache.advance(1);
+        cache.advance(1).unwrap();
 
         // One page: 2 * (heads * page_size * dim * sizeof(f32))
         let expected = 2 * heads * 4 * dim * 4; // 2 sides × 2 heads × 4 slots × 8 dim × 4 bytes
@@ -878,7 +982,7 @@ mod tests {
         for i in 0..4 {
             let (k, v) = token_kv(heads, dim, i as f32);
             cache.append(0, &k, &v).unwrap();
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
         assert_eq!(cache.pages_free(), 2);
 
@@ -891,12 +995,37 @@ mod tests {
         for i in 0..4 {
             let (k, v) = token_kv(heads, dim, (10 + i) as f32);
             cache.append(0, &k, &v).unwrap();
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
         assert_eq!(cache.position(), 6);
 
         let (kt, _) = cache.gather(0, &Device::Cpu).unwrap();
         assert_eq!(kt.dims(), &[1, 1, 6, dim]);
+    }
+
+    #[test]
+    fn truncate_retains_block_allocations() {
+        let config = PagedKvConfig::new(2, 10);
+        let (heads, dim) = (1, 2);
+        let mut cache = PagedKvCache::new(config, 1, dim, heads);
+
+        // Append 4 tokens (2 pages), then truncate to 0.
+        for i in 0..4 {
+            let (k, v) = token_kv(heads, dim, i as f32);
+            cache.append(0, &k, &v).unwrap();
+            cache.advance(1).unwrap();
+        }
+        cache.truncate(0).unwrap();
+
+        // Pool entries should still exist (blocks retained for reuse).
+        // Re-appending should reuse those allocations, not create new ones.
+        for i in 0..4 {
+            let (k, v) = token_kv(heads, dim, i as f32);
+            cache.append(0, &k, &v).unwrap();
+            cache.advance(1).unwrap();
+        }
+        assert_eq!(cache.position(), 4);
+        assert_eq!(cache.pages_allocated(), 2);
     }
 
     // -- Multi-head gather correctness --
@@ -919,7 +1048,7 @@ mod tests {
                 }
             }
             cache.append(0, &k_data, &v_data).unwrap();
-            cache.advance(1);
+            cache.advance(1).unwrap();
         }
 
         let (kt, _vt) = cache.gather(0, &Device::Cpu).unwrap();
@@ -940,6 +1069,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -- Error variant test --
+
+    #[test]
+    fn errors_use_paged_kv_cache_variant() {
+        let config = PagedKvConfig::new(4, 100);
+        let cache = PagedKvCache::new(config, 2, 4, 2);
+        let err = cache.gather(5, &Device::Cpu).unwrap_err();
+        // Should use PagedKvCacheFailed, not SpeculativeDecodeFailed.
+        assert!(err.to_string().starts_with("paged KV cache error:"));
     }
 
     // -- Debug formatting --
