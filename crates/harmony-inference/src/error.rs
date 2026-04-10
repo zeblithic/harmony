@@ -33,6 +33,10 @@ pub enum InferenceError {
     #[error("engram resolution failed: {0}")]
     EngramResolutionFailed(String),
 
+    /// Paged KV cache operation failed (pool exhaustion, invalid layer, etc.).
+    #[error("paged KV cache error: {0}")]
+    PagedKvCacheFailed(String),
+
     /// Speculative decode state machine error (e.g. push_draft while idle).
     #[error("speculative decode error: {0}")]
     SpeculativeDecodeFailed(String),
@@ -51,6 +55,17 @@ pub enum InferenceError {
     #[cfg(feature = "kv-compress")]
     #[error("serialization failed: {0}")]
     SerializationFailed(String),
+}
+
+#[cfg(test)]
+mod base_tests {
+    use super::*;
+
+    #[test]
+    fn paged_kv_cache_failed_displays_message() {
+        let err = InferenceError::PagedKvCacheFailed("pool exhausted".into());
+        assert_eq!(err.to_string(), "paged KV cache error: pool exhausted");
+    }
 }
 
 #[cfg(test)]
