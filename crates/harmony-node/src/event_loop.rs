@@ -1509,30 +1509,37 @@ pub async fn run(
                             .and_then(|(client, module)| {
                                 // Try latent projection first, fall back to token hash
                                 let request = if let Some(proj) = engine.latent_projection() {
-                                    engine.token_embeddings(&tokens).ok().and_then(|emb| {
-                                        proj.project_ngrams(&emb, tokens.len()).ok().and_then(|(keys, positions)| {
+                                    match engine.token_embeddings(&tokens)
+                                        .map_err(|e| e.to_string())
+                                        .and_then(|emb| {
+                                            proj.project_ngrams(&emb, tokens.len())
+                                                .map_err(|e| e.to_string())
+                                        })
+                                        .and_then(|(keys, positions)| {
                                             harmony_inference::engram_bridge::prepare_engram_request_latent(
                                                 client, &keys, &positions, tokens.len(),
-                                            ).ok()
-                                        })
-                                    }).or_else(|| {
-                                        tracing::debug!("latent projection failed — falling back to token hash");
-                                        harmony_inference::engram_bridge::prepare_engram_request(client, &tokens).ok()
-                                    })
+                                            ).map_err(|e| e.to_string())
+                                        }) {
+                                        Ok(req) => Ok(req),
+                                        Err(latent_err) => {
+                                            tracing::debug!(err = %latent_err, "latent projection failed — falling back to token hash");
+                                            harmony_inference::engram_bridge::prepare_engram_request(client, &tokens)
+                                        }
+                                    }
                                 } else {
-                                    harmony_inference::engram_bridge::prepare_engram_request(client, &tokens).ok()
+                                    harmony_inference::engram_bridge::prepare_engram_request(client, &tokens)
                                 };
 
                                 match request {
-                                    Some(request) if !request.required_shards.is_empty() => {
+                                    Ok(request) if !request.required_shards.is_empty() => {
                                         Some((client.clone(), module.clone(), request))
                                     }
-                                    Some(_) => {
+                                    Ok(_) => {
                                         tracing::debug!("engram: no shards needed (short sequence)");
                                         None
                                     }
-                                    None => {
-                                        tracing::warn!("engram prepare failed — skipping");
+                                    Err(e) => {
+                                        tracing::warn!(err = %e, "engram prepare failed — skipping");
                                         None
                                     }
                                 }
@@ -2765,16 +2772,23 @@ fn run_inference_loop(
                 if history.len() >= 2 {
                     let window = &history[history.len().saturating_sub(3)..];
                     let req_result = if let Some(proj) = engine.latent_projection() {
-                        engine.token_embeddings(window).ok().and_then(|emb| {
-                            proj.project_ngrams(&emb, window.len()).ok().and_then(|(keys, positions)| {
+                        match engine.token_embeddings(window)
+                            .map_err(|e| e.to_string())
+                            .and_then(|emb| {
+                                proj.project_ngrams(&emb, window.len())
+                                    .map_err(|e| e.to_string())
+                            })
+                            .and_then(|(keys, positions)| {
                                 harmony_inference::engram_bridge::prepare_engram_request_latent(
                                     &ep.client, &keys, &positions, window.len(),
-                                ).ok()
-                            })
-                        }).or_else(|| {
-                            tracing::debug!("latent projection failed in decode — falling back");
-                            harmony_inference::engram_bridge::prepare_engram_request(&ep.client, window).ok()
-                        })
+                                ).map_err(|e| e.to_string())
+                            }) {
+                            Ok(req) => Some(req),
+                            Err(latent_err) => {
+                                tracing::debug!(err = %latent_err, "latent projection failed in decode — falling back");
+                                harmony_inference::engram_bridge::prepare_engram_request(&ep.client, window).ok()
+                            }
+                        }
                     } else {
                         harmony_inference::engram_bridge::prepare_engram_request(&ep.client, window).ok()
                     };

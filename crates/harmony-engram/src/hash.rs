@@ -208,18 +208,15 @@ mod tests {
     }
 
     #[test]
-    fn compute_lookup_refactor_preserves_existing_hashes() {
+    fn compute_lookup_pinned_shard_and_offset_values() {
+        // Pin concrete shard_indices and entry_offsets for test_config() + [1,2,3].
+        // Any change here means compute_lookup changed behavior, which would
+        // silently corrupt existing Engram table lookups.
         let config = test_config();
-        let lookup_before = compute_lookup(&config, &[1, 2, 3]);
-        let expected_shard_0 = lookup_before.shard_indices[0];
-        let expected_shard_1 = lookup_before.shard_indices[1];
-        let expected_offset_0 = lookup_before.entry_offsets[0];
-        let expected_offset_1 = lookup_before.entry_offsets[1];
-        let lookup_after = compute_lookup(&config, &[1, 2, 3]);
-        assert_eq!(lookup_after.shard_indices[0], expected_shard_0);
-        assert_eq!(lookup_after.shard_indices[1], expected_shard_1);
-        assert_eq!(lookup_after.entry_offsets[0], expected_offset_0);
-        assert_eq!(lookup_after.entry_offsets[1], expected_offset_1);
+        let lookup = compute_lookup(&config, &[1, 2, 3]);
+        // Derived from xxhash64([1,2,3] as LE bytes, seed) % 12, then /3 and %3*8
+        assert_eq!(lookup.shard_indices, vec![3, 0]);
+        assert_eq!(lookup.entry_offsets, vec![16, 0]);
     }
 
     #[test]

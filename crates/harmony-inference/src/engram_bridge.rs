@@ -102,11 +102,18 @@ pub fn prepare_engram_request_latent(
     positions: &[usize],
     seq_len: usize,
 ) -> Result<EngramRequest> {
-    debug_assert_eq!(
-        binary_keys.len(),
-        positions.len(),
-        "binary_keys and positions must have the same length"
-    );
+    if binary_keys.len() != positions.len() {
+        candle_core::bail!(
+            "binary_keys.len()={} != positions.len()={}",
+            binary_keys.len(),
+            positions.len()
+        );
+    }
+    if let Some(&pos) = positions.iter().find(|&&p| p >= seq_len) {
+        candle_core::bail!(
+            "token_position {pos} out of bounds for seq_len={seq_len}"
+        );
+    }
 
     let mut lookups = Vec::with_capacity(binary_keys.len());
     let mut seen_shards = HashSet::new();

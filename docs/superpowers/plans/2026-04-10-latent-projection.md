@@ -710,11 +710,7 @@ Expected: FAIL — `prepare_engram_request_latent` does not exist yet.
 
 Add to `crates/harmony-inference/src/engram_bridge.rs`, after the `prepare_engram_request` function. Add the new import at the top:
 
-```rust
-use harmony_engram::EngramConfig;
-```
-
-Then add the function:
+Then add the function (uses `EngramClient` for real CID resolution via `collect_shards`):
 
 ```rust
 /// Phase 1 (latent): Build an [`EngramRequest`] from pre-computed binary keys.
@@ -728,35 +724,31 @@ Then add the function:
 /// (last token of the N-gram window, matching the convention in
 /// [`prepare_engram_request`]).
 pub fn prepare_engram_request_latent(
-    config: &EngramConfig,
+    client: &EngramClient,
     binary_keys: &[Vec<u8>],
     positions: &[usize],
     seq_len: usize,
 ) -> Result<EngramRequest> {
-    debug_assert_eq!(
-        binary_keys.len(),
-        positions.len(),
-        "binary_keys and positions must have the same length"
-    );
+    if binary_keys.len() != positions.len() {
+        candle_core::bail!(
+            "binary_keys.len()={} != positions.len()={}",
+            binary_keys.len(),
+            positions.len()
+        );
+    }
+    if let Some(&pos) = positions.iter().find(|&&p| p >= seq_len) {
+        candle_core::bail!(
+            "token_position {pos} out of bounds for seq_len={seq_len}"
+        );
+    }
 
     let mut lookups = Vec::with_capacity(binary_keys.len());
     let mut seen_shards = HashSet::new();
     let mut required_shards = Vec::new();
 
     for (key, &pos) in binary_keys.iter().zip(positions.iter()) {
-        let lookup = harmony_engram::hash::compute_lookup_from_bytes(config, key);
-        // Collect unique shard requests — same dedup logic as prepare_engram_request
-        for &shard_idx in &lookup.shard_indices {
-            if seen_shards.insert(shard_idx) {
-                // No CID resolution for latent keys — set placeholder CID.
-                // The caller (event loop) fetches shards by index from the
-                // already-loaded shard data in the ChunkedEngramScheduler cache.
-                required_shards.push(ShardRequest {
-                    shard_index: shard_idx,
-                    cid: [0u8; 32],
-                });
-            }
-        }
+        let lookup = harmony_engram::hash::compute_lookup_from_bytes(client.config(), key);
+        collect_shards(client, &lookup, &mut seen_shards, &mut required_shards)?;
         lookups.push(NgramLookup {
             token_position: pos,
             lookup,

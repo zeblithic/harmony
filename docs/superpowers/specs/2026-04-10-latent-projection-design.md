@@ -61,7 +61,7 @@ pub fn project_ngrams(
 
 ```rust
 pub fn prepare_engram_request_latent(
-    config: &EngramConfig,
+    client: &EngramClient,
     binary_keys: &[Vec<u8>],
     positions: &[usize],
     seq_len: usize,
@@ -131,6 +131,7 @@ pub fn contrastive_loss(
     original: &Tensor,    // [batch, seq_len, hidden_dim]
     projected: &Tensor,   // [batch, seq_len, latent_dim]
     temperature: f32,
+    k: usize,             // number of top neighbors to preserve
 ) -> Result<Tensor>
 ```
 
@@ -195,7 +196,7 @@ If no latent projection weights are present in the GGUF:
 | `harmony-inference/src/harmony_engine.rs` | `latent_projection` field, getter/setter, auto-load in `load_gguf()` |
 | `harmony-engram/src/hash.rs` | `compute_lookup_from_bytes()` + refactor `compute_lookup` to use it |
 | `harmony-inference/src/engram_bridge.rs` | `prepare_engram_request_latent()` function |
-| `harmony-inference/src/chunked_engram.rs` | `prepare_request()` accepts optional `&LatentProjection` + model ref |
+| `harmony-inference/src/chunked_engram.rs` | New `prepare_request_latent()` method; existing `prepare_request()` unchanged |
 | `harmony-node/src/event_loop.rs` | Conditional path: if projection available, use latent keys |
 
 Not changed: `engram_residual.rs`, `uq_head.rs`, `speculative_decode.rs`, `config.rs`, `continuous_thought.rs`.

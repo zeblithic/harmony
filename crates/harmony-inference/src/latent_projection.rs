@@ -71,33 +71,34 @@ impl LatentProjection {
         }
 
         let emb = embeddings.squeeze(0)?; // [seq_len, hidden_dim]
-        let mut averaged = Vec::new();
-        let mut positions = Vec::new();
 
-        // Bigrams
-        for i in 0..seq_len - 1 {
-            let a = emb.get(i)?;
-            let b = emb.get(i + 1)?;
-            let avg = ((&a + &b)? * 0.5)?;
-            averaged.push(avg);
-            positions.push(i + 1);
+        // Bigram averages via bulk slicing: avg(emb[0..n-1], emb[1..n])
+        let num_bi = seq_len - 1;
+        let bi_avg = ((emb.narrow(0, 0, num_bi)? + emb.narrow(0, 1, num_bi)?)? * 0.5)?;
+
+        // Trigram averages: avg(emb[0..n-2], emb[1..n-1], emb[2..n])
+        let num_tri = seq_len.saturating_sub(2);
+        let parts = if num_tri > 0 {
+            let tri_sum = (emb.narrow(0, 0, num_tri)? + emb.narrow(0, 1, num_tri)?)?;
+            let tri_sum = (tri_sum + emb.narrow(0, 2, num_tri)?)?;
+            let tri_avg = (tri_sum * (1.0 / 3.0))?;
+            // Concatenate: [num_bi + num_tri, hidden_dim]
+            Tensor::cat(&[&bi_avg, &tri_avg], 0)?
+        } else {
+            bi_avg
+        };
+
+        // Positions: bigrams at 1..seq_len, trigrams at 2..seq_len
+        let mut positions = Vec::with_capacity(num_bi + num_tri);
+        for i in 1..=num_bi {
+            positions.push(i);
+        }
+        for i in 2..2 + num_tri {
+            positions.push(i);
         }
 
-        // Trigrams
-        for i in 0..seq_len.saturating_sub(2) {
-            let a = emb.get(i)?;
-            let b = emb.get(i + 1)?;
-            let c = emb.get(i + 2)?;
-            let sum = (&a + &b)?;
-            let sum = (&sum + &c)?;
-            let avg = (sum * (1.0 / 3.0))?;
-            averaged.push(avg);
-            positions.push(i + 2);
-        }
-
-        // Stack into [1, num_ngrams, hidden_dim] and project
-        let stacked = Tensor::stack(&averaged, 0)?.unsqueeze(0)?;
-        let latent = self.project(&stacked)?;
+        // Project all N-grams in one batch: [1, num_ngrams, hidden_dim]
+        let latent = self.project(&parts.unsqueeze(0)?)?;
         let keys = self.to_binary_keys(&latent)?;
 
         Ok((keys, positions))
@@ -127,6 +128,8 @@ impl LatentProjection {
 /// Input: `[N, D]`. Returns: `[N, N]` similarity matrix.
 fn cosine_similarity_matrix(x: &Tensor) -> Result<Tensor> {
     let norm = x.sqr()?.sum_keepdim(1)?.sqrt()?;
+    let eps = Tensor::new(1e-8f32, x.device())?.broadcast_as(norm.shape())?;
+    let norm = norm.maximum(&eps)?;
     let normalized = x.broadcast_div(&norm)?;
     normalized.matmul(&normalized.t()?)
 }
@@ -151,6 +154,12 @@ pub fn contrastive_loss(
     // Flatten batch: [B, S, D] → [B*S, D]
     let (b, s, _) = original.dims3()?;
     let n = b * s;
+
+    // Need at least 2 vectors for contrastive loss (anchor + neighbor).
+    if n <= 1 {
+        return Tensor::new(0.0f32, original.device());
+    }
+
     let orig_flat = original.reshape((n, ()))?;
     let proj_flat = projected.reshape((n, ()))?;
 
@@ -164,8 +173,15 @@ pub fn contrastive_loss(
         return Tensor::new(0.0f32, original.device());
     }
 
-    // Scale projected similarities by temperature
+    // Scale projected similarities by temperature, mask diagonal to -inf
+    // so self-similarity doesn't dominate the softmax partition.
     let logits = (sim_proj / temperature as f64)?;
+    let mut mask_data = vec![0.0f32; n * n];
+    for i in 0..n {
+        mask_data[i * n + i] = -1e9;
+    }
+    let diag_mask = Tensor::from_vec(mask_data, (n, n), original.device())?;
+    let logits = (logits + diag_mask)?;
 
     // Build soft target distribution from original similarities:
     // For each row, keep only the top-k values (excluding self), zero others,
@@ -181,7 +197,7 @@ pub fn contrastive_loss(
             .filter(|&(j, _)| j != i)
             .map(|(j, &v)| (j, v))
             .collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         for &(j, _) in indexed.iter().take(k) {
             target_data[i][j] = orig_data[i][j];

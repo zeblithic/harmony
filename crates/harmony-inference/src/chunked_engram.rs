@@ -249,6 +249,14 @@ impl ChunkedEngramScheduler {
         embeddings: &candle_core::Tensor,
     ) -> Result<EngramRequest, InferenceError> {
         let window_len = self.token_buffer.len();
+        let emb_seq_len = embeddings.dim(1).map_err(|e| {
+            InferenceError::EngramResolutionFailed(format!("invalid embeddings shape: {e}"))
+        })?;
+        if emb_seq_len != window_len {
+            return Err(InferenceError::EngramResolutionFailed(format!(
+                "embeddings seq_len ({emb_seq_len}) != token_buffer len ({window_len})"
+            )));
+        }
         let (keys, positions) = projection
             .project_ngrams(embeddings, window_len)
             .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))?;
