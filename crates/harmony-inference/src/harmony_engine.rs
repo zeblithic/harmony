@@ -15,6 +15,7 @@ use std::io::Cursor;
 use crate::continuous_thought::{ContinuousThoughtConfig, ThoughtAction};
 use crate::engine::EngramContext;
 use crate::error::InferenceError;
+use crate::latent_projection::LatentProjection;
 use crate::harmony_model::{EngramFn, HarmonyForwardOutput, HarmonyModel, HarmonyModelConfig};
 use crate::uq_features::{extract_uq_features, UqFeatureConfig};
 use crate::uq_head::{UqClass, UqHead};
@@ -40,6 +41,7 @@ pub struct HarmonyEngine {
     model: Option<HarmonyModel>,
     tokenizer: Option<tokenizers::Tokenizer>,
     uq_head: Option<UqHead>,
+    latent_projection: Option<LatentProjection>,
     uq_feature_config: UqFeatureConfig,
     thought_config: ContinuousThoughtConfig,
     config: HarmonyModelConfig,
@@ -61,6 +63,7 @@ impl HarmonyEngine {
             model: None,
             tokenizer: None,
             uq_head: None,
+            latent_projection: None,
             uq_feature_config,
             thought_config,
             config,
@@ -84,6 +87,26 @@ impl HarmonyEngine {
     /// classification result instead of `None`.
     pub fn set_uq_head(&mut self, uq_head: UqHead) {
         self.uq_head = Some(uq_head);
+    }
+
+    /// Set the latent projection for semantic Engram key generation.
+    pub fn set_latent_projection(&mut self, proj: LatentProjection) {
+        self.latent_projection = Some(proj);
+    }
+
+    /// Reference to the latent projection, if loaded.
+    pub fn latent_projection(&self) -> Option<&LatentProjection> {
+        self.latent_projection.as_ref()
+    }
+
+    /// Look up token embeddings without running the transformer.
+    ///
+    /// Delegates to [`HarmonyModel::token_embeddings`].
+    pub fn token_embeddings(&self, token_ids: &[u32]) -> Result<Tensor, InferenceError> {
+        let model = self.model.as_ref().ok_or(InferenceError::ModelNotLoaded)?;
+        model
+            .token_embeddings(token_ids)
+            .map_err(|e| InferenceError::ForwardFailed(e.to_string()))
     }
 
     /// Reference to the device this engine targets.
@@ -318,6 +341,28 @@ impl InferenceEngine for HarmonyEngine {
                 think_token_id: None,
                 ..ContinuousThoughtConfig::default()
             };
+        }
+
+        // Auto-detect latent projection weights.
+        let lp_key = "harmony.latent_projection.layer1.weight";
+        if content.tensor_infos.contains_key(lp_key) {
+            let w1 = content.tensor(&mut cursor, "harmony.latent_projection.layer1.weight", &self.device)
+                .and_then(|qt| qt.dequantize(&self.device))
+                .map_err(|e| InferenceError::InvalidGguf(format!("latent projection layer1.weight: {e}")))?;
+            let b1 = content.tensor(&mut cursor, "harmony.latent_projection.layer1.bias", &self.device)
+                .and_then(|qt| qt.dequantize(&self.device))
+                .map_err(|e| InferenceError::InvalidGguf(format!("latent projection layer1.bias: {e}")))?;
+            let w2 = content.tensor(&mut cursor, "harmony.latent_projection.layer2.weight", &self.device)
+                .and_then(|qt| qt.dequantize(&self.device))
+                .map_err(|e| InferenceError::InvalidGguf(format!("latent projection layer2.weight: {e}")))?;
+            let b2 = content.tensor(&mut cursor, "harmony.latent_projection.layer2.bias", &self.device)
+                .and_then(|qt| qt.dequantize(&self.device))
+                .map_err(|e| InferenceError::InvalidGguf(format!("latent projection layer2.bias: {e}")))?;
+            let proj = LatentProjection::from_tensors(w1, b1, w2, b2)
+                .map_err(|e| InferenceError::InvalidGguf(format!("latent projection: {e}")))?;
+            self.latent_projection = Some(proj);
+        } else {
+            self.latent_projection = None;
         }
 
         self.model = Some(model);
@@ -1102,5 +1147,33 @@ mod tests {
             );
         }
         assert_eq!(cache.position, 13); // 3 prefill + 10 decode
+    }
+
+    #[test]
+    fn engine_without_projection_returns_none() {
+        let config = HarmonyModelConfig::tiny();
+        let engine = HarmonyEngine::new(config, Device::Cpu);
+        assert!(engine.latent_projection().is_none());
+    }
+
+    #[test]
+    fn set_latent_projection_makes_it_available() {
+        let config = HarmonyModelConfig::tiny();
+        let mut engine = HarmonyEngine::new(config.clone(), Device::Cpu);
+        let proj = crate::latent_projection::LatentProjection::new_random(
+            config.hidden_dim, 16, 8, &Device::Cpu,
+        ).unwrap();
+        engine.set_latent_projection(proj);
+        assert!(engine.latent_projection().is_some());
+    }
+
+    #[test]
+    fn token_embeddings_delegator() {
+        let config = HarmonyModelConfig::tiny();
+        let mut engine = HarmonyEngine::new(config.clone(), Device::Cpu);
+        engine.init_random().unwrap();
+
+        let emb = engine.token_embeddings(&[1, 2, 3]).unwrap();
+        assert_eq!(emb.dims(), &[1, 3, config.hidden_dim]);
     }
 }
