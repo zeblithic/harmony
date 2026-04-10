@@ -21,6 +21,43 @@ use alloc::vec::Vec;
 /// builds the modulo/division will panic.  Callers must ensure the config is
 /// constructed from a valid [`ManifestHeader`](crate::ManifestHeader).
 pub fn compute_lookup(config: &EngramConfig, ngram_tokens: &[u32]) -> EngramLookup {
+    lookup_from_hash(config, |seed| hash_ngram(ngram_tokens, seed))
+}
+
+/// Hash arbitrary bytes with a single seed.
+fn hash_bytes(bytes: &[u8], seed: u64) -> u64 {
+    xxhash_rust::xxh64::xxh64(bytes, seed)
+}
+
+/// Hash an N-gram's token bytes with a single seed.
+///
+/// Tokens are encoded as contiguous little-endian u32 bytes.
+fn hash_ngram(tokens: &[u32], seed: u64) -> u64 {
+    let byte_len = tokens.len() * 4;
+    if byte_len <= 128 {
+        let mut buf = [0u8; 128];
+        for (i, t) in tokens.iter().enumerate() {
+            buf[i * 4..(i + 1) * 4].copy_from_slice(&t.to_le_bytes());
+        }
+        hash_bytes(&buf[..byte_len], seed)
+    } else {
+        let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        hash_bytes(&bytes, seed)
+    }
+}
+
+/// Compute the [`EngramLookup`] for arbitrary key bytes.
+///
+/// Same hashing logic as [`compute_lookup`] but accepts raw bytes instead of
+/// token N-grams. Used by latent projection to hash binary LSH codes.
+pub fn compute_lookup_from_bytes(config: &EngramConfig, key_bytes: &[u8]) -> EngramLookup {
+    lookup_from_hash(config, |seed| hash_bytes(key_bytes, seed))
+}
+
+/// Shared shard/offset computation. `hash_fn(seed)` produces the raw hash
+/// for a given head seed — the rest of the arithmetic is identical regardless
+/// of whether the input was token bytes or raw LSH codes.
+fn lookup_from_hash(config: &EngramConfig, hash_fn: impl Fn(u64) -> u64) -> EngramLookup {
     debug_assert!(config.total_entries > 0, "total_entries must be positive");
     debug_assert!(config.shard_size > 0, "shard_size must be positive");
     debug_assert_eq!(
@@ -34,7 +71,7 @@ pub fn compute_lookup(config: &EngramConfig, ngram_tokens: &[u32]) -> EngramLook
     let mut entry_offsets = Vec::with_capacity(config.num_heads as usize);
 
     for seed in &config.hash_seeds {
-        let raw_hash = hash_ngram(ngram_tokens, *seed);
+        let raw_hash = hash_fn(*seed);
         let table_index = raw_hash % config.total_entries;
         let shard_index = table_index / config.shard_size as u64;
         let entry_within_shard = (table_index % config.shard_size as u64) as usize;
@@ -47,23 +84,6 @@ pub fn compute_lookup(config: &EngramConfig, ngram_tokens: &[u32]) -> EngramLook
     EngramLookup {
         shard_indices,
         entry_offsets,
-    }
-}
-
-/// Hash an N-gram's token bytes with a single seed.
-///
-/// Tokens are encoded as contiguous little-endian u32 bytes.
-fn hash_ngram(tokens: &[u32], seed: u64) -> u64 {
-    let byte_len = tokens.len() * 4;
-    if byte_len <= 128 {
-        let mut buf = [0u8; 128];
-        for (i, t) in tokens.iter().enumerate() {
-            buf[i * 4..(i + 1) * 4].copy_from_slice(&t.to_le_bytes());
-        }
-        xxhash_rust::xxh64::xxh64(&buf[..byte_len], seed)
-    } else {
-        let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
-        xxhash_rust::xxh64::xxh64(&bytes, seed)
     }
 }
 
@@ -166,5 +186,30 @@ mod tests {
         let config = test_config();
         let lookup = compute_lookup(&config, &[]);
         assert_eq!(lookup.shard_indices.len(), 2);
+    }
+
+    #[test]
+    fn compute_lookup_pinned_shard_and_offset_values() {
+        // Pin concrete shard_indices and entry_offsets for test_config() + [1,2,3].
+        // Any change here means compute_lookup changed behavior, which would
+        // silently corrupt existing Engram table lookups.
+        let config = test_config();
+        let lookup = compute_lookup(&config, &[1, 2, 3]);
+        // Derived from xxhash64([1,2,3] as LE bytes, seed) % 12, then /3 and %3*8
+        assert_eq!(lookup.shard_indices, vec![3, 0]);
+        assert_eq!(lookup.entry_offsets, vec![16, 0]);
+    }
+
+    #[test]
+    fn compute_lookup_from_bytes_matches_manual() {
+        let config = test_config();
+        let bytes: Vec<u8> = [1u32, 2, 3]
+            .iter()
+            .flat_map(|t| t.to_le_bytes())
+            .collect();
+        let from_bytes = compute_lookup_from_bytes(&config, &bytes);
+        let from_tokens = compute_lookup(&config, &[1, 2, 3]);
+        assert_eq!(from_bytes.shard_indices, from_tokens.shard_indices);
+        assert_eq!(from_bytes.entry_offsets, from_tokens.entry_offsets);
     }
 }

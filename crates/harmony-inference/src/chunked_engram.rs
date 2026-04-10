@@ -220,6 +220,11 @@ impl ChunkedEngramScheduler {
         Ok(())
     }
 
+    /// Access the current token buffer (for latent projection).
+    pub fn token_buffer(&self) -> &VecDeque<u32> {
+        &self.token_buffer
+    }
+
     /// Get the cached embedding for the current decode step.
     ///
     /// Returns `Some(&Tensor)` with shape `[1, 1, engram_dim]` if an
@@ -227,6 +232,41 @@ impl ChunkedEngramScheduler {
     /// [`resolve`](Self::resolve)), or `None` otherwise.
     pub fn cached_embedding(&self) -> Option<&Tensor> {
         self.cached_embedding.as_ref()
+    }
+
+    /// Prepare an Engram request using latent projection instead of token hashing.
+    ///
+    /// When a [`LatentProjection`](crate::latent_projection::LatentProjection) is
+    /// available, projects the token embeddings through the MLP and generates
+    /// binary LSH keys instead of xxhash64 token-byte keys.
+    ///
+    /// The caller provides `embeddings` for the current token buffer (from
+    /// `engine.token_embeddings()`).
+    pub fn prepare_request_latent(
+        &self,
+        client: &EngramClient,
+        projection: &crate::latent_projection::LatentProjection,
+        embeddings: &candle_core::Tensor,
+    ) -> Result<EngramRequest, InferenceError> {
+        let window_len = self.token_buffer.len();
+        let emb_seq_len = embeddings.dim(1).map_err(|e| {
+            InferenceError::EngramResolutionFailed(format!("invalid embeddings shape: {e}"))
+        })?;
+        if emb_seq_len != window_len {
+            return Err(InferenceError::EngramResolutionFailed(format!(
+                "embeddings seq_len ({emb_seq_len}) != token_buffer len ({window_len})"
+            )));
+        }
+        let (keys, positions) = projection
+            .project_ngrams(embeddings, window_len)
+            .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))?;
+        engram_bridge::prepare_engram_request_latent(
+            client,
+            &keys,
+            &positions,
+            window_len,
+        )
+        .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))
     }
 
     /// Number of shards currently in the persistent cache.
@@ -289,12 +329,15 @@ mod tests {
 
     use harmony_engram::EngramConfig;
 
+    /// Embedding dimension used by test_client().
+    const EMBEDDING_DIM: usize = 4;
+
     /// Create a minimal EngramClient for testing.
     /// Mirrors the test_client() in engram_bridge.rs tests.
     fn test_client() -> EngramClient {
         let config = EngramConfig {
             version: "test".into(),
-            embedding_dim: 4,
+            embedding_dim: EMBEDDING_DIM,
             dtype_bytes: 2, // f16
             num_heads: 2,
             shard_size: 100,
@@ -594,5 +637,35 @@ mod tests {
         assert_eq!(scheduler.shard_cache_len(), 0);
         assert_eq!(scheduler.steps_since_refresh(), 0);
         assert!(scheduler.token_buffer.is_empty());
+    }
+
+    // ── Latent projection ───────────────────────────────────────────────
+
+    #[test]
+    fn prepare_request_with_latent_projection() {
+        let client = test_client();
+        let mut scheduler = ChunkedEngramScheduler::new(ChunkedEngramConfig::new(3));
+        scheduler.seed(&[10, 20, 30, 40, 50], None);
+
+        // Create a tiny latent projection matching EMBEDDING_DIM
+        let proj = crate::latent_projection::LatentProjection::new_random(
+            EMBEDDING_DIM, 8, 4, &Device::Cpu,
+        ).unwrap();
+
+        // Token buffer should have 5 tokens (max_window = chunk_size + 2 = 5)
+        let token_buf: Vec<u32> = scheduler.token_buffer().iter().copied().collect();
+        let dummy_embeddings = Tensor::randn(
+            0f32, 1.0,
+            (1, token_buf.len(), EMBEDDING_DIM),
+            &Device::Cpu,
+        ).unwrap();
+
+        let request = scheduler
+            .prepare_request_latent(&client, &proj, &dummy_embeddings)
+            .unwrap();
+
+        // Should have lookups (bigrams + trigrams from the 5-token window)
+        assert!(!request.lookups.is_empty());
+        assert_eq!(request.seq_len, token_buf.len());
     }
 }
