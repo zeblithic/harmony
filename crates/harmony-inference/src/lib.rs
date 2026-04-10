@@ -29,6 +29,7 @@ pub mod harmony_model;
 #[cfg(feature = "kv-compress")]
 pub(crate) mod kv_compress;
 pub(crate) mod kv_quantize;
+pub mod paged_kv;
 pub(crate) mod qwen3_ext;
 pub mod sampling;
 pub mod speculative_decode;
@@ -48,6 +49,7 @@ pub use engine::EngramContext;
 pub use engine::QwenEngine;
 pub use engram_residual::EngramGatedResidual;
 pub use error::InferenceError;
+pub use paged_kv::{BlockAllocator, PagedKvCache, PagedKvConfig};
 pub use speculative_decode::{
     DraftAction, DraftTree, SpecContext, SpecDecConfig, SpecDecMetrics,
     SpeculativeDecodeScheduler,
