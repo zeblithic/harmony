@@ -66,7 +66,7 @@ use crate::kv_quantize::Q8KvLayer;
 /// # Lifecycle
 ///
 /// ```ignore
-/// let cache = engine.new_cache()?.with_q8();
+/// let mut cache = engine.new_cache()?.with_q8();
 /// let logits = engine.forward(&tokens, &mut cache)?;
 /// ```
 pub struct InferenceCache {
@@ -244,23 +244,37 @@ impl InferenceCache {
             return Ok(());
         }
 
-        // If q8 is active, dequantize all layers back to F16 before TurboQuant
-        // compression. TurboQuant operates on F16 tensors.
-        if self.q8_enabled {
+        // Phase 1: build F16 source tensors for compression.
+        // If q8 is active, dequantize into a staging vec (no mutation of self).
+        // If not q8, borrow from self.layers directly.
+        let dequantized: Vec<Option<(Tensor, Tensor)>>;
+        let source: &[Option<(Tensor, Tensor)>] = if self.q8_enabled {
+            let mut buf: Vec<Option<(Tensor, Tensor)>> =
+                Vec::with_capacity(self.num_layers);
             for i in 0..self.num_layers {
-                if let Some(q8) = self.q8_layers[i].take() {
-                    let (k, v) = q8
-                        .dequantize(&candle_core::Device::Cpu)
-                        .map_err(|e| InferenceError::CompressionFailed(e.to_string()))?;
-                    self.layers[i] = Some((k, v));
+                match (&self.q8_layers[i], &self.layers[i]) {
+                    (Some(q8), _) => {
+                        let (k, v) = q8
+                            .dequantize(&candle_core::Device::Cpu)
+                            .map_err(|e| {
+                                InferenceError::CompressionFailed(e.to_string())
+                            })?;
+                        buf.push(Some((k, v)));
+                    }
+                    (None, Some((k, v))) => buf.push(Some((k.clone(), v.clone()))),
+                    _ => buf.push(None),
                 }
             }
-        }
+            dequantized = buf;
+            &dequantized
+        } else {
+            &self.layers
+        };
 
-        // Phase 1: compress into a staging buffer (no mutation yet)
+        // Phase 2: compress into a staging buffer (no mutation yet).
         let mut staging: Vec<Option<kv_compress::CompressedKvLayer>> =
             Vec::with_capacity(self.num_layers);
-        for layer in self.layers.iter() {
+        for layer in source.iter() {
             match layer {
                 Some((k, v)) => {
                     let (k_vecs, seq_len) = tq.compress_tensor(k)?;
@@ -276,10 +290,13 @@ impl InferenceCache {
             }
         }
 
-        // Phase 2: commit — swap staging into self, free tensors
+        // Phase 3: commit — swap staging into self, free tensors and q8 data.
         self.compressed = staging;
         for layer in self.layers.iter_mut() {
             *layer = None;
+        }
+        for q8 in self.q8_layers.iter_mut() {
+            *q8 = None;
         }
         self.is_compressed = true;
         Ok(())

@@ -37,7 +37,19 @@ impl Q8KvLayer {
     /// `k` and `v` must have shape `[1, num_kv_heads, seq_len, head_dim]`.
     /// The original dtype is stored and restored on [`Self::dequantize`].
     pub(crate) fn quantize(k: &Tensor, v: &Tensor) -> Result<Self> {
-        let (_, num_kv_heads, seq_len, head_dim) = k.dims4()?;
+        let (k_batch, num_kv_heads, seq_len, head_dim) = k.dims4()?;
+        let (v_batch, v_heads, v_seq, v_dim) = v.dims4()?;
+        if k_batch != 1 || v_batch != 1 {
+            candle_core::bail!(
+                "Q8KvLayer expects batch size 1, got k={k_batch}, v={v_batch}"
+            );
+        }
+        if (num_kv_heads, seq_len, head_dim) != (v_heads, v_seq, v_dim) {
+            candle_core::bail!(
+                "K/V shape mismatch: k=[1,{num_kv_heads},{seq_len},{head_dim}], \
+                 v=[1,{v_heads},{v_seq},{v_dim}]"
+            );
+        }
         let dtype = k.dtype();
         let num_vecs = num_kv_heads * seq_len;
 
@@ -305,5 +317,25 @@ mod tests {
         let (scale, qvec) = quantize_vec(&vals);
         assert_eq!(scale, 0.0);
         assert!(qvec.iter().all(|&q| q == 0));
+    }
+
+    #[test]
+    fn quantize_rejects_mismatched_shapes() {
+        let k = rand_f16(4, 8, 64);
+        let v = rand_f16(4, 16, 64); // different seq_len
+        assert!(Q8KvLayer::quantize(&k, &v).is_err());
+
+        let v2 = rand_f16(2, 8, 64); // different num_kv_heads
+        assert!(Q8KvLayer::quantize(&k, &v2).is_err());
+    }
+
+    #[test]
+    fn quantize_rejects_batch_not_one() {
+        let k = Tensor::rand(-1.0f32, 1.0, (2, 4, 8, 64), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let v = k.clone();
+        assert!(Q8KvLayer::quantize(&k, &v).is_err());
     }
 }
