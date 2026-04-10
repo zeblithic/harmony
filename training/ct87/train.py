@@ -119,6 +119,17 @@ def _save_uq_head(
     torch.save(uq_head.state_dict(), path)
 
 
+def _save_mtp_head(
+    mtp_head: torch.nn.Module,
+    step: int,
+    output_dir: str,
+) -> None:
+    """Save MTP head weights alongside the model checkpoint."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"mtp_head_step_{step}.pt")
+    torch.save(mtp_head.state_dict(), path)
+
+
 def load_checkpoint(
     model: HarmonyModel,
     output_dir: str,
@@ -257,6 +268,18 @@ def main() -> None:
         "--uq-loss-weight", type=float, default=0.1,
         help="Weight for UQ auxiliary loss (default: 0.1)",
     )
+    parser.add_argument(
+        "--mtp-head", action="store_true",
+        help="Enable multi-token prediction head (shared-weight recursive MTP)",
+    )
+    parser.add_argument(
+        "--mtp-depth", type=int, default=4,
+        help="Number of future tokens to predict (default: 4)",
+    )
+    parser.add_argument(
+        "--mtp-loss-weight", type=float, default=1.0,
+        help="Weight for MTP auxiliary loss (default: 1.0)",
+    )
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -298,6 +321,14 @@ def main() -> None:
 
     if args.uq_loss_weight < 0:
         print("Error: --uq-loss-weight must be >= 0", file=sys.stderr)
+        sys.exit(1)
+
+    if args.mtp_depth < 1:
+        print("Error: --mtp-depth must be >= 1", file=sys.stderr)
+        sys.exit(1)
+
+    if args.mtp_loss_weight < 0:
+        print("Error: --mtp-loss-weight must be >= 0", file=sys.stderr)
         sys.exit(1)
 
     device = detect_device(args.device)
@@ -355,11 +386,21 @@ def main() -> None:
         uq_param_count = sum(p.numel() for p in uq_head.parameters())
         print(f"UQ head enabled: {uq_param_count} params, loss_weight={args.uq_loss_weight}")
 
+    # MTP head setup
+    mtp_head = None
+    if args.mtp_head:
+        from ct87.mtp import MtpHead
+        mtp_head = MtpHead(config, depth=args.mtp_depth).to(device)
+        mtp_param_count = sum(p.numel() for p in mtp_head.parameters())
+        print(f"MTP head enabled: depth={args.mtp_depth}, {mtp_param_count:,} params, loss_weight={args.mtp_loss_weight}")
+
     muon_params, adam_params = partition_params(model)
     if thought_norm is not None:
         adam_params.extend(thought_norm.parameters())
     if uq_head is not None:
         adam_params.extend(uq_head.parameters())
+    if mtp_head is not None:
+        adam_params.extend(mtp_head.parameters())
     optimizer = Muon(muon_params, adam_params, lr=args.lr, adam_lr=args.lr)
     schedule = WSDSchedule(warmup_steps=args.warmup, total_steps=args.steps)
 
@@ -376,7 +417,7 @@ def main() -> None:
     csv_file = None
     csv_writer = None
     if args.log_file:
-        expected_header = ["step", "loss", "uq_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
+        expected_header = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         if os.path.exists(args.log_file) and os.path.getsize(args.log_file) > 0:
             with open(args.log_file, newline="") as existing:
                 header = next(csv.reader(existing), [])
@@ -400,7 +441,10 @@ def main() -> None:
 
             accum_loss = 0.0
             accum_uq_loss = 0.0
+            accum_mtp_loss = 0.0
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
+            need_hidden = mtp_head is not None
+            use_coconut = args.coconut and num_thoughts > 0
             for micro_step in range(args.grad_accum_steps):
                 batch = next(dataloader).to(device)
                 input_ids = batch[:, :-1]
@@ -415,28 +459,49 @@ def main() -> None:
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
                     # Forward pass (optionally with LayerNormCollector for UQ)
                     think_mask = None
+                    hidden = None
                     if uq_head is not None:
                         with LayerNormCollector(model, uq_feature_config.norm_layers) as collector:
-                            if args.coconut and num_thoughts > 0:
-                                logits, think_mask = coconut_forward(
+                            if use_coconut:
+                                coconut_result = coconut_forward(
                                     model, thought_norm, input_ids,
                                     args.think_token_id, num_thoughts,
                                     engram_embeddings=engram_emb,
+                                    return_hidden_states=need_hidden,
+                                )
+                                if need_hidden:
+                                    logits, think_mask, hidden = coconut_result
+                                else:
+                                    logits, think_mask = coconut_result
+                            elif need_hidden:
+                                logits, hidden = model(
+                                    input_ids, engram_embeddings=engram_emb,
+                                    return_hidden_states=True,
                                 )
                             else:
                                 logits = model(input_ids, engram_embeddings=engram_emb)
                         uq_norms = collector.get_norms()
-                    elif args.coconut and num_thoughts > 0:
-                        logits, think_mask = coconut_forward(
+                    elif use_coconut:
+                        coconut_result = coconut_forward(
                             model, thought_norm, input_ids,
                             args.think_token_id, num_thoughts,
                             engram_embeddings=engram_emb,
+                            return_hidden_states=need_hidden,
+                        )
+                        if need_hidden:
+                            logits, think_mask, hidden = coconut_result
+                        else:
+                            logits, think_mask = coconut_result
+                    elif need_hidden:
+                        logits, hidden = model(
+                            input_ids, engram_embeddings=engram_emb,
+                            return_hidden_states=True,
                         )
                     else:
                         logits = model(input_ids, engram_embeddings=engram_emb)
 
                     # Compute main LM loss
-                    if args.coconut and num_thoughts > 0:
+                    if use_coconut:
                         think_targets = torch.full(
                             (targets.shape[0], num_thoughts), -100,
                             dtype=targets.dtype, device=targets.device,
@@ -453,7 +518,7 @@ def main() -> None:
                                 uq_norms, logits.detach(), uq_feature_config,
                             )
                             # For COCONUT: use 0 as target at think positions
-                            if args.coconut and num_thoughts > 0:
+                            if use_coconut:
                                 uq_targets = aug_targets.clone()
                                 uq_targets[uq_targets == -100] = 0
                             else:
@@ -473,6 +538,22 @@ def main() -> None:
                         loss = loss + args.uq_loss_weight * uq_loss_val
                         accum_uq_loss += uq_loss_val.item()
 
+                    # MTP auxiliary loss
+                    if mtp_head is not None and hidden is not None:
+                        if use_coconut:
+                            # Skip think-token prefix: MTP only on real tokens
+                            mtp_hidden = hidden[:, num_thoughts:, :]
+                            mtp_targets = targets
+                        else:
+                            mtp_hidden = hidden
+                            mtp_targets = targets
+                        mtp_loss_val = mtp_head(
+                            mtp_hidden, mtp_targets,
+                            model.embed_tokens, model.lm_head,
+                        )
+                        loss = loss + args.mtp_loss_weight * mtp_loss_val
+                        accum_mtp_loss += mtp_loss_val.item()
+
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
 
@@ -483,6 +564,8 @@ def main() -> None:
                     all_params.extend(thought_norm.parameters())
                 if uq_head is not None:
                     all_params.extend(uq_head.parameters())
+                if mtp_head is not None:
+                    all_params.extend(mtp_head.parameters())
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     all_params, args.max_grad_norm,
                 ).item()
@@ -499,7 +582,11 @@ def main() -> None:
                 if uq_head is not None:
                     raw_uq = accum_uq_loss / args.grad_accum_steps
                     uq_str = f"  uq_loss={raw_uq:.4f}"
-                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}{ct_str}{uq_str}")
+                mtp_str = ""
+                if mtp_head is not None:
+                    raw_mtp = accum_mtp_loss / args.grad_accum_steps
+                    mtp_str = f"  mtp_loss={raw_mtp:.4f}"
+                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}{ct_str}{uq_str}{mtp_str}")
 
             val_loss_str = ""
             if args.save_every > 0 and step > 0 and step % args.save_every == 0:
@@ -508,6 +595,8 @@ def main() -> None:
                     _save_thought_norm(thought_norm, step, args.output_dir)
                 if uq_head is not None:
                     _save_uq_head(uq_head, step, args.output_dir)
+                if mtp_head is not None:
+                    _save_mtp_head(mtp_head, step, args.output_dir)
                 print(f"  -> checkpoint saved at step {step}")
                 if val_loader is not None:
                     val_loss = compute_validation_loss(
@@ -524,10 +613,14 @@ def main() -> None:
                 uq_loss_str = ""
                 if uq_head is not None:
                     uq_loss_str = f"{accum_uq_loss / args.grad_accum_steps:.6f}"
+                mtp_loss_str = ""
+                if mtp_head is not None:
+                    mtp_loss_str = f"{accum_mtp_loss / args.grad_accum_steps:.6f}"
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
                     uq_loss_str,
+                    mtp_loss_str,
                     val_loss_str,
                     f"{current_lr:.8f}",
                     f"{grad_norm:.6f}" if grad_norm is not None else "",
@@ -541,6 +634,8 @@ def main() -> None:
             _save_thought_norm(thought_norm, args.steps, args.output_dir)
         if uq_head is not None:
             _save_uq_head(uq_head, args.steps, args.output_dir)
+        if mtp_head is not None:
+            _save_mtp_head(mtp_head, args.steps, args.output_dir)
         if val_loader is not None:
             val_loss = compute_validation_loss(
                 model, val_loader, config.vocab_size, device,
