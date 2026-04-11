@@ -367,6 +367,56 @@ class EngramTable:
 
         return result.to(self.device)
 
+    def lookup_from_keys(
+        self,
+        binary_keys: list[bytes],
+        positions: list[int],
+        batch_size: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Look up Engram embeddings from pre-computed binary keys.
+
+        Unlike lookup_batch_projected(), this does not run the projection —
+        it takes pre-computed keys directly. Used by contrastive co-training
+        where keys are computed once (with grad) and reused for both
+        contrastive loss and table lookup.
+
+        All keys/positions belong to batch item 0. For multi-item batches,
+        call once per batch item and stack, or extend with batch indexing.
+
+        Args:
+            binary_keys: list of binary key bytes from to_binary_keys()
+            positions: token position each key is attributed to
+            batch_size: output batch dimension (typically 1 per call)
+            seq_len: output sequence length dimension
+
+        Returns:
+            [batch_size, seq_len, engram_dim] embedding tensor
+        """
+        batch_indices: list[int] = []
+        pos_list: list[int] = []
+        table_indices: list[int] = []
+
+        for key_bytes, pos in zip(binary_keys, positions):
+            for seed in self.hash_seeds:
+                idx = _xxhash64(key_bytes, seed) % self.total_entries
+                batch_indices.append(0)
+                pos_list.append(pos)
+                table_indices.append(idx)
+
+        result = torch.zeros(
+            batch_size, seq_len, self.engram_dim, dtype=torch.float32,
+        )
+
+        if table_indices:
+            idx_t = torch.tensor(table_indices, dtype=torch.long)
+            embs = self.table[idx_t]
+
+            for i, (b, pos) in enumerate(zip(batch_indices, pos_list)):
+                result[b, pos] += embs[i]
+
+        return result.to(self.device)
+
     def _collect_indices(
         self,
         tokens: list[int],
