@@ -162,11 +162,15 @@ def compute_validation_loss(
     thought_norm: torch.nn.Module | None = None,
     think_token_id: int | None = None,
     num_thoughts: int = 0,
+    latent_projection: torch.nn.Module | None = None,
 ) -> float:
     """Run validation and return average cross-entropy loss.
 
     When thought_norm and think_token_id are provided with num_thoughts > 0,
     uses COCONUT forward/loss so val_loss matches the training objective.
+
+    When latent_projection is provided, uses projection-generated keys for
+    engram lookup instead of xxhash (must also provide engram_table).
     """
     was_training = model.training
     model.train(False)
@@ -183,7 +187,12 @@ def compute_validation_loss(
                 input_ids = batch[:, :-1]
                 targets = batch[:, 1:]
                 engram_emb = None
-                if engram_table is not None:
+                if engram_table is not None and latent_projection is not None:
+                    emb = model.embed_tokens(input_ids)
+                    engram_emb = engram_table.lookup_batch_projected(
+                        input_ids, emb, latent_projection,
+                    )
+                elif engram_table is not None:
                     engram_emb = engram_table.lookup_batch(input_ids)
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
                     if use_coconut:
@@ -250,6 +259,19 @@ def main() -> None:
         help="Comma-separated xxhash64 seeds for Engram table lookup (default: 42,99,137,251)",
     )
     parser.add_argument(
+        "--latent-projection", type=str, default=None,
+        help="Path to frozen latent projection checkpoint (switches engram lookup "
+             "from xxhash to projection-generated keys for fine-tuning)",
+    )
+    parser.add_argument(
+        "--latent-intermediate-dim", type=int, default=None,
+        help="Intermediate dimension for latent projection MLP",
+    )
+    parser.add_argument(
+        "--latent-dim", type=int, default=None,
+        help="Output dimension for latent projection MLP",
+    )
+    parser.add_argument(
         "--coconut", action="store_true",
         help="Enable COCONUT continuous thought training",
     )
@@ -302,6 +324,21 @@ def main() -> None:
     if args.coconut and args.think_token_id is None:
         print("Error: --think-token-id is required with --coconut", file=sys.stderr)
         sys.exit(1)
+
+    if args.latent_projection is not None:
+        if args.latent_intermediate_dim is None or args.latent_dim is None:
+            print(
+                "Error: --latent-projection requires both "
+                "--latent-intermediate-dim and --latent-dim",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.engram_table is None:
+            print(
+                "Error: --latent-projection requires --engram-table",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     config = HarmonyModelConfig.tiny() if args.config == "tiny" else HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config == "tiny" else 2048)
@@ -376,6 +413,28 @@ def main() -> None:
         print(
             f"Engram table loaded: {engram_table.total_entries:,} entries, "
             f"dim={engram_table.engram_dim}, heads={engram_table.num_heads}"
+        )
+
+    # Latent projection for fine-tuning with projection-generated engram keys.
+    # The projection is frozen — only the model (especially EngramGatedResidual)
+    # adapts to the new key distribution.
+    latent_projection = None
+    if args.latent_projection is not None:
+        from ct87.latent_projection import LatentProjection
+
+        latent_projection = LatentProjection.from_checkpoint(
+            args.latent_projection,
+            hidden_dim=config.hidden_dim,
+            intermediate_dim=args.latent_intermediate_dim,
+            latent_dim=args.latent_dim,
+            device=device,
+        )
+        latent_projection.requires_grad_(False)
+        proj_params = sum(p.numel() for p in latent_projection.parameters())
+        print(
+            f"Latent projection loaded (frozen): "
+            f"{config.hidden_dim}->{args.latent_intermediate_dim}->{args.latent_dim}, "
+            f"{proj_params:,} params"
         )
 
     # COCONUT continuous thought setup
@@ -486,7 +545,13 @@ def main() -> None:
 
                 # Compute Engram embeddings if table is loaded
                 engram_emb = None
-                if engram_table is not None:
+                if engram_table is not None and latent_projection is not None:
+                    with torch.no_grad():
+                        emb = model.embed_tokens(input_ids)
+                        engram_emb = engram_table.lookup_batch_projected(
+                            input_ids, emb, latent_projection,
+                        )
+                elif engram_table is not None:
                     with torch.no_grad():
                         engram_emb = engram_table.lookup_batch(input_ids)
 
@@ -639,6 +704,7 @@ def main() -> None:
                         thought_norm=thought_norm,
                         think_token_id=args.think_token_id if args.coconut else None,
                         num_thoughts=num_thoughts,
+                        latent_projection=latent_projection,
                     )
                     val_loss_str = f"{val_loss:.6f}"
                     print(f"  -> val_loss={val_loss:.4f}")
@@ -677,6 +743,7 @@ def main() -> None:
                 thought_norm=thought_norm,
                 think_token_id=args.think_token_id if args.coconut else None,
                 num_thoughts=num_thoughts,
+                latent_projection=latent_projection,
             )
             print(f"Final val_loss={val_loss:.4f}")
         print(f"Training complete. Final checkpoint at step {args.steps}")
