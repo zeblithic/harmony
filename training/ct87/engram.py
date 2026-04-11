@@ -393,6 +393,12 @@ class EngramTable:
         Returns:
             [batch_size, seq_len, engram_dim] embedding tensor
         """
+        if len(binary_keys) != len(positions):
+            raise ValueError(
+                f"binary_keys and positions must have the same length, "
+                f"got {len(binary_keys)} and {len(positions)}"
+            )
+
         batch_indices: list[int] = []
         pos_list: list[int] = []
         table_indices: list[int] = []

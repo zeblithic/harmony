@@ -114,29 +114,9 @@ class LatentProjection(nn.Module):
             (binary_keys, positions) — binary_keys is a list of bytes objects,
             positions is the token position each key is attributed to.
         """
-        if seq_len < 2:
+        parts, positions = compute_ngram_averages(embeddings, seq_len)
+        if len(positions) == 0:
             return [], []
-
-        emb = embeddings.squeeze(0)  # [seq_len, hidden_dim]
-
-        # Bigram averages: avg(emb[i], emb[i+1]) for i in 0..seq_len-1
-        num_bi = seq_len - 1
-        bi_avg = (emb[:num_bi] + emb[1 : num_bi + 1]) * 0.5
-
-        # Trigram averages: avg(emb[i], emb[i+1], emb[i+2]) for i in 0..seq_len-2
-        num_tri = max(seq_len - 2, 0)
-        if num_tri > 0:
-            tri_avg = (emb[:num_tri] + emb[1 : num_tri + 1] + emb[2 : num_tri + 2]) / 3.0
-            parts = torch.cat([bi_avg, tri_avg], dim=0)
-        else:
-            parts = bi_avg
-
-        # Positions: bigrams at 1..seq_len, trigrams at 2..seq_len
-        positions: list[int] = []
-        for i in range(1, num_bi + 1):
-            positions.append(i)
-        for i in range(2, 2 + num_tri):
-            positions.append(i)
 
         # Project all N-grams in one batch
         with torch.no_grad():

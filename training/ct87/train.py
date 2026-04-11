@@ -393,8 +393,30 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if args.contrastive_temperature <= 0 or not math.isfinite(args.contrastive_temperature):
+            print(
+                "Error: --contrastive-temperature must be finite and > 0",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.contrastive_k < 1:
+            print("Error: --contrastive-k must be >= 1", file=sys.stderr)
+            sys.exit(1)
+        if args.contrastive_loss_weight < 0 or not math.isfinite(args.contrastive_loss_weight):
+            print(
+                "Error: --contrastive-loss-weight must be finite and >= 0",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if args.latent_projection_init:
+        if not args.contrastive_loss:
+            print(
+                "Error: --latent-projection-init requires --contrastive-loss "
+                "(random projection without training is not useful)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if args.latent_intermediate_dim is None or args.latent_dim is None:
             print(
                 "Error: --latent-projection-init requires both "
@@ -647,7 +669,11 @@ def main() -> None:
                     # use them for engram retrieval
                     from ct87.latent_projection import compute_ngram_averages
 
-                    emb = model.embed_tokens(input_ids)
+                    # Embeddings for key generation don't need grad —
+                    # everything is detached before projection anyway.
+                    # CE gradients flow through the model's own forward pass.
+                    with torch.no_grad():
+                        emb = model.embed_tokens(input_ids)
                     seq_len_actual = input_ids.shape[1]
 
                     all_keys: list[bytes] = []
