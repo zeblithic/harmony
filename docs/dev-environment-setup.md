@@ -82,15 +82,12 @@ git config --global user.email "you@example.com"
 We use the structure `~/work/<org-or-user>/<repo-name>`:
 
 ```bash
-mkdir -p ~/work/zeblithic ~/work/steveyegge
+mkdir -p ~/work/zeblithic
 
 # Core Harmony repos
 for repo in harmony harmony-client harmony-os harmony-openwrt harmony-glitch; do
   gh repo clone "zeblithic/$repo" ~/work/zeblithic/$repo
 done
-
-# Beads issue tracker
-gh repo clone steveyegge/beads ~/work/steveyegge/beads
 ```
 
 Optional repos (not required for day-to-day development):
@@ -203,29 +200,6 @@ No extra packages needed — Tauri uses WebKit which ships with macOS.
 
 ---
 
-## 7. Go Toolchain
-
-Required by: **beads** (bd issue tracker). Needs Go >= 1.25 with CGO.
-
-### Debian/Ubuntu/WSL
-
-Debian repos won't have Go 1.25+. Install from the official tarball:
-
-```bash
-curl -fsSL https://go.dev/dl/go1.25.8.linux-amd64.tar.gz \
-  | sudo tar -C /usr/local -xzf -
-echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' >> ~/.bashrc
-source ~/.bashrc
-```
-
-### macOS
-
-```bash
-brew install go
-```
-
-Verify: `go version` (need >= 1.25)
-
 ---
 
 ## 8. Nix Package Manager
@@ -296,71 +270,11 @@ brew install qemu mtools
 
 ---
 
-## 11. Build and Install beads (bd)
+## 11. Issue Tracking
 
-```bash
-cd ~/work/steveyegge/beads
-make install
-```
-
-This builds with CGO (required for embedded Dolt) and installs `bd` to
-`~/.local/bin/`. Make sure `~/.local/bin` is on your PATH.
-
-Verify: `bd version` (need >= 0.62.0)
-
----
-
-## 12. Bootstrap beads in All Repos
-
-Each harmony repo has an existing beads database on its GitHub remote.
-Use `bd bootstrap` to pull it, then create the local config files that
-bootstrap doesn't generate.
-
-**Repeat for each repo:**
-
-```bash
-cd ~/work/zeblithic/harmony    # (or harmony-client, harmony-os, etc.)
-bd bootstrap
-
-# Fix permissions
-chmod 700 .beads
-
-# Create metadata.json — bootstrap doesn't generate this
-cat > .beads/metadata.json << 'EOF'
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "beads"
-}
-EOF
-
-# Create lock file and interactions log
-touch .beads/embeddeddolt/.lock
-touch .beads/interactions.jsonl
-
-# Create config.yaml with auto-sync
-cat > .beads/config.yaml << 'EOF'
-backup:
-  enabled: false
-
-dolt.auto-push: true
-dolt.auto-commit: "on"
-EOF
-
-# Verify
-bd ready
-```
-
-> **Why the manual steps?** `bd bootstrap` pulls the Dolt database from
-> the remote into `.beads/embeddeddolt/beads/` but does not create
-> `metadata.json` (which tells bd the database name), `config.yaml`,
-> or the `.lock` file. Without `metadata.json`, every bd command fails
-> with `"no database selected"`. These files are gitignored and must be
-> recreated on each new machine.
-
-See also: [beads-dolt-setup.md](beads-dolt-setup.md) for detailed
-Dolt operations, multi-machine sync, and troubleshooting.
+Issue tracking uses **Linear** (not beads/bd, which was the previous system).
+The Linear MCP plugin for Claude Code handles all issue operations.
+No local tooling installation is needed.
 
 ---
 
@@ -388,10 +302,6 @@ cd ~/work/zeblithic/harmony-os && cargo check --workspace
 # harmony-openwrt (musl cross-compile check)
 cd ~/work/zeblithic/harmony
 cargo check -p harmony-node --target x86_64-unknown-linux-musl
-
-# beads
-bd version
-cd ~/work/zeblithic/harmony && bd ready
 ```
 
 ---
@@ -403,13 +313,11 @@ cd ~/work/zeblithic/harmony && bd ready
 | Rust (stable) | >= 1.85 | harmony, harmony-client, harmony-os, harmony-glitch, harmony-openwrt |
 | Rust (nightly) | latest | harmony-os (bootloader crate) |
 | Node.js | >= 18 (22 LTS recommended) | harmony-client, harmony-glitch |
-| Go | >= 1.25 (with CGO) | beads |
 | Nix | >= 2.18 (with flakes) | harmony (dev shell), harmony-os (builds) |
 | just | any | harmony-os |
 | QEMU | any | harmony-os (testing) |
 | cachix | any | Nix binary cache sharing |
 | gh | any | GitHub CLI |
-| bd | >= 0.62.0 | Issue tracking across all repos |
 
 ### System packages (Debian/Ubuntu/WSL)
 
