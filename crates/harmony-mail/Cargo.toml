@@ -18,8 +18,13 @@ thiserror.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
 toml.workspace = true
 clap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+bytes = "1"
+tracing.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
 rand.workspace = true
 rand_core.workspace = true
+tokio = { workspace = true, features = ["io-util", "test-util"] }
