@@ -3311,6 +3311,7 @@ dependencies = [
  "bytes",
  "clap",
  "ed25519-dalek",
+ "futures-util",
  "harmony-identity",
  "hex",
  "rand 0.8.5",
@@ -3321,6 +3322,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

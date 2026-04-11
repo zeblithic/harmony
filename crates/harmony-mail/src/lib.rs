@@ -4,6 +4,7 @@ pub mod error;
 pub mod io;
 pub mod message;
 pub mod registry;
+pub mod server;
 pub mod smtp;
 pub mod smtp_parse;
 pub mod spam;

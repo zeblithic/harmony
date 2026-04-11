@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -69,7 +71,10 @@ enum AliasAction {
     },
 }
 
-fn main() {
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
+async fn main() {
+    tracing_subscriber::fmt::init();
+
     let cli = Cli::parse();
     match cli.command {
         Commands::Init {
@@ -79,9 +84,16 @@ fn main() {
             println!("Initializing gateway for {domain} (admin: {admin_email})");
             println!("Not yet implemented");
         }
-        Commands::Run { config } => {
-            println!("Starting gateway with config: {config}");
-            println!("Not yet implemented");
+        Commands::Run { config: config_path } => {
+            let config = harmony_mail::config::Config::from_file(Path::new(&config_path))
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to load config from {config_path}: {e}");
+                    std::process::exit(1);
+                });
+            if let Err(e) = harmony_mail::server::run(config).await {
+                eprintln!("Server error: {e}");
+                std::process::exit(1);
+            }
         }
         Commands::User { action } => match action {
             UserAction::Add {
