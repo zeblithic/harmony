@@ -17,6 +17,9 @@ pub fn load_tls_config(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor,
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
 
+    // Ensure a default crypto provider is installed (idempotent if already set)
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -214,6 +217,7 @@ mod tests {
             let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
 
             // Build a client TLS config that trusts our self-signed cert
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             let mut root_store = rustls::RootCertStore::empty();
             let certs = load_certs(cert_file.path()).unwrap();
             for cert in &certs {

@@ -29,6 +29,10 @@ blake3.workspace = true
 rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+hex.workspace = true
+mail-builder = "0.4"
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+serde_json = "1"
 
 [dev-dependencies]
 hex.workspace = true
