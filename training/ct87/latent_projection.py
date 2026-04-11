@@ -158,15 +158,23 @@ class LatentProjection(nn.Module):
         else:
             state = torch.load(str(path), map_location="cpu", weights_only=True)
 
-        # Strip common prefixes
+        # Strip nested prefixes (handles module.latent_projection.layer1.* etc.)
         cleaned: dict[str, torch.Tensor] = {}
         for k, v in state.items():
             clean_key = k
-            for prefix in ("latent_projection.", "projection.", "module."):
-                if clean_key.startswith(prefix):
-                    clean_key = clean_key[len(prefix) :]
+            while True:
+                stripped = False
+                for prefix in ("module.", "latent_projection.", "projection."):
+                    if clean_key.startswith(prefix):
+                        clean_key = clean_key[len(prefix) :]
+                        stripped = True
+                        break
+                if not stripped:
                     break
-            cleaned[clean_key] = v
+            # Only keep layer1/layer2 keys (ignore unrelated tensors from
+            # full-model checkpoints)
+            if clean_key.startswith(("layer1.", "layer2.")):
+                cleaned[clean_key] = v
 
         proj = LatentProjection(hidden_dim, intermediate_dim, latent_dim)
         proj.load_state_dict(cleaned)
@@ -210,17 +218,21 @@ def compute_key_overlap(
     xxhash_indices: set[int] = set()
     proj_indices: set[int] = set()
 
+    proj_device = next(projection.parameters()).device
+
     with torch.no_grad():
         embeddings = model.embed_tokens(input_ids)  # [batch, seq_len, hidden_dim]
 
     for b in range(batch_size):
         tokens = input_ids[b].tolist()
-        emb = embeddings[b : b + 1]  # [1, seq_len, hidden_dim]
+        emb = embeddings[b : b + 1].to(proj_device)  # [1, seq_len, hidden_dim]
 
         # Get projection keys + positions
         proj_keys, proj_positions = projection.project_ngrams(emb, seq_len)
 
-        # Build a map: position → list of projection binary keys at that position
+        # Build a map: position → list of projection binary keys at that position.
+        # project_ngrams() returns all bigram keys first, then all trigram keys,
+        # so pos_to_proj_keys[pos][0] = bigram key, [1] = trigram key (if exists).
         pos_to_proj_keys: dict[int, list[bytes]] = {}
         for key, pos in zip(proj_keys, proj_positions):
             pos_to_proj_keys.setdefault(pos, []).append(key)
@@ -231,13 +243,9 @@ def compute_key_overlap(
             pos = i + 1
             bigram = [tokens[i], tokens[i + 1]]
             proj_keys_at_pos = pos_to_proj_keys.get(pos, [])
-            # The first len(bigram_count) keys at this position are bigram keys
-            # but project_ngrams interleaves bigrams then trigrams — bigrams come
-            # first in the list, so we track an index into the position's key list
             if not proj_keys_at_pos:
                 continue
-            # First key at this position is the bigram key
-            proj_key = proj_keys_at_pos[0]
+            proj_key = proj_keys_at_pos[0]  # bigram key
 
             for seed in seeds:
                 xx_idx = _hash_ngram(bigram, seed) % total_entries
@@ -256,8 +264,7 @@ def compute_key_overlap(
             proj_keys_at_pos = pos_to_proj_keys.get(pos, [])
             if len(proj_keys_at_pos) < 2:
                 continue
-            # Second key at this position is the trigram key
-            proj_key = proj_keys_at_pos[1]
+            proj_key = proj_keys_at_pos[1]  # trigram key
 
             for seed in seeds:
                 xx_idx = _hash_ngram(trigram, seed) % total_entries

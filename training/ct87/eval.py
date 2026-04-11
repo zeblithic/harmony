@@ -23,7 +23,10 @@ from ct87.model import HarmonyModel, HarmonyModelConfig
 from ct87.train import detect_device, make_hf_dataloader, make_synthetic_dataloader
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ct87.engram import EngramTable
+    from ct87.latent_projection import LatentProjection
 
 
 def load_checkpoint_path(model: HarmonyModel, path: str) -> None:
@@ -120,7 +123,7 @@ def evaluate_projected(
     device: torch.device,
     num_batches: int,
     engram_table: EngramTable,
-    projection: object,
+    projection: LatentProjection,
     amp_dtype: torch.dtype | None = None,
 ) -> dict[str, float | int]:
     """Run perplexity measurement with projection-generated Engram keys.
@@ -154,17 +157,15 @@ def evaluate_projected(
                         f"dataloader exhausted after {i} batches; "
                         f"requested num_batches={num_batches}"
                     ) from exc
-                input_ids = batch[:, :-1]
-                targets = batch[:, 1:]
+                input_ids = batch[:, :-1].to(device)
+                targets = batch[:, 1:].to(device)
 
-                # Get embeddings for projection key generation
-                embeddings = model.embed_tokens(input_ids.to(device))
+                # Projection runs on-device; to_binary_keys() handles
+                # the device->CPU transfer internally (only tiny key bytes)
+                embeddings = model.embed_tokens(input_ids)
                 engram_emb = engram_table.lookup_batch_projected(
-                    input_ids, embeddings.cpu(), projection,
+                    input_ids, embeddings, projection,
                 )
-
-                input_ids = input_ids.to(device)
-                targets = targets.to(device)
 
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
                     logits = model(input_ids, engram_embeddings=engram_emb)
@@ -200,12 +201,12 @@ def evaluate_projected(
 def run_comparison(
     model: HarmonyModel,
     config: HarmonyModelConfig,
-    dataloader_fn: object,
+    dataloader_fn: Callable[[], Iterator[torch.Tensor]],
     device: torch.device,
     num_batches: int,
     amp_dtype: torch.dtype | None,
     engram_table: EngramTable | None = None,
-    projection: object = None,
+    projection: LatentProjection | None = None,
 ) -> None:
     """Run three-way perplexity comparison and print results table.
 
@@ -333,9 +334,13 @@ def main() -> None:
             )
             sys.exit(1)
 
-    if args.compare and args.engram_table is None:
-        print("Error: --compare requires --engram-table", file=sys.stderr)
-        sys.exit(1)
+    if args.compare:
+        if args.engram_table is None:
+            print("Error: --compare requires --engram-table", file=sys.stderr)
+            sys.exit(1)
+        if args.latent_projection is None:
+            print("Error: --compare requires --latent-projection", file=sys.stderr)
+            sys.exit(1)
 
     config = HarmonyModelConfig.tiny() if args.config == "tiny" else HarmonyModelConfig.target()
     seq_len = args.seq_len if args.seq_len is not None else (512 if args.config == "tiny" else 2048)
@@ -390,6 +395,7 @@ def main() -> None:
             hidden_dim=config.hidden_dim,
             intermediate_dim=args.latent_intermediate_dim,
             latent_dim=args.latent_dim,
+            device=device,
         )
         proj_params = sum(p.numel() for p in projection.parameters())
         print(
@@ -418,7 +424,11 @@ def main() -> None:
         agg_lookups = 0
         agg_matching = 0
         for _bi in range(args.key_overlap_batches):
-            batch = next(overlap_dl)
+            try:
+                batch = next(overlap_dl)
+            except StopIteration:
+                print(f"  Warning: dataloader exhausted after {_bi} batches", file=sys.stderr)
+                break
             input_ids = batch[:, :-1].to(device)
             stats = compute_key_overlap(model, projection, engram_table, input_ids)
             agg_lookups += stats["total_lookups"]

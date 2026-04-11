@@ -139,7 +139,7 @@ class TestProjectNgrams:
         """Bigrams at 1,2,3 and trigrams at 2,3 for seq_len=4."""
         proj = _make_projection()
         emb = torch.randn(1, 4, HIDDEN_DIM)
-        keys, positions = proj.project_ngrams(emb, 4)
+        _keys, positions = proj.project_ngrams(emb, 4)
         assert positions[:3] == [1, 2, 3]  # bigrams
         assert positions[3:] == [2, 3]  # trigrams
 
