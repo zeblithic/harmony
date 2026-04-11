@@ -131,6 +131,17 @@ def _save_mtp_head(
     torch.save(mtp_head.state_dict(), path)
 
 
+def _save_latent_projection(
+    projection: torch.nn.Module,
+    step: int,
+    output_dir: str,
+) -> None:
+    """Save latent projection weights alongside the model checkpoint."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"latent_projection_step_{step}.pt")
+    torch.save(projection.state_dict(), path)
+
+
 def load_checkpoint(
     model: HarmonyModel,
     output_dir: str,
@@ -272,6 +283,27 @@ def main() -> None:
         help="Output dimension for latent projection MLP",
     )
     parser.add_argument(
+        "--latent-projection-init", action="store_true",
+        help="Randomly initialize latent projection (for from-scratch co-training)",
+    )
+    parser.add_argument(
+        "--contrastive-loss", action="store_true",
+        help="Enable contrastive co-training (makes projection trainable, uses "
+             "projection keys for engram retrieval with InfoNCE auxiliary loss)",
+    )
+    parser.add_argument(
+        "--contrastive-loss-weight", type=float, default=0.1,
+        help="Weight for contrastive auxiliary loss (default: 0.1)",
+    )
+    parser.add_argument(
+        "--contrastive-temperature", type=float, default=0.07,
+        help="Temperature for InfoNCE contrastive loss (default: 0.07)",
+    )
+    parser.add_argument(
+        "--contrastive-k", type=int, default=4,
+        help="Number of top neighbors to preserve in contrastive loss (default: 4)",
+    )
+    parser.add_argument(
         "--coconut", action="store_true",
         help="Enable COCONUT continuous thought training",
     )
@@ -336,6 +368,44 @@ def main() -> None:
         if args.engram_table is None:
             print(
                 "Error: --latent-projection requires --engram-table",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.contrastive_loss:
+        if args.latent_projection is None and not args.latent_projection_init:
+            print(
+                "Error: --contrastive-loss requires --latent-projection or "
+                "--latent-projection-init",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.latent_intermediate_dim is None or args.latent_dim is None:
+            print(
+                "Error: --contrastive-loss requires both "
+                "--latent-intermediate-dim and --latent-dim",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.engram_table is None:
+            print(
+                "Error: --contrastive-loss requires --engram-table",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.latent_projection_init:
+        if args.latent_intermediate_dim is None or args.latent_dim is None:
+            print(
+                "Error: --latent-projection-init requires both "
+                "--latent-intermediate-dim and --latent-dim",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.latent_projection is not None:
+            print(
+                "Error: --latent-projection-init is mutually exclusive with "
+                "--latent-projection",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -415,9 +485,10 @@ def main() -> None:
             f"dim={engram_table.engram_dim}, heads={engram_table.num_heads}"
         )
 
-    # Latent projection for fine-tuning with projection-generated engram keys.
-    # The projection is frozen — only the model (especially EngramGatedResidual)
-    # adapts to the new key distribution.
+    # Latent projection setup — three modes:
+    # 1. --latent-projection + --contrastive-loss: load from checkpoint, trainable
+    # 2. --latent-projection (no contrastive): load from checkpoint, frozen
+    # 3. --latent-projection-init: randomly initialize, trainable
     latent_projection = None
     if args.latent_projection is not None:
         from ct87.latent_projection import LatentProjection
@@ -429,10 +500,31 @@ def main() -> None:
             latent_dim=args.latent_dim,
             device=device,
         )
-        latent_projection.requires_grad_(False)
+        proj_params = sum(p.numel() for p in latent_projection.parameters())
+        if args.contrastive_loss:
+            print(
+                f"Latent projection loaded (trainable): "
+                f"{config.hidden_dim}->{args.latent_intermediate_dim}->{args.latent_dim}, "
+                f"{proj_params:,} params"
+            )
+        else:
+            latent_projection.requires_grad_(False)
+            print(
+                f"Latent projection loaded (frozen): "
+                f"{config.hidden_dim}->{args.latent_intermediate_dim}->{args.latent_dim}, "
+                f"{proj_params:,} params"
+            )
+    elif args.latent_projection_init:
+        from ct87.latent_projection import LatentProjection
+
+        latent_projection = LatentProjection(
+            hidden_dim=config.hidden_dim,
+            intermediate_dim=args.latent_intermediate_dim,
+            latent_dim=args.latent_dim,
+        ).to(device)
         proj_params = sum(p.numel() for p in latent_projection.parameters())
         print(
-            f"Latent projection loaded (frozen): "
+            f"Latent projection initialized (trainable): "
             f"{config.hidden_dim}->{args.latent_intermediate_dim}->{args.latent_dim}, "
             f"{proj_params:,} params"
         )
@@ -480,6 +572,8 @@ def main() -> None:
         adam_params.extend(uq_head.parameters())
     if mtp_head is not None:
         adam_params.extend(mtp_head.parameters())
+    if latent_projection is not None and args.contrastive_loss:
+        adam_params.extend(latent_projection.parameters())
     optimizer = Muon(muon_params, adam_params, lr=args.lr, adam_lr=args.lr)
     schedule = WSDSchedule(warmup_steps=args.warmup, total_steps=args.steps)
 
@@ -496,7 +590,7 @@ def main() -> None:
     csv_file = None
     csv_writer = None
     if args.log_file:
-        expected_header = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
+        expected_header = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         if os.path.exists(args.log_file) and os.path.getsize(args.log_file) > 0:
             with open(args.log_file, newline="") as existing:
                 header = next(csv.reader(existing), [])
@@ -535,6 +629,7 @@ def main() -> None:
             accum_loss = 0.0
             accum_uq_loss = 0.0
             accum_mtp_loss = 0.0
+            accum_cl_loss = 0.0
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
             need_hidden = mtp_head is not None
             use_coconut = args.coconut and num_thoughts > 0
@@ -545,7 +640,51 @@ def main() -> None:
 
                 # Compute Engram embeddings if table is loaded
                 engram_emb = None
-                if engram_table is not None and latent_projection is not None:
+                cl_projected = None
+                cl_ngram_avgs = None
+                if engram_table is not None and latent_projection is not None and args.contrastive_loss:
+                    # Co-training: compute keys with grad for contrastive loss,
+                    # use them for engram retrieval
+                    from ct87.latent_projection import compute_ngram_averages
+
+                    emb = model.embed_tokens(input_ids)
+                    seq_len_actual = input_ids.shape[1]
+
+                    all_keys: list[bytes] = []
+                    all_positions: list[int] = []
+                    all_ngram_avgs: list[torch.Tensor] = []
+                    all_projected: list[torch.Tensor] = []
+
+                    for b_idx in range(input_ids.shape[0]):
+                        ngram_avgs, positions = compute_ngram_averages(
+                            emb[b_idx : b_idx + 1], seq_len_actual,
+                        )
+                        projected = latent_projection(ngram_avgs.detach())
+                        binary_keys = latent_projection.to_binary_keys(projected)
+
+                        all_ngram_avgs.append(ngram_avgs.detach())
+                        all_projected.append(projected)
+                        all_keys.extend(binary_keys)
+                        all_positions.extend(positions)
+
+                    cl_ngram_avgs = all_ngram_avgs
+                    cl_projected = all_projected
+
+                    # Build engram embeddings from pre-computed keys
+                    engram_parts = []
+                    offset = 0
+                    for b_idx in range(input_ids.shape[0]):
+                        n_keys = len(all_ngram_avgs[b_idx])
+                        part_keys = all_keys[offset : offset + n_keys]
+                        part_pos = all_positions[offset : offset + n_keys]
+                        offset += n_keys
+                        part = engram_table.lookup_from_keys(
+                            part_keys, part_pos,
+                            batch_size=1, seq_len=seq_len_actual,
+                        )
+                        engram_parts.append(part)
+                    engram_emb = torch.cat(engram_parts, dim=0)
+                elif engram_table is not None and latent_projection is not None:
                     with torch.no_grad():
                         emb = model.embed_tokens(input_ids)
                         engram_emb = engram_table.lookup_batch_projected(
@@ -653,6 +792,21 @@ def main() -> None:
                         loss = loss + args.mtp_loss_weight * mtp_loss_val
                         accum_mtp_loss += mtp_loss_val.item()
 
+                    # Contrastive auxiliary loss
+                    if args.contrastive_loss and cl_projected is not None:
+                        from ct87.latent_projection import contrastive_loss
+
+                        cl_total = sum(
+                            contrastive_loss(
+                                avg, proj,
+                                temperature=args.contrastive_temperature,
+                                k=args.contrastive_k,
+                            )
+                            for avg, proj in zip(cl_ngram_avgs, cl_projected)
+                        ) / len(cl_projected)
+                        loss = loss + args.contrastive_loss_weight * cl_total
+                        accum_cl_loss += cl_total.item()
+
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
 
@@ -665,6 +819,8 @@ def main() -> None:
                     all_params.extend(uq_head.parameters())
                 if mtp_head is not None:
                     all_params.extend(mtp_head.parameters())
+                if latent_projection is not None and args.contrastive_loss:
+                    all_params.extend(latent_projection.parameters())
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     all_params, args.max_grad_norm,
                 ).item()
@@ -685,7 +841,11 @@ def main() -> None:
                 if mtp_head is not None:
                     raw_mtp = accum_mtp_loss / args.grad_accum_steps
                     mtp_str = f"  mtp_loss={raw_mtp:.4f}"
-                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}{ct_str}{uq_str}{mtp_str}")
+                cl_str = ""
+                if args.contrastive_loss:
+                    raw_cl = accum_cl_loss / args.grad_accum_steps
+                    cl_str = f"  cl_loss={raw_cl:.4f}"
+                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}{ct_str}{uq_str}{mtp_str}{cl_str}")
 
             val_loss_str = ""
             if args.save_every > 0 and step > 0 and step % args.save_every == 0:
@@ -696,6 +856,8 @@ def main() -> None:
                     _save_uq_head(uq_head, step, args.output_dir)
                 if mtp_head is not None:
                     _save_mtp_head(mtp_head, step, args.output_dir)
+                if latent_projection is not None and args.contrastive_loss:
+                    _save_latent_projection(latent_projection, step, args.output_dir)
                 print(f"  -> checkpoint saved at step {step}")
                 if val_loader is not None:
                     val_loss = compute_validation_loss(
@@ -716,11 +878,15 @@ def main() -> None:
                 mtp_loss_str = ""
                 if mtp_head is not None:
                     mtp_loss_str = f"{accum_mtp_loss / args.grad_accum_steps:.6f}"
+                cl_loss_str = ""
+                if args.contrastive_loss:
+                    cl_loss_str = f"{accum_cl_loss / args.grad_accum_steps:.6f}"
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
                     uq_loss_str,
                     mtp_loss_str,
+                    cl_loss_str,
                     val_loss_str,
                     f"{current_lr:.8f}",
                     f"{grad_norm:.6f}" if grad_norm is not None else "",
@@ -736,6 +902,8 @@ def main() -> None:
             _save_uq_head(uq_head, args.steps, args.output_dir)
         if mtp_head is not None:
             _save_mtp_head(mtp_head, args.steps, args.output_dir)
+        if latent_projection is not None and args.contrastive_loss:
+            _save_latent_projection(latent_projection, args.steps, args.output_dir)
         if val_loader is not None:
             val_loss = compute_validation_loss(
                 model, val_loader, config.vocab_size, device,
