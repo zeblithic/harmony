@@ -210,6 +210,26 @@ class TestCheckpointRoundTrip:
 
         assert torch.allclose(expected, actual, atol=1e-6)
 
+    def test_load_safetensors_format(self):
+        """Round-trip through .safetensors format."""
+        from safetensors.torch import save_file
+
+        torch.manual_seed(42)
+        proj = LatentProjection(HIDDEN_DIM, INTERMEDIATE_DIM, LATENT_DIM)
+        x = torch.randn(1, 4, HIDDEN_DIM)
+        expected = proj(x)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "projection.safetensors"
+            save_file(proj.state_dict(), str(path))
+
+            loaded = LatentProjection.from_checkpoint(
+                path, HIDDEN_DIM, INTERMEDIATE_DIM, LATENT_DIM,
+            )
+            actual = loaded(x)
+
+        assert torch.allclose(expected, actual, atol=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # Projected lookup tests

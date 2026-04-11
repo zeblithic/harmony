@@ -60,6 +60,9 @@ class LatentProjection(nn.Module):
         h = F.silu(self.layer1(embeddings))
         return torch.tanh(self.layer2(h))
 
+    # Bit-position weights for vectorized LSB-first packing: [1, 2, 4, ..., 128]
+    _BIT_WEIGHTS = torch.tensor([1 << i for i in range(8)], dtype=torch.uint8)
+
     def to_binary_keys(self, latent: torch.Tensor) -> list[bytes]:
         """Binarize latent codes via sign bits.
 
@@ -74,16 +77,22 @@ class LatentProjection(nn.Module):
         Returns:
             List of binary key bytes, one per vector.
         """
-        data = latent.detach().cpu().tolist()
         key_bytes = (self.latent_dim + 7) // 8
-        keys: list[bytes] = []
-        for row in data:
-            key = bytearray(key_bytes)
-            for i, val in enumerate(row):
-                if val >= 0.0:
-                    key[i // 8] |= 1 << (i % 8)
-            keys.append(bytes(key))
-        return keys
+
+        # Vectorized: sign bits -> bool -> pad to multiple of 8 -> pack with bit weights
+        bits = (latent.detach().cpu() >= 0).to(torch.uint8)  # [N, latent_dim]
+        n = bits.shape[0]
+
+        # Pad to multiple of 8 if needed
+        pad = key_bytes * 8 - self.latent_dim
+        if pad > 0:
+            bits = torch.nn.functional.pad(bits, (0, pad))
+
+        # Reshape to [N, key_bytes, 8], multiply by bit weights, sum -> packed bytes
+        packed = (bits.reshape(n, key_bytes, 8) * self._BIT_WEIGHTS).sum(dim=2).to(torch.uint8)
+        packed_np = packed.numpy()
+
+        return [row.tobytes() for row in packed_np]
 
     def project_ngrams(
         self,

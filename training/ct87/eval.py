@@ -160,15 +160,15 @@ def evaluate_projected(
                 input_ids = batch[:, :-1].to(device)
                 targets = batch[:, 1:].to(device)
 
-                # Projection runs on-device; to_binary_keys() handles
-                # the device->CPU transfer internally (only tiny key bytes)
+                # Compute embeddings once, reuse for both projection keys
+                # and model forward (via input_embeds to avoid recomputing)
                 embeddings = model.embed_tokens(input_ids)
                 engram_emb = engram_table.lookup_batch_projected(
                     input_ids, embeddings, projection,
                 )
 
                 with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
-                    logits = model(input_ids, engram_embeddings=engram_emb)
+                    logits = model(input_embeds=embeddings, engram_embeddings=engram_emb)
                     loss = F.cross_entropy(
                         logits.reshape(-1, vocab_size),
                         targets.reshape(-1),
@@ -324,6 +324,12 @@ def main() -> None:
             print(
                 "Error: --latent-projection requires both "
                 "--latent-intermediate-dim and --latent-dim",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.latent_intermediate_dim < 1 or args.latent_dim < 1:
+            print(
+                "Error: --latent-intermediate-dim and --latent-dim must be >= 1",
                 file=sys.stderr,
             )
             sys.exit(1)
