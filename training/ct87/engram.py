@@ -318,6 +318,55 @@ class EngramTable:
 
         return result.to(self.device)
 
+    def lookup_batch_projected(
+        self,
+        input_ids: torch.Tensor,
+        embeddings: torch.Tensor,
+        projection: nn.Module,
+    ) -> torch.Tensor:
+        """Compute Engram embeddings using projection-generated binary keys.
+
+        Same as lookup_batch() but replaces xxhash-on-token-bytes with
+        projection→binarize→xxhash-on-binary-key-bytes, matching the Rust
+        inference path in compute_lookup_from_bytes().
+
+        Args:
+            input_ids: [batch, seq_len] token IDs (for shape only)
+            embeddings: [batch, seq_len, hidden_dim] from model.embed_tokens
+            projection: LatentProjection module with project_ngrams()
+
+        Returns:
+            [batch, seq_len, engram_dim] embedding tensor
+        """
+        batch_size, seq_len = input_ids.shape
+        batch_indices: list[int] = []
+        positions: list[int] = []
+        table_indices: list[int] = []
+
+        for b in range(batch_size):
+            emb = embeddings[b : b + 1]  # [1, seq_len, hidden_dim]
+            proj_keys, proj_positions = projection.project_ngrams(emb, seq_len)
+
+            for key_bytes, pos in zip(proj_keys, proj_positions):
+                for seed in self.hash_seeds:
+                    idx = _xxhash64(key_bytes, seed) % self.total_entries
+                    batch_indices.append(b)
+                    positions.append(pos)
+                    table_indices.append(idx)
+
+        result = torch.zeros(
+            batch_size, seq_len, self.engram_dim, dtype=torch.float32,
+        )
+
+        if table_indices:
+            idx_t = torch.tensor(table_indices, dtype=torch.long)
+            embs = self.table[idx_t]  # [n, engram_dim]
+
+            for i, (b, pos) in enumerate(zip(batch_indices, positions)):
+                result[b, pos] += embs[i]
+
+        return result.to(self.device)
+
     def _collect_indices(
         self,
         tokens: list[int],

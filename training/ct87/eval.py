@@ -23,7 +23,10 @@ from ct87.model import HarmonyModel, HarmonyModelConfig
 from ct87.train import detect_device, make_hf_dataloader, make_synthetic_dataloader
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ct87.engram import EngramTable
+    from ct87.latent_projection import LatentProjection
 
 
 def load_checkpoint_path(model: HarmonyModel, path: str) -> None:
@@ -113,8 +116,147 @@ def evaluate(
     }
 
 
+def evaluate_projected(
+    model: HarmonyModel,
+    dataloader: Iterator[torch.Tensor],
+    vocab_size: int,
+    device: torch.device,
+    num_batches: int,
+    engram_table: EngramTable,
+    projection: LatentProjection,
+    amp_dtype: torch.dtype | None = None,
+) -> dict[str, float | int]:
+    """Run perplexity measurement with projection-generated Engram keys.
+
+    Same as evaluate() but uses projection->binarize->xxhash for Engram
+    key generation instead of xxhash-on-token-bytes.
+
+    Returns:
+        Dict with keys: loss, perplexity, total_tokens (int),
+        tokens_per_sec, elapsed_sec.
+    """
+    if num_batches < 1:
+        raise ValueError("num_batches must be >= 1")
+
+    was_training = model.training
+    model.eval()
+    use_amp = amp_dtype is not None
+    device_type = device.type
+
+    total_loss = 0.0
+    total_tokens = 0
+    start_time = time.time()
+
+    try:
+        with torch.no_grad():
+            for i in range(num_batches):
+                try:
+                    batch = next(dataloader)
+                except StopIteration as exc:
+                    raise ValueError(
+                        f"dataloader exhausted after {i} batches; "
+                        f"requested num_batches={num_batches}"
+                    ) from exc
+                input_ids = batch[:, :-1].to(device)
+                targets = batch[:, 1:].to(device)
+
+                # Compute embeddings once, reuse for both projection keys
+                # and model forward (via input_embeds to avoid recomputing)
+                embeddings = model.embed_tokens(input_ids)
+                engram_emb = engram_table.lookup_batch_projected(
+                    input_ids, embeddings, projection,
+                )
+
+                with torch.autocast(device_type, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(input_embeds=embeddings, engram_embeddings=engram_emb)
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, vocab_size),
+                        targets.reshape(-1),
+                    )
+
+                batch_tokens = targets.numel()
+                total_loss += loss.item() * batch_tokens
+                total_tokens += batch_tokens
+
+                if (i + 1) % 10 == 0:
+                    avg = total_loss / total_tokens
+                    print(f"  batch {i + 1}/{num_batches}  loss={avg:.4f}  ppl={math.exp(avg):.2f}")
+    finally:
+        model.train(was_training)
+
+    elapsed = time.time() - start_time
+    avg_loss = total_loss / total_tokens
+    perplexity = math.exp(avg_loss)
+    tokens_per_sec = total_tokens / elapsed
+
+    return {
+        "loss": avg_loss,
+        "perplexity": perplexity,
+        "total_tokens": total_tokens,
+        "tokens_per_sec": tokens_per_sec,
+        "elapsed_sec": elapsed,
+    }
+
+
+def run_comparison(
+    model: HarmonyModel,
+    config: HarmonyModelConfig,
+    dataloader_fn: Callable[[], Iterator[torch.Tensor]],
+    device: torch.device,
+    num_batches: int,
+    amp_dtype: torch.dtype | None,
+    engram_table: EngramTable | None = None,
+    projection: LatentProjection | None = None,
+) -> None:
+    """Run three-way perplexity comparison and print results table.
+
+    Measures: (1) baseline (no engram), (2) engram with xxhash keys,
+    (3) engram with projection keys.  Each run uses a fresh dataloader
+    with the same seed for identical data.
+    """
+    results: list[tuple[str, dict[str, float | int]]] = []
+
+    # 1. Baseline (no engram)
+    print("\n=== Baseline (no engram) ===")
+    dl = dataloader_fn()
+    m = evaluate(model, dl, config.vocab_size, device, num_batches, amp_dtype)
+    results.append(("Baseline", m))
+
+    # 2. Engram with xxhash keys
+    if engram_table is not None:
+        print("\n=== Engram (xxhash keys) ===")
+        dl = dataloader_fn()
+        m = evaluate(model, dl, config.vocab_size, device, num_batches, amp_dtype, engram_table)
+        results.append(("Engram (xxhash)", m))
+
+    # 3. Engram with projection keys
+    if engram_table is not None and projection is not None:
+        print("\n=== Engram (projection keys) ===")
+        dl = dataloader_fn()
+        m = evaluate_projected(model, dl, config.vocab_size, device, num_batches, engram_table, projection, amp_dtype)
+        results.append(("Engram (projection)", m))
+
+    # Print comparison table
+    baseline_loss = results[0][1]["loss"]
+    print("\n" + "=" * 72)
+    print("COMPARISON RESULTS")
+    print("=" * 72)
+    print(f"{'Config':<25} {'Loss':>8} {'PPL':>10} {'vs Baseline':>12} {'tok/s':>8}")
+    print("-" * 72)
+    for name, m in results:
+        delta = ""
+        if m["loss"] != baseline_loss:
+            pct = (m["loss"] - baseline_loss) / baseline_loss * 100
+            delta = f"{pct:+.3f}%"
+        print(
+            f"{name:<25} {m['loss']:>8.4f} {m['perplexity']:>10.2f} "
+            f"{delta:>12} {m['tokens_per_sec']:>8.0f}"
+        )
+    print("=" * 72)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate ct87 model perplexity")
+    parser = argparse.ArgumentParser(description="Measure ct87 model perplexity")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to safetensors checkpoint")
     parser.add_argument("--config", choices=["tiny", "target"], required=True)
     parser.add_argument("--data", type=str, default=None, help="Path to pre-tokenized HF dataset")
@@ -133,6 +275,32 @@ def main() -> None:
         "--engram-seeds", type=str, default="42,99,137,251",
         help="Comma-separated xxhash64 seeds for Engram table lookup",
     )
+    # Latent projection args
+    parser.add_argument(
+        "--latent-projection", type=str, default=None,
+        help="Path to latent projection checkpoint (enables projection key mode)",
+    )
+    parser.add_argument(
+        "--latent-intermediate-dim", type=int, default=None,
+        help="Intermediate dimension for latent projection MLP",
+    )
+    parser.add_argument(
+        "--latent-dim", type=int, default=None,
+        help="Output dimension for latent projection MLP",
+    )
+    # Comparison and analysis modes
+    parser.add_argument(
+        "--compare", action="store_true",
+        help="Run three-way comparison: baseline, xxhash engram, projection engram",
+    )
+    parser.add_argument(
+        "--key-overlap", action="store_true",
+        help="Run key overlap analysis: compare xxhash vs projection key distributions",
+    )
+    parser.add_argument(
+        "--key-overlap-batches", type=int, default=10,
+        help="Number of batches for key overlap analysis (default: 10)",
+    )
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -150,6 +318,35 @@ def main() -> None:
     if args.num_batches < 1:
         print("Error: --num-batches must be >= 1", file=sys.stderr)
         sys.exit(1)
+
+    if args.latent_projection is not None:
+        if args.latent_intermediate_dim is None or args.latent_dim is None:
+            print(
+                "Error: --latent-projection requires both "
+                "--latent-intermediate-dim and --latent-dim",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.latent_intermediate_dim < 1 or args.latent_dim < 1:
+            print(
+                "Error: --latent-intermediate-dim and --latent-dim must be >= 1",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.engram_table is None:
+            print(
+                "Error: --latent-projection requires --engram-table",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.compare:
+        if args.engram_table is None:
+            print("Error: --compare requires --engram-table", file=sys.stderr)
+            sys.exit(1)
+        if args.latent_projection is None:
+            print("Error: --compare requires --latent-projection", file=sys.stderr)
+            sys.exit(1)
 
     config = HarmonyModelConfig.tiny() if args.config == "tiny" else HarmonyModelConfig.target()
     seq_len = args.seq_len if args.seq_len is not None else (512 if args.config == "tiny" else 2048)
@@ -195,18 +392,108 @@ def main() -> None:
             f"dim={engram_table.engram_dim}, heads={engram_table.num_heads}"
         )
 
+    projection = None
+    if args.latent_projection is not None:
+        from ct87.latent_projection import LatentProjection
+
+        projection = LatentProjection.from_checkpoint(
+            args.latent_projection,
+            hidden_dim=config.hidden_dim,
+            intermediate_dim=args.latent_intermediate_dim,
+            latent_dim=args.latent_dim,
+            device=device,
+        )
+        proj_params = sum(p.numel() for p in projection.parameters())
+        print(
+            f"Latent projection loaded: "
+            f"{config.hidden_dim}->{args.latent_intermediate_dim}->{args.latent_dim}, "
+            f"{proj_params:,} params"
+        )
+
+    # Key overlap analysis (runs before main perplexity measurement)
+    if args.key_overlap:
+        if projection is None or engram_table is None:
+            print(
+                "Error: --key-overlap requires --latent-projection and --engram-table",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        from ct87.latent_projection import compute_key_overlap
+
+        print(f"\nKey overlap analysis ({args.key_overlap_batches} batches)...")
+        if args.synthetic:
+            overlap_dl = make_synthetic_dataloader(config.vocab_size, seq_len, args.batch_size, args.seed)
+        else:
+            overlap_dl = make_hf_dataloader(args.data, seq_len, args.batch_size, args.seed)
+
+        agg_lookups = 0
+        agg_matching = 0
+        for _bi in range(args.key_overlap_batches):
+            try:
+                batch = next(overlap_dl)
+            except StopIteration:
+                print(f"  Warning: dataloader exhausted after {_bi} batches", file=sys.stderr)
+                break
+            input_ids = batch[:, :-1].to(device)
+            stats = compute_key_overlap(model, projection, engram_table, input_ids)
+            agg_lookups += stats["total_lookups"]
+            agg_matching += stats["matching_indices"]
+
+        pct = (agg_matching / agg_lookups * 100) if agg_lookups > 0 else 0.0
+
+        print("\n" + "=" * 50)
+        print("KEY OVERLAP ANALYSIS")
+        print("=" * 50)
+        print(f"  Total (n-gram, head) lookups:  {agg_lookups:,}")
+        print(f"  Matching table indices:        {agg_matching:,}")
+        print(f"  Overlap:                       {pct:.2f}%")
+        print(f"  Divergent:                     {100 - pct:.2f}%")
+        print("=" * 50)
+        if pct > 90:
+            print("  -> Keys are very similar -- projection may not change much.")
+        elif pct < 10:
+            print("  -> Keys are very different -- watch for train/inference mismatch.")
+        else:
+            print("  -> Moderate divergence -- projection is reshuffling some lookups.")
+        print()
+
+    # Comparison mode: run all three configs
+    if args.compare:
+        def make_dataloader():
+            if args.synthetic:
+                return make_synthetic_dataloader(config.vocab_size, seq_len, args.batch_size, args.seed)
+            return make_hf_dataloader(args.data, seq_len, args.batch_size, args.seed)
+
+        run_comparison(
+            model, config, make_dataloader, device, args.num_batches,
+            amp_dtype, engram_table, projection,
+        )
+        return
+
+    # Standard single-config perplexity measurement
     if args.synthetic:
         dataloader = make_synthetic_dataloader(config.vocab_size, seq_len, args.batch_size, args.seed)
     else:
         dataloader = make_hf_dataloader(args.data, seq_len, args.batch_size, args.seed)
 
-    print(f"Evaluating {args.num_batches} batches (batch_size={args.batch_size}, seq_len={seq_len})...")
-    metrics = evaluate(
-        model, dataloader, config.vocab_size, device,
-        num_batches=args.num_batches,
-        amp_dtype=amp_dtype,
-        engram_table=engram_table,
-    )
+    if args.latent_projection is not None and engram_table is not None:
+        print(f"\nMeasuring with projection keys ({args.num_batches} batches)...")
+        metrics = evaluate_projected(
+            model, dataloader, config.vocab_size, device,
+            num_batches=args.num_batches,
+            engram_table=engram_table,
+            projection=projection,
+            amp_dtype=amp_dtype,
+        )
+    else:
+        print(f"\nMeasuring {args.num_batches} batches (batch_size={args.batch_size}, seq_len={seq_len})...")
+        metrics = evaluate(
+            model, dataloader, config.vocab_size, device,
+            num_batches=args.num_batches,
+            amp_dtype=amp_dtype,
+            engram_table=engram_table,
+        )
 
     print("\nResults:")
     print(f"  loss:       {metrics['loss']:.4f}")
