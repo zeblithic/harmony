@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import struct
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -67,6 +68,94 @@ def generate_table(total_entries: int, embedding_dim: int) -> np.ndarray:
     table = np.zeros((total_entries, embedding_dim), dtype=np.float32)
     for i in range(total_entries):
         table[i] = generate_embedding(i, embedding_dim)
+    return table
+
+
+def generate_corpus_table(
+    chunks: Sequence[list[int]],
+    total_entries: int = DEFAULT_ENTRIES,
+    embedding_dim: int = DEFAULT_DIM,
+    vocab_size: int = 32000,
+    hash_seeds: list[int] | None = None,
+    projection_seed: int = 0,
+) -> np.ndarray:
+    """Generate engram table from next-token co-occurrence statistics.
+
+    Scans tokenized chunks for bigrams and trigrams, hashes each to a
+    table index (same xxhash64 as training lookup), records the token
+    following each n-gram, builds per-entry frequency distributions,
+    and compresses via Johnson-Lindenstrauss random projection.
+
+    Args:
+        chunks: List of tokenized sequences (each a list of int token IDs).
+        total_entries: Number of table entries.
+        embedding_dim: Output embedding dimension.
+        vocab_size: Tokenizer vocabulary size (for count matrix width).
+        hash_seeds: xxhash64 seeds for n-gram hashing (default: [42,99,137,251]).
+        projection_seed: Seed for the random projection matrix (default: 0).
+
+    Returns:
+        [total_entries, embedding_dim] float32 array, unit-normalized rows.
+        Rows with no n-gram hits are zero vectors.
+    """
+    if hash_seeds is None:
+        hash_seeds = list(DEFAULT_HASH_SEEDS)
+
+    from ct87.engram import _hash_ngram
+
+    # Build count matrix: [total_entries, vocab_size]
+    counts = np.zeros((total_entries, vocab_size), dtype=np.float64)
+
+    for chunk in chunks:
+        seq_len = len(chunk)
+
+        # Bigrams: [t[i], t[i+1]] attributed to position i+1, next token at i+2
+        for i in range(seq_len - 2):
+            bigram = [chunk[i], chunk[i + 1]]
+            next_token = chunk[i + 2]
+            for seed in hash_seeds:
+                idx = _hash_ngram(bigram, seed) % total_entries
+                counts[idx, next_token] += 1
+
+        # Trigrams: [t[i], t[i+1], t[i+2]] attributed to position i+2, next token at i+3
+        for i in range(seq_len - 3):
+            trigram = [chunk[i], chunk[i + 1], chunk[i + 2]]
+            next_token = chunk[i + 3]
+            for seed in hash_seeds:
+                idx = _hash_ngram(trigram, seed) % total_entries
+                counts[idx, next_token] += 1
+
+    # Identify rows with actual counts
+    row_sums = counts.sum(axis=1)
+    has_counts = row_sums > 0
+
+    # Johnson-Lindenstrauss random projection: [vocab_size, embedding_dim]
+    rng = np.random.RandomState(projection_seed)
+    proj_matrix = rng.randn(vocab_size, embedding_dim).astype(np.float32)
+    proj_matrix /= np.sqrt(embedding_dim)
+
+    # Only project rows that have data (avoids overflow warnings on empty rows)
+    table = np.zeros((total_entries, embedding_dim), dtype=np.float32)
+    if has_counts.any():
+        # Normalize active rows to probability distributions (L1)
+        active_counts = counts[has_counts]
+        active_sums = row_sums[has_counts, np.newaxis]
+        probs = active_counts / active_sums
+
+        # Project: [active, vocab_size] @ [vocab_size, embedding_dim]
+        # Suppress benign overflow warnings from sparse float32 matmul;
+        # any NaN/inf rows are clamped by the L2 normalization below.
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            projected = (probs.astype(np.float32) @ proj_matrix)
+
+        # Clamp any NaN/inf from float32 overflow before normalizing
+        np.nan_to_num(projected, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Unit-normalize (L2)
+        norms = np.linalg.norm(projected, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-10)
+        table[has_counts] = projected / norms
+
     return table
 
 
