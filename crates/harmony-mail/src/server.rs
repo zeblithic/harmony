@@ -391,8 +391,16 @@ async fn handle_connection(
                     if let Some(ref acceptor) = tls_acceptor {
                         // Flush pending writes before TLS handshake
                         writer.flush().await?;
-                        // Reunite the OwnedReadHalf + OwnedWriteHalf back into TcpStream
-                        let tcp_reader = framed.into_inner();
+                        // Use into_parts() to preserve any buffered bytes (e.g., an
+                        // eagerly-sent TLS ClientHello that arrived with STARTTLS)
+                        let parts = framed.into_parts();
+                        let tcp_reader = parts.io;
+                        if !parts.read_buf.is_empty() {
+                            tracing::debug!(
+                                buffered_bytes = parts.read_buf.len(),
+                                "STARTTLS: residual bytes in read buffer (likely ClientHello)"
+                            );
+                        }
                         let tcp_stream = tcp_reader.reunite(writer)
                             .map_err(|e| format!("failed to reunite TCP halves: {e}"))?;
                         // Perform TLS handshake

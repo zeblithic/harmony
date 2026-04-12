@@ -7,7 +7,7 @@
 use mail_parser::MimeHeaders;
 
 use crate::message::{
-    AttachmentRef, HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType,
+    self, AttachmentRef, HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType,
     ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN, VERSION,
 };
 
@@ -97,7 +97,7 @@ pub fn translate_inbound(raw: &[u8]) -> Result<TranslatedMessage, TranslateError
     let message_id = parsed
         .message_id()
         .map(|id| hash_to_message_id(id.as_bytes()))
-        .unwrap_or_else(random_message_id);
+        .unwrap_or_else(message::unique_message_id);
 
     // ── In-Reply-To ─────────────────────────────────────────────────
     let in_reply_to = parsed
@@ -187,26 +187,6 @@ fn hash_email_to_address(email: &str) -> [u8; ADDRESS_HASH_LEN] {
 /// Hash arbitrary bytes to a 16-byte message ID.
 fn hash_to_message_id(data: &[u8]) -> [u8; MESSAGE_ID_LEN] {
     let hash = blake3::hash(data);
-    let mut id = [0u8; MESSAGE_ID_LEN];
-    id.copy_from_slice(&hash.as_bytes()[..MESSAGE_ID_LEN]);
-    id
-}
-
-/// Generate a unique 16-byte message ID using timestamp + atomic counter.
-fn random_message_id() -> [u8; MESSAGE_ID_LEN] {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&now.to_le_bytes());
-    hasher.update(&seq.to_le_bytes());
-    let hash = hasher.finalize();
     let mut id = [0u8; MESSAGE_ID_LEN];
     id.copy_from_slice(&hash.as_bytes()[..MESSAGE_ID_LEN]);
     id

@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::message::{HarmonyMessage, MailMessageType, RecipientType, ADDRESS_HASH_LEN};
+use crate::message::{self, HarmonyMessage, MailMessageType, RecipientType, ADDRESS_HASH_LEN};
 
 // ── RFC 5322 message building ───────────────────────────────────────
 
@@ -233,7 +233,7 @@ pub fn build_bounce(
         message_type: MailMessageType::Bounce,
         flags: MessageFlags::new(false, true, false),
         timestamp: now_secs(),
-        message_id: unique_message_id(),
+        message_id: message::unique_message_id(),
         in_reply_to: Some(original.message_id),
         sender_address: [0u8; ADDRESS_HASH_LEN], // system sender
         recipients: vec![crate::message::Recipient {
@@ -256,26 +256,6 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-/// Generate a unique 16-byte message ID using timestamp + atomic counter.
-fn unique_message_id() -> [u8; 16] {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static MSG_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let seq = MSG_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&now.to_le_bytes());
-    hasher.update(&seq.to_le_bytes());
-    let hash = hasher.finalize();
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&hash.as_bytes()[..16]);
-    id
 }
 
 /// Queue-related errors.
