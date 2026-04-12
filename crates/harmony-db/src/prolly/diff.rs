@@ -91,31 +91,55 @@ fn diff_branches(
 
         match a.boundary_key.cmp(&b.boundary_key) {
             Ordering::Equal => {
-                if a.child_cid == b.child_cid {
-                    // Structural sharing — skip in O(1).
-                } else {
-                    // Same boundary, different content — recurse.
+                if a.child_cid != b.child_cid {
                     diff_nodes(
                         data_dir,
                         ContentId::from_bytes(a.child_cid),
                         ContentId::from_bytes(b.child_cid),
-                        added,
-                        removed,
-                        changed,
+                        added, removed, changed,
                     )?;
                 }
                 i += 1;
                 j += 1;
             }
-            Ordering::Less => {
-                // Boundary only in A — entire subtree removed.
-                collect_all(data_dir, ContentId::from_bytes(a.child_cid), removed)?;
-                i += 1;
-            }
-            Ordering::Greater => {
-                // Boundary only in B — entire subtree added.
-                collect_all(data_dir, ContentId::from_bytes(b.child_cid), added)?;
-                j += 1;
+            _ => {
+                // Boundaries don't align — chunk boundaries shifted.
+                // Collect leaf entries from mismatched region on both sides,
+                // then diff them as flat entry lists.
+                let mut entries_a = Vec::new();
+                let mut entries_b = Vec::new();
+
+                // Advance both sides until boundaries re-align or one side ends.
+                // We need to consume subtrees from both sides that overlap in
+                // key range, then diff the collected entries.
+                //
+                // Strategy: find the sync point — the next boundary key that
+                // appears in both sides. Collect everything before it.
+                let sync_key = find_sync_key(&children_a[i..], &children_b[j..]);
+
+                while i < children_a.len() {
+                    if let Some(ref sk) = sync_key {
+                        if children_a[i].boundary_key > *sk { break; }
+                    }
+                    collect_raw_leaves_by_cid(data_dir, ContentId::from_bytes(children_a[i].child_cid), &mut entries_a)?;
+                    i += 1;
+                    if let Some(ref sk) = sync_key {
+                        if i < children_a.len() && children_a[i - 1].boundary_key == *sk { break; }
+                    }
+                }
+
+                while j < children_b.len() {
+                    if let Some(ref sk) = sync_key {
+                        if children_b[j].boundary_key > *sk { break; }
+                    }
+                    collect_raw_leaves_by_cid(data_dir, ContentId::from_bytes(children_b[j].child_cid), &mut entries_b)?;
+                    j += 1;
+                    if let Some(ref sk) = sync_key {
+                        if j < children_b.len() && children_b[j - 1].boundary_key == *sk { break; }
+                    }
+                }
+
+                diff_leaf_entries(&entries_a, &entries_b, added, removed, changed);
             }
         }
     }
@@ -125,7 +149,6 @@ fn diff_branches(
         collect_all(data_dir, ContentId::from_bytes(children_a[i].child_cid), removed)?;
         i += 1;
     }
-
     // Remaining in B are all added.
     while j < children_b.len() {
         collect_all(data_dir, ContentId::from_bytes(children_b[j].child_cid), added)?;
@@ -133,6 +156,19 @@ fn diff_branches(
     }
 
     Ok(())
+}
+
+/// Find the next boundary key that appears in both remaining slices.
+fn find_sync_key(a: &[BranchEntry], b: &[BranchEntry]) -> Option<Vec<u8>> {
+    // Skip the first entries (they're the ones that don't match).
+    for ea in a.iter().skip(1) {
+        for eb in b.iter().skip(1) {
+            if ea.boundary_key == eb.boundary_key {
+                return Some(ea.boundary_key.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Two-pointer merge on sorted leaf entries.
@@ -195,6 +231,25 @@ fn collect_all(
 ) -> Result<(), DbError> {
     let node = Node::read_from_cas(data_dir, cid)?;
     collect_leaf_entries(data_dir, &node, out)
+}
+
+/// Collect all raw `LeafEntry` values from a subtree by CID (used for
+/// boundary-shift flattening in diff_branches).
+fn collect_raw_leaves_by_cid(
+    data_dir: &Path,
+    cid: ContentId,
+    out: &mut Vec<LeafEntry>,
+) -> Result<(), DbError> {
+    let node = Node::read_from_cas(data_dir, cid)?;
+    match node {
+        Node::Leaf(entries) => out.extend(entries),
+        Node::Branch(children) => {
+            for child in children {
+                collect_raw_leaves_by_cid(data_dir, ContentId::from_bytes(child.child_cid), out)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Recursively collect all raw `LeafEntry` values from a node (used for
@@ -366,6 +421,30 @@ mod tests {
         assert!(diff2.added.is_empty());
         assert_eq!(diff2.removed.len(), 2);
         assert!(diff2.changed.is_empty());
+    }
+
+    #[test]
+    fn diff_boundary_shift_no_false_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        persist::ensure_dirs(dir.path()).unwrap();
+        let config = ChunkerConfig::default_4k();
+
+        let entries_a: Vec<Entry> = (0..200u32)
+            .map(|i| make_entry(format!("k-{i:06}").as_bytes(), format!("v-{i}").as_bytes(), dir.path()))
+            .collect();
+        let root_a = build_tree(&entries_a, &config, dir.path()).unwrap();
+
+        // Same 200 entries + 1 new one in the middle.
+        let mut entries_b = entries_a.clone();
+        entries_b.push(make_entry(b"k-000100-new", b"inserted", dir.path()));
+        entries_b.sort_by(|a, b| a.key.cmp(&b.key));
+        let root_b = build_tree(&entries_b, &config, dir.path()).unwrap();
+
+        let td = diff_trees(dir.path(), root_a, root_b).unwrap();
+        assert_eq!(td.added.len(), 1, "should detect exactly 1 addition, not spurious changes from boundary shifts");
+        assert_eq!(td.added[0].key, b"k-000100-new");
+        assert!(td.removed.is_empty(), "no entries were removed");
+        assert!(td.changed.is_empty(), "no entries were changed");
     }
 
     #[test]

@@ -35,7 +35,10 @@ impl ChunkerConfig {
     /// above `max_size`.
     pub fn is_boundary(&self, current_size: usize, entry_size: usize, key: &[u8]) -> bool {
         // Hard minimum: never split below min_size.
-        if current_size + entry_size < self.min_size {
+        // When is_boundary returns true, the finalized chunk has size
+        // `current_size` (the new entry starts the next chunk), so we
+        // check current_size, not current_size + entry_size.
+        if current_size < self.min_size {
             return false;
         }
         // Hard maximum: always split at or above max_size.

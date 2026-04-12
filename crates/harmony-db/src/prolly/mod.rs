@@ -84,11 +84,16 @@ impl ProllyTree {
         entry: Entry,
         data_dir: &Path,
     ) -> Result<Option<ContentId>, DbError> {
+        let old_cache = self.cache.clone();
+        let old_root = self.root;
         match self.cache.binary_search_by(|e| e.key.cmp(&entry.key)) {
             Ok(idx) => self.cache[idx] = entry,
             Err(idx) => self.cache.insert(idx, entry),
         }
-        self.rebuild_tree(data_dir)
+        match self.rebuild_tree(data_dir) {
+            Ok(root) => Ok(root),
+            Err(e) => { self.cache = old_cache; self.root = old_root; Err(e) }
+        }
     }
 
     pub fn remove(
@@ -96,12 +101,17 @@ impl ProllyTree {
         key: &[u8],
         data_dir: &Path,
     ) -> Result<(Option<Entry>, Option<ContentId>), DbError> {
+        let old_cache = self.cache.clone();
+        let old_root = self.root;
         let removed = match self.cache.binary_search_by(|e| e.key.as_slice().cmp(key)) {
             Ok(idx) => Some(self.cache.remove(idx)),
             Err(_) => None,
         };
         let new_root = if removed.is_some() {
-            self.rebuild_tree(data_dir)?
+            match self.rebuild_tree(data_dir) {
+                Ok(root) => root,
+                Err(e) => { self.cache = old_cache; self.root = old_root; return Err(e); }
+            }
         } else {
             self.root
         };
@@ -119,10 +129,14 @@ impl ProllyTree {
             Ok(i) => i,
             Err(_) => return Ok(false),
         };
+        let old_cache = self.cache.clone();
+        let old_root = self.root;
         self.cache[idx].metadata.flags = flags;
         self.cache[idx].metadata.snippet = snippet;
-        self.rebuild_tree(data_dir)?;
-        Ok(true)
+        match self.rebuild_tree(data_dir) {
+            Ok(_) => Ok(true),
+            Err(e) => { self.cache = old_cache; self.root = old_root; Err(e) }
+        }
     }
 
     fn rebuild_tree(&mut self, data_dir: &Path) -> Result<Option<ContentId>, DbError> {

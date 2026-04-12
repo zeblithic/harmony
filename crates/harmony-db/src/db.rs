@@ -117,14 +117,15 @@ impl HarmonyDb {
     }
 
     /// Remove an entry by key. Does NOT delete the value blob.
+    /// Removes the table from the index when it becomes empty.
     pub fn remove(&mut self, table: &str, key: &[u8]) -> Result<Option<Entry>, DbError> {
-        let removed = match self.tables.get_mut(table) {
-            Some(t) => {
-                let (removed, _new_root) = t.remove(key, &self.data_dir)?;
-                removed
-            }
-            None => None,
+        let (removed, new_root) = match self.tables.get_mut(table) {
+            Some(t) => t.remove(key, &self.data_dir)?,
+            None => (None, None),
         };
+        if removed.is_some() && new_root.is_none() {
+            self.tables.remove(table);
+        }
         if removed.is_some() {
             self.save_roots()?;
         }
@@ -385,15 +386,13 @@ fn load_manifest(
         return Err(DbError::CommitNotFound { cid: root_hex });
     };
 
-    // Verify content hashes to expected CID.
-    if from_store {
-        let computed = ContentId::for_book(&bytes, ContentFlags::default())
-            .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
-        if computed != root_cid {
-            return Err(DbError::CorruptIndex(format!(
-                "manifest content mismatch for {root_hex}"
-            )));
-        }
+    // Verify content hashes to expected CID for both local and remote reads.
+    let computed = ContentId::for_book(&bytes, ContentFlags::default())
+        .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
+    if computed != root_cid {
+        return Err(DbError::CorruptIndex(format!(
+            "manifest content mismatch for {root_hex}"
+        )));
     }
 
     let manifest: CommitManifest = serde_json::from_slice(&bytes)
@@ -448,10 +447,16 @@ fn push_tree_nodes(
         Node::Leaf(_) => {} // No children to push.
     }
 
-    // Push this node.
-    store
+    // Push this node and verify the stored CID matches.
+    let stored_cid = store
         .insert_with_flags(&bytes, ContentFlags::default())
         .map_err(|e| DbError::Serialize(format!("BookStore node push failed: {e:?}")))?;
+    if stored_cid != cid {
+        return Err(DbError::CorruptIndex(format!(
+            "local node content mismatch for {hex}: stored as {}",
+            hex::encode(stored_cid.to_bytes())
+        )));
+    }
     Ok(())
 }
 
