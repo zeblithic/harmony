@@ -25,8 +25,10 @@
 //! assert_eq!(results[0].key, 42);
 //! ```
 
+mod compound;
 mod error;
 mod index;
 
+pub use compound::CompoundIndex;
 pub use error::{SearchError, SearchResult};
 pub use index::{Match, Metric, Quantization, VectorIndex, VectorIndexConfig};

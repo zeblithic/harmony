@@ -275,6 +275,71 @@ impl VectorIndex {
         &self.config
     }
 
+    /// Serialize the index to bytes.
+    pub fn save_to_bytes(&self) -> SearchResult<Vec<u8>> {
+        let len = self.inner.serialized_length();
+        let mut buffer = vec![0u8; len];
+        self.inner
+            .save_to_buffer(&mut buffer)
+            .map_err(|e| SearchError::Serialization(e.to_string()))?;
+        Ok(buffer)
+    }
+
+    /// Load an index from bytes.
+    ///
+    /// The provided `config` must match the configuration used when the index
+    /// was originally created and saved.
+    pub fn load_from_bytes(bytes: &[u8], config: VectorIndexConfig) -> SearchResult<Self> {
+        Self::validate_config(&config)?;
+        let inner = usearch::new_index(&make_opts(&config))
+            .map_err(|e| SearchError::Index(e.to_string()))?;
+        inner
+            .load_from_buffer(bytes)
+            .map_err(|e| SearchError::Serialization(e.to_string()))?;
+        let actual = inner.dimensions();
+        if actual != config.dimensions {
+            return Err(SearchError::InvalidConfig(format!(
+                "loaded index has {actual} dimensions, config says {}",
+                config.dimensions
+            )));
+        }
+        Ok(Self { inner, config })
+    }
+
+    /// Reserve total capacity for vectors (including existing contents).
+    pub fn reserve(&self, capacity: usize) -> SearchResult<()> {
+        self.inner
+            .reserve(capacity)
+            .map_err(|e| SearchError::Index(e.to_string()))
+    }
+
+    /// Remove a vector by key. Returns the number of vectors removed.
+    pub fn remove(&self, key: u64) -> SearchResult<usize> {
+        self.inner
+            .remove(key)
+            .map_err(|e| SearchError::Index(e.to_string()))
+    }
+
+    /// Retrieve a vector by key. Returns true if found, false if not.
+    pub fn get(&self, key: u64, buffer: &mut [f32]) -> SearchResult<bool> {
+        if buffer.len() != self.config.dimensions {
+            return Err(SearchError::InvalidConfig(format!(
+                "buffer length {} does not match index dimensions {}",
+                buffer.len(),
+                self.config.dimensions
+            )));
+        }
+        match self.inner.get(key, buffer) {
+            Ok(count) => Ok(count > 0),
+            Err(e) => Err(SearchError::Index(e.to_string())),
+        }
+    }
+
+    /// Check if a key exists in the index.
+    pub fn contains(&self, key: u64) -> bool {
+        self.inner.contains(key)
+    }
+
     /// Check that the index is configured for byte-based binary operations.
     ///
     /// Requires Hamming metric. Rejects Quantization::Binary because USearch's
@@ -543,5 +608,28 @@ mod tests {
         // Drop the viewed index before removing the dir (releases mmap)
         drop(viewed);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_to_bytes_roundtrip() {
+        let config = VectorIndexConfig {
+            dimensions: 4,
+            metric: Metric::L2,
+            quantization: Quantization::F32,
+            capacity: 100,
+            ..Default::default()
+        };
+        let index = VectorIndex::new(config.clone()).unwrap();
+        index.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+
+        let bytes = index.save_to_bytes().unwrap();
+        assert!(!bytes.is_empty());
+
+        let loaded = VectorIndex::load_from_bytes(&bytes, config).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        let results = loaded.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].key, 1);
     }
 }
