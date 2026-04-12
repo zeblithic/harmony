@@ -114,7 +114,7 @@ impl HarmonyDb {
         let found = self
             .tables
             .get_mut(table)
-            .map_or(false, |t| t.update_meta(key, meta));
+            .is_some_and(|t| t.update_meta(key, meta));
         if !found {
             return Err(DbError::TableNotFound {
                 name: table.to_string(),
