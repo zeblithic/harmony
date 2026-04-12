@@ -1,5 +1,6 @@
 use harmony_content::ContentId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Consumer-extensible metadata stored alongside each entry in the index.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -54,6 +55,20 @@ mod hex_content_id {
             .map_err(|_| serde::de::Error::custom("expected 64 hex chars for ContentId"))?;
         Ok(ContentId::from_bytes(bytes))
     }
+}
+
+/// Difference between two commits.
+#[derive(Debug, Clone)]
+pub struct Diff {
+    pub tables: HashMap<String, TableDiff>,
+}
+
+/// Differences within a single table between two commits.
+#[derive(Debug, Clone)]
+pub struct TableDiff {
+    pub added: Vec<Entry>,
+    pub removed: Vec<Entry>,
+    pub changed: Vec<(Entry, Entry)>,
 }
 
 /// Serde helper: serialize Option<ContentId> as nullable hex string.

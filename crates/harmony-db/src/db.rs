@@ -1,7 +1,9 @@
+use crate::commit;
 use crate::error::DbError;
 use crate::persist;
 use crate::table::Table;
 use crate::types::{Entry, EntryMeta};
+use harmony_content::book::BookStore;
 use harmony_content::ContentId;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -122,27 +124,51 @@ impl HarmonyDb {
         Ok(())
     }
 
+    /// Atomic snapshot: serialize all tables to CAS blobs, produce root manifest.
+    pub fn commit(
+        &mut self,
+        store: Option<&mut dyn BookStore>,
+    ) -> Result<ContentId, DbError> {
+        let root = commit::create_commit(&self.data_dir, self.head, &self.tables, store)?;
+        self.head = Some(root);
+        persist::save_index(&self.data_dir, self.head, &self.tables)?;
+        Ok(root)
+    }
+
+    /// Diff two commits.
+    pub fn diff(&self, old: ContentId, new: ContentId) -> Result<crate::types::Diff, DbError> {
+        commit::diff_commits(&self.data_dir, old, new)
+    }
+
+    /// Rebuild in-memory index from a CAS commit snapshot.
+    pub fn rebuild_from(
+        &mut self,
+        root: ContentId,
+        store: Option<&dyn BookStore>,
+    ) -> Result<(), DbError> {
+        let tables = commit::rebuild(&self.data_dir, root, store)?;
+        self.tables = tables;
+        self.head = Some(root);
+        persist::save_index(&self.data_dir, self.head, &self.tables)?;
+        Ok(())
+    }
+
+    /// Open, then immediately rebuild from a CAS commit.
+    pub fn open_from_cas(
+        data_dir: &Path,
+        root: ContentId,
+        store: &dyn BookStore,
+    ) -> Result<Self, DbError> {
+        let mut db = Self::open(data_dir)?;
+        db.rebuild_from(root, Some(store))?;
+        Ok(db)
+    }
+
     /// Current head commit CID.
     pub fn head(&self) -> Option<ContentId> {
         self.head
     }
 
-    // Internal accessors for commit module
-    pub(crate) fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
-
-    pub(crate) fn tables(&self) -> &HashMap<String, Table> {
-        &self.tables
-    }
-
-    pub(crate) fn set_head(&mut self, head: Option<ContentId>) {
-        self.head = head;
-    }
-
-    pub(crate) fn replace_tables(&mut self, tables: HashMap<String, Table>) {
-        self.tables = tables;
-    }
 }
 
 #[cfg(test)]
