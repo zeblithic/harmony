@@ -107,6 +107,11 @@ def generate_corpus_table(
         raise ValueError("hash_seeds must not be empty")
 
     if teacher_embed_matrix is not None:
+        if teacher_embed_matrix.ndim != 2:
+            raise ValueError(
+                f"teacher_embed_matrix must be 2D [vocab_size, teacher_dim], "
+                f"got {teacher_embed_matrix.ndim}D with shape {teacher_embed_matrix.shape}"
+            )
         if teacher_embed_matrix.shape[0] != vocab_size:
             raise ValueError(
                 f"teacher_embed_matrix has {teacher_embed_matrix.shape[0]} rows, "
@@ -168,20 +173,25 @@ def generate_corpus_table(
                 projected_full = probs @ teacher_embed_matrix
             np.nan_to_num(projected_full, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-            n_components = min(
-                embedding_dim,
-                projected_full.shape[0],
-                projected_full.shape[1],
-            )
-            pca = PCA(n_components=n_components, random_state=projection_seed)
-            reduced = pca.fit_transform(projected_full).astype(np.float32)
-            if n_components < embedding_dim:
+            n_active, teacher_dim = projected_full.shape
+            if n_active < 2:
+                # Too few samples for PCA — truncate/pad directly
+                cols = min(embedding_dim, teacher_dim)
                 projected = np.zeros(
-                    (projected_full.shape[0], embedding_dim), dtype=np.float32,
+                    (n_active, embedding_dim), dtype=np.float32,
                 )
-                projected[:, :n_components] = reduced
+                projected[:, :cols] = projected_full[:, :cols].astype(np.float32)
             else:
-                projected = reduced
+                n_components = min(embedding_dim, n_active, teacher_dim)
+                pca = PCA(n_components=n_components, random_state=projection_seed)
+                reduced = pca.fit_transform(projected_full).astype(np.float32)
+                if n_components < embedding_dim:
+                    projected = np.zeros(
+                        (n_active, embedding_dim), dtype=np.float32,
+                    )
+                    projected[:, :n_components] = reduced
+                else:
+                    projected = reduced
         else:
             # Random Johnson-Lindenstrauss projection
             rng = np.random.RandomState(projection_seed)
@@ -369,6 +379,16 @@ def main() -> None:
                 .weight.detach().float().numpy()
             )
             del teacher_model
+
+            # Auto-detect vocab_size from teacher if it differs from default
+            teacher_vocab = teacher_embed_matrix.shape[0]
+            if teacher_vocab != args.vocab_size:
+                print(
+                    f"Auto-detected vocab_size={teacher_vocab} from teacher "
+                    f"(overriding --vocab-size={args.vocab_size})"
+                )
+                args.vocab_size = teacher_vocab
+
             print(
                 f"Teacher embeddings loaded: {teacher_embed_matrix.shape} "
                 f"({teacher_embed_matrix.nbytes / 1024 / 1024:.0f} MB)"
