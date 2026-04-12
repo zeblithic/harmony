@@ -245,9 +245,9 @@ impl MailFolder {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, MailError> {
         let count = u16::try_from(self.page_cids.len()).map_err(|_| {
-            MailError::StringTooLong {
-                field: "page_cids",
-                len: self.page_cids.len(),
+            MailError::TooManyEntries {
+                count: self.page_cids.len(),
+                max: u16::MAX as usize,
             }
         })?;
         let mut buf = Vec::with_capacity(Self::MIN_SIZE + self.page_cids.len() * CID_LEN);
@@ -388,7 +388,14 @@ impl MessageEntry {
         let timestamp = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
-        let read = data[pos] & 0x01 != 0;
+        let read_flag = data[pos];
+        if read_flag != 0x00 && read_flag != 0x01 {
+            return Err(MailError::InvalidFlag {
+                field: "read",
+                value: read_flag,
+            });
+        }
+        let read = read_flag == 0x01;
         pos += 1;
 
         let snippet_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
@@ -403,7 +410,7 @@ impl MessageEntry {
 
         if data.len() < pos + snippet_len {
             return Err(MailError::Truncated {
-                expected: snippet_len,
+                expected: (pos + snippet_len) - data.len(),
             });
         }
 
@@ -475,9 +482,9 @@ impl MailPage {
             });
         }
         let count = u16::try_from(self.entries.len()).map_err(|_| {
-            MailError::StringTooLong {
-                field: "entries",
-                len: self.entries.len(),
+            MailError::TooManyEntries {
+                count: self.entries.len(),
+                max: u16::MAX as usize,
             }
         })?;
 
@@ -529,7 +536,9 @@ impl MailPage {
             0x00 => None,
             0x01 => {
                 if data.len() < pos + CID_LEN {
-                    return Err(MailError::Truncated { expected: CID_LEN });
+                    return Err(MailError::Truncated {
+                        expected: (pos + CID_LEN) - data.len(),
+                    });
                 }
                 let mut cid = [0u8; CID_LEN];
                 cid.copy_from_slice(&data[pos..pos + CID_LEN]);
@@ -545,7 +554,9 @@ impl MailPage {
         };
 
         if data.len() < pos + 2 {
-            return Err(MailError::Truncated { expected: 2 });
+            return Err(MailError::Truncated {
+                expected: (pos + 2) - data.len(),
+            });
         }
         let entry_count = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
