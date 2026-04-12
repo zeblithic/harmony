@@ -34,9 +34,18 @@ impl CompoundIndex {
 
     /// Add a vector to the delta index.
     ///
-    /// If the key already exists in delta, the old entry is removed first
-    /// (USearch rejects duplicate adds with multi=false).
+    /// If the key already exists in delta, the old entry is replaced.
+    /// Dimensions are validated before any mutation to prevent partial state.
     pub fn add(&mut self, key: u64, vector: &[f32]) -> SearchResult<()> {
+        // Validate dimensions before any mutation
+        if vector.len() != self.config.dimensions {
+            return Err(SearchError::InvalidConfig(format!(
+                "vector length {} does not match index dimensions {}",
+                vector.len(),
+                self.config.dimensions
+            )));
+        }
+        // Remove existing entry if present (safe — validation already passed)
         if self.delta_keys.contains(&key) {
             self.delta.remove(key)?;
         }
@@ -400,6 +409,23 @@ mod tests {
 
         // Should find the updated vector
         let results = idx.search(&[0.0, 0.0, 0.0, 1.0], 1).unwrap();
+        assert_eq!(results[0].key, 1);
+        assert!(results[0].distance < 0.01);
+    }
+
+    #[test]
+    fn failed_update_preserves_original() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+
+        // Add key 1 with a valid vector
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        // Try to "update" with wrong dimensions — should fail
+        assert!(idx.add(1, &[1.0, 0.0]).is_err());
+
+        // Original should still be searchable
+        assert_eq!(idx.delta_len(), 1);
+        let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(results[0].key, 1);
         assert!(results[0].distance < 0.01);
     }
