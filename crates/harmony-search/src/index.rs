@@ -153,8 +153,9 @@ impl VectorIndex {
     }
 
     /// Add a binary vector (packed bytes) with the given key.
-    /// For Hamming distance on binary embeddings.
+    /// Requires the index to be configured with Hamming metric.
     pub fn add_bytes(&self, key: u64, vector: &[u8]) -> SearchResult<()> {
+        self.ensure_binary_mode()?;
         let bits = self.unpack_bits(vector)?;
         self.add(key, &bits)
     }
@@ -182,7 +183,9 @@ impl VectorIndex {
     }
 
     /// Search with a binary query vector (packed bytes).
+    /// Requires the index to be configured with Hamming metric.
     pub fn search_bytes(&self, query: &[u8], k: usize) -> SearchResult<Vec<Match>> {
+        self.ensure_binary_mode()?;
         let bits = self.unpack_bits(query)?;
         self.search(&bits, k)
     }
@@ -239,7 +242,19 @@ impl VectorIndex {
         &self.config
     }
 
+    /// Check that the index is configured for binary/Hamming operations.
+    fn ensure_binary_mode(&self) -> SearchResult<()> {
+        if self.config.metric != Metric::Hamming {
+            return Err(SearchError::InvalidConfig(
+                "add_bytes/search_bytes require metric=Hamming".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Unpack binary bytes to f32 bits, validating length.
+    /// Uses MSB-first bit ordering to match harmony-semantic's
+    /// `quantize_to_binary()` and harmony-oluo's `get_bit()`.
     fn unpack_bits(&self, bytes: &[u8]) -> SearchResult<Vec<f32>> {
         let expected_bytes = self.config.dimensions.div_ceil(8);
         if bytes.len() != expected_bytes {
@@ -252,7 +267,8 @@ impl VectorIndex {
         let mut bits = Vec::with_capacity(self.config.dimensions);
         for i in 0..self.config.dimensions {
             let byte = bytes[i / 8];
-            let bit = (byte >> (i % 8)) & 1;
+            // MSB-first: bit 0 = most significant bit of byte 0
+            let bit = (byte >> (7 - (i % 8))) & 1;
             bits.push(bit as f32);
         }
         Ok(bits)
@@ -363,7 +379,7 @@ mod tests {
     fn add_bytes_wrong_length_rejected() {
         let config = VectorIndexConfig {
             dimensions: 16,
-            metric: Metric::L2,
+            metric: Metric::Hamming,
             quantization: Quantization::F32,
             capacity: 10,
             ..Default::default()
@@ -374,6 +390,20 @@ mod tests {
         assert!(index.add_bytes(2, &[0xFF, 0xFF, 0xFF]).is_err()); // too long
         assert!(index.add_bytes(3, &[0xFF, 0x00]).is_ok()); // correct
         assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn bytes_api_rejects_non_hamming() {
+        let config = VectorIndexConfig {
+            dimensions: 8,
+            metric: Metric::Cosine,
+            quantization: Quantization::F32,
+            capacity: 10,
+            ..Default::default()
+        };
+        let index = VectorIndex::new(config).unwrap();
+        assert!(index.add_bytes(1, &[0xFF]).is_err());
+        assert!(index.search_bytes(&[0xFF], 1).is_err());
     }
 
     #[test]
@@ -389,7 +419,15 @@ mod tests {
         index.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         index.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
 
-        let dir = std::env::temp_dir().join("harmony_search_test");
+        let unique = format!(
+            "harmony_search_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test_index.usearch");
         let path_str = path.to_str().unwrap();

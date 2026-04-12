@@ -1,7 +1,7 @@
 //! Vector similarity search for the Harmony mesh network.
 //!
 //! Wraps [USearch](https://github.com/unum-cloud/usearch) HNSW with
-//! Harmony-specific abstractions: content-addressed serialization,
+//! Harmony-specific abstractions: persistence (save/load/memory-mapped view),
 //! multi-metric support (Hamming, Cosine, L2, InnerProduct), and a common API surface
 //! for consumers across the ecosystem (oluo, engram, memo).
 //!
