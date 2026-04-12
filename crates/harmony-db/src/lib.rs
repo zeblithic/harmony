@@ -2,6 +2,7 @@
 //! history diffing, and portable index rebuild from CAS.
 
 mod error;
+mod persist;
 mod table;
 mod types;
 
