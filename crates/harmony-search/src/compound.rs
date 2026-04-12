@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::error::SearchResult;
+use crate::error::{SearchError, SearchResult};
 use crate::index::{Match, VectorIndex, VectorIndexConfig};
 
 /// Compound index with immutable Base + mutable Delta.
@@ -46,6 +46,14 @@ impl CompoundIndex {
     /// delta *membership* (all keys in delta), not just the top-k
     /// delta search results.
     pub fn search(&self, query: &[f32], k: usize) -> SearchResult<Vec<Match>> {
+        if query.len() != self.config.dimensions {
+            return Err(SearchError::InvalidConfig(format!(
+                "query length {} does not match index dimensions {}",
+                query.len(),
+                self.config.dimensions
+            )));
+        }
+
         let mut results = Vec::new();
 
         // Search delta
@@ -60,7 +68,6 @@ impl CompoundIndex {
                 let base_limit = base.len().min(k.saturating_add(self.delta_keys.len()));
                 let base_results = base.search(query, base_limit)?;
                 // Filter out base results for keys that exist anywhere in delta
-                // (not just in the delta top-k results)
                 for m in base_results {
                     if !self.delta_keys.contains(&m.key) {
                         results.push(m);
@@ -94,15 +101,15 @@ impl CompoundIndex {
     /// Number of unique keys (exact count, accounts for shadowing).
     pub fn unique_len(&self) -> usize {
         let base_len = self.base.as_ref().map_or(0, |b| b.len());
-        // Subtract delta keys that also exist in base (they shadow, not add)
         let shadowed = if self.base.is_some() {
-            self.delta_keys.iter().filter(|k| {
-                self.base.as_ref().map_or(false, |b| b.contains(**k))
-            }).count()
+            self.delta_keys
+                .iter()
+                .filter(|k| self.base.as_ref().map_or(false, |b| b.contains(**k)))
+                .count()
         } else {
             0
         };
-        base_len + self.delta.len() - shadowed
+        base_len + self.delta_keys.len() - shadowed
     }
 
     /// Number of vectors pending in the delta.
@@ -123,34 +130,38 @@ impl CompoundIndex {
     /// Merge delta into base and return serialized bytes.
     ///
     /// Uses serialize/deserialize to copy the base (not ANN search),
-    /// ensuring no vectors are dropped during compaction.
+    /// ensuring no vectors are dropped during compaction. For shadowed
+    /// keys (present in both base and delta), the base entry is removed
+    /// before the delta entry is inserted.
     ///
-    /// The returned bytes can be CAS-stored by the caller. After compaction,
-    /// call `load_base()` or `load_base_from_bytes()` with the persisted data
-    /// to swap in the new base.
-    ///
-    /// Resets the delta to empty after merge.
+    /// After compaction, the merged index is installed as the in-memory
+    /// base and delta is reset. The returned bytes can be CAS-stored by
+    /// the caller; once persisted, call `load_base()` to swap to the
+    /// memory-mapped version.
     pub fn compact(&mut self) -> SearchResult<Vec<u8>> {
         let dims = self.config.dimensions;
         let mut buf = vec![0.0f32; dims];
 
-        // Start with a writable copy of the base (via serialize/deserialize)
-        // or a fresh empty index if no base exists
-        let mut merged_config = self.config.clone();
-        merged_config.capacity = self.len() + 100;
-
         let merged = if let Some(ref base) = self.base {
             // Serialize base, load as writable copy — no vector loss
             let base_bytes = base.save_to_bytes()?;
-            let loaded = VectorIndex::load_from_bytes(&base_bytes, merged_config)?;
+            let loaded = VectorIndex::load_from_bytes(&base_bytes, self.config.clone())?;
             // Reserve extra capacity for delta insertions
             loaded.reserve(base.len() + self.delta_keys.len() + 100)?;
+            // Remove base entries that delta will shadow (USearch rejects duplicate adds)
+            for &key in &self.delta_keys {
+                if loaded.contains(key) {
+                    loaded.remove(key)?;
+                }
+            }
             loaded
         } else {
-            VectorIndex::new(merged_config)?
+            let mut fresh_config = self.config.clone();
+            fresh_config.capacity = self.delta_keys.len() + 100;
+            VectorIndex::new(fresh_config)?
         };
 
-        // Insert delta vectors (overwrites base entries with same key)
+        // Insert delta vectors
         for &key in &self.delta_keys {
             if self.delta.get(key, &mut buf)? {
                 merged.add(key, &buf)?;
@@ -159,6 +170,10 @@ impl CompoundIndex {
 
         // Serialize the merged result
         let bytes = merged.save_to_bytes()?;
+
+        // Install merged as in-memory base before clearing delta
+        // (no query-visible data loss between compact and load_base)
+        self.base = Some(VectorIndex::load_from_bytes(&bytes, self.config.clone())?);
 
         // Reset delta
         self.delta = VectorIndex::new(self.config.clone())?;
@@ -222,7 +237,7 @@ mod tests {
 
         let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].key, 1); // nearest
+        assert_eq!(results[0].key, 1);
     }
 
     #[test]
@@ -230,6 +245,12 @@ mod tests {
         let idx = CompoundIndex::new(test_config(), 100).unwrap();
         let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 5).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_wrong_dimensions_rejected() {
+        let idx = CompoundIndex::new(test_config(), 100).unwrap();
+        assert!(idx.search(&[1.0, 0.0], 1).is_err());
     }
 
     #[test]
@@ -249,9 +270,10 @@ mod tests {
         idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
         assert_eq!(idx.delta_len(), 2);
 
-        let bytes = idx.compact().unwrap();
-        assert!(!bytes.is_empty());
+        let _bytes = idx.compact().unwrap();
         assert_eq!(idx.delta_len(), 0);
+        // Base installed automatically
+        assert_eq!(idx.len(), 2);
     }
 
     #[test]
@@ -274,15 +296,13 @@ mod tests {
     fn search_merges_base_and_delta() {
         let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
 
-        // Add vectors, compact to base
         idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         let bytes = idx.compact().unwrap();
         idx.load_base_from_bytes(&bytes).unwrap();
 
-        // Add more to delta
         idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
 
-        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.unique_len(), 2);
         let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -296,8 +316,16 @@ mod tests {
         let bytes = idx.compact().unwrap();
         idx.load_base_from_bytes(&bytes).unwrap();
 
-        // "Update" key 1 in delta with a different vector
+        // "Update" key 1 in delta
         idx.add(1, &[0.0, 0.0, 0.0, 1.0]).unwrap();
+
+        let results = idx.search(&[0.0, 0.0, 0.0, 1.0], 1).unwrap();
+        assert_eq!(results[0].key, 1);
+        assert!(results[0].distance < 0.01);
+
+        // Compact again — the update persists through compaction
+        let bytes = idx.compact().unwrap();
+        idx.load_base_from_bytes(&bytes).unwrap();
 
         let results = idx.search(&[0.0, 0.0, 0.0, 1.0], 1).unwrap();
         assert_eq!(results[0].key, 1);
@@ -308,12 +336,10 @@ mod tests {
     fn multiple_compact_cycles() {
         let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
 
-        // Cycle 1
         idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         let bytes = idx.compact().unwrap();
         idx.load_base_from_bytes(&bytes).unwrap();
 
-        // Cycle 2
         idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
         let bytes = idx.compact().unwrap();
         idx.load_base_from_bytes(&bytes).unwrap();
@@ -328,14 +354,25 @@ mod tests {
     #[test]
     fn delta_keys_are_deduplicated() {
         let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
-
-        // Add different keys
         idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
         idx.add(3, &[0.0, 0.0, 1.0, 0.0]).unwrap();
-
-        // delta_keys is a HashSet, unique count matches
         assert_eq!(idx.delta_keys.len(), 3);
-        assert_eq!(idx.delta_len(), 3);
+    }
+
+    #[test]
+    fn unique_len_accounts_for_shadows() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let bytes = idx.compact().unwrap();
+        idx.load_base_from_bytes(&bytes).unwrap();
+
+        // Shadow key 1 in delta
+        idx.add(1, &[0.0, 0.0, 0.0, 1.0]).unwrap();
+
+        assert_eq!(idx.len(), 3); // 2 base + 1 delta (double-counts)
+        assert_eq!(idx.unique_len(), 2); // 2 unique keys
     }
 }

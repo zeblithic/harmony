@@ -313,6 +313,13 @@ impl VectorIndex {
             .map_err(|e| SearchError::Index(e.to_string()))
     }
 
+    /// Remove a vector by key. Returns the number of vectors removed.
+    pub fn remove(&self, key: u64) -> SearchResult<usize> {
+        self.inner
+            .remove(key)
+            .map_err(|e| SearchError::Index(e.to_string()))
+    }
+
     /// Retrieve a vector by key. Returns true if found, false if not.
     pub fn get(&self, key: u64, buffer: &mut [f32]) -> SearchResult<bool> {
         if buffer.len() != self.config.dimensions {
