@@ -25,6 +25,13 @@
 use crate::error::MailError;
 use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 
+// ── Wire format v1 size guards ───────────────────────────────────────
+// If any of these external constants change, the v1 wire format breaks.
+// Fail at compile time rather than producing silently incompatible blobs.
+const _: () = assert!(CID_LEN == 32, "mailbox v1 wire format requires CID_LEN == 32");
+const _: () = assert!(MESSAGE_ID_LEN == 16, "mailbox v1 wire format requires MESSAGE_ID_LEN == 16");
+const _: () = assert!(ADDRESS_HASH_LEN == 16, "mailbox v1 wire format requires ADDRESS_HASH_LEN == 16");
+
 // ── Constants ──────────────────────────────────────────────────────────
 
 /// Current mailbox format version.
@@ -150,7 +157,7 @@ impl MailRoot {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::WIRE_SIZE);
         buf.extend_from_slice(&ROOT_MAGIC);
-        buf.push(self.version);
+        buf.push(MAILBOX_VERSION);
         buf.extend_from_slice(&self.owner_address);
         buf.extend_from_slice(&self.updated_at.to_be_bytes());
         for folder_cid in &self.folders {
@@ -258,7 +265,7 @@ impl MailFolder {
         })?;
         let mut buf = Vec::with_capacity(Self::MIN_SIZE + self.page_cids.len() * CID_LEN);
         buf.extend_from_slice(&FOLDER_MAGIC);
-        buf.push(self.version);
+        buf.push(MAILBOX_VERSION);
         buf.extend_from_slice(&self.message_count.to_be_bytes());
         buf.extend_from_slice(&self.unread_count.to_be_bytes());
         buf.extend_from_slice(&count.to_be_bytes());
@@ -508,7 +515,7 @@ impl MailPage {
 
         let mut buf = Vec::with_capacity(256);
         buf.extend_from_slice(&PAGE_MAGIC);
-        buf.push(self.version);
+        buf.push(MAILBOX_VERSION);
 
         match &self.next_page {
             Some(cid) => {
