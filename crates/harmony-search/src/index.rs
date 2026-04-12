@@ -78,7 +78,7 @@ impl Default for VectorIndexConfig {
         Self {
             dimensions: 256,
             metric: Metric::Hamming,
-            quantization: Quantization::Binary,
+            quantization: Quantization::F32,
             capacity: 10_000,
             connectivity: 16,
             expansion_add: 128,
@@ -120,8 +120,8 @@ fn make_opts(config: &VectorIndexConfig) -> IndexOptions {
 }
 
 impl VectorIndex {
-    /// Create a new empty index with the given configuration.
-    pub fn new(config: VectorIndexConfig) -> SearchResult<Self> {
+    /// Validate config invariants shared across new/load/view.
+    fn validate_config(config: &VectorIndexConfig) -> SearchResult<()> {
         if config.dimensions == 0 {
             return Err(SearchError::InvalidConfig(
                 "dimensions must be > 0".into(),
@@ -132,6 +132,12 @@ impl VectorIndex {
                 "connectivity must be > 0".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Create a new empty index with the given configuration.
+    pub fn new(config: VectorIndexConfig) -> SearchResult<Self> {
+        Self::validate_config(&config)?;
 
         let index = usearch::new_index(&make_opts(&config))
             .map_err(|e| SearchError::Index(e.to_string()))?;
@@ -218,11 +224,7 @@ impl VectorIndex {
     /// was originally created and saved. Mismatched dimensions will be
     /// detected and rejected.
     pub fn load(path: &str, config: VectorIndexConfig) -> SearchResult<Self> {
-        if config.dimensions == 0 {
-            return Err(SearchError::InvalidConfig(
-                "dimensions must be > 0".into(),
-            ));
-        }
+        Self::validate_config(&config)?;
         let inner = usearch::new_index(&make_opts(&config))
             .map_err(|e| SearchError::Index(e.to_string()))?;
         inner
@@ -244,11 +246,7 @@ impl VectorIndex {
     /// was originally created and saved. Mismatched dimensions will be
     /// detected and rejected.
     pub fn view(path: &str, config: VectorIndexConfig) -> SearchResult<Self> {
-        if config.dimensions == 0 {
-            return Err(SearchError::InvalidConfig(
-                "dimensions must be > 0".into(),
-            ));
-        }
+        Self::validate_config(&config)?;
         let inner = usearch::new_index(&make_opts(&config))
             .map_err(|e| SearchError::Index(e.to_string()))?;
         inner
@@ -269,11 +267,23 @@ impl VectorIndex {
         &self.config
     }
 
-    /// Check that the index is configured for Hamming distance.
+    /// Check that the index is configured for byte-based binary operations.
+    ///
+    /// Requires Hamming metric. Rejects Quantization::Binary because USearch's
+    /// B1 mode expects packed bits internally, but the bytes API unpacks to f32.
+    /// Use Quantization::F32 (or I8) with Hamming metric for the bytes helpers.
     fn ensure_binary_mode(&self) -> SearchResult<()> {
         if self.config.metric != Metric::Hamming {
             return Err(SearchError::InvalidConfig(
                 "add_bytes/search_bytes require metric=Hamming".into(),
+            ));
+        }
+        if self.config.quantization == Quantization::Binary {
+            return Err(SearchError::InvalidConfig(
+                "add_bytes/search_bytes are incompatible with Quantization::Binary \
+                 (USearch B1 expects packed bits internally). \
+                 Use Quantization::F32 with metric=Hamming instead."
+                    .into(),
             ));
         }
         Ok(())
