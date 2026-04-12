@@ -232,14 +232,16 @@ fn strip_html_tags(html: &str) -> String {
         }
     }
 
-    // Decode common HTML entities
+    // Decode common HTML entities.
+    // &amp; must be decoded LAST to avoid corrupting double-encoded entities
+    // like &amp;lt; (should become &lt;, not <).
     result
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
 /// Errors during inbound translation.
@@ -407,6 +409,12 @@ body\r\n";
             strip_html_tags("<b>bold &amp; &lt;escaped&gt;</b>"),
             "bold & <escaped>"
         );
+    }
+
+    #[test]
+    fn strip_html_double_encoded_entities_preserved() {
+        // &amp;lt; should become &lt; (literal text), NOT <
+        assert_eq!(strip_html_tags("&amp;lt;test&amp;gt;"), "&lt;test&gt;");
     }
 
     #[test]
