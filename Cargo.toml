@@ -10,6 +10,7 @@ members = [
     "crates/harmony-discovery",
     "crates/harmony-engram",
     "crates/harmony-content",
+    "crates/harmony-db",
     "crates/harmony-crypto",
     "crates/harmony-identity",
     "crates/harmony-ingest",
@@ -141,6 +142,7 @@ harmony-credential = { path = "crates/harmony-credential", default-features = fa
 harmony-discovery = { path = "crates/harmony-discovery", default-features = false }
 harmony-engram = { path = "crates/harmony-engram", default-features = false }
 harmony-content = { path = "crates/harmony-content", default-features = false }
+harmony-db = { path = "crates/harmony-db" }
 harmony-crypto = { path = "crates/harmony-crypto", default-features = false }
 harmony-identity = { path = "crates/harmony-identity", default-features = false }
 harmony-jain = { path = "crates/harmony-jain", default-features = false }

@@ -1,0 +1,18 @@
+[package]
+name = "harmony-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Content-addressed key-value database with atomic commits and history diffing"
+
+[dependencies]
+harmony-content = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+hex = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"
