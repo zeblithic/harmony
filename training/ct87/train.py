@@ -620,12 +620,21 @@ def main() -> None:
     csv_writer = None
     if args.log_file:
         expected_header = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
-        # Accept pre-contrastive header (without cl_loss) for backwards compatibility
         legacy_header = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         if os.path.exists(args.log_file) and os.path.getsize(args.log_file) > 0:
             with open(args.log_file, newline="") as existing:
                 header = next(csv.reader(existing), [])
-            if header and header not in (expected_header, legacy_header):
+            if header == legacy_header:
+                # Migrate: rewrite file with new header so row widths match
+                with open(args.log_file, newline="") as f:
+                    rows = list(csv.reader(f))
+                rows[0] = expected_header
+                # Insert empty cl_loss column (index 4) into each data row
+                for i in range(1, len(rows)):
+                    rows[i].insert(4, "")
+                with open(args.log_file, "w", newline="") as f:
+                    csv.writer(f).writerows(rows)
+            elif header and header != expected_header:
                 print(
                     f"Error: incompatible CSV header in {args.log_file}: {header}",
                     file=sys.stderr,
@@ -828,7 +837,7 @@ def main() -> None:
                         accum_mtp_loss += mtp_loss_val.item()
 
                     # Contrastive auxiliary loss
-                    if args.contrastive_loss and cl_projected is not None:
+                    if args.contrastive_loss and cl_projected:
                         from ct87.latent_projection import contrastive_loss
 
                         cl_total = sum(
