@@ -57,6 +57,22 @@ pub const FOLDER_NAMES: [&str; FOLDER_COUNT] = ["inbox", "sent", "drafts", "tras
 /// Empty CID — all zeros, used as sentinel for "not yet created" folders/pages.
 pub const EMPTY_CID: [u8; CID_LEN] = [0u8; CID_LEN];
 
+// ── Helpers ────────────────────────────────────────────────────────────
+
+/// Truncate a UTF-8 string to at most `max_bytes` without splitting
+/// multi-byte characters. Returns the longest valid prefix.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Walk backwards from the byte limit to find a char boundary.
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 // ── Folder kind ────────────────────────────────────────────────────────
 
 /// Standard mailbox folders.
@@ -150,8 +166,19 @@ impl MailRoot {
                 min: Self::WIRE_SIZE,
             });
         }
-        if &data[0..4] != &ROOT_MAGIC {
-            return Err(MailError::UnsupportedVersion(data[0]));
+        if data.len() > Self::WIRE_SIZE {
+            return Err(MailError::TrailingBytes {
+                count: data.len() - Self::WIRE_SIZE,
+            });
+        }
+
+        let mut found_magic = [0u8; 4];
+        found_magic.copy_from_slice(&data[0..4]);
+        if found_magic != ROOT_MAGIC {
+            return Err(MailError::InvalidMagic {
+                expected: ROOT_MAGIC,
+                found: found_magic,
+            });
         }
         let version = data[4];
         if version != MAILBOX_VERSION {
@@ -216,17 +243,23 @@ impl MailFolder {
         }
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MailError> {
+        let count = u16::try_from(self.page_cids.len()).map_err(|_| {
+            MailError::StringTooLong {
+                field: "page_cids",
+                len: self.page_cids.len(),
+            }
+        })?;
         let mut buf = Vec::with_capacity(Self::MIN_SIZE + self.page_cids.len() * CID_LEN);
         buf.extend_from_slice(&FOLDER_MAGIC);
         buf.push(self.version);
         buf.extend_from_slice(&self.message_count.to_be_bytes());
         buf.extend_from_slice(&self.unread_count.to_be_bytes());
-        buf.extend_from_slice(&(self.page_cids.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&count.to_be_bytes());
         for cid in &self.page_cids {
             buf.extend_from_slice(cid);
         }
-        buf
+        Ok(buf)
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, MailError> {
@@ -236,8 +269,14 @@ impl MailFolder {
                 min: Self::MIN_SIZE,
             });
         }
-        if &data[0..4] != &FOLDER_MAGIC {
-            return Err(MailError::UnsupportedVersion(data[0]));
+
+        let mut found_magic = [0u8; 4];
+        found_magic.copy_from_slice(&data[0..4]);
+        if found_magic != FOLDER_MAGIC {
+            return Err(MailError::InvalidMagic {
+                expected: FOLDER_MAGIC,
+                found: found_magic,
+            });
         }
         let version = data[4];
         if version != MAILBOX_VERSION {
@@ -256,6 +295,11 @@ impl MailFolder {
         if data.len() < expected {
             return Err(MailError::Truncated {
                 expected: expected - data.len(),
+            });
+        }
+        if data.len() > expected {
+            return Err(MailError::TrailingBytes {
+                count: data.len() - expected,
             });
         }
 
@@ -302,9 +346,9 @@ impl MessageEntry {
     const MIN_SIZE: usize = CID_LEN + MESSAGE_ID_LEN + ADDRESS_HASH_LEN + 8 + 1 + 2;
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let snippet_bytes = self.subject_snippet.as_bytes();
-        let snippet_len = snippet_bytes.len().min(MAX_SNIPPET_LEN);
-        let mut buf = Vec::with_capacity(Self::MIN_SIZE + snippet_len);
+        let snippet = truncate_utf8(&self.subject_snippet, MAX_SNIPPET_LEN);
+        let snippet_bytes = snippet.as_bytes();
+        let mut buf = Vec::with_capacity(Self::MIN_SIZE + snippet_bytes.len());
 
         buf.extend_from_slice(&self.message_cid);
         buf.extend_from_slice(&self.message_id);
@@ -314,8 +358,8 @@ impl MessageEntry {
         let flags: u8 = if self.read { 0x01 } else { 0x00 };
         buf.push(flags);
 
-        buf.extend_from_slice(&(snippet_len as u16).to_be_bytes());
-        buf.extend_from_slice(&snippet_bytes[..snippet_len]);
+        buf.extend_from_slice(&(snippet_bytes.len() as u16).to_be_bytes());
+        buf.extend_from_slice(snippet_bytes);
         buf
     }
 
@@ -349,6 +393,13 @@ impl MessageEntry {
 
         let snippet_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
+
+        if snippet_len > MAX_SNIPPET_LEN {
+            return Err(MailError::SubjectTooLong {
+                len: snippet_len,
+                max: MAX_SNIPPET_LEN,
+            });
+        }
 
         if data.len() < pos + snippet_len {
             return Err(MailError::Truncated {
@@ -416,7 +467,20 @@ impl MailPage {
         self.entries.len() >= PAGE_CAPACITY
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MailError> {
+        if self.entries.len() > PAGE_CAPACITY {
+            return Err(MailError::TooManyEntries {
+                count: self.entries.len(),
+                max: PAGE_CAPACITY,
+            });
+        }
+        let count = u16::try_from(self.entries.len()).map_err(|_| {
+            MailError::StringTooLong {
+                field: "entries",
+                len: self.entries.len(),
+            }
+        })?;
+
         let mut buf = Vec::with_capacity(256);
         buf.extend_from_slice(&PAGE_MAGIC);
         buf.push(self.version);
@@ -429,11 +493,11 @@ impl MailPage {
             None => buf.push(0x00),
         }
 
-        buf.extend_from_slice(&(self.entries.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&count.to_be_bytes());
         for entry in &self.entries {
             buf.extend_from_slice(&entry.to_bytes());
         }
-        buf
+        Ok(buf)
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, MailError> {
@@ -443,8 +507,14 @@ impl MailPage {
                 min: Self::MIN_SIZE,
             });
         }
-        if &data[0..4] != &PAGE_MAGIC {
-            return Err(MailError::UnsupportedVersion(data[0]));
+
+        let mut found_magic = [0u8; 4];
+        found_magic.copy_from_slice(&data[0..4]);
+        if found_magic != PAGE_MAGIC {
+            return Err(MailError::InvalidMagic {
+                expected: PAGE_MAGIC,
+                found: found_magic,
+            });
         }
         let version = data[4];
         if version != MAILBOX_VERSION {
@@ -455,16 +525,23 @@ impl MailPage {
         let has_next = data[pos];
         pos += 1;
 
-        let next_page = if has_next == 0x01 {
-            if data.len() < pos + CID_LEN {
-                return Err(MailError::Truncated { expected: CID_LEN });
+        let next_page = match has_next {
+            0x00 => None,
+            0x01 => {
+                if data.len() < pos + CID_LEN {
+                    return Err(MailError::Truncated { expected: CID_LEN });
+                }
+                let mut cid = [0u8; CID_LEN];
+                cid.copy_from_slice(&data[pos..pos + CID_LEN]);
+                pos += CID_LEN;
+                Some(cid)
             }
-            let mut cid = [0u8; CID_LEN];
-            cid.copy_from_slice(&data[pos..pos + CID_LEN]);
-            pos += CID_LEN;
-            Some(cid)
-        } else {
-            None
+            _ => {
+                return Err(MailError::InvalidFlag {
+                    field: "has_next",
+                    value: has_next,
+                });
+            }
         };
 
         if data.len() < pos + 2 {
@@ -473,11 +550,24 @@ impl MailPage {
         let entry_count = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
 
+        if entry_count > PAGE_CAPACITY {
+            return Err(MailError::TooManyEntries {
+                count: entry_count,
+                max: PAGE_CAPACITY,
+            });
+        }
+
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
             let (entry, consumed) = MessageEntry::from_bytes(&data[pos..])?;
             pos += consumed;
             entries.push(entry);
+        }
+
+        if pos != data.len() {
+            return Err(MailError::TrailingBytes {
+                count: data.len() - pos,
+            });
         }
 
         Ok(Self {
@@ -534,6 +624,27 @@ mod tests {
     }
 
     #[test]
+    fn mail_root_rejects_trailing_bytes() {
+        let root = MailRoot::new_empty(dummy_address(), 100);
+        let mut bytes = root.to_bytes();
+        bytes.push(0xFF);
+        assert!(matches!(
+            MailRoot::from_bytes(&bytes),
+            Err(MailError::TrailingBytes { count: 1 })
+        ));
+    }
+
+    #[test]
+    fn mail_root_rejects_bad_magic() {
+        let mut bytes = MailRoot::new_empty(dummy_address(), 100).to_bytes();
+        bytes[0] = b'X';
+        assert!(matches!(
+            MailRoot::from_bytes(&bytes),
+            Err(MailError::InvalidMagic { .. })
+        ));
+    }
+
+    #[test]
     fn mail_root_empty() {
         let root = MailRoot::new_empty(dummy_address(), 1744403200);
         let bytes = root.to_bytes();
@@ -547,7 +658,6 @@ mod tests {
         let updated = root.with_folder(FolderKind::Inbox, dummy_cid(0xFF), 200);
         assert_eq!(updated.folders[0], dummy_cid(0xFF));
         assert_eq!(updated.updated_at, 200);
-        // Other folders unchanged
         assert_eq!(updated.folders[1], EMPTY_CID);
     }
 
@@ -559,15 +669,26 @@ mod tests {
             unread_count: 3,
             page_cids: vec![dummy_cid(1), dummy_cid(2)],
         };
-        let bytes = folder.to_bytes();
+        let bytes = folder.to_bytes().unwrap();
         let decoded = MailFolder::from_bytes(&bytes).unwrap();
         assert_eq!(folder, decoded);
     }
 
     #[test]
+    fn mail_folder_rejects_trailing_bytes() {
+        let folder = MailFolder::new_empty();
+        let mut bytes = folder.to_bytes().unwrap();
+        bytes.push(0xFF);
+        assert!(matches!(
+            MailFolder::from_bytes(&bytes),
+            Err(MailError::TrailingBytes { count: 1 })
+        ));
+    }
+
+    #[test]
     fn mail_folder_empty() {
         let folder = MailFolder::new_empty();
-        let bytes = folder.to_bytes();
+        let bytes = folder.to_bytes().unwrap();
         let decoded = MailFolder::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.message_count, 0);
         assert_eq!(decoded.unread_count, 0);
@@ -584,13 +705,32 @@ mod tests {
     }
 
     #[test]
+    fn message_entry_utf8_truncation() {
+        // 4-byte UTF-8 char (emoji) right at the boundary
+        let entry = MessageEntry {
+            message_cid: dummy_cid(1),
+            message_id: [1; MESSAGE_ID_LEN],
+            sender_address: dummy_address(),
+            timestamp: 100,
+            // Fill to just over MAX_SNIPPET_LEN with multi-byte chars
+            subject_snippet: "x".repeat(MAX_SNIPPET_LEN - 1) + "\u{1F600}", // 127 + 4 = 131 bytes
+            read: false,
+        };
+        let bytes = entry.to_bytes();
+        // Should roundtrip without InvalidUtf8 — truncation respects char boundary
+        let (decoded, _) = MessageEntry::from_bytes(&bytes).unwrap();
+        assert!(decoded.subject_snippet.len() <= MAX_SNIPPET_LEN);
+        assert!(decoded.subject_snippet.is_char_boundary(decoded.subject_snippet.len()));
+    }
+
+    #[test]
     fn mail_page_roundtrip() {
         let page = MailPage {
             version: MAILBOX_VERSION,
             next_page: Some(dummy_cid(0xAA)),
             entries: vec![dummy_entry(1), dummy_entry(2), dummy_entry(3)],
         };
-        let bytes = page.to_bytes();
+        let bytes = page.to_bytes().unwrap();
         let decoded = MailPage::from_bytes(&bytes).unwrap();
         assert_eq!(page, decoded);
     }
@@ -602,10 +742,37 @@ mod tests {
             next_page: None,
             entries: vec![dummy_entry(5)],
         };
-        let bytes = page.to_bytes();
+        let bytes = page.to_bytes().unwrap();
         let decoded = MailPage::from_bytes(&bytes).unwrap();
         assert!(decoded.next_page.is_none());
         assert_eq!(decoded.entries.len(), 1);
+    }
+
+    #[test]
+    fn mail_page_rejects_invalid_has_next() {
+        let page = MailPage::new_empty();
+        let mut bytes = page.to_bytes().unwrap();
+        // has_next byte is at offset 5 (after magic + version)
+        bytes[5] = 0x02;
+        assert!(matches!(
+            MailPage::from_bytes(&bytes),
+            Err(MailError::InvalidFlag { field: "has_next", value: 0x02 })
+        ));
+    }
+
+    #[test]
+    fn mail_page_rejects_trailing_bytes() {
+        let page = MailPage {
+            version: MAILBOX_VERSION,
+            next_page: None,
+            entries: vec![dummy_entry(1)],
+        };
+        let mut bytes = page.to_bytes().unwrap();
+        bytes.push(0xFF);
+        assert!(matches!(
+            MailPage::from_bytes(&bytes),
+            Err(MailError::TrailingBytes { .. })
+        ));
     }
 
     #[test]
@@ -626,5 +793,18 @@ mod tests {
             assert_eq!(kind.name(), FOLDER_NAMES[i]);
         }
         assert!(FolderKind::from_u8(4).is_none());
+    }
+
+    #[test]
+    fn truncate_utf8_respects_boundaries() {
+        assert_eq!(truncate_utf8("hello", 10), "hello");
+        assert_eq!(truncate_utf8("hello", 3), "hel");
+        // 2-byte char: é = 0xC3 0xA9
+        assert_eq!(truncate_utf8("café", 3), "caf");
+        assert_eq!(truncate_utf8("café", 4), "caf");
+        assert_eq!(truncate_utf8("café", 5), "café");
+        // 4-byte char: 😀 = F0 9F 98 80
+        assert_eq!(truncate_utf8("a😀b", 2), "a");
+        assert_eq!(truncate_utf8("a😀b", 5), "a😀");
     }
 }
