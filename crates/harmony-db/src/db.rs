@@ -1,17 +1,31 @@
-use crate::commit;
 use crate::error::DbError;
 use crate::persist;
-use crate::table::Table;
+use crate::prolly::node::Node;
+use crate::prolly::ProllyTree;
 use crate::types::{Entry, EntryMeta};
 use harmony_content::book::BookStore;
-use harmony_content::ContentId;
-use std::collections::HashMap;
+use harmony_content::{ContentFlags, ContentId};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+
+const COMMIT_VERSION: u32 = 2;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CommitManifest {
+    version: u32,
+    #[serde(
+        serialize_with = "crate::types::ser_opt_cid",
+        deserialize_with = "crate::types::de_opt_cid"
+    )]
+    parent: Option<ContentId>,
+    tables: BTreeMap<String, String>, // name → root CID hex
+}
 
 /// A content-addressed key-value database with named tables.
 pub struct HarmonyDb {
     data_dir: PathBuf,
-    tables: HashMap<String, Table>,
+    tables: HashMap<String, ProllyTree>,
     head: Option<ContentId>,
 }
 
@@ -19,7 +33,12 @@ impl HarmonyDb {
     /// Open or create a database at `data_dir`.
     pub fn open(data_dir: &Path) -> Result<Self, DbError> {
         persist::ensure_dirs(data_dir)?;
-        let (head, tables) = persist::load_index(data_dir);
+        let (head, table_roots) = persist::load_roots(data_dir);
+        let mut tables = HashMap::new();
+        for (name, root_cid) in table_roots {
+            let tree = ProllyTree::from_root(root_cid, data_dir)?;
+            tables.insert(name, tree);
+        }
         Ok(HarmonyDb {
             data_dir: data_dir.to_path_buf(),
             tables,
@@ -61,9 +80,9 @@ impl HarmonyDb {
         };
         self.tables
             .entry(table.to_string())
-            .or_insert_with(Table::new)
-            .upsert(entry);
-        persist::save_index(&self.data_dir, self.head, &self.tables)?;
+            .or_insert_with(ProllyTree::new)
+            .insert(entry, &self.data_dir)?;
+        self.save_roots()?;
         Ok(cid)
     }
 
@@ -99,9 +118,15 @@ impl HarmonyDb {
 
     /// Remove an entry by key. Does NOT delete the value blob.
     pub fn remove(&mut self, table: &str, key: &[u8]) -> Result<Option<Entry>, DbError> {
-        let removed = self.tables.get_mut(table).and_then(|t| t.remove(key));
+        let removed = match self.tables.get_mut(table) {
+            Some(t) => {
+                let (removed, _new_root) = t.remove(key, &self.data_dir)?;
+                removed
+            }
+            None => None,
+        };
         if removed.is_some() {
-            persist::save_index(&self.data_dir, self.head, &self.tables)?;
+            self.save_roots()?;
         }
         Ok(removed)
     }
@@ -113,41 +138,150 @@ impl HarmonyDb {
         key: &[u8],
         meta: EntryMeta,
     ) -> Result<(), DbError> {
-        let truncated_meta = EntryMeta {
-            flags: meta.flags,
-            snippet: persist::truncate_snippet(&meta.snippet),
-        };
-        let t = self.tables.get_mut(table).ok_or_else(|| DbError::TableNotFound {
-            name: table.to_string(),
-        })?;
-        if !t.update_meta(key, truncated_meta) {
-            return Err(DbError::EntryNotFound { table: table.to_string() });
+        let truncated_snippet = persist::truncate_snippet(&meta.snippet);
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound {
+                name: table.to_string(),
+            })?;
+        if !t.update_meta(key, meta.flags, truncated_snippet, &self.data_dir)? {
+            return Err(DbError::EntryNotFound {
+                table: table.to_string(),
+            });
         }
-        persist::save_index(&self.data_dir, self.head, &self.tables)?;
+        self.save_roots()?;
         Ok(())
     }
 
-    /// Atomic snapshot: serialize all tables to CAS blobs, produce root manifest.
+    /// Atomic snapshot: serialize all table trees to CAS, produce root manifest.
     pub fn commit(
         &mut self,
-        store: Option<&mut dyn BookStore>,
+        mut store: Option<&mut dyn BookStore>,
     ) -> Result<ContentId, DbError> {
-        let root = commit::create_commit(&self.data_dir, self.head, &self.tables, store)?;
-        let new_head = Some(root);
-        persist::save_index(&self.data_dir, new_head, &self.tables)?;
+        let commits_dir = self.data_dir.join("commits");
+        let mut table_cids: BTreeMap<String, String> = BTreeMap::new();
+
+        for (name, tree) in &self.tables {
+            if let Some(root_cid) = tree.root() {
+                table_cids.insert(name.clone(), hex::encode(root_cid.to_bytes()));
+            }
+        }
+
+        let manifest = CommitManifest {
+            version: COMMIT_VERSION,
+            parent: self.head,
+            tables: table_cids,
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| DbError::Serialize(e.to_string()))?;
+        let root_cid = ContentId::for_book(&manifest_bytes, ContentFlags::default())
+            .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
+        let root_hex = hex::encode(root_cid.to_bytes());
+
+        let root_path = commits_dir.join(format!("{root_hex}.bin"));
+        if !root_path.exists() {
+            let tmp = commits_dir.join(format!("{root_hex}.bin.tmp"));
+            std::fs::write(&tmp, &manifest_bytes)?;
+            std::fs::rename(&tmp, &root_path)?;
+        }
+
+        // Push to BookStore if provided.
+        if let Some(ref mut s) = store {
+            // Push tree nodes: for each table, walk the tree and push all nodes.
+            for tree in self.tables.values() {
+                if let Some(root) = tree.root() {
+                    push_tree_nodes(&self.data_dir, root, *s)?;
+                }
+            }
+
+            // Push value blobs referenced by leaf entries.
+            for tree in self.tables.values() {
+                for entry in tree.entries() {
+                    if !s.contains(&entry.value_cid) {
+                        if let Some(blob) = persist::read_blob(&self.data_dir, &entry.value_cid)? {
+                            s.store(entry.value_cid, blob);
+                        }
+                    }
+                }
+            }
+
+            // Manifest last — atomic visibility.
+            s.insert_with_flags(&manifest_bytes, ContentFlags::default())
+                .map_err(|e| {
+                    DbError::Serialize(format!("BookStore manifest push failed: {e:?}"))
+                })?;
+        }
+
+        let new_head = Some(root_cid);
         self.head = new_head;
-        Ok(root)
+        self.save_roots()?;
+        Ok(root_cid)
     }
 
     /// Diff two commits. Optionally provide a BookStore to fetch
-    /// commit blobs not cached locally (e.g., after open_from_cas).
+    /// commit blobs not cached locally.
     pub fn diff(
         &self,
         old: ContentId,
         new: ContentId,
         store: Option<&dyn BookStore>,
     ) -> Result<crate::types::Diff, DbError> {
-        commit::diff_commits(&self.data_dir, old, new, store)
+        let old_manifest = load_manifest(&self.data_dir, old, store)?;
+        let new_manifest = load_manifest(&self.data_dir, new, store)?;
+
+        let mut tables = HashMap::new();
+
+        for (name, new_root_hex) in &new_manifest.tables {
+            let new_root_cid = hex_to_cid(new_root_hex)?;
+            if let Some(old_root_hex) = old_manifest.tables.get(name) {
+                if old_root_hex == new_root_hex {
+                    continue; // Skip identical tables.
+                }
+                let old_root_cid = hex_to_cid(old_root_hex)?;
+                // Prefetch nodes from store if needed.
+                if let Some(s) = store {
+                    prefetch_tree_nodes(&self.data_dir, old_root_cid, s)?;
+                    prefetch_tree_nodes(&self.data_dir, new_root_cid, s)?;
+                }
+                let td = crate::prolly::diff::diff_trees(
+                    &self.data_dir,
+                    Some(old_root_cid),
+                    Some(new_root_cid),
+                )?;
+                if !td.added.is_empty() || !td.removed.is_empty() || !td.changed.is_empty() {
+                    tables.insert(name.clone(), td);
+                }
+            } else {
+                // New table — all entries are additions.
+                if let Some(s) = store {
+                    prefetch_tree_nodes(&self.data_dir, new_root_cid, s)?;
+                }
+                let td = crate::prolly::diff::diff_trees(
+                    &self.data_dir,
+                    None,
+                    Some(new_root_cid),
+                )?;
+                tables.insert(name.clone(), td);
+            }
+        }
+
+        for (name, old_root_hex) in &old_manifest.tables {
+            if !new_manifest.tables.contains_key(name) {
+                let old_root_cid = hex_to_cid(old_root_hex)?;
+                if let Some(s) = store {
+                    prefetch_tree_nodes(&self.data_dir, old_root_cid, s)?;
+                }
+                let td = crate::prolly::diff::diff_trees(
+                    &self.data_dir,
+                    Some(old_root_cid),
+                    None,
+                )?;
+                tables.insert(name.clone(), td);
+            }
+        }
+
+        Ok(crate::types::Diff { tables })
     }
 
     /// Rebuild in-memory index from a CAS commit snapshot.
@@ -156,11 +290,39 @@ impl HarmonyDb {
         root: ContentId,
         store: Option<&dyn BookStore>,
     ) -> Result<(), DbError> {
-        let new_tables = commit::rebuild(&self.data_dir, root, store)?;
+        let manifest = load_manifest(&self.data_dir, root, store)?;
+        let mut new_tables = HashMap::new();
+
+        for (name, root_hex) in &manifest.tables {
+            let root_cid = hex_to_cid(root_hex)?;
+
+            // Prefetch tree nodes from store to local commits/.
+            if let Some(s) = store {
+                prefetch_tree_nodes(&self.data_dir, root_cid, s)?;
+            }
+
+            let tree = ProllyTree::from_root(root_cid, &self.data_dir)?;
+
+            // Prefetch value blobs.
+            for entry in tree.entries() {
+                let cid_hex = hex::encode(entry.value_cid.to_bytes());
+                let local_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
+                if !local_blob.exists() {
+                    if let Some(s) = store {
+                        if let Some(blob_data) = s.get(&entry.value_cid) {
+                            persist::write_blob_raw(&self.data_dir, &cid_hex, blob_data)?;
+                        }
+                    }
+                }
+            }
+
+            new_tables.insert(name.clone(), tree);
+        }
+
         let new_head = Some(root);
-        persist::save_index(&self.data_dir, new_head, &new_tables)?;
         self.tables = new_tables;
         self.head = new_head;
+        self.save_roots()?;
         Ok(())
     }
 
@@ -180,6 +342,175 @@ impl HarmonyDb {
         self.head
     }
 
+    /// Persist current roots (head + per-table root CIDs) to index.json.
+    fn save_roots(&self) -> Result<(), DbError> {
+        let table_roots: BTreeMap<String, Option<ContentId>> = self
+            .tables
+            .iter()
+            .map(|(name, tree)| (name.clone(), tree.root()))
+            .collect();
+        persist::save_roots(&self.data_dir, self.head, &table_roots)
+    }
+}
+
+// ---- Helpers ----
+
+fn hex_to_cid(hex_str: &str) -> Result<ContentId, DbError> {
+    let bytes: [u8; 32] = hex::decode(hex_str)
+        .map_err(|e| DbError::CorruptIndex(e.to_string()))?
+        .try_into()
+        .map_err(|_| DbError::CorruptIndex("bad CID length".into()))?;
+    Ok(ContentId::from_bytes(bytes))
+}
+
+fn load_manifest(
+    data_dir: &Path,
+    root_cid: ContentId,
+    store: Option<&dyn BookStore>,
+) -> Result<CommitManifest, DbError> {
+    let root_hex = hex::encode(root_cid.to_bytes());
+    let local_path = data_dir.join("commits").join(format!("{root_hex}.bin"));
+
+    let (bytes, from_store) = if local_path.exists() {
+        (std::fs::read(&local_path)?, false)
+    } else if let Some(s) = store {
+        let fetched = s
+            .get(&root_cid)
+            .map(|b| b.to_vec())
+            .ok_or_else(|| DbError::CommitNotFound {
+                cid: root_hex.clone(),
+            })?;
+        (fetched, true)
+    } else {
+        return Err(DbError::CommitNotFound { cid: root_hex });
+    };
+
+    // Verify content hashes to expected CID.
+    if from_store {
+        let computed = ContentId::for_book(&bytes, ContentFlags::default())
+            .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
+        if computed != root_cid {
+            return Err(DbError::CorruptIndex(format!(
+                "manifest content mismatch for {root_hex}"
+            )));
+        }
+    }
+
+    let manifest: CommitManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| DbError::CorruptIndex(e.to_string()))?;
+    if manifest.version != COMMIT_VERSION {
+        return Err(DbError::CorruptIndex(format!(
+            "unsupported commit version: {} (expected {})",
+            manifest.version, COMMIT_VERSION
+        )));
+    }
+
+    // Cache locally after validation.
+    if from_store {
+        let tmp = local_path.with_extension("bin.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &local_path)?;
+    }
+
+    Ok(manifest)
+}
+
+/// Recursively push all tree nodes to a BookStore.
+/// Pushes children before parents so data is available before references.
+fn push_tree_nodes(
+    data_dir: &Path,
+    cid: ContentId,
+    store: &mut dyn BookStore,
+) -> Result<(), DbError> {
+    if store.contains(&cid) {
+        return Ok(());
+    }
+    let hex = hex::encode(cid.to_bytes());
+    let path = data_dir.join("commits").join(format!("{hex}.bin"));
+    let bytes = std::fs::read(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            DbError::CommitNotFound { cid: hex.clone() }
+        } else {
+            DbError::Io(e)
+        }
+    })?;
+
+    // Parse node to discover children.
+    let node: Node =
+        postcard::from_bytes(&bytes).map_err(|e| DbError::CorruptIndex(e.to_string()))?;
+    match &node {
+        Node::Branch(children) => {
+            // Push children first.
+            for child in children {
+                push_tree_nodes(data_dir, ContentId::from_bytes(child.child_cid), store)?;
+            }
+        }
+        Node::Leaf(_) => {} // No children to push.
+    }
+
+    // Push this node.
+    store
+        .insert_with_flags(&bytes, ContentFlags::default())
+        .map_err(|e| DbError::Serialize(format!("BookStore node push failed: {e:?}")))?;
+    Ok(())
+}
+
+/// Recursively prefetch tree nodes from a BookStore to local commits/.
+fn prefetch_tree_nodes(
+    data_dir: &Path,
+    cid: ContentId,
+    store: &dyn BookStore,
+) -> Result<(), DbError> {
+    let hex = hex::encode(cid.to_bytes());
+    let local_path = data_dir.join("commits").join(format!("{hex}.bin"));
+    if local_path.exists() {
+        // Already cached — but still need to recurse into children
+        // that might not be cached.
+        let bytes = std::fs::read(&local_path)?;
+        if let Ok(node) = postcard::from_bytes::<Node>(&bytes) {
+            if let Node::Branch(children) = &node {
+                for child in children {
+                    prefetch_tree_nodes(
+                        data_dir,
+                        ContentId::from_bytes(child.child_cid),
+                        store,
+                    )?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Fetch from store.
+    let bytes = match store.get(&cid) {
+        Some(b) => b.to_vec(),
+        None => return Ok(()), // Best-effort.
+    };
+
+    // Verify CID.
+    let computed = ContentId::for_book(&bytes, ContentFlags::default())
+        .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
+    if computed != cid {
+        return Err(DbError::CorruptIndex(format!(
+            "tree node content mismatch for {hex}"
+        )));
+    }
+
+    // Cache locally.
+    let tmp = local_path.with_extension("bin.tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &local_path)?;
+
+    // Recurse into children.
+    if let Ok(node) = postcard::from_bytes::<Node>(&bytes) {
+        if let Node::Branch(children) = &node {
+            for child in children {
+                prefetch_tree_nodes(data_dir, ContentId::from_bytes(child.child_cid), store)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -328,5 +659,51 @@ mod tests {
             .filter(|e| e.as_ref().unwrap().path().extension() == Some("bin".as_ref()))
             .count();
         assert_eq!(blob_count, 1);
+    }
+
+    #[test]
+    fn commit_and_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = HarmonyDb::open(dir.path()).unwrap();
+
+        db.insert("t", b"k1", b"v1", meta(0, "")).unwrap();
+        let root1 = db.commit(None).unwrap();
+
+        db.insert("t", b"k2", b"v2", meta(0, "")).unwrap();
+        let root2 = db.commit(None).unwrap();
+
+        let diff = db.diff(root1, root2, None).unwrap();
+        assert_eq!(diff.tables["t"].added.len(), 1);
+        assert_eq!(diff.tables["t"].added[0].key, b"k2");
+        assert!(diff.tables["t"].removed.is_empty());
+    }
+
+    #[test]
+    fn commit_with_bookstore_and_rebuild() {
+        use harmony_content::book::MemoryBookStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = HarmonyDb::open(dir.path()).unwrap();
+
+        db.insert("inbox", b"m1", b"hello", meta(0, "greet"))
+            .unwrap();
+        db.insert("inbox", b"m2", b"world", meta(1, "planet"))
+            .unwrap();
+
+        let mut store = MemoryBookStore::new();
+        let root = db.commit(Some(&mut store)).unwrap();
+
+        // Rebuild in a fresh directory from BookStore only.
+        let dir2 = tempfile::tempdir().unwrap();
+        let db2 = HarmonyDb::open_from_cas(dir2.path(), root, &store).unwrap();
+        assert_eq!(db2.table_len("inbox"), 2);
+        assert_eq!(
+            db2.get("inbox", b"m1").unwrap().unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            db2.get_entry("inbox", b"m2").unwrap().metadata.flags,
+            1
+        );
     }
 }
