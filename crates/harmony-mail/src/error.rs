@@ -61,6 +61,13 @@ pub enum MailError {
 
     #[error("too many entries: {count}, maximum {max}")]
     TooManyEntries { count: usize, max: usize },
+
+    #[error("{field} too long: {len} bytes, maximum {max}")]
+    FieldTooLong {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
 }
 
 /// Validate that a string's length fits in a u16 for length-prefixed encoding.

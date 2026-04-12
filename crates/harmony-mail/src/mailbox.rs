@@ -244,6 +244,12 @@ impl MailFolder {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, MailError> {
+        if self.unread_count > self.message_count {
+            return Err(MailError::TooManyEntries {
+                count: self.unread_count as usize,
+                max: self.message_count as usize,
+            });
+        }
         let count = u16::try_from(self.page_cids.len()).map_err(|_| {
             MailError::TooManyEntries {
                 count: self.page_cids.len(),
@@ -410,9 +416,10 @@ impl MessageEntry {
         pos += 2;
 
         if snippet_len > MAX_SNIPPET_LEN {
-            return Err(MailError::StringTooLong {
+            return Err(MailError::FieldTooLong {
                 field: "subject_snippet",
                 len: snippet_len,
+                max: MAX_SNIPPET_LEN,
             });
         }
 
@@ -858,18 +865,32 @@ mod tests {
         bytes[len_offset..len_offset + 2].copy_from_slice(&bad_len.to_be_bytes());
         assert!(matches!(
             MessageEntry::from_bytes(&bytes),
-            Err(MailError::StringTooLong { field: "subject_snippet", .. })
+            Err(MailError::FieldTooLong { field: "subject_snippet", max: MAX_SNIPPET_LEN, .. })
         ));
     }
 
     #[test]
-    fn mail_folder_rejects_unread_exceeding_total() {
+    fn mail_folder_rejects_unread_exceeding_total_on_deserialize() {
+        // Manually craft bytes with unread > total to test from_bytes rejection
+        let mut folder = MailFolder::new_empty();
+        folder.message_count = 5;
+        folder.unread_count = 3; // valid for to_bytes
+        let mut bytes = folder.to_bytes().unwrap();
+        // Patch unread_count (offset 9..13) to exceed message_count
+        bytes[9..13].copy_from_slice(&10u32.to_be_bytes());
+        assert!(matches!(
+            MailFolder::from_bytes(&bytes),
+            Err(MailError::TooManyEntries { .. })
+        ));
+    }
+
+    #[test]
+    fn mail_folder_to_bytes_rejects_unread_exceeding_total() {
         let mut folder = MailFolder::new_empty();
         folder.message_count = 5;
         folder.unread_count = 10; // invalid: unread > total
-        let bytes = folder.to_bytes().unwrap();
         assert!(matches!(
-            MailFolder::from_bytes(&bytes),
+            folder.to_bytes(),
             Err(MailError::TooManyEntries { .. })
         ));
     }
