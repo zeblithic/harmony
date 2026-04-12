@@ -73,6 +73,11 @@ pub struct VectorIndexConfig {
     pub expansion_search: usize,
 }
 
+/// Default: Hamming metric with F32 quantization (256 dimensions).
+///
+/// Uses F32 (not Binary/B1) because the `add_bytes`/`search_bytes` helpers
+/// unpack packed bytes to f32 0.0/1.0 values. USearch's B1 mode expects
+/// packed bits internally and is incompatible with that approach.
 impl Default for VectorIndexConfig {
     fn default() -> Self {
         Self {
@@ -101,6 +106,9 @@ pub struct Match {
 /// Provides approximate nearest-neighbor search with configurable metrics
 /// and quantization levels. Designed for edge deployment with minimal
 /// memory overhead.
+///
+/// Thread-safe for concurrent `add` and `search` calls — USearch handles
+/// internal synchronization. See USearch documentation for details.
 pub struct VectorIndex {
     inner: usearch::Index,
     config: VectorIndexConfig,
@@ -496,6 +504,44 @@ mod tests {
         let results = loaded.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(results[0].key, 1);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn view_roundtrip() {
+        let config = VectorIndexConfig {
+            dimensions: 4,
+            metric: Metric::L2,
+            quantization: Quantization::F32,
+            capacity: 100,
+            ..Default::default()
+        };
+        let index = VectorIndex::new(config.clone()).unwrap();
+        index.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        let unique = format!(
+            "harmony_search_view_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_index.usearch");
+        let path_str = path.to_str().unwrap();
+
+        index.save(path_str).unwrap();
+
+        let viewed = VectorIndex::view(path_str, config).unwrap();
+        assert_eq!(viewed.len(), 1);
+
+        let results = viewed.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].key, 1);
+
+        // Drop the viewed index before removing the dir (releases mmap)
+        drop(viewed);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
