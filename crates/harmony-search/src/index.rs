@@ -127,6 +127,11 @@ impl VectorIndex {
                 "dimensions must be > 0".into(),
             ));
         }
+        if config.connectivity == 0 {
+            return Err(SearchError::InvalidConfig(
+                "connectivity must be > 0".into(),
+            ));
+        }
 
         let index = usearch::new_index(&make_opts(&config))
             .map_err(|e| SearchError::Index(e.to_string()))?;
@@ -208,6 +213,10 @@ impl VectorIndex {
     }
 
     /// Load an index from a file path.
+    ///
+    /// The provided `config` must match the configuration used when the index
+    /// was originally created and saved. Mismatched dimensions will be
+    /// detected and rejected.
     pub fn load(path: &str, config: VectorIndexConfig) -> SearchResult<Self> {
         if config.dimensions == 0 {
             return Err(SearchError::InvalidConfig(
@@ -219,10 +228,21 @@ impl VectorIndex {
         inner
             .load(path)
             .map_err(|e| SearchError::Serialization(e.to_string()))?;
+        let actual = inner.dimensions();
+        if actual != config.dimensions {
+            return Err(SearchError::InvalidConfig(format!(
+                "loaded index has {actual} dimensions, config says {}",
+                config.dimensions
+            )));
+        }
         Ok(Self { inner, config })
     }
 
     /// View an index from a memory-mapped file (no RAM copy).
+    ///
+    /// The provided `config` must match the configuration used when the index
+    /// was originally created and saved. Mismatched dimensions will be
+    /// detected and rejected.
     pub fn view(path: &str, config: VectorIndexConfig) -> SearchResult<Self> {
         if config.dimensions == 0 {
             return Err(SearchError::InvalidConfig(
@@ -234,6 +254,13 @@ impl VectorIndex {
         inner
             .view(path)
             .map_err(|e| SearchError::Serialization(e.to_string()))?;
+        let actual = inner.dimensions();
+        if actual != config.dimensions {
+            return Err(SearchError::InvalidConfig(format!(
+                "viewed index has {actual} dimensions, config says {}",
+                config.dimensions
+            )));
+        }
         Ok(Self { inner, config })
     }
 
@@ -242,7 +269,7 @@ impl VectorIndex {
         &self.config
     }
 
-    /// Check that the index is configured for binary/Hamming operations.
+    /// Check that the index is configured for Hamming distance.
     fn ensure_binary_mode(&self) -> SearchResult<()> {
         if self.config.metric != Metric::Hamming {
             return Err(SearchError::InvalidConfig(
@@ -377,6 +404,8 @@ mod tests {
 
     #[test]
     fn add_bytes_wrong_length_rejected() {
+        // Note: bytes API unpacks to f32, so F32 quantization is correct here.
+        // USearch B1 has different internal packing expectations.
         let config = VectorIndexConfig {
             dimensions: 16,
             metric: Metric::Hamming,
@@ -404,6 +433,23 @@ mod tests {
         let index = VectorIndex::new(config).unwrap();
         assert!(index.add_bytes(1, &[0xFF]).is_err());
         assert!(index.search_bytes(&[0xFF], 1).is_err());
+    }
+
+    #[test]
+    fn unpack_bits_msb_first() {
+        let config = VectorIndexConfig {
+            dimensions: 8,
+            metric: Metric::Hamming,
+            quantization: Quantization::F32,
+            capacity: 10,
+            ..Default::default()
+        };
+        let index = VectorIndex::new(config).unwrap();
+        // 0x81 = 0b10000001: MSB-first → bits[0]=1, bits[7]=1, rest=0
+        index.add_bytes(1, &[0x81]).unwrap();
+        let results = index.search_bytes(&[0x81], 1).unwrap();
+        assert_eq!(results[0].key, 1);
+        assert!(results[0].distance < 0.01);
     }
 
     #[test]
