@@ -7,12 +7,11 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio_util::codec::FramedRead;
 
 use futures_util::StreamExt;
@@ -38,13 +37,7 @@ struct ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        let shared = Arc::clone(&self.shared);
-        let ip = self.ip;
-        // Use spawn_blocking-free approach: blocking_lock or handle.
-        // Since this runs inside a tokio context, use block_in_place.
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(shared.disconnect(ip));
-        });
+        self.shared.disconnect(self.ip);
     }
 }
 
@@ -63,8 +56,8 @@ impl SharedState {
     }
 
     /// Try to register a new connection. Returns false if limit exceeded.
-    async fn try_connect(&self, ip: IpAddr) -> bool {
-        let mut conns = self.connections.lock().await;
+    fn try_connect(&self, ip: IpAddr) -> bool {
+        let mut conns = self.connections.lock().unwrap();
         let entry = conns.entry(ip).or_insert(IpEntry {
             active: 0,
             last_seen: Instant::now(),
@@ -78,8 +71,8 @@ impl SharedState {
     }
 
     /// Unregister a connection.
-    async fn disconnect(&self, ip: IpAddr) {
-        let mut conns = self.connections.lock().await;
+    fn disconnect(&self, ip: IpAddr) {
+        let mut conns = self.connections.lock().unwrap();
         if let Some(entry) = conns.get_mut(&ip) {
             entry.active = entry.active.saturating_sub(1);
             if entry.active == 0 {
@@ -89,8 +82,8 @@ impl SharedState {
     }
 
     /// Remove stale entries older than the given duration.
-    async fn cleanup(&self, max_age: Duration) {
-        let mut conns = self.connections.lock().await;
+    fn cleanup(&self, max_age: Duration) {
+        let mut conns = self.connections.lock().unwrap();
         let now = Instant::now();
         conns.retain(|_, entry| entry.active > 0 || now.duration_since(entry.last_seen) < max_age);
     }
@@ -204,7 +197,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    cleanup_shared.cleanup(Duration::from_secs(3600)).await;
+                    cleanup_shared.cleanup(Duration::from_secs(3600));
                 }
                 _ = cleanup_cancel.cancelled() => break,
             }
@@ -226,7 +219,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             Err(e) => { tracing::warn!(error = %e, "submission accept error"); continue; }
                         };
                         let peer_ip = addr.ip();
-                        if !shared.try_connect(peer_ip).await {
+                        if !shared.try_connect(peer_ip) {
                             drop(stream);
                             continue;
                         }
@@ -268,7 +261,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                             Err(e) => { tracing::warn!(error = %e, "STARTTLS submission accept error"); continue; }
                         };
                         let peer_ip = addr.ip();
-                        if !shared.try_connect(peer_ip).await {
+                        if !shared.try_connect(peer_ip) {
                             drop(stream);
                             continue;
                         }
@@ -298,7 +291,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let (stream, addr) = result?;
                 let peer_ip = addr.ip();
 
-                if !shared.try_connect(peer_ip).await {
+                if !shared.try_connect(peer_ip) {
                     tracing::warn!(%peer_ip, "connection rejected: per-IP limit exceeded");
                     drop(stream);
                     continue;
@@ -318,7 +311,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = &mut shutdown => {
                 tracing::info!("shutting down SMTP server");
-                cancel.cancel(); // Signal all spawned tasks to stop
+                cancel.cancel(); // Signal listener loops to stop accepting
+                // Note: in-flight connection tasks are not tracked/awaited here.
+                // They will drain naturally as they complete or when the runtime
+                // shuts down. A JoinSet-based approach for graceful connection
+                // draining is a v1.1 improvement.
                 break;
             }
         }
@@ -396,10 +393,19 @@ async fn handle_connection(
                         let parts = framed.into_parts();
                         let tcp_reader = parts.io;
                         if !parts.read_buf.is_empty() {
-                            tracing::debug!(
+                            // Per RFC 3207 §4: the client must wait for the 220
+                            // response before sending TLS data. Buffered bytes here
+                            // mean a misbehaving client; reject rather than risk a
+                            // corrupted TLS handshake.
+                            tracing::warn!(
+                                %peer_ip,
                                 buffered_bytes = parts.read_buf.len(),
-                                "STARTTLS: residual bytes in read buffer (likely ClientHello)"
+                                "STARTTLS: rejecting — client sent data before 220 response"
                             );
+                            let mut wr = tcp_reader.reunite(writer)
+                                .map_err(|e| format!("failed to reunite: {e}"))?;
+                            let _ = wr.write_all(b"454 4.7.0 STARTTLS failed\r\n").await;
+                            return Ok(());
                         }
                         let tcp_stream = tcp_reader.reunite(writer)
                             .map_err(|e| format!("failed to reunite TCP halves: {e}"))?;
@@ -431,11 +437,23 @@ async fn handle_connection(
                 }
             }
             Ok(Some(Err(e))) => {
-                tracing::debug!(%peer_ip, error = %e, "codec error");
-                let _ = writer
-                    .write_all(b"421 4.7.0 Error processing input\r\n")
-                    .await;
-                break;
+                let msg = e.to_string();
+                if msg.contains("exceeds maximum size") {
+                    // Oversize DATA: permanent rejection per RFC 5321
+                    tracing::debug!(%peer_ip, "message too large");
+                    let _ = writer
+                        .write_all(b"552 5.3.4 Message too large\r\n")
+                        .await;
+                    // Reset to command mode so session can continue
+                    framed.decoder_mut().enter_command_mode();
+                    session.handle(SmtpEvent::Command(crate::smtp::SmtpCommand::Rset));
+                } else {
+                    tracing::debug!(%peer_ip, error = %e, "codec error");
+                    let _ = writer
+                        .write_all(b"421 4.7.0 Error processing input\r\n")
+                        .await;
+                    break;
+                }
             }
             Ok(None) => break,
             Err(_) => {
@@ -519,11 +537,21 @@ where
                 }
             }
             Ok(Some(Err(e))) => {
-                tracing::debug!(%peer_ip, error = %e, "codec error");
-                let _ = writer
-                    .write_all(b"421 4.7.0 Error processing input\r\n")
-                    .await;
-                break;
+                let msg = e.to_string();
+                if msg.contains("exceeds maximum size") {
+                    tracing::debug!(%peer_ip, "message too large");
+                    let _ = writer
+                        .write_all(b"552 5.3.4 Message too large\r\n")
+                        .await;
+                    framed.decoder_mut().enter_command_mode();
+                    session.handle(SmtpEvent::Command(crate::smtp::SmtpCommand::Rset));
+                } else {
+                    tracing::debug!(%peer_ip, error = %e, "codec error");
+                    let _ = writer
+                        .write_all(b"421 4.7.0 Error processing input\r\n")
+                        .await;
+                    break;
+                }
             }
             Ok(None) => break,
             Err(_) => {
@@ -803,17 +831,17 @@ node_config = "/tmp/test-node.toml"
         server_handle.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn per_ip_rate_limiting() {
+    #[test]
+    fn per_ip_rate_limiting() {
         let shared = SharedState::new(2);
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
 
-        assert!(shared.try_connect(ip).await);
-        assert!(shared.try_connect(ip).await);
-        assert!(!shared.try_connect(ip).await); // third rejected
+        assert!(shared.try_connect(ip));
+        assert!(shared.try_connect(ip));
+        assert!(!shared.try_connect(ip)); // third rejected
 
-        shared.disconnect(ip).await;
-        assert!(shared.try_connect(ip).await); // slot freed
+        shared.disconnect(ip);
+        assert!(shared.try_connect(ip)); // slot freed
     }
 
     #[test]
