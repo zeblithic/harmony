@@ -155,6 +155,18 @@ impl SmtpSession {
         }
     }
 
+    /// Reset transaction state and return to Ready.
+    ///
+    /// Clears mail_from, recipients, and pending_rcpt. Used by the I/O layer
+    /// when the codec detects an error (e.g., oversize DATA) that bypasses the
+    /// normal state machine flow.
+    pub fn reset_transaction(&mut self) {
+        self.mail_from = None;
+        self.resolved_recipients.clear();
+        self.pending_rcpt = None;
+        self.state = SmtpState::Ready;
+    }
+
     /// Feed an event into the state machine and return the resulting actions.
     pub fn handle(&mut self, event: SmtpEvent) -> Vec<SmtpAction> {
         match event {

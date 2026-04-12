@@ -453,9 +453,10 @@ async fn handle_connection(
                         .await;
                     // Reset codec and session so the connection can continue.
                     // We can't use SmtpCommand::Rset here because the state machine
-                    // rejects RSET during DataReceiving — set state directly.
+                    // rejects RSET during DataReceiving. reset_transaction() clears
+                    // all transaction state (mail_from, recipients, pending_rcpt).
                     framed.decoder_mut().enter_command_mode();
-                    session.state = SmtpState::Ready;
+                    session.reset_transaction();
                 } else {
                     tracing::debug!(%peer_ip, error = %e, "codec error");
                     let _ = writer

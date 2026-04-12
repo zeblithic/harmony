@@ -138,10 +138,17 @@ impl OutboundQueue {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
         let now = now_secs();
-        // Combine timestamp with atomic counter to avoid collisions within the same second
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id() as u64;
+        // Combine timestamp + counter + PID to avoid collisions across restarts
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&now.to_le_bytes());
+        hasher.update(&seq.to_le_bytes());
+        hasher.update(&pid.to_le_bytes());
+        let hash = hasher.finalize();
+        let id = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
         let entry = QueuedMessage {
-            id: now.wrapping_mul(1_000_000).wrapping_add(seq),
+            id,
             rfc5322,
             recipient,
             attempts: 0,
