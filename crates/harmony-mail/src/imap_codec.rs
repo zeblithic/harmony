@@ -177,11 +177,12 @@ impl ImapCodec {
             return Ok(None); // need more data
         }
 
-        // Consume the literal bytes
+        // Consume the literal bytes. Use lossy conversion since IMAP literals
+        // can carry arbitrary binary data (e.g., APPEND payloads, SASL credentials
+        // with non-UTF-8 byte sequences). Non-UTF-8 bytes become U+FFFD, which is
+        // safe — the parser/session will reject invalid content at a higher layer.
         let literal_bytes = src.split_to(remaining);
-        let literal_str = String::from_utf8(literal_bytes.to_vec()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8 in IMAP literal")
-        })?;
+        let literal_str = String::from_utf8_lossy(&literal_bytes);
 
         self.command_buf.push_str(&literal_str);
         self.mode = Mode::Command;

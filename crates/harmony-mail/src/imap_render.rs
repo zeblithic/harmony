@@ -77,10 +77,12 @@ fn format_address_list(addrs: &[String]) -> String {
 /// For v1.1, all messages are treated as single-part text/plain.
 /// Multipart rendering is deferred to when attachment content is available.
 pub fn build_bodystructure(msg: &HarmonyMessage) -> String {
-    let body_size = msg.body.len();
-    // Count lines in body for the BODYSTRUCTURE line count field
-    let lines = msg.body.matches('\n').count() + 1;
-    format!("(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" {body_size} {lines})")
+    // Compute size as it will appear on the wire (LF → CRLF normalization)
+    let crlf_body = msg.body.replace('\n', "\r\n");
+    let body_size = crlf_body.len();
+    let lines = crlf_body.matches("\r\n").count() + 1;
+    // UTF-8 can contain non-ASCII bytes → "8BIT" per RFC 2045
+    format!("(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"8BIT\" {body_size} {lines})")
 }
 
 // ── RFC 5322 rendering ──────────────────────────────────────────────
