@@ -38,6 +38,7 @@ members = [
     "crates/harmony-zenoh",
     "crates/harmony-rawlink",
     "crates/harmony-s3",
+    "crates/harmony-search",
     "crates/harmony-speculative",
     "crates/harmony-telemetry",
 ]
