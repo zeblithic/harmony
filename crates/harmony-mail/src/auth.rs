@@ -117,8 +117,9 @@ impl DkimSigner {
         let key_der = std::fs::read(key_path)
             .map_err(|e| AuthError::SigningKey(format!("reading {}: {e}", key_path.display())))?;
         // Validate the key parses before storing — fail fast on bad keys
-        let _ = mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(&key_der)
-            .map_err(|e| AuthError::SigningKey(format!("invalid key in {}: {e}", key_path.display())))?;
+        let _ = mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(&key_der).map_err(|e| {
+            AuthError::SigningKey(format!("invalid key in {}: {e}", key_path.display()))
+        })?;
         Ok(Self {
             selector: selector.to_string(),
             domain: domain.to_string(),
@@ -134,7 +135,15 @@ impl DkimSigner {
         let signature = mail_auth::dkim::DkimSigner::from_key(pk)
             .domain(&self.domain)
             .selector(&self.selector)
-            .headers(["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"])
+            .headers([
+                "From",
+                "To",
+                "Subject",
+                "Date",
+                "Message-ID",
+                "MIME-Version",
+                "Content-Type",
+            ])
             .sign(message)
             .map_err(|e| AuthError::Signing(format!("{e}")))?;
 
@@ -191,7 +200,11 @@ mod tests {
 
         let verdict = spam::score(&signals, 5);
         // SPF fail (+3) + DKIM fail (+3) + DMARC fail (+3) = 9 >= 5
-        assert!(verdict.score >= 5, "score should be >= 5, got {}", verdict.score);
+        assert!(
+            verdict.score >= 5,
+            "score should be >= 5, got {}",
+            verdict.score
+        );
         assert_eq!(verdict.action, SpamAction::Reject);
     }
 
@@ -214,7 +227,11 @@ mod tests {
         };
 
         let verdict = spam::score(&signals, 5);
-        assert!(verdict.score <= 0, "score should be <= 0, got {}", verdict.score);
+        assert!(
+            verdict.score <= 0,
+            "score should be <= 0, got {}",
+            verdict.score
+        );
         assert_eq!(verdict.action, SpamAction::Deliver);
     }
 

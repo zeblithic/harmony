@@ -77,10 +77,7 @@ pub fn translate_inbound(raw: &[u8]) -> Result<TranslatedMessage, TranslateError
     }
 
     // ── Subject ─────────────────────────────────────────────────────
-    let subject = parsed
-        .subject()
-        .unwrap_or("")
-        .to_string();
+    let subject = parsed.subject().unwrap_or("").to_string();
 
     // ── Timestamp ───────────────────────────────────────────────────
     let timestamp = parsed
@@ -127,10 +124,7 @@ pub fn translate_inbound(raw: &[u8]) -> Result<TranslatedMessage, TranslateError
         let data = part.contents();
         let cid = blake3_cid(data);
 
-        let filename = part
-            .attachment_name()
-            .unwrap_or("attachment")
-            .to_string();
+        let filename = part.attachment_name().unwrap_or("attachment").to_string();
 
         let mime_type = part
             .content_type()
@@ -308,10 +302,14 @@ Hi everyone\r\n";
         let msg = &result.message;
         assert_eq!(msg.recipients.len(), 3);
 
-        let to_count = msg.recipients.iter()
+        let to_count = msg
+            .recipients
+            .iter()
             .filter(|r| r.recipient_type == RecipientType::To)
             .count();
-        let cc_count = msg.recipients.iter()
+        let cc_count = msg
+            .recipients
+            .iter()
             .filter(|r| r.recipient_type == RecipientType::Cc)
             .count();
         assert_eq!(to_count, 2);
@@ -365,7 +363,10 @@ b2JqCg==\r\n\
 
         // Attachment data should match
         assert_eq!(result.attachment_data.len(), 1);
-        assert_eq!(result.attachment_data[0].len(), msg.attachments[0].size as usize);
+        assert_eq!(
+            result.attachment_data[0].len(),
+            msg.attachments[0].size as usize
+        );
 
         // CID should be BLAKE3 of the decoded content
         let expected_cid = blake3_cid(&result.attachment_data[0]);

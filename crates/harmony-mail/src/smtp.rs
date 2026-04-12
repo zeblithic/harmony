@@ -1064,7 +1064,10 @@ mod tests {
         let actions = session.handle(SmtpEvent::Command(SmtpCommand::StartTls));
         match &actions[0] {
             SmtpAction::SendResponse(code, _) => {
-                assert_eq!(*code, 454, "should reject STARTTLS with 454 when TLS unavailable");
+                assert_eq!(
+                    *code, 454,
+                    "should reject STARTTLS with 454 when TLS unavailable"
+                );
             }
             other => panic!("expected SendResponse(454, ...), got {other:?}"),
         }

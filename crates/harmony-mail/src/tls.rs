@@ -29,16 +29,25 @@ pub fn load_tls_config(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor,
 }
 
 /// Load PEM-encoded certificates from a file.
-fn load_certs(
-    path: &Path,
-) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| TlsError::Io(format!("failed to open cert file {}: {}", path.display(), e)))?;
+fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        TlsError::Io(format!(
+            "failed to open cert file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
     let mut reader = io::BufReader::new(file);
 
     let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| TlsError::Io(format!("failed to parse certs from {}: {}", path.display(), e)))?;
+        .map_err(|e| {
+            TlsError::Io(format!(
+                "failed to parse certs from {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
 
     if certs.is_empty() {
         return Err(TlsError::NoCerts(path.display().to_string()));
@@ -49,9 +58,7 @@ fn load_certs(
 
 /// Load a PEM-encoded private key from a file.
 /// Supports PKCS#8, RSA, and EC private keys.
-fn load_private_key(
-    path: &Path,
-) -> Result<rustls::pki_types::PrivateKeyDer<'static>, TlsError> {
+fn load_private_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>, TlsError> {
     let file = std::fs::File::open(path)
         .map_err(|e| TlsError::Io(format!("failed to open key file {}: {}", path.display(), e)))?;
     let mut reader = io::BufReader::new(file);
@@ -140,7 +147,10 @@ mod tests {
         use rcgen::CertifiedKey;
         let CertifiedKey { cert, key_pair } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        (cert.pem().into_bytes(), key_pair.serialize_pem().into_bytes())
+        (
+            cert.pem().into_bytes(),
+            key_pair.serialize_pem().into_bytes(),
+        )
     }
 
     fn write_temp_file(data: &[u8]) -> NamedTempFile {
@@ -157,7 +167,11 @@ mod tests {
         let key_file = write_temp_file(&key_pem);
 
         let acceptor = load_tls_config(cert_file.path(), key_file.path());
-        assert!(acceptor.is_ok(), "failed to load TLS config: {:?}", acceptor.err());
+        assert!(
+            acceptor.is_ok(),
+            "failed to load TLS config: {:?}",
+            acceptor.err()
+        );
     }
 
     #[test]

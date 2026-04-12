@@ -226,10 +226,7 @@ mod tests {
         assert_eq!(f1, Some(SmtpFrame::Line("EHLO x.com".to_string())));
 
         let f2 = c.decode(&mut buf).unwrap();
-        assert_eq!(
-            f2,
-            Some(SmtpFrame::Line("MAIL FROM:<a@b.com>".to_string()))
-        );
+        assert_eq!(f2, Some(SmtpFrame::Line("MAIL FROM:<a@b.com>".to_string())));
 
         assert!(buf.is_empty());
     }
