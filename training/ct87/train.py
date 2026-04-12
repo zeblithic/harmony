@@ -417,6 +417,13 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if args.contrastive_loss_weight <= 0:
+            print(
+                "Error: --latent-projection-init requires "
+                "--contrastive-loss-weight > 0",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if args.latent_intermediate_dim is None or args.latent_dim is None:
             print(
                 "Error: --latent-projection-init requires both "
@@ -613,10 +620,12 @@ def main() -> None:
     csv_writer = None
     if args.log_file:
         expected_header = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
+        # Accept pre-contrastive header (without cl_loss) for backwards compatibility
+        legacy_header = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         if os.path.exists(args.log_file) and os.path.getsize(args.log_file) > 0:
             with open(args.log_file, newline="") as existing:
                 header = next(csv.reader(existing), [])
-            if header and header != expected_header:
+            if header and header not in (expected_header, legacy_header):
                 print(
                     f"Error: incompatible CSV header in {args.log_file}: {header}",
                     file=sys.stderr,

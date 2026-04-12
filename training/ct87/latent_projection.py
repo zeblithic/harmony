@@ -252,12 +252,14 @@ def contrastive_loss(
         normalized = x / norm
         return normalized @ normalized.t()
 
-    sim_orig = _cosine_sim(original)
+    # original is detached — compute its similarities without autograd overhead
+    with torch.no_grad():
+        sim_orig = _cosine_sim(original)
     sim_proj = _cosine_sim(projected)
 
     # Scale projected similarities by temperature, mask diagonal
     logits = sim_proj / temperature
-    diag_mask = torch.full((n, n), 0.0, device=original.device)
+    diag_mask = torch.full((n, n), 0.0, device=projected.device)
     diag_mask.fill_diagonal_(-1e9)
     logits = logits + diag_mask
 
