@@ -56,7 +56,9 @@ impl CompoundIndex {
         // Search base
         if let Some(ref base) = self.base {
             if !base.is_empty() {
-                let base_results = base.search(query, k)?;
+                // Over-fetch to compensate for shadowed keys that get filtered out
+                let base_limit = base.len().min(k.saturating_add(self.delta_keys.len()));
+                let base_results = base.search(query, base_limit)?;
                 // Filter out base results for keys that exist anywhere in delta
                 // (not just in the delta top-k results)
                 for m in base_results {
@@ -82,10 +84,25 @@ impl CompoundIndex {
         self.delta_len() >= self.compact_threshold
     }
 
-    /// Total vectors across base + delta.
+    /// Total vectors across base + delta (approximate — may double-count
+    /// keys that exist in both due to updates).
     pub fn len(&self) -> usize {
         let base_len = self.base.as_ref().map_or(0, |b| b.len());
         base_len + self.delta.len()
+    }
+
+    /// Number of unique keys (exact count, accounts for shadowing).
+    pub fn unique_len(&self) -> usize {
+        let base_len = self.base.as_ref().map_or(0, |b| b.len());
+        // Subtract delta keys that also exist in base (they shadow, not add)
+        let shadowed = if self.base.is_some() {
+            self.delta_keys.iter().filter(|k| {
+                self.base.as_ref().map_or(false, |b| b.contains(**k))
+            }).count()
+        } else {
+            0
+        };
+        base_len + self.delta.len() - shadowed
     }
 
     /// Number of vectors pending in the delta.
