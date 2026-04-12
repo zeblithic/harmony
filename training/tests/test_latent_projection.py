@@ -596,3 +596,120 @@ class TestLookupFromKeys:
         actual = tbl.lookup_from_keys(keys, positions, batch_size=1, seq_len=8)
 
         assert torch.allclose(expected, actual, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# GGUF export tests
+# ---------------------------------------------------------------------------
+
+
+class TestGgufExportWithLatentProjection:
+    def test_naming_map_keys(self):
+        from ct87.export_gguf import build_latent_projection_map
+
+        lp_map = build_latent_projection_map()
+        assert set(lp_map.keys()) == {
+            "layer1.weight", "layer1.bias",
+            "layer2.weight", "layer2.bias",
+        }
+        for gguf_name in lp_map.values():
+            assert gguf_name.startswith("harmony.latent_projection.")
+
+    def test_export_roundtrip(self):
+        """Export model + projection and verify projection tensors are in GGUF."""
+        from gguf import GGUFReader
+        from ct87.export_gguf import export_gguf
+
+        cfg = _tiny_config()
+        torch.manual_seed(42)
+        model = HarmonyModel(cfg)
+        proj = LatentProjection(cfg.hidden_dim, INTERMEDIATE_DIM, LATENT_DIM)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.gguf"
+            export_gguf(
+                model.state_dict(), cfg, path,
+                latent_projection_state=proj.state_dict(),
+            )
+
+            reader = GGUFReader(str(path))
+            tensor_names = {t.name for t in reader.tensors}
+            assert "harmony.latent_projection.layer1.weight" in tensor_names
+            assert "harmony.latent_projection.layer1.bias" in tensor_names
+            assert "harmony.latent_projection.layer2.weight" in tensor_names
+            assert "harmony.latent_projection.layer2.bias" in tensor_names
+
+    def test_export_without_projection_has_no_projection_tensors(self):
+        """Export without projection should not include projection tensors."""
+        from gguf import GGUFReader
+        from ct87.export_gguf import export_gguf
+
+        cfg = _tiny_config()
+        torch.manual_seed(42)
+        model = HarmonyModel(cfg)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.gguf"
+            export_gguf(model.state_dict(), cfg, path)
+
+            reader = GGUFReader(str(path))
+            tensor_names = {t.name for t in reader.tensors}
+            assert "harmony.latent_projection.layer1.weight" not in tensor_names
+
+    def test_export_with_prefixed_state_dict(self):
+        """State dict with 'latent_projection.' prefix should export correctly."""
+        from gguf import GGUFReader
+        from ct87.export_gguf import export_gguf
+
+        cfg = _tiny_config()
+        torch.manual_seed(42)
+        model = HarmonyModel(cfg)
+        proj = LatentProjection(cfg.hidden_dim, INTERMEDIATE_DIM, LATENT_DIM)
+
+        prefixed = {f"latent_projection.{k}": v for k, v in proj.state_dict().items()}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.gguf"
+            export_gguf(
+                model.state_dict(), cfg, path,
+                latent_projection_state=prefixed,
+            )
+
+            reader = GGUFReader(str(path))
+            tensor_names = {t.name for t in reader.tensors}
+            assert "harmony.latent_projection.layer1.weight" in tensor_names
+
+    def test_state_dict_mismatch_raises(self):
+        """Providing wrong keys should raise ValueError."""
+        from ct87.export_gguf import export_gguf
+
+        cfg = _tiny_config()
+        torch.manual_seed(42)
+        model = HarmonyModel(cfg)
+
+        bad_state = {"wrong_key": torch.randn(4, 4)}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.gguf"
+            with pytest.raises(ValueError, match="Latent projection state_dict mismatch"):
+                export_gguf(
+                    model.state_dict(), cfg, path,
+                    latent_projection_state=bad_state,
+                )
+
+    def test_shape_mismatch_raises(self):
+        """Projection with wrong hidden_dim should raise ValueError."""
+        from ct87.export_gguf import export_gguf
+
+        cfg = _tiny_config()
+        torch.manual_seed(42)
+        model = HarmonyModel(cfg)
+
+        # Create projection with wrong hidden_dim (64 instead of 32)
+        wrong_proj = LatentProjection(64, INTERMEDIATE_DIM, LATENT_DIM)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.gguf"
+            with pytest.raises(ValueError, match="has shape"):
+                export_gguf(
+                    model.state_dict(), cfg, path,
+                    latent_projection_state=wrong_proj.state_dict(),
+                )

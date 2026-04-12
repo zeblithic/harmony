@@ -100,6 +100,20 @@ def build_mtp_head_map() -> dict[str, str]:
     }
 
 
+def build_latent_projection_map() -> dict[str, str]:
+    """Build naming map for latent projection weights.
+
+    No transposition needed — both PyTorch nn.Linear and candle_nn::Linear
+    use ``[out_features, in_features]`` weight convention.
+    """
+    return {
+        "layer1.weight": "harmony.latent_projection.layer1.weight",
+        "layer1.bias": "harmony.latent_projection.layer1.bias",
+        "layer2.weight": "harmony.latent_projection.layer2.weight",
+        "layer2.bias": "harmony.latent_projection.layer2.bias",
+    }
+
+
 def write_metadata(
     writer: GGUFWriter, config: HarmonyModelConfig, name: str,
 ) -> None:
@@ -159,6 +173,7 @@ def export_gguf(
     uq_head_state: dict[str, torch.Tensor] | None = None,
     mtp_head_state: dict[str, torch.Tensor] | None = None,
     mtp_depth: int = 4,
+    latent_projection_state: dict[str, torch.Tensor] | None = None,
 ) -> None:
     """Export a ct87 state_dict to GGUF format.
 
@@ -175,6 +190,9 @@ def export_gguf(
             prediction. Only provided for MTP-trained models.
         mtp_depth: MTP draft depth (default: 4). Only used when
             mtp_head_state is provided.
+        latent_projection_state: Optional latent projection state_dict
+            for semantic Engram key generation. Only provided for models
+            trained with --contrastive-loss or --latent-projection.
 
     Raises:
         ValueError: If state_dict keys don't match expected keys for config.
@@ -296,6 +314,49 @@ def export_gguf(
             arr = t.numpy()
             writer.add_tensor(gguf_name, arr)
 
+    # Latent projection weights (semantic Engram key generation)
+    if latent_projection_state is not None:
+        from ct87.latent_projection import clean_projection_state_dict
+
+        lp_map = build_latent_projection_map()
+        expected_lp = set(lp_map.keys())
+        cleaned_lp = clean_projection_state_dict(latent_projection_state)
+        actual_lp = set(cleaned_lp.keys())
+        if expected_lp != actual_lp:
+            raise ValueError(
+                f"Latent projection state_dict mismatch. "
+                f"Expected: {sorted(expected_lp)}, got: {sorted(actual_lp)}"
+            )
+
+        # Validate shapes against each other and config.hidden_dim
+        w1 = cleaned_lp["layer1.weight"]
+        b1 = cleaned_lp["layer1.bias"]
+        w2 = cleaned_lp["layer2.weight"]
+        b2 = cleaned_lp["layer2.bias"]
+        expected_shapes = {
+            "layer1.weight": (w1.shape[0], config.hidden_dim),
+            "layer1.bias": (w1.shape[0],),
+            "layer2.weight": (w2.shape[0], w1.shape[0]),
+            "layer2.bias": (w2.shape[0],),
+        }
+        for key, expected_shape in expected_shapes.items():
+            actual_shape = tuple(cleaned_lp[key].shape)
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"Latent projection tensor {key} has shape {actual_shape}, "
+                    f"expected {expected_shape}"
+                )
+
+        intermediate_dim = int(w1.shape[0])
+        latent_dim = int(w2.shape[0])
+        writer.add_bool("harmony.latent_projection.enabled", True)
+        writer.add_uint32("harmony.latent_projection.intermediate_dim", intermediate_dim)
+        writer.add_uint32("harmony.latent_projection.latent_dim", latent_dim)
+        # No transposition: both PyTorch and candle Linear use [out, in]
+        for pytorch_key, gguf_name in lp_map.items():
+            t = cleaned_lp[pytorch_key].detach().cpu().float()
+            writer.add_tensor(gguf_name, t.numpy())
+
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -341,6 +402,10 @@ def main() -> None:
         "--mtp-depth", type=int, default=4,
         help="MTP draft depth (default: 4, must match training --mtp-depth)",
     )
+    parser.add_argument(
+        "--latent-projection", type=str, default=None,
+        help="Path to latent projection checkpoint (latent_projection_step_*.pt) for export",
+    )
     args = parser.parse_args()
 
     if args.thought_norm is not None and args.think_token_id is None:
@@ -375,12 +440,19 @@ def main() -> None:
     if args.mtp_head is not None:
         mtp_head_state = torch.load(args.mtp_head, map_location="cpu", weights_only=True)
 
+    latent_projection_state = None
+    if args.latent_projection is not None:
+        latent_projection_state = torch.load(
+            args.latent_projection, map_location="cpu", weights_only=True,
+        )
+
     export_gguf(
         state_dict, config, args.output, name,
         thought_norm_state=thought_norm_state,
         uq_head_state=uq_head_state,
         mtp_head_state=mtp_head_state,
         mtp_depth=args.mtp_depth,
+        latent_projection_state=latent_projection_state,
     )
     print(f"Exported to {args.output}")
 
