@@ -71,9 +71,8 @@ pub(crate) fn create_commit(
     }
 
     if let Some(ref mut s) = store {
-        s.insert_with_flags(&manifest_bytes, ContentFlags::default())
-            .map_err(|e| DbError::Serialize(format!("BookStore manifest push failed: {e:?}")))?;
-        // Value blob push remains best-effort (blob may not exist locally)
+        // Push value blobs before manifest so the manifest never references
+        // missing data in the remote store.
         for table in tables.values() {
             for entry in table.entries() {
                 if !s.contains(&entry.value_cid) {
@@ -83,6 +82,10 @@ pub(crate) fn create_commit(
                 }
             }
         }
+        // Manifest last — makes the root CID discoverable only after all
+        // referenced data is available.
+        s.insert_with_flags(&manifest_bytes, ContentFlags::default())
+            .map_err(|e| DbError::Serialize(format!("BookStore manifest push failed: {e:?}")))?;
     }
 
     Ok(root_cid)
@@ -99,9 +102,14 @@ pub(crate) fn load_manifest(
     let bytes = if local_path.exists() {
         std::fs::read(&local_path)?
     } else if let Some(s) = store {
-        s.get(&root_cid)
+        let fetched = s.get(&root_cid)
             .map(|b| b.to_vec())
-            .ok_or_else(|| DbError::CommitNotFound { cid: root_hex.clone() })?
+            .ok_or_else(|| DbError::CommitNotFound { cid: root_hex.clone() })?;
+        // Cache locally so diff() works without a store later.
+        let tmp = local_path.with_extension("bin.tmp");
+        std::fs::write(&tmp, &fetched)?;
+        std::fs::rename(&tmp, &local_path)?;
+        fetched
     } else {
         return Err(DbError::CommitNotFound { cid: root_hex });
     };
@@ -134,9 +142,14 @@ fn load_page(
         std::fs::read(&local_path)?
     } else if let Some(s) = store {
         let page_cid = ContentId::from_bytes(page_bytes);
-        s.get(&page_cid)
+        let fetched = s.get(&page_cid)
             .map(|b| b.to_vec())
-            .ok_or(DbError::CommitNotFound { cid: canonical_hex })?
+            .ok_or(DbError::CommitNotFound { cid: canonical_hex })?;
+        // Cache locally so diff() works without a store later.
+        let tmp = local_path.with_extension("bin.tmp");
+        std::fs::write(&tmp, &fetched)?;
+        std::fs::rename(&tmp, &local_path)?;
+        fetched
     } else {
         return Err(DbError::CommitNotFound { cid: canonical_hex });
     };
@@ -177,9 +190,10 @@ pub(crate) fn diff_commits(
     data_dir: &Path,
     old_cid: ContentId,
     new_cid: ContentId,
+    store: Option<&dyn BookStore>,
 ) -> Result<crate::types::Diff, DbError> {
-    let old_manifest = load_manifest(data_dir, old_cid, None)?;
-    let new_manifest = load_manifest(data_dir, new_cid, None)?;
+    let old_manifest = load_manifest(data_dir, old_cid, store)?;
+    let new_manifest = load_manifest(data_dir, new_cid, store)?;
 
     let mut tables = HashMap::new();
 
@@ -188,8 +202,8 @@ pub(crate) fn diff_commits(
             if old_page_hex == new_page_hex {
                 continue;
             }
-            let old_entries = load_page(data_dir, old_page_hex, None)?;
-            let new_entries = load_page(data_dir, new_page_hex, None)?;
+            let old_entries = load_page(data_dir, old_page_hex, store)?;
+            let new_entries = load_page(data_dir, new_page_hex, store)?;
             let td = diff_entries(&old_entries, &new_entries);
             if !td.added.is_empty() || !td.removed.is_empty() || !td.changed.is_empty() {
                 tables.insert(name.clone(), td);
@@ -206,7 +220,7 @@ pub(crate) fn diff_commits(
 
     for (name, old_page_hex) in &old_manifest.tables {
         if !new_manifest.tables.contains_key(name) {
-            let old_entries = load_page(data_dir, old_page_hex, None)?;
+            let old_entries = load_page(data_dir, old_page_hex, store)?;
             tables.insert(name.clone(), crate::types::TableDiff {
                 added: Vec::new(),
                 removed: old_entries,
@@ -386,7 +400,7 @@ mod tests {
         tables.insert("t".to_string(), t);
 
         let root = create_commit(dir.path(), None, &tables, None).unwrap();
-        let d = diff_commits(dir.path(), root, root).unwrap();
+        let d = diff_commits(dir.path(), root, root, None).unwrap();
         assert!(d.tables.is_empty());
     }
 
@@ -411,7 +425,7 @@ mod tests {
         tables2.insert("t".to_string(), t2);
         let root2 = create_commit(dir.path(), Some(root1), &tables2, None).unwrap();
 
-        let d = diff_commits(dir.path(), root1, root2).unwrap();
+        let d = diff_commits(dir.path(), root1, root2, None).unwrap();
         assert_eq!(d.tables["t"].added.len(), 1);
         assert_eq!(d.tables["t"].added[0].key, b"k2");
         assert!(d.tables["t"].removed.is_empty());
@@ -438,7 +452,7 @@ mod tests {
         tables2.insert("t".to_string(), t2);
         let root2 = create_commit(dir.path(), Some(root1), &tables2, None).unwrap();
 
-        let d = diff_commits(dir.path(), root1, root2).unwrap();
+        let d = diff_commits(dir.path(), root1, root2, None).unwrap();
         assert_eq!(d.tables["t"].removed.len(), 1);
         assert_eq!(d.tables["t"].removed[0].key, b"k2");
     }
@@ -463,7 +477,7 @@ mod tests {
         tables2.insert("t".to_string(), t2);
         let root2 = create_commit(dir.path(), Some(root1), &tables2, None).unwrap();
 
-        let d = diff_commits(dir.path(), root1, root2).unwrap();
+        let d = diff_commits(dir.path(), root1, root2, None).unwrap();
         assert_eq!(d.tables["t"].changed.len(), 1);
         assert_eq!(d.tables["t"].changed[0].0.value_cid, cid_old);
         assert_eq!(d.tables["t"].changed[0].1.value_cid, cid_new);
@@ -494,7 +508,7 @@ mod tests {
         tables2.insert("t".to_string(), t2);
         let root2 = create_commit(dir.path(), Some(root1), &tables2, None).unwrap();
 
-        let d = diff_commits(dir.path(), root1, root2).unwrap();
+        let d = diff_commits(dir.path(), root1, root2, None).unwrap();
         assert_eq!(d.tables["t"].changed.len(), 1);
         assert_eq!(d.tables["t"].changed[0].0.metadata.flags, 0);
         assert_eq!(d.tables["t"].changed[0].1.metadata.flags, 1);
@@ -524,8 +538,51 @@ mod tests {
         });
         let root2 = create_commit(dir.path(), Some(root1), &tables, None).unwrap();
 
-        let d = diff_commits(dir.path(), root1, root2).unwrap();
+        let d = diff_commits(dir.path(), root1, root2, None).unwrap();
         assert!(!d.tables.contains_key("unchanged"));
         assert!(d.tables.contains_key("changed"));
+    }
+
+    #[test]
+    fn diff_after_rebuild_from_bookstore() {
+        // Regression test for P1 bug: rebuild fetches commit blobs from
+        // BookStore but didn't cache them locally, so diff() failed with
+        // CommitNotFound after open_from_cas.
+        use harmony_content::book::MemoryBookStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        persist::ensure_dirs(dir.path()).unwrap();
+
+        let cid_a = ContentId::for_book(b"a", ContentFlags::default()).unwrap();
+        let cid_b = ContentId::for_book(b"b", ContentFlags::default()).unwrap();
+
+        // Commit 1: one entry.
+        let mut tables1 = HashMap::new();
+        let mut t1 = Table::new();
+        t1.upsert(Entry { key: b"k1".to_vec(), value_cid: cid_a, timestamp: 1, metadata: meta("") });
+        tables1.insert("t".to_string(), t1);
+
+        let mut bs = MemoryBookStore::new();
+        let root1 = create_commit(dir.path(), None, &tables1, Some(&mut bs)).unwrap();
+
+        // Commit 2: add an entry.
+        let mut tables2 = HashMap::new();
+        let mut t2 = Table::new();
+        t2.upsert(Entry { key: b"k1".to_vec(), value_cid: cid_a, timestamp: 1, metadata: meta("") });
+        t2.upsert(Entry { key: b"k2".to_vec(), value_cid: cid_b, timestamp: 2, metadata: meta("") });
+        tables2.insert("t".to_string(), t2);
+        let root2 = create_commit(dir.path(), Some(root1), &tables2, Some(&mut bs)).unwrap();
+
+        // Rebuild into a fresh directory from BookStore only.
+        let dir2 = tempfile::tempdir().unwrap();
+        persist::ensure_dirs(dir2.path()).unwrap();
+        let rebuilt = rebuild(dir2.path(), root2, Some(&bs)).unwrap();
+        assert_eq!(rebuilt["t"].len(), 2);
+
+        // diff() works: root2 was cached locally by rebuild, root1 fetched
+        // from BookStore via the store parameter.
+        let d = diff_commits(dir2.path(), root1, root2, Some(&bs)).unwrap();
+        assert_eq!(d.tables["t"].added.len(), 1);
+        assert_eq!(d.tables["t"].added[0].key, b"k2");
     }
 }

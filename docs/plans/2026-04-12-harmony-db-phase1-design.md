@@ -309,13 +309,13 @@ pub enum DbError {
     #[error("table not found: {name}")]
     TableNotFound { name: String },
 
-    #[error("value blob missing: {cid}")]
-    BlobMissing { cid: String },
+    #[error("entry not found: key in table {table}")]
+    EntryNotFound { table: String },
 }
 ```
 
 Each variant maps to a distinct recovery strategy. `CorruptIndex` → start fresh or
-rebuild. `CommitNotFound` / `BlobMissing` → sync gap. `TableNotFound` → programmer error.
+rebuild. `CommitNotFound` → sync gap. `TableNotFound` / `EntryNotFound` → programmer error.
 
 ## Testing Strategy
 

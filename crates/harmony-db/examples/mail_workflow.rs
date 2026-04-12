@@ -70,7 +70,7 @@ fn main() {
     );
 
     println!("\n=== Diff commit 1 vs 2 ===");
-    let diff = db.diff(root1, root2).unwrap();
+    let diff = db.diff(root1, root2, None).unwrap();
     for (table, td) in &diff.tables {
         println!(
             "  {table}: +{} added, -{} removed, ~{} changed",

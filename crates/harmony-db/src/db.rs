@@ -137,9 +137,15 @@ impl HarmonyDb {
         Ok(root)
     }
 
-    /// Diff two commits.
-    pub fn diff(&self, old: ContentId, new: ContentId) -> Result<crate::types::Diff, DbError> {
-        commit::diff_commits(&self.data_dir, old, new)
+    /// Diff two commits. Optionally provide a BookStore to fetch
+    /// commit blobs not cached locally (e.g., after open_from_cas).
+    pub fn diff(
+        &self,
+        old: ContentId,
+        new: ContentId,
+        store: Option<&dyn BookStore>,
+    ) -> Result<crate::types::Diff, DbError> {
+        commit::diff_commits(&self.data_dir, old, new, store)
     }
 
     /// Rebuild in-memory index from a CAS commit snapshot.

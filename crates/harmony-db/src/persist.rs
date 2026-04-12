@@ -98,10 +98,20 @@ pub(crate) fn read_blob(data_dir: &Path, cid: &ContentId) -> Result<Option<Vec<u
     }
 }
 
+/// Write raw bytes to a blob file by hex CID (used during rebuild).
+/// Verifies the content matches the expected CID to reject corrupt/adversarial data.
 pub(crate) fn write_blob_raw(data_dir: &Path, cid_hex: &str, data: &[u8]) -> Result<(), DbError> {
     let blob_path = data_dir.join("blobs").join(format!("{cid_hex}.bin"));
     if blob_path.exists() {
         return Ok(());
+    }
+    // Verify content matches the expected CID before persisting.
+    let computed = ContentId::for_book(data, ContentFlags::default())
+        .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
+    if hex::encode(computed.to_bytes()) != cid_hex {
+        return Err(DbError::CorruptIndex(format!(
+            "blob content mismatch for {cid_hex}"
+        )));
     }
     let tmp = data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
     std::fs::write(&tmp, data)?;
