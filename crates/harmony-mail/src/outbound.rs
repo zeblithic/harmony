@@ -18,7 +18,7 @@ pub fn build_rfc5322(
     msg: &HarmonyMessage,
     domain: &str,
     sender_display: &str,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, QueueError> {
     let mut builder = mail_builder::MessageBuilder::new();
 
     // From header
@@ -64,16 +64,30 @@ pub fn build_rfc5322(
     // AttachmentRefs are included as X-Harmony-Attachment headers for now.
     for att in &msg.attachments {
         let cid_hex = hex::encode(att.cid);
+        // Sanitize filename and mime_type to prevent header injection
+        let safe_filename = sanitize_header_value(&att.filename);
+        let safe_mime = sanitize_header_value(&att.mime_type);
         builder = builder.header(
             "X-Harmony-Attachment",
             mail_builder::headers::raw::Raw::new(format!(
                 "cid={};filename=\"{}\";type={};size={}",
-                cid_hex, att.filename, att.mime_type, att.size
+                cid_hex, safe_filename, safe_mime, att.size
             )),
         );
     }
 
-    builder.write_to_vec().unwrap_or_default()
+    builder
+        .write_to_vec()
+        .map_err(|e| QueueError::Serialize(format!("RFC 5322 build failed: {e}")))
+}
+
+/// Sanitize a string for safe inclusion in header values.
+/// Strips CR, LF, and escapes double quotes.
+fn sanitize_header_value(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '\r' && *c != '\n')
+        .map(|c| if c == '"' { '\'' } else { c })
+        .collect()
 }
 
 /// Format a Harmony address hash as an email address for outbound headers.
@@ -120,9 +134,14 @@ impl OutboundQueue {
 
     /// Add a message to the outbound queue.
     pub fn enqueue(&self, rfc5322: Vec<u8>, recipient: String) -> Result<(), QueueError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let now = now_secs();
+        // Combine timestamp with atomic counter to avoid collisions within the same second
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let entry = QueuedMessage {
-            id: now, // simple monotonic ID
+            id: now.wrapping_mul(1_000_000).wrapping_add(seq),
             rfc5322,
             recipient,
             attempts: 0,
@@ -209,12 +228,7 @@ pub fn build_bounce(
         message_type: MailMessageType::Bounce,
         flags: MessageFlags::new(false, true, false),
         timestamp: now_secs(),
-        message_id: {
-            let hash = blake3::hash(&now_secs().to_le_bytes());
-            let mut id = [0u8; 16];
-            id.copy_from_slice(&hash.as_bytes()[..16]);
-            id
-        },
+        message_id: unique_message_id(),
         in_reply_to: Some(original.message_id),
         sender_address: [0u8; ADDRESS_HASH_LEN], // system sender
         recipients: vec![crate::message::Recipient {
@@ -237,6 +251,26 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Generate a unique 16-byte message ID using timestamp + atomic counter.
+fn unique_message_id() -> [u8; 16] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MSG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = MSG_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&now.to_le_bytes());
+    hasher.update(&seq.to_le_bytes());
+    let hash = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash.as_bytes()[..16]);
+    id
 }
 
 /// Queue-related errors.
@@ -275,7 +309,7 @@ mod tests {
     #[test]
     fn build_rfc5322_basic() {
         let msg = sample_message();
-        let rfc5322 = build_rfc5322(&msg, "q8.fyi", "sender@q8.fyi");
+        let rfc5322 = build_rfc5322(&msg, "q8.fyi", "sender@q8.fyi").unwrap();
         let text = String::from_utf8_lossy(&rfc5322);
 
         eprintln!("RFC5322 output:\n{text}");
@@ -292,7 +326,7 @@ mod tests {
         msg.in_reply_to = Some([0xDD; 16]);
         msg.flags = MessageFlags::new(false, true, false);
 
-        let rfc5322 = build_rfc5322(&msg, "q8.fyi", "sender@q8.fyi");
+        let rfc5322 = build_rfc5322(&msg, "q8.fyi", "sender@q8.fyi").unwrap();
         let text = String::from_utf8_lossy(&rfc5322);
 
         assert!(text.contains("In-Reply-To:"), "missing In-Reply-To header");
@@ -306,7 +340,7 @@ mod tests {
             recipient_type: RecipientType::Cc,
         });
 
-        let rfc5322 = build_rfc5322(&msg, "q8.fyi", "sender@q8.fyi");
+        let rfc5322 = build_rfc5322(&msg, "q8.fyi", "sender@q8.fyi").unwrap();
         let text = String::from_utf8_lossy(&rfc5322);
 
         assert!(text.contains("To:"), "missing To header");

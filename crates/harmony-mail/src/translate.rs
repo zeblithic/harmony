@@ -85,7 +85,7 @@ pub fn translate_inbound(raw: &[u8]) -> Result<TranslatedMessage, TranslateError
     // ── Timestamp ───────────────────────────────────────────────────
     let timestamp = parsed
         .date()
-        .map(|dt| dt.to_timestamp() as u64)
+        .and_then(|dt| u64::try_from(dt.to_timestamp()).ok())
         .unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -192,13 +192,21 @@ fn hash_to_message_id(data: &[u8]) -> [u8; MESSAGE_ID_LEN] {
     id
 }
 
-/// Generate a random 16-byte message ID.
+/// Generate a unique 16-byte message ID using timestamp + atomic counter.
 fn random_message_id() -> [u8; MESSAGE_ID_LEN] {
-    let hash = blake3::hash(&std::time::SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos()
-        .to_le_bytes());
+        .as_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&now.to_le_bytes());
+    hasher.update(&seq.to_le_bytes());
+    let hash = hasher.finalize();
     let mut id = [0u8; MESSAGE_ID_LEN];
     id.copy_from_slice(&hash.as_bytes()[..MESSAGE_ID_LEN]);
     id

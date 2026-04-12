@@ -50,7 +50,8 @@ pub async fn verify_dkim(
 ) -> DkimResult {
     let authenticated = match mail_auth::AuthenticatedMessage::parse(message) {
         Some(msg) => msg,
-        None => return DkimResult::Missing,
+        // Unparseable message is an auth failure, not "missing DKIM"
+        None => return DkimResult::Fail,
     };
 
     let results = authenticator.verify_dkim(&authenticated).await;
@@ -86,12 +87,9 @@ pub fn map_dmarc_result(output: &mail_auth::DmarcOutput) -> DmarcResult {
     if dkim_aligned || spf_aligned {
         DmarcResult::Pass
     } else {
-        match output.policy() {
-            mail_auth::dmarc::Policy::Reject | mail_auth::dmarc::Policy::Quarantine => {
-                DmarcResult::Fail
-            }
-            _ => DmarcResult::None,
-        }
+        // Alignment failure is Fail regardless of policy — policy determines
+        // enforcement action, not whether authentication passed.
+        DmarcResult::Fail
     }
 }
 
@@ -108,8 +106,9 @@ impl DkimSigner {
         selector: &str,
         domain: &str,
         key_path: &std::path::Path,
-    ) -> Result<Self, std::io::Error> {
-        let key_der = std::fs::read(key_path)?;
+    ) -> Result<Self, AuthError> {
+        let key_der = std::fs::read(key_path)
+            .map_err(|e| AuthError::SigningKey(format!("reading {}: {e}", key_path.display())))?;
         Ok(Self {
             selector: selector.to_string(),
             domain: domain.to_string(),

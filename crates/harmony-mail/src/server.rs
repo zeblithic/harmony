@@ -6,20 +6,22 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_util::codec::FramedRead;
 
 use futures_util::StreamExt;
 
-use crate::config::Config;
+use crate::config::{Config, TlsMode};
 use crate::io::{SmtpCodec, SmtpFrame};
 use crate::smtp::{SmtpAction, SmtpConfig, SmtpEvent, SmtpSession, SmtpState};
 use crate::smtp_parse::parse_command;
+use crate::tls;
 
 /// Per-IP connection tracking entry.
 struct IpEntry {
@@ -77,6 +79,8 @@ impl SharedState {
 
 /// Parse the max_message_size config string (e.g. "25MB") to bytes.
 fn parse_message_size(s: &str) -> usize {
+    const DEFAULT_SIZE: usize = 25 * 1024 * 1024; // 25 MB
+
     let s = s.trim();
     let (num_str, multiplier) = if let Some(n) = s.strip_suffix("MB") {
         (n, 1024 * 1024)
@@ -90,8 +94,9 @@ fn parse_message_size(s: &str) -> usize {
     num_str
         .trim()
         .parse::<usize>()
-        .unwrap_or(25 * 1024 * 1024)
-        * multiplier
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
+        .unwrap_or(DEFAULT_SIZE)
 }
 
 /// Idle timeout for SMTP command reads.
@@ -114,8 +119,59 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let shared = Arc::new(SharedState::new(config.spam.max_connections_per_ip));
 
-    let listener = TcpListener::bind(&config.gateway.listen_smtp).await?;
-    tracing::info!(addr = %config.gateway.listen_smtp, "SMTP listener started");
+    // Load TLS if configured with manual certs
+    let tls_acceptor = if config.tls.mode == TlsMode::Manual {
+        match (&config.tls.cert, &config.tls.key) {
+            (Some(cert), Some(key)) => {
+                let acceptor = tls::load_tls_config(Path::new(cert), Path::new(key))?;
+                tracing::info!("TLS loaded from cert={cert}, key={key}");
+                Some(Arc::new(acceptor))
+            }
+            _ => {
+                tracing::warn!("TLS mode=manual but cert/key not configured");
+                None
+            }
+        }
+    } else {
+        tracing::info!("TLS mode=acme (not yet implemented), STARTTLS unavailable");
+        None
+    };
+
+    // Bind port 25 (inbound SMTP, STARTTLS)
+    let smtp_listener = TcpListener::bind(&config.gateway.listen_smtp).await?;
+    tracing::info!(addr = %config.gateway.listen_smtp, "SMTP listener started (port 25)");
+
+    // Bind port 465 (implicit TLS) if TLS is available
+    let submission_listener = if tls_acceptor.is_some() {
+        match TcpListener::bind(&config.gateway.listen_submission).await {
+            Ok(l) => {
+                tracing::info!(addr = %config.gateway.listen_submission, "Submission listener started (port 465, implicit TLS)");
+                Some(l)
+            }
+            Err(e) => {
+                tracing::warn!(addr = %config.gateway.listen_submission, error = %e, "failed to bind submission port");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Bind port 587 (STARTTLS submission) if TLS is available
+    let starttls_listener = if tls_acceptor.is_some() {
+        match TcpListener::bind(&config.gateway.listen_submission_starttls).await {
+            Ok(l) => {
+                tracing::info!(addr = %config.gateway.listen_submission_starttls, "STARTTLS submission listener started (port 587)");
+                Some(l)
+            }
+            Err(e) => {
+                tracing::warn!(addr = %config.gateway.listen_submission_starttls, error = %e, "failed to bind STARTTLS submission port");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Background cleanup task for per-IP tracking
     let cleanup_shared = Arc::clone(&shared);
@@ -127,13 +183,79 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Graceful shutdown signal
+    // Spawn implicit TLS listener (port 465)
+    if let Some(sub_listener) = submission_listener {
+        let smtp_config = smtp_config.clone();
+        let shared = Arc::clone(&shared);
+        let acceptor = tls_acceptor.clone().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, addr) = match sub_listener.accept().await {
+                    Ok(sa) => sa,
+                    Err(e) => { tracing::warn!(error = %e, "submission accept error"); continue; }
+                };
+                let peer_ip = addr.ip();
+                if !shared.try_connect(peer_ip).await {
+                    drop(stream);
+                    continue;
+                }
+                let cfg = smtp_config.clone();
+                let sh = Arc::clone(&shared);
+                let acc = Arc::clone(&acceptor);
+                tokio::spawn(async move {
+                    // Implicit TLS: wrap in TLS before SMTP
+                    match tls::implicit_tls_wrap(stream, &acc).await {
+                        Ok(tls_stream) => {
+                            let (reader, writer) = tokio::io::split(tls_stream);
+                            let session = SmtpSession::new(cfg);
+                            if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None).await {
+                                tracing::debug!(%peer_ip, error = %e, "implicit TLS connection ended with error");
+                            }
+                        }
+                        Err(e) => tracing::debug!(%peer_ip, error = %e, "implicit TLS handshake failed"),
+                    }
+                    sh.disconnect(peer_ip).await;
+                });
+            }
+        });
+    }
+
+    // Spawn STARTTLS submission listener (port 587)
+    if let Some(starttls_listener) = starttls_listener {
+        let smtp_config = smtp_config.clone();
+        let shared = Arc::clone(&shared);
+        let acceptor = tls_acceptor.clone().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, addr) = match starttls_listener.accept().await {
+                    Ok(sa) => sa,
+                    Err(e) => { tracing::warn!(error = %e, "STARTTLS submission accept error"); continue; }
+                };
+                let peer_ip = addr.ip();
+                if !shared.try_connect(peer_ip).await {
+                    drop(stream);
+                    continue;
+                }
+                let cfg = smtp_config.clone();
+                let sh = Arc::clone(&shared);
+                let acc = Arc::clone(&acceptor);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone())).await {
+                        tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
+                    }
+                    sh.disconnect(peer_ip).await;
+                });
+            }
+        });
+    }
+
+    // Main SMTP accept loop (port 25)
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
-            result = listener.accept() => {
+            result = smtp_listener.accept() => {
                 let (stream, addr) = result?;
                 let peer_ip = addr.ip();
 
@@ -145,9 +267,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
                 let smtp_config = smtp_config.clone();
                 let shared = Arc::clone(&shared);
+                let acceptor = tls_acceptor.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size).await {
+                    let acc = acceptor.as_ref().map(|a| (**a).clone());
+                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc).await {
                         tracing::debug!(%peer_ip, error = %e, "connection ended with error");
                     }
                     shared.disconnect(peer_ip).await;
@@ -163,34 +287,35 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Handle a single SMTP connection.
+/// Handle a single plaintext SMTP connection with optional STARTTLS support.
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     peer_ip: IpAddr,
     smtp_config: SmtpConfig,
     max_message_size: usize,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut session = SmtpSession::new(smtp_config);
 
-    let (reader, mut writer) = stream.into_split();
-    let mut framed = FramedRead::new(reader, SmtpCodec::new(max_message_size));
-
-    // Send initial greeting
+    // Send initial greeting on plaintext
     let actions = session.handle(SmtpEvent::Connected {
         peer_ip,
         tls: false,
     });
-    execute_actions(&actions, &mut writer).await?;
+
+    // Use into_split so we can reunite for STARTTLS upgrade
+    let (reader, mut writer) = stream.into_split();
+    let mut framed = FramedRead::new(reader, SmtpCodec::new(max_message_size));
+    execute_actions_generic(&actions, &mut writer).await?;
 
     loop {
-        // Choose timeout based on current state
-        let timeout = if session.state == SmtpState::DataReceiving {
+        let timeout_dur = if session.state == SmtpState::DataReceiving {
             DATA_TIMEOUT
         } else {
             COMMAND_TIMEOUT
         };
 
-        let frame = tokio::time::timeout(timeout, framed.next()).await;
+        let frame = tokio::time::timeout(timeout_dur, framed.next()).await;
 
         match frame {
             Ok(Some(Ok(smtp_frame))) => {
@@ -198,7 +323,6 @@ async fn handle_connection(
                     SmtpFrame::Line(line) => {
                         match parse_command(line.as_bytes()) {
                             Ok(cmd) => {
-                                // If DATA command is accepted, switch codec to data mode
                                 let actions = session.handle(SmtpEvent::Command(cmd));
                                 if session.state == SmtpState::DataReceiving {
                                     framed.decoder_mut().enter_data_mode();
@@ -206,7 +330,6 @@ async fn handle_connection(
                                 actions
                             }
                             Err(_) => {
-                                // Unknown or malformed command
                                 vec![SmtpAction::SendResponse(
                                     500,
                                     "5.5.1 Command not recognized".to_string(),
@@ -215,23 +338,18 @@ async fn handle_connection(
                         }
                     }
                     SmtpFrame::Data(body) => {
-                        // Switch back to command mode
                         framed.decoder_mut().enter_command_mode();
                         session.handle(SmtpEvent::DataComplete(body))
                     }
                 };
 
-                let should_close = execute_actions(&actions, &mut writer).await?;
+                let should_close = execute_actions_generic(&actions, &mut writer).await?;
 
                 // Handle async actions that need callbacks
+                let mut needs_starttls = false;
                 for action in &actions {
                     match action {
-                        SmtpAction::ResolveHarmonyAddress {
-                            local_part,
-                            domain: _,
-                        } => {
-                            // For now, stub: all addresses resolve to a dummy identity.
-                            // Real implementation will query the announce cache.
+                        SmtpAction::ResolveHarmonyAddress { local_part, .. } => {
                             use crate::message::ADDRESS_HASH_LEN;
                             let identity = Some([0u8; ADDRESS_HASH_LEN]);
                             let resolve_actions =
@@ -239,23 +357,160 @@ async fn handle_connection(
                                     local_part: local_part.clone(),
                                     identity,
                                 });
-                            execute_actions(&resolve_actions, &mut writer).await?;
+                            execute_actions_generic(&resolve_actions, &mut writer).await?;
                         }
                         SmtpAction::DeliverToHarmony { .. } => {
-                            // For now, stub: delivery always succeeds.
-                            // Real implementation will deliver to Harmony network.
                             let result_actions =
                                 session.handle(SmtpEvent::DeliveryResult { success: true });
-                            execute_actions(&result_actions, &mut writer).await?;
+                            execute_actions_generic(&result_actions, &mut writer).await?;
                         }
-                        SmtpAction::CheckSpf { .. } => {
-                            // Fire-and-forget for now — SPF results will feed into
-                            // spam scoring in Task 16.
-                        }
+                        SmtpAction::CheckSpf { .. } => {}
                         SmtpAction::StartTls => {
-                            // TLS upgrade handled in Task 13. For now, just complete
-                            // the handshake stub so the state machine can proceed.
-                            tracing::warn!("STARTTLS requested but TLS not yet implemented");
+                            needs_starttls = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // STARTTLS: upgrade the connection to TLS
+                if needs_starttls {
+                    if let Some(ref acceptor) = tls_acceptor {
+                        // Flush pending writes before TLS handshake
+                        writer.flush().await?;
+                        // Reunite the OwnedReadHalf + OwnedWriteHalf back into TcpStream
+                        let tcp_reader = framed.into_inner();
+                        let tcp_stream = tcp_reader.reunite(writer)
+                            .map_err(|e| format!("failed to reunite TCP halves: {e}"))?;
+                        // Perform TLS handshake
+                        match tls::starttls_upgrade(tcp_stream, acceptor).await {
+                            Ok(tls_stream) => {
+                                let (tls_reader, tls_writer) = tokio::io::split(tls_stream);
+                                // Feed TlsCompleted to state machine
+                                let tls_actions = session.handle(SmtpEvent::TlsCompleted);
+                                let mut tls_writer = tls_writer;
+                                execute_actions_generic(&tls_actions, &mut tls_writer).await?;
+                                // Continue the session over TLS
+                                return handle_connection_generic(
+                                    tls_reader, tls_writer, peer_ip, session, max_message_size, None,
+                                ).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(%peer_ip, error = %e, "STARTTLS handshake failed");
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        tracing::warn!(%peer_ip, "STARTTLS requested but no TLS configured");
+                    }
+                }
+
+                if should_close || session.state == SmtpState::Closed {
+                    break;
+                }
+            }
+            Ok(Some(Err(e))) => {
+                tracing::debug!(%peer_ip, error = %e, "codec error");
+                let _ = writer
+                    .write_all(b"421 4.7.0 Error processing input\r\n")
+                    .await;
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                let _ = writer
+                    .write_all(b"421 4.4.2 Connection timed out\r\n")
+                    .await;
+                break;
+            }
+        }
+    }
+
+    let _ = writer.shutdown().await;
+    Ok(())
+}
+
+/// Generic connection handler over any AsyncRead + AsyncWrite (used after TLS upgrade
+/// and for implicit TLS connections).
+async fn handle_connection_generic<R, W>(
+    reader: R,
+    mut writer: W,
+    peer_ip: IpAddr,
+    mut session: SmtpSession,
+    max_message_size: usize,
+    _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    // For implicit TLS, send the greeting if session is fresh
+    if session.state == SmtpState::Connected {
+        let actions = session.handle(SmtpEvent::Connected {
+            peer_ip,
+            tls: true,
+        });
+        execute_actions_generic(&actions, &mut writer).await?;
+    }
+
+    let mut framed = FramedRead::new(reader, SmtpCodec::new(max_message_size));
+
+    loop {
+        let timeout_dur = if session.state == SmtpState::DataReceiving {
+            DATA_TIMEOUT
+        } else {
+            COMMAND_TIMEOUT
+        };
+
+        let frame = tokio::time::timeout(timeout_dur, framed.next()).await;
+
+        match frame {
+            Ok(Some(Ok(smtp_frame))) => {
+                let actions = match smtp_frame {
+                    SmtpFrame::Line(line) => {
+                        match parse_command(line.as_bytes()) {
+                            Ok(cmd) => {
+                                let actions = session.handle(SmtpEvent::Command(cmd));
+                                if session.state == SmtpState::DataReceiving {
+                                    framed.decoder_mut().enter_data_mode();
+                                }
+                                actions
+                            }
+                            Err(_) => {
+                                vec![SmtpAction::SendResponse(
+                                    500,
+                                    "5.5.1 Command not recognized".to_string(),
+                                )]
+                            }
+                        }
+                    }
+                    SmtpFrame::Data(body) => {
+                        framed.decoder_mut().enter_command_mode();
+                        session.handle(SmtpEvent::DataComplete(body))
+                    }
+                };
+
+                let should_close = execute_actions_generic(&actions, &mut writer).await?;
+
+                for action in &actions {
+                    match action {
+                        SmtpAction::ResolveHarmonyAddress { local_part, .. } => {
+                            use crate::message::ADDRESS_HASH_LEN;
+                            let identity = Some([0u8; ADDRESS_HASH_LEN]);
+                            let resolve_actions =
+                                session.handle(SmtpEvent::HarmonyResolved {
+                                    local_part: local_part.clone(),
+                                    identity,
+                                });
+                            execute_actions_generic(&resolve_actions, &mut writer).await?;
+                        }
+                        SmtpAction::DeliverToHarmony { .. } => {
+                            let result_actions =
+                                session.handle(SmtpEvent::DeliveryResult { success: true });
+                            execute_actions_generic(&result_actions, &mut writer).await?;
+                        }
+                        SmtpAction::CheckSpf { .. } => {}
+                        SmtpAction::StartTls => {
+                            // Already on TLS — ignore (state machine would have rejected this)
                         }
                         _ => {}
                     }
@@ -272,12 +527,8 @@ async fn handle_connection(
                     .await;
                 break;
             }
-            Ok(None) => {
-                // Client disconnected
-                break;
-            }
+            Ok(None) => break,
             Err(_) => {
-                // Timeout
                 let _ = writer
                     .write_all(b"421 4.4.2 Connection timed out\r\n")
                     .await;
@@ -292,9 +543,9 @@ async fn handle_connection(
 
 /// Execute SMTP actions by writing responses to the client.
 /// Returns true if a Close action was encountered.
-async fn execute_actions(
+async fn execute_actions_generic<W: AsyncWrite + Unpin>(
     actions: &[SmtpAction],
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut W,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut should_close = false;
 
@@ -413,7 +664,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None)
                 .await
                 .unwrap();
         });
@@ -455,7 +706,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None)
                 .await
                 .unwrap();
         });

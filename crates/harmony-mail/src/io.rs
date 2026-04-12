@@ -73,6 +73,14 @@ impl SmtpCodec {
 
         match crlf_pos {
             Some(pos) => {
+                // Enforce RFC 5321 §4.5.3.1.4: 512 octets including CRLF
+                if pos + 2 > MAX_LINE_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("SMTP command line exceeds {} bytes", MAX_LINE_LEN),
+                    ));
+                }
+
                 // Extract line bytes (not including CRLF)
                 let line_bytes = src.split_to(pos);
                 // Consume the CRLF
@@ -114,9 +122,10 @@ impl SmtpCodec {
                         return Ok(Some(SmtpFrame::Data(body)));
                     }
 
-                    // Dot-unstuffing: if line starts with "..", remove leading dot
-                    // per RFC 5321 §4.5.2
-                    let content = if line.starts_with(b"..") {
+                    // Dot-unstuffing per RFC 5321 §4.5.2: "If the first
+                    // character is a period and there are other characters
+                    // on the line, the first character is deleted."
+                    let content = if line.starts_with(b".") {
                         &line[1..]
                     } else {
                         line
@@ -382,10 +391,20 @@ mod tests {
     fn data_dot_on_line_alone_is_terminator() {
         let mut c = codec();
         c.enter_data_mode();
-        // A line with just "." followed by CRLF is the terminator,
-        // but ".text" is a normal line (not dot-stuffed, no leading extra dot)
+        // A line with just "." followed by CRLF is the terminator.
+        // ".text" is dot-unstuffed to "text" per RFC 5321 §4.5.2
+        // (the sender would have transmitted "..text" to represent ".text")
         let mut buf = BytesMut::from(".text\r\n.\r\n");
         let frame = c.decode(&mut buf).unwrap();
-        assert_eq!(frame, Some(SmtpFrame::Data(b".text\r\n".to_vec())));
+        assert_eq!(frame, Some(SmtpFrame::Data(b"text\r\n".to_vec())));
+    }
+
+    #[test]
+    fn reject_oversized_command_with_crlf_in_buffer() {
+        let mut c = codec();
+        let long_line = "X".repeat(MAX_LINE_LEN); // 512 Xs + \r\n = 514 bytes
+        let mut buf = BytesMut::from(format!("{}\r\n", long_line).as_bytes());
+        let err = c.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
