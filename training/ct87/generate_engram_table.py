@@ -98,15 +98,27 @@ def generate_corpus_table(
         [total_entries, embedding_dim] float32 array, unit-normalized rows.
         Rows with no n-gram hits are zero vectors.
     """
+    if total_entries <= 0:
+        raise ValueError("total_entries must be > 0")
     if hash_seeds is None:
         hash_seeds = list(DEFAULT_HASH_SEEDS)
 
     from ct87.engram import _hash_ngram
 
     # Build count matrix: [total_entries, vocab_size]
-    counts = np.zeros((total_entries, vocab_size), dtype=np.float64)
+    # float32 keeps peak memory ~1.2GB at 10K×32K (vs 2.56GB with float64)
+    counts = np.zeros((total_entries, vocab_size), dtype=np.float32)
 
     for chunk in chunks:
+        # Validate token IDs before scanning
+        if chunk:
+            max_token = max(chunk)
+            min_token = min(chunk)
+            if min_token < 0 or max_token >= vocab_size:
+                raise ValueError(
+                    f"Token IDs out of range for vocab_size={vocab_size}: "
+                    f"min={min_token}, max={max_token}"
+                )
         seq_len = len(chunk)
 
         # Bigrams: [t[i], t[i+1]] attributed to position i+1, next token at i+2
@@ -146,7 +158,7 @@ def generate_corpus_table(
         # Suppress benign overflow warnings from sparse float32 matmul;
         # any NaN/inf rows are clamped by the L2 normalization below.
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-            projected = (probs.astype(np.float32) @ proj_matrix)
+            projected = probs @ proj_matrix
 
         # Clamp any NaN/inf from float32 overflow before normalizing
         np.nan_to_num(projected, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
