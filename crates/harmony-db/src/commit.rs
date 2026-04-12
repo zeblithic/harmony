@@ -76,8 +76,9 @@ pub(crate) fn create_commit(
         for table in tables.values() {
             for entry in table.entries() {
                 if !s.contains(&entry.value_cid) {
-                    if let Ok(Some(blob)) = persist::read_blob(data_dir, &entry.value_cid) {
-                        s.store(entry.value_cid, blob);
+                    match persist::read_blob(data_dir, &entry.value_cid)? {
+                        Some(blob) => s.store(entry.value_cid, blob),
+                        None => {} // Blob not on disk (orphaned) — best-effort skip
                     }
                 }
             }
@@ -99,21 +100,18 @@ pub(crate) fn load_manifest(
     let root_hex = hex::encode(root_cid.to_bytes());
     let local_path = data_dir.join("commits").join(format!("{root_hex}.bin"));
 
-    let bytes = if local_path.exists() {
-        std::fs::read(&local_path)?
+    let (bytes, from_store) = if local_path.exists() {
+        (std::fs::read(&local_path)?, false)
     } else if let Some(s) = store {
         let fetched = s.get(&root_cid)
             .map(|b| b.to_vec())
             .ok_or_else(|| DbError::CommitNotFound { cid: root_hex.clone() })?;
-        // Cache locally so diff() works without a store later.
-        let tmp = local_path.with_extension("bin.tmp");
-        std::fs::write(&tmp, &fetched)?;
-        std::fs::rename(&tmp, &local_path)?;
-        fetched
+        (fetched, true)
     } else {
         return Err(DbError::CommitNotFound { cid: root_hex });
     };
 
+    // Validate before caching — don't persist corrupt data from a bad store.
     let manifest: RootManifest = serde_json::from_slice(&bytes)
         .map_err(|e| DbError::CorruptIndex(e.to_string()))?;
     if manifest.version != COMMIT_VERSION {
@@ -122,6 +120,14 @@ pub(crate) fn load_manifest(
             manifest.version, COMMIT_VERSION
         )));
     }
+
+    // Cache locally after validation so diff() works without a store later.
+    if from_store {
+        let tmp = local_path.with_extension("bin.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &local_path)?;
+    }
+
     Ok(manifest)
 }
 
@@ -138,23 +144,29 @@ fn load_page(
     let canonical_hex = hex::encode(page_bytes);
     let local_path = data_dir.join("commits").join(format!("{canonical_hex}.bin"));
 
-    let bytes = if local_path.exists() {
-        std::fs::read(&local_path)?
+    let (bytes, from_store) = if local_path.exists() {
+        (std::fs::read(&local_path)?, false)
     } else if let Some(s) = store {
         let page_cid = ContentId::from_bytes(page_bytes);
         let fetched = s.get(&page_cid)
             .map(|b| b.to_vec())
             .ok_or(DbError::CommitNotFound { cid: canonical_hex })?;
-        // Cache locally so diff() works without a store later.
-        let tmp = local_path.with_extension("bin.tmp");
-        std::fs::write(&tmp, &fetched)?;
-        std::fs::rename(&tmp, &local_path)?;
-        fetched
+        (fetched, true)
     } else {
         return Err(DbError::CommitNotFound { cid: canonical_hex });
     };
 
-    serde_json::from_slice(&bytes).map_err(|e| DbError::CorruptIndex(e.to_string()))
+    // Validate before caching — don't persist corrupt data from a bad store.
+    let entries: Vec<Entry> = serde_json::from_slice(&bytes)
+        .map_err(|e| DbError::CorruptIndex(e.to_string()))?;
+
+    if from_store {
+        let tmp = local_path.with_extension("bin.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &local_path)?;
+    }
+
+    Ok(entries)
 }
 
 pub(crate) fn rebuild(
@@ -584,5 +596,45 @@ mod tests {
         let d = diff_commits(dir2.path(), root1, root2, Some(&bs)).unwrap();
         assert_eq!(d.tables["t"].added.len(), 1);
         assert_eq!(d.tables["t"].added[0].key, b"k2");
+    }
+
+    #[test]
+    fn diff_new_table_from_bookstore() {
+        // Exercises the diff code path where a brand-new table exists
+        // only in the BookStore (not locally).
+        use harmony_content::book::MemoryBookStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        persist::ensure_dirs(dir.path()).unwrap();
+
+        let cid_a = ContentId::for_book(b"a", ContentFlags::default()).unwrap();
+        let cid_b = ContentId::for_book(b"b", ContentFlags::default()).unwrap();
+
+        // Commit 1: only table "t".
+        let mut tables1 = HashMap::new();
+        let mut t1 = Table::new();
+        t1.upsert(Entry { key: b"k1".to_vec(), value_cid: cid_a, timestamp: 1, metadata: meta("") });
+        tables1.insert("t".to_string(), t1);
+
+        let mut bs = MemoryBookStore::new();
+        let root1 = create_commit(dir.path(), None, &tables1, Some(&mut bs)).unwrap();
+
+        // Commit 2: add new table "new_t".
+        let mut tables2 = tables1.clone();
+        let mut t2 = Table::new();
+        t2.upsert(Entry { key: b"n1".to_vec(), value_cid: cid_b, timestamp: 2, metadata: meta("") });
+        tables2.insert("new_t".to_string(), t2);
+        let root2 = create_commit(dir.path(), Some(root1), &tables2, Some(&mut bs)).unwrap();
+
+        // Rebuild in fresh directory, then diff.
+        let dir2 = tempfile::tempdir().unwrap();
+        persist::ensure_dirs(dir2.path()).unwrap();
+        let _rebuilt = rebuild(dir2.path(), root2, Some(&bs)).unwrap();
+
+        let d = diff_commits(dir2.path(), root1, root2, Some(&bs)).unwrap();
+        // "t" unchanged → not in diff. "new_t" is brand new → all entries added.
+        assert!(!d.tables.contains_key("t"));
+        assert_eq!(d.tables["new_t"].added.len(), 1);
+        assert_eq!(d.tables["new_t"].added[0].key, b"n1");
     }
 }

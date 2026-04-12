@@ -28,7 +28,9 @@ impl HarmonyDb {
     }
 
     pub fn table_names(&self) -> Vec<&str> {
-        self.tables.keys().map(|s| s.as_str()).collect()
+        let mut names: Vec<&str> = self.tables.keys().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        names
     }
 
     pub fn table_len(&self, table: &str) -> usize {

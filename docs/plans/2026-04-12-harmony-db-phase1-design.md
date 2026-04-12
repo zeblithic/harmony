@@ -270,9 +270,13 @@ Per-table two-pointer merge over sorted entries:
 3. Otherwise, load both page blobs and two-pointer merge:
    - Key only in old → removed
    - Key only in new → added
-   - Key in both, different value_cid → changed
+   - Key in both, different value_cid or metadata → changed
 4. Tables only in new → all entries added
 5. Tables only in old → all entries removed
+
+Diff compares `value_cid` and `metadata` (flags + snippet). `timestamp` is excluded —
+it records insertion time and changes on every upsert, so including it would make every
+re-insert appear as a change even when the semantic content is identical.
 
 The page CID short-circuit makes diff O(d) in practice — proportional to what changed.
 
