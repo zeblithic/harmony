@@ -199,6 +199,12 @@ def generate_and_save_corpus_table(
     from datasets import load_from_disk
 
     ds = load_from_disk(data_path)
+    if "input_ids" not in ds.column_names:
+        raise ValueError(
+            f"Dataset at {data_path} has no 'input_ids' column. "
+            f"Available columns: {ds.column_names}. "
+            f"Use ct87.prepare_data to create a tokenized dataset."
+        )
     chunks = ds["input_ids"]
 
     print(f"Loaded {len(chunks)} chunks from {data_path}")
