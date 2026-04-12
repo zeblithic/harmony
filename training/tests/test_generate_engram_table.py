@@ -196,6 +196,42 @@ class TestTeacherProjection:
         )
         np.testing.assert_array_equal(t1, t2)
 
+    def test_single_active_row_skips_pca(self):
+        """Single active row should bypass PCA without crashing."""
+        from ct87.generate_engram_table import generate_corpus_table
+
+        # Very small corpus + large table = likely only 1 active entry
+        chunks = [[1, 2, 3, 4]]
+        rng = np.random.RandomState(42)
+        teacher_matrix = rng.randn(32, 64).astype(np.float32)
+
+        table = generate_corpus_table(
+            chunks, total_entries=10000, embedding_dim=16,
+            vocab_size=32, hash_seeds=[42],
+            teacher_embed_matrix=teacher_matrix,
+        )
+        assert table.shape == (10000, 16)
+        assert table.dtype == np.float32
+        # At least one non-zero entry should exist
+        nonzero = np.count_nonzero(np.linalg.norm(table, axis=1))
+        assert nonzero >= 1
+
+    def test_teacher_dim_smaller_than_embedding_dim(self):
+        """Teacher dim < embedding_dim should pad with zeros."""
+        from ct87.generate_engram_table import generate_corpus_table
+
+        chunks = [[1, 2, 3, 4, 5, 6, 7, 8]] * 10
+        rng = np.random.RandomState(42)
+        # teacher_dim=8 but embedding_dim=16 — must pad
+        teacher_matrix = rng.randn(32, 8).astype(np.float32)
+
+        table = generate_corpus_table(
+            chunks, total_entries=100, embedding_dim=16,
+            vocab_size=32, hash_seeds=[42, 99],
+            teacher_embed_matrix=teacher_matrix,
+        )
+        assert table.shape == (100, 16)
+
     def test_teacher_vocab_mismatch_raises(self):
         """Teacher matrix with wrong vocab dimension should raise."""
         from ct87.generate_engram_table import generate_corpus_table

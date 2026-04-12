@@ -373,6 +373,7 @@ def main() -> None:
             print(f"Loading teacher embeddings from {args.teacher}...")
             teacher_model = AutoModel.from_pretrained(
                 args.teacher, torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
             )
             teacher_embed_matrix = (
                 teacher_model.get_input_embeddings()

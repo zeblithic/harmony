@@ -21,6 +21,8 @@ dev = [
 ]
 teacher = [
     "scikit-learn>=1.0",
+    "torch>=2.2",
+    "transformers>=4.38",
 ]
 
 [tool.pytest.ini_options]
