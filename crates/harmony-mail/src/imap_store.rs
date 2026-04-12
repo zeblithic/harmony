@@ -214,11 +214,28 @@ impl ImapStore {
     }
 
     pub fn create_mailbox(&self, name: &str) -> Result<(), StoreError> {
+        // Canonicalize INBOX to uppercase for consistency
+        let canonical = if name.eq_ignore_ascii_case("INBOX") {
+            "INBOX".to_string()
+        } else {
+            name.to_string()
+        };
         let conn = self.conn.lock().unwrap();
+        // Check for case-insensitive duplicate before insert
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM mailboxes WHERE name = ?1 COLLATE NOCASE",
+                [&canonical],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if exists {
+            return Err(StoreError::MailboxExists(canonical));
+        }
         let uid_validity = now_secs() as u32;
         match conn.execute(
             "INSERT INTO mailboxes (name, uid_validity) VALUES (?1, ?2)",
-            rusqlite::params![name, uid_validity],
+            rusqlite::params![canonical, uid_validity],
         ) {
             Ok(_) => Ok(()),
             Err(rusqlite::Error::SqliteFailure(err, _))
@@ -270,7 +287,7 @@ impl ImapStore {
     pub fn subscribe(&self, name: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let affected = conn.execute(
-            "UPDATE mailboxes SET subscribed = 1 WHERE name = ?1",
+            "UPDATE mailboxes SET subscribed = 1 WHERE name = ?1 COLLATE NOCASE",
             [name],
         )?;
         if affected == 0 {
@@ -282,7 +299,7 @@ impl ImapStore {
     pub fn unsubscribe(&self, name: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let affected = conn.execute(
-            "UPDATE mailboxes SET subscribed = 0 WHERE name = ?1",
+            "UPDATE mailboxes SET subscribed = 0 WHERE name = ?1 COLLATE NOCASE",
             [name],
         )?;
         if affected == 0 {

@@ -174,6 +174,7 @@ fn extract_specific_headers(rfc5322: &[u8], fields: &[String]) -> Vec<u8> {
 
     for line in header_str.split("\r\n") {
         if line.is_empty() {
+            // End of headers — flush the last header if it matched
             if include {
                 result.push_str(&current_header);
             }
@@ -181,7 +182,7 @@ fn extract_specific_headers(rfc5322: &[u8], fields: &[String]) -> Vec<u8> {
         }
 
         if !line.starts_with(' ') && !line.starts_with('\t') {
-            // New header
+            // New header — flush the previous one if it matched
             if include {
                 result.push_str(&current_header);
             }
@@ -189,15 +190,14 @@ fn extract_specific_headers(rfc5322: &[u8], fields: &[String]) -> Vec<u8> {
             let field_name = line.split(':').next().unwrap_or("").trim().to_uppercase();
             include = fields.iter().any(|f| f == &field_name);
         } else {
-            // Continuation
+            // Continuation of current header
             current_header.push_str(line);
             current_header.push_str("\r\n");
         }
     }
-
-    if include {
-        result.push_str(&current_header);
-    }
+    // Note: no post-loop flush — the blank-line break already handles
+    // the last matching header. If there's no blank line (malformed input),
+    // we intentionally don't emit partial headers.
     result.push_str("\r\n"); // trailing blank line
     result.into_bytes()
 }

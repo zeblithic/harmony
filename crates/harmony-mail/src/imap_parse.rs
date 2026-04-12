@@ -204,6 +204,20 @@ pub enum ParseError {
     BadArguments(String),
     #[error("bad sequence set: {0}")]
     BadSequenceSet(String),
+    /// Error after the tag was successfully extracted — the tag is preserved
+    /// so the I/O layer can send a properly tagged BAD response.
+    #[error("{tag} BAD {message}")]
+    Tagged { tag: String, message: String },
+}
+
+impl ParseError {
+    /// If this error carries a tag (extracted before the failure), return it.
+    pub fn tag(&self) -> Option<&str> {
+        match self {
+            ParseError::Tagged { tag, .. } => Some(tag),
+            _ => None,
+        }
+    }
 }
 
 // ── Main parser ─────────────────────────────────────────────────────
@@ -223,10 +237,10 @@ pub fn parse_command(line: &str) -> Result<ImapTaggedCommand, ParseError> {
 
     // Handle UID prefix
     if verb_upper == "UID" {
-        return parse_uid_command(&tag, args);
+        return parse_uid_command(&tag, args).map_err(|e| wrap_tagged(&tag, e));
     }
 
-    let command = parse_command_verb(&verb_upper, args)?;
+    let command = parse_command_verb(&verb_upper, args).map_err(|e| wrap_tagged(&tag, e))?;
     Ok(ImapTaggedCommand { tag, command })
 }
 
@@ -986,6 +1000,18 @@ fn unquote(s: &str) -> String {
     }
 }
 
+/// Wrap a parse error with the command tag so the I/O layer can send
+/// a properly tagged BAD response instead of untagged `* BAD`.
+fn wrap_tagged(tag: &str, err: ParseError) -> ParseError {
+    match err {
+        ParseError::Tagged { .. } => err, // already tagged
+        other => ParseError::Tagged {
+            tag: tag.to_string(),
+            message: other.to_string(),
+        },
+    }
+}
+
 /// Split string at first whitespace, returning (first_word, rest).
 fn split_first_word(s: &str) -> Option<(&str, &str)> {
     let s = s.trim_start();
@@ -1616,18 +1642,17 @@ mod tests {
 
     #[test]
     fn parse_error_unknown_command() {
-        assert!(matches!(
-            parse_err("A001 FOOBAR"),
-            ParseError::UnknownCommand(_)
-        ));
+        let err = parse_err("A001 FOOBAR");
+        // After tag extraction, errors are wrapped as Tagged
+        assert!(matches!(err, ParseError::Tagged { .. }));
+        assert_eq!(err.tag(), Some("A001"));
     }
 
     #[test]
     fn parse_error_bad_sequence() {
-        assert!(matches!(
-            parse_err("A001 FETCH abc (FLAGS)"),
-            ParseError::BadSequenceSet(_)
-        ));
+        let err = parse_err("A001 FETCH abc (FLAGS)");
+        assert!(matches!(err, ParseError::Tagged { .. }));
+        assert_eq!(err.tag(), Some("A001"));
     }
 
     // ── Case insensitivity ──────────────────────────────────────────

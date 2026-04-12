@@ -876,9 +876,12 @@ where
                         }
                     }
                     Err(e) => {
-                        writer
-                            .write_all(format!("* BAD {e}\r\n").as_bytes())
-                            .await?;
+                        let response = if let Some(tag) = e.tag() {
+                            format!("{tag} BAD {e}\r\n")
+                        } else {
+                            format!("* BAD {e}\r\n")
+                        };
+                        writer.write_all(response.as_bytes()).await?;
                         writer.flush().await?;
                     }
                 },
@@ -1006,59 +1009,78 @@ where
                 });
                 execute_imap_actions(&callback, writer).await?;
             }
-            ImapAction::SelectMailbox { name, read_only } => match store.get_mailbox(name) {
-                Ok(Some(mbox)) => {
-                    let total = store.count_messages(mbox.id).unwrap_or(0);
-                    let recent = store.count_recent(mbox.id).unwrap_or(0);
-                    let unseen = store.count_unseen(mbox.id).unwrap_or(0);
-                    let snapshot = MailboxSnapshot {
+            ImapAction::SelectMailbox { name, read_only } => {
+                let select_result: Result<MailboxSnapshot, String> = (|| {
+                    let mbox = store
+                        .get_mailbox(name)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "mailbox not found".to_string())?;
+                    let total = store.count_messages(mbox.id).map_err(|e| e.to_string())?;
+                    let recent = store.count_recent(mbox.id).map_err(|e| e.to_string())?;
+                    let unseen = store.count_unseen(mbox.id).map_err(|e| e.to_string())?;
+                    let first_unseen = store
+                        .first_unseen_seqnum(mbox.id)
+                        .map_err(|e| e.to_string())?;
+                    Ok(MailboxSnapshot {
                         name: mbox.name,
                         uid_validity: mbox.uid_validity,
                         uid_next: mbox.uid_next,
                         total_messages: total,
                         recent_count: recent,
                         unseen_count: unseen,
-                        first_unseen: store.first_unseen_seqnum(mbox.id).unwrap_or(None),
+                        first_unseen,
                         read_only: *read_only,
-                    };
-                    let callback = session.handle(ImapEvent::MailboxLoaded(snapshot));
-                    execute_imap_actions(&callback, writer).await?;
+                    })
+                })();
+                match select_result {
+                    Ok(snapshot) => {
+                        let callback = session.handle(ImapEvent::MailboxLoaded(snapshot));
+                        execute_imap_actions(&callback, writer).await?;
+                    }
+                    Err(reason) => {
+                        let tag = session
+                            .pending_tag
+                            .take()
+                            .unwrap_or_else(|| "?".to_string());
+                        writer
+                            .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                            .await?;
+                        writer.flush().await?;
+                    }
                 }
-                _ => {
-                    let tag = session
-                        .pending_tag
-                        .take()
-                        .unwrap_or_else(|| "?".to_string());
-                    writer
-                        .write_all(format!("{tag} NO mailbox not found\r\n").as_bytes())
-                        .await?;
-                    writer.flush().await?;
-                }
-            },
+            }
             ImapAction::ListMailboxes { pattern, .. } => {
-                let mailboxes = store.list_mailboxes(pattern).unwrap_or_default();
-                for mbox in &mailboxes {
-                    let quoted = imap_quote_mailbox(&mbox.name);
-                    let line = format!("* LIST () NIL {quoted}\r\n");
-                    writer.write_all(line.as_bytes()).await?;
-                }
-                // The tagged OK is sent by the state machine after the action completes.
-                // For LIST, we need to send the tagged response ourselves since it's
-                // a synchronous action in the I/O layer.
-                // Actually, LIST was dispatched as an async action. We need to signal
-                // completion. For now, extract the pending tag and send OK.
-                if let Some(tag) = session.pending_tag.take() {
-                    writer
-                        .write_all(format!("{tag} OK LIST completed\r\n").as_bytes())
-                        .await?;
+                match store.list_mailboxes(pattern) {
+                    Ok(mailboxes) => {
+                        for mbox in &mailboxes {
+                            let quoted = imap_quote_mailbox(&mbox.name);
+                            let line = format!("* LIST () NIL {quoted}\r\n");
+                            writer.write_all(line.as_bytes()).await?;
+                        }
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} OK LIST completed\r\n").as_bytes())
+                                .await?;
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} NO {e}\r\n").as_bytes())
+                                .await?;
+                        }
+                    }
                 }
                 writer.flush().await?;
             }
             ImapAction::GetStatus { mailbox, items } => {
-                if let Ok(Some(mbox)) = store.get_mailbox(mailbox) {
-                    let total = store.count_messages(mbox.id).unwrap_or(0);
-                    let recent = store.count_recent(mbox.id).unwrap_or(0);
-                    let unseen = store.count_unseen(mbox.id).unwrap_or(0);
+                let status_result = store.get_mailbox(mailbox).ok().flatten().and_then(|mbox| {
+                    let total = store.count_messages(mbox.id).ok()?;
+                    let recent = store.count_recent(mbox.id).ok()?;
+                    let unseen = store.count_unseen(mbox.id).ok()?;
+                    Some((mbox, total, recent, unseen))
+                });
+                if let Some((mbox, total, recent, unseen)) = status_result {
                     let mut status_items = Vec::new();
                     for item in items {
                         match item {
@@ -1171,28 +1193,43 @@ where
                 writer.flush().await?;
             }
             ImapAction::Expunge => {
-                if let ImapState::Selected { ref mailbox, .. } = session.state {
-                    if let Ok(Some(mbox)) = store.get_mailbox(&mailbox.name) {
-                        // Build UID→seqnum map before expunge (seqnums are 1-based position in UID order)
-                        let all_msgs = store.get_messages(mbox.id).unwrap_or_default();
-                        let uid_to_seqnum: std::collections::HashMap<u32, u32> = all_msgs
-                            .iter()
-                            .enumerate()
-                            .map(|(i, m)| (m.uid, (i + 1) as u32))
-                            .collect();
-
-                        let expunged_uids = store.expunge(mbox.id).unwrap_or_default();
-                        // Convert UIDs to sequence numbers. EXPUNGE responses must be
-                        // sent in descending order so earlier seqnums remain valid.
-                        let mut expunged_seqnums: Vec<u32> = expunged_uids
-                            .iter()
-                            .filter_map(|uid| uid_to_seqnum.get(uid).copied())
-                            .collect();
-                        expunged_seqnums.sort_unstable_by(|a, b| b.cmp(a));
-
-                        let callback =
-                            session.handle(ImapEvent::ExpungeComplete { expunged_seqnums });
+                let expunge_result: Result<Vec<u32>, String> = (|| {
+                    let mailbox_name = match &session.state {
+                        ImapState::Selected { mailbox, .. } => mailbox.name.clone(),
+                        _ => return Err("no mailbox selected".to_string()),
+                    };
+                    let mbox = store
+                        .get_mailbox(&mailbox_name)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "mailbox not found".to_string())?;
+                    let all_msgs = store.get_messages(mbox.id).map_err(|e| e.to_string())?;
+                    let uid_to_seqnum: std::collections::HashMap<u32, u32> = all_msgs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, m)| (m.uid, (i + 1) as u32))
+                        .collect();
+                    let expunged_uids = store.expunge(mbox.id).map_err(|e| e.to_string())?;
+                    let mut seqnums: Vec<u32> = expunged_uids
+                        .iter()
+                        .filter_map(|uid| uid_to_seqnum.get(uid).copied())
+                        .collect();
+                    seqnums.sort_unstable_by(|a, b| b.cmp(a));
+                    Ok(seqnums)
+                })();
+                match expunge_result {
+                    Ok(seqnums) => {
+                        let callback = session.handle(ImapEvent::ExpungeComplete {
+                            expunged_seqnums: seqnums,
+                        });
                         execute_imap_actions(&callback, writer).await?;
+                    }
+                    Err(reason) => {
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                                .await?;
+                            writer.flush().await?;
+                        }
                     }
                 }
             }
