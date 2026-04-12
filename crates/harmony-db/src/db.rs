@@ -111,14 +111,15 @@ impl HarmonyDb {
         key: &[u8],
         meta: EntryMeta,
     ) -> Result<(), DbError> {
-        let found = self
-            .tables
-            .get_mut(table)
-            .is_some_and(|t| t.update_meta(key, meta));
-        if !found {
-            return Err(DbError::TableNotFound {
-                name: table.to_string(),
-            });
+        let truncated_meta = EntryMeta {
+            flags: meta.flags,
+            snippet: persist::truncate_snippet(&meta.snippet),
+        };
+        let t = self.tables.get_mut(table).ok_or_else(|| DbError::TableNotFound {
+            name: table.to_string(),
+        })?;
+        if !t.update_meta(key, truncated_meta) {
+            return Err(DbError::EntryNotFound { table: table.to_string() });
         }
         persist::save_index(&self.data_dir, self.head, &self.tables)?;
         Ok(())
@@ -286,6 +287,17 @@ mod tests {
         let mut db = HarmonyDb::open(dir.path()).unwrap();
         let long = "a".repeat(500);
         db.insert("t", b"k", b"v", meta(0, &long)).unwrap();
+        let e = db.get_entry("t", b"k").unwrap();
+        assert!(e.metadata.snippet.len() <= 256);
+    }
+
+    #[test]
+    fn update_meta_truncates_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = HarmonyDb::open(dir.path()).unwrap();
+        db.insert("t", b"k", b"v", meta(0, "short")).unwrap();
+        let long = "x".repeat(500);
+        db.update_meta("t", b"k", meta(1, &long)).unwrap();
         let e = db.get_entry("t", b"k").unwrap();
         assert!(e.metadata.snippet.len() <= 256);
     }

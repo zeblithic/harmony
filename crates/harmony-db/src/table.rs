@@ -59,6 +59,9 @@ impl Table {
         let hi = match self.entries.binary_search_by(|e| e.key.as_slice().cmp(end)) {
             Ok(i) | Err(i) => i,
         };
+        if lo >= hi {
+            return &[];
+        }
         &self.entries[lo..hi]
     }
 

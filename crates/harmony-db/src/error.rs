@@ -16,6 +16,9 @@ pub enum DbError {
     #[error("table not found: {name}")]
     TableNotFound { name: String },
 
+    #[error("entry not found: key in table {table}")]
+    EntryNotFound { table: String },
+
     #[error("value blob missing: {cid}")]
     BlobMissing { cid: String },
 }
@@ -46,6 +49,12 @@ mod tests {
     fn table_not_found_display() {
         let err = DbError::TableNotFound { name: "inbox".into() };
         assert_eq!(err.to_string(), "table not found: inbox");
+    }
+
+    #[test]
+    fn entry_not_found_display() {
+        let err = DbError::EntryNotFound { table: "inbox".into() };
+        assert_eq!(err.to_string(), "entry not found: key in table inbox");
     }
 
     #[test]

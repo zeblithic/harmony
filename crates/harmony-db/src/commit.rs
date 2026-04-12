@@ -5,7 +5,7 @@ use crate::types::Entry;
 use harmony_content::book::BookStore;
 use harmony_content::{ContentFlags, ContentId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 const COMMIT_VERSION: u32 = 1;
@@ -18,7 +18,7 @@ pub(crate) struct RootManifest {
         deserialize_with = "crate::types::de_opt_cid"
     )]
     parent: Option<ContentId>,
-    tables: HashMap<String, String>,
+    tables: BTreeMap<String, String>,
 }
 
 pub(crate) fn create_commit(
@@ -28,7 +28,7 @@ pub(crate) fn create_commit(
     mut store: Option<&mut dyn BookStore>,
 ) -> Result<ContentId, DbError> {
     let commits_dir = data_dir.join("commits");
-    let mut table_cids: HashMap<String, String> = HashMap::new();
+    let mut table_cids: BTreeMap<String, String> = BTreeMap::new();
 
     for (name, table) in tables {
         let page_bytes = serde_json::to_vec(table.entries())
@@ -45,7 +45,8 @@ pub(crate) fn create_commit(
         }
 
         if let Some(ref mut s) = store {
-            let _ = s.insert_with_flags(&page_bytes, ContentFlags::default());
+            s.insert_with_flags(&page_bytes, ContentFlags::default())
+                .map_err(|e| DbError::Serialize(format!("BookStore page push failed: {e:?}")))?;
         }
 
         table_cids.insert(name.clone(), page_hex);
@@ -70,7 +71,9 @@ pub(crate) fn create_commit(
     }
 
     if let Some(ref mut s) = store {
-        let _ = s.insert_with_flags(&manifest_bytes, ContentFlags::default());
+        s.insert_with_flags(&manifest_bytes, ContentFlags::default())
+            .map_err(|e| DbError::Serialize(format!("BookStore manifest push failed: {e:?}")))?;
+        // Value blob push remains best-effort (blob may not exist locally)
         for table in tables.values() {
             for entry in table.entries() {
                 if !s.contains(&entry.value_cid) {
@@ -103,7 +106,15 @@ pub(crate) fn load_manifest(
         return Err(DbError::CommitNotFound { cid: root_hex });
     };
 
-    serde_json::from_slice(&bytes).map_err(|e| DbError::CorruptIndex(e.to_string()))
+    let manifest: RootManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| DbError::CorruptIndex(e.to_string()))?;
+    if manifest.version != COMMIT_VERSION {
+        return Err(DbError::CorruptIndex(format!(
+            "unsupported commit version: {} (expected {})",
+            manifest.version, COMMIT_VERSION
+        )));
+    }
+    Ok(manifest)
 }
 
 fn load_page(
@@ -111,21 +122,23 @@ fn load_page(
     page_hex: &str,
     store: Option<&dyn BookStore>,
 ) -> Result<Vec<Entry>, DbError> {
-    let local_path = data_dir.join("commits").join(format!("{page_hex}.bin"));
+    // Validate hex format upfront (prevents path traversal from corrupt manifests).
+    let page_bytes: [u8; 32] = hex::decode(page_hex)
+        .map_err(|e| DbError::CorruptIndex(e.to_string()))?
+        .try_into()
+        .map_err(|_| DbError::CorruptIndex("bad page CID length".into()))?;
+    let canonical_hex = hex::encode(page_bytes);
+    let local_path = data_dir.join("commits").join(format!("{canonical_hex}.bin"));
 
     let bytes = if local_path.exists() {
         std::fs::read(&local_path)?
     } else if let Some(s) = store {
-        let page_bytes: [u8; 32] = hex::decode(page_hex)
-            .map_err(|e| DbError::CorruptIndex(e.to_string()))?
-            .try_into()
-            .map_err(|_| DbError::CorruptIndex("bad page CID length".into()))?;
         let page_cid = ContentId::from_bytes(page_bytes);
         s.get(&page_cid)
             .map(|b| b.to_vec())
-            .ok_or_else(|| DbError::CommitNotFound { cid: page_hex.to_string() })?
+            .ok_or(DbError::CommitNotFound { cid: canonical_hex })?
     } else {
-        return Err(DbError::CommitNotFound { cid: page_hex.to_string() });
+        return Err(DbError::CommitNotFound { cid: canonical_hex });
     };
 
     serde_json::from_slice(&bytes).map_err(|e| DbError::CorruptIndex(e.to_string()))
@@ -148,7 +161,7 @@ pub(crate) fn rebuild(
             if !local_blob.exists() {
                 if let Some(s) = store {
                     if let Some(blob_data) = s.get(&entry.value_cid) {
-                        let _ = persist::write_blob_raw(data_dir, &cid_hex, blob_data);
+                        persist::write_blob_raw(data_dir, &cid_hex, blob_data)?;
                     }
                 }
             }
@@ -221,7 +234,8 @@ fn diff_entries(old: &[Entry], new: &[Entry]) -> crate::types::TableDiff {
                 ni += 1;
             }
             std::cmp::Ordering::Equal => {
-                if old[oi].value_cid != new[ni].value_cid {
+                if old[oi].value_cid != new[ni].value_cid
+                    || old[oi].metadata != new[ni].metadata {
                     changed.push((old[oi].clone(), new[ni].clone()));
                 }
                 oi += 1;
@@ -450,6 +464,37 @@ mod tests {
         assert_eq!(d.tables["t"].changed.len(), 1);
         assert_eq!(d.tables["t"].changed[0].0.value_cid, cid_old);
         assert_eq!(d.tables["t"].changed[0].1.value_cid, cid_new);
+    }
+
+    #[test]
+    fn diff_metadata_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        persist::ensure_dirs(dir.path()).unwrap();
+
+        let cid = ContentId::for_book(b"val", ContentFlags::default()).unwrap();
+
+        let mut tables1 = HashMap::new();
+        let mut t1 = Table::new();
+        t1.upsert(Entry {
+            key: b"k".to_vec(), value_cid: cid, timestamp: 1,
+            metadata: EntryMeta { flags: 0, snippet: "unread".to_string() },
+        });
+        tables1.insert("t".to_string(), t1);
+        let root1 = create_commit(dir.path(), None, &tables1, None).unwrap();
+
+        let mut tables2 = HashMap::new();
+        let mut t2 = Table::new();
+        t2.upsert(Entry {
+            key: b"k".to_vec(), value_cid: cid, timestamp: 1,
+            metadata: EntryMeta { flags: 1, snippet: "read".to_string() },
+        });
+        tables2.insert("t".to_string(), t2);
+        let root2 = create_commit(dir.path(), Some(root1), &tables2, None).unwrap();
+
+        let d = diff_commits(dir.path(), root1, root2).unwrap();
+        assert_eq!(d.tables["t"].changed.len(), 1);
+        assert_eq!(d.tables["t"].changed[0].0.metadata.flags, 0);
+        assert_eq!(d.tables["t"].changed[0].1.metadata.flags, 1);
     }
 
     #[test]
