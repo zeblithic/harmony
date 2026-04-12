@@ -174,13 +174,21 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Shared cancellation token for graceful shutdown of all tasks
+    let cancel = tokio_util::sync::CancellationToken::new();
+
     // Background cleanup task for per-IP tracking
     let cleanup_shared = Arc::clone(&shared);
+    let cleanup_cancel = cancel.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         loop {
-            interval.tick().await;
-            cleanup_shared.cleanup(Duration::from_secs(3600)).await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    cleanup_shared.cleanup(Duration::from_secs(3600)).await;
+                }
+                _ = cleanup_cancel.cancelled() => break,
+            }
         }
     });
 
@@ -189,34 +197,39 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let smtp_config = smtp_config.clone();
         let shared = Arc::clone(&shared);
         let acceptor = tls_acceptor.clone().unwrap();
+        let listener_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
-                let (stream, addr) = match sub_listener.accept().await {
-                    Ok(sa) => sa,
-                    Err(e) => { tracing::warn!(error = %e, "submission accept error"); continue; }
-                };
-                let peer_ip = addr.ip();
-                if !shared.try_connect(peer_ip).await {
-                    drop(stream);
-                    continue;
-                }
-                let cfg = smtp_config.clone();
-                let sh = Arc::clone(&shared);
-                let acc = Arc::clone(&acceptor);
-                tokio::spawn(async move {
-                    // Implicit TLS: wrap in TLS before SMTP
-                    match tls::implicit_tls_wrap(stream, &acc).await {
-                        Ok(tls_stream) => {
-                            let (reader, writer) = tokio::io::split(tls_stream);
-                            let session = SmtpSession::new(cfg);
-                            if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None).await {
-                                tracing::debug!(%peer_ip, error = %e, "implicit TLS connection ended with error");
-                            }
+                tokio::select! {
+                    result = sub_listener.accept() => {
+                        let (stream, addr) = match result {
+                            Ok(sa) => sa,
+                            Err(e) => { tracing::warn!(error = %e, "submission accept error"); continue; }
+                        };
+                        let peer_ip = addr.ip();
+                        if !shared.try_connect(peer_ip).await {
+                            drop(stream);
+                            continue;
                         }
-                        Err(e) => tracing::debug!(%peer_ip, error = %e, "implicit TLS handshake failed"),
+                        let cfg = smtp_config.clone();
+                        let sh = Arc::clone(&shared);
+                        let acc = Arc::clone(&acceptor);
+                        tokio::spawn(async move {
+                            match tls::implicit_tls_wrap(stream, &acc).await {
+                                Ok(tls_stream) => {
+                                    let (reader, writer) = tokio::io::split(tls_stream);
+                                    let session = SmtpSession::new(cfg);
+                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None).await {
+                                        tracing::debug!(%peer_ip, error = %e, "implicit TLS connection ended with error");
+                                    }
+                                }
+                                Err(e) => tracing::debug!(%peer_ip, error = %e, "implicit TLS handshake failed"),
+                            }
+                            sh.disconnect(peer_ip).await;
+                        });
                     }
-                    sh.disconnect(peer_ip).await;
-                });
+                    _ = listener_cancel.cancelled() => break,
+                }
             }
         });
     }
@@ -226,26 +239,32 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let smtp_config = smtp_config.clone();
         let shared = Arc::clone(&shared);
         let acceptor = tls_acceptor.clone().unwrap();
+        let listener_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
-                let (stream, addr) = match starttls_listener.accept().await {
-                    Ok(sa) => sa,
-                    Err(e) => { tracing::warn!(error = %e, "STARTTLS submission accept error"); continue; }
-                };
-                let peer_ip = addr.ip();
-                if !shared.try_connect(peer_ip).await {
-                    drop(stream);
-                    continue;
-                }
-                let cfg = smtp_config.clone();
-                let sh = Arc::clone(&shared);
-                let acc = Arc::clone(&acceptor);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone())).await {
-                        tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
+                tokio::select! {
+                    result = starttls_listener.accept() => {
+                        let (stream, addr) = match result {
+                            Ok(sa) => sa,
+                            Err(e) => { tracing::warn!(error = %e, "STARTTLS submission accept error"); continue; }
+                        };
+                        let peer_ip = addr.ip();
+                        if !shared.try_connect(peer_ip).await {
+                            drop(stream);
+                            continue;
+                        }
+                        let cfg = smtp_config.clone();
+                        let sh = Arc::clone(&shared);
+                        let acc = Arc::clone(&acceptor);
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone())).await {
+                                tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
+                            }
+                            sh.disconnect(peer_ip).await;
+                        });
                     }
-                    sh.disconnect(peer_ip).await;
-                });
+                    _ = listener_cancel.cancelled() => break,
+                }
             }
         });
     }
@@ -280,6 +299,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = &mut shutdown => {
                 tracing::info!("shutting down SMTP server");
+                cancel.cancel(); // Signal all spawned tasks to stop
                 break;
             }
         }

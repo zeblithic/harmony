@@ -1014,6 +1014,53 @@ mod tests {
     }
 
     #[test]
+    fn tls_unavailable_ehlo_omits_starttls() {
+        let mut config = test_config();
+        config.tls_available = false;
+        let mut session = SmtpSession::new(config);
+        session.handle(SmtpEvent::Connected {
+            peer_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            tls: false,
+        });
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+            domain: "client.example.com".to_string(),
+        }));
+        match &actions[0] {
+            SmtpAction::SendEhloResponse { capabilities, .. } => {
+                let caps = capabilities.join(" ");
+                assert!(
+                    !caps.contains("STARTTLS"),
+                    "should NOT list STARTTLS when tls_available=false: {caps}"
+                );
+            }
+            other => panic!("expected SendEhloResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tls_unavailable_starttls_returns_454() {
+        let mut config = test_config();
+        config.tls_available = false;
+        let mut session = SmtpSession::new(config);
+        session.handle(SmtpEvent::Connected {
+            peer_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            tls: false,
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+            domain: "client.example.com".to_string(),
+        }));
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::StartTls));
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => {
+                assert_eq!(*code, 454, "should reject STARTTLS with 454 when TLS unavailable");
+            }
+            other => panic!("expected SendResponse(454, ...), got {other:?}"),
+        }
+        // Session should NOT be stuck in TlsNegotiating
+        assert_ne!(session.state, SmtpState::TlsNegotiating);
+    }
+
+    #[test]
     fn stale_resolution_ignored() {
         // A HarmonyResolved with mismatched local_part should be silently ignored.
         let mut session = ready_session();

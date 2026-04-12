@@ -112,6 +112,9 @@ impl DkimSigner {
     ) -> Result<Self, AuthError> {
         let key_der = std::fs::read(key_path)
             .map_err(|e| AuthError::SigningKey(format!("reading {}: {e}", key_path.display())))?;
+        // Validate the key parses before storing — fail fast on bad keys
+        let _ = mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(&key_der)
+            .map_err(|e| AuthError::SigningKey(format!("invalid key in {}: {e}", key_path.display())))?;
         Ok(Self {
             selector: selector.to_string(),
             domain: domain.to_string(),
@@ -215,7 +218,10 @@ mod tests {
     async fn verify_dkim_missing_on_unsigned() {
         let authenticator = match create_authenticator() {
             Ok(a) => a,
-            Err(_) => return, // Skip test if DNS resolver unavailable
+            Err(e) => {
+                eprintln!("SKIP verify_dkim_missing_on_unsigned: DNS resolver unavailable ({e})");
+                return;
+            }
         };
         let unsigned = b"From: test@example.com\r\nTo: recv@test.com\r\n\r\nHello\r\n";
         let result = verify_dkim(&authenticator, unsigned).await;
