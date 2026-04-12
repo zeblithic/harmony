@@ -288,7 +288,14 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             result = smtp_listener.accept() => {
-                let (stream, addr) = result?;
+                let (stream, addr) = match result {
+                    Ok(sa) => sa,
+                    Err(e) => {
+                        tracing::error!(error = %e, "SMTP accept error, shutting down");
+                        cancel.cancel();
+                        return Err(e.into());
+                    }
+                };
                 let peer_ip = addr.ip();
 
                 if !shared.try_connect(peer_ip) {
@@ -444,9 +451,11 @@ async fn handle_connection(
                     let _ = writer
                         .write_all(b"552 5.3.4 Message too large\r\n")
                         .await;
-                    // Reset to command mode so session can continue
+                    // Reset codec and session so the connection can continue.
+                    // We can't use SmtpCommand::Rset here because the state machine
+                    // rejects RSET during DataReceiving — set state directly.
                     framed.decoder_mut().enter_command_mode();
-                    session.handle(SmtpEvent::Command(crate::smtp::SmtpCommand::Rset));
+                    session.state = SmtpState::Ready;
                 } else {
                     tracing::debug!(%peer_ip, error = %e, "codec error");
                     let _ = writer
