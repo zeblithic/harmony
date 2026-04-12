@@ -467,15 +467,13 @@ fn prefetch_tree_nodes(
         // Already cached — but still need to recurse into children
         // that might not be cached.
         let bytes = std::fs::read(&local_path)?;
-        if let Ok(node) = postcard::from_bytes::<Node>(&bytes) {
-            if let Node::Branch(children) = &node {
-                for child in children {
-                    prefetch_tree_nodes(
-                        data_dir,
-                        ContentId::from_bytes(child.child_cid),
-                        store,
-                    )?;
-                }
+        if let Ok(Node::Branch(children)) = postcard::from_bytes::<Node>(&bytes) {
+            for child in children {
+                prefetch_tree_nodes(
+                    data_dir,
+                    ContentId::from_bytes(child.child_cid),
+                    store,
+                )?;
             }
         }
         return Ok(());
@@ -502,11 +500,9 @@ fn prefetch_tree_nodes(
     std::fs::rename(&tmp, &local_path)?;
 
     // Recurse into children.
-    if let Ok(node) = postcard::from_bytes::<Node>(&bytes) {
-        if let Node::Branch(children) = &node {
-            for child in children {
-                prefetch_tree_nodes(data_dir, ContentId::from_bytes(child.child_cid), store)?;
-            }
+    if let Ok(Node::Branch(children)) = postcard::from_bytes::<Node>(&bytes) {
+        for child in children {
+            prefetch_tree_nodes(data_dir, ContentId::from_bytes(child.child_cid), store)?;
         }
     }
 
