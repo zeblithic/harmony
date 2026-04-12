@@ -232,7 +232,8 @@ pub fn parse_command(line: &str) -> Result<ImapTaggedCommand, ParseError> {
     }
 
     let tag = tag.to_string();
-    let (verb, args) = split_first_word(rest).ok_or(ParseError::MissingCommand)?;
+    let (verb, args) =
+        split_first_word(rest).ok_or_else(|| wrap_tagged(&tag, ParseError::MissingCommand))?;
     let verb_upper = verb.to_uppercase();
 
     // Handle UID prefix
@@ -245,7 +246,8 @@ pub fn parse_command(line: &str) -> Result<ImapTaggedCommand, ParseError> {
 }
 
 fn parse_uid_command(tag: &str, rest: &str) -> Result<ImapTaggedCommand, ParseError> {
-    let (verb, args) = split_first_word(rest).ok_or(ParseError::MissingCommand)?;
+    let (verb, args) =
+        split_first_word(rest).ok_or_else(|| wrap_tagged(tag, ParseError::MissingCommand))?;
     let verb_upper = verb.to_uppercase();
 
     let command = match verb_upper.as_str() {
@@ -1637,7 +1639,10 @@ mod tests {
 
     #[test]
     fn parse_error_missing_command() {
-        assert!(matches!(parse_err("A001"), ParseError::MissingCommand));
+        let err = parse_err("A001");
+        // Tag was extracted, so MissingCommand is wrapped as Tagged
+        assert!(matches!(err, ParseError::Tagged { .. }));
+        assert_eq!(err.tag(), Some("A001"));
     }
 
     #[test]
