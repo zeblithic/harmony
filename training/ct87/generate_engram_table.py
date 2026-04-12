@@ -78,6 +78,7 @@ def generate_corpus_table(
     vocab_size: int = 32000,
     hash_seeds: list[int] | None = None,
     projection_seed: int = 0,
+    teacher_embed_matrix: np.ndarray | None = None,
 ) -> np.ndarray:
     """Generate engram table from next-token co-occurrence statistics.
 
@@ -104,6 +105,13 @@ def generate_corpus_table(
         hash_seeds = list(DEFAULT_HASH_SEEDS)
     if not hash_seeds:
         raise ValueError("hash_seeds must not be empty")
+
+    if teacher_embed_matrix is not None:
+        if teacher_embed_matrix.shape[0] != vocab_size:
+            raise ValueError(
+                f"teacher_embed_matrix has {teacher_embed_matrix.shape[0]} rows, "
+                f"expected vocab_size={vocab_size}"
+            )
 
     from ct87.engram import _hash_ngram
 
@@ -143,12 +151,7 @@ def generate_corpus_table(
     row_sums = counts.sum(axis=1)
     has_counts = row_sums > 0
 
-    # Johnson-Lindenstrauss random projection: [vocab_size, embedding_dim]
-    rng = np.random.RandomState(projection_seed)
-    proj_matrix = rng.randn(vocab_size, embedding_dim).astype(np.float32)
-    proj_matrix /= np.sqrt(embedding_dim)
-
-    # Only project rows that have data (avoids overflow warnings on empty rows)
+    # Only project rows that have data
     table = np.zeros((total_entries, embedding_dim), dtype=np.float32)
     if has_counts.any():
         # Normalize active rows to probability distributions (L1)
@@ -156,11 +159,25 @@ def generate_corpus_table(
         active_sums = row_sums[has_counts, np.newaxis]
         probs = active_counts / active_sums
 
-        # Project: [active, vocab_size] @ [vocab_size, embedding_dim]
-        # Suppress benign overflow warnings from sparse float32 matmul;
-        # any NaN/inf rows are clamped by the L2 normalization below.
-        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-            projected = probs @ proj_matrix
+        if teacher_embed_matrix is not None:
+            # Teacher projection: probs @ embed_matrix -> [active, teacher_dim]
+            # then PCA to reduce to embedding_dim
+            from sklearn.decomposition import PCA
+
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                projected_full = (probs @ teacher_embed_matrix.astype(np.float32))
+            np.nan_to_num(projected_full, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+            pca = PCA(n_components=embedding_dim)
+            projected = pca.fit_transform(projected_full).astype(np.float32)
+        else:
+            # Random Johnson-Lindenstrauss projection
+            rng = np.random.RandomState(projection_seed)
+            proj_matrix = rng.randn(vocab_size, embedding_dim).astype(np.float32)
+            proj_matrix /= np.sqrt(embedding_dim)
+
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                projected = probs @ proj_matrix
 
         # Clamp any NaN/inf from float32 overflow before normalizing
         np.nan_to_num(projected, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
