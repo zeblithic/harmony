@@ -656,6 +656,29 @@ class TestGgufExportWithLatentProjection:
             tensor_names = {t.name for t in reader.tensors}
             assert "harmony.latent_projection.layer1.weight" not in tensor_names
 
+    def test_export_with_prefixed_state_dict(self):
+        """State dict with 'latent_projection.' prefix should export correctly."""
+        from gguf import GGUFReader
+        from ct87.export_gguf import export_gguf
+
+        cfg = _tiny_config()
+        torch.manual_seed(42)
+        model = HarmonyModel(cfg)
+        proj = LatentProjection(cfg.hidden_dim, INTERMEDIATE_DIM, LATENT_DIM)
+
+        prefixed = {f"latent_projection.{k}": v for k, v in proj.state_dict().items()}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.gguf"
+            export_gguf(
+                model.state_dict(), cfg, path,
+                latent_projection_state=prefixed,
+            )
+
+            reader = GGUFReader(str(path))
+            tensor_names = {t.name for t in reader.tensors}
+            assert "harmony.latent_projection.layer1.weight" in tensor_names
+
     def test_state_dict_mismatch_raises(self):
         """Providing wrong keys should raise ValueError."""
         from ct87.export_gguf import export_gguf
@@ -671,4 +694,22 @@ class TestGgufExportWithLatentProjection:
                 export_gguf(
                     model.state_dict(), cfg, path,
                     latent_projection_state=bad_state,
+                )
+
+    def test_shape_mismatch_raises(self):
+        """Projection with wrong hidden_dim should raise ValueError."""
+        from ct87.export_gguf import export_gguf
+
+        cfg = _tiny_config()
+        torch.manual_seed(42)
+        model = HarmonyModel(cfg)
+
+        # Create projection with wrong hidden_dim (64 instead of 32)
+        wrong_proj = LatentProjection(64, INTERMEDIATE_DIM, LATENT_DIM)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.gguf"
+            with pytest.raises(ValueError, match="has shape"):
+                export_gguf(
+                    model.state_dict(), cfg, path,
+                    latent_projection_state=wrong_proj.state_dict(),
                 )

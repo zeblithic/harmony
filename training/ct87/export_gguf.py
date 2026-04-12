@@ -318,23 +318,57 @@ def export_gguf(
     if latent_projection_state is not None:
         lp_map = build_latent_projection_map()
         expected_lp = set(lp_map.keys())
-        actual_lp = set(latent_projection_state.keys())
+
+        # Strip common prefixes (same as LatentProjection.from_checkpoint)
+        cleaned_lp: dict[str, torch.Tensor] = {}
+        for k, v in latent_projection_state.items():
+            clean_key = k
+            while True:
+                stripped = False
+                for prefix in ("module.", "latent_projection.", "projection."):
+                    if clean_key.startswith(prefix):
+                        clean_key = clean_key[len(prefix):]
+                        stripped = True
+                        break
+                if not stripped:
+                    break
+            if clean_key.startswith(("layer1.", "layer2.")):
+                cleaned_lp[clean_key] = v
+
+        actual_lp = set(cleaned_lp.keys())
         if expected_lp != actual_lp:
             raise ValueError(
                 f"Latent projection state_dict mismatch. "
                 f"Expected: {sorted(expected_lp)}, got: {sorted(actual_lp)}"
             )
-        # Infer dimensions from weight shapes
-        w1 = latent_projection_state["layer1.weight"]
-        w2 = latent_projection_state["layer2.weight"]
-        intermediate_dim = w1.shape[0]
-        latent_dim = w2.shape[0]
+
+        # Validate shapes against each other and config.hidden_dim
+        w1 = cleaned_lp["layer1.weight"]
+        b1 = cleaned_lp["layer1.bias"]
+        w2 = cleaned_lp["layer2.weight"]
+        b2 = cleaned_lp["layer2.bias"]
+        expected_shapes = {
+            "layer1.weight": (w1.shape[0], config.hidden_dim),
+            "layer1.bias": (w1.shape[0],),
+            "layer2.weight": (w2.shape[0], w1.shape[0]),
+            "layer2.bias": (w2.shape[0],),
+        }
+        for key, expected_shape in expected_shapes.items():
+            actual_shape = tuple(cleaned_lp[key].shape)
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"Latent projection tensor {key} has shape {actual_shape}, "
+                    f"expected {expected_shape}"
+                )
+
+        intermediate_dim = int(w1.shape[0])
+        latent_dim = int(w2.shape[0])
         writer.add_bool("harmony.latent_projection.enabled", True)
         writer.add_uint32("harmony.latent_projection.intermediate_dim", intermediate_dim)
         writer.add_uint32("harmony.latent_projection.latent_dim", latent_dim)
         # No transposition: both PyTorch and candle Linear use [out, in]
         for pytorch_key, gguf_name in lp_map.items():
-            t = latent_projection_state[pytorch_key].detach().cpu().float()
+            t = cleaned_lp[pytorch_key].detach().cpu().float()
             writer.add_tensor(gguf_name, t.numpy())
 
     writer.write_header_to_file()
