@@ -114,29 +114,9 @@ class LatentProjection(nn.Module):
             (binary_keys, positions) — binary_keys is a list of bytes objects,
             positions is the token position each key is attributed to.
         """
-        if seq_len < 2:
+        parts, positions = compute_ngram_averages(embeddings, seq_len)
+        if len(positions) == 0:
             return [], []
-
-        emb = embeddings.squeeze(0)  # [seq_len, hidden_dim]
-
-        # Bigram averages: avg(emb[i], emb[i+1]) for i in 0..seq_len-1
-        num_bi = seq_len - 1
-        bi_avg = (emb[:num_bi] + emb[1 : num_bi + 1]) * 0.5
-
-        # Trigram averages: avg(emb[i], emb[i+1], emb[i+2]) for i in 0..seq_len-2
-        num_tri = max(seq_len - 2, 0)
-        if num_tri > 0:
-            tri_avg = (emb[:num_tri] + emb[1 : num_tri + 1] + emb[2 : num_tri + 2]) / 3.0
-            parts = torch.cat([bi_avg, tri_avg], dim=0)
-        else:
-            parts = bi_avg
-
-        # Positions: bigrams at 1..seq_len, trigrams at 2..seq_len
-        positions: list[int] = []
-        for i in range(1, num_bi + 1):
-            positions.append(i)
-        for i in range(2, 2 + num_tri):
-            positions.append(i)
 
         # Project all N-grams in one batch
         with torch.no_grad():
@@ -188,6 +168,116 @@ class LatentProjection(nn.Module):
         proj = LatentProjection(hidden_dim, intermediate_dim, latent_dim)
         proj.load_state_dict(cleaned)
         return proj.to(device)
+
+
+def compute_ngram_averages(
+    embeddings: torch.Tensor,
+    seq_len: int,
+) -> tuple[torch.Tensor, list[int]]:
+    """Extract bigram/trigram averaged embeddings without projecting.
+
+    Same n-gram windowing as LatentProjection.project_ngrams() but returns
+    the pre-projection averages. Used by contrastive co-training where the
+    contrastive loss needs both the raw averages and the projected output.
+
+    Operates per-sequence: takes [1, seq_len, hidden_dim], returns
+    [num_ngrams, hidden_dim] and positions list.
+
+    Args:
+        embeddings: [1, seq_len, hidden_dim] token embeddings
+        seq_len: sequence length
+
+    Returns:
+        (ngram_averages, positions) where ngram_averages is
+        [num_ngrams, hidden_dim] and positions maps each n-gram
+        to its attributed token position. Bigrams come first,
+        then trigrams.
+    """
+    if seq_len < 2:
+        return embeddings.new_zeros(0, embeddings.shape[-1]), []
+
+    emb = embeddings.squeeze(0)  # [seq_len, hidden_dim]
+
+    num_bi = seq_len - 1
+    bi_avg = (emb[:num_bi] + emb[1 : num_bi + 1]) * 0.5
+
+    num_tri = max(seq_len - 2, 0)
+    if num_tri > 0:
+        tri_avg = (emb[:num_tri] + emb[1 : num_tri + 1] + emb[2 : num_tri + 2]) / 3.0
+        parts = torch.cat([bi_avg, tri_avg], dim=0)
+    else:
+        parts = bi_avg
+
+    positions: list[int] = []
+    for i in range(1, num_bi + 1):
+        positions.append(i)
+    for i in range(2, 2 + num_tri):
+        positions.append(i)
+
+    return parts, positions
+
+
+def contrastive_loss(
+    original: torch.Tensor,
+    projected: torch.Tensor,
+    temperature: float = 0.07,
+    k: int = 4,
+) -> torch.Tensor:
+    """InfoNCE contrastive loss preserving nearest-neighbor topology.
+
+    Port of crates/harmony-inference/src/latent_projection.rs::contrastive_loss.
+    Ensures vectors that are nearest neighbors in the original embedding space
+    remain nearest neighbors in the projected latent space.
+
+    Args:
+        original: [N, hidden_dim] -- n-gram averaged embeddings (typically detached)
+        projected: [N, latent_dim] -- MLP output, post-tanh (with grad)
+        temperature: scaling factor for logits (default: 0.07)
+        k: number of top neighbors to preserve (default: 4)
+
+    Returns:
+        Scalar loss tensor.
+    """
+    n = original.shape[0]
+    if n <= 1:
+        return original.new_tensor(0.0)
+
+    k = min(k, n - 1)
+    if k == 0:
+        return original.new_tensor(0.0)
+
+    # Cosine similarity matrices [N, N]
+    def _cosine_sim(x: torch.Tensor) -> torch.Tensor:
+        norm = x.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        normalized = x / norm
+        return normalized @ normalized.t()
+
+    # original is detached — compute its similarities without autograd overhead
+    with torch.no_grad():
+        sim_orig = _cosine_sim(original)
+    sim_proj = _cosine_sim(projected)
+
+    # Scale projected similarities by temperature, mask diagonal
+    logits = sim_proj / temperature
+    diag_mask = torch.full((n, n), 0.0, device=projected.device)
+    diag_mask.fill_diagonal_(-1e9)
+    logits = logits + diag_mask
+
+    # Build soft targets from original similarities: keep only top-k per row
+    with torch.no_grad():
+        orig_data = sim_orig.clone()
+        orig_data.fill_diagonal_(float("-inf"))  # exclude self
+        _, top_indices = orig_data.topk(k, dim=1)
+
+        target_logits = torch.full((n, n), float("-inf"), device=projected.device)
+        target_logits.scatter_(1, top_indices, sim_orig.gather(1, top_indices))
+        targets = torch.softmax(target_logits, dim=1)
+
+    # Cross-entropy: -sum(targets * log_softmax(logits)) / N
+    log_probs = torch.log_softmax(logits, dim=1)
+    loss = -(targets * log_probs).sum() / n
+
+    return loss
 
 
 def compute_key_overlap(

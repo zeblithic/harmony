@@ -455,3 +455,144 @@ class TestEvaluateProjected:
 
         for k, v in model.named_parameters():
             assert torch.allclose(v, params_before[k]), f"Parameter {k} was modified"
+
+
+# ---------------------------------------------------------------------------
+# compute_ngram_averages (pre-projection n-gram extraction)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeNgramAverages:
+    def test_output_shapes(self):
+        """4 tokens -> 3 bigrams + 2 trigrams = 5 n-gram averages."""
+        from ct87.latent_projection import compute_ngram_averages
+
+        emb = torch.randn(1, 4, HIDDEN_DIM)
+        avgs, positions = compute_ngram_averages(emb, 4)
+        assert avgs.shape == (5, HIDDEN_DIM)
+        assert positions == [1, 2, 3, 2, 3]
+
+    def test_single_token_returns_empty(self):
+        from ct87.latent_projection import compute_ngram_averages
+
+        avgs, positions = compute_ngram_averages(torch.randn(1, 1, HIDDEN_DIM), 1)
+        assert avgs.shape[0] == 0
+        assert positions == []
+
+    def test_bigram_average_is_correct(self):
+        """Verify the average of two adjacent embeddings."""
+        from ct87.latent_projection import compute_ngram_averages
+
+        emb = torch.zeros(1, 3, HIDDEN_DIM)
+        emb[0, 0, :] = 2.0
+        emb[0, 1, :] = 4.0
+        avgs, _ = compute_ngram_averages(emb, 3)
+        # First bigram: avg(emb[0], emb[1]) = avg(2, 4) = 3
+        assert torch.allclose(avgs[0], torch.full((HIDDEN_DIM,), 3.0))
+
+    def test_preserves_grad(self):
+        """Averages should be differentiable w.r.t. input embeddings."""
+        from ct87.latent_projection import compute_ngram_averages
+
+        emb = torch.randn(1, 4, HIDDEN_DIM, requires_grad=True)
+        avgs, _ = compute_ngram_averages(emb, 4)
+        avgs.sum().backward()
+        assert emb.grad is not None
+        assert emb.grad.abs().sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# Contrastive loss tests
+# ---------------------------------------------------------------------------
+
+
+class TestContrastiveLoss:
+    def test_scalar_output(self):
+        from ct87.latent_projection import contrastive_loss
+
+        original = torch.randn(8, HIDDEN_DIM)
+        projected = torch.randn(8, LATENT_DIM)
+        loss = contrastive_loss(original, projected, temperature=0.07, k=4)
+        assert loss.dim() == 0  # scalar
+
+    def test_finite_nonnegative(self):
+        from ct87.latent_projection import contrastive_loss
+
+        original = torch.randn(16, HIDDEN_DIM)
+        projected = torch.randn(16, LATENT_DIM)
+        loss = contrastive_loss(original, projected, temperature=0.07, k=4)
+        assert loss.item() >= 0.0
+        assert torch.isfinite(loss)
+
+    def test_aligned_lower_than_random(self):
+        """Projection that preserves structure should have lower loss."""
+        from ct87.latent_projection import contrastive_loss
+
+        torch.manual_seed(42)
+        original = torch.randn(16, 128)
+        random_proj = torch.randn(16, 32)
+        aligned_proj = original[:, :32]
+
+        loss_random = contrastive_loss(original, random_proj, temperature=0.07, k=4)
+        loss_aligned = contrastive_loss(original, aligned_proj, temperature=0.07, k=4)
+        assert loss_aligned.item() < loss_random.item()
+
+    def test_single_vector_returns_zero(self):
+        from ct87.latent_projection import contrastive_loss
+
+        loss = contrastive_loss(torch.randn(1, HIDDEN_DIM), torch.randn(1, LATENT_DIM))
+        assert loss.item() == 0.0
+
+    def test_gradient_flows_to_projected(self):
+        """Contrastive loss should produce gradients for projected, not original."""
+        from ct87.latent_projection import contrastive_loss
+
+        original = torch.randn(8, HIDDEN_DIM)
+        projected = torch.randn(8, LATENT_DIM, requires_grad=True)
+        loss = contrastive_loss(original, projected, temperature=0.07, k=4)
+        loss.backward()
+        assert projected.grad is not None
+        assert projected.grad.abs().sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# lookup_from_keys tests (pre-computed binary keys)
+# ---------------------------------------------------------------------------
+
+
+class TestLookupFromKeys:
+    def test_output_shape(self):
+        tbl = _make_table()
+        proj = _make_projection()
+        emb = torch.randn(1, 4, HIDDEN_DIM)
+        keys, positions = proj.project_ngrams(emb, 4)
+        out = tbl.lookup_from_keys(keys, positions, batch_size=1, seq_len=4)
+        assert out.shape == (1, 4, tbl.engram_dim)
+
+    def test_position_zero_is_zero(self):
+        tbl = _make_table()
+        proj = _make_projection()
+        emb = torch.randn(1, 4, HIDDEN_DIM)
+        keys, positions = proj.project_ngrams(emb, 4)
+        out = tbl.lookup_from_keys(keys, positions, batch_size=1, seq_len=4)
+        assert out[0, 0].abs().max().item() < 1e-6
+
+    def test_matches_lookup_batch_projected(self):
+        """lookup_from_keys with projection-generated keys should match
+        lookup_batch_projected on the same input."""
+        cfg = _tiny_config()
+        torch.manual_seed(42)
+        model = HarmonyModel(cfg)
+        proj = LatentProjection(cfg.hidden_dim, INTERMEDIATE_DIM, LATENT_DIM)
+        tbl = _make_table()
+
+        input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
+        with torch.no_grad():
+            emb = model.embed_tokens(input_ids)
+
+        expected = tbl.lookup_batch_projected(input_ids, emb, proj)
+
+        keys, positions = proj.project_ngrams(emb[0:1], 8)
+        actual = tbl.lookup_from_keys(keys, positions, batch_size=1, seq_len=8)
+
+        assert torch.allclose(expected, actual, atol=1e-6)
