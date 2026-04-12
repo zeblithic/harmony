@@ -120,3 +120,128 @@ class TestCorpusCLIIntegration:
             toml_text = toml_path.read_text()
             assert "hash_seeds" in toml_text
             assert "shard_size" in toml_text
+
+
+class TestTeacherProjection:
+    def test_output_shape_with_teacher(self):
+        """Teacher projection should produce [entries, dim] float32."""
+        from ct87.generate_engram_table import generate_corpus_table
+
+        chunks = [[1, 2, 3, 4, 5, 6, 7, 8]] * 10
+        rng = np.random.RandomState(42)
+        teacher_matrix = rng.randn(32, 64).astype(np.float32)
+
+        table = generate_corpus_table(
+            chunks, total_entries=100, embedding_dim=16,
+            vocab_size=32, hash_seeds=[42, 99],
+            teacher_embed_matrix=teacher_matrix,
+        )
+        assert table.shape == (100, 16)
+        assert table.dtype == np.float32
+
+    def test_unit_normalized_with_teacher(self):
+        """Non-zero rows from teacher projection should be unit-normalized."""
+        from ct87.generate_engram_table import generate_corpus_table
+
+        chunks = [[1, 2, 3, 4, 5, 6, 7, 8]] * 10
+        rng = np.random.RandomState(42)
+        teacher_matrix = rng.randn(32, 64).astype(np.float32)
+
+        table = generate_corpus_table(
+            chunks, total_entries=100, embedding_dim=16,
+            vocab_size=32, hash_seeds=[42, 99],
+            teacher_embed_matrix=teacher_matrix,
+        )
+        for i in range(100):
+            norm = np.linalg.norm(table[i])
+            if norm > 0:
+                assert abs(norm - 1.0) < 1e-5, f"Row {i} norm={norm}"
+
+    def test_different_from_random_projection(self):
+        """Teacher projection should produce different results than random JL."""
+        from ct87.generate_engram_table import generate_corpus_table
+
+        chunks = [[1, 2, 3, 4, 5, 6, 7, 8]] * 20
+        rng = np.random.RandomState(42)
+        teacher_matrix = rng.randn(32, 64).astype(np.float32)
+
+        table_random = generate_corpus_table(
+            chunks, total_entries=100, embedding_dim=16,
+            vocab_size=32, hash_seeds=[42, 99],
+        )
+        table_teacher = generate_corpus_table(
+            chunks, total_entries=100, embedding_dim=16,
+            vocab_size=32, hash_seeds=[42, 99],
+            teacher_embed_matrix=teacher_matrix,
+        )
+        assert not np.allclose(table_random, table_teacher)
+
+    def test_deterministic_with_teacher(self):
+        """Same inputs should produce identical results."""
+        from ct87.generate_engram_table import generate_corpus_table
+
+        chunks = [[1, 2, 3, 4, 5, 6, 7, 8]] * 10
+        rng = np.random.RandomState(42)
+        teacher_matrix = rng.randn(32, 64).astype(np.float32)
+
+        t1 = generate_corpus_table(
+            chunks, total_entries=100, embedding_dim=16,
+            vocab_size=32, hash_seeds=[42, 99],
+            teacher_embed_matrix=teacher_matrix,
+        )
+        t2 = generate_corpus_table(
+            chunks, total_entries=100, embedding_dim=16,
+            vocab_size=32, hash_seeds=[42, 99],
+            teacher_embed_matrix=teacher_matrix,
+        )
+        np.testing.assert_array_equal(t1, t2)
+
+    def test_single_active_row_skips_pca(self):
+        """Single active row should bypass PCA without crashing."""
+        from ct87.generate_engram_table import generate_corpus_table
+
+        # Very small corpus + large table = likely only 1 active entry
+        chunks = [[1, 2, 3, 4]]
+        rng = np.random.RandomState(42)
+        teacher_matrix = rng.randn(32, 64).astype(np.float32)
+
+        table = generate_corpus_table(
+            chunks, total_entries=10000, embedding_dim=16,
+            vocab_size=32, hash_seeds=[42],
+            teacher_embed_matrix=teacher_matrix,
+        )
+        assert table.shape == (10000, 16)
+        assert table.dtype == np.float32
+        # At least one non-zero entry should exist
+        nonzero = np.count_nonzero(np.linalg.norm(table, axis=1))
+        assert nonzero >= 1
+
+    def test_teacher_dim_smaller_than_embedding_dim(self):
+        """Teacher dim < embedding_dim should pad with zeros."""
+        from ct87.generate_engram_table import generate_corpus_table
+
+        chunks = [[1, 2, 3, 4, 5, 6, 7, 8]] * 10
+        rng = np.random.RandomState(42)
+        # teacher_dim=8 but embedding_dim=16 — must pad
+        teacher_matrix = rng.randn(32, 8).astype(np.float32)
+
+        table = generate_corpus_table(
+            chunks, total_entries=100, embedding_dim=16,
+            vocab_size=32, hash_seeds=[42, 99],
+            teacher_embed_matrix=teacher_matrix,
+        )
+        assert table.shape == (100, 16)
+
+    def test_teacher_vocab_mismatch_raises(self):
+        """Teacher matrix with wrong vocab dimension should raise."""
+        from ct87.generate_engram_table import generate_corpus_table
+
+        chunks = [[1, 2, 3, 4, 5, 6, 7, 8]] * 5
+        wrong_matrix = np.random.randn(16, 64).astype(np.float32)
+
+        with pytest.raises(ValueError, match="teacher_embed_matrix"):
+            generate_corpus_table(
+                chunks, total_entries=100, embedding_dim=16,
+                vocab_size=32, hash_seeds=[42, 99],
+                teacher_embed_matrix=wrong_matrix,
+            )

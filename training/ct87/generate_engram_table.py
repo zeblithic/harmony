@@ -78,6 +78,7 @@ def generate_corpus_table(
     vocab_size: int = 32000,
     hash_seeds: list[int] | None = None,
     projection_seed: int = 0,
+    teacher_embed_matrix: np.ndarray | None = None,
 ) -> np.ndarray:
     """Generate engram table from next-token co-occurrence statistics.
 
@@ -104,6 +105,18 @@ def generate_corpus_table(
         hash_seeds = list(DEFAULT_HASH_SEEDS)
     if not hash_seeds:
         raise ValueError("hash_seeds must not be empty")
+
+    if teacher_embed_matrix is not None:
+        if teacher_embed_matrix.ndim != 2:
+            raise ValueError(
+                f"teacher_embed_matrix must be 2D [vocab_size, teacher_dim], "
+                f"got {teacher_embed_matrix.ndim}D with shape {teacher_embed_matrix.shape}"
+            )
+        if teacher_embed_matrix.shape[0] != vocab_size:
+            raise ValueError(
+                f"teacher_embed_matrix has {teacher_embed_matrix.shape[0]} rows, "
+                f"expected vocab_size={vocab_size}"
+            )
 
     from ct87.engram import _hash_ngram
 
@@ -143,12 +156,7 @@ def generate_corpus_table(
     row_sums = counts.sum(axis=1)
     has_counts = row_sums > 0
 
-    # Johnson-Lindenstrauss random projection: [vocab_size, embedding_dim]
-    rng = np.random.RandomState(projection_seed)
-    proj_matrix = rng.randn(vocab_size, embedding_dim).astype(np.float32)
-    proj_matrix /= np.sqrt(embedding_dim)
-
-    # Only project rows that have data (avoids overflow warnings on empty rows)
+    # Only project rows that have data
     table = np.zeros((total_entries, embedding_dim), dtype=np.float32)
     if has_counts.any():
         # Normalize active rows to probability distributions (L1)
@@ -156,11 +164,42 @@ def generate_corpus_table(
         active_sums = row_sums[has_counts, np.newaxis]
         probs = active_counts / active_sums
 
-        # Project: [active, vocab_size] @ [vocab_size, embedding_dim]
-        # Suppress benign overflow warnings from sparse float32 matmul;
-        # any NaN/inf rows are clamped by the L2 normalization below.
-        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-            projected = probs @ proj_matrix
+        if teacher_embed_matrix is not None:
+            # Teacher projection: probs @ embed_matrix -> [active, teacher_dim]
+            # then PCA to reduce to embedding_dim
+            from sklearn.decomposition import PCA
+
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                projected_full = probs @ teacher_embed_matrix
+            np.nan_to_num(projected_full, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+            n_active, teacher_dim = projected_full.shape
+            if n_active < 2:
+                # Too few samples for PCA — truncate/pad directly
+                cols = min(embedding_dim, teacher_dim)
+                projected = np.zeros(
+                    (n_active, embedding_dim), dtype=np.float32,
+                )
+                projected[:, :cols] = projected_full[:, :cols].astype(np.float32)
+            else:
+                n_components = min(embedding_dim, n_active, teacher_dim)
+                pca = PCA(n_components=n_components, random_state=projection_seed)
+                reduced = pca.fit_transform(projected_full).astype(np.float32)
+                if n_components < embedding_dim:
+                    projected = np.zeros(
+                        (n_active, embedding_dim), dtype=np.float32,
+                    )
+                    projected[:, :n_components] = reduced
+                else:
+                    projected = reduced
+        else:
+            # Random Johnson-Lindenstrauss projection
+            rng = np.random.RandomState(projection_seed)
+            proj_matrix = rng.randn(vocab_size, embedding_dim).astype(np.float32)
+            proj_matrix /= np.sqrt(embedding_dim)
+
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                projected = probs @ proj_matrix
 
         # Clamp any NaN/inf from float32 overflow before normalizing
         np.nan_to_num(projected, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
@@ -182,6 +221,7 @@ def generate_and_save_corpus_table(
     vocab_size: int = 32000,
     hash_seeds: list[int] | None = None,
     projection_seed: int = 0,
+    teacher_embed_matrix: np.ndarray | None = None,
 ) -> Path:
     """Load tokenized data, generate corpus-based table, and save.
 
@@ -194,6 +234,7 @@ def generate_and_save_corpus_table(
         vocab_size: Tokenizer vocabulary size.
         hash_seeds: xxhash64 seeds (default: [42,99,137,251]).
         projection_seed: Seed for random projection (default: 0).
+        teacher_embed_matrix: Optional teacher embedding matrix for projection.
 
     Returns:
         Path to the generated safetensors file.
@@ -219,6 +260,7 @@ def generate_and_save_corpus_table(
         vocab_size=vocab_size,
         hash_seeds=hash_seeds,
         projection_seed=projection_seed,
+        teacher_embed_matrix=teacher_embed_matrix,
     )
 
     nonzero = np.count_nonzero(np.linalg.norm(table, axis=1))
@@ -295,6 +337,11 @@ def main() -> None:
         "--projection-seed", type=int, default=0,
         help="Seed for random projection matrix (default: 0)",
     )
+    parser.add_argument(
+        "--teacher", type=str, default=None,
+        help="HuggingFace model name for teacher embedding projection "
+             "(e.g., mistralai/Mistral-7B-v0.1). Requires --corpus.",
+    )
     args = parser.parse_args()
 
     for flag, value in (
@@ -307,6 +354,9 @@ def main() -> None:
     if hasattr(args, "vocab_size") and args.vocab_size is not None and args.vocab_size <= 0:
         parser.error("--vocab-size must be > 0")
 
+    if args.teacher is not None and args.corpus is None:
+        parser.error("--teacher requires --corpus")
+
     # Row index is packed as uint32 in SHA-256 seed — validate range.
     if args.entries > 2**32:
         parser.error(f"--entries {args.entries} exceeds uint32 max (2**32)")
@@ -315,6 +365,36 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.corpus is not None:
+        teacher_embed_matrix = None
+        if args.teacher is not None:
+            import torch
+            from transformers import AutoModel
+
+            print(f"Loading teacher embeddings from {args.teacher}...")
+            teacher_model = AutoModel.from_pretrained(
+                args.teacher, torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+            )
+            teacher_embed_matrix = (
+                teacher_model.get_input_embeddings()
+                .weight.detach().float().numpy()
+            )
+            del teacher_model
+
+            # Auto-detect vocab_size from teacher if it differs from default
+            teacher_vocab = teacher_embed_matrix.shape[0]
+            if teacher_vocab != args.vocab_size:
+                print(
+                    f"Auto-detected vocab_size={teacher_vocab} from teacher "
+                    f"(overriding --vocab-size={args.vocab_size})"
+                )
+                args.vocab_size = teacher_vocab
+
+            print(
+                f"Teacher embeddings loaded: {teacher_embed_matrix.shape} "
+                f"({teacher_embed_matrix.nbytes / 1024 / 1024:.0f} MB)"
+            )
+
         generate_and_save_corpus_table(
             data_path=args.corpus,
             total_entries=args.entries,
@@ -323,6 +403,7 @@ def main() -> None:
             shard_size=args.shard_size,
             vocab_size=args.vocab_size,
             projection_seed=args.projection_seed,
+            teacher_embed_matrix=teacher_embed_matrix,
         )
     else:
         print(f"Generating {args.entries} random embeddings, dim={args.dim}...")
