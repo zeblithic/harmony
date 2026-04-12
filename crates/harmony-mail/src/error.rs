@@ -52,6 +52,22 @@ pub enum MailError {
 
     #[error("{field} too long for u16 length prefix: {len} bytes (max 65535)")]
     StringTooLong { field: &'static str, len: usize },
+
+    #[error("invalid magic bytes: expected {expected:?}, found {found:?}")]
+    InvalidMagic { expected: [u8; 4], found: [u8; 4] },
+
+    #[error("invalid flag value in {field}: {value:#04x}")]
+    InvalidFlag { field: &'static str, value: u8 },
+
+    #[error("too many entries: {count}, maximum {max}")]
+    TooManyEntries { count: usize, max: usize },
+
+    #[error("{field} too long: {len} bytes, maximum {max}")]
+    FieldTooLong {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
 }
 
 /// Validate that a string's length fits in a u16 for length-prefixed encoding.
