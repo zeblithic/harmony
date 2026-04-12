@@ -2,6 +2,7 @@ pub mod address;
 pub mod config;
 pub mod error;
 pub mod io;
+pub mod mailbox;
 pub mod message;
 pub mod registry;
 pub mod auth;
