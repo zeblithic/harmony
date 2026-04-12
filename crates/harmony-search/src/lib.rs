@@ -2,7 +2,7 @@
 //!
 //! Wraps [USearch](https://github.com/unum-cloud/usearch) HNSW with
 //! Harmony-specific abstractions: content-addressed serialization,
-//! multi-metric support (Hamming, Cosine, L2), and a common API surface
+//! multi-metric support (Hamming, Cosine, L2, InnerProduct), and a common API surface
 //! for consumers across the ecosystem (oluo, engram, memo).
 //!
 //! # Usage

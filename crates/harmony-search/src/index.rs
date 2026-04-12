@@ -106,6 +106,19 @@ pub struct VectorIndex {
     config: VectorIndexConfig,
 }
 
+/// Create USearch IndexOptions from config without reserving capacity.
+fn make_opts(config: &VectorIndexConfig) -> IndexOptions {
+    IndexOptions {
+        dimensions: config.dimensions,
+        metric: config.metric.to_usearch(),
+        quantization: config.quantization.to_usearch(),
+        connectivity: config.connectivity,
+        expansion_add: config.expansion_add,
+        expansion_search: config.expansion_search,
+        multi: false,
+    }
+}
+
 impl VectorIndex {
     /// Create a new empty index with the given configuration.
     pub fn new(config: VectorIndexConfig) -> SearchResult<Self> {
@@ -115,17 +128,7 @@ impl VectorIndex {
             ));
         }
 
-        let opts = IndexOptions {
-            dimensions: config.dimensions,
-            metric: config.metric.to_usearch(),
-            quantization: config.quantization.to_usearch(),
-            connectivity: config.connectivity,
-            expansion_add: config.expansion_add,
-            expansion_search: config.expansion_search,
-            multi: false,
-        };
-
-        let index = usearch::new_index(&opts)
+        let index = usearch::new_index(&make_opts(&config))
             .map_err(|e| SearchError::Index(e.to_string()))?;
 
         index
@@ -137,6 +140,13 @@ impl VectorIndex {
 
     /// Add a vector with the given key.
     pub fn add(&self, key: u64, vector: &[f32]) -> SearchResult<()> {
+        if vector.len() != self.config.dimensions {
+            return Err(SearchError::InvalidConfig(format!(
+                "vector length {} does not match index dimensions {}",
+                vector.len(),
+                self.config.dimensions
+            )));
+        }
         self.inner
             .add(key, vector)
             .map_err(|e| SearchError::Index(e.to_string()))
@@ -145,18 +155,19 @@ impl VectorIndex {
     /// Add a binary vector (packed bytes) with the given key.
     /// For Hamming distance on binary embeddings.
     pub fn add_bytes(&self, key: u64, vector: &[u8]) -> SearchResult<()> {
-        // USearch expects f32 slice even for binary — convert packed bytes
-        // to f32 where each element is 0.0 or 1.0 for individual bits.
-        let bits: Vec<f32> = vector
-            .iter()
-            .flat_map(|byte| (0..8).map(move |bit| if byte & (1 << bit) != 0 { 1.0 } else { 0.0 }))
-            .take(self.config.dimensions)
-            .collect();
+        let bits = self.unpack_bits(vector)?;
         self.add(key, &bits)
     }
 
     /// Search for the k nearest neighbors of the query vector.
     pub fn search(&self, query: &[f32], k: usize) -> SearchResult<Vec<Match>> {
+        if query.len() != self.config.dimensions {
+            return Err(SearchError::InvalidConfig(format!(
+                "query length {} does not match index dimensions {}",
+                query.len(),
+                self.config.dimensions
+            )));
+        }
         let results = self
             .inner
             .search(query, k)
@@ -172,11 +183,7 @@ impl VectorIndex {
 
     /// Search with a binary query vector (packed bytes).
     pub fn search_bytes(&self, query: &[u8], k: usize) -> SearchResult<Vec<Match>> {
-        let bits: Vec<f32> = query
-            .iter()
-            .flat_map(|byte| (0..8).map(move |bit| if byte & (1 << bit) != 0 { 1.0 } else { 0.0 }))
-            .take(self.config.dimensions)
-            .collect();
+        let bits = self.unpack_bits(query)?;
         self.search(&bits, k)
     }
 
@@ -199,27 +206,56 @@ impl VectorIndex {
 
     /// Load an index from a file path.
     pub fn load(path: &str, config: VectorIndexConfig) -> SearchResult<Self> {
-        let index = Self::new(config)?;
-        index
-            .inner
+        if config.dimensions == 0 {
+            return Err(SearchError::InvalidConfig(
+                "dimensions must be > 0".into(),
+            ));
+        }
+        let inner = usearch::new_index(&make_opts(&config))
+            .map_err(|e| SearchError::Index(e.to_string()))?;
+        inner
             .load(path)
             .map_err(|e| SearchError::Serialization(e.to_string()))?;
-        Ok(index)
+        Ok(Self { inner, config })
     }
 
     /// View an index from a memory-mapped file (no RAM copy).
     pub fn view(path: &str, config: VectorIndexConfig) -> SearchResult<Self> {
-        let index = Self::new(config)?;
-        index
-            .inner
+        if config.dimensions == 0 {
+            return Err(SearchError::InvalidConfig(
+                "dimensions must be > 0".into(),
+            ));
+        }
+        let inner = usearch::new_index(&make_opts(&config))
+            .map_err(|e| SearchError::Index(e.to_string()))?;
+        inner
             .view(path)
             .map_err(|e| SearchError::Serialization(e.to_string()))?;
-        Ok(index)
+        Ok(Self { inner, config })
     }
 
     /// Reference to the configuration.
     pub fn config(&self) -> &VectorIndexConfig {
         &self.config
+    }
+
+    /// Unpack binary bytes to f32 bits, validating length.
+    fn unpack_bits(&self, bytes: &[u8]) -> SearchResult<Vec<f32>> {
+        let expected_bytes = self.config.dimensions.div_ceil(8);
+        if bytes.len() != expected_bytes {
+            return Err(SearchError::InvalidConfig(format!(
+                "binary vector must be exactly {expected_bytes} bytes for {} dimensions, got {}",
+                self.config.dimensions,
+                bytes.len()
+            )));
+        }
+        let mut bits = Vec::with_capacity(self.config.dimensions);
+        for i in 0..self.config.dimensions {
+            let byte = bytes[i / 8];
+            let bit = (byte >> (i % 8)) & 1;
+            bits.push(bit as f32);
+        }
+        Ok(bits)
     }
 }
 
@@ -250,7 +286,6 @@ mod tests {
 
         let results = index.search(&[1.0, 0.0, 0.0], 2).unwrap();
         assert_eq!(results.len(), 2);
-        // Nearest to [1,0,0] should be key 1 (exact match)
         assert_eq!(results[0].key, 1);
         assert!(results[0].distance < 0.01);
     }
@@ -292,5 +327,81 @@ mod tests {
         index.add(1, &[0.0; 4]).unwrap();
         index.add(2, &[1.0; 4]).unwrap();
         assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn add_wrong_dimensions_rejected() {
+        let config = VectorIndexConfig {
+            dimensions: 3,
+            metric: Metric::L2,
+            quantization: Quantization::F32,
+            capacity: 10,
+            ..Default::default()
+        };
+        let index = VectorIndex::new(config).unwrap();
+        // Too short
+        assert!(index.add(1, &[1.0, 0.0]).is_err());
+        // Too long
+        assert!(index.add(2, &[1.0, 0.0, 0.0, 0.0]).is_err());
+    }
+
+    #[test]
+    fn search_wrong_dimensions_rejected() {
+        let config = VectorIndexConfig {
+            dimensions: 3,
+            metric: Metric::L2,
+            quantization: Quantization::F32,
+            capacity: 10,
+            ..Default::default()
+        };
+        let index = VectorIndex::new(config).unwrap();
+        index.add(1, &[1.0, 0.0, 0.0]).unwrap();
+        assert!(index.search(&[1.0, 0.0], 1).is_err());
+    }
+
+    #[test]
+    fn add_bytes_wrong_length_rejected() {
+        let config = VectorIndexConfig {
+            dimensions: 16,
+            metric: Metric::L2,
+            quantization: Quantization::F32,
+            capacity: 10,
+            ..Default::default()
+        };
+        let index = VectorIndex::new(config).unwrap();
+        // 16 dimensions needs exactly 2 bytes
+        assert!(index.add_bytes(1, &[0xFF]).is_err()); // too short
+        assert!(index.add_bytes(2, &[0xFF, 0xFF, 0xFF]).is_err()); // too long
+        assert!(index.add_bytes(3, &[0xFF, 0x00]).is_ok()); // correct
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let config = VectorIndexConfig {
+            dimensions: 4,
+            metric: Metric::L2,
+            quantization: Quantization::F32,
+            capacity: 100,
+            ..Default::default()
+        };
+        let index = VectorIndex::new(config.clone()).unwrap();
+        index.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+
+        let dir = std::env::temp_dir().join("harmony_search_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_index.usearch");
+        let path_str = path.to_str().unwrap();
+
+        index.save(path_str).unwrap();
+
+        let loaded = VectorIndex::load(path_str, config).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        let results = loaded.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].key, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
