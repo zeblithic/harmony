@@ -111,7 +111,17 @@ pub(crate) fn load_manifest(
         return Err(DbError::CommitNotFound { cid: root_hex });
     };
 
-    // Validate before caching — don't persist corrupt data from a bad store.
+    // Verify content hashes to expected CID (rejects corrupt/adversarial stores).
+    if from_store {
+        let computed = ContentId::for_book(&bytes, ContentFlags::default())
+            .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
+        if computed != root_cid {
+            return Err(DbError::CorruptIndex(format!(
+                "manifest content mismatch for {root_hex}"
+            )));
+        }
+    }
+
     let manifest: RootManifest = serde_json::from_slice(&bytes)
         .map_err(|e| DbError::CorruptIndex(e.to_string()))?;
     if manifest.version != COMMIT_VERSION {
@@ -156,7 +166,18 @@ fn load_page(
         return Err(DbError::CommitNotFound { cid: canonical_hex });
     };
 
-    // Validate before caching — don't persist corrupt data from a bad store.
+    // Verify content hashes to expected CID (rejects corrupt/adversarial stores).
+    if from_store {
+        let computed = ContentId::for_book(&bytes, ContentFlags::default())
+            .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
+        let expected_cid = ContentId::from_bytes(page_bytes);
+        if computed != expected_cid {
+            return Err(DbError::CorruptIndex(format!(
+                "page content mismatch for {}", hex::encode(page_bytes)
+            )));
+        }
+    }
+
     let entries: Vec<Entry> = serde_json::from_slice(&bytes)
         .map_err(|e| DbError::CorruptIndex(e.to_string()))?;
 
