@@ -1030,6 +1030,7 @@ where
                         unseen_count: unseen,
                         first_unseen,
                         read_only: *read_only,
+                        is_examine: *read_only,
                     })
                 })();
                 match select_result {

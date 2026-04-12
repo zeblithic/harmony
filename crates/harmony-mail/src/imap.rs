@@ -113,6 +113,9 @@ pub struct MailboxSnapshot {
     pub unseen_count: u32,
     pub first_unseen: Option<u32>,
     pub read_only: bool,
+    /// Whether the originating command was EXAMINE (true) or SELECT (false).
+    /// Determines the tagged OK text independently of the access mode.
+    pub is_examine: bool,
 }
 
 // ── Actions ──────────────────────────────────────────────────────────
@@ -798,7 +801,8 @@ impl ImapSession {
         } else {
             "READ-WRITE"
         };
-        let cmd_name = if snapshot.read_only {
+        // Response text reflects the command issued, not the resulting access mode
+        let cmd_name = if snapshot.is_examine {
             "EXAMINE"
         } else {
             "SELECT"
@@ -1098,6 +1102,7 @@ mod tests {
             unseen_count: 2,
             first_unseen: Some(3),
             read_only: false,
+            is_examine: false,
         }));
         s
     }
@@ -1411,6 +1416,7 @@ mod tests {
             unseen_count: 2,
             first_unseen: Some(2),
             read_only: false,
+            is_examine: false,
         }));
 
         assert!(actions
@@ -1561,6 +1567,7 @@ mod tests {
             unseen_count: 0,
             first_unseen: None,
             read_only: true,
+            is_examine: true,
         }));
 
         let cmd = parse_command("A003 STORE 1 +FLAGS (\\Seen)").unwrap();
