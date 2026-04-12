@@ -10,6 +10,8 @@ pub struct Config {
     pub spam: SpamConfig,
     pub outbound: OutboundConfig,
     pub harmony: HarmonyConfig,
+    #[serde(default)]
+    pub imap: ImapConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +163,56 @@ fn default_trust_topic() -> String {
 }
 fn default_announce_interval() -> u64 {
     3600
+}
+
+/// IMAP server configuration (v1.1).
+///
+/// Defaults to disabled. Add `[imap]` section to config.toml to enable.
+#[derive(Debug, Deserialize)]
+pub struct ImapConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_listen_imap")]
+    pub listen_imap: String,
+    #[serde(default = "default_listen_imaps")]
+    pub listen_imaps: String,
+    #[serde(default = "default_imap_store_path")]
+    pub store_path: String,
+    /// IDLE timeout in seconds (default: 30 minutes per RFC 9051 recommendation).
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout: u64,
+    /// Maximum authentication failures before disconnect.
+    #[serde(default = "default_max_auth_failures")]
+    pub max_auth_failures: u32,
+}
+
+impl Default for ImapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_imap: default_listen_imap(),
+            listen_imaps: default_listen_imaps(),
+            store_path: default_imap_store_path(),
+            idle_timeout: default_idle_timeout(),
+            max_auth_failures: default_max_auth_failures(),
+        }
+    }
+}
+
+fn default_listen_imap() -> String {
+    "0.0.0.0:143".to_string()
+}
+fn default_listen_imaps() -> String {
+    "0.0.0.0:993".to_string()
+}
+fn default_imap_store_path() -> String {
+    "/var/lib/harmony-mail/imap.db".to_string()
+}
+fn default_idle_timeout() -> u64 {
+    1800
+}
+fn default_max_auth_failures() -> u32 {
+    3
 }
 
 impl Config {

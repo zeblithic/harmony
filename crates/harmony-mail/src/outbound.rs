@@ -156,8 +156,8 @@ impl OutboundQueue {
             next_retry: now, // immediate first attempt
         };
 
-        let mut line = serde_json::to_string(&entry)
-            .map_err(|e| QueueError::Serialize(e.to_string()))?;
+        let mut line =
+            serde_json::to_string(&entry).map_err(|e| QueueError::Serialize(e.to_string()))?;
         line.push('\n');
 
         std::fs::create_dir_all(self.path.parent().unwrap_or(Path::new(".")))
@@ -188,8 +188,8 @@ impl OutboundQueue {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: QueuedMessage = serde_json::from_str(line)
-                .map_err(|e| QueueError::Serialize(e.to_string()))?;
+            let entry: QueuedMessage =
+                serde_json::from_str(line).map_err(|e| QueueError::Serialize(e.to_string()))?;
             entries.push(entry);
         }
         Ok(entries)
@@ -201,16 +201,14 @@ impl OutboundQueue {
     pub fn write_all(&self, entries: &[QueuedMessage]) -> Result<(), QueueError> {
         let mut content = String::new();
         for entry in entries {
-            let line = serde_json::to_string(entry)
-                .map_err(|e| QueueError::Serialize(e.to_string()))?;
+            let line =
+                serde_json::to_string(entry).map_err(|e| QueueError::Serialize(e.to_string()))?;
             content.push_str(&line);
             content.push('\n');
         }
         let tmp_path = self.path.with_extension("tmp");
-        std::fs::write(&tmp_path, content.as_bytes())
-            .map_err(|e| QueueError::Io(e.to_string()))?;
-        std::fs::rename(&tmp_path, &self.path)
-            .map_err(|e| QueueError::Io(e.to_string()))?;
+        std::fs::write(&tmp_path, content.as_bytes()).map_err(|e| QueueError::Io(e.to_string()))?;
+        std::fs::rename(&tmp_path, &self.path).map_err(|e| QueueError::Io(e.to_string()))?;
         Ok(())
     }
 
@@ -229,10 +227,7 @@ impl OutboundQueue {
 }
 
 /// Build a bounce HarmonyMessage for a permanently failed delivery.
-pub fn build_bounce(
-    original: &HarmonyMessage,
-    reason: &str,
-) -> HarmonyMessage {
+pub fn build_bounce(original: &HarmonyMessage, reason: &str) -> HarmonyMessage {
     use crate::message::{MessageFlags, VERSION};
 
     HarmonyMessage {
@@ -341,8 +336,10 @@ mod tests {
 
     #[test]
     fn format_address_hash_uses_first_4_bytes() {
-        let hash = [0xA1, 0xB2, 0xC3, 0xD4, 0x00, 0x00, 0x00, 0x00,
-                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let hash = [
+            0xA1, 0xB2, 0xC3, 0xD4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
         let formatted = format_address_hash(&hash, "example.com");
         assert_eq!(formatted, "user-a1b2c3d4@example.com");
     }
@@ -353,8 +350,12 @@ mod tests {
         let queue_path = dir.path().join("queue.jsonl");
         let queue = OutboundQueue::new(&queue_path, vec![300, 900], 3);
 
-        queue.enqueue(b"RFC5322 content".to_vec(), "test@example.com".to_string()).unwrap();
-        queue.enqueue(b"Second message".to_vec(), "other@example.com".to_string()).unwrap();
+        queue
+            .enqueue(b"RFC5322 content".to_vec(), "test@example.com".to_string())
+            .unwrap();
+        queue
+            .enqueue(b"Second message".to_vec(), "other@example.com".to_string())
+            .unwrap();
 
         let entries = queue.read_pending().unwrap();
         assert_eq!(entries.len(), 2);
@@ -374,11 +375,7 @@ mod tests {
 
     #[test]
     fn queue_retry_schedule() {
-        let queue = OutboundQueue::new(
-            Path::new("/tmp/test"),
-            vec![300, 900, 1800],
-            3,
-        );
+        let queue = OutboundQueue::new(Path::new("/tmp/test"), vec![300, 900, 1800], 3);
 
         assert_eq!(queue.retry_delay(0), Some(Duration::from_secs(300)));
         assert_eq!(queue.retry_delay(1), Some(Duration::from_secs(900)));
@@ -405,9 +402,15 @@ mod tests {
         let queue = OutboundQueue::new(&queue_path, vec![300], 3);
 
         // Enqueue 3 messages
-        queue.enqueue(b"msg1".to_vec(), "a@b.com".to_string()).unwrap();
-        queue.enqueue(b"msg2".to_vec(), "c@d.com".to_string()).unwrap();
-        queue.enqueue(b"msg3".to_vec(), "e@f.com".to_string()).unwrap();
+        queue
+            .enqueue(b"msg1".to_vec(), "a@b.com".to_string())
+            .unwrap();
+        queue
+            .enqueue(b"msg2".to_vec(), "c@d.com".to_string())
+            .unwrap();
+        queue
+            .enqueue(b"msg3".to_vec(), "e@f.com".to_string())
+            .unwrap();
 
         // Simulate processing: remove the first, keep the rest
         let mut entries = queue.read_pending().unwrap();

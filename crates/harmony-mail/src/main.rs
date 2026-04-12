@@ -84,7 +84,9 @@ async fn main() {
             println!("Initializing gateway for {domain} (admin: {admin_email})");
             println!("Not yet implemented");
         }
-        Commands::Run { config: config_path } => {
+        Commands::Run {
+            config: config_path,
+        } => {
             let config = harmony_mail::config::Config::from_file(Path::new(&config_path))
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to load config from {config_path}: {e}");
