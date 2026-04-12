@@ -1,9 +1,15 @@
 pub mod address;
 pub mod config;
 pub mod error;
+pub mod io;
 pub mod message;
 pub mod registry;
+pub mod auth;
+pub mod outbound;
+pub mod server;
 pub mod smtp;
+pub mod tls;
+pub mod translate;
 pub mod smtp_parse;
 pub mod spam;
 pub mod trust;

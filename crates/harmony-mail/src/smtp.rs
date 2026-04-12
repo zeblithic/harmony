@@ -21,6 +21,9 @@ pub struct SmtpConfig {
     pub max_message_size: usize,
     /// Maximum number of recipients per message.
     pub max_recipients: usize,
+    /// Whether TLS is available for STARTTLS. When false, STARTTLS is not
+    /// advertised in EHLO and STARTTLS commands are rejected.
+    pub tls_available: bool,
 }
 
 // ── State ────────────────────────────────────────────────────────────
@@ -152,6 +155,18 @@ impl SmtpSession {
         }
     }
 
+    /// Reset transaction state and return to Ready.
+    ///
+    /// Clears mail_from, recipients, and pending_rcpt. Used by the I/O layer
+    /// when the codec detects an error (e.g., oversize DATA) that bypasses the
+    /// normal state machine flow.
+    pub fn reset_transaction(&mut self) {
+        self.mail_from = None;
+        self.resolved_recipients.clear();
+        self.pending_rcpt = None;
+        self.state = SmtpState::Ready;
+    }
+
     /// Feed an event into the state machine and return the resulting actions.
     pub fn handle(&mut self, event: SmtpEvent) -> Vec<SmtpAction> {
         match event {
@@ -246,7 +261,7 @@ impl SmtpSession {
             format!("SIZE {}", self.config.message_size_display()),
             "8BITMIME".to_string(),
         ];
-        if !self.tls {
+        if !self.tls && self.config.tls_available {
             capabilities.push("STARTTLS".to_string());
         }
 
@@ -434,6 +449,12 @@ impl SmtpSession {
                 "TLS already active".to_string(),
             )];
         }
+        if !self.config.tls_available {
+            return vec![SmtpAction::SendResponse(
+                454,
+                "TLS not available".to_string(),
+            )];
+        }
         // RFC 3207 §4.2: STARTTLS only valid before a mail transaction starts.
         match self.state {
             SmtpState::GreetingSent | SmtpState::Ready => {}
@@ -572,6 +593,7 @@ mod tests {
             mx_host: "mail.harmony.example.com".to_string(),
             max_message_size: 10 * 1024 * 1024,
             max_recipients: 100,
+            tls_available: true,
         }
     }
 
@@ -1001,6 +1023,53 @@ mod tests {
             }
             other => panic!("expected SendResponse(503, ...), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tls_unavailable_ehlo_omits_starttls() {
+        let mut config = test_config();
+        config.tls_available = false;
+        let mut session = SmtpSession::new(config);
+        session.handle(SmtpEvent::Connected {
+            peer_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            tls: false,
+        });
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+            domain: "client.example.com".to_string(),
+        }));
+        match &actions[0] {
+            SmtpAction::SendEhloResponse { capabilities, .. } => {
+                let caps = capabilities.join(" ");
+                assert!(
+                    !caps.contains("STARTTLS"),
+                    "should NOT list STARTTLS when tls_available=false: {caps}"
+                );
+            }
+            other => panic!("expected SendEhloResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tls_unavailable_starttls_returns_454() {
+        let mut config = test_config();
+        config.tls_available = false;
+        let mut session = SmtpSession::new(config);
+        session.handle(SmtpEvent::Connected {
+            peer_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            tls: false,
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+            domain: "client.example.com".to_string(),
+        }));
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::StartTls));
+        match &actions[0] {
+            SmtpAction::SendResponse(code, _) => {
+                assert_eq!(*code, 454, "should reject STARTTLS with 454 when TLS unavailable");
+            }
+            other => panic!("expected SendResponse(454, ...), got {other:?}"),
+        }
+        // Session should NOT be stuck in TlsNegotiating
+        assert_ne!(session.state, SmtpState::TlsNegotiating);
     }
 
     #[test]
