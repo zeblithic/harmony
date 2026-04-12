@@ -161,15 +161,28 @@ fn diff_branches(
 /// Find the next boundary key that appears in both remaining slices.
 /// Uses a two-pointer merge (O(n)) since both slices are sorted by boundary_key.
 ///
-/// Starts at index 1 in `a` (a[0] caused the mismatch so can't be a sync point)
-/// but at index 0 in `b` (b[0] might match a later entry in `a`).
+/// Both a[0] and b[0] are the entries that triggered the mismatch (one < the
+/// other). We start both pointers at 0 and let the two-pointer naturally advance
+/// past entries that can't match. This handles both Less (a[0]<b[0], so a[0]
+/// can't sync but b[0] might) and Greater (a[0]>b[0], so a[0] might sync with
+/// later b entries) correctly.
 fn find_sync_key(a: &[BranchEntry], b: &[BranchEntry]) -> Option<Vec<u8>> {
     use std::cmp::Ordering;
-    let mut i = 1; // Skip a[0] — it's the entry that triggered the mismatch.
-    let mut j = 0; // b[0] is a valid sync candidate for later entries in a.
+    // Start both at 0 — the two-pointer merge naturally skips non-matching
+    // entries. The first match found is the earliest possible sync point.
+    let mut i = 0;
+    let mut j = 0;
     while i < a.len() && j < b.len() {
         match a[i].boundary_key.cmp(&b[j].boundary_key) {
-            Ordering::Equal => return Some(a[i].boundary_key.clone()),
+            Ordering::Equal => {
+                // Skip if this is the very first pair (both at 0) AND they
+                // didn't actually mismatch — but the caller only invokes us
+                // when a[0] != b[0], so if they match at i=0,j=0 that's a
+                // valid sync. However, the caller's loop already consumed
+                // a[0] and b[0] before slicing, so a[0] here is actually
+                // the NEXT entry after the mismatch. Always valid.
+                return Some(a[i].boundary_key.clone());
+            }
             Ordering::Less => i += 1,
             Ordering::Greater => j += 1,
         }
