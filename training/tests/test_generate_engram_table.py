@@ -1,8 +1,12 @@
 """Tests for corpus-based engram table generation."""
 
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import torch
 import pytest
+from safetensors.numpy import load_file
 
 from ct87.generate_engram_table import (
     generate_corpus_table,
@@ -81,3 +85,32 @@ class TestGenerateCorpusTable:
         )
         nonzero_count = sum(1 for i in range(100) if not np.allclose(table[i], 0))
         assert nonzero_count > 0, "Expected some non-zero entries"
+
+
+class TestCorpusCLIIntegration:
+    def test_corpus_flag_produces_table(self):
+        """generate_and_save_corpus_table should produce a safetensors file with correct shape."""
+        from datasets import Dataset
+
+        chunks = [[1, 2, 3, 4, 5, 6, 7, 8]] * 20
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            ds = Dataset.from_dict({"input_ids": chunks})
+            ds.save_to_disk(str(data_dir))
+
+            out_dir = Path(tmpdir) / "output"
+            from ct87.generate_engram_table import generate_and_save_corpus_table
+
+            generate_and_save_corpus_table(
+                data_path=str(data_dir),
+                total_entries=100,
+                embedding_dim=16,
+                output_dir=str(out_dir),
+                vocab_size=32,
+            )
+
+            st_path = out_dir / "engram_table.safetensors"
+            assert st_path.exists()
+            tensors = load_file(str(st_path))
+            assert "engram.weight" in tensors
+            assert tensors["engram.weight"].shape == (100, 16)

@@ -159,6 +159,69 @@ def generate_corpus_table(
     return table
 
 
+def generate_and_save_corpus_table(
+    data_path: str,
+    total_entries: int = DEFAULT_ENTRIES,
+    embedding_dim: int = DEFAULT_DIM,
+    output_dir: str = "engram_corpus",
+    shard_size: int = DEFAULT_SHARD_SIZE,
+    vocab_size: int = 32000,
+    hash_seeds: list[int] | None = None,
+    projection_seed: int = 0,
+) -> Path:
+    """Load tokenized data, generate corpus-based table, and save.
+
+    Args:
+        data_path: Path to HuggingFace Arrow dataset with 'input_ids' column.
+        total_entries: Number of table entries.
+        embedding_dim: Output embedding dimension.
+        output_dir: Directory for output files.
+        shard_size: Embeddings per shard for ingest config.
+        vocab_size: Tokenizer vocabulary size.
+        hash_seeds: xxhash64 seeds (default: [42,99,137,251]).
+        projection_seed: Seed for random projection (default: 0).
+
+    Returns:
+        Path to the generated safetensors file.
+    """
+    from datasets import load_from_disk
+
+    ds = load_from_disk(data_path)
+    chunks = ds["input_ids"]
+
+    print(f"Loaded {len(chunks)} chunks from {data_path}")
+    print(f"Scanning for n-gram co-occurrences (entries={total_entries}, dim={embedding_dim})...")
+
+    table = generate_corpus_table(
+        chunks,
+        total_entries=total_entries,
+        embedding_dim=embedding_dim,
+        vocab_size=vocab_size,
+        hash_seeds=hash_seeds,
+        projection_seed=projection_seed,
+    )
+
+    nonzero = np.count_nonzero(np.linalg.norm(table, axis=1))
+    print(f"Table built: {nonzero}/{total_entries} entries have data")
+
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    table_f16 = table.astype(np.float16)
+    safetensors_path = out_path / "engram_table.safetensors"
+    save_file({DEFAULT_TENSOR_NAME: table_f16}, str(safetensors_path))
+
+    size_mb = safetensors_path.stat().st_size / (1024 * 1024)
+    print(f"Wrote {safetensors_path} ({size_mb:.2f} MB)")
+
+    if hash_seeds is None:
+        hash_seeds = list(DEFAULT_HASH_SEEDS)
+    config_path = write_ingest_config(out_path, shard_size=shard_size, hash_seeds=hash_seeds)
+    print(f"Wrote {config_path}")
+
+    return safetensors_path
+
+
 def write_ingest_config(
     output_dir: Path,
     shard_size: int = DEFAULT_SHARD_SIZE,
@@ -200,6 +263,18 @@ def main() -> None:
         "--shard-size", type=int, default=DEFAULT_SHARD_SIZE,
         help=f"Embeddings per shard (default: {DEFAULT_SHARD_SIZE})",
     )
+    parser.add_argument(
+        "--corpus", type=str, default=None,
+        help="Path to tokenized HF dataset (enables corpus-based generation)",
+    )
+    parser.add_argument(
+        "--vocab-size", type=int, default=32000,
+        help="Tokenizer vocabulary size (default: 32000, Mistral v0.1)",
+    )
+    parser.add_argument(
+        "--projection-seed", type=int, default=0,
+        help="Seed for random projection matrix (default: 0)",
+    )
     args = parser.parse_args()
 
     # Row index is packed as uint32 in SHA-256 seed — validate range.
@@ -209,22 +284,32 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Generating {args.entries} embeddings, dim={args.dim}...")
-    table = generate_table(args.entries, args.dim)
+    if args.corpus is not None:
+        generate_and_save_corpus_table(
+            data_path=args.corpus,
+            total_entries=args.entries,
+            embedding_dim=args.dim,
+            output_dir=args.output_dir,
+            shard_size=args.shard_size,
+            vocab_size=args.vocab_size,
+            projection_seed=args.projection_seed,
+        )
+    else:
+        print(f"Generating {args.entries} random embeddings, dim={args.dim}...")
+        table = generate_table(args.entries, args.dim)
 
-    # Convert to f16 for safetensors (matches Engram table format)
-    table_f16 = table.astype(np.float16)
+        table_f16 = table.astype(np.float16)
 
-    safetensors_path = output_dir / "engram_table.safetensors"
-    save_file({DEFAULT_TENSOR_NAME: table_f16}, str(safetensors_path))
+        safetensors_path = output_dir / "engram_table.safetensors"
+        save_file({DEFAULT_TENSOR_NAME: table_f16}, str(safetensors_path))
 
-    size_mb = safetensors_path.stat().st_size / (1024 * 1024)
-    print(f"Wrote {safetensors_path} ({size_mb:.2f} MB)")
+        size_mb = safetensors_path.stat().st_size / (1024 * 1024)
+        print(f"Wrote {safetensors_path} ({size_mb:.2f} MB)")
 
-    config_path = write_ingest_config(
-        output_dir, shard_size=args.shard_size,
-    )
-    print(f"Wrote {config_path}")
+        config_path = write_ingest_config(
+            output_dir, shard_size=args.shard_size,
+        )
+        print(f"Wrote {config_path}")
 
     num_shards = (args.entries + args.shard_size - 1) // args.shard_size
     print(f"\nTable stats:")
@@ -233,6 +318,9 @@ def main() -> None:
     print(f"  Shard size:   {args.shard_size}")
     print(f"  Num shards:   {num_shards}")
     print(f"  Num heads:    {len(DEFAULT_HASH_SEEDS)}")
+
+    safetensors_path = output_dir / "engram_table.safetensors"
+    config_path = output_dir / "engram_config.toml"
     print(f"\nNext step:")
     print(f"  cargo run --manifest-path src-tauri/Cargo.toml -p harmony-ingest \\")
     print(f"    -- engram --config {config_path} --input {safetensors_path} \\")
