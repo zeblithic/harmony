@@ -100,6 +100,68 @@ impl CompoundIndex {
     pub fn config(&self) -> &VectorIndexConfig {
         &self.config
     }
+
+    /// Merge delta into base and return serialized bytes.
+    ///
+    /// The returned bytes can be CAS-stored by the caller. After compaction,
+    /// call `load_base()` or `load_base_from_bytes()` with the persisted data
+    /// to swap in the new base.
+    ///
+    /// Resets the delta to empty after merge.
+    pub fn compact(&mut self) -> SearchResult<Vec<u8>> {
+        // Build a new writable index containing everything
+        let mut merged_config = self.config.clone();
+        merged_config.capacity = self.len() + 100;
+        let merged = VectorIndex::new(merged_config)?;
+
+        let dims = self.config.dimensions;
+        let mut buf = vec![0.0f32; dims];
+
+        // Copy base vectors if we have a base
+        if let Some(ref base) = self.base {
+            if !base.is_empty() {
+                // USearch has no keys iterator, so search with zero query
+                // and k=base.len() to get all keys
+                let all = base.search(&vec![0.0f32; dims], base.len())?;
+                for m in &all {
+                    if base.get(m.key, &mut buf)? {
+                        merged.add(m.key, &buf)?;
+                    }
+                }
+            }
+        }
+
+        // Copy delta vectors (overwrites base if same key)
+        for &key in &self.delta_keys {
+            if self.delta.get(key, &mut buf)? {
+                merged.add(key, &buf)?;
+            }
+        }
+
+        // Serialize
+        let bytes = merged.save_to_bytes()?;
+
+        // Reset delta
+        self.delta = VectorIndex::new(self.config.clone())?;
+        self.delta_keys.clear();
+
+        Ok(bytes)
+    }
+
+    /// Load the base index from a file (memory-mapped, zero-copy).
+    pub fn load_base(&mut self, path: &str) -> SearchResult<()> {
+        self.base = Some(VectorIndex::view(path, self.config.clone())?);
+        Ok(())
+    }
+
+    /// Load the base index from raw bytes.
+    ///
+    /// Loads into RAM (not memory-mapped). Suitable for tests
+    /// and for the initial bootstrap case.
+    pub fn load_base_from_bytes(&mut self, bytes: &[u8]) -> SearchResult<()> {
+        self.base = Some(VectorIndex::load_from_bytes(bytes, self.config.clone())?);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -159,5 +221,88 @@ mod tests {
         assert!(!idx.should_compact());
         idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
         assert!(idx.should_compact());
+    }
+
+    #[test]
+    fn compact_returns_bytes_and_resets_delta() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(idx.delta_len(), 2);
+
+        let bytes = idx.compact().unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(idx.delta_len(), 0);
+    }
+
+    #[test]
+    fn compact_then_load_base_preserves_search() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+
+        let bytes = idx.compact().unwrap();
+        idx.load_base_from_bytes(&bytes).unwrap();
+
+        assert_eq!(idx.delta_len(), 0);
+        assert_eq!(idx.len(), 2);
+
+        let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].key, 1);
+    }
+
+    #[test]
+    fn search_merges_base_and_delta() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+
+        // Add vectors, compact to base
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        let bytes = idx.compact().unwrap();
+        idx.load_base_from_bytes(&bytes).unwrap();
+
+        // Add more to delta
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+
+        assert_eq!(idx.len(), 2);
+        let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn delta_shadows_base_on_same_key() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+
+        // Add key 1 to base
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        let bytes = idx.compact().unwrap();
+        idx.load_base_from_bytes(&bytes).unwrap();
+
+        // "Update" key 1 in delta with a different vector
+        idx.add(1, &[0.0, 0.0, 0.0, 1.0]).unwrap();
+
+        let results = idx.search(&[0.0, 0.0, 0.0, 1.0], 1).unwrap();
+        assert_eq!(results[0].key, 1);
+        assert!(results[0].distance < 0.01);
+    }
+
+    #[test]
+    fn multiple_compact_cycles() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+
+        // Cycle 1
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        let bytes = idx.compact().unwrap();
+        idx.load_base_from_bytes(&bytes).unwrap();
+
+        // Cycle 2
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let bytes = idx.compact().unwrap();
+        idx.load_base_from_bytes(&bytes).unwrap();
+
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.delta_len(), 0);
+
+        let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
     }
 }
