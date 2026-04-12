@@ -35,7 +35,11 @@ pub enum OluoEvent {
     /// Timer tick: evict expired lightweight entries.
     EvictExpired { now_ms: u64 },
     /// A compacted base index was persisted to this path.
-    CompactComplete { path: String },
+    CompactComplete {
+        path: String,
+        /// The generation this compaction was initiated for.
+        generation: u64,
+    },
 }
 
 /// An action emitted by the Oluo engine for the caller to execute.
@@ -49,7 +53,13 @@ pub enum OluoAction {
         results: Vec<RawSearchResult>,
     },
     /// Delta reached compaction threshold; caller should persist these bytes.
-    CompactRequest { bytes: Vec<u8> },
+    CompactRequest {
+        bytes: Vec<u8>,
+        /// The compaction generation, must be passed back in `CompactComplete`.
+        generation: u64,
+    },
+    /// An internal error occurred (index add/search/load_base failure).
+    Error { message: String },
 }
 
 /// Metadata stored alongside each indexed vector.
@@ -77,6 +87,12 @@ pub struct OluoEngine {
     metadata: hashbrown::HashMap<u64, EntryMetadata>,
     /// Monotonic key counter for assigning index keys.
     key_counter: u64,
+    /// Monotonic generation counter for compaction. Incremented each time
+    /// a `CompactRequest` is emitted; used to reject stale `CompactComplete`.
+    compact_generation: u64,
+    /// Reverse lookup: CID -> index key. Ensures re-ingesting the same CID
+    /// replaces the previous entry (deduplication).
+    cid_to_key: hashbrown::HashMap<[u8; 32], u64>,
 }
 
 /// Unpack a 256-bit tier3 binary vector to 256 f32 values (0.0 / 1.0).
@@ -93,44 +109,43 @@ fn unpack_tier3(tier3: &[u8; 32]) -> Vec<f32> {
     bits
 }
 
+/// Default `VectorIndexConfig` for the 256-bit Hamming HNSW index.
+fn default_index_config() -> VectorIndexConfig {
+    VectorIndexConfig {
+        dimensions: 256,
+        metric: Metric::Hamming,
+        quantization: Quantization::F32,
+        capacity: 10_000,
+        connectivity: 16,
+        expansion_add: 128,
+        expansion_search: 64,
+    }
+}
+
 impl OluoEngine {
     /// Create a new engine with an empty index and default compact threshold (1000).
     pub fn new() -> Self {
-        let config = VectorIndexConfig {
-            dimensions: 256,
-            metric: Metric::Hamming,
-            quantization: Quantization::F32,
-            capacity: 10_000,
-            connectivity: 16,
-            expansion_add: 128,
-            expansion_search: 64,
-        };
-        let index =
-            CompoundIndex::new(config, 1000).expect("default VectorIndexConfig must be valid");
+        let index = CompoundIndex::new(default_index_config(), 1000)
+            .expect("default VectorIndexConfig must be valid");
         Self {
             index,
             metadata: hashbrown::HashMap::new(),
             key_counter: 0,
+            compact_generation: 0,
+            cid_to_key: hashbrown::HashMap::new(),
         }
     }
 
     /// Create a new engine with a custom compact threshold (used in tests).
     pub fn with_compact_threshold(threshold: usize) -> Self {
-        let config = VectorIndexConfig {
-            dimensions: 256,
-            metric: Metric::Hamming,
-            quantization: Quantization::F32,
-            capacity: 10_000,
-            connectivity: 16,
-            expansion_add: 128,
-            expansion_search: 64,
-        };
-        let index =
-            CompoundIndex::new(config, threshold).expect("default VectorIndexConfig must be valid");
+        let index = CompoundIndex::new(default_index_config(), threshold)
+            .expect("default VectorIndexConfig must be valid");
         Self {
             index,
             metadata: hashbrown::HashMap::new(),
             key_counter: 0,
+            compact_generation: 0,
+            cid_to_key: hashbrown::HashMap::new(),
         }
     }
 
@@ -145,7 +160,9 @@ impl OluoEngine {
             } => self.handle_ingest(header, metadata, decision, now_ms),
             OluoEvent::Search { query_id, query } => self.handle_search(query_id, query),
             OluoEvent::EvictExpired { now_ms } => self.handle_evict(now_ms),
-            OluoEvent::CompactComplete { path } => self.handle_compact_complete(&path),
+            OluoEvent::CompactComplete { path, generation } => {
+                self.handle_compact_complete(&path, generation)
+            }
         }
     }
 
@@ -179,18 +196,33 @@ impl OluoEngine {
             IngestDecision::Reject => unreachable!(),
         };
 
-        let key = self.key_counter;
-        self.key_counter += 1;
+        // CID deduplication: if this CID was previously ingested, reuse the key
+        // and replace the old entry (mirrors HashMap::insert semantics).
+        let key = if let Some(&existing_key) = self.cid_to_key.get(&header.target_cid) {
+            // Remove old metadata (the index key is reused via CompoundIndex::add
+            // which handles duplicate keys internally).
+            self.metadata.remove(&existing_key);
+            existing_key
+        } else {
+            let k = self.key_counter;
+            self.key_counter += 1;
+            k
+        };
 
         let f32_vector = unpack_tier3(&header.tier3);
 
-        // Add to HNSW index — on failure, silently skip (don't crash the engine).
-        if self.index.add(key, &f32_vector).is_err() {
-            // Roll back key counter since we didn't store anything.
-            self.key_counter -= 1;
-            return Vec::new();
+        // Add to HNSW index — on failure, emit an error action.
+        if let Err(e) = self.index.add(key, &f32_vector) {
+            // Roll back key counter if we allocated a new one.
+            if !self.cid_to_key.contains_key(&header.target_cid) {
+                self.key_counter -= 1;
+            }
+            return vec![OluoAction::Error {
+                message: format!("index add failed: {e}"),
+            }];
         }
 
+        self.cid_to_key.insert(header.target_cid, key);
         self.metadata.insert(
             key,
             EntryMetadata {
@@ -205,8 +237,19 @@ impl OluoEngine {
 
         // Check if compaction is needed.
         if self.index.should_compact() {
-            if let Ok(bytes) = self.index.compact() {
-                actions.push(OluoAction::CompactRequest { bytes });
+            self.compact_generation += 1;
+            match self.index.compact() {
+                Ok(bytes) => {
+                    actions.push(OluoAction::CompactRequest {
+                        bytes,
+                        generation: self.compact_generation,
+                    });
+                }
+                Err(e) => {
+                    actions.push(OluoAction::Error {
+                        message: format!("compaction failed: {e}"),
+                    });
+                }
             }
         }
 
@@ -215,6 +258,14 @@ impl OluoEngine {
     }
 
     fn handle_search(&self, query_id: u64, query: SearchQuery) -> Vec<OluoAction> {
+        // max_results == 0 guard: return empty results immediately.
+        if query.max_results == 0 {
+            return vec![OluoAction::SearchResults {
+                query_id,
+                results: Vec::new(),
+            }];
+        }
+
         // Only Tier 3 (256-bit) search is supported.
         if query.tier != EmbeddingTier::T3 {
             return vec![OluoAction::SearchResults {
@@ -227,14 +278,17 @@ impl OluoEngine {
 
         // Over-fetch to compensate for entries that may have been evicted
         // from metadata but still live in the HNSW index.
-        let fetch_k = (query.max_results as usize).saturating_add(self.evicted_headroom());
+        let headroom = self.evicted_headroom();
+        let capped_headroom = headroom
+            .min(query.max_results as usize * 5)
+            .min(1000);
+        let fetch_k = (query.max_results as usize).saturating_add(capped_headroom);
 
         let matches: Vec<SearchMatch> = match self.index.search(&f32_vector, fetch_k) {
             Ok(m) => m,
-            Err(_) => {
-                return vec![OluoAction::SearchResults {
-                    query_id,
-                    results: Vec::new(),
+            Err(e) => {
+                return vec![OluoAction::Error {
+                    message: format!("search failed: {e}"),
                 }];
             }
         };
@@ -263,25 +317,36 @@ impl OluoEngine {
         // Collect expired keys. We cannot remove vectors from CompoundIndex
         // easily (viewed base doesn't support remove), so we only remove
         // from metadata. Search results will filter out keyless entries.
-        let expired_keys: Vec<u64> = self
+        let expired: Vec<(u64, [u8; 32])> = self
             .metadata
             .iter()
             .filter_map(|(&key, entry)| match entry.expires_at {
-                Some(expires) if expires <= now_ms => Some(key),
+                Some(expires) if expires <= now_ms => Some((key, entry.target_cid)),
                 _ => None,
             })
             .collect();
 
-        for key in expired_keys {
+        for (key, cid) in expired {
             self.metadata.remove(&key);
+            self.cid_to_key.remove(&cid);
         }
 
         Vec::new()
     }
 
-    fn handle_compact_complete(&mut self, path: &str) -> Vec<OluoAction> {
-        // Load the compacted base from disk — on error, ignore (base stays as is).
-        let _ = self.index.load_base(path);
+    fn handle_compact_complete(&mut self, path: &str, generation: u64) -> Vec<OluoAction> {
+        // Reject stale CompactComplete: only accept if the generation matches
+        // the current compact_generation. A newer compaction has been issued
+        // since this one was started; loading the old base would overwrite
+        // a newer in-memory base.
+        if generation != self.compact_generation {
+            return Vec::new();
+        }
+        if let Err(e) = self.index.load_base(path) {
+            return vec![OluoAction::Error {
+                message: format!("load_base failed: {e}"),
+            }];
+        }
         Vec::new()
     }
 
@@ -623,5 +688,119 @@ mod tests {
             actions.iter().any(|a| matches!(a, OluoAction::IndexUpdated)),
             "expected IndexUpdated alongside CompactRequest"
         );
+    }
+
+    #[test]
+    fn engine_compact_generation_tracking() {
+        // Set compact_threshold=2 so compaction triggers after 2 vectors.
+        let mut engine = OluoEngine::with_compact_threshold(2);
+
+        // Insert 2 vectors to trigger compaction.
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x10; 32], [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+        });
+        let actions = engine.handle(OluoEvent::Ingest {
+            header: test_header([0x20; 32], [0xBB; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+        });
+
+        // Extract the generation from the CompactRequest.
+        let gen = actions.iter().find_map(|a| match a {
+            OluoAction::CompactRequest { generation, .. } => Some(*generation),
+            _ => None,
+        });
+        assert!(gen.is_some(), "expected CompactRequest with generation");
+        let gen = gen.unwrap();
+        assert_eq!(gen, 1, "first compaction should be generation 1");
+
+        // A stale CompactComplete with wrong generation should be ignored.
+        let stale_actions = engine.handle(OluoEvent::CompactComplete {
+            path: "/tmp/fake_base".into(),
+            generation: 999, // wrong generation
+        });
+        assert!(
+            stale_actions.is_empty(),
+            "stale CompactComplete should be silently ignored"
+        );
+    }
+
+    #[test]
+    fn engine_cid_deduplication() {
+        let mut engine = OluoEngine::new();
+
+        let cid = [0x42; 32];
+        let header1 = test_header(cid, [0xAA; 32]);
+        let header2 = test_header(cid, [0xBB; 32]); // same CID, different vector
+
+        // Ingest twice with the same CID.
+        engine.handle(OluoEvent::Ingest {
+            header: header1,
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+        });
+        assert_eq!(engine.entry_count(), 1);
+
+        engine.handle(OluoEvent::Ingest {
+            header: header2,
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+        });
+        // Should still be 1 entry — the old one was replaced.
+        assert_eq!(engine.entry_count(), 1);
+
+        // Search for the new vector [0xBB; 32] — should find it.
+        let query = SearchQuery {
+            embedding: [0xBB; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 1, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].target_cid, cid);
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
+
+    #[test]
+    fn engine_search_max_results_zero() {
+        let mut engine = OluoEngine::new();
+
+        // Insert an entry so the index isn't empty.
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+        });
+
+        let query = SearchQuery {
+            embedding: [0xAA; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 0,
+        };
+
+        let actions = engine.handle(OluoEvent::Search {
+            query_id: 50,
+            query,
+        });
+        match &actions[0] {
+            OluoAction::SearchResults { query_id, results } => {
+                assert_eq!(*query_id, 50);
+                assert!(results.is_empty(), "max_results=0 should return empty results");
+            }
+            _ => panic!("expected SearchResults action"),
+        }
     }
 }
