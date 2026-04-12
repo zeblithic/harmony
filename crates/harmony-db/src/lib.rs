@@ -5,6 +5,7 @@ mod commit;
 mod db;
 mod error;
 mod persist;
+mod prolly;
 mod table;
 mod types;
 
