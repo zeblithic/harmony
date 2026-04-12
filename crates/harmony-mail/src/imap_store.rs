@@ -238,7 +238,7 @@ impl ImapStore {
         let conn = self.conn.lock().unwrap();
         let sql_pattern = imap_pattern_to_sql(pattern);
         let mut stmt = conn.prepare(
-            "SELECT id, name, uid_validity, uid_next, subscribed FROM mailboxes WHERE name LIKE ?1 ORDER BY name",
+            "SELECT id, name, uid_validity, uid_next, subscribed FROM mailboxes WHERE name LIKE ?1 ESCAPE '\\' ORDER BY name",
         )?;
         let rows = stmt
             .query_map([&sql_pattern], |row| {
@@ -590,12 +590,20 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<MessageRow> {
     })
 }
 
+/// Convert IMAP LIST pattern to SQL LIKE pattern.
+/// IMAP `*` matches everything (including hierarchy delimiter) → SQL `%`.
+/// IMAP `%` matches everything except hierarchy delimiter → SQL `%` (flat namespace, equivalent).
+/// SQL `_` is a wildcard so must be escaped. SQL `%` from IMAP patterns is intentional.
 fn imap_pattern_to_sql(pattern: &str) -> String {
-    pattern
-        .replace('%', "*PERCENT*")
-        .replace('_', "\\_")
-        .replace('*', "%")
-        .replace("*PERCENT*", "%")
+    let mut result = String::with_capacity(pattern.len());
+    for ch in pattern.chars() {
+        match ch {
+            '*' | '%' => result.push('%'),
+            '_' => result.push_str("\\_"),
+            _ => result.push(ch),
+        }
+    }
+    result
 }
 
 fn hash_password(password: &str) -> Result<String, StoreError> {

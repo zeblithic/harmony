@@ -232,6 +232,27 @@ pub fn build_fetch_response(
     let mut items = Vec::new();
     let mut literal_data: Option<Vec<u8>> = None;
 
+    // Reject requests with multiple literal-producing attributes — the response
+    // model only supports one literal payload per FETCH response.
+    let literal_attr_count = attrs
+        .iter()
+        .filter(|a| {
+            matches!(
+                a,
+                FetchAttribute::BodySection { .. }
+                    | FetchAttribute::Rfc822
+                    | FetchAttribute::Rfc822Header
+                    | FetchAttribute::Rfc822Text
+            )
+        })
+        .count();
+    if literal_attr_count > 1 {
+        return Err(RenderError::Build(
+            "multiple literal FETCH attributes in a single request are not yet supported"
+                .to_string(),
+        ));
+    }
+
     for attr in attrs {
         match attr {
             FetchAttribute::Flags => {
@@ -316,13 +337,20 @@ pub struct FetchResponse {
 impl FetchResponse {
     /// Format the complete response for transmission.
     /// Returns bytes ready to write to the client.
+    ///
+    /// For literal data, the IMAP format is:
+    /// `* 1 FETCH (... BODY[] {N}\r\n<data>)\r\n`
+    /// The literal size marker `{N}` is already in the items list; we insert
+    /// CRLF + raw data + closing paren after it.
     pub fn to_bytes(&self) -> Vec<u8> {
         let items_str = self.items.join(" ");
         let mut result = format!("* {} FETCH ({}", self.seqnum, items_str);
         if let Some(ref data) = self.literal_data {
-            result.push_str(")\r\n");
+            // Items already contain "{N}" — append CRLF, literal data, then close
+            result.push_str("\r\n");
             let mut bytes = result.into_bytes();
             bytes.extend_from_slice(data);
+            bytes.extend_from_slice(b")\r\n");
             bytes
         } else {
             result.push_str(")\r\n");
@@ -561,7 +589,7 @@ mod tests {
     #[test]
     fn internal_date_formatting() {
         let date = format_internal_date(1744358400);
-        // 2025-04-11 00:00:00 UTC
+        // 2025-04-11 08:00:00 UTC
         assert!(date.contains("Apr"), "date: {date}");
         assert!(date.contains("2025"), "date: {date}");
         assert!(date.contains("08:00:00"), "date: {date}");

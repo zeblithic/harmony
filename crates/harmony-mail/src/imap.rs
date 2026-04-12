@@ -18,6 +18,9 @@ pub struct ImapConfig {
     pub domain: String,
     /// Whether TLS is currently active on this connection.
     pub tls_active: bool,
+    /// Whether a TLS acceptor is available for STARTTLS upgrade.
+    /// When false, STARTTLS is not advertised and the command is rejected.
+    pub tls_available: bool,
     /// Maximum authentication failures before disconnect.
     pub max_auth_failures: u32,
 }
@@ -376,6 +379,14 @@ impl ImapSession {
         if self.config.tls_active {
             return vec![self.bad_tag(tag, "TLS already active")];
         }
+        if !self.config.tls_available {
+            return vec![ImapAction::SendTagged {
+                tag,
+                status: ResponseStatus::No,
+                code: None,
+                text: "TLS not available".to_string(),
+            }];
+        }
         self.state = ImapState::TlsNegotiating;
         self.pending_tag = Some(tag.clone());
         vec![
@@ -439,9 +450,18 @@ impl ImapSession {
                 }
             }
             None => {
-                // Need continuation for credentials
-                self.pending_tag = Some(tag);
-                vec![ImapAction::SendContinuation(String::new())]
+                // Continuation-based AUTHENTICATE requires the I/O loop to
+                // handle untagged follow-up lines, which is not yet wired.
+                // Reject until implemented — clients should use the initial
+                // response form (AUTHENTICATE PLAIN <base64>).
+                vec![ImapAction::SendTagged {
+                    tag,
+                    status: ResponseStatus::Bad,
+                    code: None,
+                    text: "AUTHENTICATE without initial response not supported; \
+                           use AUTHENTICATE PLAIN <base64> or LOGIN"
+                        .to_string(),
+                }]
             }
         }
     }
@@ -872,21 +892,13 @@ impl ImapSession {
         ]
     }
 
-    fn handle_copy_complete(&mut self, uid_mapping: Vec<(u32, u32)>) -> Vec<ImapAction> {
+    fn handle_copy_complete(&mut self, _uid_mapping: Vec<(u32, u32)>) -> Vec<ImapAction> {
         let tag = self.pending_tag.take().unwrap_or_else(|| "?".to_string());
 
-        let code = if !uid_mapping.is_empty() {
-            let src_uids: Vec<String> = uid_mapping.iter().map(|(s, _)| s.to_string()).collect();
-            let dst_uids: Vec<String> = uid_mapping.iter().map(|(_, d)| d.to_string()).collect();
-            Some(format!(
-                "COPYUID {} {} {}",
-                0,
-                src_uids.join(","),
-                dst_uids.join(",")
-            ))
-        } else {
-            None
-        };
+        // COPYUID response requires destination UIDVALIDITY, which is not
+        // available in the current event payload. Omit COPYUID rather than
+        // emit an invalid response with uidvalidity=0.
+        let code: Option<String> = None;
 
         vec![ImapAction::SendTagged {
             tag,
@@ -939,7 +951,9 @@ impl ImapSession {
         match &self.state {
             ImapState::NotAuthenticated { .. } | ImapState::Connected => {
                 if !self.config.tls_active {
-                    caps.push("STARTTLS");
+                    if self.config.tls_available {
+                        caps.push("STARTTLS");
+                    }
                     caps.push("LOGINDISABLED");
                 } else {
                     caps.push("AUTH=PLAIN");
@@ -1022,6 +1036,7 @@ mod tests {
         ImapConfig {
             domain: "q8.fyi".to_string(),
             tls_active: true,
+            tls_available: true,
             max_auth_failures: 3,
         }
     }
@@ -1030,6 +1045,7 @@ mod tests {
         ImapConfig {
             domain: "q8.fyi".to_string(),
             tls_active: false,
+            tls_available: true,
             max_auth_failures: 3,
         }
     }
@@ -1256,11 +1272,18 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_plain_without_initial_response() {
+    fn authenticate_plain_without_initial_response_rejected() {
         let mut s = connected_session(config_tls());
         let cmd = parse_command("A001 AUTHENTICATE PLAIN").unwrap();
         let actions = s.handle(ImapEvent::Command(cmd));
-        assert!(matches!(&actions[0], ImapAction::SendContinuation(_)));
+        // Without initial response, we reject until continuation handling is implemented
+        assert!(matches!(
+            &actions[0],
+            ImapAction::SendTagged {
+                status: ResponseStatus::Bad,
+                ..
+            }
+        ));
     }
 
     // ── STARTTLS ────────────────────────────────────────────────────
@@ -1286,6 +1309,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn starttls_rejected_when_tls_unavailable() {
+        let mut cfg = config_no_tls();
+        cfg.tls_available = false;
+        let mut s = connected_session(cfg);
+        let cmd = parse_command("A001 STARTTLS").unwrap();
+        let actions = s.handle(ImapEvent::Command(cmd));
+        assert!(matches!(
+            &actions[0],
+            ImapAction::SendTagged {
+                status: ResponseStatus::No,
+                ..
+            }
+        ));
+        // Should NOT enter TlsNegotiating
+        assert!(matches!(s.state, ImapState::NotAuthenticated { .. }));
+    }
+
+    #[test]
+    fn greeting_without_tls_available_omits_starttls() {
+        let mut cfg = config_no_tls();
+        cfg.tls_available = false;
+        let mut s = ImapSession::new(cfg);
+        let actions = s.handle(ImapEvent::Connected);
+        let msg = match &actions[0] {
+            ImapAction::SendUntagged(m) => m,
+            _ => panic!(),
+        };
+        assert!(
+            !msg.contains("STARTTLS"),
+            "should not advertise STARTTLS: {msg}"
+        );
+        assert!(
+            msg.contains("LOGINDISABLED"),
+            "should still have LOGINDISABLED: {msg}"
+        );
     }
 
     #[test]

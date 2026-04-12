@@ -295,7 +295,15 @@ fn parse_uid_command(tag: &str, rest: &str) -> Result<ImapTaggedCommand, ParseEr
                 uid: true,
             }
         }
-        "EXPUNGE" => ImapCommand::Expunge,
+        "EXPUNGE" => {
+            // UID EXPUNGE requires a UID set argument (RFC 4315).
+            // Plain EXPUNGE (without UID set handling) would delete ALL
+            // \Deleted messages, which is not the correct UID EXPUNGE
+            // semantics. Reject until proper UID-set filtering is implemented.
+            return Err(ParseError::BadArguments(
+                "UID EXPUNGE requires a UID set (not yet supported)".into(),
+            ));
+        }
         _ => return Err(ParseError::UnknownCommand(format!("UID {verb_upper}"))),
     };
 

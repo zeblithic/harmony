@@ -336,6 +336,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                                 let imap_cfg = ImapConfig {
                                                     domain: d,
                                                     tls_active: true,
+                                                    tls_available: true,
                                                     max_auth_failures: imap_max_auth_failures,
                                                 };
                                                 if let Err(e) = handle_imap_connection(reader, writer, imap_cfg, st, imap_idle_timeout).await {
@@ -389,6 +390,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                     let imap_cfg = ImapConfig {
                                         domain: d,
                                         tls_active: false,
+                                        tls_available: acc.is_some(),
                                         max_auth_failures: imap_max_auth_failures,
                                     };
                                     if let Err(e) = handle_imap_connection_starttls(reader, writer, imap_cfg, st, imap_idle_timeout, acc).await {
@@ -808,7 +810,7 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 }
             }
             SmtpAction::CheckSpf { .. } => {
-                // TODO: wire to mail_auth SPF resolver and feed result into spam scorer
+                // SPF checking tracked in Linear — requires mail_auth SPF resolver integration
             }
             SmtpAction::StartTls => {
                 needs_starttls = true;
@@ -975,7 +977,7 @@ async fn process_imap_async_actions<R, W>(
     actions: &[ImapAction],
     session: &mut ImapSession,
     writer: &mut W,
-    store: &ImapStore,
+    store: &Arc<ImapStore>,
     framed: &mut FramedRead<R, ImapCodec>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -985,7 +987,13 @@ where
     for action in actions {
         match action {
             ImapAction::Authenticate { username, password } => {
-                let result = store.authenticate(username, password);
+                // Argon2 verification is CPU-intensive — run off the async runtime.
+                let u = username.clone();
+                let p = password.clone();
+                let store_clone = Arc::clone(store);
+                let result = tokio::task::spawn_blocking(move || store_clone.authenticate(&u, &p))
+                    .await
+                    .map_err(|e| format!("auth task panicked: {e}"))?;
                 let (success, uname) = match result {
                     Ok(user) => (true, user.username),
                     Err(_) => (false, username.clone()),
@@ -996,35 +1004,35 @@ where
                 });
                 execute_imap_actions(&callback, writer).await?;
             }
-            ImapAction::SelectMailbox { name, read_only } => {
-                match store.get_mailbox(name) {
-                    Ok(Some(mbox)) => {
-                        let total = store.count_messages(mbox.id).unwrap_or(0);
-                        let recent = store.count_recent(mbox.id).unwrap_or(0);
-                        let unseen = store.count_unseen(mbox.id).unwrap_or(0);
-                        let snapshot = MailboxSnapshot {
-                            name: mbox.name,
-                            uid_validity: mbox.uid_validity,
-                            uid_next: mbox.uid_next,
-                            total_messages: total,
-                            recent_count: recent,
-                            unseen_count: unseen,
-                            first_unseen: if unseen > 0 { Some(1) } else { None },
-                            read_only: *read_only,
-                        };
-                        let callback = session.handle(ImapEvent::MailboxLoaded(snapshot));
-                        execute_imap_actions(&callback, writer).await?;
-                    }
-                    _ => {
-                        // Mailbox not found — send NO directly
-                        let tag = "?"; // pending tag consumed by state machine
-                        writer
-                            .write_all(format!("{tag} NO mailbox not found\r\n").as_bytes())
-                            .await?;
-                        writer.flush().await?;
-                    }
+            ImapAction::SelectMailbox { name, read_only } => match store.get_mailbox(name) {
+                Ok(Some(mbox)) => {
+                    let total = store.count_messages(mbox.id).unwrap_or(0);
+                    let recent = store.count_recent(mbox.id).unwrap_or(0);
+                    let unseen = store.count_unseen(mbox.id).unwrap_or(0);
+                    let snapshot = MailboxSnapshot {
+                        name: mbox.name,
+                        uid_validity: mbox.uid_validity,
+                        uid_next: mbox.uid_next,
+                        total_messages: total,
+                        recent_count: recent,
+                        unseen_count: unseen,
+                        first_unseen: if unseen > 0 { Some(1) } else { None },
+                        read_only: *read_only,
+                    };
+                    let callback = session.handle(ImapEvent::MailboxLoaded(snapshot));
+                    execute_imap_actions(&callback, writer).await?;
                 }
-            }
+                _ => {
+                    let tag = session
+                        .pending_tag
+                        .take()
+                        .unwrap_or_else(|| "?".to_string());
+                    writer
+                        .write_all(format!("{tag} NO mailbox not found\r\n").as_bytes())
+                        .await?;
+                    writer.flush().await?;
+                }
+            },
             ImapAction::ListMailboxes { pattern, .. } => {
                 let mailboxes = store.list_mailboxes(pattern).unwrap_or_default();
                 for mbox in &mailboxes {
@@ -1036,11 +1044,10 @@ where
                 // a synchronous action in the I/O layer.
                 // Actually, LIST was dispatched as an async action. We need to signal
                 // completion. For now, extract the pending tag and send OK.
-                if let Some(tag) = &session.pending_tag {
+                if let Some(tag) = session.pending_tag.take() {
                     writer
                         .write_all(format!("{tag} OK LIST completed\r\n").as_bytes())
                         .await?;
-                    session.pending_tag = None;
                 }
                 writer.flush().await?;
             }
@@ -1076,17 +1083,16 @@ where
                         )
                         .await?;
                 }
-                if let Some(tag) = &session.pending_tag {
+                if let Some(tag) = session.pending_tag.take() {
                     writer
                         .write_all(format!("{tag} OK STATUS completed\r\n").as_bytes())
                         .await?;
-                    session.pending_tag = None;
                 }
                 writer.flush().await?;
             }
             ImapAction::CreateMailbox { name } => {
                 let result = store.create_mailbox(name);
-                if let Some(tag) = &session.pending_tag {
+                if let Some(tag) = session.pending_tag.take() {
                     match result {
                         Ok(()) => {
                             writer
@@ -1099,13 +1105,12 @@ where
                                 .await?
                         }
                     }
-                    session.pending_tag = None;
                 }
                 writer.flush().await?;
             }
             ImapAction::DeleteMailbox { name } => {
                 let result = store.delete_mailbox(name);
-                if let Some(tag) = &session.pending_tag {
+                if let Some(tag) = session.pending_tag.take() {
                     match result {
                         Ok(()) => {
                             writer
@@ -1118,13 +1123,12 @@ where
                                 .await?
                         }
                     }
-                    session.pending_tag = None;
                 }
                 writer.flush().await?;
             }
             ImapAction::SubscribeMailbox { name } => {
                 let result = store.subscribe(name);
-                if let Some(tag) = &session.pending_tag {
+                if let Some(tag) = session.pending_tag.take() {
                     match result {
                         Ok(()) => {
                             writer
@@ -1137,13 +1141,12 @@ where
                                 .await?
                         }
                     }
-                    session.pending_tag = None;
                 }
                 writer.flush().await?;
             }
             ImapAction::UnsubscribeMailbox { name } => {
                 let result = store.unsubscribe(name);
-                if let Some(tag) = &session.pending_tag {
+                if let Some(tag) = session.pending_tag.take() {
                     match result {
                         Ok(()) => {
                             writer
@@ -1156,18 +1159,31 @@ where
                                 .await?
                         }
                     }
-                    session.pending_tag = None;
                 }
                 writer.flush().await?;
             }
             ImapAction::Expunge => {
                 if let ImapState::Selected { ref mailbox, .. } = session.state {
                     if let Ok(Some(mbox)) = store.get_mailbox(&mailbox.name) {
+                        // Build UID→seqnum map before expunge (seqnums are 1-based position in UID order)
+                        let all_msgs = store.get_messages(mbox.id).unwrap_or_default();
+                        let uid_to_seqnum: std::collections::HashMap<u32, u32> = all_msgs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, m)| (m.uid, (i + 1) as u32))
+                            .collect();
+
                         let expunged_uids = store.expunge(mbox.id).unwrap_or_default();
-                        // Convert UIDs to sequence numbers (for simplicity, use UIDs as seqnums in v1.1)
-                        let callback = session.handle(ImapEvent::ExpungeComplete {
-                            expunged_seqnums: expunged_uids,
-                        });
+                        // Convert UIDs to sequence numbers. EXPUNGE responses must be
+                        // sent in descending order so earlier seqnums remain valid.
+                        let mut expunged_seqnums: Vec<u32> = expunged_uids
+                            .iter()
+                            .filter_map(|uid| uid_to_seqnum.get(uid).copied())
+                            .collect();
+                        expunged_seqnums.sort_unstable_by(|a, b| b.cmp(a));
+
+                        let callback =
+                            session.handle(ImapEvent::ExpungeComplete { expunged_seqnums });
                         execute_imap_actions(&callback, writer).await?;
                     }
                 }
@@ -1179,18 +1195,17 @@ where
                 uid_mode: _,
                 silent,
             } => {
-                // Stub: in v1.1, STORE is acknowledged without actual Harmony integration
-                let updated = Vec::new(); // TODO: resolve sequence set, update flags in store
+                // Stub: STORE is acknowledged without actual Harmony integration
+                let updated = Vec::new();
                 if !silent {
                     let callback = session.handle(ImapEvent::StoreComplete { updated });
                     execute_imap_actions(&callback, writer).await?;
                 } else {
                     // Silent: just send tagged OK
-                    if let Some(tag) = &session.pending_tag {
+                    if let Some(tag) = session.pending_tag.take() {
                         writer
                             .write_all(format!("{tag} OK STORE completed\r\n").as_bytes())
                             .await?;
-                        session.pending_tag = None;
                     }
                     writer.flush().await?;
                 }
@@ -1198,11 +1213,10 @@ where
             ImapAction::FetchMessages { .. } => {
                 // Stub: FETCH requires Harmony message retrieval + rendering
                 // For v1.1, send tagged OK without data
-                if let Some(tag) = &session.pending_tag {
+                if let Some(tag) = session.pending_tag.take() {
                     writer
                         .write_all(format!("{tag} OK FETCH completed\r\n").as_bytes())
                         .await?;
-                    session.pending_tag = None;
                 }
                 writer.flush().await?;
             }
