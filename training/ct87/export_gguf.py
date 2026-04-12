@@ -316,25 +316,11 @@ def export_gguf(
 
     # Latent projection weights (semantic Engram key generation)
     if latent_projection_state is not None:
+        from ct87.latent_projection import clean_projection_state_dict
+
         lp_map = build_latent_projection_map()
         expected_lp = set(lp_map.keys())
-
-        # Strip common prefixes (same as LatentProjection.from_checkpoint)
-        cleaned_lp: dict[str, torch.Tensor] = {}
-        for k, v in latent_projection_state.items():
-            clean_key = k
-            while True:
-                stripped = False
-                for prefix in ("module.", "latent_projection.", "projection."):
-                    if clean_key.startswith(prefix):
-                        clean_key = clean_key[len(prefix):]
-                        stripped = True
-                        break
-                if not stripped:
-                    break
-            if clean_key.startswith(("layer1.", "layer2.")):
-                cleaned_lp[clean_key] = v
-
+        cleaned_lp = clean_projection_state_dict(latent_projection_state)
         actual_lp = set(cleaned_lp.keys())
         if expected_lp != actual_lp:
             raise ValueError(

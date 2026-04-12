@@ -21,6 +21,34 @@ if TYPE_CHECKING:
     from ct87.engram import EngramTable
 
 
+def clean_projection_state_dict(
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Strip common prefixes and filter to layer1/layer2 keys.
+
+    Handles state dicts with prefixes like 'module.', 'latent_projection.',
+    'projection.' (including nested combinations), and filters out unrelated
+    keys from full-model checkpoints.
+
+    Used by both LatentProjection.from_checkpoint() and export_gguf.py.
+    """
+    cleaned: dict[str, torch.Tensor] = {}
+    for k, v in state.items():
+        clean_key = k
+        while True:
+            stripped = False
+            for prefix in ("module.", "latent_projection.", "projection."):
+                if clean_key.startswith(prefix):
+                    clean_key = clean_key[len(prefix):]
+                    stripped = True
+                    break
+            if not stripped:
+                break
+        if clean_key.startswith(("layer1.", "layer2.")):
+            cleaned[clean_key] = v
+    return cleaned
+
+
 class LatentProjection(nn.Module):
     """2-layer MLP that projects token embeddings to a compact latent space.
 
@@ -147,23 +175,7 @@ class LatentProjection(nn.Module):
         else:
             state = torch.load(str(path), map_location="cpu", weights_only=True)
 
-        # Strip nested prefixes (handles module.latent_projection.layer1.* etc.)
-        cleaned: dict[str, torch.Tensor] = {}
-        for k, v in state.items():
-            clean_key = k
-            while True:
-                stripped = False
-                for prefix in ("module.", "latent_projection.", "projection."):
-                    if clean_key.startswith(prefix):
-                        clean_key = clean_key[len(prefix) :]
-                        stripped = True
-                        break
-                if not stripped:
-                    break
-            # Only keep layer1/layer2 keys (ignore unrelated tensors from
-            # full-model checkpoints)
-            if clean_key.startswith(("layer1.", "layer2.")):
-                cleaned[clean_key] = v
+        cleaned = clean_projection_state_dict(state)
 
         proj = LatentProjection(hidden_dim, intermediate_dim, latent_dim)
         proj.load_state_dict(cleaned)
