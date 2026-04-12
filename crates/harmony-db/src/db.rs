@@ -131,8 +131,9 @@ impl HarmonyDb {
         store: Option<&mut dyn BookStore>,
     ) -> Result<ContentId, DbError> {
         let root = commit::create_commit(&self.data_dir, self.head, &self.tables, store)?;
-        self.head = Some(root);
-        persist::save_index(&self.data_dir, self.head, &self.tables)?;
+        let new_head = Some(root);
+        persist::save_index(&self.data_dir, new_head, &self.tables)?;
+        self.head = new_head;
         Ok(root)
     }
 
@@ -147,10 +148,11 @@ impl HarmonyDb {
         root: ContentId,
         store: Option<&dyn BookStore>,
     ) -> Result<(), DbError> {
-        let tables = commit::rebuild(&self.data_dir, root, store)?;
-        self.tables = tables;
-        self.head = Some(root);
-        persist::save_index(&self.data_dir, self.head, &self.tables)?;
+        let new_tables = commit::rebuild(&self.data_dir, root, store)?;
+        let new_head = Some(root);
+        persist::save_index(&self.data_dir, new_head, &new_tables)?;
+        self.tables = new_tables;
+        self.head = new_head;
         Ok(())
     }
 

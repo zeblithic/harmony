@@ -98,58 +98,48 @@ pub fn open_from_cas(data_dir: &Path, root: ContentId,
 
 ### Table Operations
 
-```rust
-/// Get or create a named table. Returns a mutable reference.
-pub fn table(&mut self, name: &str) -> &mut Table;
+All table operations go through HarmonyDb with a table name parameter. Table is a
+crate-internal sorted vec — the public API avoids borrow-checker friction from
+`&mut Table` references.
 
+```rust
 /// List all table names.
 pub fn table_names(&self) -> Vec<&str>;
-```
 
-### Table Methods
+/// Number of entries in a table (0 if table doesn't exist).
+pub fn table_len(&self, table: &str) -> usize;
 
-```rust
-impl Table {
-    /// Insert a key-value pair. Computes BLAKE3 CID for the value,
-    /// stores the blob, upserts the entry (replaces if key exists).
-    pub fn insert(&mut self, key: &[u8], value: &[u8], meta: EntryMeta,
-                  blobs_dir: &Path) -> Result<ContentId, DbError>;
+/// Insert a key-value pair into a table. Creates the table if needed.
+/// Computes BLAKE3 CID for the value, stores the blob, upserts the entry.
+pub fn insert(&mut self, table: &str, key: &[u8], value: &[u8],
+              meta: EntryMeta) -> Result<ContentId, DbError>;
 
-    /// Get the value bytes for a key. Reads the blob from disk.
-    pub fn get(&self, key: &[u8], blobs_dir: &Path)
-               -> Result<Option<Vec<u8>>, DbError>;
+/// Get the value bytes for a key. Reads the blob from disk.
+pub fn get(&self, table: &str, key: &[u8])
+           -> Result<Option<Vec<u8>>, DbError>;
 
-    /// Get just the entry (metadata + CID) without reading the blob.
-    pub fn get_entry(&self, key: &[u8]) -> Option<&Entry>;
+/// Get just the entry (metadata + CID) without reading the blob.
+pub fn get_entry(&self, table: &str, key: &[u8]) -> Option<&Entry>;
 
-    /// Ordered iteration over a key range [start, end).
-    /// Returns entries only — call get() to fetch value blobs.
-    pub fn range(&self, start: &[u8], end: &[u8]) -> &[Entry];
+/// Ordered iteration over a key range [start, end).
+/// Returns entries only — call get() to fetch value blobs.
+pub fn range(&self, table: &str, start: &[u8], end: &[u8]) -> &[Entry];
 
-    /// All entries in sorted order.
-    pub fn entries(&self) -> &[Entry];
+/// All entries in a table, sorted by key.
+pub fn entries(&self, table: &str) -> &[Entry];
 
-    /// Remove an entry by key. Returns the removed entry if found.
-    /// Does NOT delete the value blob (other tables may reference it).
-    pub fn remove(&mut self, key: &[u8]) -> Option<Entry>;
+/// Remove an entry by key. Does NOT delete the value blob.
+pub fn remove(&mut self, table: &str, key: &[u8])
+              -> Result<Option<Entry>, DbError>;
 
-    /// Update metadata for an entry without touching the value.
-    pub fn update_meta(&mut self, key: &[u8], meta: EntryMeta)
-                       -> Result<(), DbError>;
-
-    /// Number of entries.
-    pub fn len(&self) -> usize;
-}
+/// Update metadata for an entry without touching the value.
+pub fn update_meta(&mut self, table: &str, key: &[u8], meta: EntryMeta)
+                   -> Result<(), DbError>;
 ```
 
 Insert is an upsert — same key replaces the entry. Remove doesn't delete blobs because
 the same CID may be referenced by multiple tables (e.g., self-sent mail appears in both
 inbox and sent). Range returns a zero-copy slice into the sorted vec.
-
-Note: Table methods show `blobs_dir: &Path` parameters in the signatures above. In
-implementation, Table will hold an internal reference to the database's blobs directory
-so callers don't need to pass it. The signatures here show the data flow; the ergonomic
-API will be `table.insert(key, value, meta)` without the path parameter.
 
 ### Commit / History
 

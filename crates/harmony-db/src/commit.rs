@@ -190,7 +190,10 @@ pub(crate) fn diff_commits(
             }
             let old_entries = load_page(data_dir, old_page_hex, None)?;
             let new_entries = load_page(data_dir, new_page_hex, None)?;
-            tables.insert(name.clone(), diff_entries(&old_entries, &new_entries));
+            let td = diff_entries(&old_entries, &new_entries);
+            if !td.added.is_empty() || !td.removed.is_empty() || !td.changed.is_empty() {
+                tables.insert(name.clone(), td);
+            }
         } else {
             let new_entries = load_page(data_dir, new_page_hex, None)?;
             tables.insert(name.clone(), crate::types::TableDiff {
