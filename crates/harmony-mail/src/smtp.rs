@@ -21,6 +21,9 @@ pub struct SmtpConfig {
     pub max_message_size: usize,
     /// Maximum number of recipients per message.
     pub max_recipients: usize,
+    /// Whether TLS is available for STARTTLS. When false, STARTTLS is not
+    /// advertised in EHLO and STARTTLS commands are rejected.
+    pub tls_available: bool,
 }
 
 // ── State ────────────────────────────────────────────────────────────
@@ -246,7 +249,7 @@ impl SmtpSession {
             format!("SIZE {}", self.config.message_size_display()),
             "8BITMIME".to_string(),
         ];
-        if !self.tls {
+        if !self.tls && self.config.tls_available {
             capabilities.push("STARTTLS".to_string());
         }
 
@@ -434,6 +437,12 @@ impl SmtpSession {
                 "TLS already active".to_string(),
             )];
         }
+        if !self.config.tls_available {
+            return vec![SmtpAction::SendResponse(
+                454,
+                "TLS not available".to_string(),
+            )];
+        }
         // RFC 3207 §4.2: STARTTLS only valid before a mail transaction starts.
         match self.state {
             SmtpState::GreetingSent | SmtpState::Ready => {}
@@ -572,6 +581,7 @@ mod tests {
             mx_host: "mail.harmony.example.com".to_string(),
             max_message_size: 10 * 1024 * 1024,
             max_recipients: 100,
+            tls_available: true,
         }
     }
 

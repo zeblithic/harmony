@@ -87,9 +87,12 @@ pub fn map_dmarc_result(output: &mail_auth::DmarcOutput) -> DmarcResult {
     if dkim_aligned || spf_aligned {
         DmarcResult::Pass
     } else {
-        // Alignment failure is Fail regardless of policy — policy determines
-        // enforcement action, not whether authentication passed.
-        DmarcResult::Fail
+        match output.policy() {
+            // No DMARC record → can't fail what doesn't exist
+            mail_auth::dmarc::Policy::Unspecified => DmarcResult::None,
+            // Domain has a DMARC record but alignment failed
+            _ => DmarcResult::Fail,
+        }
     }
 }
 

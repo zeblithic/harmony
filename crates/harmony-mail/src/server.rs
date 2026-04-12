@@ -110,13 +110,6 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let max_message_size = parse_message_size(&config.spam.max_message_size);
 
-    let smtp_config = SmtpConfig {
-        domain: config.domain.name.clone(),
-        mx_host: config.domain.mx_host.clone(),
-        max_message_size,
-        max_recipients: 100,
-    };
-
     let shared = Arc::new(SharedState::new(config.spam.max_connections_per_ip));
 
     // Load TLS if configured with manual certs
@@ -135,6 +128,14 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         tracing::info!("TLS mode=acme (not yet implemented), STARTTLS unavailable");
         None
+    };
+
+    let smtp_config = SmtpConfig {
+        domain: config.domain.name.clone(),
+        mx_host: config.domain.mx_host.clone(),
+        max_message_size,
+        max_recipients: 100,
+        tls_available: tls_acceptor.is_some(),
     };
 
     // Bind port 25 (inbound SMTP, STARTTLS)
@@ -344,33 +345,7 @@ async fn handle_connection(
                 };
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
-
-                // Handle async actions that need callbacks
-                let mut needs_starttls = false;
-                for action in &actions {
-                    match action {
-                        SmtpAction::ResolveHarmonyAddress { local_part, .. } => {
-                            use crate::message::ADDRESS_HASH_LEN;
-                            let identity = Some([0u8; ADDRESS_HASH_LEN]);
-                            let resolve_actions =
-                                session.handle(SmtpEvent::HarmonyResolved {
-                                    local_part: local_part.clone(),
-                                    identity,
-                                });
-                            execute_actions_generic(&resolve_actions, &mut writer).await?;
-                        }
-                        SmtpAction::DeliverToHarmony { .. } => {
-                            let result_actions =
-                                session.handle(SmtpEvent::DeliveryResult { success: true });
-                            execute_actions_generic(&result_actions, &mut writer).await?;
-                        }
-                        SmtpAction::CheckSpf { .. } => {}
-                        SmtpAction::StartTls => {
-                            needs_starttls = true;
-                        }
-                        _ => {}
-                    }
-                }
+                let needs_starttls = process_async_actions(&actions, &mut session, &mut writer).await?;
 
                 // STARTTLS: upgrade the connection to TLS
                 if needs_starttls {
@@ -490,31 +465,7 @@ where
                 };
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
-
-                for action in &actions {
-                    match action {
-                        SmtpAction::ResolveHarmonyAddress { local_part, .. } => {
-                            use crate::message::ADDRESS_HASH_LEN;
-                            let identity = Some([0u8; ADDRESS_HASH_LEN]);
-                            let resolve_actions =
-                                session.handle(SmtpEvent::HarmonyResolved {
-                                    local_part: local_part.clone(),
-                                    identity,
-                                });
-                            execute_actions_generic(&resolve_actions, &mut writer).await?;
-                        }
-                        SmtpAction::DeliverToHarmony { .. } => {
-                            let result_actions =
-                                session.handle(SmtpEvent::DeliveryResult { success: true });
-                            execute_actions_generic(&result_actions, &mut writer).await?;
-                        }
-                        SmtpAction::CheckSpf { .. } => {}
-                        SmtpAction::StartTls => {
-                            // Already on TLS — ignore (state machine would have rejected this)
-                        }
-                        _ => {}
-                    }
-                }
+                let _ = process_async_actions(&actions, &mut session, &mut writer).await?;
 
                 if should_close || session.state == SmtpState::Closed {
                     break;
@@ -595,6 +546,46 @@ async fn execute_actions_generic<W: AsyncWrite + Unpin>(
     Ok(should_close)
 }
 
+/// Process async action callbacks (address resolution, delivery, SPF).
+/// Returns true if a StartTls action was encountered.
+async fn process_async_actions<W: AsyncWrite + Unpin>(
+    actions: &[SmtpAction],
+    session: &mut SmtpSession,
+    writer: &mut W,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let mut needs_starttls = false;
+    for action in actions {
+        match action {
+            SmtpAction::ResolveHarmonyAddress { local_part, .. } => {
+                use crate::message::ADDRESS_HASH_LEN;
+                // Stub: all addresses resolve to a dummy identity.
+                // Real implementation will query the announce cache.
+                let identity = Some([0u8; ADDRESS_HASH_LEN]);
+                let resolve_actions = session.handle(SmtpEvent::HarmonyResolved {
+                    local_part: local_part.clone(),
+                    identity,
+                });
+                execute_actions_generic(&resolve_actions, writer).await?;
+            }
+            SmtpAction::DeliverToHarmony { .. } => {
+                // Stub: delivery always succeeds.
+                // Real implementation will deliver to Harmony network.
+                let result_actions =
+                    session.handle(SmtpEvent::DeliveryResult { success: true });
+                execute_actions_generic(&result_actions, writer).await?;
+            }
+            SmtpAction::CheckSpf { .. } => {
+                // Fire-and-forget for now
+            }
+            SmtpAction::StartTls => {
+                needs_starttls = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(needs_starttls)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +648,7 @@ node_config = "/tmp/test-node.toml"
             mx_host: config.domain.mx_host.clone(),
             max_message_size,
             max_recipients: 100,
+            tls_available: false,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -699,6 +691,7 @@ node_config = "/tmp/test-node.toml"
             mx_host: config.domain.mx_host.clone(),
             max_message_size,
             max_recipients: 100,
+            tls_available: false,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
