@@ -306,7 +306,7 @@ impl VectorIndex {
         Ok(Self { inner, config })
     }
 
-    /// Reserve capacity for additional vectors.
+    /// Reserve total capacity for vectors (including existing contents).
     pub fn reserve(&self, capacity: usize) -> SearchResult<()> {
         self.inner
             .reserve(capacity)

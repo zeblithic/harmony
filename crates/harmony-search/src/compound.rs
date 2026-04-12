@@ -33,7 +33,13 @@ impl CompoundIndex {
     }
 
     /// Add a vector to the delta index.
+    ///
+    /// If the key already exists in delta, the old entry is removed first
+    /// (USearch rejects duplicate adds with multi=false).
     pub fn add(&mut self, key: u64, vector: &[f32]) -> SearchResult<()> {
+        if self.delta_keys.contains(&key) {
+            self.delta.remove(key)?;
+        }
         self.delta.add(key, vector)?;
         self.delta_keys.insert(key);
         Ok(())
@@ -142,14 +148,19 @@ impl CompoundIndex {
         let dims = self.config.dimensions;
         let mut buf = vec![0.0f32; dims];
 
+        // Sort keys for deterministic iteration order — ensures serialized
+        // bytes are stable across runs (important for CAS/BLAKE3 dedup)
+        let mut sorted_keys: Vec<u64> = self.delta_keys.iter().copied().collect();
+        sorted_keys.sort_unstable();
+
         let merged = if let Some(ref base) = self.base {
             // Serialize base, load as writable copy — no vector loss
             let base_bytes = base.save_to_bytes()?;
             let loaded = VectorIndex::load_from_bytes(&base_bytes, self.config.clone())?;
             // Reserve extra capacity for delta insertions
-            loaded.reserve(base.len() + self.delta_keys.len() + 100)?;
+            loaded.reserve(base.len() + sorted_keys.len() + 100)?;
             // Remove base entries that delta will shadow (USearch rejects duplicate adds)
-            for &key in &self.delta_keys {
+            for &key in &sorted_keys {
                 if loaded.contains(key) {
                     loaded.remove(key)?;
                 }
@@ -157,23 +168,22 @@ impl CompoundIndex {
             loaded
         } else {
             let mut fresh_config = self.config.clone();
-            fresh_config.capacity = self.delta_keys.len() + 100;
+            fresh_config.capacity = sorted_keys.len() + 100;
             VectorIndex::new(fresh_config)?
         };
 
-        // Insert delta vectors
-        for &key in &self.delta_keys {
-            if self.delta.get(key, &mut buf)? {
-                merged.add(key, &buf)?;
+        // Insert delta vectors in sorted order
+        for key in &sorted_keys {
+            if self.delta.get(*key, &mut buf)? {
+                merged.add(*key, &buf)?;
             }
         }
 
         // Serialize the merged result
         let bytes = merged.save_to_bytes()?;
 
-        // Install merged as in-memory base before clearing delta
-        // (no query-visible data loss between compact and load_base)
-        self.base = Some(VectorIndex::load_from_bytes(&bytes, self.config.clone())?);
+        // Install merged directly as in-memory base (no redundant deserialize)
+        self.base = Some(merged);
 
         // Reset delta
         self.delta = VectorIndex::new(self.config.clone())?;
@@ -374,5 +384,23 @@ mod tests {
 
         assert_eq!(idx.len(), 3); // 2 base + 1 delta (double-counts)
         assert_eq!(idx.unique_len(), 2); // 2 unique keys
+    }
+
+    #[test]
+    fn update_same_key_within_delta() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+
+        // Add key 1 with one vector
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        // Update key 1 with a different vector (same delta, no compact)
+        idx.add(1, &[0.0, 0.0, 0.0, 1.0]).unwrap();
+
+        assert_eq!(idx.delta_len(), 1); // still one entry
+        assert_eq!(idx.delta_keys.len(), 1);
+
+        // Should find the updated vector
+        let results = idx.search(&[0.0, 0.0, 0.0, 1.0], 1).unwrap();
+        assert_eq!(results[0].key, 1);
+        assert!(results[0].distance < 0.01);
     }
 }
