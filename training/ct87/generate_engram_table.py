@@ -165,11 +165,23 @@ def generate_corpus_table(
             from sklearn.decomposition import PCA
 
             with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-                projected_full = (probs @ teacher_embed_matrix.astype(np.float32))
+                projected_full = probs @ teacher_embed_matrix
             np.nan_to_num(projected_full, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-            pca = PCA(n_components=embedding_dim)
-            projected = pca.fit_transform(projected_full).astype(np.float32)
+            n_components = min(
+                embedding_dim,
+                projected_full.shape[0],
+                projected_full.shape[1],
+            )
+            pca = PCA(n_components=n_components, random_state=projection_seed)
+            reduced = pca.fit_transform(projected_full).astype(np.float32)
+            if n_components < embedding_dim:
+                projected = np.zeros(
+                    (projected_full.shape[0], embedding_dim), dtype=np.float32,
+                )
+                projected[:, :n_components] = reduced
+            else:
+                projected = reduced
         else:
             # Random Johnson-Lindenstrauss projection
             rng = np.random.RandomState(projection_seed)

@@ -19,6 +19,9 @@ dependencies = [
 dev = [
     "pytest>=7.0",
 ]
+teacher = [
+    "scikit-learn>=1.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
