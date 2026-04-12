@@ -51,9 +51,9 @@ impl ChunkerConfig {
         let mu = self.target_size as f64;
         let sigma = self.std_dev;
 
-        // Normal CDF logistic approximation: F(x) = 1 / (1 + exp(-k*(x - mu)))
-        // where k = sqrt(2/pi) * (1/sigma) ≈ 0.7978845608 / sigma
-        let k = 0.7978845608028654_f64 / sigma;
+        // Normal CDF logistic approximation: Φ(z) ≈ 0.5*(1 + tanh(√(2/π)*z))
+        // which equals logistic(2*√(2/π)*z). So k = 2*√(2/π)/σ ≈ 1.5957691/σ.
+        let k = 2.0 * 0.7978845608028654_f64 / sigma;
 
         let f_s = logistic(k * (s - mu));
         let f_s_a = logistic(k * (s + a - mu));
