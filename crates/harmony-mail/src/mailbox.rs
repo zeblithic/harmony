@@ -288,6 +288,14 @@ impl MailFolder {
         pos += 4;
         let unread_count = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
         pos += 4;
+
+        if unread_count > message_count {
+            return Err(MailError::TooManyEntries {
+                count: unread_count as usize,
+                max: message_count as usize,
+            });
+        }
+
         let page_count = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
 
@@ -402,9 +410,9 @@ impl MessageEntry {
         pos += 2;
 
         if snippet_len > MAX_SNIPPET_LEN {
-            return Err(MailError::SubjectTooLong {
+            return Err(MailError::StringTooLong {
+                field: "subject_snippet",
                 len: snippet_len,
-                max: MAX_SNIPPET_LEN,
             });
         }
 
@@ -437,9 +445,12 @@ impl MessageEntry {
 
 // ── MailPage ───────────────────────────────────────────────────────────
 
-/// A page of message entries within a folder. Pages are linked — the
-/// newest page is referenced from the folder, and each page links to
-/// the next (older) page.
+/// A page of message entries within a folder.
+///
+/// NOTE: The folder's `page_cids` array is the canonical page index.
+/// The `next_page` field provides redundant linked-list traversal and
+/// must stay in sync with `page_cids` ordering. See ZEB-101 for the
+/// decision on whether to remove this dual linkage.
 ///
 /// Wire format:
 /// ```text
@@ -804,6 +815,63 @@ mod tests {
             assert_eq!(kind.name(), FOLDER_NAMES[i]);
         }
         assert!(FolderKind::from_u8(4).is_none());
+    }
+
+    #[test]
+    fn message_entry_rejects_invalid_read_flag() {
+        let entry = dummy_entry(1);
+        let mut bytes = entry.to_bytes();
+        // read flag is at offset: CID + message_id + sender + timestamp
+        let flag_offset = CID_LEN + MESSAGE_ID_LEN + ADDRESS_HASH_LEN + 8;
+        bytes[flag_offset] = 0x02;
+        assert!(matches!(
+            MessageEntry::from_bytes(&bytes),
+            Err(MailError::InvalidFlag { field: "read", value: 0x02 })
+        ));
+    }
+
+    #[test]
+    fn mail_page_rejects_entry_count_over_capacity() {
+        let page = MailPage {
+            version: MAILBOX_VERSION,
+            next_page: None,
+            entries: vec![dummy_entry(1)],
+        };
+        let mut bytes = page.to_bytes().unwrap();
+        // entry_count is a u16 at offset 6 (magic:4 + version:1 + has_next:1)
+        let count_offset = 6;
+        let bad_count = (PAGE_CAPACITY as u16) + 1;
+        bytes[count_offset..count_offset + 2].copy_from_slice(&bad_count.to_be_bytes());
+        assert!(matches!(
+            MailPage::from_bytes(&bytes),
+            Err(MailError::TooManyEntries { .. })
+        ));
+    }
+
+    #[test]
+    fn message_entry_rejects_oversized_snippet() {
+        let entry = dummy_entry(1);
+        let mut bytes = entry.to_bytes();
+        // snippet_len is a u16 at offset: CID + message_id + sender + timestamp + flags
+        let len_offset = CID_LEN + MESSAGE_ID_LEN + ADDRESS_HASH_LEN + 8 + 1;
+        let bad_len = (MAX_SNIPPET_LEN as u16) + 1;
+        bytes[len_offset..len_offset + 2].copy_from_slice(&bad_len.to_be_bytes());
+        assert!(matches!(
+            MessageEntry::from_bytes(&bytes),
+            Err(MailError::StringTooLong { field: "subject_snippet", .. })
+        ));
+    }
+
+    #[test]
+    fn mail_folder_rejects_unread_exceeding_total() {
+        let mut folder = MailFolder::new_empty();
+        folder.message_count = 5;
+        folder.unread_count = 10; // invalid: unread > total
+        let bytes = folder.to_bytes().unwrap();
+        assert!(matches!(
+            MailFolder::from_bytes(&bytes),
+            Err(MailError::TooManyEntries { .. })
+        ));
     }
 
     #[test]
