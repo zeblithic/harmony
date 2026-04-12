@@ -199,6 +199,7 @@ def generate_and_save_corpus_table(
     vocab_size: int = 32000,
     hash_seeds: list[int] | None = None,
     projection_seed: int = 0,
+    teacher_embed_matrix: np.ndarray | None = None,
 ) -> Path:
     """Load tokenized data, generate corpus-based table, and save.
 
@@ -211,6 +212,7 @@ def generate_and_save_corpus_table(
         vocab_size: Tokenizer vocabulary size.
         hash_seeds: xxhash64 seeds (default: [42,99,137,251]).
         projection_seed: Seed for random projection (default: 0).
+        teacher_embed_matrix: Optional teacher embedding matrix for projection.
 
     Returns:
         Path to the generated safetensors file.
@@ -236,6 +238,7 @@ def generate_and_save_corpus_table(
         vocab_size=vocab_size,
         hash_seeds=hash_seeds,
         projection_seed=projection_seed,
+        teacher_embed_matrix=teacher_embed_matrix,
     )
 
     nonzero = np.count_nonzero(np.linalg.norm(table, axis=1))
@@ -312,6 +315,11 @@ def main() -> None:
         "--projection-seed", type=int, default=0,
         help="Seed for random projection matrix (default: 0)",
     )
+    parser.add_argument(
+        "--teacher", type=str, default=None,
+        help="HuggingFace model name for teacher embedding projection "
+             "(e.g., mistralai/Mistral-7B-v0.1). Requires --corpus.",
+    )
     args = parser.parse_args()
 
     for flag, value in (
@@ -324,6 +332,9 @@ def main() -> None:
     if hasattr(args, "vocab_size") and args.vocab_size is not None and args.vocab_size <= 0:
         parser.error("--vocab-size must be > 0")
 
+    if args.teacher is not None and args.corpus is None:
+        parser.error("--teacher requires --corpus")
+
     # Row index is packed as uint32 in SHA-256 seed — validate range.
     if args.entries > 2**32:
         parser.error(f"--entries {args.entries} exceeds uint32 max (2**32)")
@@ -332,6 +343,25 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.corpus is not None:
+        teacher_embed_matrix = None
+        if args.teacher is not None:
+            import torch
+            from transformers import AutoModel
+
+            print(f"Loading teacher embeddings from {args.teacher}...")
+            teacher_model = AutoModel.from_pretrained(
+                args.teacher, torch_dtype=torch.float16,
+            )
+            teacher_embed_matrix = (
+                teacher_model.get_input_embeddings()
+                .weight.detach().float().numpy()
+            )
+            del teacher_model
+            print(
+                f"Teacher embeddings loaded: {teacher_embed_matrix.shape} "
+                f"({teacher_embed_matrix.nbytes / 1024 / 1024:.0f} MB)"
+            )
+
         generate_and_save_corpus_table(
             data_path=args.corpus,
             total_entries=args.entries,
@@ -340,6 +370,7 @@ def main() -> None:
             shard_size=args.shard_size,
             vocab_size=args.vocab_size,
             projection_seed=args.projection_seed,
+            teacher_embed_matrix=teacher_embed_matrix,
         )
     else:
         print(f"Generating {args.entries} random embeddings, dim={args.dim}...")
