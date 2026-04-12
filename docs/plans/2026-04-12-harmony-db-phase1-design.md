@@ -153,7 +153,9 @@ pub fn commit(&mut self, store: Option<&mut impl BookStore>)
 pub fn head(&self) -> Option<ContentId>;
 
 /// Diff two commits. Returns entries added, removed, or changed per table.
-pub fn diff(&self, old: ContentId, new: ContentId) -> Result<Diff, DbError>;
+/// Optionally provide a BookStore to fetch commit blobs not cached locally.
+pub fn diff(&self, old: ContentId, new: ContentId,
+            store: Option<&dyn BookStore>) -> Result<Diff, DbError>;
 
 /// Rebuild the in-memory index from a CAS commit snapshot.
 /// Fetches blobs locally first, falls back to BookStore if provided.
