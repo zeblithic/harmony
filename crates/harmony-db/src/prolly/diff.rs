@@ -159,13 +159,16 @@ fn diff_branches(
 }
 
 /// Find the next boundary key that appears in both remaining slices.
+/// Uses a two-pointer merge (O(n)) since both slices are sorted by boundary_key.
 fn find_sync_key(a: &[BranchEntry], b: &[BranchEntry]) -> Option<Vec<u8>> {
-    // Skip the first entries (they're the ones that don't match).
-    for ea in a.iter().skip(1) {
-        for eb in b.iter().skip(1) {
-            if ea.boundary_key == eb.boundary_key {
-                return Some(ea.boundary_key.clone());
-            }
+    use std::cmp::Ordering;
+    let mut i = 1; // Skip first entries (they're the ones that don't match).
+    let mut j = 1;
+    while i < a.len() && j < b.len() {
+        match a[i].boundary_key.cmp(&b[j].boundary_key) {
+            Ordering::Equal => return Some(a[i].boundary_key.clone()),
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
         }
     }
     None

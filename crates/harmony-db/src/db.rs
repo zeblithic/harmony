@@ -208,10 +208,18 @@ impl HarmonyDb {
             }
 
             // Manifest last — atomic visibility.
-            s.insert_with_flags(&manifest_bytes, ContentFlags::default())
+            let stored_manifest_cid = s
+                .insert_with_flags(&manifest_bytes, ContentFlags::default())
                 .map_err(|e| {
                     DbError::Serialize(format!("BookStore manifest push failed: {e:?}"))
                 })?;
+            if stored_manifest_cid != root_cid {
+                return Err(DbError::CorruptIndex(format!(
+                    "manifest CID mismatch: local {} vs store {}",
+                    hex::encode(root_cid.to_bytes()),
+                    hex::encode(stored_manifest_cid.to_bytes())
+                )));
+            }
         }
 
         // Persist before updating in-memory state so a failed save
