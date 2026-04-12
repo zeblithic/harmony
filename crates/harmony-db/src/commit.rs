@@ -209,7 +209,7 @@ pub(crate) fn diff_commits(
                 tables.insert(name.clone(), td);
             }
         } else {
-            let new_entries = load_page(data_dir, new_page_hex, None)?;
+            let new_entries = load_page(data_dir, new_page_hex, store)?;
             tables.insert(name.clone(), crate::types::TableDiff {
                 added: new_entries,
                 removed: Vec::new(),
