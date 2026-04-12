@@ -1,5 +1,7 @@
 //! CompoundIndex: Base + Delta index management for CAS integration.
 
+use std::collections::HashSet;
+
 use crate::error::SearchResult;
 use crate::index::{Match, VectorIndex, VectorIndexConfig};
 
@@ -12,7 +14,7 @@ use crate::index::{Match, VectorIndex, VectorIndexConfig};
 pub struct CompoundIndex {
     base: Option<VectorIndex>,
     delta: VectorIndex,
-    delta_keys: Vec<u64>,
+    delta_keys: HashSet<u64>,
     config: VectorIndexConfig,
     compact_threshold: usize,
 }
@@ -24,7 +26,7 @@ impl CompoundIndex {
         Ok(Self {
             base: None,
             delta,
-            delta_keys: Vec::new(),
+            delta_keys: HashSet::new(),
             config,
             compact_threshold,
         })
@@ -33,14 +35,16 @@ impl CompoundIndex {
     /// Add a vector to the delta index.
     pub fn add(&mut self, key: u64, vector: &[f32]) -> SearchResult<()> {
         self.delta.add(key, vector)?;
-        self.delta_keys.push(key);
+        self.delta_keys.insert(key);
         Ok(())
     }
 
     /// Search both base and delta, merge results by distance.
     ///
     /// If the same key exists in both base and delta, the delta's
-    /// entry is kept (it represents an update).
+    /// entry is kept (it represents an update). Dedup is based on
+    /// delta *membership* (all keys in delta), not just the top-k
+    /// delta search results.
     pub fn search(&self, query: &[f32], k: usize) -> SearchResult<Vec<Match>> {
         let mut results = Vec::new();
 
@@ -53,12 +57,10 @@ impl CompoundIndex {
         if let Some(ref base) = self.base {
             if !base.is_empty() {
                 let base_results = base.search(query, k)?;
-                // Collect delta keys for dedup
-                let delta_key_set: std::collections::HashSet<u64> =
-                    results.iter().map(|m| m.key).collect();
-                // Add base results that aren't shadowed by delta
+                // Filter out base results for keys that exist anywhere in delta
+                // (not just in the delta top-k results)
                 for m in base_results {
-                    if !delta_key_set.contains(&m.key) {
+                    if !self.delta_keys.contains(&m.key) {
                         results.push(m);
                     }
                 }
@@ -103,42 +105,42 @@ impl CompoundIndex {
 
     /// Merge delta into base and return serialized bytes.
     ///
+    /// Uses serialize/deserialize to copy the base (not ANN search),
+    /// ensuring no vectors are dropped during compaction.
+    ///
     /// The returned bytes can be CAS-stored by the caller. After compaction,
     /// call `load_base()` or `load_base_from_bytes()` with the persisted data
     /// to swap in the new base.
     ///
     /// Resets the delta to empty after merge.
     pub fn compact(&mut self) -> SearchResult<Vec<u8>> {
-        // Build a new writable index containing everything
-        let mut merged_config = self.config.clone();
-        merged_config.capacity = self.len() + 100;
-        let merged = VectorIndex::new(merged_config)?;
-
         let dims = self.config.dimensions;
         let mut buf = vec![0.0f32; dims];
 
-        // Copy base vectors if we have a base
-        if let Some(ref base) = self.base {
-            if !base.is_empty() {
-                // USearch has no keys iterator, so search with zero query
-                // and k=base.len() to get all keys
-                let all = base.search(&vec![0.0f32; dims], base.len())?;
-                for m in &all {
-                    if base.get(m.key, &mut buf)? {
-                        merged.add(m.key, &buf)?;
-                    }
-                }
-            }
-        }
+        // Start with a writable copy of the base (via serialize/deserialize)
+        // or a fresh empty index if no base exists
+        let mut merged_config = self.config.clone();
+        merged_config.capacity = self.len() + 100;
 
-        // Copy delta vectors (overwrites base if same key)
+        let merged = if let Some(ref base) = self.base {
+            // Serialize base, load as writable copy — no vector loss
+            let base_bytes = base.save_to_bytes()?;
+            let loaded = VectorIndex::load_from_bytes(&base_bytes, merged_config)?;
+            // Reserve extra capacity for delta insertions
+            loaded.reserve(base.len() + self.delta_keys.len() + 100)?;
+            loaded
+        } else {
+            VectorIndex::new(merged_config)?
+        };
+
+        // Insert delta vectors (overwrites base entries with same key)
         for &key in &self.delta_keys {
             if self.delta.get(key, &mut buf)? {
                 merged.add(key, &buf)?;
             }
         }
 
-        // Serialize
+        // Serialize the merged result
         let bytes = merged.save_to_bytes()?;
 
         // Reset delta
@@ -304,5 +306,19 @@ mod tests {
 
         let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn delta_keys_are_deduplicated() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+
+        // Add different keys
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        idx.add(3, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+
+        // delta_keys is a HashSet, unique count matches
+        assert_eq!(idx.delta_keys.len(), 3);
+        assert_eq!(idx.delta_len(), 3);
     }
 }

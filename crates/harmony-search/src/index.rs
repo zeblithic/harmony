@@ -306,8 +306,22 @@ impl VectorIndex {
         Ok(Self { inner, config })
     }
 
+    /// Reserve capacity for additional vectors.
+    pub fn reserve(&self, capacity: usize) -> SearchResult<()> {
+        self.inner
+            .reserve(capacity)
+            .map_err(|e| SearchError::Index(e.to_string()))
+    }
+
     /// Retrieve a vector by key. Returns true if found, false if not.
     pub fn get(&self, key: u64, buffer: &mut [f32]) -> SearchResult<bool> {
+        if buffer.len() != self.config.dimensions {
+            return Err(SearchError::InvalidConfig(format!(
+                "buffer length {} does not match index dimensions {}",
+                buffer.len(),
+                self.config.dimensions
+            )));
+        }
         match self.inner.get(key, buffer) {
             Ok(count) => Ok(count > 0),
             Err(e) => Err(SearchError::Index(e.to_string())),
