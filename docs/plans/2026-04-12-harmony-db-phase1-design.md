@@ -187,7 +187,7 @@ pub struct TableDiff {
 
 ## On-Disk Layout
 
-```
+```text
 data_dir/
 ├── index.json              # local cache: all tables + head CID
 ├── index.json.tmp          # atomic write staging (transient)
@@ -242,6 +242,7 @@ old file or the new file exists, never a partial write.
 Stored in `commits/` as content-addressed blobs:
 
 **Root manifest:**
+
 ```json
 {
   "version": 1,

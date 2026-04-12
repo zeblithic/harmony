@@ -12,7 +12,7 @@
 
 ## File Structure
 
-```
+```text
 harmony/crates/harmony-db/
 ├── Cargo.toml          # Crate manifest, workspace deps
 ├── src/
