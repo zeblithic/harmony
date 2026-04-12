@@ -214,9 +214,16 @@ impl HarmonyDb {
                 })?;
         }
 
+        // Persist before updating in-memory state so a failed save
+        // doesn't leave head inconsistent with disk.
         let new_head = Some(root_cid);
+        let table_roots: BTreeMap<String, Option<ContentId>> = self
+            .tables
+            .iter()
+            .map(|(n, t): (&String, &ProllyTree)| (n.clone(), t.root()))
+            .collect();
+        persist::save_roots(&self.data_dir, new_head, &table_roots)?;
         self.head = new_head;
-        self.save_roots()?;
         Ok(root_cid)
     }
 

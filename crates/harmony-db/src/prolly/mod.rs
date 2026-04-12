@@ -183,6 +183,7 @@ pub(crate) fn build_tree(
 
     // Build branch levels until single root.
     loop {
+        let prev_len = branch_entries.len();
         let branch_chunks = chunk_items(
             &branch_entries,
             config,
@@ -201,6 +202,14 @@ pub(crate) fn build_tree(
         }
         if next_level.len() == 1 {
             return Ok(Some(ContentId::from_bytes(next_level[0].child_cid)));
+        }
+        // Guard against infinite loop: if chunking didn't reduce the count
+        // (e.g., large boundary keys where each entry exceeds min_size),
+        // force convergence by wrapping everything into a single root.
+        if next_level.len() >= prev_len {
+            let node = Node::Branch(next_level);
+            let cid = node.write_to_cas(data_dir)?;
+            return Ok(Some(cid));
         }
         branch_entries = next_level;
     }
