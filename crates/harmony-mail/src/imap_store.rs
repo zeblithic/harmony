@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::message::{ADDRESS_HASH_LEN, MESSAGE_ID_LEN};
+use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 
 // ── Schema version ──────────────────────────────────────────────────
 
@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS messages (
     mailbox_id     INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
     uid            INTEGER NOT NULL,
     harmony_msg_id BLOB NOT NULL,
+    message_cid    BLOB,
     internal_date  INTEGER NOT NULL,
     rfc822_size    INTEGER NOT NULL DEFAULT 0,
     UNIQUE(mailbox_id, uid)
@@ -97,6 +98,9 @@ pub struct MessageRow {
     pub mailbox_id: i64,
     pub uid: u32,
     pub harmony_msg_id: [u8; MESSAGE_ID_LEN],
+    /// Content-addressed storage CID for fetching the message blob.
+    /// None for messages inserted before CAS integration.
+    pub message_cid: Option<[u8; CID_LEN]>,
     pub internal_date: u64,
     pub rfc822_size: u32,
 }
@@ -118,7 +122,13 @@ pub struct ImapStore {
     conn: Mutex<rusqlite::Connection>,
 }
 
-// Safety: The Mutex serializes all access to the !Send rusqlite::Connection.
+// Safety: rusqlite::Connection is !Send because it wraps a raw *mut sqlite3
+// pointer. However, SQLite is compiled with SQLITE_THREADSAFE=1 (serialized mode)
+// by default in the `bundled` feature, meaning the library itself is thread-safe.
+// The Mutex<Connection> ensures only one thread accesses the connection at a time,
+// satisfying the requirement that a single connection is not used concurrently.
+// The spawn_blocking path for argon2 moves the Arc<ImapStore> to a thread pool
+// thread, which is safe because the Mutex prevents concurrent connection access.
 unsafe impl Send for ImapStore {}
 unsafe impl Sync for ImapStore {}
 
@@ -187,7 +197,7 @@ impl ImapStore {
     pub fn get_mailbox(&self, name: &str) -> Result<Option<MailboxRow>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, uid_validity, uid_next, subscribed FROM mailboxes WHERE name = ?1",
+            "SELECT id, name, uid_validity, uid_next, subscribed FROM mailboxes WHERE name = ?1 COLLATE NOCASE",
         )?;
         let row = stmt
             .query_row([name], |row| {
@@ -221,13 +231,16 @@ impl ImapStore {
     }
 
     pub fn delete_mailbox(&self, name: &str) -> Result<(), StoreError> {
-        if name == "INBOX" {
+        if name.eq_ignore_ascii_case("INBOX") {
             return Err(StoreError::MailboxNotFound(
                 "cannot delete INBOX".to_string(),
             ));
         }
         let conn = self.conn.lock().unwrap();
-        let affected = conn.execute("DELETE FROM mailboxes WHERE name = ?1", [name])?;
+        let affected = conn.execute(
+            "DELETE FROM mailboxes WHERE name = ?1 COLLATE NOCASE",
+            [name],
+        )?;
         if affected == 0 {
             return Err(StoreError::MailboxNotFound(name.to_string()));
         }
@@ -284,6 +297,7 @@ impl ImapStore {
         &self,
         mailbox_name: &str,
         harmony_msg_id: &[u8; MESSAGE_ID_LEN],
+        message_cid: Option<&[u8; CID_LEN]>,
         internal_date: u64,
         rfc822_size: u32,
     ) -> Result<u32, StoreError> {
@@ -303,9 +317,10 @@ impl ImapStore {
             "UPDATE mailboxes SET uid_next = ?1 WHERE id = ?2",
             rusqlite::params![uid + 1, mailbox_id],
         )?;
+        let cid_slice: Option<&[u8]> = message_cid.map(|c| c.as_slice());
         tx.execute(
-            "INSERT INTO messages (mailbox_id, uid, harmony_msg_id, internal_date, rfc822_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![mailbox_id, uid, harmony_msg_id.as_slice(), internal_date, rfc822_size],
+            "INSERT INTO messages (mailbox_id, uid, harmony_msg_id, message_cid, internal_date, rfc822_size) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![mailbox_id, uid, harmony_msg_id.as_slice(), cid_slice, internal_date, rfc822_size],
         )?;
         tx.commit()?;
         Ok(uid)
@@ -314,7 +329,7 @@ impl ImapStore {
     pub fn get_messages(&self, mailbox_id: i64) -> Result<Vec<MessageRow>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, mailbox_id, uid, harmony_msg_id, internal_date, rfc822_size FROM messages WHERE mailbox_id = ?1 ORDER BY uid",
+            "SELECT id, mailbox_id, uid, harmony_msg_id, message_cid, internal_date, rfc822_size FROM messages WHERE mailbox_id = ?1 ORDER BY uid",
         )?;
         let rows = stmt
             .query_map([mailbox_id], row_to_message)?
@@ -329,7 +344,7 @@ impl ImapStore {
     ) -> Result<Option<MessageRow>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, mailbox_id, uid, harmony_msg_id, internal_date, rfc822_size FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+            "SELECT id, mailbox_id, uid, harmony_msg_id, message_cid, internal_date, rfc822_size FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
         )?;
         let row = stmt
             .query_row(rusqlite::params![mailbox_id, uid], row_to_message)
@@ -345,7 +360,7 @@ impl ImapStore {
     ) -> Result<Vec<MessageRow>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, mailbox_id, uid, harmony_msg_id, internal_date, rfc822_size FROM messages WHERE mailbox_id = ?1 AND uid >= ?2 AND uid <= ?3 ORDER BY uid",
+            "SELECT id, mailbox_id, uid, harmony_msg_id, message_cid, internal_date, rfc822_size FROM messages WHERE mailbox_id = ?1 AND uid >= ?2 AND uid <= ?3 ORDER BY uid",
         )?;
         let rows = stmt
             .query_map(
@@ -382,6 +397,24 @@ impl ImapStore {
             [mailbox_id], |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Get the 1-based sequence number of the first unseen message, or None if all are seen.
+    pub fn first_unseen_seqnum(&self, mailbox_id: i64) -> Result<Option<u32>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // Messages ordered by UID; sequence number = 1-based position
+        let result: Option<u32> = conn
+            .query_row(
+                "SELECT MIN(sub.seqnum) FROM (\
+                     SELECT ROW_NUMBER() OVER (ORDER BY m.uid) AS seqnum, m.id \
+                     FROM messages m WHERE m.mailbox_id = ?1\
+                 ) sub WHERE sub.id NOT IN (SELECT message_id FROM flags WHERE flag = '\\Seen')",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(result)
     }
 
     // ── Flag operations ─────────────────────────────────────────────
@@ -473,16 +506,17 @@ impl ImapStore {
         let mut mapping = Vec::with_capacity(uids.len());
         for &src_uid in uids {
             let msg: MessageRow = tx.query_row(
-                "SELECT id, mailbox_id, uid, harmony_msg_id, internal_date, rfc822_size FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+                "SELECT id, mailbox_id, uid, harmony_msg_id, message_cid, internal_date, rfc822_size FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
                 rusqlite::params![src_mailbox_id, src_uid],
                 row_to_message,
             ).map_err(|_| StoreError::MessageNotFound)?;
 
             let new_uid = dst_uid_next;
             dst_uid_next += 1;
+            let cid_slice: Option<&[u8]> = msg.message_cid.as_ref().map(|c| c.as_slice());
             tx.execute(
-                "INSERT INTO messages (mailbox_id, uid, harmony_msg_id, internal_date, rfc822_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![dst_id, new_uid, msg.harmony_msg_id.as_slice(), msg.internal_date, msg.rfc822_size],
+                "INSERT INTO messages (mailbox_id, uid, harmony_msg_id, message_cid, internal_date, rfc822_size) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![dst_id, new_uid, msg.harmony_msg_id.as_slice(), cid_slice, msg.internal_date, msg.rfc822_size],
             )?;
             let new_msg_id = tx.last_insert_rowid();
             tx.execute("INSERT INTO flags (message_id, flag) SELECT ?1, flag FROM flags WHERE message_id = ?2", rusqlite::params![new_msg_id, msg.id])?;
@@ -530,7 +564,15 @@ impl ImapStore {
                 [username],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
-            .map_err(|_| StoreError::AuthFailed)?;
+            .map_err(|_| {
+                // Perform a dummy argon2 verification to prevent username enumeration
+                // via timing side channel (missing user would otherwise return instantly)
+                let _ = verify_password(
+                    password,
+                    "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                );
+                StoreError::AuthFailed
+            })?;
         // Drop the lock before password verification (CPU-intensive)
         drop(conn);
 
@@ -574,19 +616,32 @@ impl ImapStore {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+/// Parse a MessageRow from a query returning:
+/// (id, mailbox_id, uid, harmony_msg_id, message_cid, internal_date, rfc822_size)
 fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<MessageRow> {
     let harmony_blob: Vec<u8> = row.get(3)?;
     let mut harmony_msg_id = [0u8; MESSAGE_ID_LEN];
     if harmony_blob.len() == MESSAGE_ID_LEN {
         harmony_msg_id.copy_from_slice(&harmony_blob);
     }
+    let cid_blob: Option<Vec<u8>> = row.get(4)?;
+    let message_cid = cid_blob.and_then(|b| {
+        if b.len() == CID_LEN {
+            let mut cid = [0u8; CID_LEN];
+            cid.copy_from_slice(&b);
+            Some(cid)
+        } else {
+            None
+        }
+    });
     Ok(MessageRow {
         id: row.get(0)?,
         mailbox_id: row.get(1)?,
         uid: row.get(2)?,
         harmony_msg_id,
-        internal_date: row.get(4)?,
-        rfc822_size: row.get(5)?,
+        message_cid,
+        internal_date: row.get(5)?,
+        rfc822_size: row.get(6)?,
     })
 }
 
@@ -709,19 +764,19 @@ mod tests {
         let store = test_store();
         assert_eq!(
             store
-                .insert_message("INBOX", &[0xAA; MESSAGE_ID_LEN], 1000, 500)
+                .insert_message("INBOX", &[0xAA; MESSAGE_ID_LEN], None, 1000, 500)
                 .unwrap(),
             1
         );
         assert_eq!(
             store
-                .insert_message("INBOX", &[0xBB; MESSAGE_ID_LEN], 1001, 600)
+                .insert_message("INBOX", &[0xBB; MESSAGE_ID_LEN], None, 1001, 600)
                 .unwrap(),
             2
         );
         assert_eq!(
             store
-                .insert_message("INBOX", &[0xCC; MESSAGE_ID_LEN], 1002, 700)
+                .insert_message("INBOX", &[0xCC; MESSAGE_ID_LEN], None, 1002, 700)
                 .unwrap(),
             3
         );
@@ -733,10 +788,10 @@ mod tests {
         let store = test_store();
         let mbox = store.get_mailbox("INBOX").unwrap().unwrap();
         store
-            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], 100, 10)
+            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], None, 100, 10)
             .unwrap();
         store
-            .insert_message("INBOX", &[2; MESSAGE_ID_LEN], 200, 20)
+            .insert_message("INBOX", &[2; MESSAGE_ID_LEN], None, 200, 20)
             .unwrap();
         let messages = store.get_messages(mbox.id).unwrap();
         assert_eq!(messages.len(), 2);
@@ -749,7 +804,7 @@ mod tests {
         let store = test_store();
         let mbox = store.get_mailbox("INBOX").unwrap().unwrap();
         store
-            .insert_message("INBOX", &[0xAA; MESSAGE_ID_LEN], 100, 10)
+            .insert_message("INBOX", &[0xAA; MESSAGE_ID_LEN], None, 100, 10)
             .unwrap();
         assert!(store.get_message_by_uid(mbox.id, 1).unwrap().is_some());
         assert!(store.get_message_by_uid(mbox.id, 99).unwrap().is_none());
@@ -761,7 +816,7 @@ mod tests {
         let mbox = store.get_mailbox("INBOX").unwrap().unwrap();
         for i in 0..5 {
             store
-                .insert_message("INBOX", &[i; MESSAGE_ID_LEN], 100 + i as u64, 10)
+                .insert_message("INBOX", &[i; MESSAGE_ID_LEN], None, 100 + i as u64, 10)
                 .unwrap();
         }
         let range = store.get_messages_by_uid_range(mbox.id, 2, 4).unwrap();
@@ -776,10 +831,10 @@ mod tests {
         let mbox = store.get_mailbox("INBOX").unwrap().unwrap();
         assert_eq!(store.count_messages(mbox.id).unwrap(), 0);
         store
-            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], 100, 10)
+            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], None, 100, 10)
             .unwrap();
         store
-            .insert_message("INBOX", &[2; MESSAGE_ID_LEN], 200, 20)
+            .insert_message("INBOX", &[2; MESSAGE_ID_LEN], None, 200, 20)
             .unwrap();
         assert_eq!(store.count_messages(mbox.id).unwrap(), 2);
     }
@@ -788,7 +843,7 @@ mod tests {
     fn flag_operations() {
         let store = test_store();
         store
-            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], 100, 10)
+            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], None, 100, 10)
             .unwrap();
         let mbox = store.get_mailbox("INBOX").unwrap().unwrap();
         let msg = store
@@ -816,13 +871,13 @@ mod tests {
         let store = test_store();
         let mbox = store.get_mailbox("INBOX").unwrap().unwrap();
         store
-            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], 100, 10)
+            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], None, 100, 10)
             .unwrap();
         store
-            .insert_message("INBOX", &[2; MESSAGE_ID_LEN], 200, 20)
+            .insert_message("INBOX", &[2; MESSAGE_ID_LEN], None, 200, 20)
             .unwrap();
         store
-            .insert_message("INBOX", &[3; MESSAGE_ID_LEN], 300, 30)
+            .insert_message("INBOX", &[3; MESSAGE_ID_LEN], None, 300, 30)
             .unwrap();
         let messages = store.get_messages(mbox.id).unwrap();
         store.add_flags(messages[1].id, &["\\Deleted"]).unwrap();
@@ -835,10 +890,10 @@ mod tests {
     fn copy_messages_between_mailboxes() {
         let store = test_store();
         store
-            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], 100, 10)
+            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], None, 100, 10)
             .unwrap();
         store
-            .insert_message("INBOX", &[2; MESSAGE_ID_LEN], 200, 20)
+            .insert_message("INBOX", &[2; MESSAGE_ID_LEN], None, 200, 20)
             .unwrap();
         let inbox = store.get_mailbox("INBOX").unwrap().unwrap();
         let msgs = store.get_messages(inbox.id).unwrap();
@@ -858,13 +913,13 @@ mod tests {
         let store = test_store();
         let mbox = store.get_mailbox("INBOX").unwrap().unwrap();
         store
-            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], 100, 10)
+            .insert_message("INBOX", &[1; MESSAGE_ID_LEN], None, 100, 10)
             .unwrap();
         store
-            .insert_message("INBOX", &[2; MESSAGE_ID_LEN], 200, 20)
+            .insert_message("INBOX", &[2; MESSAGE_ID_LEN], None, 200, 20)
             .unwrap();
         store
-            .insert_message("INBOX", &[3; MESSAGE_ID_LEN], 300, 30)
+            .insert_message("INBOX", &[3; MESSAGE_ID_LEN], None, 300, 30)
             .unwrap();
         let msgs = store.get_messages(mbox.id).unwrap();
         store.add_flags(msgs[0].id, &["\\Recent"]).unwrap();

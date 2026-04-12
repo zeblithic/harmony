@@ -390,7 +390,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                     let imap_cfg = ImapConfig {
                                         domain: d,
                                         tls_active: false,
-                                        tls_available: acc.is_some(),
+                                        // STARTTLS upgrade not yet wired on port 143 — don't
+                                        // advertise it until the upgrade path is implemented
+                                        tls_available: false,
                                         max_auth_failures: imap_max_auth_failures,
                                     };
                                     if let Err(e) = handle_imap_connection_starttls(reader, writer, imap_cfg, st, imap_idle_timeout, acc).await {
@@ -680,7 +682,7 @@ where
                     tracing::debug!(%peer_ip, "message too large");
                     let _ = writer.write_all(b"552 5.3.4 Message too large\r\n").await;
                     framed.decoder_mut().enter_command_mode();
-                    session.handle(SmtpEvent::Command(crate::smtp::SmtpCommand::Rset));
+                    session.reset_transaction();
                 } else {
                     tracing::debug!(%peer_ip, error = %e, "codec error");
                     let _ = writer
@@ -1016,7 +1018,7 @@ where
                         total_messages: total,
                         recent_count: recent,
                         unseen_count: unseen,
-                        first_unseen: if unseen > 0 { Some(1) } else { None },
+                        first_unseen: store.first_unseen_seqnum(mbox.id).unwrap_or(None),
                         read_only: *read_only,
                     };
                     let callback = session.handle(ImapEvent::MailboxLoaded(snapshot));
@@ -1036,7 +1038,8 @@ where
             ImapAction::ListMailboxes { pattern, .. } => {
                 let mailboxes = store.list_mailboxes(pattern).unwrap_or_default();
                 for mbox in &mailboxes {
-                    let line = format!("* LIST () NIL {}\r\n", mbox.name);
+                    let quoted = imap_quote_mailbox(&mbox.name);
+                    let line = format!("* LIST () NIL {quoted}\r\n");
                     writer.write_all(line.as_bytes()).await?;
                 }
                 // The tagged OK is sent by the state machine after the action completes.
@@ -1076,16 +1079,21 @@ where
                             }
                         }
                     }
+                    let quoted = imap_quote_mailbox(mailbox);
                     writer
                         .write_all(
-                            format!("* STATUS {} ({})\r\n", mailbox, status_items.join(" "))
+                            format!("* STATUS {quoted} ({})\r\n", status_items.join(" "))
                                 .as_bytes(),
                         )
                         .await?;
-                }
-                if let Some(tag) = session.pending_tag.take() {
+                    if let Some(tag) = session.pending_tag.take() {
+                        writer
+                            .write_all(format!("{tag} OK STATUS completed\r\n").as_bytes())
+                            .await?;
+                    }
+                } else if let Some(tag) = session.pending_tag.take() {
                     writer
-                        .write_all(format!("{tag} OK STATUS completed\r\n").as_bytes())
+                        .write_all(format!("{tag} NO mailbox not found\r\n").as_bytes())
                         .await?;
                 }
                 writer.flush().await?;
@@ -1188,49 +1196,50 @@ where
                     }
                 }
             }
-            ImapAction::StoreFlags {
-                sequence_set: _,
-                operation: _,
-                flags: _,
-                uid_mode: _,
-                silent,
-            } => {
-                // Stub: STORE is acknowledged without actual Harmony integration
-                let updated = Vec::new();
-                if !silent {
-                    let callback = session.handle(ImapEvent::StoreComplete { updated });
-                    execute_imap_actions(&callback, writer).await?;
-                } else {
-                    // Silent: just send tagged OK
-                    if let Some(tag) = session.pending_tag.take() {
-                        writer
-                            .write_all(format!("{tag} OK STORE completed\r\n").as_bytes())
-                            .await?;
-                    }
-                    writer.flush().await?;
-                }
-            }
-            ImapAction::FetchMessages { .. } => {
-                // Stub: FETCH requires Harmony message retrieval + rendering
-                // For v1.1, send tagged OK without data
+            ImapAction::StoreFlags { .. } => {
+                // Not yet wired to Harmony message storage
                 if let Some(tag) = session.pending_tag.take() {
                     writer
-                        .write_all(format!("{tag} OK FETCH completed\r\n").as_bytes())
+                        .write_all(
+                            format!("{tag} NO [CANNOT] STORE not yet implemented\r\n").as_bytes(),
+                        )
+                        .await?;
+                }
+                writer.flush().await?;
+            }
+            ImapAction::FetchMessages { .. } => {
+                // Not yet wired to Harmony message retrieval + rendering
+                if let Some(tag) = session.pending_tag.take() {
+                    writer
+                        .write_all(
+                            format!("{tag} NO [CANNOT] FETCH not yet implemented\r\n").as_bytes(),
+                        )
                         .await?;
                 }
                 writer.flush().await?;
             }
             ImapAction::Search { .. } => {
-                // Stub: return empty results
-                let callback = session.handle(ImapEvent::SearchComplete { results: vec![] });
-                execute_imap_actions(&callback, writer).await?;
+                // Not yet wired to store search
+                if let Some(tag) = session.pending_tag.take() {
+                    writer
+                        .write_all(
+                            format!("{tag} NO [CANNOT] SEARCH not yet implemented\r\n").as_bytes(),
+                        )
+                        .await?;
+                }
+                writer.flush().await?;
             }
             ImapAction::CopyMessages { .. } => {
-                // Stub: return empty mapping
-                let callback = session.handle(ImapEvent::CopyComplete {
-                    uid_mapping: vec![],
-                });
-                execute_imap_actions(&callback, writer).await?;
+                // Not yet wired to store copy
+                if let Some(tag) = session.pending_tag.take() {
+                    writer
+                        .write_all(
+                            format!("{tag} NO [CANNOT] COPY/MOVE not yet implemented\r\n")
+                                .as_bytes(),
+                        )
+                        .await?;
+                }
+                writer.flush().await?;
             }
             ImapAction::StartIdle { .. } => {
                 framed.decoder_mut().enter_idle_mode();
@@ -1240,8 +1249,18 @@ where
             ImapAction::StopIdle => {
                 framed.decoder_mut().exit_idle_mode();
             }
+            ImapAction::CloseExpunge { tag, mailbox } => {
+                // RFC 9051 §6.4.2: CLOSE silently expunges — no untagged EXPUNGE responses.
+                if let Ok(Some(mbox)) = store.get_mailbox(mailbox) {
+                    let _ = store.expunge(mbox.id);
+                }
+                writer
+                    .write_all(format!("{tag} OK CLOSE completed\r\n").as_bytes())
+                    .await?;
+                writer.flush().await?;
+            }
             ImapAction::StartTls => {
-                // STARTTLS for IMAP — not yet wired in v1.1 (port 143 handler)
+                // STARTTLS for IMAP — not yet wired (tls_available=false prevents advertisement)
                 tracing::debug!("IMAP STARTTLS requested but not yet implemented");
             }
             // Synchronous actions already handled by execute_imap_actions
@@ -1252,6 +1271,40 @@ where
         }
     }
     Ok(())
+}
+
+/// Quote a mailbox name for safe inclusion in IMAP responses.
+/// Returns the name as-is if it's atom-safe, otherwise wraps in double quotes
+/// with proper escaping. Prevents CRLF injection via crafted mailbox names.
+fn imap_quote_mailbox(name: &str) -> String {
+    // Atom-safe: printable ASCII excluding specials per RFC 9051 §9 formal syntax
+    let needs_quoting = name.is_empty()
+        || name.bytes().any(|b| {
+            b <= 0x20
+                || b >= 0x7F
+                || matches!(
+                    b,
+                    b'"' | b'\\' | b'(' | b')' | b'{' | b'}' | b' ' | b'*' | b'%'
+                )
+        });
+
+    if !needs_quoting {
+        name.to_string()
+    } else {
+        let mut quoted = String::with_capacity(name.len() + 4);
+        quoted.push('"');
+        for ch in name.chars() {
+            if ch == '"' || ch == '\\' {
+                quoted.push('\\');
+            }
+            // Strip control characters including CR/LF to prevent injection
+            if ch >= ' ' && ch != '\x7f' {
+                quoted.push(ch);
+            }
+        }
+        quoted.push('"');
+        quoted
+    }
 }
 
 #[cfg(test)]

@@ -192,6 +192,9 @@ pub enum ImapAction {
     StopIdle,
     /// Initiate TLS upgrade.
     StartTls,
+    /// Silent expunge + tagged OK for CLOSE command (RFC 9051 §6.4.2).
+    /// Unlike Expunge, this does NOT send untagged EXPUNGE responses.
+    CloseExpunge { tag: String, mailbox: String },
     /// Close the connection.
     Close,
 }
@@ -534,17 +537,27 @@ impl ImapSession {
     fn handle_close(&mut self, tag: String) -> Vec<ImapAction> {
         match &self.state {
             ImapState::Selected { username, mailbox } => {
+                let read_only = mailbox.read_only;
+                let mailbox_name = mailbox.name.clone();
                 let username = username.clone();
-                let _was_readonly = mailbox.read_only;
                 self.state = ImapState::Authenticated { username };
-                // CLOSE implicitly expunges (if not read-only)
-                // For simplicity in v1.1, we just close without expunge
-                vec![ImapAction::SendTagged {
-                    tag,
-                    status: ResponseStatus::Ok,
-                    code: None,
-                    text: "CLOSE completed".to_string(),
-                }]
+                if read_only {
+                    vec![ImapAction::SendTagged {
+                        tag,
+                        status: ResponseStatus::Ok,
+                        code: None,
+                        text: "CLOSE completed".to_string(),
+                    }]
+                } else {
+                    // RFC 9051 §6.4.2: CLOSE silently removes \Deleted messages.
+                    // Unlike explicit EXPUNGE, CLOSE does NOT send untagged
+                    // EXPUNGE responses. We emit CloseExpunge so the I/O layer
+                    // can perform the expunge without notifications.
+                    vec![ImapAction::CloseExpunge {
+                        tag,
+                        mailbox: mailbox_name,
+                    }]
+                }
             }
             _ => vec![self.bad_tag(tag, "no mailbox selected")],
         }
@@ -881,8 +894,13 @@ impl ImapSession {
     fn handle_search_complete(&mut self, results: Vec<u32>) -> Vec<ImapAction> {
         let tag = self.pending_tag.take().unwrap_or_else(|| "?".to_string());
         let nums: Vec<String> = results.iter().map(|n| n.to_string()).collect();
+        let search_line = if nums.is_empty() {
+            "SEARCH".to_string()
+        } else {
+            format!("SEARCH {}", nums.join(" "))
+        };
         vec![
-            ImapAction::SendUntagged(format!("SEARCH {}", nums.join(" "))),
+            ImapAction::SendUntagged(search_line),
             ImapAction::SendTagged {
                 tag,
                 status: ResponseStatus::Ok,
@@ -963,7 +981,7 @@ impl ImapSession {
                 caps.push("IDLE");
                 caps.push("MOVE");
                 caps.push("UNSELECT");
-                caps.push("UIDPLUS");
+                // UIDPLUS deferred: requires COPYUID responses and UID EXPUNGE support
             }
         }
 
@@ -1430,13 +1448,8 @@ mod tests {
         let mut s = selected_session();
         let cmd = parse_command("A003 CLOSE").unwrap();
         let actions = s.handle(ImapEvent::Command(cmd));
-        assert!(matches!(
-            &actions[0],
-            ImapAction::SendTagged {
-                status: ResponseStatus::Ok,
-                ..
-            }
-        ));
+        // CLOSE on a non-read-only mailbox emits CloseExpunge (silent expunge)
+        assert!(matches!(&actions[0], ImapAction::CloseExpunge { .. }));
         assert!(matches!(s.state, ImapState::Authenticated { .. }));
     }
 
@@ -1870,6 +1883,6 @@ mod tests {
         assert!(!post_auth.contains("AUTH=PLAIN"));
         assert!(post_auth.contains("IDLE"));
         assert!(post_auth.contains("MOVE"));
-        assert!(post_auth.contains("UIDPLUS"));
+        assert!(!post_auth.contains("UIDPLUS")); // deferred until COPYUID + UID EXPUNGE
     }
 }

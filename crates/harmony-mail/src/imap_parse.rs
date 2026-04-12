@@ -533,8 +533,15 @@ fn parse_seq_number(s: &str) -> Result<u32, ParseError> {
     if s == "*" {
         Ok(u32::MAX)
     } else {
-        s.parse::<u32>()
-            .map_err(|_| ParseError::BadSequenceSet(format!("invalid number: {s}")))
+        let n = s
+            .parse::<u32>()
+            .map_err(|_| ParseError::BadSequenceSet(format!("invalid number: {s}")))?;
+        if n == 0 {
+            return Err(ParseError::BadSequenceSet(format!(
+                "sequence number must be non-zero: {s}"
+            )));
+        }
+        Ok(n)
     }
 }
 
@@ -866,6 +873,8 @@ fn tokenize_search(s: &str) -> Vec<String> {
                     break;
                 }
                 if ch == '\\' {
+                    // Keep the backslash — unquote() handles escape processing
+                    token.push('\\');
                     if let Some(&escaped) = chars.peek() {
                         chars.next();
                         token.push(escaped);
