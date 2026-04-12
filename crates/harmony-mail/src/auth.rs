@@ -88,10 +88,14 @@ pub fn map_dmarc_result(output: &mail_auth::DmarcOutput) -> DmarcResult {
         DmarcResult::Pass
     } else {
         match output.policy() {
-            // No DMARC record → can't fail what doesn't exist
-            mail_auth::dmarc::Policy::Unspecified => DmarcResult::None,
-            // Domain has a DMARC record but alignment failed
-            _ => DmarcResult::Fail,
+            // Enforced policies: alignment failure is a real Fail
+            mail_auth::dmarc::Policy::Reject | mail_auth::dmarc::Policy::Quarantine => {
+                DmarcResult::Fail
+            }
+            // p=none (monitoring mode) or no record: don't penalize
+            mail_auth::dmarc::Policy::None | mail_auth::dmarc::Policy::Unspecified => {
+                DmarcResult::None
+            }
         }
     }
 }

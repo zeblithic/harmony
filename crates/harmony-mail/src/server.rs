@@ -29,6 +29,25 @@ struct IpEntry {
     last_seen: Instant,
 }
 
+/// RAII guard that calls `SharedState::disconnect` on drop.
+/// Ensures the per-IP counter is decremented even if the connection task panics.
+struct ConnectionGuard {
+    shared: Arc<SharedState>,
+    ip: IpAddr,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let shared = Arc::clone(&self.shared);
+        let ip = self.ip;
+        // Use spawn_blocking-free approach: blocking_lock or handle.
+        // Since this runs inside a tokio context, use block_in_place.
+        tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(shared.disconnect(ip));
+        });
+    }
+}
+
 /// Shared state across all connections.
 struct SharedState {
     connections: Mutex<HashMap<IpAddr, IpEntry>>,
@@ -215,6 +234,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let sh = Arc::clone(&shared);
                         let acc = Arc::clone(&acceptor);
                         tokio::spawn(async move {
+                            let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                             match tls::implicit_tls_wrap(stream, &acc).await {
                                 Ok(tls_stream) => {
                                     let (reader, writer) = tokio::io::split(tls_stream);
@@ -225,7 +245,6 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 Err(e) => tracing::debug!(%peer_ip, error = %e, "implicit TLS handshake failed"),
                             }
-                            sh.disconnect(peer_ip).await;
                         });
                     }
                     _ = listener_cancel.cancelled() => break,
@@ -257,10 +276,10 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let sh = Arc::clone(&shared);
                         let acc = Arc::clone(&acceptor);
                         tokio::spawn(async move {
+                            let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                             if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone())).await {
                                 tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
                             }
-                            sh.disconnect(peer_ip).await;
                         });
                     }
                     _ = listener_cancel.cancelled() => break,
@@ -290,11 +309,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let acceptor = tls_acceptor.clone();
 
                 tokio::spawn(async move {
+                    let _guard = ConnectionGuard { shared: Arc::clone(&shared), ip: peer_ip };
                     let acc = acceptor.as_ref().map(|a| (**a).clone());
                     if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc).await {
                         tracing::debug!(%peer_ip, error = %e, "connection ended with error");
                     }
-                    shared.disconnect(peer_ip).await;
                 });
             }
             _ = &mut shutdown => {
@@ -581,21 +600,32 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 // Stub: all addresses resolve to a dummy identity.
                 // Real implementation will query the announce cache.
                 let identity = Some([0u8; ADDRESS_HASH_LEN]);
-                let resolve_actions = session.handle(SmtpEvent::HarmonyResolved {
+                let callback_actions = session.handle(SmtpEvent::HarmonyResolved {
                     local_part: local_part.clone(),
                     identity,
                 });
-                execute_actions_generic(&resolve_actions, writer).await?;
+                execute_actions_generic(&callback_actions, writer).await?;
+                // Warn if callbacks produced further async actions (not yet handled)
+                for a in &callback_actions {
+                    if matches!(a, SmtpAction::ResolveHarmonyAddress { .. } | SmtpAction::DeliverToHarmony { .. } | SmtpAction::CheckSpf { .. }) {
+                        tracing::warn!("nested async action from HarmonyResolved callback dropped: {a:?}");
+                    }
+                }
             }
             SmtpAction::DeliverToHarmony { .. } => {
                 // Stub: delivery always succeeds.
                 // Real implementation will deliver to Harmony network.
-                let result_actions =
+                let callback_actions =
                     session.handle(SmtpEvent::DeliveryResult { success: true });
-                execute_actions_generic(&result_actions, writer).await?;
+                execute_actions_generic(&callback_actions, writer).await?;
+                for a in &callback_actions {
+                    if matches!(a, SmtpAction::ResolveHarmonyAddress { .. } | SmtpAction::DeliverToHarmony { .. } | SmtpAction::CheckSpf { .. }) {
+                        tracing::warn!("nested async action from DeliveryResult callback dropped: {a:?}");
+                    }
+                }
             }
             SmtpAction::CheckSpf { .. } => {
-                // Fire-and-forget for now
+                // TODO: wire to mail_auth SPF resolver and feed result into spam scorer
             }
             SmtpAction::StartTls => {
                 needs_starttls = true;

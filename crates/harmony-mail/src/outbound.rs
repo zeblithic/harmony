@@ -189,6 +189,8 @@ impl OutboundQueue {
     }
 
     /// Rewrite the queue file with updated entries (after processing).
+    /// Uses write-then-rename for crash safety — a crash mid-write leaves
+    /// the original file intact instead of truncated/empty.
     pub fn write_all(&self, entries: &[QueuedMessage]) -> Result<(), QueueError> {
         let mut content = String::new();
         for entry in entries {
@@ -197,7 +199,10 @@ impl OutboundQueue {
             content.push_str(&line);
             content.push('\n');
         }
-        std::fs::write(&self.path, content.as_bytes())
+        let tmp_path = self.path.with_extension("tmp");
+        std::fs::write(&tmp_path, content.as_bytes())
+            .map_err(|e| QueueError::Io(e.to_string()))?;
+        std::fs::rename(&tmp_path, &self.path)
             .map_err(|e| QueueError::Io(e.to_string()))?;
         Ok(())
     }
