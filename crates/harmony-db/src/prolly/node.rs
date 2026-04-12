@@ -99,7 +99,7 @@ impl Node {
         Ok(cid)
     }
 
-    /// Read a node from `commits/{hex}.bin` and deserialize with postcard.
+    /// Read a node from `commits/{hex}.bin`, verify CID, and deserialize.
     pub fn read_from_cas(data_dir: &Path, cid: ContentId) -> Result<Node, DbError> {
         let hex = hex::encode(cid.to_bytes());
         let path = data_dir.join("commits").join(format!("{hex}.bin"));
@@ -110,6 +110,14 @@ impl Node {
                 DbError::Io(e)
             }
         })?;
+        // Verify content integrity — reject corrupt/tampered node files.
+        let computed = ContentId::for_book(&bytes, ContentFlags::default())
+            .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
+        if computed != cid {
+            return Err(DbError::CorruptIndex(format!(
+                "node content mismatch for {hex}"
+            )));
+        }
         let node: Node =
             postcard::from_bytes(&bytes).map_err(|e| DbError::CorruptIndex(e.to_string()))?;
         Ok(node)

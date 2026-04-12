@@ -335,10 +335,15 @@ impl HarmonyDb {
             new_tables.insert(name.clone(), tree);
         }
 
+        // Persist before updating in-memory state.
         let new_head = Some(root);
+        let table_roots: BTreeMap<String, Option<ContentId>> = new_tables
+            .iter()
+            .map(|(n, t)| (n.clone(), t.root()))
+            .collect();
+        persist::save_roots(&self.data_dir, new_head, &table_roots)?;
         self.tables = new_tables;
         self.head = new_head;
-        self.save_roots()?;
         Ok(())
     }
 

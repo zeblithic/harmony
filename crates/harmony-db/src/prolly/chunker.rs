@@ -251,4 +251,14 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn chunk_handles_oversized_single_item() {
+        let config = ChunkerConfig::default_4k();
+        // Single item larger than max_size.
+        let items: Vec<(Vec<u8>, usize)> = vec![(b"huge-item".to_vec(), 20000)];
+        let chunks = chunk_items(&items, &config, |item| item.1, |item| &item.0);
+        assert_eq!(chunks.len(), 1, "single oversized item should form one chunk");
+        assert_eq!(chunks[0].len(), 1);
+    }
 }
