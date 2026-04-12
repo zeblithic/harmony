@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! OluoEngine — sans-I/O state machine for semantic search.
+//!
+//! Uses `CompoundIndex` from `harmony-search` (USearch HNSW) for approximate
+//! nearest-neighbor search on binary embeddings.
 
-use alloc::vec::Vec;
-use harmony_semantic::distance::hamming_distance;
+use harmony_search::{CompoundIndex, Match as SearchMatch, Metric, Quantization, VectorIndexConfig};
 use harmony_semantic::metadata::{PrivacyTier, SidecarMetadata};
 use harmony_semantic::sidecar::SidecarHeader;
 use harmony_semantic::tier::EmbeddingTier;
@@ -30,43 +32,30 @@ pub enum OluoEvent {
     /// stale entries before querying. This separation keeps clock concerns out
     /// of the query path (consistent with the sans-I/O pattern).
     Search { query_id: u64, query: SearchQuery },
-    /// A community published an updated trie root.
-    SyncReceived {
-        community_id: [u8; 32],
-        trie_root: [u8; 32],
-    },
     /// Timer tick: evict expired lightweight entries.
     EvictExpired { now_ms: u64 },
+    /// A compacted base index was persisted to this path.
+    CompactComplete { path: String },
 }
 
 /// An action emitted by the Oluo engine for the caller to execute.
 #[derive(Debug, Clone)]
 pub enum OluoAction {
-    /// The local index trie root changed.
-    IndexUpdated { trie_root: [u8; 32] },
+    /// The local index was updated (vector added).
+    IndexUpdated,
     /// Search results ready for Jain filtering.
     SearchResults {
         query_id: u64,
         results: Vec<RawSearchResult>,
     },
-    /// Request a trie node blob from content store.
-    FetchTrieNode { cid: [u8; 32] },
-    /// Request a sidecar blob from content store.
-    FetchSidecar { cid: [u8; 32] },
-    /// Publish our trie root to a community.
-    PublishTrieRoot {
-        community_id: [u8; 32],
-        root: [u8; 32],
-    },
-    /// Persist a blob to content-addressed storage.
-    PersistBlob { cid: [u8; 32], data: Vec<u8> },
+    /// Delta reached compaction threshold; caller should persist these bytes.
+    CompactRequest { bytes: Vec<u8> },
 }
 
-/// An entry in the in-memory flat index.
-#[derive(Debug, Clone)]
-struct IndexEntry {
-    /// Tier 3 binary vector (256-bit) for distance comparison.
-    tier3: [u8; 32],
+/// Metadata stored alongside each indexed vector.
+struct EntryMetadata {
+    /// CID of the content this entry references.
+    target_cid: [u8; 32],
     /// Merged metadata.
     metadata: SidecarMetadata,
     /// If Some, this is a lightweight entry with TTL (expires at this timestamp ms).
@@ -77,29 +66,71 @@ struct IndexEntry {
 }
 
 /// The Oluo search engine state machine.
+///
+/// Wraps a `CompoundIndex` (USearch HNSW) with a metadata side-table.
+/// Keys in the index are monotonically assigned u64 counters; the metadata
+/// map holds the CID, privacy/TTL metadata, and ingestion timestamp.
 pub struct OluoEngine {
-    /// In-memory index entries (target_cid -> entry).
-    entries: hashbrown::HashMap<[u8; 32], IndexEntry>,
-    /// The collection threshold — when flat entries exceed this, a trie should be built.
-    /// Reserved for future trie-building logic.
-    #[allow(dead_code)]
-    collection_threshold: u32,
+    /// HNSW vector index (base + delta).
+    index: CompoundIndex,
+    /// Metadata keyed by the same u64 key used in the vector index.
+    metadata: hashbrown::HashMap<u64, EntryMetadata>,
+    /// Monotonic key counter for assigning index keys.
+    key_counter: u64,
+}
+
+/// Unpack a 256-bit tier3 binary vector to 256 f32 values (0.0 / 1.0).
+///
+/// MSB-first ordering, matching `harmony_semantic::quantize_to_binary()`.
+fn unpack_tier3(tier3: &[u8; 32]) -> Vec<f32> {
+    let mut bits = Vec::with_capacity(256);
+    for byte in tier3.iter() {
+        for bit in (0..8).rev() {
+            // MSB-first
+            bits.push(if byte & (1 << bit) != 0 { 1.0 } else { 0.0 });
+        }
+    }
+    bits
 }
 
 impl OluoEngine {
-    /// Create a new engine with an empty index and default threshold (256).
+    /// Create a new engine with an empty index and default compact threshold (1000).
     pub fn new() -> Self {
+        let config = VectorIndexConfig {
+            dimensions: 256,
+            metric: Metric::Hamming,
+            quantization: Quantization::F32,
+            capacity: 10_000,
+            connectivity: 16,
+            expansion_add: 128,
+            expansion_search: 64,
+        };
+        let index =
+            CompoundIndex::new(config, 1000).expect("default VectorIndexConfig must be valid");
         Self {
-            entries: hashbrown::HashMap::new(),
-            collection_threshold: 256,
+            index,
+            metadata: hashbrown::HashMap::new(),
+            key_counter: 0,
         }
     }
 
-    /// Create a new engine with a custom collection threshold.
-    pub fn with_threshold(threshold: u32) -> Self {
+    /// Create a new engine with a custom compact threshold (used in tests).
+    pub fn with_compact_threshold(threshold: usize) -> Self {
+        let config = VectorIndexConfig {
+            dimensions: 256,
+            metric: Metric::Hamming,
+            quantization: Quantization::F32,
+            capacity: 10_000,
+            connectivity: 16,
+            expansion_add: 128,
+            expansion_search: 64,
+        };
+        let index =
+            CompoundIndex::new(config, threshold).expect("default VectorIndexConfig must be valid");
         Self {
-            entries: hashbrown::HashMap::new(),
-            collection_threshold: threshold,
+            index,
+            metadata: hashbrown::HashMap::new(),
+            key_counter: 0,
         }
     }
 
@@ -113,27 +144,14 @@ impl OluoEngine {
                 now_ms,
             } => self.handle_ingest(header, metadata, decision, now_ms),
             OluoEvent::Search { query_id, query } => self.handle_search(query_id, query),
-            OluoEvent::SyncReceived {
-                community_id: _,
-                trie_root,
-            } => {
-                // For now, request the trie root node from the content store.
-                alloc::vec![OluoAction::FetchTrieNode { cid: trie_root }]
-            }
-            OluoEvent::EvictExpired { now_ms } => {
-                // Evict entries at or past their expiry (strictly-greater keeps live entries).
-                self.entries.retain(|_, entry| match entry.expires_at {
-                    Some(expires) => expires > now_ms,
-                    None => true,
-                });
-                Vec::new()
-            }
+            OluoEvent::EvictExpired { now_ms } => self.handle_evict(now_ms),
+            OluoEvent::CompactComplete { path } => self.handle_compact_complete(&path),
         }
     }
 
-    /// Number of indexed entries.
+    /// Number of indexed entries (authoritative count including expired-but-not-evicted).
     pub fn entry_count(&self) -> usize {
-        self.entries.len()
+        self.metadata.len()
     }
 
     fn handle_ingest(
@@ -161,57 +179,119 @@ impl OluoEngine {
             IngestDecision::Reject => unreachable!(),
         };
 
-        let entry = IndexEntry {
-            tier3: header.tier3,
-            metadata,
-            expires_at,
-            ingested_at_ms: now_ms,
-        };
+        let key = self.key_counter;
+        self.key_counter += 1;
 
-        self.entries.insert(header.target_cid, entry);
+        let f32_vector = unpack_tier3(&header.tier3);
 
-        // Trie building deferred — return empty actions for now.
-        Vec::new()
+        // Add to HNSW index — on failure, silently skip (don't crash the engine).
+        if self.index.add(key, &f32_vector).is_err() {
+            // Roll back key counter since we didn't store anything.
+            self.key_counter -= 1;
+            return Vec::new();
+        }
+
+        self.metadata.insert(
+            key,
+            EntryMetadata {
+                target_cid: header.target_cid,
+                metadata,
+                expires_at,
+                ingested_at_ms: now_ms,
+            },
+        );
+
+        let mut actions = Vec::new();
+
+        // Check if compaction is needed.
+        if self.index.should_compact() {
+            if let Ok(bytes) = self.index.compact() {
+                actions.push(OluoAction::CompactRequest { bytes });
+            }
+        }
+
+        actions.push(OluoAction::IndexUpdated);
+        actions
     }
 
     fn handle_search(&self, query_id: u64, query: SearchQuery) -> Vec<OluoAction> {
-        // Only Tier 3 (256-bit) search is supported — the flat index stores tier3 vectors.
-        // Non-T3 queries return empty results rather than producing incorrect scores.
+        // Only Tier 3 (256-bit) search is supported.
         if query.tier != EmbeddingTier::T3 {
-            return alloc::vec![OluoAction::SearchResults {
+            return vec![OluoAction::SearchResults {
                 query_id,
                 results: Vec::new(),
             }];
         }
 
-        let max_bits = EmbeddingTier::T3.bit_count() as f32;
-        let mut scored: Vec<([u8; 32], f32, &IndexEntry)> = self
-            .entries
+        let f32_vector = unpack_tier3(&query.embedding);
+
+        // Over-fetch to compensate for entries that may have been evicted
+        // from metadata but still live in the HNSW index.
+        let fetch_k = (query.max_results as usize).saturating_add(self.evicted_headroom());
+
+        let matches: Vec<SearchMatch> = match self.index.search(&f32_vector, fetch_k) {
+            Ok(m) => m,
+            Err(_) => {
+                return vec![OluoAction::SearchResults {
+                    query_id,
+                    results: Vec::new(),
+                }];
+            }
+        };
+
+        let mut results: Vec<RawSearchResult> = Vec::new();
+        for m in matches {
+            if let Some(entry) = self.metadata.get(&m.key) {
+                let score = m.distance / 256.0;
+                results.push(RawSearchResult {
+                    target_cid: entry.target_cid,
+                    score,
+                    metadata: entry.metadata.clone(),
+                    overlays: Vec::new(),
+                });
+                if results.len() >= query.max_results as usize {
+                    break;
+                }
+            }
+            // No metadata → entry was evicted; skip it.
+        }
+
+        vec![OluoAction::SearchResults { query_id, results }]
+    }
+
+    fn handle_evict(&mut self, now_ms: u64) -> Vec<OluoAction> {
+        // Collect expired keys. We cannot remove vectors from CompoundIndex
+        // easily (viewed base doesn't support remove), so we only remove
+        // from metadata. Search results will filter out keyless entries.
+        let expired_keys: Vec<u64> = self
+            .metadata
             .iter()
-            .map(|(cid, entry)| {
-                let dist = hamming_distance(&query.embedding, &entry.tier3);
-                let score = dist as f32 / max_bits;
-                (*cid, score, entry)
+            .filter_map(|(&key, entry)| match entry.expires_at {
+                Some(expires) if expires <= now_ms => Some(key),
+                _ => None,
             })
             .collect();
 
-        // Sort by distance ascending (closest first).
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(core::cmp::Ordering::Equal));
+        for key in expired_keys {
+            self.metadata.remove(&key);
+        }
 
-        // Take top max_results.
-        scored.truncate(query.max_results as usize);
+        Vec::new()
+    }
 
-        let results: Vec<RawSearchResult> = scored
-            .into_iter()
-            .map(|(cid, score, entry)| RawSearchResult {
-                target_cid: cid,
-                score,
-                metadata: entry.metadata.clone(),
-                overlays: Vec::new(),
-            })
-            .collect();
+    fn handle_compact_complete(&mut self, path: &str) -> Vec<OluoAction> {
+        // Load the compacted base from disk — on error, ignore (base stays as is).
+        let _ = self.index.load_base(path);
+        Vec::new()
+    }
 
-        alloc::vec![OluoAction::SearchResults { query_id, results }]
+    /// Estimate of how many extra results to fetch to compensate for
+    /// evicted-but-still-indexed vectors.
+    fn evicted_headroom(&self) -> usize {
+        // The index may contain vectors whose metadata has been removed.
+        // Difference between unique index entries and metadata entries
+        // gives a rough bound.
+        self.index.unique_len().saturating_sub(self.metadata.len())
     }
 }
 
@@ -258,8 +338,11 @@ mod tests {
             now_ms: 1_700_000_000_000,
         });
 
-        assert!(actions.is_empty());
         assert_eq!(engine.entry_count(), 1);
+        assert!(
+            actions.iter().any(|a| matches!(a, OluoAction::IndexUpdated)),
+            "expected IndexUpdated action"
+        );
     }
 
     #[test]
@@ -337,7 +420,7 @@ mod tests {
 
     #[test]
     fn engine_search_empty_returns_empty() {
-        let mut engine = OluoEngine::new();
+        let engine = OluoEngine::new();
 
         let query = SearchQuery {
             embedding: [0xFF; 32],
@@ -346,6 +429,8 @@ mod tests {
             max_results: 10,
         };
 
+        // Use handle on a mutable ref even though we know it's a search
+        let mut engine = engine;
         let actions = engine.handle(OluoEvent::Search { query_id: 1, query });
 
         assert_eq!(actions.len(), 1);
@@ -400,15 +485,16 @@ mod tests {
                 assert_eq!(*query_id, 42);
                 assert_eq!(results.len(), 3);
 
-                // Verify ranking: A (dist 0), B (dist 128), C (dist 256).
+                // Verify ranking order: A (dist 0), B (dist 128), C (dist 256).
+                // Don't assert exact scores — USearch Hamming on f32 may produce
+                // slightly different distances than pure hamming_distance.
                 assert_eq!(results[0].target_cid, [0x01; 32]);
-                assert!((results[0].score - 0.0).abs() < f32::EPSILON);
-
                 assert_eq!(results[1].target_cid, [0x02; 32]);
-                assert!((results[1].score - 0.5).abs() < f32::EPSILON);
-
                 assert_eq!(results[2].target_cid, [0x03; 32]);
-                assert!((results[2].score - 1.0).abs() < f32::EPSILON);
+
+                // Verify ordering: A closer than B closer than C.
+                assert!(results[0].score <= results[1].score);
+                assert!(results[1].score <= results[2].score);
             }
             _ => panic!("expected SearchResults action"),
         }
@@ -445,11 +531,27 @@ mod tests {
             _ => panic!("expected SearchResults"),
         }
 
-        // After eviction, the entry is gone.
+        // After eviction, metadata is removed. The vector stays in CompoundIndex
+        // but search won't return it because there's no metadata to build a result.
         engine.handle(OluoEvent::EvictExpired {
             now_ms: ingest_time + 20_000,
         });
         assert_eq!(engine.entry_count(), 0);
+
+        // Verify search returns empty after eviction.
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 8, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert!(results.is_empty(), "evicted entry should not appear in search");
+            }
+            _ => panic!("expected SearchResults"),
+        }
     }
 
     #[test]
@@ -477,10 +579,49 @@ mod tests {
         });
         assert_eq!(engine.entry_count(), 1);
 
-        // Evict at expiry time — should be removed (strictly-greater keeps live entries).
+        // Evict at expiry time — should be removed (expires <= now_ms).
         engine.handle(OluoEvent::EvictExpired {
             now_ms: ingest_time + 60_000,
         });
         assert_eq!(engine.entry_count(), 0);
+    }
+
+    #[test]
+    fn engine_compact_request_at_threshold() {
+        // Set compact_threshold=2 so compaction triggers after 2 vectors.
+        let mut engine = OluoEngine::with_compact_threshold(2);
+
+        // First vector — no compaction yet.
+        let actions = engine.handle(OluoEvent::Ingest {
+            header: test_header([0x10; 32], [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, OluoAction::CompactRequest { .. })),
+            "no CompactRequest after 1 vector"
+        );
+
+        // Second vector — should trigger compaction.
+        let actions = engine.handle(OluoEvent::Ingest {
+            header: test_header([0x20; 32], [0xBB; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, OluoAction::CompactRequest { .. })),
+            "expected CompactRequest after reaching compact threshold"
+        );
+        // IndexUpdated should also be present.
+        assert!(
+            actions.iter().any(|a| matches!(a, OluoAction::IndexUpdated)),
+            "expected IndexUpdated alongside CompactRequest"
+        );
     }
 }

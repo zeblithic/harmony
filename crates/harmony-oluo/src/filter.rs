@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Retrieval filter — Jain's output filtering interface for search results.
 
-use alloc::vec::Vec;
+use std::vec::Vec;
 use harmony_semantic::metadata::SidecarMetadata;
 
 /// A raw search result before Jain filtering.
