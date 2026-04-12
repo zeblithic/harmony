@@ -4,7 +4,6 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-import torch
 import pytest
 from safetensors.numpy import load_file
 
@@ -114,3 +113,10 @@ class TestCorpusCLIIntegration:
             tensors = load_file(str(st_path))
             assert "engram.weight" in tensors
             assert tensors["engram.weight"].shape == (100, 16)
+
+            # Verify config TOML was also written
+            toml_path = out_dir / "engram_config.toml"
+            assert toml_path.exists()
+            toml_text = toml_path.read_text()
+            assert "hash_seeds" in toml_text
+            assert "shard_size" in toml_text

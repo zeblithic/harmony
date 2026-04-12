@@ -295,6 +295,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    for flag, value in (
+        ("--entries", args.entries),
+        ("--dim", args.dim),
+        ("--shard-size", args.shard_size),
+    ):
+        if value <= 0:
+            parser.error(f"{flag} must be > 0")
+    if hasattr(args, "vocab_size") and args.vocab_size is not None and args.vocab_size <= 0:
+        parser.error("--vocab-size must be > 0")
+
     # Row index is packed as uint32 in SHA-256 seed — validate range.
     if args.entries > 2**32:
         parser.error(f"--entries {args.entries} exceeds uint32 max (2**32)")
