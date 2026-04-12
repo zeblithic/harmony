@@ -102,6 +102,8 @@ def generate_corpus_table(
         raise ValueError("total_entries must be > 0")
     if hash_seeds is None:
         hash_seeds = list(DEFAULT_HASH_SEEDS)
+    if not hash_seeds:
+        raise ValueError("hash_seeds must not be empty")
 
     from ct87.engram import _hash_ngram
 
