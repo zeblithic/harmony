@@ -1624,7 +1624,9 @@ where
                                         .iter()
                                         .filter_map(|uid| uid_to_seqnum.get(uid).copied())
                                         .collect();
-                                    seqnums.sort_unstable_by(|a, b| b.cmp(a)); // descending
+                                    // Descending order: higher seqnums emitted first so lower
+                                    // seqnums remain valid (each EXPUNGE renumbers only above).
+                                    seqnums.sort_unstable_by(|a, b| b.cmp(a));
 
                                     for seqnum in &seqnums {
                                         writer
