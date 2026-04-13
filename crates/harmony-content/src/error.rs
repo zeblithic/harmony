@@ -41,4 +41,7 @@ pub enum ContentError {
 
     #[error("chunk index {index} exceeds maximum {max}")]
     ChunkIndexTooLarge { index: u32, max: u32 },
+
+    #[error("storage write failed")]
+    StorageFailed,
 }

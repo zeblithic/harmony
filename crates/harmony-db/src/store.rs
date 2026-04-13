@@ -105,16 +105,18 @@ impl BookStore for DiskBookStore {
         flags: ContentFlags,
     ) -> Result<ContentId, ContentError> {
         let cid = ContentId::for_book(data, flags)?;
-        // Best-effort disk write — data is also cached in memory.
-        let _ = self.write_to_commits(&cid, data);
+        self.write_to_commits(&cid, data)
+            .map_err(|_| ContentError::StorageFailed)?;
         self.cache.borrow_mut().insert(cid, data.to_vec());
         Ok(cid)
     }
 
     fn store(&mut self, cid: ContentId, data: Vec<u8>) {
-        // Best-effort disk write — store() has no error return.
-        let _ = self.write_to_commits(&cid, &data);
-        self.cache.borrow_mut().insert(cid, data);
+        // store() returns () per trait — skip cache if disk write fails
+        // to avoid RAM-only ghost data.
+        if self.write_to_commits(&cid, &data).is_ok() {
+            self.cache.borrow_mut().insert(cid, data);
+        }
     }
 
     fn get(&self, cid: &ContentId) -> Option<&[u8]> {
@@ -125,7 +127,9 @@ impl BookStore for DiskBookStore {
             } else if let Some(ref fetcher) = self.fetcher {
                 if let Some(data) = fetcher(cid) {
                     if Self::verify_cid(cid, &data) {
-                        // Cache on disk (best-effort) and in memory.
+                        // Unlike insert/store, this is a read-side cache:
+                        // the caller needs this data now and it's CID-verified.
+                        // Disk write is best-effort for future sessions.
                         let _ = self.write_to_commits(cid, &data);
                         self.cache.borrow_mut().insert(*cid, data);
                     }
@@ -343,6 +347,27 @@ mod tests {
 
         assert_eq!(store.get(&cid).unwrap(), data);
         assert!(!fetcher_called.load(Ordering::SeqCst), "fetcher should not be called for local hit");
+    }
+
+    #[test]
+    fn insert_with_flags_returns_err_on_disk_failure() {
+        let dir = TempDir::new().unwrap();
+        // Don't call ensure_dirs — commits/ missing → write fails
+        let mut store = DiskBookStore::new(dir.path());
+        let result = store.insert_with_flags(b"data", ContentFlags::default());
+        assert!(matches!(result, Err(ContentError::StorageFailed)));
+    }
+
+    #[test]
+    fn store_skips_cache_on_disk_failure() {
+        let dir = TempDir::new().unwrap();
+        // Don't call ensure_dirs — commits/ missing → write fails
+        let data = b"data";
+        let cid = ContentId::for_book(data, ContentFlags::default()).unwrap();
+        let mut store = DiskBookStore::new(dir.path());
+        store.store(cid, data.to_vec());
+        assert!(!store.contains(&cid));
+        assert!(store.get(&cid).is_none());
     }
 
     #[test]

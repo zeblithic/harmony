@@ -17,7 +17,7 @@ Zenoh-based DAG synchronization for harmony-db. When a peer commits a new root C
 
 ### Root CID Announcements (pub/sub)
 
-```
+```text
 harmony/db/{owner_addr_hex}/{db_name}/root
 ```
 
@@ -27,7 +27,7 @@ harmony/db/{owner_addr_hex}/{db_name}/root
 
 ### Block Fetch (queryable)
 
-```
+```text
 harmony/db/{owner_addr_hex}/{db_name}/block/{cid_hex}
 ```
 
@@ -111,7 +111,7 @@ Which peers and databases to follow is an application-level concern (contacts, s
 
 ## Sync Flow
 
-```
+```text
 Writer (Peer A)                          Reader (Peer B)
 ─────────────                            ────────────────
 1. db.insert(...)
