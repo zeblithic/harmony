@@ -369,4 +369,99 @@ mod tests {
         assert!(path.exists());
         assert!(dir.path().join(HEAD_FILE).exists());
     }
+
+    #[test]
+    fn manifest_fields_match_persist_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MemoryBookStore::new();
+        let (index_bytes, metadata_bytes, key_counter, generation) = make_test_snapshot();
+
+        persist_snapshot(
+            dir.path(),
+            &mut store,
+            &index_bytes,
+            &metadata_bytes,
+            key_counter,
+            generation,
+        )
+        .unwrap();
+
+        // Read back the head file to get the manifest CID.
+        let head_bytes = std::fs::read(dir.path().join(HEAD_FILE)).unwrap();
+        let head: HeadFile = serde_json::from_slice(&head_bytes).unwrap();
+        let manifest_cid_bytes: [u8; 32] = hex::decode(&head.head).unwrap().try_into().unwrap();
+        let manifest_cid = ContentId::from_bytes(manifest_cid_bytes);
+
+        // Fetch and deserialize the manifest.
+        let manifest_bytes = store.get(&manifest_cid).unwrap();
+        let manifest: SnapshotManifest = postcard::from_bytes(manifest_bytes).unwrap();
+
+        assert_eq!(manifest.version, SNAPSHOT_VERSION);
+        assert_eq!(manifest.key_counter, key_counter);
+        assert_eq!(manifest.compact_generation, generation);
+
+        // Verify index and metadata CIDs resolve to the original bytes.
+        let index_cid = ContentId::from_bytes(manifest.index_cid);
+        let metadata_cid = ContentId::from_bytes(manifest.metadata_cid);
+        let recovered_index = dag::reassemble(&index_cid, &store).unwrap();
+        let recovered_metadata = dag::reassemble(&metadata_cid, &store).unwrap();
+        assert_eq!(recovered_index, index_bytes);
+        assert_eq!(recovered_metadata, metadata_bytes);
+    }
+
+    #[test]
+    fn load_after_head_deleted_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MemoryBookStore::new();
+        let (index_bytes, metadata_bytes, key_counter, generation) = make_test_snapshot();
+
+        persist_snapshot(
+            dir.path(),
+            &mut store,
+            &index_bytes,
+            &metadata_bytes,
+            key_counter,
+            generation,
+        )
+        .unwrap();
+
+        // Simulate crash: delete head file.
+        std::fs::remove_file(dir.path().join(HEAD_FILE)).unwrap();
+
+        let result = load_snapshot(dir.path(), &store, 1000).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn persist_same_data_twice_produces_same_head() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut store1 = MemoryBookStore::new();
+        let mut store2 = MemoryBookStore::new();
+        let (index_bytes, metadata_bytes, key_counter, generation) = make_test_snapshot();
+
+        persist_snapshot(
+            dir1.path(),
+            &mut store1,
+            &index_bytes,
+            &metadata_bytes,
+            key_counter,
+            generation,
+        )
+        .unwrap();
+
+        persist_snapshot(
+            dir2.path(),
+            &mut store2,
+            &index_bytes,
+            &metadata_bytes,
+            key_counter,
+            generation,
+        )
+        .unwrap();
+
+        let head1 = std::fs::read_to_string(dir1.path().join(HEAD_FILE)).unwrap();
+        let head2 = std::fs::read_to_string(dir2.path().join(HEAD_FILE)).unwrap();
+        assert_eq!(head1, head2);
+    }
 }
