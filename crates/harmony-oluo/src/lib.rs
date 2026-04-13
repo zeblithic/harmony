@@ -8,10 +8,12 @@ pub mod engine;
 pub mod error;
 pub mod filter;
 pub mod ingest;
+pub mod persist;
 pub mod scope;
 
 pub use engine::{EntryMetadata, OluoAction, OluoEngine, OluoEvent};
 pub use error::{OluoError, OluoResult};
 pub use filter::{FilteredSearchResult, RawSearchResult, RetrievalContext, RetrievalFilter};
 pub use ingest::{IngestDecision, IngestGate};
+pub use persist::{OluoPersistError, SnapshotManifest};
 pub use scope::{SearchQuery, SearchScope};

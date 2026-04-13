@@ -89,24 +89,26 @@ The return tuple gives the caller the engine plus the path and generation needed
 ## Error Type
 
 ```rust
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum OluoPersistError {
     /// CAS storage or DAG operation failed.
     Content(ContentError),
     /// Local filesystem I/O failed.
     Io(std::io::Error),
-    /// Manifest or metadata deserialization failed.
-    Deserialize(String),
+    /// Manifest serialization or deserialization failed.
+    ManifestSerde(String),
+    /// Metadata deserialization failed.
+    MetadataDeserialize(String),
     /// Engine restoration failed.
     Engine(SearchError),
     /// Manifest version not supported.
     UnsupportedVersion(u32),
-    /// Referenced CID not found in store.
-    NotFound([u8; 32]),
+    /// Referenced CID not found in store (hex-encoded CID).
+    NotFound(String),
 }
 ```
 
-Implements `std::error::Error` and `Display`. `From` impls for `ContentError`, `io::Error`, and `SearchError`.
+Uses `thiserror` for `Error` and `Display` derives. `From` impls for `ContentError`, `io::Error`, and `SearchError`.
 
 ## Persistence Flow
 
