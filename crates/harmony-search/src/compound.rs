@@ -74,6 +74,21 @@ impl CompoundIndex {
         Ok(())
     }
 
+    /// Remove a key from the delta index.
+    ///
+    /// Returns `Ok(true)` if the key was in delta and removed,
+    /// `Ok(false)` if the key was not in delta (may be base-resident
+    /// or unknown). Base-resident keys cannot be removed — they are
+    /// cleaned up during compaction.
+    pub fn remove(&mut self, key: u64) -> SearchResult<bool> {
+        if self.delta_keys.remove(&key) {
+            self.delta.remove(key)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Search both base and delta, merge results by distance.
     ///
     /// If the same key exists in both base and delta, the delta's
@@ -431,6 +446,48 @@ mod tests {
         let results = idx.search(&[0.0, 0.0, 0.0, 1.0], 1).unwrap();
         assert_eq!(results[0].key, 1);
         assert!(results[0].distance < 0.01);
+    }
+
+    #[test]
+    fn remove_delta_key() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.add(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(idx.delta_len(), 2);
+
+        let removed = idx.remove(1).unwrap();
+        assert!(removed, "key 1 should have been in delta");
+        assert_eq!(idx.delta_len(), 1);
+
+        // Search should only find key 2
+        let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, 2);
+    }
+
+    #[test]
+    fn remove_missing_key_returns_false() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        let removed = idx.remove(999).unwrap();
+        assert!(!removed, "non-existent key should return false");
+        assert_eq!(idx.delta_len(), 1);
+    }
+
+    #[test]
+    fn remove_base_resident_returns_false() {
+        let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
+        idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        let bytes = idx.compact().unwrap();
+        idx.load_base_from_bytes(&bytes).unwrap();
+
+        // Key 1 is now in base, not delta
+        let removed = idx.remove(1).unwrap();
+        assert!(!removed, "base-resident key should return false");
+        // Base still has the vector
+        assert_eq!(idx.len(), 1);
     }
 
     /// Verifies that dimension validation rejects the update before any
