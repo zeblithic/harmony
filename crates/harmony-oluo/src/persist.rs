@@ -115,6 +115,80 @@ pub fn persist_snapshot(
     Ok((base_path, generation))
 }
 
+/// Load a snapshot from CAS and construct a ready-to-use OluoEngine.
+///
+/// Reads `oluo_head.json`, fetches the manifest from CAS,
+/// reassembles index + metadata via DAG, restores the engine
+/// via `from_snapshot`, and writes the local index file for mmap.
+///
+/// Returns `None` if no head file exists (fresh start).
+pub fn load_snapshot(
+    data_dir: &Path,
+    store: &dyn BookStore,
+    compact_threshold: usize,
+) -> Result<Option<(OluoEngine, PathBuf, u64)>, OluoPersistError> {
+    // 1. Read head file.
+    let head_path = data_dir.join(HEAD_FILE);
+    let head_bytes = match std::fs::read(&head_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(OluoPersistError::Io(e)),
+    };
+
+    let head: HeadFile = serde_json::from_slice(&head_bytes)
+        .map_err(|e| OluoPersistError::ManifestDeserialize(e.to_string()))?;
+
+    if head.version != SNAPSHOT_VERSION {
+        return Err(OluoPersistError::UnsupportedVersion(head.version));
+    }
+
+    // 2. Fetch manifest from CAS.
+    let manifest_cid_bytes: [u8; 32] = hex::decode(&head.head)
+        .map_err(|e| OluoPersistError::ManifestDeserialize(e.to_string()))?
+        .try_into()
+        .map_err(|_| OluoPersistError::ManifestDeserialize("invalid CID length".into()))?;
+    let manifest_cid = ContentId::from_bytes(manifest_cid_bytes);
+
+    let manifest_bytes = store
+        .get(&manifest_cid)
+        .ok_or_else(|| OluoPersistError::NotFound(head.head.clone()))?;
+
+    // 3. Deserialize manifest.
+    let manifest: SnapshotManifest = postcard::from_bytes(manifest_bytes)
+        .map_err(|e| OluoPersistError::ManifestDeserialize(e.to_string()))?;
+
+    if manifest.version != SNAPSHOT_VERSION {
+        return Err(OluoPersistError::UnsupportedVersion(manifest.version));
+    }
+
+    // 4-5. Reassemble index and metadata from CAS.
+    let index_cid = ContentId::from_bytes(manifest.index_cid);
+    let metadata_cid = ContentId::from_bytes(manifest.metadata_cid);
+
+    let index_bytes = dag::reassemble(&index_cid, store)?;
+    let metadata_bytes = dag::reassemble(&metadata_cid, store)?;
+
+    // 6. Deserialize metadata.
+    let metadata_map: std::collections::BTreeMap<u64, EntryMetadata> =
+        postcard::from_bytes(&metadata_bytes)
+            .map_err(|e| OluoPersistError::MetadataDeserialize(e.to_string()))?;
+
+    // 7. Restore engine.
+    let engine = OluoEngine::from_snapshot(
+        &index_bytes,
+        metadata_map,
+        manifest.key_counter,
+        manifest.compact_generation,
+        compact_threshold,
+    )?;
+
+    // 8. Write local index file for mmap.
+    let base_path = data_dir.join(BASE_FILE);
+    atomic_write(&base_path, &index_bytes)?;
+
+    Ok(Some((engine, base_path, manifest.compact_generation)))
+}
+
 /// Atomically write data to a file (write to .tmp, then rename).
 fn atomic_write(path: &Path, data: &[u8]) -> Result<(), OluoPersistError> {
     let tmp = path.with_extension("tmp");
@@ -139,6 +213,15 @@ mod tests {
         let key_counter = 42;
         let generation = 3;
         (index_bytes, metadata_bytes, key_counter, generation)
+    }
+
+    #[test]
+    fn load_snapshot_returns_none_when_no_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryBookStore::new();
+
+        let result = load_snapshot(dir.path(), &store, 1000).unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
