@@ -22,6 +22,7 @@ use crate::imap::{
 };
 use crate::imap_codec::{ImapCodec, ImapFrame};
 use crate::imap_parse;
+use crate::imap_parse::StoreOperation;
 use crate::imap_store::{self, ImapStore};
 use crate::io::{SmtpCodec, SmtpFrame};
 use crate::smtp::{SmtpAction, SmtpConfig, SmtpEvent, SmtpSession, SmtpState};
@@ -1246,16 +1247,69 @@ where
                     }
                 }
             }
-            ImapAction::StoreFlags { .. } => {
-                // Not yet wired to Harmony message storage
-                if let Some(tag) = session.pending_tag.take() {
-                    writer
-                        .write_all(
-                            format!("{tag} NO [CANNOT] STORE not yet implemented\r\n").as_bytes(),
-                        )
-                        .await?;
+            ImapAction::StoreFlags {
+                sequence_set,
+                operation,
+                flags,
+                uid_mode,
+                silent,
+            } => {
+                let store_result: Result<Vec<(u32, Vec<String>)>, String> = (|| {
+                    let mailbox_name = match &session.state {
+                        ImapState::Selected { mailbox, .. } => mailbox.name.clone(),
+                        _ => return Err("no mailbox selected".to_string()),
+                    };
+                    let mbox = store
+                        .get_mailbox(&mailbox_name)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "mailbox not found".to_string())?;
+                    let all_msgs = store.get_messages(mbox.id).map_err(|e| e.to_string())?;
+                    let resolved = resolve_sequence_set(sequence_set, *uid_mode, &all_msgs);
+
+                    let flag_refs: Vec<&str> = flags.iter().map(|s| s.as_str()).collect();
+                    let mut updated = Vec::new();
+
+                    for (uid, seqnum) in &resolved {
+                        let msg_row = match all_msgs.iter().find(|m| m.uid == *uid) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+
+                        match operation {
+                            StoreOperation::Set | StoreOperation::SetSilent => {
+                                store.set_flags(msg_row.id, &flag_refs).map_err(|e| e.to_string())?;
+                            }
+                            StoreOperation::Add | StoreOperation::AddSilent => {
+                                store.add_flags(msg_row.id, &flag_refs).map_err(|e| e.to_string())?;
+                            }
+                            StoreOperation::Remove | StoreOperation::RemoveSilent => {
+                                store.remove_flags(msg_row.id, &flag_refs).map_err(|e| e.to_string())?;
+                            }
+                        }
+
+                        if !silent {
+                            let current_flags = store.get_flags(msg_row.id).map_err(|e| e.to_string())?;
+                            updated.push((*seqnum, current_flags));
+                        }
+                    }
+
+                    Ok(updated)
+                })();
+
+                match store_result {
+                    Ok(updated) => {
+                        let callback = session.handle(ImapEvent::StoreComplete { updated });
+                        execute_imap_actions(&callback, writer).await?;
+                    }
+                    Err(reason) => {
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                                .await?;
+                            writer.flush().await?;
+                        }
+                    }
                 }
-                writer.flush().await?;
             }
             ImapAction::FetchMessages {
                 sequence_set,
@@ -1891,5 +1945,38 @@ mod sequence_set_tests {
         let messages = imap_store.get_messages(mbox.id).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].message_cid.is_none());
+    }
+
+    #[test]
+    fn store_flags_add_and_retrieve() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let imap_store = ImapStore::open(&db_path).unwrap();
+        imap_store.initialize_default_mailboxes().unwrap();
+
+        let uid = imap_store
+            .insert_message("INBOX", &[3u8; MESSAGE_ID_LEN], None, 1713000000, 100)
+            .unwrap();
+        assert_eq!(uid, 1);
+
+        // Get message DB id
+        let mbox = imap_store.get_mailbox("INBOX").unwrap().unwrap();
+        let msgs = imap_store.get_messages(mbox.id).unwrap();
+        let msg_id = msgs[0].id;
+
+        // Add flags
+        imap_store.add_flags(msg_id, &["\\Seen"]).unwrap();
+        let flags = imap_store.get_flags(msg_id).unwrap();
+        assert_eq!(flags, vec!["\\Seen"]);
+
+        // Set flags (replaces all)
+        imap_store.set_flags(msg_id, &["\\Flagged", "\\Answered"]).unwrap();
+        let flags = imap_store.get_flags(msg_id).unwrap();
+        assert_eq!(flags, vec!["\\Answered", "\\Flagged"]); // sorted by flag name
+
+        // Remove flags
+        imap_store.remove_flags(msg_id, &["\\Answered"]).unwrap();
+        let flags = imap_store.get_flags(msg_id).unwrap();
+        assert_eq!(flags, vec!["\\Flagged"]);
     }
 }
