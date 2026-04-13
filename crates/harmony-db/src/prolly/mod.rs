@@ -117,13 +117,22 @@ impl ProllyTree {
             Err(_) => None,
         };
         let new_root = if removed.is_some() {
-            match self.rebuild_tree(data_dir) {
-                Ok(root) => root,
-                Err(e) => { self.cache = old_cache; self.root = old_root; return Err(e); }
+            if let Some(root) = self.root {
+                match mutate::incremental_remove(data_dir, root, key, &self.config) {
+                    Ok(root) => root,
+                    Err(e) => {
+                        self.cache = old_cache;
+                        self.root = old_root;
+                        return Err(e);
+                    }
+                }
+            } else {
+                None
             }
         } else {
             self.root
         };
+        self.root = new_root;
         Ok((removed, new_root))
     }
 

@@ -339,6 +339,44 @@ pub(crate) fn incremental_insert(
     }
 }
 
+/// Incrementally remove an entry from a Prolly Tree.
+///
+/// Walk to the leaf containing the key, remove the entry, rechunk with
+/// boundary convergence, cascade up. Returns None if the tree becomes empty.
+pub(crate) fn incremental_remove(
+    data_dir: &Path,
+    root: ContentId,
+    key: &[u8],
+    config: &ChunkerConfig,
+) -> Result<Option<ContentId>, DbError> {
+    let path = walk_to_leaf(data_dir, root, key)?;
+
+    let mut leaf = path.leaf_entries.clone();
+    match leaf.binary_search_by(|e| e.key.as_slice().cmp(key)) {
+        Ok(idx) => {
+            leaf.remove(idx);
+        }
+        Err(_) => {
+            // Key not found in this leaf — tree unchanged.
+            return Ok(Some(root));
+        }
+    }
+
+    if leaf.is_empty() && path.levels.is_empty() {
+        // Removed the last entry from a single-leaf tree.
+        return Ok(None);
+    }
+
+    let rechunk = rechunk_leaf(data_dir, &path, leaf, config)?;
+    cascade_up(
+        data_dir,
+        &path,
+        rechunk.new_children,
+        rechunk.siblings_consumed,
+        config,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +569,71 @@ mod tests {
         let reference_root = build_tree(&entries, &config, dir.path()).unwrap();
 
         assert_eq!(incremental_root, reference_root);
+    }
+
+    #[test]
+    fn incremental_remove_matches_rebuild() {
+        let dir = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        let entries: Vec<Entry> = (0..200u32)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir.path(),
+            ))
+            .collect();
+        let initial_root = build_tree(&entries, &config, dir.path()).unwrap().unwrap();
+
+        // Remove entry 100 incrementally.
+        let remove_key = format!("k-{:06}", 100).into_bytes();
+        let incremental_root = incremental_remove(
+            dir.path(),
+            initial_root,
+            &remove_key,
+            &config,
+        ).unwrap();
+
+        // Build reference tree without entry 100.
+        let remaining: Vec<Entry> = entries.into_iter()
+            .filter(|e| e.key != remove_key)
+            .collect();
+        let reference_root = build_tree(&remaining, &config, dir.path()).unwrap();
+
+        assert_eq!(
+            incremental_root, reference_root,
+            "incremental remove must produce same root CID as full rebuild"
+        );
+    }
+
+    #[test]
+    fn incremental_remove_last_entry() {
+        let dir = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        let entry = make_entry(b"only-key", b"only-value", dir.path());
+        let root = build_tree(&[entry], &config, dir.path()).unwrap().unwrap();
+
+        let result = incremental_remove(dir.path(), root, b"only-key", &config).unwrap();
+        assert!(result.is_none(), "removing last entry should produce None root");
+    }
+
+    #[test]
+    fn incremental_remove_nonexistent_key() {
+        let dir = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        let entries: Vec<Entry> = (0..10u32)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir.path(),
+            ))
+            .collect();
+        let root = build_tree(&entries, &config, dir.path()).unwrap().unwrap();
+
+        // Try to remove a key that doesn't exist.
+        let result = incremental_remove(dir.path(), root, b"nonexistent", &config).unwrap();
+        assert_eq!(result, Some(root), "removing nonexistent key should return same root");
     }
 }
