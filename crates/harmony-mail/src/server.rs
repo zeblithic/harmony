@@ -1507,19 +1507,24 @@ where
 
                     // Check if any criterion needs CAS content
                     let needs_cas = criteria_need_cas(criteria);
+                    let max_uid = all_msgs.last().map(|m| m.uid).unwrap_or(0);
+                    let max_seqnum = all_msgs.len() as u32;
+                    let book_store = if needs_cas {
+                        Some(harmony_db::DiskBookStore::new(&content_store_path))
+                    } else {
+                        None
+                    };
 
                     let mut results = Vec::new();
                     for (idx, msg_row) in all_msgs.iter().enumerate() {
                         let seqnum = (idx + 1) as u32;
                         let flags = store.get_flags(msg_row.id).map_err(|e| e.to_string())?;
 
-                        let harmony_msg = if needs_cas {
+                        let harmony_msg = if let Some(ref bs) = book_store {
                             match msg_row.message_cid {
                                 Some(cid_bytes) => {
-                                    let csp_inner = content_store_path.to_path_buf();
-                                    let book_store = harmony_db::DiskBookStore::new(&csp_inner);
                                     let content_id = harmony_content::cid::ContentId::from_bytes(cid_bytes);
-                                    match harmony_content::dag::reassemble(&content_id, &book_store) {
+                                    match harmony_content::dag::reassemble(&content_id, bs) {
                                         Ok(bytes) => crate::message::HarmonyMessage::from_bytes(&bytes).ok(),
                                         Err(_) => None,
                                     }
@@ -1530,7 +1535,7 @@ where
                             None
                         };
 
-                        if matches_criteria(criteria, msg_row, &flags, seqnum, harmony_msg.as_ref()) {
+                        if matches_criteria(criteria, msg_row, &flags, seqnum, harmony_msg.as_ref(), max_uid, max_seqnum) {
                             results.push(if *uid_mode { msg_row.uid } else { seqnum });
                         }
                     }
@@ -1594,37 +1599,52 @@ where
                 match copy_result {
                     Ok(CopyOutcome::Done(mapping, all_msgs, mailbox_id)) => {
                         if *is_move {
-                            // Flag source messages as \Deleted
+                            // Flag source messages as \Deleted and expunge only those UIDs
+                            let src_uids: Vec<u32> = mapping.iter().map(|(src, _)| *src).collect();
                             let rows_by_uid: std::collections::HashMap<u32, &imap_store::MessageRow> =
                                 all_msgs.iter().map(|m| (m.uid, m)).collect();
-                            for (src_uid, _dst_uid) in &mapping {
-                                if let Some(row) = rows_by_uid.get(src_uid) {
-                                    let _ = store.add_flags(row.id, &["\\Deleted"]);
+
+                            let move_result: Result<Vec<u32>, String> = (|| {
+                                for &src_uid in &src_uids {
+                                    if let Some(row) = rows_by_uid.get(&src_uid) {
+                                        store.add_flags(row.id, &["\\Deleted"]).map_err(|e| e.to_string())?;
+                                    }
                                 }
-                            }
+                                store.expunge_uids(mailbox_id, &src_uids).map_err(|e| e.to_string())
+                            })();
 
-                            let uid_to_seqnum: std::collections::HashMap<u32, u32> = all_msgs
-                                .iter()
-                                .enumerate()
-                                .map(|(i, m)| (m.uid, (i + 1) as u32))
-                                .collect();
-                            let expunged_uids = store.expunge(mailbox_id).unwrap_or_default();
-                            let mut seqnums: Vec<u32> = expunged_uids
-                                .iter()
-                                .filter_map(|uid| uid_to_seqnum.get(uid).copied())
-                                .collect();
-                            seqnums.sort_unstable_by(|a, b| b.cmp(a)); // descending
+                            match move_result {
+                                Ok(expunged_uids) => {
+                                    let uid_to_seqnum: std::collections::HashMap<u32, u32> = all_msgs
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, m)| (m.uid, (i + 1) as u32))
+                                        .collect();
+                                    let mut seqnums: Vec<u32> = expunged_uids
+                                        .iter()
+                                        .filter_map(|uid| uid_to_seqnum.get(uid).copied())
+                                        .collect();
+                                    seqnums.sort_unstable_by(|a, b| b.cmp(a)); // descending
 
-                            for seqnum in &seqnums {
-                                writer
-                                    .write_all(format!("* {seqnum} EXPUNGE\r\n").as_bytes())
-                                    .await?;
-                            }
+                                    for seqnum in &seqnums {
+                                        writer
+                                            .write_all(format!("* {seqnum} EXPUNGE\r\n").as_bytes())
+                                            .await?;
+                                    }
 
-                            if let Some(tag) = session.pending_tag.take() {
-                                writer
-                                    .write_all(format!("{tag} OK MOVE completed\r\n").as_bytes())
-                                    .await?;
+                                    if let Some(tag) = session.pending_tag.take() {
+                                        writer
+                                            .write_all(format!("{tag} OK MOVE completed\r\n").as_bytes())
+                                            .await?;
+                                    }
+                                }
+                                Err(reason) => {
+                                    if let Some(tag) = session.pending_tag.take() {
+                                        writer
+                                            .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                                            .await?;
+                                    }
+                                }
                             }
                         } else {
                             if let Some(tag) = session.pending_tag.take() {
@@ -1822,7 +1842,18 @@ fn parse_imap_date(s: &str) -> Option<u64> {
         _ => return None,
     };
     let year: u64 = parts[2].parse().ok()?;
-    if year < 1970 {
+    if year < 1970 || year > 9999 {
+        return None;
+    }
+
+    // Validate day against actual month length
+    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let max_day = if month == 2 && is_leap(year) {
+        29
+    } else {
+        month_days[month as usize]
+    };
+    if day > max_day {
         return None;
     }
 
@@ -1832,7 +1863,6 @@ fn parse_imap_date(s: &str) -> Option<u64> {
         days += if is_leap(y) { 366 } else { 365 };
     }
     // Days from start of year to start of month
-    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     for m in 1..month {
         days += month_days[m as usize] as u64;
         if m == 2 && is_leap(year) {
@@ -1862,6 +1892,24 @@ fn criteria_need_cas(criteria: &[imap_parse::SearchKey]) -> bool {
     })
 }
 
+/// Check if a value is contained in an IMAP SequenceSet.
+/// `star_value` is what `*` resolves to (max_uid or max_seqnum).
+fn sequence_set_contains(set: &imap_parse::SequenceSet, value: u32, star_value: u32) -> bool {
+    for range in &set.ranges {
+        let s = if range.start == u32::MAX { star_value } else { range.start };
+        let e = match range.end {
+            None => s,
+            Some(u32::MAX) => star_value,
+            Some(e) => e,
+        };
+        let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+        if value >= lo && value <= hi {
+            return true;
+        }
+    }
+    false
+}
+
 /// Evaluate IMAP SEARCH criteria against a message.
 /// Multiple criteria are AND'd per RFC 9051.
 fn matches_criteria(
@@ -1870,8 +1918,10 @@ fn matches_criteria(
     flags: &[String],
     seqnum: u32,
     msg: Option<&crate::message::HarmonyMessage>,
+    max_uid: u32,
+    max_seqnum: u32,
 ) -> bool {
-    criteria.iter().all(|key| matches_single_criterion(key, msg_row, flags, seqnum, msg))
+    criteria.iter().all(|key| matches_single_criterion(key, msg_row, flags, seqnum, msg, max_uid, max_seqnum))
 }
 
 /// Evaluate a single IMAP SEARCH criterion.
@@ -1881,6 +1931,8 @@ fn matches_single_criterion(
     flags: &[String],
     seqnum: u32,
     msg: Option<&crate::message::HarmonyMessage>,
+    max_uid: u32,
+    max_seqnum: u32,
 ) -> bool {
     use imap_parse::SearchKey;
 
@@ -1919,30 +1971,8 @@ fn matches_single_criterion(
             })
         }
 
-        SearchKey::Uid(set) => {
-            let dummy_msgs = [imap_store::MessageRow {
-                id: msg_row.id,
-                mailbox_id: msg_row.mailbox_id,
-                uid: msg_row.uid,
-                harmony_msg_id: msg_row.harmony_msg_id,
-                message_cid: msg_row.message_cid,
-                internal_date: msg_row.internal_date,
-                rfc822_size: msg_row.rfc822_size,
-            }];
-            !resolve_sequence_set(set, true, &dummy_msgs).is_empty()
-        }
-        SearchKey::SequenceSet(set) => {
-            let dummy_msgs = [imap_store::MessageRow {
-                id: msg_row.id,
-                mailbox_id: msg_row.mailbox_id,
-                uid: msg_row.uid,
-                harmony_msg_id: msg_row.harmony_msg_id,
-                message_cid: msg_row.message_cid,
-                internal_date: msg_row.internal_date,
-                rfc822_size: msg_row.rfc822_size,
-            }];
-            !resolve_sequence_set(set, false, &dummy_msgs).is_empty()
-        }
+        SearchKey::Uid(set) => sequence_set_contains(set, msg_row.uid, max_uid),
+        SearchKey::SequenceSet(set) => sequence_set_contains(set, seqnum, max_seqnum),
 
         SearchKey::Subject(s) => {
             msg.map_or(false, |m| m.subject.to_lowercase().contains(&s.to_lowercase()))
@@ -1966,29 +1996,32 @@ fn matches_single_criterion(
         }
         SearchKey::Header(name, value) => {
             msg.map_or(false, |m| {
-                let field_content = match name.to_lowercase().as_str() {
-                    "subject" => Some(m.subject.as_str()),
-                    "from" => None,
-                    _ => None,
-                };
-                match field_content {
-                    Some(content) => content.to_lowercase().contains(&value.to_lowercase()),
-                    None => {
-                        if name.eq_ignore_ascii_case("from") {
-                            let sender_hex = hex::encode(m.sender_address);
-                            sender_hex.to_lowercase().contains(&value.to_lowercase())
-                        } else {
-                            false
-                        }
+                let val_lower = value.to_lowercase();
+                match name.to_lowercase().as_str() {
+                    "subject" => m.subject.to_lowercase().contains(&val_lower),
+                    "from" => {
+                        let sender_hex = hex::encode(m.sender_address);
+                        sender_hex.to_lowercase().contains(&val_lower)
                     }
+                    "to" => {
+                        m.recipients.iter().any(|r| {
+                            if r.recipient_type == crate::message::RecipientType::To {
+                                let addr_hex = hex::encode(r.address_hash);
+                                addr_hex.to_lowercase().contains(&val_lower)
+                            } else {
+                                false
+                            }
+                        })
+                    }
+                    _ => false,
                 }
             })
         }
 
-        SearchKey::Not(inner) => !matches_single_criterion(inner, msg_row, flags, seqnum, msg),
+        SearchKey::Not(inner) => !matches_single_criterion(inner, msg_row, flags, seqnum, msg, max_uid, max_seqnum),
         SearchKey::Or(a, b) => {
-            matches_single_criterion(a, msg_row, flags, seqnum, msg)
-                || matches_single_criterion(b, msg_row, flags, seqnum, msg)
+            matches_single_criterion(a, msg_row, flags, seqnum, msg, max_uid, max_seqnum)
+                || matches_single_criterion(b, msg_row, flags, seqnum, msg, max_uid, max_seqnum)
         }
     }
 }
@@ -2633,31 +2666,31 @@ mod search_tests {
     #[test]
     fn search_all() {
         let row = msg_row_with(1, 1000, 100);
-        assert!(super::matches_criteria(&[SearchKey::All], &row, &[], 1, None));
+        assert!(super::matches_criteria(&[SearchKey::All], &row, &[], 1, None, 100, 100));
     }
 
     #[test]
     fn search_flag_seen() {
         let row = msg_row_with(1, 1000, 100);
         let seen = vec!["\\Seen".to_string()];
-        assert!(super::matches_criteria(&[SearchKey::Seen], &row, &seen, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Unseen], &row, &seen, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Seen], &row, &[], 1, None));
-        assert!(super::matches_criteria(&[SearchKey::Unseen], &row, &[], 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Seen], &row, &seen, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Unseen], &row, &seen, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Seen], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Unseen], &row, &[], 1, None, 100, 100));
     }
 
     #[test]
     fn search_flag_deleted_draft_flagged_answered() {
         let row = msg_row_with(1, 1000, 100);
         let flags = vec!["\\Deleted".to_string(), "\\Draft".to_string()];
-        assert!(super::matches_criteria(&[SearchKey::Deleted], &row, &flags, 1, None));
-        assert!(super::matches_criteria(&[SearchKey::Draft], &row, &flags, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Undeleted], &row, &flags, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Undraft], &row, &flags, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Flagged], &row, &flags, 1, None));
-        assert!(super::matches_criteria(&[SearchKey::Unflagged], &row, &flags, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Answered], &row, &flags, 1, None));
-        assert!(super::matches_criteria(&[SearchKey::Unanswered], &row, &flags, 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Deleted], &row, &flags, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Draft], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Undeleted], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Undraft], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Flagged], &row, &flags, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Unflagged], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Answered], &row, &flags, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Unanswered], &row, &flags, 1, None, 100, 100));
     }
 
     #[test]
@@ -2665,47 +2698,47 @@ mod search_tests {
         let row = msg_row_with(1, 1000, 100);
         let recent = vec!["\\Recent".to_string()];
         let recent_seen = vec!["\\Recent".to_string(), "\\Seen".to_string()];
-        assert!(super::matches_criteria(&[SearchKey::Recent], &row, &recent, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Old], &row, &recent, 1, None));
-        assert!(super::matches_criteria(&[SearchKey::New], &row, &recent, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::New], &row, &recent_seen, 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Recent], &row, &recent, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Old], &row, &recent, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::New], &row, &recent, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::New], &row, &recent_seen, 1, None, 100, 100));
     }
 
     #[test]
     fn search_size() {
         let row = msg_row_with(1, 1000, 500);
-        assert!(super::matches_criteria(&[SearchKey::Larger(499)], &row, &[], 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Larger(500)], &row, &[], 1, None));
-        assert!(super::matches_criteria(&[SearchKey::Smaller(501)], &row, &[], 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Smaller(500)], &row, &[], 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Larger(499)], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Larger(500)], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Smaller(501)], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Smaller(500)], &row, &[], 1, None, 100, 100));
     }
 
     #[test]
     fn search_date_since_before_on() {
         // internal_date = 86400 (Jan 2, 1970)
         let row = msg_row_with(1, 86400, 100);
-        assert!(super::matches_criteria(&[SearchKey::Since("02-Jan-1970".to_string())], &row, &[], 1, None));
-        assert!(super::matches_criteria(&[SearchKey::Since("01-Jan-1970".to_string())], &row, &[], 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Since("03-Jan-1970".to_string())], &row, &[], 1, None));
-        assert!(super::matches_criteria(&[SearchKey::Before("03-Jan-1970".to_string())], &row, &[], 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Before("02-Jan-1970".to_string())], &row, &[], 1, None));
-        assert!(super::matches_criteria(&[SearchKey::On("02-Jan-1970".to_string())], &row, &[], 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::On("01-Jan-1970".to_string())], &row, &[], 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Since("02-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Since("01-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Since("03-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Before("03-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Before("02-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::On("02-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::On("01-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
     }
 
     #[test]
     fn search_not_and_or() {
         let row = msg_row_with(1, 1000, 100);
         let seen = vec!["\\Seen".to_string()];
-        assert!(!super::matches_criteria(&[SearchKey::Not(Box::new(SearchKey::Seen))], &row, &seen, 1, None));
-        assert!(super::matches_criteria(&[SearchKey::Not(Box::new(SearchKey::Seen))], &row, &[], 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Not(Box::new(SearchKey::Seen))], &row, &seen, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Not(Box::new(SearchKey::Seen))], &row, &[], 1, None, 100, 100));
         assert!(super::matches_criteria(
             &[SearchKey::Or(Box::new(SearchKey::Seen), Box::new(SearchKey::Flagged))],
-            &row, &seen, 1, None
+            &row, &seen, 1, None, 100, 100
         ));
         assert!(!super::matches_criteria(
             &[SearchKey::Or(Box::new(SearchKey::Flagged), Box::new(SearchKey::Deleted))],
-            &row, &[], 1, None
+            &row, &[], 1, None, 100, 100
         ));
     }
 
@@ -2713,8 +2746,8 @@ mod search_tests {
     fn search_multi_criteria_and() {
         let row = msg_row_with(1, 1000, 500);
         let seen = vec!["\\Seen".to_string()];
-        assert!(super::matches_criteria(&[SearchKey::Seen, SearchKey::Larger(100)], &row, &seen, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Seen, SearchKey::Larger(600)], &row, &seen, 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Seen, SearchKey::Larger(100)], &row, &seen, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Seen, SearchKey::Larger(600)], &row, &seen, 1, None, 100, 100));
     }
 
     #[test]
@@ -2722,38 +2755,38 @@ mod search_tests {
         let row = msg_row_with(1, 1000, 100);
         let msg = test_message();
         assert!(super::matches_criteria(
-            &[SearchKey::Subject("test".to_string())], &row, &[], 1, Some(&msg)
+            &[SearchKey::Subject("test".to_string())], &row, &[], 1, Some(&msg), 100, 100
         ));
         assert!(super::matches_criteria(
-            &[SearchKey::Subject("TEST SUBJECT".to_string())], &row, &[], 1, Some(&msg)
+            &[SearchKey::Subject("TEST SUBJECT".to_string())], &row, &[], 1, Some(&msg), 100, 100
         ));
         assert!(!super::matches_criteria(
-            &[SearchKey::Subject("missing".to_string())], &row, &[], 1, Some(&msg)
+            &[SearchKey::Subject("missing".to_string())], &row, &[], 1, Some(&msg), 100, 100
         ));
         assert!(super::matches_criteria(
-            &[SearchKey::Body("hello".to_string())], &row, &[], 1, Some(&msg)
+            &[SearchKey::Body("hello".to_string())], &row, &[], 1, Some(&msg), 100, 100
         ));
         assert!(!super::matches_criteria(
-            &[SearchKey::Body("missing".to_string())], &row, &[], 1, Some(&msg)
+            &[SearchKey::Body("missing".to_string())], &row, &[], 1, Some(&msg), 100, 100
         ));
     }
 
     #[test]
     fn search_content_without_message_returns_false() {
         let row = msg_row_with(1, 1000, 100);
-        assert!(!super::matches_criteria(&[SearchKey::Subject("test".to_string())], &row, &[], 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Body("hello".to_string())], &row, &[], 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::From("user".to_string())], &row, &[], 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Subject("test".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Body("hello".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::From("user".to_string())], &row, &[], 1, None, 100, 100));
     }
 
     #[test]
     fn search_keyword() {
         let row = msg_row_with(1, 1000, 100);
         let flags = vec!["$Important".to_string()];
-        assert!(super::matches_criteria(&[SearchKey::Keyword("$Important".to_string())], &row, &flags, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Keyword("$Other".to_string())], &row, &flags, 1, None));
-        assert!(!super::matches_criteria(&[SearchKey::Unkeyword("$Important".to_string())], &row, &flags, 1, None));
-        assert!(super::matches_criteria(&[SearchKey::Unkeyword("$Other".to_string())], &row, &flags, 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Keyword("$Important".to_string())], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Keyword("$Other".to_string())], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Unkeyword("$Important".to_string())], &row, &flags, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Unkeyword("$Other".to_string())], &row, &flags, 1, None, 100, 100));
     }
 
     #[test]
@@ -2774,11 +2807,14 @@ mod search_tests {
         imap_store.add_flags(msgs[0].id, &["\\Seen"]).unwrap();
         imap_store.add_flags(msgs[1].id, &["\\Seen", "\\Flagged"]).unwrap();
 
+        let max_uid = msgs.last().map(|m| m.uid).unwrap_or(0);
+        let max_seqnum = msgs.len() as u32;
+
         // SEARCH SEEN should match UIDs 1 and 2
         let mut results = Vec::new();
         for (idx, msg) in msgs.iter().enumerate() {
             let flags = imap_store.get_flags(msg.id).unwrap();
-            if super::matches_criteria(&[SearchKey::Seen], msg, &flags, (idx + 1) as u32, None) {
+            if super::matches_criteria(&[SearchKey::Seen], msg, &flags, (idx + 1) as u32, None, max_uid, max_seqnum) {
                 results.push(msg.uid);
             }
         }
@@ -2788,7 +2824,7 @@ mod search_tests {
         let mut results = Vec::new();
         for (idx, msg) in msgs.iter().enumerate() {
             let flags = imap_store.get_flags(msg.id).unwrap();
-            if super::matches_criteria(&[SearchKey::Flagged], msg, &flags, (idx + 1) as u32, None) {
+            if super::matches_criteria(&[SearchKey::Flagged], msg, &flags, (idx + 1) as u32, None, max_uid, max_seqnum) {
                 results.push(msg.uid);
             }
         }
@@ -2798,10 +2834,98 @@ mod search_tests {
         let mut results = Vec::new();
         for (idx, msg) in msgs.iter().enumerate() {
             let flags = imap_store.get_flags(msg.id).unwrap();
-            if super::matches_criteria(&[SearchKey::Unseen], msg, &flags, (idx + 1) as u32, None) {
+            if super::matches_criteria(&[SearchKey::Unseen], msg, &flags, (idx + 1) as u32, None, max_uid, max_seqnum) {
                 results.push(msg.uid);
             }
         }
         assert_eq!(results, vec![uid3]);
+    }
+
+    #[test]
+    fn sequence_set_contains_single() {
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 3, end: None }] };
+        assert!(super::sequence_set_contains(&set, 3, 10));
+        assert!(!super::sequence_set_contains(&set, 4, 10));
+    }
+
+    #[test]
+    fn sequence_set_contains_range() {
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 2, end: Some(5) }] };
+        assert!(!super::sequence_set_contains(&set, 1, 10));
+        assert!(super::sequence_set_contains(&set, 2, 10));
+        assert!(super::sequence_set_contains(&set, 5, 10));
+        assert!(!super::sequence_set_contains(&set, 6, 10));
+    }
+
+    #[test]
+    fn sequence_set_contains_wildcard() {
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        // 5:* with max=10 should match 5..=10
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 5, end: Some(u32::MAX) }] };
+        assert!(!super::sequence_set_contains(&set, 4, 10));
+        assert!(super::sequence_set_contains(&set, 5, 10));
+        assert!(super::sequence_set_contains(&set, 10, 10));
+        assert!(!super::sequence_set_contains(&set, 11, 10));
+    }
+
+    #[test]
+    fn sequence_set_contains_wildcard_beyond_max() {
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        // UID 20:* with max_uid=10 should not match anything < 10, reversed range 10..=10
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 20, end: Some(u32::MAX) }] };
+        assert!(super::sequence_set_contains(&set, 10, 10)); // reversed: 10..=20
+        assert!(!super::sequence_set_contains(&set, 9, 10));
+    }
+
+    #[test]
+    fn search_uid_set() {
+        let row = msg_row_with(5, 1000, 100);
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        // UID 3:7 with max_uid=10, msg uid=5 -> match
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 3, end: Some(7) }] };
+        assert!(super::matches_criteria(
+            &[SearchKey::Uid(set.clone())], &row, &[], 2, None, 10, 5
+        ));
+        // UID 6:* with max_uid=10, msg uid=5 -> no match
+        let set2 = SequenceSet { ranges: vec![SequenceRange { start: 6, end: Some(u32::MAX) }] };
+        assert!(!super::matches_criteria(
+            &[SearchKey::Uid(set2)], &row, &[], 2, None, 10, 5
+        ));
+    }
+
+    #[test]
+    fn search_seqnum_set() {
+        let row = msg_row_with(10, 1000, 100);
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        // seqnum=3, set 2:4, max_seqnum=5 -> match
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 2, end: Some(4) }] };
+        assert!(super::matches_criteria(
+            &[SearchKey::SequenceSet(set)], &row, &[], 3, None, 10, 5
+        ));
+        // seqnum=3, set 4:5, max_seqnum=5 -> no match
+        let set2 = SequenceSet { ranges: vec![SequenceRange { start: 4, end: Some(5) }] };
+        assert!(!super::matches_criteria(
+            &[SearchKey::SequenceSet(set2)], &row, &[], 3, None, 10, 5
+        ));
+    }
+
+    #[test]
+    fn parse_date_rejects_invalid_day() {
+        // April has 30 days
+        assert!(super::parse_imap_date("30-Apr-2026").is_some());
+        assert!(super::parse_imap_date("31-Apr-2026").is_none());
+        // Feb non-leap
+        assert!(super::parse_imap_date("28-Feb-2025").is_some());
+        assert!(super::parse_imap_date("29-Feb-2025").is_none());
+        // Feb leap
+        assert!(super::parse_imap_date("29-Feb-2024").is_some());
+    }
+
+    #[test]
+    fn parse_date_rejects_extreme_year() {
+        assert!(super::parse_imap_date("01-Jan-10000").is_none());
+        assert!(super::parse_imap_date("01-Jan-9999").is_some());
     }
 }
