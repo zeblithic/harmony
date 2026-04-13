@@ -10,7 +10,7 @@ pub mod filter;
 pub mod ingest;
 pub mod scope;
 
-pub use engine::{OluoAction, OluoEngine, OluoEvent};
+pub use engine::{EntryMetadata, OluoAction, OluoEngine, OluoEvent};
 pub use error::{OluoError, OluoResult};
 pub use filter::{FilteredSearchResult, RawSearchResult, RetrievalContext, RetrievalFilter};
 pub use ingest::{IngestDecision, IngestGate};

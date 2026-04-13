@@ -41,33 +41,23 @@ pub enum PrivacyTier {
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SidecarMetadata {
     /// Privacy tier controlling indexing and gate behaviour.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub privacy_tier: Option<PrivacyTier>,
     /// Creation timestamp (Unix seconds).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
     /// MIME content type (e.g. "text/plain").
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
     /// BCP-47 language tag (e.g. "en-US").
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     /// Geographic coordinates (latitude, longitude).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub geo: Option<(f64, f64)>,
     /// Human-readable description.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Free-form tags for categorisation.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
     /// References to other content CIDs.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub refs: Option<Vec<[u8; 32]>>,
     /// Source device identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub source_device: Option<String>,
     /// Extension map for future fields.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<BTreeMap<String, Vec<u8>>>,
 }
