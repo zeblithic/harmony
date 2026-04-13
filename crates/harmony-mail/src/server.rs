@@ -1359,7 +1359,40 @@ where
                             };
                             let cid_bytes = match msg_row.message_cid {
                                 Some(c) => c,
-                                None => continue, // skip messages without CAS content
+                                None => {
+                                    // No CAS content — render metadata-only attributes
+                                    // (FLAGS, UID, RFC822.SIZE) per RFC 9051 §7.5.2
+                                    let mut items = Vec::new();
+                                    for attr in &attrs {
+                                        match attr {
+                                            imap_parse::FetchAttribute::Flags => {
+                                                let f = store.get_flags(msg_row.id).unwrap_or_default();
+                                                let flags_str = if f.is_empty() {
+                                                    "()".to_string()
+                                                } else {
+                                                    format!("({})", f.join(" "))
+                                                };
+                                                items.push(format!("FLAGS {flags_str}"));
+                                            }
+                                            imap_parse::FetchAttribute::Uid => {
+                                                items.push(format!("UID {uid}"));
+                                            }
+                                            imap_parse::FetchAttribute::Rfc822Size => {
+                                                items.push(format!("RFC822.SIZE {}", msg_row.rfc822_size));
+                                            }
+                                            _ => {} // content-requiring attributes skipped
+                                        }
+                                    }
+                                    if !items.is_empty() {
+                                        writer
+                                            .write_all(
+                                                format!("* {seqnum} FETCH ({})\r\n", items.join(" "))
+                                                    .as_bytes(),
+                                            )
+                                            .await?;
+                                    }
+                                    continue;
+                                }
                             };
 
                             // Retrieve message from CAS via spawn_blocking (file I/O)
@@ -2009,14 +2042,14 @@ mod sequence_set_tests {
     }
 
     #[test]
-    fn fetch_skips_message_without_cid() {
+    fn fetch_metadata_only_without_cid() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("imap.db");
         let imap_store = ImapStore::open(&db_path).unwrap();
         imap_store.initialize_default_mailboxes().unwrap();
 
         // Insert message with no CID
-        imap_store
+        let uid = imap_store
             .insert_message("INBOX", &[2u8; MESSAGE_ID_LEN], None, 1713000000, 100)
             .unwrap();
 
@@ -2024,6 +2057,16 @@ mod sequence_set_tests {
         let messages = imap_store.get_messages(mbox.id).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].message_cid.is_none());
+
+        // Add a flag so we can verify it's returned
+        imap_store.add_flags(messages[0].id, &["\\Seen"]).unwrap();
+        let flags = imap_store.get_flags(messages[0].id).unwrap();
+        assert_eq!(flags, vec!["\\Seen"]);
+
+        // Verify metadata is available even without CAS content:
+        // UID, FLAGS, and RFC822.SIZE should all be renderable from MessageRow
+        assert_eq!(uid, 1);
+        assert_eq!(messages[0].rfc822_size, 100);
     }
 
     #[test]
