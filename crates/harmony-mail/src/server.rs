@@ -1699,6 +1699,137 @@ fn is_leap(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
+/// Evaluate IMAP SEARCH criteria against a message.
+/// Multiple criteria are AND'd per RFC 9051.
+fn matches_criteria(
+    criteria: &[imap_parse::SearchKey],
+    msg_row: &imap_store::MessageRow,
+    flags: &[String],
+    seqnum: u32,
+    msg: Option<&crate::message::HarmonyMessage>,
+) -> bool {
+    criteria.iter().all(|key| matches_single_criterion(key, msg_row, flags, seqnum, msg))
+}
+
+/// Evaluate a single IMAP SEARCH criterion.
+fn matches_single_criterion(
+    key: &imap_parse::SearchKey,
+    msg_row: &imap_store::MessageRow,
+    flags: &[String],
+    seqnum: u32,
+    msg: Option<&crate::message::HarmonyMessage>,
+) -> bool {
+    use imap_parse::SearchKey;
+
+    let has_flag = |f: &str| flags.iter().any(|fl| fl == f);
+
+    match key {
+        SearchKey::All => true,
+        SearchKey::Seen => has_flag("\\Seen"),
+        SearchKey::Unseen => !has_flag("\\Seen"),
+        SearchKey::Flagged => has_flag("\\Flagged"),
+        SearchKey::Unflagged => !has_flag("\\Flagged"),
+        SearchKey::Answered => has_flag("\\Answered"),
+        SearchKey::Unanswered => !has_flag("\\Answered"),
+        SearchKey::Deleted => has_flag("\\Deleted"),
+        SearchKey::Undeleted => !has_flag("\\Deleted"),
+        SearchKey::Draft => has_flag("\\Draft"),
+        SearchKey::Undraft => !has_flag("\\Draft"),
+        SearchKey::Recent => has_flag("\\Recent"),
+        SearchKey::New => has_flag("\\Recent") && !has_flag("\\Seen"),
+        SearchKey::Old => !has_flag("\\Recent"),
+        SearchKey::Keyword(s) => has_flag(s),
+        SearchKey::Unkeyword(s) => !has_flag(s),
+
+        SearchKey::Larger(n) => msg_row.rfc822_size > *n,
+        SearchKey::Smaller(n) => msg_row.rfc822_size < *n,
+
+        SearchKey::Since(date) => {
+            parse_imap_date(date).map_or(false, |d| msg_row.internal_date >= d)
+        }
+        SearchKey::Before(date) => {
+            parse_imap_date(date).map_or(false, |d| msg_row.internal_date < d)
+        }
+        SearchKey::On(date) => {
+            parse_imap_date(date).map_or(false, |d| {
+                msg_row.internal_date >= d && msg_row.internal_date < d + 86400
+            })
+        }
+
+        SearchKey::Uid(set) => {
+            let dummy_msgs = [imap_store::MessageRow {
+                id: msg_row.id,
+                mailbox_id: msg_row.mailbox_id,
+                uid: msg_row.uid,
+                harmony_msg_id: msg_row.harmony_msg_id,
+                message_cid: msg_row.message_cid,
+                internal_date: msg_row.internal_date,
+                rfc822_size: msg_row.rfc822_size,
+            }];
+            !resolve_sequence_set(set, true, &dummy_msgs).is_empty()
+        }
+        SearchKey::SequenceSet(set) => {
+            let dummy_msgs = [imap_store::MessageRow {
+                id: msg_row.id,
+                mailbox_id: msg_row.mailbox_id,
+                uid: msg_row.uid,
+                harmony_msg_id: msg_row.harmony_msg_id,
+                message_cid: msg_row.message_cid,
+                internal_date: msg_row.internal_date,
+                rfc822_size: msg_row.rfc822_size,
+            }];
+            !resolve_sequence_set(set, false, &dummy_msgs).is_empty()
+        }
+
+        SearchKey::Subject(s) => {
+            msg.map_or(false, |m| m.subject.to_lowercase().contains(&s.to_lowercase()))
+        }
+        SearchKey::Body(s) => {
+            msg.map_or(false, |m| m.body.to_lowercase().contains(&s.to_lowercase()))
+        }
+        SearchKey::From(s) => {
+            msg.map_or(false, |m| {
+                let sender_hex = hex::encode(m.sender_address);
+                sender_hex.to_lowercase().contains(&s.to_lowercase())
+            })
+        }
+        SearchKey::To(s) => {
+            msg.map_or(false, |m| {
+                m.recipients.iter().any(|r| {
+                    let addr_hex = hex::encode(r.address_hash);
+                    addr_hex.to_lowercase().contains(&s.to_lowercase())
+                })
+            })
+        }
+        SearchKey::Header(name, value) => {
+            msg.map_or(false, |m| {
+                let field_content = match name.to_lowercase().as_str() {
+                    "subject" => Some(m.subject.as_str()),
+                    "from" => None,
+                    _ => None,
+                };
+                match field_content {
+                    Some(content) => content.to_lowercase().contains(&value.to_lowercase()),
+                    None => {
+                        if name.eq_ignore_ascii_case("from") {
+                            let sender_hex = hex::encode(m.sender_address);
+                            sender_hex.to_lowercase().contains(&value.to_lowercase())
+                        } else {
+                            false
+                        }
+                    }
+                }
+            })
+        }
+
+        SearchKey::Not(inner) => !matches_single_criterion(inner, msg_row, flags, seqnum, msg),
+        SearchKey::Or(a, b) => {
+            matches_single_criterion(a, msg_row, flags, seqnum, msg)
+                || matches_single_criterion(b, msg_row, flags, seqnum, msg)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2222,5 +2353,172 @@ mod sequence_set_tests {
         assert!(super::parse_imap_date("invalid").is_none());
         assert!(super::parse_imap_date("32-Jan-2026").is_none());
         assert!(super::parse_imap_date("01-Xyz-2026").is_none());
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use crate::imap_parse::SearchKey;
+    use crate::message::{
+        HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType, ADDRESS_HASH_LEN,
+        MESSAGE_ID_LEN, VERSION,
+    };
+
+    fn msg_row_with(uid: u32, internal_date: u64, rfc822_size: u32) -> imap_store::MessageRow {
+        imap_store::MessageRow {
+            id: uid as i64,
+            mailbox_id: 1,
+            uid,
+            harmony_msg_id: [0u8; MESSAGE_ID_LEN],
+            message_cid: None,
+            internal_date,
+            rfc822_size,
+        }
+    }
+
+    fn test_message() -> HarmonyMessage {
+        HarmonyMessage {
+            version: VERSION,
+            message_type: MailMessageType::Email,
+            flags: MessageFlags::new(false, false, false),
+            timestamp: 1713000000,
+            message_id: [1u8; MESSAGE_ID_LEN],
+            in_reply_to: None,
+            sender_address: [0xAA; ADDRESS_HASH_LEN],
+            recipients: vec![Recipient {
+                address_hash: [0xBB; ADDRESS_HASH_LEN],
+                recipient_type: RecipientType::To,
+            }],
+            subject: "Test subject".to_string(),
+            body: "Hello, world!".to_string(),
+            attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn search_all() {
+        let row = msg_row_with(1, 1000, 100);
+        assert!(super::matches_criteria(&[SearchKey::All], &row, &[], 1, None));
+    }
+
+    #[test]
+    fn search_flag_seen() {
+        let row = msg_row_with(1, 1000, 100);
+        let seen = vec!["\\Seen".to_string()];
+        assert!(super::matches_criteria(&[SearchKey::Seen], &row, &seen, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Unseen], &row, &seen, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Seen], &row, &[], 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Unseen], &row, &[], 1, None));
+    }
+
+    #[test]
+    fn search_flag_deleted_draft_flagged_answered() {
+        let row = msg_row_with(1, 1000, 100);
+        let flags = vec!["\\Deleted".to_string(), "\\Draft".to_string()];
+        assert!(super::matches_criteria(&[SearchKey::Deleted], &row, &flags, 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Draft], &row, &flags, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Undeleted], &row, &flags, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Undraft], &row, &flags, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Flagged], &row, &flags, 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Unflagged], &row, &flags, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Answered], &row, &flags, 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Unanswered], &row, &flags, 1, None));
+    }
+
+    #[test]
+    fn search_recent_new_old() {
+        let row = msg_row_with(1, 1000, 100);
+        let recent = vec!["\\Recent".to_string()];
+        let recent_seen = vec!["\\Recent".to_string(), "\\Seen".to_string()];
+        assert!(super::matches_criteria(&[SearchKey::Recent], &row, &recent, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Old], &row, &recent, 1, None));
+        assert!(super::matches_criteria(&[SearchKey::New], &row, &recent, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::New], &row, &recent_seen, 1, None));
+    }
+
+    #[test]
+    fn search_size() {
+        let row = msg_row_with(1, 1000, 500);
+        assert!(super::matches_criteria(&[SearchKey::Larger(499)], &row, &[], 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Larger(500)], &row, &[], 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Smaller(501)], &row, &[], 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Smaller(500)], &row, &[], 1, None));
+    }
+
+    #[test]
+    fn search_date_since_before_on() {
+        // internal_date = 86400 (Jan 2, 1970)
+        let row = msg_row_with(1, 86400, 100);
+        assert!(super::matches_criteria(&[SearchKey::Since("02-Jan-1970".to_string())], &row, &[], 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Since("01-Jan-1970".to_string())], &row, &[], 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Since("03-Jan-1970".to_string())], &row, &[], 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Before("03-Jan-1970".to_string())], &row, &[], 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Before("02-Jan-1970".to_string())], &row, &[], 1, None));
+        assert!(super::matches_criteria(&[SearchKey::On("02-Jan-1970".to_string())], &row, &[], 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::On("01-Jan-1970".to_string())], &row, &[], 1, None));
+    }
+
+    #[test]
+    fn search_not_and_or() {
+        let row = msg_row_with(1, 1000, 100);
+        let seen = vec!["\\Seen".to_string()];
+        assert!(!super::matches_criteria(&[SearchKey::Not(Box::new(SearchKey::Seen))], &row, &seen, 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Not(Box::new(SearchKey::Seen))], &row, &[], 1, None));
+        assert!(super::matches_criteria(
+            &[SearchKey::Or(Box::new(SearchKey::Seen), Box::new(SearchKey::Flagged))],
+            &row, &seen, 1, None
+        ));
+        assert!(!super::matches_criteria(
+            &[SearchKey::Or(Box::new(SearchKey::Flagged), Box::new(SearchKey::Deleted))],
+            &row, &[], 1, None
+        ));
+    }
+
+    #[test]
+    fn search_multi_criteria_and() {
+        let row = msg_row_with(1, 1000, 500);
+        let seen = vec!["\\Seen".to_string()];
+        assert!(super::matches_criteria(&[SearchKey::Seen, SearchKey::Larger(100)], &row, &seen, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Seen, SearchKey::Larger(600)], &row, &seen, 1, None));
+    }
+
+    #[test]
+    fn search_subject_body() {
+        let row = msg_row_with(1, 1000, 100);
+        let msg = test_message();
+        assert!(super::matches_criteria(
+            &[SearchKey::Subject("test".to_string())], &row, &[], 1, Some(&msg)
+        ));
+        assert!(super::matches_criteria(
+            &[SearchKey::Subject("TEST SUBJECT".to_string())], &row, &[], 1, Some(&msg)
+        ));
+        assert!(!super::matches_criteria(
+            &[SearchKey::Subject("missing".to_string())], &row, &[], 1, Some(&msg)
+        ));
+        assert!(super::matches_criteria(
+            &[SearchKey::Body("hello".to_string())], &row, &[], 1, Some(&msg)
+        ));
+        assert!(!super::matches_criteria(
+            &[SearchKey::Body("missing".to_string())], &row, &[], 1, Some(&msg)
+        ));
+    }
+
+    #[test]
+    fn search_content_without_message_returns_false() {
+        let row = msg_row_with(1, 1000, 100);
+        assert!(!super::matches_criteria(&[SearchKey::Subject("test".to_string())], &row, &[], 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Body("hello".to_string())], &row, &[], 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::From("user".to_string())], &row, &[], 1, None));
+    }
+
+    #[test]
+    fn search_keyword() {
+        let row = msg_row_with(1, 1000, 100);
+        let flags = vec!["$Important".to_string()];
+        assert!(super::matches_criteria(&[SearchKey::Keyword("$Important".to_string())], &row, &flags, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Keyword("$Other".to_string())], &row, &flags, 1, None));
+        assert!(!super::matches_criteria(&[SearchKey::Unkeyword("$Important".to_string())], &row, &flags, 1, None));
+        assert!(super::matches_criteria(&[SearchKey::Unkeyword("$Other".to_string())], &row, &flags, 1, None));
     }
 }
