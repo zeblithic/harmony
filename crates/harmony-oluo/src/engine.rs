@@ -26,6 +26,11 @@ pub enum OluoEvent {
         decision: IngestDecision,
         /// Current wall-clock time in milliseconds (caller-provided, sans-I/O).
         now_ms: u64,
+        /// The scope this entry should be indexed under (caller-provided).
+        scope: crate::scope::SearchScope,
+        /// CIDs of the sidecar records merged to produce this entry.
+        /// Empty means single sidecar, no overlay merge.
+        overlay_cids: Vec<[u8; 32]>,
     },
     /// Execute a search query.
     ///
@@ -75,6 +80,12 @@ struct EntryMetadata {
     /// When this entry was ingested (milliseconds since epoch).
     #[allow(dead_code)] // stored for future diagnostics and re-indexing
     ingested_at_ms: u64,
+    /// The scope this entry was indexed under.
+    #[allow(dead_code)] // used for scope-filtered search in a future task
+    scope: crate::scope::SearchScope,
+    /// CIDs of the sidecar records that were merged for this entry.
+    #[allow(dead_code)] // used for overlay provenance in a future task
+    overlay_cids: Vec<[u8; 32]>,
 }
 
 /// The Oluo search engine state machine.
@@ -98,6 +109,10 @@ pub struct OluoEngine {
     /// Reverse lookup: CID -> index key. Ensures re-ingesting the same CID
     /// replaces the previous entry (deduplication).
     cid_to_key: hashbrown::HashMap<[u8; 32], u64>,
+    /// Per-scope entry counts: [Personal, Community, NetworkWide].
+    /// Used to estimate over-fetch ratio for scope-filtered searches.
+    #[allow(dead_code)] // wired in a future task
+    scope_counts: [usize; 3],
 }
 
 /// Unpack a 256-bit tier3 binary vector to 256 f32 values (0.0 / 1.0).
@@ -139,6 +154,7 @@ impl OluoEngine {
             compact_generation: 0,
             has_compacted: false,
             cid_to_key: hashbrown::HashMap::new(),
+            scope_counts: [0; 3],
         }
     }
 
@@ -153,6 +169,7 @@ impl OluoEngine {
             compact_generation: 0,
             has_compacted: false,
             cid_to_key: hashbrown::HashMap::new(),
+            scope_counts: [0; 3],
         }
     }
 
@@ -164,7 +181,9 @@ impl OluoEngine {
                 metadata,
                 decision,
                 now_ms,
-            } => self.handle_ingest(header, metadata, decision, now_ms),
+                scope,
+                overlay_cids,
+            } => self.handle_ingest(header, metadata, decision, now_ms, scope, overlay_cids),
             OluoEvent::Search { query_id, query } => self.handle_search(query_id, query),
             OluoEvent::EvictExpired { now_ms } => self.handle_evict(now_ms),
             OluoEvent::CompactComplete { path, generation } => {
@@ -184,6 +203,8 @@ impl OluoEngine {
         metadata: SidecarMetadata,
         decision: IngestDecision,
         now_ms: u64,
+        scope: crate::scope::SearchScope,
+        overlay_cids: Vec<[u8; 32]>,
     ) -> Vec<OluoAction> {
         // Reject decision — do not index.
         if decision == IngestDecision::Reject {
@@ -246,6 +267,8 @@ impl OluoEngine {
                 metadata,
                 expires_at,
                 ingested_at_ms: now_ms,
+                scope,
+                overlay_cids,
             },
         );
 
@@ -423,6 +446,8 @@ mod tests {
             metadata,
             decision,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         assert_eq!(engine.entry_count(), 1);
@@ -445,6 +470,8 @@ mod tests {
             metadata,
             decision,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         assert!(actions.is_empty());
@@ -467,6 +494,8 @@ mod tests {
             metadata,
             decision,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         assert!(actions.is_empty());
@@ -483,6 +512,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         let query = SearchQuery {
@@ -549,6 +580,8 @@ mod tests {
                 metadata: SidecarMetadata::default(),
                 decision: IngestDecision::IndexFull,
                 now_ms: 1_700_000_000_000,
+                scope: SearchScope::Personal,
+                overlay_cids: Vec::new(),
             });
         }
 
@@ -600,6 +633,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexLightweight { ttl_secs: 10 },
             now_ms: ingest_time,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         // Time has passed well beyond TTL, but no EvictExpired sent.
@@ -656,6 +691,8 @@ mod tests {
             metadata,
             decision,
             now_ms: ingest_time,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         assert_eq!(engine.entry_count(), 1);
 
@@ -684,6 +721,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         assert!(
             !actions
@@ -698,6 +737,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         assert!(
             actions
@@ -723,12 +764,16 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         let actions = engine.handle(OluoEvent::Ingest {
             header: test_header([0x20; 32], [0xBB; 32]),
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         // Extract the generation from the CompactRequest.
@@ -765,6 +810,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         assert_eq!(engine.entry_count(), 1);
 
@@ -773,6 +820,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         // Should still be 1 entry — the old one was replaced.
         assert_eq!(engine.entry_count(), 1);
@@ -804,6 +853,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         let query = SearchQuery {
