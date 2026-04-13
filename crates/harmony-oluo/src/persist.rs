@@ -201,6 +201,131 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), OluoPersistError> {
 mod tests {
     use super::*;
     use harmony_content::book::MemoryBookStore;
+    use crate::engine::{OluoAction, OluoEngine, OluoEvent};
+    use crate::scope::SearchScope;
+    use harmony_semantic::metadata::SidecarMetadata;
+    use harmony_semantic::sidecar::SidecarHeader;
+    use harmony_semantic::tier::EmbeddingTier;
+    use crate::ingest::IngestDecision;
+    use crate::scope::SearchQuery;
+
+    /// Helper: create a SidecarHeader with a specific tier3 embedding.
+    fn test_header(tier3: [u8; 32], cid: [u8; 32]) -> SidecarHeader {
+        SidecarHeader {
+            fingerprint: [0u8; 4],
+            target_cid: cid,
+            tier1: [0u8; 8],
+            tier2: [0u8; 16],
+            tier3,
+            tier4: [0u8; 64],
+            tier5: [0u8; 128],
+        }
+    }
+
+    /// Helper: ingest N entries and trigger compaction, returning the PersistSnapshot payload.
+    fn ingest_and_compact(engine: &mut OluoEngine, count: usize) -> OluoAction {
+        for i in 0..count {
+            let mut tier3 = [0u8; 32];
+            tier3[0] = i as u8;
+            let mut cid = [0u8; 32];
+            cid[0] = i as u8;
+            cid[1] = 0xFF;
+
+            let actions = engine.handle(OluoEvent::Ingest {
+                header: test_header(tier3, cid),
+                metadata: SidecarMetadata::default(),
+                decision: IngestDecision::IndexFull,
+                now_ms: 1000 + i as u64,
+                scope: SearchScope::Personal,
+                overlay_cids: vec![],
+            });
+            // Check if PersistSnapshot was emitted (compaction triggered)
+            for action in &actions {
+                if matches!(action, OluoAction::PersistSnapshot { .. }) {
+                    return action.clone();
+                }
+            }
+        }
+        panic!("compaction was not triggered after {count} ingests");
+    }
+
+    #[test]
+    fn persist_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MemoryBookStore::new();
+
+        // Create engine with low threshold so compaction triggers quickly.
+        let mut engine = OluoEngine::with_compact_threshold(5);
+
+        // Ingest entries until compaction triggers.
+        let persist_action = ingest_and_compact(&mut engine, 10);
+
+        let (index_bytes, metadata_bytes, key_counter, generation) = match persist_action {
+            OluoAction::PersistSnapshot {
+                index_bytes,
+                metadata_bytes,
+                key_counter,
+                generation,
+            } => (index_bytes, metadata_bytes, key_counter, generation),
+            _ => unreachable!(),
+        };
+
+        // Search the original engine for a reference result.
+        let query = SearchQuery {
+            embedding: [0u8; 32], // matches first entry
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 5,
+        };
+        let original_actions = engine.handle(OluoEvent::Search {
+            query_id: 1,
+            query: query.clone(),
+        });
+        let original_results = match &original_actions[0] {
+            OluoAction::SearchResults { results, .. } => results.clone(),
+            _ => panic!("expected SearchResults"),
+        };
+
+        // Persist.
+        let (base_path, gen) = persist_snapshot(
+            dir.path(),
+            &mut store,
+            &index_bytes,
+            &metadata_bytes,
+            key_counter,
+            generation,
+        )
+        .unwrap();
+        assert_eq!(gen, generation);
+        assert!(base_path.exists());
+
+        // Load.
+        let (restored_engine, restored_path, restored_gen) =
+            load_snapshot(dir.path(), &store, 5).unwrap().unwrap();
+        assert_eq!(restored_gen, generation);
+        assert!(restored_path.exists());
+
+        // Search the restored engine and compare.
+        let mut restored_engine = restored_engine;
+        let restored_actions = restored_engine.handle(OluoEvent::Search {
+            query_id: 2,
+            query,
+        });
+        let restored_results = match &restored_actions[0] {
+            OluoAction::SearchResults { results, .. } => results.clone(),
+            _ => panic!("expected SearchResults"),
+        };
+
+        // Same number of results, same CIDs (order may vary by distance).
+        assert_eq!(original_results.len(), restored_results.len());
+        let mut orig_cids: Vec<[u8; 32]> =
+            original_results.iter().map(|r| r.target_cid).collect();
+        let mut rest_cids: Vec<[u8; 32]> =
+            restored_results.iter().map(|r| r.target_cid).collect();
+        orig_cids.sort();
+        rest_cids.sort();
+        assert_eq!(orig_cids, rest_cids);
+    }
 
     fn make_test_snapshot() -> (Vec<u8>, Vec<u8>, u64, u64) {
         // Fake index bytes (just needs to be non-empty for DAG ingest)
