@@ -990,4 +990,9 @@ mod tests {
         assert!(db_root_key("abcd1234", "").is_err());
         assert!(db_block_key("abcd1234", "", "ff00").is_err());
     }
+
+    #[test]
+    fn db_block_key_rejects_empty_cid_hex() {
+        assert!(db_block_key("abcd1234", "mail", "").is_err());
+    }
 }

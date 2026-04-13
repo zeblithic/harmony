@@ -1,5 +1,15 @@
 //! Disk-backed BookStore with optional network fallback.
 
+// DiskBookStore::get() uses unsafe lifetime extension that is formally UB
+// under Miri's stacked borrows model. See the ALIASING LIMITATION comment
+// in the get() implementation.
+#[cfg(miri)]
+compile_error!(
+    "DiskBookStore::get() extends a RefCell-derived slice lifetime via unsafe; \
+     this is UB under Miri's stacked borrows. Run without Miri or redesign \
+     BookStore::get to return owned data (Vec<u8> or Cow)."
+);
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -175,6 +185,8 @@ impl BookStore for DiskBookStore {
         // immediately via .to_vec() or extend_from_slice before the next
         // get(), so this never manifests. A proper fix requires the
         // BookStore trait to return owned data (Vec<u8> or Cow).
+        // TODO: Redesign BookStore::get to return owned data, eliminating
+        // the need for unsafe lifetime extension here.
         let cache = self.cache.borrow();
         cache.get(cid).map(|v| {
             let ptr = v.as_ptr();
