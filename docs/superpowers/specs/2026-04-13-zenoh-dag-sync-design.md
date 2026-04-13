@@ -54,23 +54,22 @@ Add builder functions to `crates/harmony-zenoh/src/keyspace.rs` following existi
 
 All functions validate inputs with `reject_slashes()` and return `Result<OwnedKeyExpr, ZenohError>`, consistent with existing keyspace helpers.
 
-### 2. ZenohBookStore (application layer)
+### 2. DiskBookStore with Zenoh Fetcher (application layer)
 
-Implements `harmony_content::BookStore` to bridge local CAS with Zenoh network fetches.
+`DiskBookStore::with_fetcher(...)` provides the `BookStore` implementation passed to `rebuild_from()`. The application layer wires the fetch callback to Zenoh queries for `harmony/db/{owner}/{db_name}/block/{cid_hex}`.
 
 #### Construction
 
-Created per-sync-session with:
-- `data_dir: &Path` — local CAS directory
-- Remote peer address and database name (for constructing query key expressions)
-- A Zenoh query callback or handle
+Created per-sync-session via `DiskBookStore::with_fetcher(data_dir, fetcher)`:
+- `data_dir: &Path` — reader's local CAS directory
+- `fetcher` — closure that sends a Zenoh query to the writer's block queryable and returns the raw bytes
 
 #### Method behavior
 
-- **`get(cid)`** — Check local CAS first (`commits/{hex}.bin` and `blobs/{hex}.bin`). On local miss, send Zenoh query to `harmony/db/{owner}/{db_name}/block/{cid_hex}`. Verify BLAKE3 integrity of received bytes. Cache locally on success.
+- **`get(cid)`** — Check local CAS first (`commits/{hex}.bin` and `blobs/{hex}.bin`). On local miss, invoke the Zenoh fetch callback. Verify BLAKE3 integrity of received bytes. Cache locally on success.
 - **`contains(cid)`** — Local CAS only. No network round-trip.
-- **`store(cid, data)`** — Write to local CAS.
-- **`insert_with_flags(data, flags)`** — Compute CID, write to local CAS.
+- **`store(cid, data)`** — Write to local CAS. Skips cache if disk write fails.
+- **`insert_with_flags(data, flags)`** — Compute CID, write to local CAS. Returns error if disk write fails.
 
 #### Lifetime
 
@@ -102,8 +101,8 @@ Subscribe to `harmony/db/{peer_addr_hex}/{db_name}/root`. On message:
 1. Decode 32-byte `ContentId` from payload
 2. Compare against `db.head()`
 3. If identical: no-op
-4. If different: create `ZenohBookStore` for that peer, call `db.rebuild_from(new_root, Some(&store))`
-5. `rebuild_from` walks the tree, fetching missing blocks via `ZenohBookStore`, updates local state
+4. If different: create `DiskBookStore::with_fetcher(...)` for that peer, call `db.rebuild_from(new_root, Some(&store))`
+5. `rebuild_from` walks the tree, fetching missing blocks via the Zenoh-backed `DiskBookStore`, updates local state
 
 #### Subscription management
 
@@ -119,7 +118,7 @@ Writer (Peer A)                          Reader (Peer B)
 3. publish root_cid ──pub/sub──────────> receive root_cid
                                          4. compare with db.head()
                                          5. if different:
-                                            create ZenohBookStore(peer_a)
+                                            create DiskBookStore::with_fetcher(peer_a)
                                             db.rebuild_from(root_cid, store)
                                               │
                                               ├─ get(root_cid) ──query──> serve from CAS
@@ -143,7 +142,7 @@ Writer (Peer A)                          Reader (Peer B)
 ### application layer (harmony-node/harmony-runtime)
 
 - New module (e.g., `sync.rs` or `db_sync.rs`):
-  - `ZenohBookStore` struct implementing `BookStore`
+  - Zenoh fetcher wiring: closure that queries `harmony/db/{owner}/{db_name}/block/{cid_hex}` for use with `DiskBookStore::with_fetcher(...)`
   - `serve_blocks(db, zenoh_session)` — register block server queryable
   - `publish_root(root_cid, zenoh_session)` — publish after commit
   - `handle_root_announcement(root_cid, peer, db)` — trigger `rebuild_from`
@@ -160,7 +159,7 @@ Writer (Peer A)                          Reader (Peer B)
 - Wildcard subscription patterns match expected keys
 - Input validation (reject slashes, empty strings)
 
-### Unit tests (ZenohBookStore)
+### Unit tests (DiskBookStore)
 
 - `get()` returns local CAS data when present (no network call)
 - `get()` falls through to network fetch on local miss (mock Zenoh query)
@@ -172,7 +171,7 @@ Writer (Peer A)                          Reader (Peer B)
 
 - Two `HarmonyDb` instances with separate data directories
 - Writer commits entries, passes root CID directly to reader (simulated pub/sub)
-- Reader creates `ZenohBookStore` backed by writer's local CAS (in-process, no actual Zenoh), calls `rebuild_from`
+- Reader creates `DiskBookStore::with_fetcher(...)` backed by writer's local CAS (in-process, no actual Zenoh), calls `rebuild_from`
 - Verify reader state matches writer (same entries, same head CID)
 - Verify incremental sync: writer commits more changes, reader syncs again, structural sharing means only new blocks fetched
 

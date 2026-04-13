@@ -65,17 +65,25 @@ impl DiskBookStore {
     }
 
     /// Try to read a CID from local CAS (commits/ then blobs/).
-    fn read_local(&self, cid: &ContentId) -> Option<Vec<u8>> {
+    ///
+    /// Returns `Ok(None)` only when both paths are `NotFound`.
+    /// Non-NotFound IO errors (permissions, disk failure) propagate
+    /// so callers don't silently fall through to network fetch.
+    fn read_local(&self, cid: &ContentId) -> std::io::Result<Option<Vec<u8>>> {
         let hex = hex::encode(cid.to_bytes());
         let commit_path = self.data_dir.join("commits").join(format!("{hex}.bin"));
-        if let Ok(data) = std::fs::read(&commit_path) {
-            return Some(data);
+        match std::fs::read(&commit_path) {
+            Ok(data) => return Ok(Some(data)),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            Err(_) => {}
         }
         let blob_path = self.data_dir.join("blobs").join(format!("{hex}.bin"));
-        if let Ok(data) = std::fs::read(&blob_path) {
-            return Some(data);
+        match std::fs::read(&blob_path) {
+            Ok(data) => return Ok(Some(data)),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            Err(_) => {}
         }
-        None
+        Ok(None)
     }
 
     /// Write data to commits/ directory (atomic via tmp + rename).
@@ -90,11 +98,9 @@ impl DiskBookStore {
         Ok(())
     }
 
-    /// Verify that data matches the expected CID.
+    /// Verify that data matches the expected CID (any CID type).
     fn verify_cid(cid: &ContentId, data: &[u8]) -> bool {
-        ContentId::for_book(data, cid.flags())
-            .map(|computed| computed == *cid)
-            .unwrap_or(false)
+        cid.verify_hash(data)
     }
 }
 
@@ -122,18 +128,28 @@ impl BookStore for DiskBookStore {
     fn get(&self, cid: &ContentId) -> Option<&[u8]> {
         // Populate cache from disk or network if needed
         if !self.cache.borrow().contains_key(cid) {
-            if let Some(data) = self.read_local(cid) {
-                self.cache.borrow_mut().insert(*cid, data);
-            } else if let Some(ref fetcher) = self.fetcher {
-                if let Some(data) = fetcher(cid) {
-                    if Self::verify_cid(cid, &data) {
-                        // Unlike insert/store, this is a read-side cache:
-                        // the caller needs this data now and it's CID-verified.
-                        // Disk write is best-effort for future sessions.
-                        let _ = self.write_to_commits(cid, &data);
-                        self.cache.borrow_mut().insert(*cid, data);
+            match self.read_local(cid) {
+                Ok(Some(data)) => {
+                    self.cache.borrow_mut().insert(*cid, data);
+                }
+                Ok(None) => {
+                    // Not on disk — try network fetch
+                    if let Some(ref fetcher) = self.fetcher {
+                        if let Some(data) = fetcher(cid) {
+                            if Self::verify_cid(cid, &data) {
+                                // Unlike insert/store, this is a read-side cache:
+                                // the caller needs this data now and it's CID-verified.
+                                // Disk write is best-effort for future sessions.
+                                let _ = self.write_to_commits(cid, &data);
+                                self.cache.borrow_mut().insert(*cid, data);
+                            }
+                            // CID mismatch: corrupted data from network, ignore
+                        }
                     }
-                    // CID mismatch: corrupted data from network, ignore
+                }
+                Err(_) => {
+                    // Non-NotFound IO error — local CAS is broken, don't
+                    // fall through to network fetch.
                 }
             }
         }
@@ -162,7 +178,7 @@ impl BookStore for DiskBookStore {
 
     fn remove(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
         let data = self.cache.borrow_mut().remove(cid)
-            .or_else(|| self.read_local(cid));
+            .or_else(|| self.read_local(cid).unwrap_or(None));
 
         // Remove from disk (both possible locations).
         let hex = hex::encode(cid.to_bytes());
