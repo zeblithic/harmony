@@ -34,7 +34,6 @@ struct RechunkResult {
     new_children: Vec<BranchEntry>,
     /// How many additional sibling leaves were absorbed during convergence
     /// (0 = only the target leaf was rechunked).
-    #[allow(dead_code)]
     siblings_consumed: usize,
 }
 

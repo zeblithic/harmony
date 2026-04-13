@@ -184,6 +184,14 @@ Since the key doesn't change, boundaries are guaranteed unchanged:
 No rechunking at any level. Strict O(log n) with exactly one node write per
 tree level.
 
+**Implementation note:** The actual implementation uses the same rechunk path
+for update_meta rather than the CID-only cascade described above. This is more
+correct because changing a snippet can change `LeafEntry::approx_size()`, which
+is an input to `is_boundary()`. A large snippet change could legitimately shift
+chunk boundaries. Using the full rechunk path handles this correctly with
+negligible overhead (the common case where boundaries don't shift converges
+immediately).
+
 ## Changes to Existing Code
 
 ### `prolly/mod.rs`
