@@ -1265,13 +1265,15 @@ where
                         .ok_or_else(|| "mailbox not found".to_string())?;
                     let all_msgs = store.get_messages(mbox.id).map_err(|e| e.to_string())?;
                     let resolved = resolve_sequence_set(sequence_set, *uid_mode, &all_msgs);
+                    let rows_by_uid: std::collections::HashMap<u32, &imap_store::MessageRow> =
+                        all_msgs.iter().map(|m| (m.uid, m)).collect();
 
                     let flag_refs: Vec<&str> = flags.iter().map(|s| s.as_str()).collect();
                     let mut updated = Vec::new();
 
                     for (uid, seqnum) in &resolved {
-                        let msg_row = match all_msgs.iter().find(|m| m.uid == *uid) {
-                            Some(r) => r,
+                        let msg_row = match rows_by_uid.get(uid) {
+                            Some(r) => *r,
                             None => continue,
                         };
 
@@ -1316,6 +1318,14 @@ where
                 attributes,
                 uid_mode,
             } => {
+                // RFC 9051 §6.4.8: UID FETCH responses MUST include UID
+                let attrs = if *uid_mode && !attributes.contains(&imap_parse::FetchAttribute::Uid) {
+                    let mut a = attributes.clone();
+                    a.push(imap_parse::FetchAttribute::Uid);
+                    a
+                } else {
+                    attributes.clone()
+                };
                 let fetch_result: Result<(Vec<(u32, u32)>, Vec<imap_store::MessageRow>, PathBuf), String> = (|| {
                     let mailbox_name = match &session.state {
                         ImapState::Selected { mailbox, .. } => mailbox.name.clone(),
@@ -1334,9 +1344,11 @@ where
 
                 match fetch_result {
                     Ok((resolved, all_msgs, csp)) => {
+                        let rows_by_uid: std::collections::HashMap<u32, &imap_store::MessageRow> =
+                            all_msgs.iter().map(|m| (m.uid, m)).collect();
                         for (uid, seqnum) in &resolved {
-                            let msg_row = match all_msgs.iter().find(|m| m.uid == *uid) {
-                                Some(r) => r,
+                            let msg_row = match rows_by_uid.get(uid) {
+                                Some(r) => *r,
                                 None => continue,
                             };
                             let cid_bytes = match msg_row.message_cid {
@@ -1374,9 +1386,15 @@ where
                                 }
                             };
 
-                            let flags = store.get_flags(msg_row.id).unwrap_or_default();
+                            let flags = match store.get_flags(msg_row.id) {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    tracing::warn!(uid = uid, error = %e, "FETCH: flag retrieval failed, skipping");
+                                    continue;
+                                }
+                            };
                             match crate::imap_render::build_fetch_response(
-                                *seqnum, *uid, attributes, &harmony_msg, &flags,
+                                *seqnum, *uid, &attrs, &harmony_msg, &flags,
                                 msg_row.rfc822_size, domain,
                             ) {
                                 Ok(response) => {
@@ -1512,6 +1530,7 @@ fn resolve_sequence_set(
     let max_uid = messages.last().map(|m| m.uid).unwrap_or(0);
     let max_seqnum = messages.len() as u32;
     let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
 
     for range in &set.ranges {
         let (start, end) = if uid_mode {
@@ -1536,16 +1555,22 @@ fn resolve_sequence_set(
 
         if uid_mode {
             for (idx, msg) in messages.iter().enumerate() {
-                if msg.uid >= lo && msg.uid <= hi {
+                if msg.uid >= lo && msg.uid <= hi && seen.insert(msg.uid) {
                     result.push((msg.uid, (idx + 1) as u32));
                 }
             }
         } else {
-            let clamped_lo = lo.max(1).min(max_seqnum);
-            let clamped_hi = hi.max(1).min(max_seqnum);
-            for seqnum in clamped_lo..=clamped_hi {
+            // Intersect with valid range [1, max_seqnum]; skip if no overlap
+            if lo > max_seqnum || hi == 0 {
+                continue;
+            }
+            let intersect_lo = lo.max(1);
+            let intersect_hi = hi.min(max_seqnum);
+            for seqnum in intersect_lo..=intersect_hi {
                 let msg = &messages[(seqnum - 1) as usize];
-                result.push((msg.uid, seqnum));
+                if seen.insert(msg.uid) {
+                    result.push((msg.uid, seqnum));
+                }
             }
         }
     }
@@ -1857,6 +1882,54 @@ mod sequence_set_tests {
         // UID 2 doesn't exist — should be skipped
         let result = resolve_sequence_set(&seq(vec![(2, None)]), true, &msgs);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_seqnum_out_of_range_returns_empty() {
+        let msgs = make_messages(&[10, 20, 30]);
+        // Seqnum 999 doesn't exist in a 3-message mailbox — must not resolve to message 3
+        let result = resolve_sequence_set(&seq(vec![(999, None)]), false, &msgs);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_seqnum_range_out_of_range_returns_empty() {
+        let msgs = make_messages(&[10, 20, 30]);
+        // Seqnums 100:200 don't exist — must return nothing
+        let result = resolve_sequence_set(&seq(vec![(100, Some(200))]), false, &msgs);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_seqnum_partial_overlap() {
+        let msgs = make_messages(&[10, 20, 30]);
+        // Seqnums 2:10 — only 2 and 3 are valid
+        let result = resolve_sequence_set(&seq(vec![(2, Some(10))]), false, &msgs);
+        assert_eq!(result, vec![(20, 2), (30, 3)]);
+    }
+
+    #[test]
+    fn resolve_dedup_overlapping_ranges() {
+        let msgs = make_messages(&[1, 2, 3, 4, 5]);
+        // "1:3,2" — UID 2 appears in both ranges, should only appear once
+        let result = resolve_sequence_set(
+            &seq(vec![(1, Some(3)), (2, None)]),
+            true,
+            &msgs,
+        );
+        assert_eq!(result, vec![(1, 1), (2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn resolve_dedup_repeated_single() {
+        let msgs = make_messages(&[1, 2, 3]);
+        // "2,2" — same UID twice, should appear once
+        let result = resolve_sequence_set(
+            &seq(vec![(2, None), (2, None)]),
+            true,
+            &msgs,
+        );
+        assert_eq!(result, vec![(2, 2)]);
     }
 
     use crate::imap_parse::FetchAttribute;
