@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -300,6 +300,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let imap_domain = config.domain.name.clone();
         let imap_idle_timeout = Duration::from_secs(config.imap.idle_timeout);
         let imap_max_auth_failures = config.imap.max_auth_failures;
+        let content_store_path = PathBuf::from(&config.imap.content_store_path);
 
         // Port 993: IMAP implicit TLS
         if let Some(ref acceptor) = tls_acceptor {
@@ -311,6 +312,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     let acc = Arc::clone(acceptor);
                     let domain = imap_domain.clone();
                     let listener_cancel = cancel.clone();
+                    let csp_outer = content_store_path.clone();
                     tokio::spawn(async move {
                         loop {
                             tokio::select! {
@@ -328,6 +330,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                     let a = Arc::clone(&acc);
                                     let st = Arc::clone(&store);
                                     let d = domain.clone();
+                                    let csp = csp_outer.clone();
                                     tokio::spawn(async move {
                                         let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                                         match tls::implicit_tls_wrap(stream, &a).await {
@@ -339,7 +342,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                                     tls_available: true,
                                                     max_auth_failures: imap_max_auth_failures,
                                                 };
-                                                if let Err(e) = handle_imap_connection(reader, writer, imap_cfg, st, imap_idle_timeout).await {
+                                                if let Err(e) = handle_imap_connection(reader, writer, imap_cfg, st, imap_idle_timeout, csp).await {
                                                     tracing::debug!(%peer_ip, error = %e, "IMAPS connection ended with error");
                                                 }
                                             }
@@ -367,6 +370,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let acceptor_for_imap = tls_acceptor.clone();
                 let domain = imap_domain.clone();
                 let listener_cancel = cancel.clone();
+                let csp_outer = content_store_path.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -384,6 +388,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                 let st = Arc::clone(&store);
                                 let d = domain.clone();
                                 let acc = acceptor_for_imap.clone();
+                                let csp = csp_outer.clone();
                                 tokio::spawn(async move {
                                     let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                                     let (reader, writer) = tokio::io::split(stream);
@@ -395,7 +400,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                         tls_available: false,
                                         max_auth_failures: imap_max_auth_failures,
                                     };
-                                    if let Err(e) = handle_imap_connection_starttls(reader, writer, imap_cfg, st, imap_idle_timeout, acc).await {
+                                    if let Err(e) = handle_imap_connection_starttls(reader, writer, imap_cfg, st, imap_idle_timeout, acc, csp).await {
                                         tracing::debug!(%peer_ip, error = %e, "IMAP connection ended with error");
                                     }
                                 });
@@ -835,11 +840,13 @@ async fn handle_imap_connection<R, W>(
     config: ImapConfig,
     store: Arc<ImapStore>,
     idle_timeout: Duration,
+    content_store_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
+    let domain = config.domain.clone();
     let mut session = ImapSession::new(config);
     let codec = ImapCodec::new();
 
@@ -869,6 +876,8 @@ where
                             &mut writer,
                             &store,
                             &mut framed,
+                            &content_store_path,
+                            &domain,
                         )
                         .await?;
                         if should_close || session.state == ImapState::Logout {
@@ -921,6 +930,7 @@ async fn handle_imap_connection_starttls<R, W>(
     store: Arc<ImapStore>,
     idle_timeout: Duration,
     _tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    content_store_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -929,7 +939,7 @@ where
     // For v1.1, STARTTLS on IMAP port 143 is not yet wired — use the
     // generic handler. Full STARTTLS upgrade (similar to SMTP's
     // handle_connection) will be added when needed.
-    handle_imap_connection(reader, writer, config, store, idle_timeout).await
+    handle_imap_connection(reader, writer, config, store, idle_timeout, content_store_path).await
 }
 
 /// Execute IMAP actions by writing responses to the client.
@@ -984,6 +994,8 @@ async fn process_imap_async_actions<R, W>(
     writer: &mut W,
     store: &Arc<ImapStore>,
     framed: &mut FramedRead<R, ImapCodec>,
+    content_store_path: &Path,
+    domain: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
