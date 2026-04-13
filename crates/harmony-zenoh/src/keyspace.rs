@@ -402,6 +402,56 @@ pub fn parse_book_meta(ke: &keyexpr) -> Result<String, ZenohError> {
         .to_string())
 }
 
+// ── DB sync key expressions ─────────────────────────────────────────────
+
+/// Build a db root announcement key expression.
+///
+/// Pattern: `harmony/db/{owner_addr_hex}/{db_name}/root`
+pub fn db_root_key(owner_addr_hex: &str, db_name: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(owner_addr_hex)?;
+    reject_slashes(db_name)?;
+    ke(&format!("harmony/db/{owner_addr_hex}/{db_name}/root"))
+}
+
+/// Build a db root announcement subscription pattern.
+///
+/// Pattern: `harmony/db/{owner_addr_hex}/{db_name}/root`
+pub fn db_root_sub(owner_addr_hex: &str, db_name: &str) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(owner_addr_hex)?;
+    reject_slashes(db_name)?;
+    ke(&format!("harmony/db/{owner_addr_hex}/{db_name}/root"))
+}
+
+/// Build a db block fetch key expression.
+///
+/// Pattern: `harmony/db/{owner_addr_hex}/{db_name}/block/{cid_hex}`
+pub fn db_block_key(
+    owner_addr_hex: &str,
+    db_name: &str,
+    cid_hex: &str,
+) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(owner_addr_hex)?;
+    reject_slashes(db_name)?;
+    reject_slashes(cid_hex)?;
+    ke(&format!(
+        "harmony/db/{owner_addr_hex}/{db_name}/block/{cid_hex}"
+    ))
+}
+
+/// Build a db block queryable pattern (wildcard for any CID).
+///
+/// Pattern: `harmony/db/{owner_addr_hex}/{db_name}/block/*`
+pub fn db_block_queryable(
+    owner_addr_hex: &str,
+    db_name: &str,
+) -> Result<OwnedKeyExpr, ZenohError> {
+    reject_slashes(owner_addr_hex)?;
+    reject_slashes(db_name)?;
+    ke(&format!(
+        "harmony/db/{owner_addr_hex}/{db_name}/block/*"
+    ))
+}
+
 // ── Re-export the keyexpr type for consumers ─────────────────────────
 
 pub use zenoh_keyexpr::key_expr::keyexpr;
@@ -863,5 +913,59 @@ mod tests {
         let built = book_meta_key(&cid).unwrap();
         let parsed_cid = parse_book_meta(&built).unwrap();
         assert_eq!(parsed_cid, cid);
+    }
+
+    // ── DB sync key expression tests ────────────────────────────────
+
+    #[test]
+    fn db_root_key_builds_correctly() {
+        let ke = db_root_key("abcd1234", "mail").unwrap();
+        assert_eq!(ke.as_str(), "harmony/db/abcd1234/mail/root");
+    }
+
+    #[test]
+    fn db_root_sub_matches_root_key() {
+        let sub = db_root_sub("abcd1234", "mail").unwrap();
+        let key = db_root_key("abcd1234", "mail").unwrap();
+        assert!(sub.intersects(&key));
+    }
+
+    #[test]
+    fn db_root_sub_does_not_match_other_peer() {
+        let sub = db_root_sub("abcd1234", "mail").unwrap();
+        let key = db_root_key("deadbeef", "mail").unwrap();
+        assert!(!sub.intersects(&key));
+    }
+
+    #[test]
+    fn db_block_key_builds_correctly() {
+        let ke = db_block_key("abcd1234", "mail", "ff00ff00").unwrap();
+        assert_eq!(ke.as_str(), "harmony/db/abcd1234/mail/block/ff00ff00");
+    }
+
+    #[test]
+    fn db_block_queryable_matches_any_block() {
+        let queryable = db_block_queryable("abcd1234", "mail").unwrap();
+        let key1 = db_block_key("abcd1234", "mail", "aabbccdd").unwrap();
+        let key2 = db_block_key("abcd1234", "mail", "11223344").unwrap();
+        assert!(queryable.intersects(&key1));
+        assert!(queryable.intersects(&key2));
+    }
+
+    #[test]
+    fn db_block_queryable_does_not_match_other_db() {
+        let queryable = db_block_queryable("abcd1234", "mail").unwrap();
+        let key = db_block_key("abcd1234", "contacts", "aabbccdd").unwrap();
+        assert!(!queryable.intersects(&key));
+    }
+
+    #[test]
+    fn db_key_rejects_slashes_in_owner() {
+        assert!(db_root_key("ab/cd", "mail").is_err());
+    }
+
+    #[test]
+    fn db_key_rejects_slashes_in_db_name() {
+        assert!(db_root_key("abcd1234", "my/db").is_err());
     }
 }
