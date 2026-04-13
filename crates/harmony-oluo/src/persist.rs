@@ -197,10 +197,14 @@ pub fn load_snapshot(
     Ok(Some((engine, base_path, manifest.compact_generation)))
 }
 
-/// Atomically write data to a file (write to .tmp, then rename).
+/// Atomically write data to a file (write to .tmp, sync, then rename).
 fn atomic_write(path: &Path, data: &[u8]) -> Result<(), OluoPersistError> {
+    use std::io::Write;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
