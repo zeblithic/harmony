@@ -1493,16 +1493,65 @@ where
                     }
                 }
             }
-            ImapAction::Search { .. } => {
-                // Not yet wired to store search
-                if let Some(tag) = session.pending_tag.take() {
-                    writer
-                        .write_all(
-                            format!("{tag} NO [CANNOT] SEARCH not yet implemented\r\n").as_bytes(),
-                        )
-                        .await?;
+            ImapAction::Search { criteria, uid_mode } => {
+                let search_result: Result<Vec<u32>, String> = (|| {
+                    let mailbox_name = match &session.state {
+                        ImapState::Selected { mailbox, .. } => mailbox.name.clone(),
+                        _ => return Err("no mailbox selected".to_string()),
+                    };
+                    let mbox = store
+                        .get_mailbox(&mailbox_name)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "mailbox not found".to_string())?;
+                    let all_msgs = store.get_messages(mbox.id).map_err(|e| e.to_string())?;
+
+                    // Check if any criterion needs CAS content
+                    let needs_cas = criteria_need_cas(criteria);
+
+                    let mut results = Vec::new();
+                    for (idx, msg_row) in all_msgs.iter().enumerate() {
+                        let seqnum = (idx + 1) as u32;
+                        let flags = store.get_flags(msg_row.id).map_err(|e| e.to_string())?;
+
+                        let harmony_msg = if needs_cas {
+                            match msg_row.message_cid {
+                                Some(cid_bytes) => {
+                                    let csp_inner = content_store_path.to_path_buf();
+                                    let book_store = harmony_db::DiskBookStore::new(&csp_inner);
+                                    let content_id = harmony_content::cid::ContentId::from_bytes(cid_bytes);
+                                    match harmony_content::dag::reassemble(&content_id, &book_store) {
+                                        Ok(bytes) => crate::message::HarmonyMessage::from_bytes(&bytes).ok(),
+                                        Err(_) => None,
+                                    }
+                                }
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        if matches_criteria(criteria, msg_row, &flags, seqnum, harmony_msg.as_ref()) {
+                            results.push(if *uid_mode { msg_row.uid } else { seqnum });
+                        }
+                    }
+
+                    Ok(results)
+                })();
+
+                match search_result {
+                    Ok(results) => {
+                        let callback = session.handle(ImapEvent::SearchComplete { results });
+                        execute_imap_actions(&callback, writer).await?;
+                    }
+                    Err(reason) => {
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                                .await?;
+                            writer.flush().await?;
+                        }
+                    }
                 }
-                writer.flush().await?;
             }
             ImapAction::CopyMessages { .. } => {
                 // Not yet wired to store copy
@@ -1697,6 +1746,21 @@ fn parse_imap_date(s: &str) -> Option<u64> {
 
 fn is_leap(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Check if any search criterion requires CAS message content.
+fn criteria_need_cas(criteria: &[imap_parse::SearchKey]) -> bool {
+    use imap_parse::SearchKey;
+    criteria.iter().any(|key| match key {
+        SearchKey::From(_) | SearchKey::To(_) | SearchKey::Subject(_)
+        | SearchKey::Body(_) | SearchKey::Header(_, _) => true,
+        SearchKey::Not(inner) => criteria_need_cas(std::slice::from_ref(inner.as_ref())),
+        SearchKey::Or(a, b) => {
+            criteria_need_cas(std::slice::from_ref(a.as_ref()))
+                || criteria_need_cas(std::slice::from_ref(b.as_ref()))
+        }
+        _ => false,
+    })
 }
 
 /// Evaluate IMAP SEARCH criteria against a message.
@@ -2520,5 +2584,54 @@ mod search_tests {
         assert!(!super::matches_criteria(&[SearchKey::Keyword("$Other".to_string())], &row, &flags, 1, None));
         assert!(!super::matches_criteria(&[SearchKey::Unkeyword("$Important".to_string())], &row, &flags, 1, None));
         assert!(super::matches_criteria(&[SearchKey::Unkeyword("$Other".to_string())], &row, &flags, 1, None));
+    }
+
+    #[test]
+    fn search_by_flags_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let imap_store = crate::imap_store::ImapStore::open(&db_path).unwrap();
+        imap_store.initialize_default_mailboxes().unwrap();
+
+        // Insert 3 messages
+        let uid1 = imap_store.insert_message("INBOX", &[1u8; MESSAGE_ID_LEN], None, 1000, 100).unwrap();
+        let uid2 = imap_store.insert_message("INBOX", &[2u8; MESSAGE_ID_LEN], None, 2000, 200).unwrap();
+        let uid3 = imap_store.insert_message("INBOX", &[3u8; MESSAGE_ID_LEN], None, 3000, 300).unwrap();
+
+        // Flag message 1 as Seen, message 2 as Seen+Flagged
+        let mbox = imap_store.get_mailbox("INBOX").unwrap().unwrap();
+        let msgs = imap_store.get_messages(mbox.id).unwrap();
+        imap_store.add_flags(msgs[0].id, &["\\Seen"]).unwrap();
+        imap_store.add_flags(msgs[1].id, &["\\Seen", "\\Flagged"]).unwrap();
+
+        // SEARCH SEEN should match UIDs 1 and 2
+        let mut results = Vec::new();
+        for (idx, msg) in msgs.iter().enumerate() {
+            let flags = imap_store.get_flags(msg.id).unwrap();
+            if super::matches_criteria(&[SearchKey::Seen], msg, &flags, (idx + 1) as u32, None) {
+                results.push(msg.uid);
+            }
+        }
+        assert_eq!(results, vec![uid1, uid2]);
+
+        // SEARCH FLAGGED should match UID 2 only
+        let mut results = Vec::new();
+        for (idx, msg) in msgs.iter().enumerate() {
+            let flags = imap_store.get_flags(msg.id).unwrap();
+            if super::matches_criteria(&[SearchKey::Flagged], msg, &flags, (idx + 1) as u32, None) {
+                results.push(msg.uid);
+            }
+        }
+        assert_eq!(results, vec![uid2]);
+
+        // SEARCH UNSEEN should match UID 3 only
+        let mut results = Vec::new();
+        for (idx, msg) in msgs.iter().enumerate() {
+            let flags = imap_store.get_flags(msg.id).unwrap();
+            if super::matches_criteria(&[SearchKey::Unseen], msg, &flags, (idx + 1) as u32, None) {
+                results.push(msg.uid);
+            }
+        }
+        assert_eq!(results, vec![uid3]);
     }
 }
