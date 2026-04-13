@@ -8,16 +8,11 @@ rust-version.workspace = true
 description = "Oluo — Harmony's semantic search engine (USearch HNSW, sans-I/O)"
 
 [features]
-default = ["std"]
 no-neon = ["harmony-crypto/no-neon"]
-std = [
-    "harmony-semantic/std",
-    "harmony-crypto/std",
-]
 
 [dependencies]
-harmony-semantic = { workspace = true, default-features = false }
-harmony-crypto = { workspace = true, default-features = false }
+harmony-semantic = { workspace = true }
+harmony-crypto = { workspace = true }
 harmony-search = { path = "../harmony-search" }
 hashbrown = { workspace = true }
 
