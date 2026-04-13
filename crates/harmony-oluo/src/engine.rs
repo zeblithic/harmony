@@ -83,17 +83,17 @@ pub enum OluoAction {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntryMetadata {
     /// CID of the content this entry references.
-    target_cid: [u8; 32],
+    pub target_cid: [u8; 32],
     /// Merged metadata.
     pub metadata: SidecarMetadata,
     /// If Some, this is a lightweight entry with TTL (expires at this timestamp ms).
-    expires_at: Option<u64>,
+    pub expires_at: Option<u64>,
     /// When this entry was ingested (milliseconds since epoch).
-    ingested_at_ms: u64,
+    pub ingested_at_ms: u64,
     /// The scope this entry was indexed under.
-    scope: crate::scope::SearchScope,
+    pub scope: crate::scope::SearchScope,
     /// CIDs of the sidecar records that were merged for this entry.
-    overlay_cids: Vec<[u8; 32]>,
+    pub overlay_cids: Vec<[u8; 32]>,
 }
 
 /// The Oluo search engine state machine.
@@ -1418,7 +1418,7 @@ mod tests {
         // Third ingest triggers compaction.
         let header_c = test_header([0x03; 32], [0xCC; 32]);
         let actions = engine.handle(OluoEvent::Ingest {
-            header: header_c.clone(),
+            header: header_c,
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,

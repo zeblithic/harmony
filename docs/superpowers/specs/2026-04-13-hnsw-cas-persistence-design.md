@@ -84,7 +84,7 @@ impl OluoEngine {
     /// Restore from a persisted snapshot.
     pub fn from_snapshot(
         index_bytes: &[u8],
-        metadata: HashMap<u64, EntryMetadata>,
+        metadata: impl IntoIterator<Item = (u64, EntryMetadata)>,
         key_counter: u64,
         generation: u64,
         compact_threshold: usize,
