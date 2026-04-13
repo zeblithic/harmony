@@ -59,10 +59,20 @@ pub enum OluoAction {
         query_id: u64,
         results: Vec<RawSearchResult>,
     },
-    /// Delta reached compaction threshold; caller should persist these bytes.
-    CompactRequest {
-        bytes: Vec<u8>,
-        /// The compaction generation, must be passed back in `CompactComplete`.
+    /// Compacted index ready for CAS persistence. Caller should:
+    /// 1. DAG-ingest `index_bytes` and `metadata_bytes` into CAS
+    /// 2. Build a SnapshotManifest with the resulting CIDs
+    /// 3. Write manifest to CAS, update local head file
+    /// 4. Write `index_bytes` to a local file for memory-mapping
+    /// 5. Send `CompactComplete { path, generation }` back to the engine
+    PersistSnapshot {
+        /// Serialized HNSW index (from CompoundIndex::compact).
+        index_bytes: Vec<u8>,
+        /// Postcard-serialized HashMap<u64, EntryMetadata>.
+        metadata_bytes: Vec<u8>,
+        /// Current key counter — persist in the snapshot manifest.
+        key_counter: u64,
+        /// Compaction generation — must be passed back in CompactComplete.
         generation: u64,
     },
     /// An internal error occurred (index add/search/load_base failure).
@@ -99,9 +109,9 @@ pub struct OluoEngine {
     /// Monotonic key counter for assigning index keys.
     key_counter: u64,
     /// Monotonic generation counter for compaction. Incremented each time
-    /// a `CompactRequest` is emitted; used to reject stale `CompactComplete`.
+    /// a `PersistSnapshot` is emitted; used to reject stale `CompactComplete`.
     compact_generation: u64,
-    /// Whether at least one `CompactRequest` has been emitted. Guards against
+    /// Whether at least one `PersistSnapshot` has been emitted. Guards against
     /// spurious `CompactComplete { generation: 0 }` before any compaction.
     has_compacted: bool,
     /// Reverse lookup: CID -> index key. Ensures re-ingesting the same CID
@@ -287,11 +297,15 @@ impl OluoEngine {
         // Check if compaction is needed.
         if self.index.should_compact() {
             match self.index.compact() {
-                Ok(bytes) => {
+                Ok(index_bytes) => {
                     self.compact_generation += 1;
                     self.has_compacted = true;
-                    actions.push(OluoAction::CompactRequest {
-                        bytes,
+                    let metadata_bytes = postcard::to_allocvec(&self.metadata)
+                        .expect("metadata serialization must not fail");
+                    actions.push(OluoAction::PersistSnapshot {
+                        index_bytes,
+                        metadata_bytes,
+                        key_counter: self.key_counter,
                         generation: self.compact_generation,
                     });
                 }
@@ -418,7 +432,7 @@ impl OluoEngine {
 
     fn handle_compact_complete(&mut self, path: &str, generation: u64) -> Vec<OluoAction> {
         // Reject if no compaction has ever been issued, or if the generation
-        // doesn't match the most recent CompactRequest.
+        // doesn't match the most recent PersistSnapshot.
         if !self.has_compacted || generation != self.compact_generation {
             return Vec::new();
         }
@@ -762,8 +776,8 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, OluoAction::CompactRequest { .. })),
-            "no CompactRequest after 1 vector"
+                .any(|a| matches!(a, OluoAction::PersistSnapshot { .. })),
+            "no PersistSnapshot after 1 vector"
         );
 
         // Second vector — should trigger compaction.
@@ -778,13 +792,13 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, OluoAction::CompactRequest { .. })),
-            "expected CompactRequest after reaching compact threshold"
+                .any(|a| matches!(a, OluoAction::PersistSnapshot { .. })),
+            "expected PersistSnapshot after reaching compact threshold"
         );
         // IndexUpdated should also be present.
         assert!(
             actions.iter().any(|a| matches!(a, OluoAction::IndexUpdated)),
-            "expected IndexUpdated alongside CompactRequest"
+            "expected IndexUpdated alongside PersistSnapshot"
         );
     }
 
@@ -811,12 +825,12 @@ mod tests {
             overlay_cids: Vec::new(),
         });
 
-        // Extract the generation from the CompactRequest.
+        // Extract the generation from the PersistSnapshot.
         let gen = actions.iter().find_map(|a| match a {
-            OluoAction::CompactRequest { generation, .. } => Some(*generation),
+            OluoAction::PersistSnapshot { generation, .. } => Some(*generation),
             _ => None,
         });
-        assert!(gen.is_some(), "expected CompactRequest with generation");
+        assert!(gen.is_some(), "expected PersistSnapshot with generation");
         let gen = gen.unwrap();
         assert_eq!(gen, 1, "first compaction should be generation 1");
 
@@ -1304,5 +1318,56 @@ mod tests {
         assert_eq!(entry.expires_at, Some(1_700_000_060_000));
         assert_eq!(entry.overlay_cids.len(), 2);
         assert_eq!(entry.metadata, SidecarMetadata::default());
+    }
+
+    #[test]
+    fn compaction_emits_persist_snapshot_with_metadata() {
+        // Use threshold=3 so compaction triggers after 3 ingests.
+        let mut engine = OluoEngine::with_compact_threshold(3);
+
+        // Ingest 2 entries — not enough to trigger compaction yet.
+        for i in 0..2u8 {
+            let header = test_header([i + 1; 32], [i + 0x10; 32]);
+            engine.handle(OluoEvent::Ingest {
+                header,
+                metadata: SidecarMetadata::default(),
+                decision: IngestDecision::IndexFull,
+                now_ms: 1_700_000_000_000,
+                scope: SearchScope::Personal,
+                overlay_cids: Vec::new(),
+            });
+        }
+
+        // Third ingest triggers compaction (delta_len=3 >= threshold=3 after add).
+        let header = test_header([0x03; 32], [0x30; 32]);
+        let actions = engine.handle(OluoEvent::Ingest {
+            header,
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        let snapshot = actions.iter().find(|a| matches!(a, OluoAction::PersistSnapshot { .. }));
+        assert!(snapshot.is_some(), "expected PersistSnapshot action");
+
+        if let Some(OluoAction::PersistSnapshot {
+            index_bytes,
+            metadata_bytes,
+            key_counter,
+            generation,
+        }) = snapshot
+        {
+            assert!(!index_bytes.is_empty(), "index_bytes must not be empty");
+            assert!(!metadata_bytes.is_empty(), "metadata_bytes must not be empty");
+            assert_eq!(*key_counter, 3, "3 entries ingested → key_counter=3");
+            assert_eq!(*generation, 1, "first compaction → generation=1");
+
+            // Verify metadata_bytes round-trips correctly.
+            let restored: hashbrown::HashMap<u64, EntryMetadata> =
+                postcard::from_bytes(metadata_bytes).expect("metadata must deserialize");
+            assert_eq!(restored.len(), 3);
+        }
     }
 }
