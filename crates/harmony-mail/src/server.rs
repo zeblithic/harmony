@@ -1647,6 +1647,58 @@ fn resolve_sequence_set(
     result
 }
 
+/// Parse an IMAP date string ("DD-Mon-YYYY") to a Unix timestamp (midnight UTC).
+/// Returns None if the format is invalid.
+fn parse_imap_date(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let day: u32 = parts[0].parse().ok()?;
+    if day == 0 || day > 31 {
+        return None;
+    }
+    let month: u32 = match parts[1].to_ascii_lowercase().as_str() {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => return None,
+    };
+    let year: u64 = parts[2].parse().ok()?;
+    if year < 1970 {
+        return None;
+    }
+
+    // Days from epoch to start of year
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    // Days from start of year to start of month
+    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += month_days[m as usize] as u64;
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+    days += (day - 1) as u64;
+    Some(days * 86400)
+}
+
+fn is_leap(year: u64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2130,5 +2182,45 @@ mod sequence_set_tests {
         imap_store.remove_flags(msg_id, &["\\Answered"]).unwrap();
         let flags = imap_store.get_flags(msg_id).unwrap();
         assert_eq!(flags, vec!["\\Flagged"]);
+    }
+
+    #[test]
+    fn parse_imap_date_standard() {
+        // 13-Apr-2026 00:00:00 UTC
+        let ts = super::parse_imap_date("13-Apr-2026");
+        // 2026-04-13 = days since epoch: 20,556 * 86400 = 1776038400
+        assert!(ts.is_some());
+        let t = ts.unwrap();
+        // April 13, 2026 is 20556 days after Jan 1 1970
+        assert_eq!(t, 20556 * 86400);
+    }
+
+    #[test]
+    fn parse_imap_date_all_months() {
+        assert!(super::parse_imap_date("01-Jan-2000").is_some());
+        assert!(super::parse_imap_date("01-Feb-2000").is_some());
+        assert!(super::parse_imap_date("01-Mar-2000").is_some());
+        assert!(super::parse_imap_date("01-Apr-2000").is_some());
+        assert!(super::parse_imap_date("01-May-2000").is_some());
+        assert!(super::parse_imap_date("01-Jun-2000").is_some());
+        assert!(super::parse_imap_date("01-Jul-2000").is_some());
+        assert!(super::parse_imap_date("01-Aug-2000").is_some());
+        assert!(super::parse_imap_date("01-Sep-2000").is_some());
+        assert!(super::parse_imap_date("01-Oct-2000").is_some());
+        assert!(super::parse_imap_date("01-Nov-2000").is_some());
+        assert!(super::parse_imap_date("01-Dec-2000").is_some());
+    }
+
+    #[test]
+    fn parse_imap_date_epoch() {
+        let ts = super::parse_imap_date("01-Jan-1970");
+        assert_eq!(ts, Some(0));
+    }
+
+    #[test]
+    fn parse_imap_date_invalid() {
+        assert!(super::parse_imap_date("invalid").is_none());
+        assert!(super::parse_imap_date("32-Jan-2026").is_none());
+        assert!(super::parse_imap_date("01-Xyz-2026").is_none());
     }
 }
