@@ -377,6 +377,39 @@ pub(crate) fn incremental_remove(
     )
 }
 
+/// Incrementally update metadata for an entry in a Prolly Tree.
+///
+/// Walk to the leaf containing the key, update flags and snippet, rechunk
+/// (in case snippet size change affects boundaries), cascade up.
+/// Returns None if the key was not found.
+pub(crate) fn incremental_update_meta(
+    data_dir: &Path,
+    root: ContentId,
+    key: &[u8],
+    flags: u64,
+    snippet: String,
+    config: &ChunkerConfig,
+) -> Result<Option<ContentId>, DbError> {
+    let path = walk_to_leaf(data_dir, root, key)?;
+
+    let mut leaf = path.leaf_entries.clone();
+    let idx = match leaf.binary_search_by(|e| e.key.as_slice().cmp(key)) {
+        Ok(i) => i,
+        Err(_) => return Ok(None), // Key not found.
+    };
+    leaf[idx].flags = flags;
+    leaf[idx].snippet = snippet;
+
+    let rechunk = rechunk_leaf(data_dir, &path, leaf, config)?;
+    cascade_up(
+        data_dir,
+        &path,
+        rechunk.new_children,
+        rechunk.siblings_consumed,
+        config,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +668,42 @@ mod tests {
         // Try to remove a key that doesn't exist.
         let result = incremental_remove(dir.path(), root, b"nonexistent", &config).unwrap();
         assert_eq!(result, Some(root), "removing nonexistent key should return same root");
+    }
+
+    #[test]
+    fn incremental_update_meta_matches_rebuild() {
+        let dir = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        let mut entries: Vec<Entry> = (0..100u32)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir.path(),
+            ))
+            .collect();
+        let initial_root = build_tree(&entries, &config, dir.path()).unwrap().unwrap();
+
+        // Update metadata on entry 50.
+        let incremental_root = incremental_update_meta(
+            dir.path(),
+            initial_root,
+            format!("k-{:06}", 50).as_bytes(),
+            42,
+            "updated snippet".to_string(),
+            &config,
+        ).unwrap();
+
+        assert!(incremental_root.is_some(), "update_meta should return a root");
+
+        // Build reference with the same metadata change.
+        entries[50].metadata.flags = 42;
+        entries[50].metadata.snippet = "updated snippet".to_string();
+        let reference_root = build_tree(&entries, &config, dir.path()).unwrap();
+
+        assert_eq!(
+            incremental_root, reference_root,
+            "incremental update_meta must produce same root CID as full rebuild"
+        );
     }
 }

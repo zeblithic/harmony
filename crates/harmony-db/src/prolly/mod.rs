@@ -150,10 +150,32 @@ impl ProllyTree {
         let old_cache = self.cache.clone();
         let old_root = self.root;
         self.cache[idx].metadata.flags = flags;
-        self.cache[idx].metadata.snippet = snippet;
-        match self.rebuild_tree(data_dir) {
-            Ok(_) => Ok(true),
-            Err(e) => { self.cache = old_cache; self.root = old_root; Err(e) }
+        self.cache[idx].metadata.snippet = snippet.clone();
+
+        if let Some(root) = self.root {
+            match mutate::incremental_update_meta(
+                data_dir, root, key, flags, snippet, &self.config,
+            ) {
+                Ok(Some(new_root)) => {
+                    self.root = Some(new_root);
+                    Ok(true)
+                }
+                Ok(None) => {
+                    // Key not found in tree (shouldn't happen — cache had it).
+                    self.cache = old_cache;
+                    self.root = old_root;
+                    Ok(false)
+                }
+                Err(e) => {
+                    self.cache = old_cache;
+                    self.root = old_root;
+                    Err(e)
+                }
+            }
+        } else {
+            self.cache = old_cache;
+            self.root = old_root;
+            Ok(false)
         }
     }
 
