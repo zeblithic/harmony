@@ -7,7 +7,7 @@
 use crate::error::DbError;
 use harmony_content::ContentId;
 use std::path::Path;
-use super::chunker::{chunk_items, ChunkerConfig};
+use super::chunker::ChunkerConfig;
 use super::node::{BranchEntry, LeafEntry, Node};
 
 /// One level of the descent path from root to leaf.
@@ -29,6 +29,7 @@ struct TreePath {
 }
 
 /// Result of rechunking a leaf region after mutation.
+#[allow(dead_code)]
 struct RechunkResult {
     /// New leaf children (boundary_key + CID) to replace in the parent branch.
     new_children: Vec<BranchEntry>,
