@@ -180,6 +180,47 @@ impl OluoEngine {
         }
     }
 
+    /// Restore an engine from a previously persisted snapshot.
+    ///
+    /// `index_bytes` — serialized HNSW index (from `PersistSnapshot::index_bytes`,
+    ///   or reassembled from CAS via `dag::reassemble`)
+    /// `metadata` — deserialized `HashMap<u64, EntryMetadata>` (from
+    ///   `PersistSnapshot::metadata_bytes` via postcard)
+    /// `key_counter` — from `SnapshotManifest::key_counter`
+    /// `generation` — from `SnapshotManifest::compact_generation`
+    pub fn from_snapshot(
+        index_bytes: &[u8],
+        metadata: hashbrown::HashMap<u64, EntryMetadata>,
+        key_counter: u64,
+        generation: u64,
+    ) -> Result<Self, SearchError> {
+        let config = default_index_config();
+        let mut index = CompoundIndex::new(config, 1000)?;
+        index.load_base_from_bytes(index_bytes)?;
+
+        // Derive scope_counts from metadata.
+        let mut scope_counts = [0usize; 3];
+        for entry in metadata.values() {
+            scope_counts[entry.scope.index()] += 1;
+        }
+
+        // Derive cid_to_key from metadata.
+        let mut cid_to_key = hashbrown::HashMap::with_capacity(metadata.len());
+        for (&key, entry) in &metadata {
+            cid_to_key.insert(entry.target_cid, key);
+        }
+
+        Ok(Self {
+            index,
+            metadata,
+            key_counter,
+            compact_generation: generation,
+            has_compacted: true,
+            cid_to_key,
+            scope_counts,
+        })
+    }
+
     /// Process an event and return resulting actions.
     pub fn handle(&mut self, event: OluoEvent) -> Vec<OluoAction> {
         match event {
@@ -1318,6 +1359,93 @@ mod tests {
         assert_eq!(entry.expires_at, Some(1_700_000_060_000));
         assert_eq!(entry.overlay_cids.len(), 2);
         assert_eq!(entry.metadata, SidecarMetadata::default());
+    }
+
+    #[test]
+    fn from_snapshot_restores_search_results() {
+        // Create engine, ingest entries, compact, capture snapshot.
+        // threshold=3: compaction triggers after 3 vectors are added to the delta.
+        let mut engine = OluoEngine::with_compact_threshold(3);
+
+        let header_a = test_header([0x01; 32], [0xAA; 32]);
+        let header_b = test_header([0x02; 32], [0xBB; 32]);
+
+        engine.handle(OluoEvent::Ingest {
+            header: header_a,
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: header_b,
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        // Third ingest triggers compaction.
+        let header_c = test_header([0x03; 32], [0xCC; 32]);
+        let actions = engine.handle(OluoEvent::Ingest {
+            header: header_c.clone(),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::NetworkWide,
+            overlay_cids: vec![[0xDD; 32]],
+        });
+
+        let snapshot = actions
+            .iter()
+            .find(|a| matches!(a, OluoAction::PersistSnapshot { .. }))
+            .expect("compaction must emit PersistSnapshot");
+
+        let (index_bytes, metadata_bytes, key_counter, generation) = match snapshot {
+            OluoAction::PersistSnapshot {
+                index_bytes,
+                metadata_bytes,
+                key_counter,
+                generation,
+            } => (index_bytes.clone(), metadata_bytes.clone(), *key_counter, *generation),
+            _ => unreachable!(),
+        };
+
+        // Restore from snapshot.
+        let metadata: hashbrown::HashMap<u64, EntryMetadata> =
+            postcard::from_bytes(&metadata_bytes).expect("deserialize metadata");
+
+        let mut restored = OluoEngine::from_snapshot(
+            &index_bytes,
+            metadata,
+            key_counter,
+            generation,
+        )
+        .expect("from_snapshot must succeed");
+
+        // Verify entry count matches.
+        assert_eq!(restored.entry_count(), 3);
+
+        // Verify search works — search for header_c's tier3.
+        let search_actions = restored.handle(OluoEvent::Search {
+            query_id: 1,
+            query: SearchQuery {
+                embedding: [0xCC; 32],
+                tier: EmbeddingTier::T3,
+                scope: SearchScope::NetworkWide,
+                max_results: 5,
+            },
+        });
+
+        let results = match &search_actions[0] {
+            OluoAction::SearchResults { results, .. } => results,
+            other => panic!("expected SearchResults, got {other:?}"),
+        };
+        assert!(!results.is_empty(), "search must return results after restore");
+        // The closest result should be the entry with the same tier3.
+        assert_eq!(results[0].target_cid, [0x03; 32]);
     }
 
     #[test]
