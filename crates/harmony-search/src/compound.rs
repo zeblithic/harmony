@@ -154,7 +154,7 @@ impl CompoundIndex {
         let shadowed = if self.base.is_some() {
             self.delta_keys
                 .iter()
-                .filter(|k| self.base.as_ref().map_or(false, |b| b.contains(**k)))
+                .filter(|k| self.base.as_ref().is_some_and(|b| b.contains(**k)))
                 .count()
         } else {
             0
