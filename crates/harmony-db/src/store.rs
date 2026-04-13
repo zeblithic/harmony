@@ -251,4 +251,206 @@ mod tests {
         assert!(store.contains(&cid));
         assert_eq!(store.get(&cid).unwrap(), data);
     }
+
+    #[test]
+    fn get_falls_through_to_fetcher_on_miss() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path();
+        persist::ensure_dirs(data_dir).unwrap();
+
+        let data = b"remote data";
+        let cid = ContentId::for_book(data, ContentFlags::default()).unwrap();
+
+        let store = DiskBookStore::with_fetcher(data_dir, move |requested_cid| {
+            if *requested_cid == cid {
+                Some(data.to_vec())
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(store.get(&cid).unwrap(), data);
+
+        // Should now be cached on disk too
+        let hex = hex::encode(cid.to_bytes());
+        assert!(data_dir.join("commits").join(format!("{hex}.bin")).exists());
+    }
+
+    #[test]
+    fn get_rejects_corrupted_fetch() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path();
+        persist::ensure_dirs(data_dir).unwrap();
+
+        let real_data = b"real data";
+        let cid = ContentId::for_book(real_data, ContentFlags::default()).unwrap();
+
+        let store = DiskBookStore::with_fetcher(data_dir, move |_| {
+            Some(b"corrupted data".to_vec())
+        });
+
+        assert!(store.get(&cid).is_none());
+    }
+
+    #[test]
+    fn fetcher_not_called_when_local_hit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path();
+        persist::ensure_dirs(data_dir).unwrap();
+
+        let data = b"local data";
+        let cid = ContentId::for_book(data, ContentFlags::default()).unwrap();
+        let hex = hex::encode(cid.to_bytes());
+        std::fs::write(
+            data_dir.join("commits").join(format!("{hex}.bin")),
+            data,
+        )
+        .unwrap();
+
+        let fetcher_called = Arc::new(AtomicBool::new(false));
+        let fetcher_called_clone = fetcher_called.clone();
+
+        let store = DiskBookStore::with_fetcher(data_dir, move |_| {
+            fetcher_called_clone.store(true, Ordering::SeqCst);
+            None
+        });
+
+        assert_eq!(store.get(&cid).unwrap(), data);
+        assert!(!fetcher_called.load(Ordering::SeqCst), "fetcher should not be called for local hit");
+    }
+
+    #[test]
+    fn end_to_end_sync_via_disk_book_store() {
+        let writer_dir = TempDir::new().unwrap();
+        let reader_dir = TempDir::new().unwrap();
+
+        // Writer: create db, insert entries, commit
+        let mut writer_db = crate::HarmonyDb::open(writer_dir.path()).unwrap();
+        writer_db
+            .insert(
+                "mail",
+                b"msg-001",
+                b"Hello from writer",
+                crate::EntryMeta {
+                    flags: 0,
+                    snippet: "Hello".into(),
+                },
+            )
+            .unwrap();
+        writer_db
+            .insert(
+                "mail",
+                b"msg-002",
+                b"Second message",
+                crate::EntryMeta {
+                    flags: 0,
+                    snippet: "Second".into(),
+                },
+            )
+            .unwrap();
+        let root_cid = writer_db.commit(None).unwrap();
+
+        // Reader: create empty db, sync from writer's CAS
+        let mut reader_db = crate::HarmonyDb::open(reader_dir.path()).unwrap();
+
+        // Simulate network: fetcher reads from writer's data_dir
+        let writer_path = writer_dir.path().to_path_buf();
+        let fetcher_store = DiskBookStore::with_fetcher(reader_dir.path(), move |cid| {
+            let hex = hex::encode(cid.to_bytes());
+            std::fs::read(writer_path.join("commits").join(format!("{hex}.bin")))
+                .or_else(|_| std::fs::read(writer_path.join("blobs").join(format!("{hex}.bin"))))
+                .ok()
+        });
+
+        reader_db.rebuild_from(root_cid, Some(&fetcher_store)).unwrap();
+
+        // Verify reader has same state
+        assert_eq!(reader_db.head(), Some(root_cid));
+        assert_eq!(reader_db.table_names(), writer_db.table_names());
+
+        let reader_val = reader_db.get("mail", b"msg-001").unwrap();
+        assert_eq!(reader_val.as_deref(), Some(b"Hello from writer".as_slice()));
+
+        let reader_val2 = reader_db.get("mail", b"msg-002").unwrap();
+        assert_eq!(reader_val2.as_deref(), Some(b"Second message".as_slice()));
+    }
+
+    #[test]
+    fn incremental_sync_reuses_existing_blocks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let writer_dir = TempDir::new().unwrap();
+        let reader_dir = TempDir::new().unwrap();
+
+        // Writer: create db with initial data
+        let mut writer_db = crate::HarmonyDb::open(writer_dir.path()).unwrap();
+        for i in 0..10 {
+            writer_db
+                .insert(
+                    "data",
+                    format!("key-{i:03}").as_bytes(),
+                    format!("value-{i}").as_bytes(),
+                    crate::EntryMeta {
+                        flags: 0,
+                        snippet: format!("v{i}"),
+                    },
+                )
+                .unwrap();
+        }
+        let root_v1 = writer_db.commit(None).unwrap();
+
+        // Initial sync
+        let mut reader_db = crate::HarmonyDb::open(reader_dir.path()).unwrap();
+        let writer_path = writer_dir.path().to_path_buf();
+        let wp = writer_path.clone();
+        let store_v1 = DiskBookStore::with_fetcher(reader_dir.path(), move |cid| {
+            let hex = hex::encode(cid.to_bytes());
+            std::fs::read(wp.join("commits").join(format!("{hex}.bin")))
+                .or_else(|_| std::fs::read(wp.join("blobs").join(format!("{hex}.bin"))))
+                .ok()
+        });
+        reader_db.rebuild_from(root_v1, Some(&store_v1)).unwrap();
+
+        // Writer adds one more entry
+        writer_db
+            .insert(
+                "data",
+                b"key-010",
+                b"value-10",
+                crate::EntryMeta {
+                    flags: 0,
+                    snippet: "v10".into(),
+                },
+            )
+            .unwrap();
+        let root_v2 = writer_db.commit(None).unwrap();
+
+        // Incremental sync — count fetcher calls
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let fc = fetch_count.clone();
+        let wp2 = writer_path.clone();
+        let store_v2 = DiskBookStore::with_fetcher(reader_dir.path(), move |cid| {
+            fc.fetch_add(1, Ordering::SeqCst);
+            let hex = hex::encode(cid.to_bytes());
+            std::fs::read(wp2.join("commits").join(format!("{hex}.bin")))
+                .or_else(|_| std::fs::read(wp2.join("blobs").join(format!("{hex}.bin"))))
+                .ok()
+        });
+        reader_db.rebuild_from(root_v2, Some(&store_v2)).unwrap();
+
+        assert_eq!(reader_db.head(), Some(root_v2));
+        let val = reader_db.get("data", b"key-010").unwrap();
+        assert_eq!(val.as_deref(), Some(b"value-10".as_slice()));
+
+        // Structural sharing: should fetch far fewer blocks than total
+        let fetches = fetch_count.load(Ordering::SeqCst);
+        assert!(
+            fetches < 10,
+            "incremental sync should fetch fewer blocks than total entries, got {fetches}"
+        );
+    }
 }
