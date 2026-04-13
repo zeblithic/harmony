@@ -1257,16 +1257,100 @@ where
                 }
                 writer.flush().await?;
             }
-            ImapAction::FetchMessages { .. } => {
-                // Not yet wired to Harmony message retrieval + rendering
-                if let Some(tag) = session.pending_tag.take() {
-                    writer
-                        .write_all(
-                            format!("{tag} NO [CANNOT] FETCH not yet implemented\r\n").as_bytes(),
-                        )
-                        .await?;
+            ImapAction::FetchMessages {
+                sequence_set,
+                attributes,
+                uid_mode,
+            } => {
+                let fetch_result: Result<(Vec<(u32, u32)>, Vec<imap_store::MessageRow>, PathBuf), String> = (|| {
+                    let mailbox_name = match &session.state {
+                        ImapState::Selected { mailbox, .. } => mailbox.name.clone(),
+                        _ => return Err("no mailbox selected".to_string()),
+                    };
+                    let mbox = store
+                        .get_mailbox(&mailbox_name)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "mailbox not found".to_string())?;
+                    let all_msgs = store.get_messages(mbox.id).map_err(|e| e.to_string())?;
+                    let resolved = resolve_sequence_set(sequence_set, *uid_mode, &all_msgs);
+
+                    let csp = content_store_path.to_path_buf();
+                    Ok((resolved, all_msgs, csp))
+                })();
+
+                match fetch_result {
+                    Ok((resolved, all_msgs, csp)) => {
+                        for (uid, seqnum) in &resolved {
+                            let msg_row = match all_msgs.iter().find(|m| m.uid == *uid) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            let cid_bytes = match msg_row.message_cid {
+                                Some(c) => c,
+                                None => continue, // skip messages without CAS content
+                            };
+
+                            // Retrieve message from CAS via spawn_blocking (file I/O)
+                            let csp_clone = csp.clone();
+                            let cas_result = tokio::task::spawn_blocking(move || {
+                                let book_store = harmony_db::DiskBookStore::new(&csp_clone);
+                                let content_id = harmony_content::cid::ContentId::from_bytes(cid_bytes);
+                                harmony_content::dag::reassemble(&content_id, &book_store)
+                            })
+                            .await
+                            .map_err(|e| format!("CAS task panicked: {e}"));
+
+                            let raw_bytes = match cas_result {
+                                Ok(Ok(bytes)) => bytes,
+                                Ok(Err(e)) => {
+                                    tracing::warn!(uid = uid, error = %e, "FETCH: CAS retrieval failed, skipping message");
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(uid = uid, error = %e, "FETCH: CAS task failed, skipping message");
+                                    continue;
+                                }
+                            };
+
+                            let harmony_msg = match crate::message::HarmonyMessage::from_bytes(&raw_bytes) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::warn!(uid = uid, error = %e, "FETCH: message deserialization failed, skipping");
+                                    continue;
+                                }
+                            };
+
+                            let flags = store.get_flags(msg_row.id).unwrap_or_default();
+                            match crate::imap_render::build_fetch_response(
+                                *seqnum, *uid, attributes, &harmony_msg, &flags,
+                                msg_row.rfc822_size, domain,
+                            ) {
+                                Ok(response) => {
+                                    writer.write_all(&response.to_bytes()).await?;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(uid = uid, error = %e, "FETCH: render failed, skipping");
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} OK FETCH completed\r\n").as_bytes())
+                                .await?;
+                        }
+                        writer.flush().await?;
+                    }
+                    Err(reason) => {
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                                .await?;
+                        }
+                        writer.flush().await?;
+                    }
                 }
-                writer.flush().await?;
             }
             ImapAction::Search { .. } => {
                 // Not yet wired to store search
@@ -1719,5 +1803,94 @@ mod sequence_set_tests {
         // UID 2 doesn't exist — should be skipped
         let result = resolve_sequence_set(&seq(vec![(2, None)]), true, &msgs);
         assert!(result.is_empty());
+    }
+
+    use crate::imap_parse::FetchAttribute;
+    use crate::imap_render::build_fetch_response;
+    use crate::imap_store::ImapStore;
+    use crate::message::{
+        HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType, ADDRESS_HASH_LEN,
+        CID_LEN, VERSION,
+    };
+    use harmony_content::book::MemoryBookStore;
+    use harmony_content::chunker::ChunkerConfig;
+    use harmony_content::cid::ContentId;
+    use harmony_content::dag;
+    use tempfile::tempdir;
+
+    /// Build a minimal HarmonyMessage for testing.
+    fn test_message() -> HarmonyMessage {
+        HarmonyMessage {
+            version: VERSION,
+            message_type: MailMessageType::Email,
+            flags: MessageFlags::new(false, false, false),
+            timestamp: 1713000000,
+            message_id: [1u8; MESSAGE_ID_LEN],
+            in_reply_to: None,
+            sender_address: [0xAA; ADDRESS_HASH_LEN],
+            recipients: vec![Recipient {
+                address_hash: [0xBB; ADDRESS_HASH_LEN],
+                recipient_type: RecipientType::To,
+            }],
+            subject: "Test subject".to_string(),
+            body: "Hello, world!".to_string(),
+            attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn fetch_round_trip_via_cas() {
+        let msg = test_message();
+        let msg_bytes = msg.to_bytes().unwrap();
+
+        // Ingest message into CAS
+        let mut store = MemoryBookStore::new();
+        let root_cid = dag::ingest(&msg_bytes, &ChunkerConfig::DEFAULT, &mut store).unwrap();
+
+        // Set up IMAP store and insert message with CID
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let imap_store = ImapStore::open(&db_path).unwrap();
+        imap_store.initialize_default_mailboxes().unwrap();
+
+        let cid_bytes: [u8; CID_LEN] = root_cid.to_bytes();
+        let uid = imap_store
+            .insert_message("INBOX", &[1u8; MESSAGE_ID_LEN], Some(&cid_bytes), 1713000000, 500)
+            .unwrap();
+
+        // Reassemble from CAS and deserialize
+        let reassembled = dag::reassemble(&root_cid, &store).unwrap();
+        let restored = HarmonyMessage::from_bytes(&reassembled).unwrap();
+        assert_eq!(restored.subject, "Test subject");
+        assert_eq!(restored.body, "Hello, world!");
+
+        // Render FETCH response
+        let flags = imap_store.get_flags(1).unwrap(); // message db id = 1 (first message)
+        let attrs = vec![FetchAttribute::Flags, FetchAttribute::Uid, FetchAttribute::Envelope];
+        let response = build_fetch_response(1, uid, &attrs, &restored, &flags, 500, "test.local").unwrap();
+        let bytes = response.to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("* 1 FETCH ("));
+        assert!(text.contains(&format!("UID {uid}")));
+        assert!(text.contains("FLAGS ()"));
+        assert!(text.contains("ENVELOPE"));
+    }
+
+    #[test]
+    fn fetch_skips_message_without_cid() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let imap_store = ImapStore::open(&db_path).unwrap();
+        imap_store.initialize_default_mailboxes().unwrap();
+
+        // Insert message with no CID
+        imap_store
+            .insert_message("INBOX", &[2u8; MESSAGE_ID_LEN], None, 1713000000, 100)
+            .unwrap();
+
+        let mbox = imap_store.get_mailbox("INBOX").unwrap().unwrap();
+        let messages = imap_store.get_messages(mbox.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].message_cid.is_none());
     }
 }
