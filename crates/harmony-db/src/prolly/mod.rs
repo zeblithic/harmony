@@ -1,5 +1,6 @@
 pub(crate) mod chunker;
 pub(crate) mod diff;
+pub(crate) mod mutate;
 pub(crate) mod node;
 
 use crate::error::DbError;
@@ -87,12 +88,20 @@ impl ProllyTree {
         let old_cache = self.cache.clone();
         let old_root = self.root;
         match self.cache.binary_search_by(|e| e.key.cmp(&entry.key)) {
-            Ok(idx) => self.cache[idx] = entry,
-            Err(idx) => self.cache.insert(idx, entry),
+            Ok(idx) => self.cache[idx] = entry.clone(),
+            Err(idx) => self.cache.insert(idx, entry.clone()),
         }
-        match self.rebuild_tree(data_dir) {
-            Ok(root) => Ok(root),
-            Err(e) => { self.cache = old_cache; self.root = old_root; Err(e) }
+        let leaf_entry = LeafEntry::from_entry(&entry);
+        match mutate::incremental_insert(data_dir, self.root, &leaf_entry, &self.config) {
+            Ok(new_root) => {
+                self.root = new_root;
+                Ok(new_root)
+            }
+            Err(e) => {
+                self.cache = old_cache;
+                self.root = old_root;
+                Err(e)
+            }
         }
     }
 
@@ -108,13 +117,22 @@ impl ProllyTree {
             Err(_) => None,
         };
         let new_root = if removed.is_some() {
-            match self.rebuild_tree(data_dir) {
-                Ok(root) => root,
-                Err(e) => { self.cache = old_cache; self.root = old_root; return Err(e); }
+            if let Some(root) = self.root {
+                match mutate::incremental_remove(data_dir, root, key, &self.config) {
+                    Ok(root) => root,
+                    Err(e) => {
+                        self.cache = old_cache;
+                        self.root = old_root;
+                        return Err(e);
+                    }
+                }
+            } else {
+                None
             }
         } else {
             self.root
         };
+        self.root = new_root;
         Ok((removed, new_root))
     }
 
@@ -132,13 +150,36 @@ impl ProllyTree {
         let old_cache = self.cache.clone();
         let old_root = self.root;
         self.cache[idx].metadata.flags = flags;
-        self.cache[idx].metadata.snippet = snippet;
-        match self.rebuild_tree(data_dir) {
-            Ok(_) => Ok(true),
-            Err(e) => { self.cache = old_cache; self.root = old_root; Err(e) }
+        self.cache[idx].metadata.snippet = snippet.clone();
+
+        if let Some(root) = self.root {
+            match mutate::incremental_update_meta(
+                data_dir, root, key, flags, snippet, &self.config,
+            ) {
+                Ok(Some(new_root)) => {
+                    self.root = Some(new_root);
+                    Ok(true)
+                }
+                Ok(None) => {
+                    // Key not found in tree (shouldn't happen — cache had it).
+                    self.cache = old_cache;
+                    self.root = old_root;
+                    Ok(false)
+                }
+                Err(e) => {
+                    self.cache = old_cache;
+                    self.root = old_root;
+                    Err(e)
+                }
+            }
+        } else {
+            self.cache = old_cache;
+            self.root = old_root;
+            Ok(false)
         }
     }
 
+    #[cfg(test)]
     fn rebuild_tree(&mut self, data_dir: &Path) -> Result<Option<ContentId>, DbError> {
         self.root = build_tree(&self.cache, &self.config, data_dir)?;
         Ok(self.root)
