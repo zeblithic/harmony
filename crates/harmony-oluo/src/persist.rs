@@ -40,8 +40,8 @@ pub enum OluoPersistError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("manifest deserialization failed: {0}")]
-    ManifestDeserialize(String),
+    #[error("manifest serialization/deserialization failed: {0}")]
+    ManifestSerde(String),
 
     #[error("metadata deserialization failed: {0}")]
     MetadataDeserialize(String),
@@ -71,6 +71,10 @@ struct HeadFile {
 ///
 /// Returns (local_index_path, generation) so the caller can
 /// send `CompactComplete` back to the engine.
+///
+/// # Preconditions
+///
+/// `data_dir` must exist. This function does not create it.
 pub fn persist_snapshot(
     data_dir: &Path,
     store: &mut dyn BookStore,
@@ -94,7 +98,7 @@ pub fn persist_snapshot(
         compact_generation: generation,
     };
     let manifest_bytes = postcard::to_allocvec(&manifest)
-        .map_err(|e| OluoPersistError::ManifestDeserialize(e.to_string()))?;
+        .map_err(|e| OluoPersistError::ManifestSerde(e.to_string()))?;
 
     // 5. Store manifest as a single CAS book.
     let manifest_cid = store.insert(&manifest_bytes)?;
@@ -109,7 +113,7 @@ pub fn persist_snapshot(
         head: hex::encode(manifest_cid.to_bytes()),
     };
     let head_json = serde_json::to_vec(&head)
-        .map_err(|e| OluoPersistError::ManifestDeserialize(e.to_string()))?;
+        .map_err(|e| OluoPersistError::ManifestSerde(e.to_string()))?;
     atomic_write(&data_dir.join(HEAD_FILE), &head_json)?;
 
     Ok((base_path, generation))
@@ -122,6 +126,10 @@ pub fn persist_snapshot(
 /// via `from_snapshot`, and writes the local index file for mmap.
 ///
 /// Returns `None` if no head file exists (fresh start).
+///
+/// # Preconditions
+///
+/// `data_dir` must exist. This function does not create it.
 pub fn load_snapshot(
     data_dir: &Path,
     store: &dyn BookStore,
@@ -136,7 +144,7 @@ pub fn load_snapshot(
     };
 
     let head: HeadFile = serde_json::from_slice(&head_bytes)
-        .map_err(|e| OluoPersistError::ManifestDeserialize(e.to_string()))?;
+        .map_err(|e| OluoPersistError::ManifestSerde(e.to_string()))?;
 
     if head.version != SNAPSHOT_VERSION {
         return Err(OluoPersistError::UnsupportedVersion(head.version));
@@ -144,9 +152,9 @@ pub fn load_snapshot(
 
     // 2. Fetch manifest from CAS.
     let manifest_cid_bytes: [u8; 32] = hex::decode(&head.head)
-        .map_err(|e| OluoPersistError::ManifestDeserialize(e.to_string()))?
+        .map_err(|e| OluoPersistError::ManifestSerde(e.to_string()))?
         .try_into()
-        .map_err(|_| OluoPersistError::ManifestDeserialize("invalid CID length".into()))?;
+        .map_err(|_| OluoPersistError::ManifestSerde("invalid CID length".into()))?;
     let manifest_cid = ContentId::from_bytes(manifest_cid_bytes);
 
     let manifest_bytes = store
@@ -155,7 +163,7 @@ pub fn load_snapshot(
 
     // 3. Deserialize manifest.
     let manifest: SnapshotManifest = postcard::from_bytes(manifest_bytes)
-        .map_err(|e| OluoPersistError::ManifestDeserialize(e.to_string()))?;
+        .map_err(|e| OluoPersistError::ManifestSerde(e.to_string()))?;
 
     if manifest.version != SNAPSHOT_VERSION {
         return Err(OluoPersistError::UnsupportedVersion(manifest.version));
