@@ -8,6 +8,7 @@ use harmony_content::book::BookStore;
 use harmony_content::cid::{ContentFlags, ContentId};
 use harmony_content::error::ContentError;
 
+
 /// A [`BookStore`] backed by the harmony-db CAS filesystem.
 ///
 /// Reads from both `commits/` (tree nodes, manifests) and `blobs/`
@@ -26,6 +27,10 @@ pub struct DiskBookStore {
 
 impl DiskBookStore {
     /// Create a store backed by the given data directory (no network fallback).
+    ///
+    /// The `commits/` and `blobs/` subdirectories must already exist
+    /// (call `persist::ensure_dirs` first, or use `HarmonyDb::open`
+    /// which does this automatically).
     pub fn new(data_dir: &Path) -> Self {
         Self {
             data_dir: data_dir.to_path_buf(),
@@ -39,6 +44,8 @@ impl DiskBookStore {
     /// The callback is invoked when `get()` can't find a CID locally.
     /// Fetched data is verified (CID must match BLAKE3 hash) and cached
     /// locally in both the in-memory cache and on disk.
+    ///
+    /// The `commits/` and `blobs/` subdirectories must already exist.
     pub fn with_fetcher(
         data_dir: &Path,
         fetcher: impl Fn(&ContentId) -> Option<Vec<u8>> + 'static,
@@ -50,15 +57,20 @@ impl DiskBookStore {
         }
     }
 
+    /// Check if a CID exists on local disk (commits/ or blobs/) without reading contents.
+    fn exists_local(&self, cid: &ContentId) -> bool {
+        let hex = hex::encode(cid.to_bytes());
+        self.data_dir.join("commits").join(format!("{hex}.bin")).exists()
+            || self.data_dir.join("blobs").join(format!("{hex}.bin")).exists()
+    }
+
     /// Try to read a CID from local CAS (commits/ then blobs/).
     fn read_local(&self, cid: &ContentId) -> Option<Vec<u8>> {
         let hex = hex::encode(cid.to_bytes());
-        // Check commits/ first (tree nodes, manifests)
         let commit_path = self.data_dir.join("commits").join(format!("{hex}.bin"));
         if let Ok(data) = std::fs::read(&commit_path) {
             return Some(data);
         }
-        // Check blobs/ (value data)
         let blob_path = self.data_dir.join("blobs").join(format!("{hex}.bin"));
         if let Ok(data) = std::fs::read(&blob_path) {
             return Some(data);
@@ -67,19 +79,20 @@ impl DiskBookStore {
     }
 
     /// Write data to commits/ directory (atomic via tmp + rename).
-    fn write_to_commits(&self, cid: &ContentId, data: &[u8]) {
+    fn write_to_commits(&self, cid: &ContentId, data: &[u8]) -> std::io::Result<()> {
         let hex = hex::encode(cid.to_bytes());
         let path = self.data_dir.join("commits").join(format!("{hex}.bin"));
         if !path.exists() {
             let tmp = self.data_dir.join("commits").join(format!("{hex}.bin.tmp"));
-            let _ = std::fs::write(&tmp, data);
-            let _ = std::fs::rename(&tmp, &path);
+            std::fs::write(&tmp, data)?;
+            std::fs::rename(&tmp, &path)?;
         }
+        Ok(())
     }
 
     /// Verify that data matches the expected CID.
     fn verify_cid(cid: &ContentId, data: &[u8]) -> bool {
-        ContentId::for_book(data, ContentFlags::default())
+        ContentId::for_book(data, cid.flags())
             .map(|computed| computed == *cid)
             .unwrap_or(false)
     }
@@ -92,13 +105,15 @@ impl BookStore for DiskBookStore {
         flags: ContentFlags,
     ) -> Result<ContentId, ContentError> {
         let cid = ContentId::for_book(data, flags)?;
-        self.write_to_commits(&cid, data);
+        // Best-effort disk write — data is also cached in memory.
+        let _ = self.write_to_commits(&cid, data);
         self.cache.borrow_mut().insert(cid, data.to_vec());
         Ok(cid)
     }
 
     fn store(&mut self, cid: ContentId, data: Vec<u8>) {
-        self.write_to_commits(&cid, &data);
+        // Best-effort disk write — store() has no error return.
+        let _ = self.write_to_commits(&cid, &data);
         self.cache.borrow_mut().insert(cid, data);
     }
 
@@ -110,8 +125,8 @@ impl BookStore for DiskBookStore {
             } else if let Some(ref fetcher) = self.fetcher {
                 if let Some(data) = fetcher(cid) {
                     if Self::verify_cid(cid, &data) {
-                        // Cache on disk and in memory
-                        self.write_to_commits(cid, &data);
+                        // Cache on disk (best-effort) and in memory.
+                        let _ = self.write_to_commits(cid, &data);
                         self.cache.borrow_mut().insert(*cid, data);
                     }
                     // CID mismatch: corrupted data from network, ignore
@@ -138,11 +153,19 @@ impl BookStore for DiskBookStore {
     }
 
     fn contains(&self, cid: &ContentId) -> bool {
-        self.cache.borrow().contains_key(cid) || self.read_local(cid).is_some()
+        self.cache.borrow().contains_key(cid) || self.exists_local(cid)
     }
 
     fn remove(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
-        self.cache.borrow_mut().remove(cid)
+        let data = self.cache.borrow_mut().remove(cid)
+            .or_else(|| self.read_local(cid));
+
+        // Remove from disk (both possible locations).
+        let hex = hex::encode(cid.to_bytes());
+        let _ = std::fs::remove_file(self.data_dir.join("commits").join(format!("{hex}.bin")));
+        let _ = std::fs::remove_file(self.data_dir.join("blobs").join(format!("{hex}.bin")));
+
+        data
     }
 }
 

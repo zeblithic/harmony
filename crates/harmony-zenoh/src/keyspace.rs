@@ -968,4 +968,9 @@ mod tests {
     fn db_key_rejects_slashes_in_db_name() {
         assert!(db_root_key("abcd1234", "my/db").is_err());
     }
+
+    #[test]
+    fn db_block_key_rejects_slashes_in_cid_hex() {
+        assert!(db_block_key("abcd1234", "mail", "cid/hex").is_err());
+    }
 }

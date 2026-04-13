@@ -150,7 +150,7 @@ Writer (Peer A)                          Reader (Peer B)
 
 ### harmony-db
 
-No changes. Existing `commit()`, `rebuild_from()`, and `BookStore` interface are sufficient.
+- `crates/harmony-db/src/store.rs` — New `DiskBookStore` implementing `BookStore`, backed by local CAS filesystem with optional network fetch callback. Used by `rebuild_from()` to transparently fetch missing blocks from the network during sync.
 
 ## Testing Strategy
 
