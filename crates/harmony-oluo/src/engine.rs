@@ -383,21 +383,22 @@ impl OluoEngine {
     }
 
     fn handle_evict(&mut self, now_ms: u64) -> Vec<OluoAction> {
-        // Collect expired keys. We cannot remove vectors from CompoundIndex
-        // easily (viewed base doesn't support remove), so we only remove
-        // from metadata. Search results will filter out keyless entries.
-        let expired: Vec<(u64, [u8; 32])> = self
+        let expired: Vec<(u64, [u8; 32], crate::scope::SearchScope)> = self
             .metadata
             .iter()
             .filter_map(|(&key, entry)| match entry.expires_at {
-                Some(expires) if expires <= now_ms => Some((key, entry.target_cid)),
+                Some(expires) if expires <= now_ms => Some((key, entry.target_cid, entry.scope)),
                 _ => None,
             })
             .collect();
 
-        for (key, cid) in expired {
+        for (key, cid, scope) in expired {
             self.metadata.remove(&key);
             self.cid_to_key.remove(&cid);
+            self.scope_counts[scope.index()] -= 1;
+            // Remove from delta if present; base-resident vectors are
+            // cleaned up at compaction (evicted_headroom handles interim).
+            let _ = self.index.remove(key);
         }
 
         Vec::new()
@@ -1107,5 +1108,56 @@ mod tests {
             }
             _ => panic!("expected SearchResults"),
         }
+    }
+
+    #[test]
+    fn engine_evict_removes_delta_vector() {
+        let mut engine = OluoEngine::new();
+        let ingest_time: u64 = 1_700_000_000_000;
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexLightweight { ttl_secs: 60 },
+            now_ms: ingest_time,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.entry_count(), 1);
+        // Delta should have the vector
+        assert_eq!(engine.index.delta_len(), 1);
+
+        // Evict after TTL
+        engine.handle(OluoEvent::EvictExpired {
+            now_ms: ingest_time + 60_000,
+        });
+
+        assert_eq!(engine.entry_count(), 0);
+        // Delta vector should be removed too
+        assert_eq!(engine.index.delta_len(), 0);
+    }
+
+    #[test]
+    fn engine_evict_decrements_scope_counter() {
+        let mut engine = OluoEngine::new();
+        let ingest_time: u64 = 1_700_000_000_000;
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexLightweight { ttl_secs: 60 },
+            now_ms: ingest_time,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.scope_counts[SearchScope::Community.index()], 1);
+
+        engine.handle(OluoEvent::EvictExpired {
+            now_ms: ingest_time + 60_000,
+        });
+
+        assert_eq!(engine.scope_counts[SearchScope::Community.index()], 0);
     }
 }
