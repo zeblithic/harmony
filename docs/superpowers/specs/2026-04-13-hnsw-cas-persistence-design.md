@@ -9,7 +9,7 @@ Persist the harmony-oluo HNSW search index as CAS blobs so it survives restarts 
 - **Independent lifecycle:** Oluo persists its own state, not tied to harmony-db commits. The two systems can be linked later by storing a pointer in the db manifest.
 - **Accept delta loss:** Only compacted state survives restarts. Entries ingested since the last compaction are lost. The caller re-ingests from its source of truth (harmony-db entries, incoming messages). The default compaction threshold is 1000 entries, bounding worst-case loss.
 - **DAG ingest for large blobs:** The compacted HNSW index can be 10-50MB for 10k vectors. `harmony-content::dag::ingest()` chunks it into ~512KB CAS books automatically. No custom chunking code.
-- **Postcard for metadata:** The `HashMap<u64, EntryMetadata>` sidecar is serialized with postcard (already a workspace dependency). At ~100 bytes per entry, 10k entries yields ~1MB — fits in one or two CAS books.
+- **Postcard for metadata:** The metadata sidecar is serialized with postcard (already a workspace dependency) using deterministic key order (entries sorted by u64 key via BTreeMap before encoding) to ensure stable CAS CIDs. At ~100 bytes per entry, 10k entries yields ~1MB — fits in one or two CAS books.
 - **Sans-I/O preserved:** OluoEngine emits a `PersistSnapshot` action after compaction. The caller does all DAG ingest, manifest construction, and head-file management.
 - **Three-level pointer chain:** Local head file → snapshot manifest CID → (index CID + metadata CID). Same pattern as harmony-db's `index.json` → commit manifest → table roots.
 
@@ -41,7 +41,7 @@ struct SnapshotManifest {
 
 ### Metadata Sidecar
 
-The existing `EntryMetadata` gets `Serialize`/`Deserialize` derives. The full `HashMap<u64, EntryMetadata>` is postcard-serialized, then DAG-ingested into CAS.
+The existing `EntryMetadata` gets `Serialize`/`Deserialize` derives. The metadata map is sorted by key (collected into a `BTreeMap<u64, EntryMetadata>`) before postcard serialization to ensure deterministic byte output and stable CAS CIDs. The serialized bytes are then DAG-ingested into CAS.
 
 ### Local Head File
 

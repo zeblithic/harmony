@@ -191,7 +191,7 @@ impl OluoEngine {
     /// `compact_threshold` — compaction threshold (entries before compaction triggers)
     pub fn from_snapshot(
         index_bytes: &[u8],
-        metadata: hashbrown::HashMap<u64, EntryMetadata>,
+        metadata: impl IntoIterator<Item = (u64, EntryMetadata)>,
         key_counter: u64,
         generation: u64,
         compact_threshold: usize,
@@ -199,6 +199,8 @@ impl OluoEngine {
         let config = default_index_config();
         let mut index = CompoundIndex::new(config, compact_threshold)?;
         index.load_base_from_bytes(index_bytes)?;
+
+        let metadata: hashbrown::HashMap<u64, EntryMetadata> = metadata.into_iter().collect();
 
         // Clamp key_counter to at least max(existing_keys) + 1 to prevent
         // future ingests from reusing an existing key.
@@ -215,9 +217,14 @@ impl OluoEngine {
             scope_counts[entry.scope.index()] += 1;
         }
 
-        // Derive cid_to_key from metadata.
+        // Derive cid_to_key from metadata, rejecting duplicate target_cids.
         let mut cid_to_key = hashbrown::HashMap::with_capacity(metadata.len());
         for (&key, entry) in &metadata {
+            if cid_to_key.contains_key(&entry.target_cid) {
+                return Err(SearchError::InvalidConfig(
+                    "snapshot contains duplicate target_cid".into(),
+                ));
+            }
             cid_to_key.insert(entry.target_cid, key);
         }
 
@@ -1825,19 +1832,16 @@ mod tests {
 
         assert_eq!(gen, 1, "first compaction must be generation 1");
 
-        let metadata: hashbrown::HashMap<u64, EntryMetadata> =
-            postcard::from_bytes::<std::collections::BTreeMap<u64, EntryMetadata>>(&mb)
-                .expect("deserialize metadata")
-                .into_iter()
-                .collect();
+        let metadata: std::collections::BTreeMap<u64, EntryMetadata> =
+            postcard::from_bytes(&mb).expect("deserialize metadata");
+        // Restore with threshold=2 so we can trigger a second compaction.
         let mut restored =
-            OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000).expect("from_snapshot must succeed");
+            OluoEngine::from_snapshot(&ib, metadata, kc, gen, 2).expect("from_snapshot must succeed");
 
-        // The restored engine uses compact_threshold=1000 (hardcoded in from_snapshot).
-        // Ingesting a few entries will NOT trigger another compaction (delta < 1000).
-        // Verify: ingest some entries and assert no PersistSnapshot is emitted,
-        // confirming the restored generation (1) is set and the engine doesn't panic.
-        for i in 0x10u8..0x14 {
+        // Ingest entries to trigger compaction on the restored engine.
+        // With threshold=2, compaction fires on the 2nd ingest.
+        let mut next_generation = None;
+        for i in 0x10u8..0x12 {
             let ingest_actions = restored.handle(OluoEvent::Ingest {
                 header: test_header([i; 32], [i; 32]),
                 metadata: SidecarMetadata::default(),
@@ -1846,27 +1850,15 @@ mod tests {
                 scope: SearchScope::Personal,
                 overlay_cids: Vec::new(),
             });
-            assert!(
-                !ingest_actions
-                    .iter()
-                    .any(|a| matches!(a, OluoAction::PersistSnapshot { .. })),
-                "restored engine (threshold=1000) must not compact on small delta"
-            );
+            next_generation = ingest_actions.iter().find_map(|a| match a {
+                OluoAction::PersistSnapshot { generation, .. } => Some(*generation),
+                _ => None,
+            });
         }
-
-        // Verify generation was properly restored: compact_generation must be >= 1.
-        // We confirm indirectly: if generation was not set, a stale CompactComplete
-        // with generation=1 would be accepted; with the correct state it's still
-        // generation=1 and would be accepted. To prove the generation IS set, we
-        // check that has_compacted is true by sending a CompactComplete with a
-        // wrong generation and asserting it's silently ignored.
-        let stale = restored.handle(OluoEvent::CompactComplete {
-            path: "/tmp/fake_base".into(),
-            generation: 999,
-        });
-        assert!(
-            stale.is_empty(),
-            "stale CompactComplete must be ignored (confirms generation was restored to {gen})"
+        assert_eq!(
+            next_generation,
+            Some(2),
+            "second compaction after restore must advance generation to 2"
         );
 
         // Also verify the engine is healthy: can search without errors.
