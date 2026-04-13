@@ -502,21 +502,28 @@ impl ImapStore {
     }
 
     /// Expunge specific messages by UID (for MOVE — does not affect other \Deleted messages).
+    /// Only deletes messages that still have the \Deleted flag set, within a transaction.
     pub fn expunge_uids(&self, mailbox_id: i64, uids: &[u32]) -> Result<Vec<u32>, StoreError> {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
         let mut deleted = Vec::new();
         for &uid in uids {
-            let rows = conn.execute(
-                "DELETE FROM messages WHERE mailbox_id = ?1 AND uid = ?2",
+            let rows = tx.execute(
+                "DELETE FROM messages WHERE id IN (
+                    SELECT m.id FROM messages m
+                    JOIN flags f ON f.message_id = m.id
+                    WHERE m.mailbox_id = ?1 AND m.uid = ?2 AND f.flag = '\\Deleted'
+                )",
                 rusqlite::params![mailbox_id, uid],
             )?;
             if rows > 0 {
                 deleted.push(uid);
             }
         }
+        tx.commit()?;
         Ok(deleted)
     }
 

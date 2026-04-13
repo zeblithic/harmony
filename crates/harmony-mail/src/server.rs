@@ -1987,10 +1987,13 @@ fn matches_single_criterion(
             })
         }
         SearchKey::To(s) => {
+            let needle = s.to_lowercase();
             msg.map_or(false, |m| {
                 m.recipients.iter().any(|r| {
-                    let addr_hex = hex::encode(r.address_hash);
-                    addr_hex.to_lowercase().contains(&s.to_lowercase())
+                    r.recipient_type == crate::message::RecipientType::To && {
+                        let addr_hex = hex::encode(r.address_hash);
+                        addr_hex.to_lowercase().contains(&needle)
+                    }
                 })
             })
         }
