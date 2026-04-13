@@ -1814,7 +1814,6 @@ mod sequence_set_tests {
     };
     use harmony_content::book::MemoryBookStore;
     use harmony_content::chunker::ChunkerConfig;
-    use harmony_content::cid::ContentId;
     use harmony_content::dag;
     use tempfile::tempdir;
 
