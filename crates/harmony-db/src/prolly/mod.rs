@@ -1,5 +1,6 @@
 pub(crate) mod chunker;
 pub(crate) mod diff;
+pub(crate) mod mutate;
 pub(crate) mod node;
 
 use crate::error::DbError;
