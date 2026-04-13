@@ -379,7 +379,7 @@ fn apply_partial(data: &[u8], partial: Option<(u32, u32)>) -> Vec<u8> {
 // ── Date formatting ─────────────────────────────────────────────────
 
 /// Format a unix timestamp as an IMAP date string: `"11-Apr-2026 00:00:00 +0000"`
-fn format_internal_date(timestamp: u64) -> String {
+pub(crate) fn format_internal_date(timestamp: u64) -> String {
     // Simple UTC formatting without chrono dependency
     let secs = timestamp;
     let days = secs / 86400;

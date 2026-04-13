@@ -178,6 +178,8 @@ pub struct ImapConfig {
     pub listen_imaps: String,
     #[serde(default = "default_imap_store_path")]
     pub store_path: String,
+    #[serde(default = "default_content_store_path")]
+    pub content_store_path: String,
     /// IDLE timeout in seconds (default: 30 minutes per RFC 9051 recommendation).
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout: u64,
@@ -193,6 +195,7 @@ impl Default for ImapConfig {
             listen_imap: default_listen_imap(),
             listen_imaps: default_listen_imaps(),
             store_path: default_imap_store_path(),
+            content_store_path: default_content_store_path(),
             idle_timeout: default_idle_timeout(),
             max_auth_failures: default_max_auth_failures(),
         }
@@ -207,6 +210,9 @@ fn default_listen_imaps() -> String {
 }
 fn default_imap_store_path() -> String {
     "/var/lib/harmony-mail/imap.db".to_string()
+}
+fn default_content_store_path() -> String {
+    "/var/lib/harmony-mail/content".to_string()
 }
 fn default_idle_timeout() -> u64 {
     1800

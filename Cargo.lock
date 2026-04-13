@@ -3470,6 +3470,8 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "futures-util",
+ "harmony-content",
+ "harmony-db",
  "harmony-identity",
  "hex",
  "lettre",
@@ -3479,6 +3481,7 @@ dependencies = [
  "rand 0.8.5",
  "rand_core 0.6.4",
  "rcgen",
+ "rpassword",
  "rusqlite",
  "rustls 0.23.37",
  "rustls-pemfile",
@@ -3576,12 +3579,17 @@ dependencies = [
 name = "harmony-oluo"
 version = "0.1.0"
 dependencies = [
+ "harmony-content",
  "harmony-crypto",
  "harmony-search",
  "harmony-semantic",
  "hashbrown 0.15.5",
+ "hex",
  "postcard",
  "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6920,6 +6928,16 @@ dependencies = [
  "serde_derive",
  "typeid",
  "unicode-ident",
+]
+
+[[package]]
+name = "rpassword"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffc936cf8a7ea60c58f030fd36a612a48f440610214dc54bc36431f9ea0c3efb"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
