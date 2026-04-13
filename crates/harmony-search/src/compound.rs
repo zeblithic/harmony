@@ -81,8 +81,9 @@ impl CompoundIndex {
     /// or unknown). Base-resident keys cannot be removed — they are
     /// cleaned up during compaction.
     pub fn remove(&mut self, key: u64) -> SearchResult<bool> {
-        if self.delta_keys.remove(&key) {
+        if self.delta_keys.contains(&key) {
             self.delta.remove(key)?;
+            self.delta_keys.remove(&key);
             Ok(true)
         } else {
             Ok(false)

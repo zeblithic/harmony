@@ -243,6 +243,10 @@ impl OluoEngine {
                 SearchError::RollbackFailed { .. } => {
                     // Index state is poisoned — the old vector is gone and could
                     // not be restored. Don't restore metadata; orphan the entry.
+                    // Decrement scope counter for the orphaned old entry.
+                    if let Some(ref old) = old_metadata {
+                        self.scope_counts[old.scope.index()] -= 1;
+                    }
                     self.cid_to_key.remove(&header.target_cid);
                 }
                 _ => {
@@ -335,12 +339,15 @@ impl OluoEngine {
             crate::scope::SearchScope::Community => self.scope_counts[0] + self.scope_counts[1],
             crate::scope::SearchScope::NetworkWide => total,
         };
+        let requested = query.max_results as usize;
         let scope_fetch = if in_scope_count == 0 || in_scope_count >= total {
-            query.max_results as usize
+            requested
         } else {
             // Scale up to compensate for out-of-scope entries we'll filter out.
-            ((query.max_results as usize) * total / in_scope_count)
-                .min(query.max_results as usize * 5)
+            // Ceiling division ensures we never under-fetch by rounding down.
+            (requested * total)
+                .div_ceil(in_scope_count)
+                .min(requested * 5)
                 .min(1000)
         };
         let fetch_k = scope_fetch.saturating_add(capped_headroom);
@@ -392,16 +399,21 @@ impl OluoEngine {
             })
             .collect();
 
+        let mut actions = Vec::new();
         for (key, cid, scope) in expired {
             self.metadata.remove(&key);
             self.cid_to_key.remove(&cid);
             self.scope_counts[scope.index()] -= 1;
             // Remove from delta if present; base-resident vectors are
             // cleaned up at compaction (evicted_headroom handles interim).
-            let _ = self.index.remove(key);
+            if let Err(e) = self.index.remove(key) {
+                actions.push(OluoAction::Error {
+                    message: format!("evict remove failed for key {key}: {e}"),
+                });
+            }
         }
 
-        Vec::new()
+        actions
     }
 
     fn handle_compact_complete(&mut self, path: &str, generation: u64) -> Vec<OluoAction> {
