@@ -1498,4 +1498,249 @@ mod tests {
             assert_eq!(restored.len(), 3);
         }
     }
+
+    // ── Task 4 tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn from_snapshot_derives_scope_counts() {
+        // threshold=3: compaction triggers after the 4th ingest adds the 4th
+        // vector to the delta (delta grows to 4 which exceeds threshold 3).
+        // Actually threshold=3 means compact when delta_len >= 3 *after* add.
+        // So with threshold=4: first compaction fires on the 4th add.
+        // Use threshold=4 so we can ingest 1 Personal + 1 Community + 1 NetworkWide
+        // and then 1 more Personal to trigger compaction.
+        let mut engine = OluoEngine::with_compact_threshold(4);
+
+        // Ingest 1 Personal, 1 Community, 1 NetworkWide, then 1 more Personal
+        // (4th ingest triggers compaction).
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x10; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x02; 32], [0x20; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x03; 32], [0x30; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_002,
+            scope: SearchScope::NetworkWide,
+            overlay_cids: Vec::new(),
+        });
+
+        // 4th ingest — triggers compaction.
+        let actions = engine.handle(OluoEvent::Ingest {
+            header: test_header([0x04; 32], [0x40; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_003,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        let (ib, mb, kc, gen) = match actions
+            .iter()
+            .find(|a| matches!(a, OluoAction::PersistSnapshot { .. }))
+            .expect("compaction must emit PersistSnapshot on 4th ingest")
+        {
+            OluoAction::PersistSnapshot {
+                index_bytes,
+                metadata_bytes,
+                key_counter,
+                generation,
+            } => (
+                index_bytes.clone(),
+                metadata_bytes.clone(),
+                *key_counter,
+                *generation,
+            ),
+            _ => unreachable!(),
+        };
+
+        let metadata: hashbrown::HashMap<u64, EntryMetadata> =
+            postcard::from_bytes(&mb).expect("deserialize metadata");
+        let mut restored =
+            OluoEngine::from_snapshot(&ib, metadata, kc, gen).expect("from_snapshot must succeed");
+
+        // Search with Personal scope — only Personal entries should be returned.
+        let search_actions = restored.handle(OluoEvent::Search {
+            query_id: 1,
+            query: SearchQuery {
+                embedding: [0x10; 32], // close to Personal entries
+                tier: EmbeddingTier::T3,
+                scope: SearchScope::Personal,
+                max_results: 10,
+            },
+        });
+
+        let results = match &search_actions[0] {
+            OluoAction::SearchResults { results, .. } => results,
+            other => panic!("expected SearchResults, got {other:?}"),
+        };
+
+        // Only Personal entries ([0x01;32] and [0x04;32]) should appear.
+        assert_eq!(results.len(), 2, "Personal search must return exactly 2 Personal entries");
+        let cids: Vec<[u8; 32]> = results.iter().map(|r| r.target_cid).collect();
+        assert!(cids.contains(&[0x01; 32]), "must contain first Personal entry");
+        assert!(cids.contains(&[0x04; 32]), "must contain second Personal entry");
+    }
+
+    #[test]
+    fn from_snapshot_key_counter_continues() {
+        // threshold=2: compaction fires on the 2nd ingest; then 3rd ingest
+        // does NOT retrigger (base loaded, delta reset).
+        // We need 3 ingests before snapshot so key_counter=3. Use threshold=3.
+        let mut engine = OluoEngine::with_compact_threshold(3);
+
+        // Ingest 3 entries — 3rd triggers compaction.
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x11; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x02; 32], [0x22; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        let actions = engine.handle(OluoEvent::Ingest {
+            header: test_header([0x03; 32], [0x33; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_002,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        let (ib, mb, kc, gen) = match actions
+            .iter()
+            .find(|a| matches!(a, OluoAction::PersistSnapshot { .. }))
+            .expect("PersistSnapshot must be emitted on 3rd ingest")
+        {
+            OluoAction::PersistSnapshot {
+                index_bytes,
+                metadata_bytes,
+                key_counter,
+                generation,
+            } => (
+                index_bytes.clone(),
+                metadata_bytes.clone(),
+                *key_counter,
+                *generation,
+            ),
+            _ => unreachable!(),
+        };
+
+        assert_eq!(kc, 3, "key_counter must be 3 after 3 ingests");
+
+        let metadata: hashbrown::HashMap<u64, EntryMetadata> =
+            postcard::from_bytes(&mb).expect("deserialize metadata");
+        let mut restored =
+            OluoEngine::from_snapshot(&ib, metadata, kc, gen).expect("from_snapshot must succeed");
+
+        assert_eq!(restored.entry_count(), 3, "restored engine must have 3 entries");
+
+        // Ingest a 4th entry into the restored engine.
+        restored.handle(OluoEvent::Ingest {
+            header: test_header([0x04; 32], [0x44; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_003,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(restored.entry_count(), 4, "entry_count must be 4 after 1 new ingest into restored engine");
+    }
+
+    #[test]
+    fn from_snapshot_dedup_works_after_restore() {
+        // threshold=3: compaction fires on 3rd ingest.
+        let mut engine = OluoEngine::with_compact_threshold(3);
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x11; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x02; 32], [0x22; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        let actions = engine.handle(OluoEvent::Ingest {
+            header: test_header([0x03; 32], [0x33; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_002,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        let (ib, mb, kc, gen) = match actions
+            .iter()
+            .find(|a| matches!(a, OluoAction::PersistSnapshot { .. }))
+            .expect("PersistSnapshot must be emitted on 3rd ingest")
+        {
+            OluoAction::PersistSnapshot {
+                index_bytes,
+                metadata_bytes,
+                key_counter,
+                generation,
+            } => (
+                index_bytes.clone(),
+                metadata_bytes.clone(),
+                *key_counter,
+                *generation,
+            ),
+            _ => unreachable!(),
+        };
+
+        let metadata: hashbrown::HashMap<u64, EntryMetadata> =
+            postcard::from_bytes(&mb).expect("deserialize metadata");
+        let mut restored =
+            OluoEngine::from_snapshot(&ib, metadata, kc, gen).expect("from_snapshot must succeed");
+
+        assert_eq!(restored.entry_count(), 3);
+
+        // Re-ingest same CID [0x01;32] with Community scope (widen).
+        // Deduplication: should replace the old entry, not add a new one.
+        restored.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x11; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_003,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(
+            restored.entry_count(),
+            3,
+            "dedup: re-ingesting same CID must not increase entry count"
+        );
+    }
+
 }
