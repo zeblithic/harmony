@@ -7,7 +7,7 @@
 use crate::error::DbError;
 use harmony_content::ContentId;
 use std::path::Path;
-use super::chunker::ChunkerConfig;
+use super::chunker::{chunk_items, ChunkerConfig};
 use super::node::{BranchEntry, LeafEntry, Node};
 
 /// One level of the descent path from root to leaf.
@@ -184,6 +184,161 @@ fn rechunk_leaf(
     })
 }
 
+/// Cascade new children up through branch levels to produce a new root CID.
+///
+/// At each level: splice new children into the branch entries, rechunk the
+/// branch, and propagate upward. At the root, build additional branch levels
+/// if needed (tree height may grow or shrink).
+fn cascade_up(
+    data_dir: &Path,
+    path: &TreePath,
+    new_leaf_children: Vec<BranchEntry>,
+    siblings_consumed: usize,
+    config: &ChunkerConfig,
+) -> Result<Option<ContentId>, DbError> {
+    if path.levels.is_empty() {
+        // Root was a leaf — promote new children to root.
+        return finish_to_root(data_dir, new_leaf_children, config);
+    }
+
+    let mut replacement = new_leaf_children;
+    let mut replace_count = 1 + siblings_consumed;
+    let num_levels = path.levels.len();
+
+    for (i, level) in path.levels.iter().rev().enumerate() {
+        let is_root_level = i == num_levels - 1;
+
+        // Splice new children into this level's branch entries.
+        let mut entries = level.entries.clone();
+        let start = level.child_idx;
+        let end = (start + replace_count).min(entries.len());
+        entries.splice(start..end, replacement.into_iter());
+
+        if entries.is_empty() {
+            // Branch level emptied — propagate upward.
+            replacement = Vec::new();
+            replace_count = 1;
+            continue;
+        }
+
+        if entries.len() == 1 && is_root_level {
+            // Single child at root → child becomes the root.
+            return Ok(Some(ContentId::from_bytes(entries[0].child_cid)));
+        }
+
+        if is_root_level {
+            // At root level, write and potentially build more levels.
+            return finish_to_root(data_dir, entries, config);
+        }
+
+        // Non-root level — rechunk the branch entries.
+        let chunks = chunk_items(
+            &entries,
+            config,
+            |e| e.approx_size(),
+            |e| e.boundary_key.as_slice(),
+        );
+        replacement = Vec::new();
+        for chunk in &chunks {
+            let bk = chunk.last().unwrap().boundary_key.clone();
+            let node = Node::Branch(chunk.clone());
+            let cid = node.write_to_cas(data_dir)?;
+            replacement.push(BranchEntry {
+                boundary_key: bk,
+                child_cid: cid.to_bytes(),
+            });
+        }
+        replace_count = 1; // Higher levels: replace just this one branch.
+    }
+
+    // Should not reach here — loop returns at root level.
+    finish_to_root(data_dir, replacement, config)
+}
+
+/// Build branch levels from entries until a single root is produced.
+/// Same logic as the branch loop in `build_tree`.
+fn finish_to_root(
+    data_dir: &Path,
+    branch_entries: Vec<BranchEntry>,
+    config: &ChunkerConfig,
+) -> Result<Option<ContentId>, DbError> {
+    if branch_entries.is_empty() {
+        return Ok(None);
+    }
+    if branch_entries.len() == 1 {
+        return Ok(Some(ContentId::from_bytes(branch_entries[0].child_cid)));
+    }
+
+    let mut entries = branch_entries;
+    loop {
+        let prev_len = entries.len();
+        let chunks = chunk_items(
+            &entries,
+            config,
+            |e| e.approx_size(),
+            |e| e.boundary_key.as_slice(),
+        );
+        let mut next: Vec<BranchEntry> = Vec::new();
+        for chunk in &chunks {
+            let bk = chunk.last().unwrap().boundary_key.clone();
+            let node = Node::Branch(chunk.clone());
+            let cid = node.write_to_cas(data_dir)?;
+            next.push(BranchEntry {
+                boundary_key: bk,
+                child_cid: cid.to_bytes(),
+            });
+        }
+        if next.len() == 1 {
+            return Ok(Some(ContentId::from_bytes(next[0].child_cid)));
+        }
+        // Convergence guard: if chunking didn't reduce count, force single root.
+        if next.len() >= prev_len {
+            let node = Node::Branch(next);
+            let cid = node.write_to_cas(data_dir)?;
+            return Ok(Some(cid));
+        }
+        entries = next;
+    }
+}
+
+/// Incrementally insert an entry into a Prolly Tree.
+///
+/// Walk to the target leaf, insert the entry (or upsert if key exists),
+/// rechunk with boundary convergence, cascade up to a new root CID.
+pub(crate) fn incremental_insert(
+    data_dir: &Path,
+    root: Option<ContentId>,
+    entry: &LeafEntry,
+    config: &ChunkerConfig,
+) -> Result<Option<ContentId>, DbError> {
+    match root {
+        None => {
+            // Empty tree — create a single leaf with this entry.
+            let node = Node::Leaf(vec![entry.clone()]);
+            let cid = node.write_to_cas(data_dir)?;
+            Ok(Some(cid))
+        }
+        Some(root_cid) => {
+            let path = walk_to_leaf(data_dir, root_cid, &entry.key)?;
+
+            let mut leaf = path.leaf_entries.clone();
+            match leaf.binary_search_by(|e| e.key.cmp(&entry.key)) {
+                Ok(idx) => leaf[idx] = entry.clone(),   // upsert
+                Err(idx) => leaf.insert(idx, entry.clone()), // insert
+            }
+
+            let rechunk = rechunk_leaf(data_dir, &path, leaf, config)?;
+            cascade_up(
+                data_dir,
+                &path,
+                rechunk.new_children,
+                rechunk.siblings_consumed,
+                config,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +442,94 @@ mod tests {
                 "boundary keys should be sorted"
             );
         }
+    }
+
+    #[test]
+    fn incremental_insert_matches_rebuild() {
+        let dir = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        // Build initial tree with 200 entries.
+        let mut entries: Vec<Entry> = (0..200u32)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir.path(),
+            ))
+            .collect();
+        let initial_root = build_tree(&entries, &config, dir.path()).unwrap();
+
+        // Insert one new entry incrementally.
+        let new_entry = make_entry(b"k-000100-new", b"inserted", dir.path());
+        let new_leaf_entry = LeafEntry::from_entry(&new_entry);
+        let incremental_root = incremental_insert(
+            dir.path(),
+            initial_root,
+            &new_leaf_entry,
+            &config,
+        ).unwrap();
+
+        // Build reference tree with all 201 entries from scratch.
+        entries.push(new_entry);
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let reference_root = build_tree(&entries, &config, dir.path()).unwrap();
+
+        assert_eq!(
+            incremental_root, reference_root,
+            "incremental insert must produce same root CID as full rebuild"
+        );
+    }
+
+    #[test]
+    fn incremental_insert_into_empty_tree() {
+        let dir = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        let entry = make_entry(b"first-key", b"first-value", dir.path());
+        let leaf_entry = LeafEntry::from_entry(&entry);
+        let root = incremental_insert(dir.path(), None, &leaf_entry, &config).unwrap();
+
+        assert!(root.is_some(), "inserting into empty tree should produce a root");
+
+        // Should be a single leaf node.
+        let node = Node::read_from_cas(dir.path(), root.unwrap()).unwrap();
+        match node {
+            Node::Leaf(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].key, b"first-key");
+            }
+            _ => panic!("expected leaf node"),
+        }
+    }
+
+    #[test]
+    fn incremental_upsert_matches_rebuild() {
+        let dir = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        let mut entries: Vec<Entry> = (0..100u32)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir.path(),
+            ))
+            .collect();
+        let initial_root = build_tree(&entries, &config, dir.path()).unwrap();
+
+        // Upsert: same key, different value.
+        let updated_entry = make_entry(b"k-000050", b"updated-value", dir.path());
+        let updated_leaf = LeafEntry::from_entry(&updated_entry);
+        let incremental_root = incremental_insert(
+            dir.path(),
+            initial_root,
+            &updated_leaf,
+            &config,
+        ).unwrap();
+
+        // Build reference with updated entry.
+        entries[50] = updated_entry;
+        let reference_root = build_tree(&entries, &config, dir.path()).unwrap();
+
+        assert_eq!(incremental_root, reference_root);
     }
 }
