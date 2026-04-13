@@ -1361,17 +1361,23 @@ where
                                 Some(c) => c,
                                 None => {
                                     // No CAS content — render metadata-only attributes
-                                    // (FLAGS, UID, RFC822.SIZE) per RFC 9051 §7.5.2
+                                    // per RFC 9051 §7.5.2 (must emit untagged FETCH)
+                                    let flags = match store.get_flags(msg_row.id) {
+                                        Ok(f) => f,
+                                        Err(e) => {
+                                            tracing::warn!(uid = uid, error = %e, "FETCH: flag retrieval failed, skipping");
+                                            continue;
+                                        }
+                                    };
+                                    let flags_str = if flags.is_empty() {
+                                        "()".to_string()
+                                    } else {
+                                        format!("({})", flags.join(" "))
+                                    };
                                     let mut items = Vec::new();
                                     for attr in &attrs {
                                         match attr {
                                             imap_parse::FetchAttribute::Flags => {
-                                                let f = store.get_flags(msg_row.id).unwrap_or_default();
-                                                let flags_str = if f.is_empty() {
-                                                    "()".to_string()
-                                                } else {
-                                                    format!("({})", f.join(" "))
-                                                };
                                                 items.push(format!("FLAGS {flags_str}"));
                                             }
                                             imap_parse::FetchAttribute::Uid => {
@@ -1380,17 +1386,22 @@ where
                                             imap_parse::FetchAttribute::Rfc822Size => {
                                                 items.push(format!("RFC822.SIZE {}", msg_row.rfc822_size));
                                             }
+                                            imap_parse::FetchAttribute::InternalDate => {
+                                                let date = crate::imap_render::format_internal_date(msg_row.internal_date);
+                                                items.push(format!("INTERNALDATE \"{date}\""));
+                                            }
                                             _ => {} // content-requiring attributes skipped
                                         }
                                     }
-                                    if !items.is_empty() {
-                                        writer
-                                            .write_all(
-                                                format!("* {seqnum} FETCH ({})\r\n", items.join(" "))
-                                                    .as_bytes(),
-                                            )
-                                            .await?;
-                                    }
+                                    // Always emit a FETCH response so the client knows
+                                    // the message exists, even if no requested attrs
+                                    // could be satisfied from metadata alone
+                                    writer
+                                        .write_all(
+                                            format!("* {seqnum} FETCH ({})\r\n", items.join(" "))
+                                                .as_bytes(),
+                                        )
+                                        .await?;
                                     continue;
                                 }
                             };
