@@ -83,16 +83,16 @@ pub enum OluoAction {
 impl OluoEngine {
     /// Restore from a persisted snapshot.
     pub fn from_snapshot(
-        config: OluoConfig,
         index_bytes: &[u8],
         metadata: HashMap<u64, EntryMetadata>,
         key_counter: u64,
         generation: u64,
+        compact_threshold: usize,
     ) -> Result<Self, SearchError> {
-        // 1. Create CompoundIndex, load base from index_bytes
-        // 2. Derive scope_counts by iterating metadata
-        // 3. Derive cid_to_key from metadata target_cid fields
-        // 4. Set key_counter and compact_generation
+        // 1. Create CompoundIndex with compact_threshold, load base from index_bytes
+        // 2. Clamp key_counter to max(existing_keys) + 1
+        // 3. Derive scope_counts by iterating metadata
+        // 4. Derive cid_to_key from metadata target_cid fields
         // 5. Set has_compacted = true (we have a base)
     }
 }
@@ -144,9 +144,9 @@ Caller (app layer)                   OluoEngine
 5. dag::reassemble(metadata_cid, store) → metadata_bytes
 6. Deserialize metadata_bytes → HashMap
 7. OluoEngine::from_snapshot(
-     config, &index_bytes,      ───> Load CompoundIndex base
-     metadata, key_counter,          Derive scope_counts, cid_to_key
-     generation                      Ready for queries + ingests
+     &index_bytes, metadata,    ───> Load CompoundIndex base
+     key_counter, generation,        Clamp key_counter, derive state
+     compact_threshold               Ready for queries + ingests
    )
 ```
 

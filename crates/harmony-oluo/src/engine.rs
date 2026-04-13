@@ -188,15 +188,26 @@ impl OluoEngine {
     ///   `PersistSnapshot::metadata_bytes` via postcard)
     /// `key_counter` — from `SnapshotManifest::key_counter`
     /// `generation` — from `SnapshotManifest::compact_generation`
+    /// `compact_threshold` — compaction threshold (entries before compaction triggers)
     pub fn from_snapshot(
         index_bytes: &[u8],
         metadata: hashbrown::HashMap<u64, EntryMetadata>,
         key_counter: u64,
         generation: u64,
+        compact_threshold: usize,
     ) -> Result<Self, SearchError> {
         let config = default_index_config();
-        let mut index = CompoundIndex::new(config, 1000)?;
+        let mut index = CompoundIndex::new(config, compact_threshold)?;
         index.load_base_from_bytes(index_bytes)?;
+
+        // Clamp key_counter to at least max(existing_keys) + 1 to prevent
+        // future ingests from reusing an existing key.
+        let min_key_counter = metadata
+            .keys()
+            .copied()
+            .max()
+            .map_or(0, |k| k.saturating_add(1));
+        let key_counter = key_counter.max(min_key_counter);
 
         // Derive scope_counts from metadata.
         let mut scope_counts = [0usize; 3];
@@ -341,14 +352,24 @@ impl OluoEngine {
                 Ok(index_bytes) => {
                     self.compact_generation += 1;
                     self.has_compacted = true;
-                    let metadata_bytes = postcard::to_allocvec(&self.metadata)
-                        .expect("metadata serialization must not fail");
-                    actions.push(OluoAction::PersistSnapshot {
-                        index_bytes,
-                        metadata_bytes,
-                        key_counter: self.key_counter,
-                        generation: self.compact_generation,
-                    });
+                    // Deterministic key order for stable CAS CIDs.
+                    let sorted: std::collections::BTreeMap<u64, &EntryMetadata> =
+                        self.metadata.iter().map(|(&k, v)| (k, v)).collect();
+                    match postcard::to_allocvec(&sorted) {
+                        Ok(metadata_bytes) => {
+                            actions.push(OluoAction::PersistSnapshot {
+                                index_bytes,
+                                metadata_bytes,
+                                key_counter: self.key_counter,
+                                generation: self.compact_generation,
+                            });
+                        }
+                        Err(e) => {
+                            actions.push(OluoAction::Error {
+                                message: format!("metadata serialization failed: {e}"),
+                            });
+                        }
+                    }
                 }
                 Err(e) => {
                     actions.push(OluoAction::Error {
@@ -1346,11 +1367,11 @@ mod tests {
             overlay_cids: vec![[0xBB; 32], [0xCC; 32]],
         };
 
-        let mut map = hashbrown::HashMap::new();
+        let mut map = std::collections::BTreeMap::new();
         map.insert(42u64, meta);
 
         let bytes = postcard::to_allocvec(&map).expect("serialize");
-        let restored: hashbrown::HashMap<u64, EntryMetadata> =
+        let restored: std::collections::BTreeMap<u64, EntryMetadata> =
             postcard::from_bytes(&bytes).expect("deserialize");
 
         let entry = restored.get(&42).expect("key 42 must exist");
@@ -1415,13 +1436,17 @@ mod tests {
 
         // Restore from snapshot.
         let metadata: hashbrown::HashMap<u64, EntryMetadata> =
-            postcard::from_bytes(&metadata_bytes).expect("deserialize metadata");
+            postcard::from_bytes::<std::collections::BTreeMap<u64, EntryMetadata>>(&metadata_bytes)
+                .expect("deserialize metadata")
+                .into_iter()
+                .collect();
 
         let mut restored = OluoEngine::from_snapshot(
             &index_bytes,
             metadata,
             key_counter,
             generation,
+            1000,
         )
         .expect("from_snapshot must succeed");
 
@@ -1494,7 +1519,10 @@ mod tests {
 
             // Verify metadata_bytes round-trips correctly.
             let restored: hashbrown::HashMap<u64, EntryMetadata> =
-                postcard::from_bytes(metadata_bytes).expect("metadata must deserialize");
+                postcard::from_bytes::<std::collections::BTreeMap<u64, EntryMetadata>>(metadata_bytes)
+                    .expect("metadata must deserialize")
+                    .into_iter()
+                    .collect();
             assert_eq!(restored.len(), 3);
         }
     }
@@ -1568,9 +1596,12 @@ mod tests {
         };
 
         let metadata: hashbrown::HashMap<u64, EntryMetadata> =
-            postcard::from_bytes(&mb).expect("deserialize metadata");
+            postcard::from_bytes::<std::collections::BTreeMap<u64, EntryMetadata>>(&mb)
+                .expect("deserialize metadata")
+                .into_iter()
+                .collect();
         let mut restored =
-            OluoEngine::from_snapshot(&ib, metadata, kc, gen).expect("from_snapshot must succeed");
+            OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000).expect("from_snapshot must succeed");
 
         // Search with Personal scope — only Personal entries should be returned.
         let search_actions = restored.handle(OluoEvent::Search {
@@ -1650,9 +1681,12 @@ mod tests {
         assert_eq!(kc, 3, "key_counter must be 3 after 3 ingests");
 
         let metadata: hashbrown::HashMap<u64, EntryMetadata> =
-            postcard::from_bytes(&mb).expect("deserialize metadata");
+            postcard::from_bytes::<std::collections::BTreeMap<u64, EntryMetadata>>(&mb)
+                .expect("deserialize metadata")
+                .into_iter()
+                .collect();
         let mut restored =
-            OluoEngine::from_snapshot(&ib, metadata, kc, gen).expect("from_snapshot must succeed");
+            OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000).expect("from_snapshot must succeed");
 
         assert_eq!(restored.entry_count(), 3, "restored engine must have 3 entries");
 
@@ -1719,9 +1753,12 @@ mod tests {
         };
 
         let metadata: hashbrown::HashMap<u64, EntryMetadata> =
-            postcard::from_bytes(&mb).expect("deserialize metadata");
+            postcard::from_bytes::<std::collections::BTreeMap<u64, EntryMetadata>>(&mb)
+                .expect("deserialize metadata")
+                .into_iter()
+                .collect();
         let mut restored =
-            OluoEngine::from_snapshot(&ib, metadata, kc, gen).expect("from_snapshot must succeed");
+            OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000).expect("from_snapshot must succeed");
 
         assert_eq!(restored.entry_count(), 3);
 
@@ -1789,9 +1826,12 @@ mod tests {
         assert_eq!(gen, 1, "first compaction must be generation 1");
 
         let metadata: hashbrown::HashMap<u64, EntryMetadata> =
-            postcard::from_bytes(&mb).expect("deserialize metadata");
+            postcard::from_bytes::<std::collections::BTreeMap<u64, EntryMetadata>>(&mb)
+                .expect("deserialize metadata")
+                .into_iter()
+                .collect();
         let mut restored =
-            OluoEngine::from_snapshot(&ib, metadata, kc, gen).expect("from_snapshot must succeed");
+            OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000).expect("from_snapshot must succeed");
 
         // The restored engine uses compact_threshold=1000 (hardcoded in from_snapshot).
         // Ingesting a few entries will NOT trigger another compaction (delta < 1000).
