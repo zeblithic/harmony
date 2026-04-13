@@ -88,12 +88,20 @@ impl ProllyTree {
         let old_cache = self.cache.clone();
         let old_root = self.root;
         match self.cache.binary_search_by(|e| e.key.cmp(&entry.key)) {
-            Ok(idx) => self.cache[idx] = entry,
-            Err(idx) => self.cache.insert(idx, entry),
+            Ok(idx) => self.cache[idx] = entry.clone(),
+            Err(idx) => self.cache.insert(idx, entry.clone()),
         }
-        match self.rebuild_tree(data_dir) {
-            Ok(root) => Ok(root),
-            Err(e) => { self.cache = old_cache; self.root = old_root; Err(e) }
+        let leaf_entry = LeafEntry::from_entry(&entry);
+        match mutate::incremental_insert(data_dir, self.root, &leaf_entry, &self.config) {
+            Ok(new_root) => {
+                self.root = new_root;
+                Ok(new_root)
+            }
+            Err(e) => {
+                self.cache = old_cache;
+                self.root = old_root;
+                Err(e)
+            }
         }
     }
 
