@@ -179,6 +179,7 @@ impl ProllyTree {
         }
     }
 
+    #[cfg(test)]
     fn rebuild_tree(&mut self, data_dir: &Path) -> Result<Option<ContentId>, DbError> {
         self.root = build_tree(&self.cache, &self.config, data_dir)?;
         Ok(self.root)

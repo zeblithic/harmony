@@ -706,4 +706,196 @@ mod tests {
             "incremental update_meta must produce same root CID as full rebuild"
         );
     }
+
+    #[test]
+    fn incremental_sequence_matches_rebuild() {
+        let dir = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        // Insert 100 entries one at a time using incremental_insert.
+        let entries: Vec<Entry> = (0..100u32)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir.path(),
+            ))
+            .collect();
+
+        let mut root: Option<ContentId> = None;
+        for entry in &entries {
+            let leaf_entry = LeafEntry::from_entry(entry);
+            root = incremental_insert(dir.path(), root, &leaf_entry, &config).unwrap();
+        }
+
+        // Compare with full rebuild.
+        let reference = build_tree(&entries, &config, dir.path()).unwrap();
+        assert_eq!(root, reference, "100 sequential incremental inserts must match full rebuild");
+    }
+
+    #[test]
+    fn incremental_mixed_ops_matches_rebuild() {
+        let dir = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        // Start with 50 entries.
+        let entries: Vec<Entry> = (0..50u32)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir.path(),
+            ))
+            .collect();
+
+        let mut root: Option<ContentId> = None;
+        for entry in &entries {
+            let leaf_entry = LeafEntry::from_entry(entry);
+            root = incremental_insert(dir.path(), root, &leaf_entry, &config).unwrap();
+        }
+
+        // Remove entries 10, 20, 30.
+        for i in [10u32, 20, 30] {
+            let key = format!("k-{i:06}").into_bytes();
+            root = incremental_remove(dir.path(), root.unwrap(), &key, &config).unwrap();
+        }
+
+        // Update metadata on entry 25.
+        root = incremental_update_meta(
+            dir.path(),
+            root.unwrap(),
+            format!("k-{:06}", 25).as_bytes(),
+            99,
+            "mixed-test".to_string(),
+            &config,
+        ).unwrap();
+
+        // Insert 5 new entries.
+        for i in 50..55u32 {
+            let entry = make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir.path(),
+            );
+            let leaf_entry = LeafEntry::from_entry(&entry);
+            root = incremental_insert(dir.path(), root, &leaf_entry, &config).unwrap();
+        }
+
+        // Build reference from the expected final state.
+        let mut expected: Vec<Entry> = (0..55u32)
+            .filter(|i| *i != 10 && *i != 20 && *i != 30)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir.path(),
+            ))
+            .collect();
+        // Apply metadata update to entry 25.
+        if let Some(e) = expected.iter_mut().find(|e| e.key == format!("k-{:06}", 25).as_bytes()) {
+            e.metadata.flags = 99;
+            e.metadata.snippet = "mixed-test".to_string();
+        }
+        let reference = build_tree(&expected, &config, dir.path()).unwrap();
+
+        assert_eq!(root, reference, "mixed operations must match full rebuild");
+    }
+
+    #[test]
+    fn incremental_order_independence() {
+        let dir1 = setup_dir();
+        let dir2 = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        let entries: Vec<Entry> = (0..100u32)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir1.path(),
+            ))
+            .collect();
+
+        // Insert in ascending order.
+        let mut root1: Option<ContentId> = None;
+        for entry in &entries {
+            let leaf_entry = LeafEntry::from_entry(entry);
+            root1 = incremental_insert(dir1.path(), root1, &leaf_entry, &config).unwrap();
+        }
+
+        // Insert in descending order (different dir to avoid CAS collisions).
+        // Re-create entries with dir2 blobs.
+        let entries2: Vec<Entry> = (0..100u32)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir2.path(),
+            ))
+            .collect();
+        let mut root2: Option<ContentId> = None;
+        for entry in entries2.iter().rev() {
+            let leaf_entry = LeafEntry::from_entry(entry);
+            root2 = incremental_insert(dir2.path(), root2, &leaf_entry, &config).unwrap();
+        }
+
+        assert_eq!(
+            root1, root2,
+            "same entries inserted in different order must produce same root CID"
+        );
+    }
+
+    #[test]
+    fn incremental_insert_writes_few_nodes() {
+        let dir = setup_dir();
+        let config = ChunkerConfig::default_4k();
+
+        // Build a 1000-entry tree.
+        let entries: Vec<Entry> = (0..1000u32)
+            .map(|i| make_entry(
+                format!("k-{i:06}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+                dir.path(),
+            ))
+            .collect();
+        let root = build_tree(&entries, &config, dir.path()).unwrap();
+
+        // Count CAS files before.
+        let commits_dir = dir.path().join("commits");
+        let before_count = std::fs::read_dir(&commits_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .map_or(false, |ext| ext == "bin")
+            })
+            .count();
+
+        // Insert one entry.
+        let new_entry = make_entry(b"k-000500-new", b"inserted", dir.path());
+        let leaf_entry = LeafEntry::from_entry(&new_entry);
+        incremental_insert(dir.path(), root, &leaf_entry, &config).unwrap();
+
+        // Count CAS files after.
+        let after_count = std::fs::read_dir(&commits_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .map_or(false, |ext| ext == "bin")
+            })
+            .count();
+
+        let nodes_written = after_count - before_count;
+
+        // For a 1000-entry tree (~3-4 levels), should write ~3-8 nodes,
+        // not 50+ (which a full rebuild would produce).
+        assert!(
+            nodes_written <= 15,
+            "incremental insert should write few nodes, got {nodes_written}"
+        );
+        assert!(
+            nodes_written >= 2,
+            "should write at least a leaf and a branch, got {nodes_written}"
+        );
+    }
 }
