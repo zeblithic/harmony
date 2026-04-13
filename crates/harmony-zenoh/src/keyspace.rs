@@ -468,9 +468,14 @@ fn ze(msg: String) -> ZenohError {
     ZenohError::InvalidKeyExpr(msg)
 }
 
-/// Reject field values containing `/` which would silently create extra path
-/// segments in format!-based subscription patterns.
+/// Reject field values that are empty or contain `/`, which would produce
+/// malformed key expressions (empty segments or extra path levels).
 fn reject_slashes(field: &str) -> Result<(), ZenohError> {
+    if field.is_empty() {
+        return Err(ZenohError::InvalidKeyExpr(
+            "field value must not be empty".to_string(),
+        ));
+    }
     if field.contains('/') {
         return Err(ZenohError::InvalidKeyExpr(format!(
             "field value must not contain '/': {field:?}"
@@ -972,5 +977,17 @@ mod tests {
     #[test]
     fn db_block_key_rejects_slashes_in_cid_hex() {
         assert!(db_block_key("abcd1234", "mail", "cid/hex").is_err());
+    }
+
+    #[test]
+    fn db_key_rejects_empty_owner() {
+        assert!(db_root_key("", "mail").is_err());
+        assert!(db_block_queryable("", "mail").is_err());
+    }
+
+    #[test]
+    fn db_key_rejects_empty_db_name() {
+        assert!(db_root_key("abcd1234", "").is_err());
+        assert!(db_block_key("abcd1234", "", "ff00").is_err());
     }
 }

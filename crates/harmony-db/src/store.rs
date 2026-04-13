@@ -118,6 +118,9 @@ impl BookStore for DiskBookStore {
     }
 
     fn store(&mut self, cid: ContentId, data: Vec<u8>) {
+        if !Self::verify_cid(&cid, &data) {
+            return;
+        }
         // store() returns () per trait — skip cache if disk write fails
         // to avoid RAM-only ghost data.
         if self.write_to_commits(&cid, &data).is_ok() {
@@ -154,16 +157,24 @@ impl BookStore for DiskBookStore {
             }
         }
 
-        // SAFETY: We need to return &[u8] with lifetime tied to &self,
-        // but RefCell::borrow() returns a Ref guard that drops at end
-        // of this function. We use unsafe to create a slice from the
-        // cached Vec's allocation.
+        // SAFETY: We return `&[u8]` pointing into the heap allocation of
+        // a Vec<u8> stored in our RefCell<HashMap>. This is sound for a
+        // single outstanding get() result because:
         //
-        // This is sound because:
-        // 1. &self prevents concurrent &mut self calls
-        // 2. The HashMap only grows during get() (insert, never remove)
-        //    so existing Vec allocations remain stable
-        // 3. The Vec inside the HashMap is never modified after insertion
+        // 1. The Vec's heap buffer is stable — HashMap resizing moves the
+        //    Vec struct but not its heap allocation. New inserts don't
+        //    affect existing Vec buffers.
+        // 2. We only insert, never remove or modify, entries during get().
+        // 3. &self prevents concurrent &mut self calls (store, remove, etc.).
+        //
+        // ALIASING LIMITATION: Under stacked/tree borrows, calling get()
+        // while holding a &[u8] from a previous get() is formally UB —
+        // the borrow_mut().insert() during cache population invalidates
+        // pointers derived from earlier borrow() calls. All current
+        // callers (rebuild_from, walk, reassemble) consume the result
+        // immediately via .to_vec() or extend_from_slice before the next
+        // get(), so this never manifests. A proper fix requires the
+        // BookStore trait to return owned data (Vec<u8> or Cow).
         let cache = self.cache.borrow();
         cache.get(cid).map(|v| {
             let ptr = v.as_ptr();
