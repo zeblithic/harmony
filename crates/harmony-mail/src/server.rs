@@ -1352,108 +1352,127 @@ where
                     Ok((resolved, all_msgs, csp)) => {
                         let rows_by_uid: std::collections::HashMap<u32, &imap_store::MessageRow> =
                             all_msgs.iter().map(|m| (m.uid, m)).collect();
+                        // Determine if any attribute requires CAS message content
+                        let needs_cas = attrs.iter().any(|a| matches!(a,
+                            imap_parse::FetchAttribute::Envelope
+                            | imap_parse::FetchAttribute::Body
+                            | imap_parse::FetchAttribute::BodyStructure
+                            | imap_parse::FetchAttribute::BodySection { .. }
+                            | imap_parse::FetchAttribute::Rfc822
+                            | imap_parse::FetchAttribute::Rfc822Header
+                            | imap_parse::FetchAttribute::Rfc822Text
+                        ));
+
                         for (uid, seqnum) in &resolved {
                             let msg_row = match rows_by_uid.get(uid) {
                                 Some(r) => *r,
                                 None => continue,
                             };
-                            let cid_bytes = match msg_row.message_cid {
-                                Some(c) => c,
-                                None => {
-                                    // No CAS content — render metadata-only attributes
-                                    // per RFC 9051 §7.5.2 (must emit untagged FETCH)
-                                    let flags = match store.get_flags(msg_row.id) {
-                                        Ok(f) => f,
-                                        Err(e) => {
-                                            tracing::warn!(uid = uid, error = %e, "FETCH: flag retrieval failed, skipping");
-                                            continue;
-                                        }
-                                    };
-                                    let flags_str = if flags.is_empty() {
-                                        "()".to_string()
-                                    } else {
-                                        format!("({})", flags.join(" "))
-                                    };
-                                    let mut items = Vec::new();
-                                    for attr in &attrs {
-                                        match attr {
-                                            imap_parse::FetchAttribute::Flags => {
-                                                items.push(format!("FLAGS {flags_str}"));
+
+                            // Try CAS retrieval only when content-requiring attrs are requested
+                            // and the message has a CID. On CAS failure, fall back to metadata.
+                            let harmony_msg = if needs_cas {
+                                match msg_row.message_cid {
+                                    Some(cid_bytes) => {
+                                        let csp_clone = csp.clone();
+                                        let cas_result = tokio::task::spawn_blocking(move || {
+                                            let book_store = harmony_db::DiskBookStore::new(&csp_clone);
+                                            let content_id = harmony_content::cid::ContentId::from_bytes(cid_bytes);
+                                            harmony_content::dag::reassemble(&content_id, &book_store)
+                                        })
+                                        .await
+                                        .map_err(|e| format!("CAS task panicked: {e}"));
+
+                                        match cas_result {
+                                            Ok(Ok(bytes)) => {
+                                                match crate::message::HarmonyMessage::from_bytes(&bytes) {
+                                                    Ok(m) => Some(m),
+                                                    Err(e) => {
+                                                        tracing::warn!(uid = uid, error = %e, "FETCH: deserialization failed, falling back to metadata");
+                                                        None
+                                                    }
+                                                }
                                             }
-                                            imap_parse::FetchAttribute::Uid => {
-                                                items.push(format!("UID {uid}"));
+                                            Ok(Err(e)) => {
+                                                tracing::warn!(uid = uid, error = %e, "FETCH: CAS retrieval failed, falling back to metadata");
+                                                None
                                             }
-                                            imap_parse::FetchAttribute::Rfc822Size => {
-                                                items.push(format!("RFC822.SIZE {}", msg_row.rfc822_size));
+                                            Err(e) => {
+                                                tracing::warn!(uid = uid, error = %e, "FETCH: CAS task failed, falling back to metadata");
+                                                None
                                             }
-                                            imap_parse::FetchAttribute::InternalDate => {
-                                                let date = crate::imap_render::format_internal_date(msg_row.internal_date);
-                                                items.push(format!("INTERNALDATE \"{date}\""));
-                                            }
-                                            _ => {} // content-requiring attributes skipped
                                         }
                                     }
-                                    // Always emit a FETCH response so the client knows
-                                    // the message exists, even if no requested attrs
-                                    // could be satisfied from metadata alone
-                                    writer
-                                        .write_all(
-                                            format!("* {seqnum} FETCH ({})\r\n", items.join(" "))
-                                                .as_bytes(),
-                                        )
-                                        .await?;
-                                    continue;
+                                    None => None,
                                 }
+                            } else {
+                                None
                             };
 
-                            // Retrieve message from CAS via spawn_blocking (file I/O)
-                            let csp_clone = csp.clone();
-                            let cas_result = tokio::task::spawn_blocking(move || {
-                                let book_store = harmony_db::DiskBookStore::new(&csp_clone);
-                                let content_id = harmony_content::cid::ContentId::from_bytes(cid_bytes);
-                                harmony_content::dag::reassemble(&content_id, &book_store)
-                            })
-                            .await
-                            .map_err(|e| format!("CAS task panicked: {e}"));
+                            // Render via build_fetch_response when we have the full message
+                            if let Some(mut msg) = harmony_msg {
+                                // Use msg_row.internal_date as the canonical INTERNALDATE
+                                // source (same value in both CAS and metadata paths)
+                                msg.timestamp = msg_row.internal_date;
 
-                            let raw_bytes = match cas_result {
-                                Ok(Ok(bytes)) => bytes,
-                                Ok(Err(e)) => {
-                                    tracing::warn!(uid = uid, error = %e, "FETCH: CAS retrieval failed, skipping message");
-                                    continue;
+                                let flags = match store.get_flags(msg_row.id) {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        tracing::warn!(uid = uid, error = %e, "FETCH: flag retrieval failed, skipping");
+                                        continue;
+                                    }
+                                };
+                                match crate::imap_render::build_fetch_response(
+                                    *seqnum, *uid, &attrs, &msg, &flags,
+                                    msg_row.rfc822_size, domain,
+                                ) {
+                                    Ok(response) => {
+                                        writer.write_all(&response.to_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(uid = uid, error = %e, "FETCH: render failed, skipping");
+                                        continue;
+                                    }
                                 }
-                                Err(e) => {
-                                    tracing::warn!(uid = uid, error = %e, "FETCH: CAS task failed, skipping message");
-                                    continue;
+                            } else {
+                                // Metadata-only: render from msg_row without CAS
+                                let flags = match store.get_flags(msg_row.id) {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        tracing::warn!(uid = uid, error = %e, "FETCH: flag retrieval failed, skipping");
+                                        continue;
+                                    }
+                                };
+                                let flags_str = if flags.is_empty() {
+                                    "()".to_string()
+                                } else {
+                                    format!("({})", flags.join(" "))
+                                };
+                                let mut items = Vec::new();
+                                for attr in &attrs {
+                                    match attr {
+                                        imap_parse::FetchAttribute::Flags => {
+                                            items.push(format!("FLAGS {flags_str}"));
+                                        }
+                                        imap_parse::FetchAttribute::Uid => {
+                                            items.push(format!("UID {uid}"));
+                                        }
+                                        imap_parse::FetchAttribute::Rfc822Size => {
+                                            items.push(format!("RFC822.SIZE {}", msg_row.rfc822_size));
+                                        }
+                                        imap_parse::FetchAttribute::InternalDate => {
+                                            let date = crate::imap_render::format_internal_date(msg_row.internal_date);
+                                            items.push(format!("INTERNALDATE \"{date}\""));
+                                        }
+                                        _ => {} // content-requiring attributes need CAS
+                                    }
                                 }
-                            };
-
-                            let harmony_msg = match crate::message::HarmonyMessage::from_bytes(&raw_bytes) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    tracing::warn!(uid = uid, error = %e, "FETCH: message deserialization failed, skipping");
-                                    continue;
-                                }
-                            };
-
-                            let flags = match store.get_flags(msg_row.id) {
-                                Ok(f) => f,
-                                Err(e) => {
-                                    tracing::warn!(uid = uid, error = %e, "FETCH: flag retrieval failed, skipping");
-                                    continue;
-                                }
-                            };
-                            match crate::imap_render::build_fetch_response(
-                                *seqnum, *uid, &attrs, &harmony_msg, &flags,
-                                msg_row.rfc822_size, domain,
-                            ) {
-                                Ok(response) => {
-                                    writer.write_all(&response.to_bytes()).await?;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(uid = uid, error = %e, "FETCH: render failed, skipping");
-                                    continue;
-                                }
+                                writer
+                                    .write_all(
+                                        format!("* {seqnum} FETCH ({})\r\n", items.join(" "))
+                                            .as_bytes(),
+                                    )
+                                    .await?;
                             }
                         }
 
