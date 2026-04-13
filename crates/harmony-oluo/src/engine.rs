@@ -310,6 +310,9 @@ impl OluoEngine {
             }
         };
 
+        // TODO(ZEB-107): filter by query.scope once entries carry scope metadata.
+        // Currently all entries are treated as Personal — SidecarMetadata has no
+        // scope/community field, so there's nothing to filter against yet.
         let mut results: Vec<RawSearchResult> = Vec::new();
         for m in matches {
             if let Some(entry) = self.metadata.get(&m.key) {
