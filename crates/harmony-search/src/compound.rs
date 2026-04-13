@@ -36,8 +36,9 @@ impl CompoundIndex {
     ///
     /// If the key already exists in delta, the old entry is replaced.
     /// Dimensions are validated before any mutation to prevent partial state.
-    /// On failure during replacement, the old vector is restored (or the key
-    /// is unshadowed from `delta_keys` if restore also fails).
+    /// On failure during replacement, the old vector is restored. If restore
+    /// also fails, returns [`SearchError::RollbackFailed`] — the caller must
+    /// not assume pre-call state was preserved.
     pub fn add(&mut self, key: u64, vector: &[f32]) -> SearchResult<()> {
         // Validate dimensions before any mutation
         if vector.len() != self.config.dimensions {
@@ -54,13 +55,17 @@ impl CompoundIndex {
 
             self.delta.remove(key)?;
 
-            if let Err(e) = self.delta.add(key, vector) {
-                // Restore old vector; if that also fails, unshadow from delta_keys
-                // so at least the base entry (if any) isn't incorrectly filtered out.
-                if self.delta.add(key, &old_vector).is_err() {
-                    self.delta_keys.remove(&key);
+            if let Err(add_err) = self.delta.add(key, vector) {
+                // Try to restore the old vector
+                if let Err(restore_err) = self.delta.add(key, &old_vector) {
+                    // Both failed — delta_keys still claims the key but no vector
+                    // exists. Surface this explicitly so the caller can clean up.
+                    return Err(SearchError::RollbackFailed {
+                        add_error: add_err.to_string(),
+                        restore_error: restore_err.to_string(),
+                    });
                 }
-                return Err(e);
+                return Err(add_err);
             }
         } else {
             self.delta.add(key, vector)?;

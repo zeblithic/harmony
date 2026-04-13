@@ -14,6 +14,20 @@ pub enum SearchError {
     /// Serialization/deserialization failed.
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    /// A replace-add failed and the old vector could not be restored.
+    ///
+    /// The index is in a degraded state: `delta_keys` still claims ownership
+    /// of the key, but neither delta nor base has a valid vector for it.
+    /// Callers must not attempt to roll back metadata — the entry is orphaned
+    /// and should be cleaned up.
+    #[error("rollback failed: add error: {add_error}, restore error: {restore_error}")]
+    RollbackFailed {
+        /// The original add error.
+        add_error: String,
+        /// The error from trying to restore the old vector.
+        restore_error: String,
+    },
 }
 
 /// Result type for vector index operations.

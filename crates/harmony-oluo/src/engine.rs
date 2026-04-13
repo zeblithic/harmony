@@ -4,7 +4,9 @@
 //! Uses `CompoundIndex` from `harmony-search` (USearch HNSW) for approximate
 //! nearest-neighbor search on binary embeddings.
 
-use harmony_search::{CompoundIndex, Match as SearchMatch, Metric, Quantization, VectorIndexConfig};
+use harmony_search::{
+    CompoundIndex, Match as SearchMatch, Metric, Quantization, SearchError, VectorIndexConfig,
+};
 use harmony_semantic::metadata::{PrivacyTier, SidecarMetadata};
 use harmony_semantic::sidecar::SidecarHeader;
 use harmony_semantic::tier::EmbeddingTier;
@@ -211,11 +213,20 @@ impl OluoEngine {
 
         // Add to HNSW index — on failure, roll back and emit error.
         if let Err(e) = self.index.add(key, &f32_vector) {
-            // Restore previous state
-            if let Some(old) = old_metadata {
-                self.metadata.insert(key, old);
-            } else {
-                self.key_counter -= 1;
+            match &e {
+                SearchError::RollbackFailed { .. } => {
+                    // Index state is poisoned — the old vector is gone and could
+                    // not be restored. Don't restore metadata; orphan the entry.
+                    self.cid_to_key.remove(&header.target_cid);
+                }
+                _ => {
+                    // Normal failure — old vector preserved, restore metadata.
+                    if let Some(old) = old_metadata {
+                        self.metadata.insert(key, old);
+                    } else {
+                        self.key_counter -= 1;
+                    }
+                }
             }
             return vec![OluoAction::Error {
                 message: format!("index add failed: {e}"),
