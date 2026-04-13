@@ -1553,17 +1553,116 @@ where
                     }
                 }
             }
-            ImapAction::CopyMessages { .. } => {
-                // Not yet wired to store copy
-                if let Some(tag) = session.pending_tag.take() {
-                    writer
-                        .write_all(
-                            format!("{tag} NO [CANNOT] COPY/MOVE not yet implemented\r\n")
-                                .as_bytes(),
-                        )
-                        .await?;
+            ImapAction::CopyMessages {
+                sequence_set,
+                destination,
+                uid_mode,
+                is_move,
+            } => {
+                // Phase 1: sync — resolve mailbox, sequence set, do the copy
+                enum CopyOutcome {
+                    Done(Vec<(u32, u32)>, Vec<imap_store::MessageRow>, i64), // mapping, all_msgs, mailbox_id
+                    Empty,
+                    TryCreate,
                 }
-                writer.flush().await?;
+
+                let copy_result: Result<CopyOutcome, String> = (|| {
+                    let mailbox_name = match &session.state {
+                        ImapState::Selected { mailbox, .. } => mailbox.name.clone(),
+                        _ => return Err("no mailbox selected".to_string()),
+                    };
+                    let mbox = store
+                        .get_mailbox(&mailbox_name)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "mailbox not found".to_string())?;
+                    let all_msgs = store.get_messages(mbox.id).map_err(|e| e.to_string())?;
+                    let resolved = resolve_sequence_set(sequence_set, *uid_mode, &all_msgs);
+                    let uids: Vec<u32> = resolved.iter().map(|(uid, _)| *uid).collect();
+
+                    if uids.is_empty() {
+                        return Ok(CopyOutcome::Empty);
+                    }
+
+                    match store.copy_messages(mbox.id, &uids, destination) {
+                        Ok(mapping) => Ok(CopyOutcome::Done(mapping, all_msgs, mbox.id)),
+                        Err(imap_store::StoreError::MailboxNotFound(_)) => Ok(CopyOutcome::TryCreate),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })();
+
+                // Phase 2: async — write responses, handle MOVE expunge
+                match copy_result {
+                    Ok(CopyOutcome::Done(mapping, all_msgs, mailbox_id)) => {
+                        if *is_move {
+                            // Flag source messages as \Deleted
+                            let rows_by_uid: std::collections::HashMap<u32, &imap_store::MessageRow> =
+                                all_msgs.iter().map(|m| (m.uid, m)).collect();
+                            for (src_uid, _dst_uid) in &mapping {
+                                if let Some(row) = rows_by_uid.get(src_uid) {
+                                    let _ = store.add_flags(row.id, &["\\Deleted"]);
+                                }
+                            }
+
+                            let uid_to_seqnum: std::collections::HashMap<u32, u32> = all_msgs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, m)| (m.uid, (i + 1) as u32))
+                                .collect();
+                            let expunged_uids = store.expunge(mailbox_id).unwrap_or_default();
+                            let mut seqnums: Vec<u32> = expunged_uids
+                                .iter()
+                                .filter_map(|uid| uid_to_seqnum.get(uid).copied())
+                                .collect();
+                            seqnums.sort_unstable_by(|a, b| b.cmp(a)); // descending
+
+                            for seqnum in &seqnums {
+                                writer
+                                    .write_all(format!("* {seqnum} EXPUNGE\r\n").as_bytes())
+                                    .await?;
+                            }
+
+                            if let Some(tag) = session.pending_tag.take() {
+                                writer
+                                    .write_all(format!("{tag} OK MOVE completed\r\n").as_bytes())
+                                    .await?;
+                            }
+                        } else {
+                            if let Some(tag) = session.pending_tag.take() {
+                                writer
+                                    .write_all(format!("{tag} OK COPY completed\r\n").as_bytes())
+                                    .await?;
+                            }
+                        }
+                        writer.flush().await?;
+                    }
+                    Ok(CopyOutcome::Empty) => {
+                        let cmd = if *is_move { "MOVE" } else { "COPY" };
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} OK {cmd} completed\r\n").as_bytes())
+                                .await?;
+                        }
+                        writer.flush().await?;
+                    }
+                    Ok(CopyOutcome::TryCreate) => {
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(
+                                    format!("{tag} NO [TRYCREATE] mailbox not found\r\n").as_bytes(),
+                                )
+                                .await?;
+                        }
+                        writer.flush().await?;
+                    }
+                    Err(reason) => {
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                                .await?;
+                            writer.flush().await?;
+                        }
+                    }
+                }
             }
             ImapAction::StartIdle { .. } => {
                 framed.decoder_mut().enter_idle_mode();
@@ -2417,6 +2516,77 @@ mod sequence_set_tests {
         assert!(super::parse_imap_date("invalid").is_none());
         assert!(super::parse_imap_date("32-Jan-2026").is_none());
         assert!(super::parse_imap_date("01-Xyz-2026").is_none());
+    }
+
+    #[test]
+    fn copy_messages_preserves_flags() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let imap_store = ImapStore::open(&db_path).unwrap();
+        imap_store.initialize_default_mailboxes().unwrap();
+        imap_store.create_mailbox("Archive").unwrap();
+
+        // Insert message with flags
+        let uid = imap_store.insert_message("INBOX", &[1u8; MESSAGE_ID_LEN], None, 1000, 100).unwrap();
+        let mbox = imap_store.get_mailbox("INBOX").unwrap().unwrap();
+        let msgs = imap_store.get_messages(mbox.id).unwrap();
+        imap_store.add_flags(msgs[0].id, &["\\Seen", "\\Flagged"]).unwrap();
+
+        // Copy to Archive
+        let mapping = imap_store.copy_messages(mbox.id, &[uid], "Archive").unwrap();
+        assert_eq!(mapping.len(), 1);
+        let (src_uid, dst_uid) = mapping[0];
+        assert_eq!(src_uid, uid);
+
+        // Verify source still exists
+        let src_msgs = imap_store.get_messages(mbox.id).unwrap();
+        assert_eq!(src_msgs.len(), 1);
+
+        // Verify destination has the message with flags
+        let dst_mbox = imap_store.get_mailbox("Archive").unwrap().unwrap();
+        let dst_msgs = imap_store.get_messages(dst_mbox.id).unwrap();
+        assert_eq!(dst_msgs.len(), 1);
+        assert_eq!(dst_msgs[0].uid, dst_uid);
+        let dst_flags = imap_store.get_flags(dst_msgs[0].id).unwrap();
+        assert!(dst_flags.contains(&"\\Flagged".to_string()));
+        assert!(dst_flags.contains(&"\\Seen".to_string()));
+    }
+
+    #[test]
+    fn move_removes_source() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let imap_store = ImapStore::open(&db_path).unwrap();
+        imap_store.initialize_default_mailboxes().unwrap();
+        // "Trash" is already created by initialize_default_mailboxes
+
+        // Insert 2 messages
+        let uid1 = imap_store.insert_message("INBOX", &[1u8; MESSAGE_ID_LEN], None, 1000, 100).unwrap();
+        let uid2 = imap_store.insert_message("INBOX", &[2u8; MESSAGE_ID_LEN], None, 2000, 200).unwrap();
+        let mbox = imap_store.get_mailbox("INBOX").unwrap().unwrap();
+
+        // Move uid1 to Trash (copy + flag \Deleted + expunge)
+        let mapping = imap_store.copy_messages(mbox.id, &[uid1], "Trash").unwrap();
+        assert_eq!(mapping.len(), 1);
+
+        // Flag source as deleted
+        let msgs = imap_store.get_messages(mbox.id).unwrap();
+        let msg1 = msgs.iter().find(|m| m.uid == uid1).unwrap();
+        imap_store.add_flags(msg1.id, &["\\Deleted"]).unwrap();
+
+        // Expunge
+        let expunged = imap_store.expunge(mbox.id).unwrap();
+        assert_eq!(expunged, vec![uid1]);
+
+        // Verify source only has uid2
+        let remaining = imap_store.get_messages(mbox.id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].uid, uid2);
+
+        // Verify destination has the moved message
+        let dst_mbox = imap_store.get_mailbox("Trash").unwrap().unwrap();
+        let dst_msgs = imap_store.get_messages(dst_mbox.id).unwrap();
+        assert_eq!(dst_msgs.len(), 1);
     }
 }
 
