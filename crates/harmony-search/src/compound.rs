@@ -36,6 +36,8 @@ impl CompoundIndex {
     ///
     /// If the key already exists in delta, the old entry is replaced.
     /// Dimensions are validated before any mutation to prevent partial state.
+    /// On failure during replacement, the old vector is restored (or the key
+    /// is unshadowed from `delta_keys` if restore also fails).
     pub fn add(&mut self, key: u64, vector: &[f32]) -> SearchResult<()> {
         // Validate dimensions before any mutation
         if vector.len() != self.config.dimensions {
@@ -45,11 +47,24 @@ impl CompoundIndex {
                 self.config.dimensions
             )));
         }
-        // Remove existing entry if present (safe — validation already passed)
         if self.delta_keys.contains(&key) {
+            // Save old vector before removing so we can restore on failure
+            let mut old_vector = vec![0.0f32; self.config.dimensions];
+            self.delta.get(key, &mut old_vector)?;
+
             self.delta.remove(key)?;
+
+            if let Err(e) = self.delta.add(key, vector) {
+                // Restore old vector; if that also fails, unshadow from delta_keys
+                // so at least the base entry (if any) isn't incorrectly filtered out.
+                if self.delta.add(key, &old_vector).is_err() {
+                    self.delta_keys.remove(&key);
+                }
+                return Err(e);
+            }
+        } else {
+            self.delta.add(key, vector)?;
         }
-        self.delta.add(key, vector)?;
         self.delta_keys.insert(key);
         Ok(())
     }
