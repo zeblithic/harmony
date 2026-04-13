@@ -4,7 +4,11 @@
 use harmony_semantic::EmbeddingTier;
 
 /// The scope of a search query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Ordered from narrowest to broadest: Personal < Community < NetworkWide.
+/// Scopes are hierarchical: a Community query includes Personal entries,
+/// and a NetworkWide query includes all entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SearchScope {
     /// Search only the local node's personal index.
     Personal,
@@ -12,6 +16,17 @@ pub enum SearchScope {
     Community,
     /// Search across the entire reachable network.
     NetworkWide,
+}
+
+impl SearchScope {
+    /// Index into `scope_counts` array (Personal=0, Community=1, NetworkWide=2).
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Personal => 0,
+            Self::Community => 1,
+            Self::NetworkWide => 2,
+        }
+    }
 }
 
 /// A search query submitted to the Oluo engine.
@@ -40,6 +55,27 @@ mod tests {
         assert_ne!(SearchScope::Personal, SearchScope::Community);
         assert_ne!(SearchScope::Community, SearchScope::NetworkWide);
         assert_ne!(SearchScope::Personal, SearchScope::NetworkWide);
+    }
+
+    #[test]
+    fn search_scope_ordering() {
+        assert!(SearchScope::Personal < SearchScope::Community);
+        assert!(SearchScope::Community < SearchScope::NetworkWide);
+        assert!(SearchScope::Personal < SearchScope::NetworkWide);
+
+        // Widening: max picks the broadest scope
+        assert_eq!(
+            SearchScope::Personal.max(SearchScope::Community),
+            SearchScope::Community
+        );
+        assert_eq!(
+            SearchScope::Community.max(SearchScope::NetworkWide),
+            SearchScope::NetworkWide
+        );
+        assert_eq!(
+            SearchScope::Personal.max(SearchScope::Personal),
+            SearchScope::Personal
+        );
     }
 
     #[test]

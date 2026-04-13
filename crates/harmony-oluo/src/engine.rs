@@ -26,6 +26,11 @@ pub enum OluoEvent {
         decision: IngestDecision,
         /// Current wall-clock time in milliseconds (caller-provided, sans-I/O).
         now_ms: u64,
+        /// The scope this entry should be indexed under (caller-provided).
+        scope: crate::scope::SearchScope,
+        /// CIDs of the sidecar records merged to produce this entry.
+        /// Empty means single sidecar, no overlay merge.
+        overlay_cids: Vec<[u8; 32]>,
     },
     /// Execute a search query.
     ///
@@ -75,6 +80,10 @@ struct EntryMetadata {
     /// When this entry was ingested (milliseconds since epoch).
     #[allow(dead_code)] // stored for future diagnostics and re-indexing
     ingested_at_ms: u64,
+    /// The scope this entry was indexed under.
+    scope: crate::scope::SearchScope,
+    /// CIDs of the sidecar records that were merged for this entry.
+    overlay_cids: Vec<[u8; 32]>,
 }
 
 /// The Oluo search engine state machine.
@@ -98,6 +107,9 @@ pub struct OluoEngine {
     /// Reverse lookup: CID -> index key. Ensures re-ingesting the same CID
     /// replaces the previous entry (deduplication).
     cid_to_key: hashbrown::HashMap<[u8; 32], u64>,
+    /// Per-scope entry counts: [Personal, Community, NetworkWide].
+    /// Used to estimate over-fetch ratio for scope-filtered searches.
+    scope_counts: [usize; 3],
 }
 
 /// Unpack a 256-bit tier3 binary vector to 256 f32 values (0.0 / 1.0).
@@ -139,6 +151,7 @@ impl OluoEngine {
             compact_generation: 0,
             has_compacted: false,
             cid_to_key: hashbrown::HashMap::new(),
+            scope_counts: [0; 3],
         }
     }
 
@@ -153,6 +166,7 @@ impl OluoEngine {
             compact_generation: 0,
             has_compacted: false,
             cid_to_key: hashbrown::HashMap::new(),
+            scope_counts: [0; 3],
         }
     }
 
@@ -164,7 +178,9 @@ impl OluoEngine {
                 metadata,
                 decision,
                 now_ms,
-            } => self.handle_ingest(header, metadata, decision, now_ms),
+                scope,
+                overlay_cids,
+            } => self.handle_ingest(header, metadata, decision, now_ms, scope, overlay_cids),
             OluoEvent::Search { query_id, query } => self.handle_search(query_id, query),
             OluoEvent::EvictExpired { now_ms } => self.handle_evict(now_ms),
             OluoEvent::CompactComplete { path, generation } => {
@@ -184,6 +200,8 @@ impl OluoEngine {
         metadata: SidecarMetadata,
         decision: IngestDecision,
         now_ms: u64,
+        scope: crate::scope::SearchScope,
+        overlay_cids: Vec<[u8; 32]>,
     ) -> Vec<OluoAction> {
         // Reject decision — do not index.
         if decision == IngestDecision::Reject {
@@ -205,13 +223,16 @@ impl OluoEngine {
 
         // CID deduplication: if this CID was previously ingested, reuse the key
         // and replace the old entry (mirrors HashMap::insert semantics).
-        let (key, old_metadata) = if let Some(&existing_key) = self.cid_to_key.get(&header.target_cid) {
+        // Scope widens to the broadest seen (never narrows).
+        let (key, old_metadata, effective_scope) = if let Some(&existing_key) = self.cid_to_key.get(&header.target_cid) {
             let old = self.metadata.remove(&existing_key);
-            (existing_key, old)
+            let old_scope = old.as_ref().map(|m| m.scope).unwrap_or(scope);
+            let widened = scope.max(old_scope);
+            (existing_key, old, widened)
         } else {
             let k = self.key_counter;
             self.key_counter += 1;
-            (k, None)
+            (k, None, scope)
         };
 
         let f32_vector = unpack_tier3(&header.tier3);
@@ -222,6 +243,10 @@ impl OluoEngine {
                 SearchError::RollbackFailed { .. } => {
                     // Index state is poisoned — the old vector is gone and could
                     // not be restored. Don't restore metadata; orphan the entry.
+                    // Decrement scope counter for the orphaned old entry.
+                    if let Some(ref old) = old_metadata {
+                        self.scope_counts[old.scope.index()] -= 1;
+                    }
                     self.cid_to_key.remove(&header.target_cid);
                 }
                 _ => {
@@ -238,6 +263,12 @@ impl OluoEngine {
             }];
         }
 
+        // Update scope counters: decrement old (if re-ingest), increment new.
+        if let Some(ref old) = old_metadata {
+            self.scope_counts[old.scope.index()] -= 1;
+        }
+        self.scope_counts[effective_scope.index()] += 1;
+
         self.cid_to_key.insert(header.target_cid, key);
         self.metadata.insert(
             key,
@@ -246,6 +277,8 @@ impl OluoEngine {
                 metadata,
                 expires_at,
                 ingested_at_ms: now_ms,
+                scope: effective_scope,
+                overlay_cids,
             },
         );
 
@@ -293,13 +326,31 @@ impl OluoEngine {
 
         let f32_vector = unpack_tier3(&query.embedding);
 
-        // Over-fetch to compensate for entries that may have been evicted
-        // from metadata but still live in the HNSW index.
+        // Over-fetch to compensate for evicted entries and scope filtering.
         let headroom = self.evicted_headroom();
         let capped_headroom = headroom
             .min(query.max_results as usize * 5)
             .min(1000);
-        let fetch_k = (query.max_results as usize).saturating_add(capped_headroom);
+
+        // Scope-aware over-fetch: estimate what fraction of entries match the query scope.
+        let total = self.metadata.len();
+        let in_scope_count = match query.scope {
+            crate::scope::SearchScope::Personal => self.scope_counts[0],
+            crate::scope::SearchScope::Community => self.scope_counts[0] + self.scope_counts[1],
+            crate::scope::SearchScope::NetworkWide => total,
+        };
+        let requested = query.max_results as usize;
+        let scope_fetch = if in_scope_count == 0 || in_scope_count >= total {
+            requested
+        } else {
+            // Scale up to compensate for out-of-scope entries we'll filter out.
+            // Ceiling division ensures we never under-fetch by rounding down.
+            (requested * total)
+                .div_ceil(in_scope_count)
+                .min(requested * 5)
+                .min(1000)
+        };
+        let fetch_k = scope_fetch.saturating_add(capped_headroom);
 
         let matches: Vec<SearchMatch> = match self.index.search(&f32_vector, fetch_k) {
             Ok(m) => m,
@@ -310,12 +361,13 @@ impl OluoEngine {
             }
         };
 
-        // TODO(ZEB-107): filter by query.scope once entries carry scope metadata.
-        // Currently all entries are treated as Personal — SidecarMetadata has no
-        // scope/community field, so there's nothing to filter against yet.
         let mut results: Vec<RawSearchResult> = Vec::new();
         for m in matches {
             if let Some(entry) = self.metadata.get(&m.key) {
+                // Hierarchical scope filter: entry.scope must be <= query.scope.
+                if entry.scope > query.scope {
+                    continue;
+                }
                 // USearch Hamming on f32 XORs raw bytes and counts bits.
                 // For 0.0/1.0 encoding: each differing dimension contributes
                 // popcount(0x3F800000 XOR 0x00000000) = 8 bits.
@@ -325,7 +377,7 @@ impl OluoEngine {
                     target_cid: entry.target_cid,
                     score,
                     metadata: entry.metadata.clone(),
-                    overlays: Vec::new(),
+                    overlays: entry.overlay_cids.clone(),
                 });
                 if results.len() >= query.max_results as usize {
                     break;
@@ -338,24 +390,30 @@ impl OluoEngine {
     }
 
     fn handle_evict(&mut self, now_ms: u64) -> Vec<OluoAction> {
-        // Collect expired keys. We cannot remove vectors from CompoundIndex
-        // easily (viewed base doesn't support remove), so we only remove
-        // from metadata. Search results will filter out keyless entries.
-        let expired: Vec<(u64, [u8; 32])> = self
+        let expired: Vec<(u64, [u8; 32], crate::scope::SearchScope)> = self
             .metadata
             .iter()
             .filter_map(|(&key, entry)| match entry.expires_at {
-                Some(expires) if expires <= now_ms => Some((key, entry.target_cid)),
+                Some(expires) if expires <= now_ms => Some((key, entry.target_cid, entry.scope)),
                 _ => None,
             })
             .collect();
 
-        for (key, cid) in expired {
+        let mut actions = Vec::new();
+        for (key, cid, scope) in expired {
             self.metadata.remove(&key);
             self.cid_to_key.remove(&cid);
+            self.scope_counts[scope.index()] -= 1;
+            // Remove from delta if present; base-resident vectors are
+            // cleaned up at compaction (evicted_headroom handles interim).
+            if let Err(e) = self.index.remove(key) {
+                actions.push(OluoAction::Error {
+                    message: format!("evict remove failed for key {key}: {e}"),
+                });
+            }
         }
 
-        Vec::new()
+        actions
     }
 
     fn handle_compact_complete(&mut self, path: &str, generation: u64) -> Vec<OluoAction> {
@@ -423,6 +481,8 @@ mod tests {
             metadata,
             decision,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         assert_eq!(engine.entry_count(), 1);
@@ -445,6 +505,8 @@ mod tests {
             metadata,
             decision,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         assert!(actions.is_empty());
@@ -467,6 +529,8 @@ mod tests {
             metadata,
             decision,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         assert!(actions.is_empty());
@@ -483,6 +547,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         let query = SearchQuery {
@@ -549,6 +615,8 @@ mod tests {
                 metadata: SidecarMetadata::default(),
                 decision: IngestDecision::IndexFull,
                 now_ms: 1_700_000_000_000,
+                scope: SearchScope::Personal,
+                overlay_cids: Vec::new(),
             });
         }
 
@@ -600,6 +668,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexLightweight { ttl_secs: 10 },
             now_ms: ingest_time,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         // Time has passed well beyond TTL, but no EvictExpired sent.
@@ -656,6 +726,8 @@ mod tests {
             metadata,
             decision,
             now_ms: ingest_time,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         assert_eq!(engine.entry_count(), 1);
 
@@ -684,6 +756,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         assert!(
             !actions
@@ -698,6 +772,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         assert!(
             actions
@@ -723,12 +799,16 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         let actions = engine.handle(OluoEvent::Ingest {
             header: test_header([0x20; 32], [0xBB; 32]),
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         // Extract the generation from the CompactRequest.
@@ -765,6 +845,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         assert_eq!(engine.entry_count(), 1);
 
@@ -773,6 +855,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
         // Should still be 1 entry — the old one was replaced.
         assert_eq!(engine.entry_count(), 1);
@@ -804,6 +888,8 @@ mod tests {
             metadata: SidecarMetadata::default(),
             decision: IngestDecision::IndexFull,
             now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
         });
 
         let query = SearchQuery {
@@ -823,6 +909,374 @@ mod tests {
                 assert!(results.is_empty(), "max_results=0 should return empty results");
             }
             _ => panic!("expected SearchResults action"),
+        }
+    }
+
+    #[test]
+    fn engine_scope_stored_on_ingest() {
+        let mut engine = OluoEngine::new();
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.scope_counts[SearchScope::Community.index()], 1);
+        assert_eq!(engine.scope_counts[SearchScope::Personal.index()], 0);
+    }
+
+    #[test]
+    fn engine_scope_widens_on_reingest() {
+        let mut engine = OluoEngine::new();
+        let cid = [0x42; 32];
+
+        // First ingest as Personal
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.scope_counts[SearchScope::Personal.index()], 1);
+
+        // Re-ingest same CID as Community — should widen
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0xBB; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.entry_count(), 1);
+        assert_eq!(engine.scope_counts[SearchScope::Personal.index()], 0);
+        assert_eq!(engine.scope_counts[SearchScope::Community.index()], 1);
+    }
+
+    #[test]
+    fn engine_scope_does_not_narrow_on_reingest() {
+        let mut engine = OluoEngine::new();
+        let cid = [0x42; 32];
+
+        // First ingest as Community
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        // Re-ingest same CID as Personal — should NOT narrow
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0xBB; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.entry_count(), 1);
+        assert_eq!(engine.scope_counts[SearchScope::Personal.index()], 0);
+        assert_eq!(engine.scope_counts[SearchScope::Community.index()], 1);
+    }
+
+    #[test]
+    fn engine_search_personal_skips_community() {
+        let mut engine = OluoEngine::new();
+
+        // Insert one Personal and one Community entry
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x02; 32], [0x01; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        // Personal query should only return the Personal entry
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 1, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].target_cid, [0x01; 32]);
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
+
+    #[test]
+    fn engine_search_community_includes_personal() {
+        let mut engine = OluoEngine::new();
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x02; 32], [0x01; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x03; 32], [0xFF; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::NetworkWide,
+            overlay_cids: Vec::new(),
+        });
+
+        // Community query should return Personal + Community, skip NetworkWide
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Community,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 2, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 2);
+                // Should not contain the NetworkWide entry
+                assert!(results.iter().all(|r| r.target_cid != [0x03; 32]));
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
+
+    #[test]
+    fn engine_search_network_wide_includes_all() {
+        let mut engine = OluoEngine::new();
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x02; 32], [0x01; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x03; 32], [0xFF; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::NetworkWide,
+            overlay_cids: Vec::new(),
+        });
+
+        // NetworkWide query should return all 3
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::NetworkWide,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 3, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 3);
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
+
+    #[test]
+    fn engine_evict_removes_delta_vector() {
+        let mut engine = OluoEngine::new();
+        let ingest_time: u64 = 1_700_000_000_000;
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexLightweight { ttl_secs: 60 },
+            now_ms: ingest_time,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.entry_count(), 1);
+        // Delta should have the vector
+        assert_eq!(engine.index.delta_len(), 1);
+
+        // Evict after TTL
+        engine.handle(OluoEvent::EvictExpired {
+            now_ms: ingest_time + 60_000,
+        });
+
+        assert_eq!(engine.entry_count(), 0);
+        // Delta vector should be removed too
+        assert_eq!(engine.index.delta_len(), 0);
+    }
+
+    #[test]
+    fn engine_evict_decrements_scope_counter() {
+        let mut engine = OluoEngine::new();
+        let ingest_time: u64 = 1_700_000_000_000;
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexLightweight { ttl_secs: 60 },
+            now_ms: ingest_time,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.scope_counts[SearchScope::Community.index()], 1);
+
+        engine.handle(OluoEvent::EvictExpired {
+            now_ms: ingest_time + 60_000,
+        });
+
+        assert_eq!(engine.scope_counts[SearchScope::Community.index()], 0);
+    }
+
+    #[test]
+    fn engine_overlay_cids_appear_in_search_results() {
+        let mut engine = OluoEngine::new();
+
+        let overlay1 = [0xA1; 32];
+        let overlay2 = [0xA2; 32];
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: vec![overlay1, overlay2],
+        });
+
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 1, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].overlays.len(), 2);
+                assert_eq!(results[0].overlays[0], overlay1);
+                assert_eq!(results[0].overlays[1], overlay2);
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
+
+    #[test]
+    fn engine_empty_overlay_cids_convention() {
+        let mut engine = OluoEngine::new();
+
+        // Single sidecar, no overlays
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 1, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert!(results[0].overlays.is_empty());
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
+
+    #[test]
+    fn engine_reingest_replaces_overlay_cids() {
+        let mut engine = OluoEngine::new();
+        let cid = [0x42; 32];
+
+        // First ingest with overlay A
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: vec![[0xA1; 32]],
+        });
+
+        // Re-ingest with overlay B — should replace, not accumulate
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: vec![[0xB1; 32], [0xB2; 32]],
+        });
+
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 1, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].overlays.len(), 2);
+                assert_eq!(results[0].overlays[0], [0xB1; 32]);
+                assert_eq!(results[0].overlays[1], [0xB2; 32]);
+            }
+            _ => panic!("expected SearchResults"),
         }
     }
 }
