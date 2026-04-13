@@ -1391,11 +1391,11 @@ fn resolve_sequence_set(
                 }
             }
         } else {
-            for seqnum in lo..=hi {
-                if seqnum >= 1 && seqnum <= max_seqnum {
-                    let msg = &messages[(seqnum - 1) as usize];
-                    result.push((msg.uid, seqnum));
-                }
+            let clamped_lo = lo.max(1).min(max_seqnum);
+            let clamped_hi = hi.max(1).min(max_seqnum);
+            for seqnum in clamped_lo..=clamped_hi {
+                let msg = &messages[(seqnum - 1) as usize];
+                result.push((msg.uid, seqnum));
             }
         }
     }
