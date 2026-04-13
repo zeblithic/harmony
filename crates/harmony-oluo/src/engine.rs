@@ -83,7 +83,6 @@ struct EntryMetadata {
     /// The scope this entry was indexed under.
     scope: crate::scope::SearchScope,
     /// CIDs of the sidecar records that were merged for this entry.
-    #[allow(dead_code)] // used for overlay provenance in a future task
     overlay_cids: Vec<[u8; 32]>,
 }
 
@@ -323,13 +322,28 @@ impl OluoEngine {
 
         let f32_vector = unpack_tier3(&query.embedding);
 
-        // Over-fetch to compensate for entries that may have been evicted
-        // from metadata but still live in the HNSW index.
+        // Over-fetch to compensate for evicted entries and scope filtering.
         let headroom = self.evicted_headroom();
         let capped_headroom = headroom
             .min(query.max_results as usize * 5)
             .min(1000);
-        let fetch_k = (query.max_results as usize).saturating_add(capped_headroom);
+
+        // Scope-aware over-fetch: estimate what fraction of entries match the query scope.
+        let total = self.metadata.len();
+        let in_scope_count = match query.scope {
+            crate::scope::SearchScope::Personal => self.scope_counts[0],
+            crate::scope::SearchScope::Community => self.scope_counts[0] + self.scope_counts[1],
+            crate::scope::SearchScope::NetworkWide => total,
+        };
+        let scope_fetch = if in_scope_count == 0 || in_scope_count >= total {
+            query.max_results as usize
+        } else {
+            // Scale up to compensate for out-of-scope entries we'll filter out.
+            ((query.max_results as usize) * total / in_scope_count)
+                .min(query.max_results as usize * 5)
+                .min(1000)
+        };
+        let fetch_k = scope_fetch.saturating_add(capped_headroom);
 
         let matches: Vec<SearchMatch> = match self.index.search(&f32_vector, fetch_k) {
             Ok(m) => m,
@@ -340,12 +354,13 @@ impl OluoEngine {
             }
         };
 
-        // TODO(ZEB-107): filter by query.scope once entries carry scope metadata.
-        // Currently all entries are treated as Personal — SidecarMetadata has no
-        // scope/community field, so there's nothing to filter against yet.
         let mut results: Vec<RawSearchResult> = Vec::new();
         for m in matches {
             if let Some(entry) = self.metadata.get(&m.key) {
+                // Hierarchical scope filter: entry.scope must be <= query.scope.
+                if entry.scope > query.scope {
+                    continue;
+                }
                 // USearch Hamming on f32 XORs raw bytes and counts bits.
                 // For 0.0/1.0 encoding: each differing dimension contributes
                 // popcount(0x3F800000 XOR 0x00000000) = 8 bits.
@@ -355,7 +370,7 @@ impl OluoEngine {
                     target_cid: entry.target_cid,
                     score,
                     metadata: entry.metadata.clone(),
-                    overlays: Vec::new(),
+                    overlays: entry.overlay_cids.clone(),
                 });
                 if results.len() >= query.max_results as usize {
                     break;
@@ -961,5 +976,136 @@ mod tests {
         assert_eq!(engine.entry_count(), 1);
         assert_eq!(engine.scope_counts[SearchScope::Personal.index()], 0);
         assert_eq!(engine.scope_counts[SearchScope::Community.index()], 1);
+    }
+
+    #[test]
+    fn engine_search_personal_skips_community() {
+        let mut engine = OluoEngine::new();
+
+        // Insert one Personal and one Community entry
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x02; 32], [0x01; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        // Personal query should only return the Personal entry
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 1, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].target_cid, [0x01; 32]);
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
+
+    #[test]
+    fn engine_search_community_includes_personal() {
+        let mut engine = OluoEngine::new();
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x02; 32], [0x01; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x03; 32], [0xFF; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::NetworkWide,
+            overlay_cids: Vec::new(),
+        });
+
+        // Community query should return Personal + Community, skip NetworkWide
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Community,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 2, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 2);
+                // Should not contain the NetworkWide entry
+                assert!(results.iter().all(|r| r.target_cid != [0x03; 32]));
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
+
+    #[test]
+    fn engine_search_network_wide_includes_all() {
+        let mut engine = OluoEngine::new();
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x02; 32], [0x01; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x03; 32], [0xFF; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::NetworkWide,
+            overlay_cids: Vec::new(),
+        });
+
+        // NetworkWide query should return all 3
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::NetworkWide,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 3, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 3);
+            }
+            _ => panic!("expected SearchResults"),
+        }
     }
 }
