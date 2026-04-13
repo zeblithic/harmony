@@ -1,6 +1,6 @@
 # Incremental O(log n) Prolly Tree Mutations — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Replace the O(n) full tree rebuild on every mutation with path-local incremental updates that walk the tree, mutate one leaf, rechunk forward until boundaries re-converge, and cascade new CIDs up to the root — giving O(log n) expected cost per mutation.
 
@@ -32,7 +32,7 @@
 - Create: `crates/harmony-db/src/prolly/mutate.rs`
 - Modify: `crates/harmony-db/src/prolly/mod.rs` (add `mod mutate;`)
 
-- [ ] **Step 1: Add `mod mutate;` to prolly/mod.rs**
+- **Step 1: Add `mod mutate;` to prolly/mod.rs**
 
 In `crates/harmony-db/src/prolly/mod.rs`, add the module declaration after the existing ones (line 3):
 
@@ -43,7 +43,7 @@ pub(crate) mod mutate;
 pub(crate) mod node;
 ```
 
-- [ ] **Step 2: Create mutate.rs with types and walk_to_leaf**
+- **Step 2: Create mutate.rs with types and walk_to_leaf**
 
 Create `crates/harmony-db/src/prolly/mutate.rs`:
 
@@ -119,7 +119,7 @@ fn walk_to_leaf(
 }
 ```
 
-- [ ] **Step 3: Write test for walk_to_leaf**
+- **Step 3: Write test for walk_to_leaf**
 
 Add at the bottom of `crates/harmony-db/src/prolly/mutate.rs`:
 
@@ -184,13 +184,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run the test**
+- **Step 4: Run the test**
 
 Run: `cargo test -p harmony-db walk_to_leaf_finds_correct_leaf -- --nocapture`
 
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add crates/harmony-db/src/prolly/mutate.rs crates/harmony-db/src/prolly/mod.rs
@@ -204,7 +204,7 @@ git commit -m "feat(harmony-db): add mutate.rs with TreePath and walk_to_leaf"
 **Files:**
 - Modify: `crates/harmony-db/src/prolly/mutate.rs`
 
-- [ ] **Step 1: Add load_leaf_entries helper and rechunk_leaf**
+- **Step 1: Add load_leaf_entries helper and rechunk_leaf**
 
 Add to `crates/harmony-db/src/prolly/mutate.rs`, after the `walk_to_leaf` function:
 
@@ -325,7 +325,7 @@ fn rechunk_leaf(
 }
 ```
 
-- [ ] **Step 2: Write test for rechunk_leaf**
+- **Step 2: Write test for rechunk_leaf**
 
 Add to the `tests` module in `mutate.rs`:
 
@@ -378,13 +378,13 @@ Add to the `tests` module in `mutate.rs`:
     }
 ```
 
-- [ ] **Step 3: Run the test**
+- **Step 3: Run the test**
 
 Run: `cargo test -p harmony-db rechunk_after_insert -- --nocapture`
 
 Expected: PASS
 
-- [ ] **Step 4: Commit**
+- **Step 4: Commit**
 
 ```bash
 git add crates/harmony-db/src/prolly/mutate.rs
@@ -398,7 +398,7 @@ git commit -m "feat(harmony-db): add rechunk_leaf with boundary convergence"
 **Files:**
 - Modify: `crates/harmony-db/src/prolly/mutate.rs`
 
-- [ ] **Step 1: Add cascade_up, finish_to_root, and incremental_insert**
+- **Step 1: Add cascade_up, finish_to_root, and incremental_insert**
 
 Add to `crates/harmony-db/src/prolly/mutate.rs`, after `rechunk_leaf`:
 
@@ -559,7 +559,7 @@ pub(crate) fn incremental_insert(
 }
 ```
 
-- [ ] **Step 2: Write equivalence test for incremental_insert**
+- **Step 2: Write equivalence test for incremental_insert**
 
 Add to the `tests` module in `mutate.rs`:
 
@@ -654,13 +654,13 @@ Add to the `tests` module in `mutate.rs`:
     }
 ```
 
-- [ ] **Step 3: Run the tests**
+- **Step 3: Run the tests**
 
 Run: `cargo test -p harmony-db incremental_insert -- --nocapture`
 
 Expected: all 3 tests PASS
 
-- [ ] **Step 4: Commit**
+- **Step 4: Commit**
 
 ```bash
 git add crates/harmony-db/src/prolly/mutate.rs
@@ -674,7 +674,7 @@ git commit -m "feat(harmony-db): add cascade_up and incremental_insert"
 **Files:**
 - Modify: `crates/harmony-db/src/prolly/mod.rs`
 
-- [ ] **Step 1: Update ProllyTree::insert to use incremental_insert**
+- **Step 1: Update ProllyTree::insert to use incremental_insert**
 
 In `crates/harmony-db/src/prolly/mod.rs`, replace the `insert` method (lines 82-97):
 
@@ -707,13 +707,13 @@ In `crates/harmony-db/src/prolly/mod.rs`, replace the `insert` method (lines 82-
 
 Also add `use mutate;` — but since `mod mutate` is already declared, it's accessible as `mutate::`. No extra import needed.
 
-- [ ] **Step 2: Run all existing tests**
+- **Step 2: Run all existing tests**
 
 Run: `cargo test -p harmony-db -- --nocapture`
 
 Expected: ALL tests pass (56 existing + new mutate tests). The critical test is `history_independence` — it inserts entries in forward and reverse order and expects identical root CIDs. Since incremental_insert produces the same tree as full rebuild, this must pass.
 
-- [ ] **Step 3: Commit**
+- **Step 3: Commit**
 
 ```bash
 git add crates/harmony-db/src/prolly/mod.rs
@@ -728,7 +728,7 @@ git commit -m "feat(harmony-db): wire incremental insert into ProllyTree"
 - Modify: `crates/harmony-db/src/prolly/mutate.rs`
 - Modify: `crates/harmony-db/src/prolly/mod.rs`
 
-- [ ] **Step 1: Add incremental_remove to mutate.rs**
+- **Step 1: Add incremental_remove to mutate.rs**
 
 Add to `crates/harmony-db/src/prolly/mutate.rs`, after `incremental_insert`:
 
@@ -772,7 +772,7 @@ pub(crate) fn incremental_remove(
 }
 ```
 
-- [ ] **Step 2: Write equivalence test for incremental_remove**
+- **Step 2: Write equivalence test for incremental_remove**
 
 Add to the `tests` module in `mutate.rs`:
 
@@ -844,13 +844,13 @@ Add to the `tests` module in `mutate.rs`:
     }
 ```
 
-- [ ] **Step 3: Run mutate tests**
+- **Step 3: Run mutate tests**
 
 Run: `cargo test -p harmony-db incremental_remove -- --nocapture`
 
 Expected: all 3 remove tests PASS
 
-- [ ] **Step 4: Wire remove into ProllyTree**
+- **Step 4: Wire remove into ProllyTree**
 
 In `crates/harmony-db/src/prolly/mod.rs`, replace the `remove` method (lines 99-119):
 
@@ -887,13 +887,13 @@ In `crates/harmony-db/src/prolly/mod.rs`, replace the `remove` method (lines 99-
     }
 ```
 
-- [ ] **Step 5: Run all tests**
+- **Step 5: Run all tests**
 
 Run: `cargo test -p harmony-db -- --nocapture`
 
 Expected: ALL tests pass
 
-- [ ] **Step 6: Commit**
+- **Step 6: Commit**
 
 ```bash
 git add crates/harmony-db/src/prolly/mutate.rs crates/harmony-db/src/prolly/mod.rs
@@ -908,7 +908,7 @@ git commit -m "feat(harmony-db): add incremental_remove and wire into ProllyTree
 - Modify: `crates/harmony-db/src/prolly/mutate.rs`
 - Modify: `crates/harmony-db/src/prolly/mod.rs`
 
-- [ ] **Step 1: Add incremental_update_meta to mutate.rs**
+- **Step 1: Add incremental_update_meta to mutate.rs**
 
 Add to `crates/harmony-db/src/prolly/mutate.rs`, after `incremental_remove`:
 
@@ -947,7 +947,7 @@ pub(crate) fn incremental_update_meta(
 }
 ```
 
-- [ ] **Step 2: Write equivalence test**
+- **Step 2: Write equivalence test**
 
 Add to the `tests` module in `mutate.rs`:
 
@@ -990,13 +990,13 @@ Add to the `tests` module in `mutate.rs`:
     }
 ```
 
-- [ ] **Step 3: Run the test**
+- **Step 3: Run the test**
 
 Run: `cargo test -p harmony-db incremental_update_meta -- --nocapture`
 
 Expected: PASS
 
-- [ ] **Step 4: Wire update_meta into ProllyTree**
+- **Step 4: Wire update_meta into ProllyTree**
 
 In `crates/harmony-db/src/prolly/mod.rs`, replace the `update_meta` method (lines 121-139):
 
@@ -1045,13 +1045,13 @@ In `crates/harmony-db/src/prolly/mod.rs`, replace the `update_meta` method (line
     }
 ```
 
-- [ ] **Step 5: Run all tests**
+- **Step 5: Run all tests**
 
 Run: `cargo test -p harmony-db -- --nocapture`
 
 Expected: ALL tests pass
 
-- [ ] **Step 6: Commit**
+- **Step 6: Commit**
 
 ```bash
 git add crates/harmony-db/src/prolly/mutate.rs crates/harmony-db/src/prolly/mod.rs
@@ -1066,7 +1066,7 @@ git commit -m "feat(harmony-db): add incremental_update_meta and wire into Proll
 - Modify: `crates/harmony-db/src/prolly/mutate.rs` (tests)
 - Modify: `crates/harmony-db/src/prolly/mod.rs` (make rebuild_tree test-only)
 
-- [ ] **Step 1: Add sequential insert equivalence test**
+- **Step 1: Add sequential insert equivalence test**
 
 Add to `tests` module in `mutate.rs`:
 
@@ -1163,7 +1163,7 @@ Add to `tests` module in `mutate.rs`:
     }
 ```
 
-- [ ] **Step 2: Add order independence test**
+- **Step 2: Add order independence test**
 
 Add to `tests` module in `mutate.rs`:
 
@@ -1211,7 +1211,7 @@ Add to `tests` module in `mutate.rs`:
     }
 ```
 
-- [ ] **Step 3: Add performance validation test**
+- **Step 3: Add performance validation test**
 
 Add to `tests` module in `mutate.rs`:
 
@@ -1276,7 +1276,7 @@ Add to `tests` module in `mutate.rs`:
     }
 ```
 
-- [ ] **Step 4: Make rebuild_tree test-only**
+- **Step 4: Make rebuild_tree test-only**
 
 In `crates/harmony-db/src/prolly/mod.rs`, add `#[cfg(test)]` to the `rebuild_tree` method:
 
@@ -1288,19 +1288,19 @@ In `crates/harmony-db/src/prolly/mod.rs`, add `#[cfg(test)]` to the `rebuild_tre
     }
 ```
 
-- [ ] **Step 5: Run the full test suite**
+- **Step 5: Run the full test suite**
 
 Run: `cargo test -p harmony-db -- --nocapture`
 
 Expected: ALL tests pass. Count should be 56 existing + ~12 new mutate tests = ~68 total.
 
-- [ ] **Step 6: Run the mail_workflow example**
+- **Step 6: Run the mail_workflow example**
 
 Run: `cargo run -p harmony-db --example mail_workflow`
 
 Expected: runs successfully with no errors
 
-- [ ] **Step 7: Commit**
+- **Step 7: Commit**
 
 ```bash
 git add crates/harmony-db/src/prolly/mutate.rs crates/harmony-db/src/prolly/mod.rs

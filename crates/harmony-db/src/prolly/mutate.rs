@@ -57,10 +57,17 @@ fn walk_to_leaf(
                 return Ok(TreePath { levels, leaf_entries: entries });
             }
             Node::Branch(entries) => {
-                let child_idx = entries
-                    .iter()
-                    .position(|e| e.boundary_key.as_slice() >= key)
-                    .unwrap_or(entries.len() - 1);
+                if entries.is_empty() {
+                    return Err(DbError::CorruptIndex(
+                        "empty branch node".into(),
+                    ));
+                }
+                let child_idx = match entries
+                    .binary_search_by(|e| e.boundary_key.as_slice().cmp(key))
+                {
+                    Ok(i) => i,
+                    Err(i) => i.min(entries.len() - 1),
+                };
                 cid = ContentId::from_bytes(entries[child_idx].child_cid);
                 levels.push(PathLevel { entries, child_idx });
             }
@@ -356,8 +363,9 @@ pub(crate) fn incremental_remove(
             leaf.remove(idx);
         }
         Err(_) => {
-            // Key not found in this leaf — tree unchanged.
-            return Ok(Some(root));
+            return Err(DbError::CorruptIndex(
+                "key not found in tree during incremental remove".into(),
+            ));
         }
     }
 
@@ -664,9 +672,9 @@ mod tests {
             .collect();
         let root = build_tree(&entries, &config, dir.path()).unwrap().unwrap();
 
-        // Try to remove a key that doesn't exist.
-        let result = incremental_remove(dir.path(), root, b"nonexistent", &config).unwrap();
-        assert_eq!(result, Some(root), "removing nonexistent key should return same root");
+        // Try to remove a key that doesn't exist — should error.
+        let result = incremental_remove(dir.path(), root, b"nonexistent", &config);
+        assert!(result.is_err(), "removing nonexistent key should return error");
     }
 
     #[test]
