@@ -5,8 +5,10 @@ mod db;
 mod error;
 mod persist;
 mod prolly;
+mod store;
 mod types;
 
 pub use db::HarmonyDb;
+pub use store::DiskBookStore;
 pub use error::DbError;
 pub use types::{Diff, Entry, EntryMeta, TableDiff};
