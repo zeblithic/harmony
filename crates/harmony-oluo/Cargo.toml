@@ -14,6 +14,8 @@ no-neon = ["harmony-crypto/no-neon"]
 harmony-semantic = { workspace = true }
 harmony-crypto = { workspace = true }
 harmony-search = { path = "../harmony-search" }
-hashbrown = { workspace = true }
+hashbrown = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+postcard = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]

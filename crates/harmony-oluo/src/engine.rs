@@ -70,15 +70,15 @@ pub enum OluoAction {
 }
 
 /// Metadata stored alongside each indexed vector.
-struct EntryMetadata {
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntryMetadata {
     /// CID of the content this entry references.
     target_cid: [u8; 32],
     /// Merged metadata.
-    metadata: SidecarMetadata,
+    pub metadata: SidecarMetadata,
     /// If Some, this is a lightweight entry with TTL (expires at this timestamp ms).
     expires_at: Option<u64>,
     /// When this entry was ingested (milliseconds since epoch).
-    #[allow(dead_code)] // stored for future diagnostics and re-indexing
     ingested_at_ms: u64,
     /// The scope this entry was indexed under.
     scope: crate::scope::SearchScope,
@@ -1278,5 +1278,31 @@ mod tests {
             }
             _ => panic!("expected SearchResults"),
         }
+    }
+
+    #[test]
+    fn entry_metadata_postcard_round_trip() {
+        let meta = EntryMetadata {
+            target_cid: [0xAA; 32],
+            metadata: SidecarMetadata::default(),
+            expires_at: Some(1_700_000_060_000),
+            ingested_at_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: vec![[0xBB; 32], [0xCC; 32]],
+        };
+
+        let mut map = hashbrown::HashMap::new();
+        map.insert(42u64, meta);
+
+        let bytes = postcard::to_allocvec(&map).expect("serialize");
+        let restored: hashbrown::HashMap<u64, EntryMetadata> =
+            postcard::from_bytes(&bytes).expect("deserialize");
+
+        let entry = restored.get(&42).expect("key 42 must exist");
+        assert_eq!(entry.target_cid, [0xAA; 32]);
+        assert_eq!(entry.scope, SearchScope::Community);
+        assert_eq!(entry.expires_at, Some(1_700_000_060_000));
+        assert_eq!(entry.overlay_cids.len(), 2);
+        assert_eq!(entry.metadata, SidecarMetadata::default());
     }
 }

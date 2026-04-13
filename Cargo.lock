@@ -3580,6 +3580,8 @@ dependencies = [
  "harmony-search",
  "harmony-semantic",
  "hashbrown 0.15.5",
+ "postcard",
+ "serde",
 ]
 
 [[package]]

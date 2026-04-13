@@ -8,7 +8,7 @@ use harmony_semantic::EmbeddingTier;
 /// Ordered from narrowest to broadest: Personal < Community < NetworkWide.
 /// Scopes are hierarchical: a Community query includes Personal entries,
 /// and a NetworkWide query includes all entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum SearchScope {
     /// Search only the local node's personal index.
     Personal,
