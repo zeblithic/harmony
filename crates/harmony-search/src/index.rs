@@ -364,7 +364,7 @@ impl VectorIndex {
 
     /// Unpack binary bytes to f32 bits, validating length.
     /// Uses MSB-first bit ordering to match harmony-semantic's
-    /// `quantize_to_binary()` and harmony-oluo's `get_bit()`.
+    /// `quantize_to_binary()`.
     fn unpack_bits(&self, bytes: &[u8]) -> SearchResult<Vec<f32>> {
         let expected_bytes = self.config.dimensions.div_ceil(8);
         if bytes.len() != expected_bytes {

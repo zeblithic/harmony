@@ -36,6 +36,9 @@ impl CompoundIndex {
     ///
     /// If the key already exists in delta, the old entry is replaced.
     /// Dimensions are validated before any mutation to prevent partial state.
+    /// On failure during replacement, the old vector is restored. If restore
+    /// also fails, returns [`SearchError::RollbackFailed`] — the caller must
+    /// not assume pre-call state was preserved.
     pub fn add(&mut self, key: u64, vector: &[f32]) -> SearchResult<()> {
         // Validate dimensions before any mutation
         if vector.len() != self.config.dimensions {
@@ -45,11 +48,28 @@ impl CompoundIndex {
                 self.config.dimensions
             )));
         }
-        // Remove existing entry if present (safe — validation already passed)
         if self.delta_keys.contains(&key) {
+            // Save old vector before removing so we can restore on failure
+            let mut old_vector = vec![0.0f32; self.config.dimensions];
+            self.delta.get(key, &mut old_vector)?;
+
             self.delta.remove(key)?;
+
+            if let Err(add_err) = self.delta.add(key, vector) {
+                // Try to restore the old vector
+                if let Err(restore_err) = self.delta.add(key, &old_vector) {
+                    // Both failed — delta_keys still claims the key but no vector
+                    // exists. Surface this explicitly so the caller can clean up.
+                    return Err(SearchError::RollbackFailed {
+                        add_error: add_err.to_string(),
+                        restore_error: restore_err.to_string(),
+                    });
+                }
+                return Err(add_err);
+            }
+        } else {
+            self.delta.add(key, vector)?;
         }
-        self.delta.add(key, vector)?;
         self.delta_keys.insert(key);
         Ok(())
     }
@@ -413,17 +433,21 @@ mod tests {
         assert!(results[0].distance < 0.01);
     }
 
+    /// Verifies that dimension validation rejects the update before any
+    /// mutation occurs — the old vector is never removed, so no rollback
+    /// is needed. The post-remove rollback path (restore old vector on
+    /// USearch add failure) cannot be exercised without mocking USearch.
     #[test]
-    fn failed_update_preserves_original() {
+    fn wrong_dimensions_rejected_before_mutation() {
         let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
 
         // Add key 1 with a valid vector
         idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
 
-        // Try to "update" with wrong dimensions — should fail
+        // Try to "update" with wrong dimensions — rejected at validation
         assert!(idx.add(1, &[1.0, 0.0]).is_err());
 
-        // Original should still be searchable
+        // Original should still be searchable (no mutation occurred)
         assert_eq!(idx.delta_len(), 1);
         let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(results[0].key, 1);
