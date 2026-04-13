@@ -14,8 +14,13 @@ no-neon = ["harmony-crypto/no-neon"]
 harmony-semantic = { workspace = true }
 harmony-crypto = { workspace = true }
 harmony-search = { path = "../harmony-search" }
+harmony-content = { workspace = true, features = ["std"] }
 hashbrown = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 postcard = { workspace = true, features = ["alloc"] }
+serde_json = { workspace = true, features = ["std"] }
+hex = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
+tempfile = "3"
