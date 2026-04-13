@@ -22,7 +22,7 @@ use crate::imap::{
 };
 use crate::imap_codec::{ImapCodec, ImapFrame};
 use crate::imap_parse;
-use crate::imap_store::ImapStore;
+use crate::imap_store::{self, ImapStore};
 use crate::io::{SmtpCodec, SmtpFrame};
 use crate::smtp::{SmtpAction, SmtpConfig, SmtpEvent, SmtpSession, SmtpState};
 use crate::smtp_parse::parse_command;
@@ -1345,6 +1345,64 @@ fn imap_quote_mailbox(name: &str) -> String {
     }
 }
 
+/// Resolve an IMAP SequenceSet to (uid, seqnum) pairs.
+///
+/// `messages` must be sorted by UID (ascending), as returned by `ImapStore::get_messages`.
+/// In `uid_mode`, set ranges refer to UIDs. Otherwise, they refer to 1-based sequence numbers.
+/// `u32::MAX` represents the wildcard `*` (highest UID or last sequence number).
+fn resolve_sequence_set(
+    set: &imap_parse::SequenceSet,
+    uid_mode: bool,
+    messages: &[imap_store::MessageRow],
+) -> Vec<(u32, u32)> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let max_uid = messages.last().map(|m| m.uid).unwrap_or(0);
+    let max_seqnum = messages.len() as u32;
+    let mut result = Vec::new();
+
+    for range in &set.ranges {
+        let (start, end) = if uid_mode {
+            let s = if range.start == u32::MAX { max_uid } else { range.start };
+            let e = match range.end {
+                None => s,
+                Some(u32::MAX) => max_uid,
+                Some(e) => e,
+            };
+            (s, e)
+        } else {
+            let s = if range.start == u32::MAX { max_seqnum } else { range.start };
+            let e = match range.end {
+                None => s,
+                Some(u32::MAX) => max_seqnum,
+                Some(e) => e,
+            };
+            (s, e)
+        };
+
+        let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+
+        if uid_mode {
+            for (idx, msg) in messages.iter().enumerate() {
+                if msg.uid >= lo && msg.uid <= hi {
+                    result.push((msg.uid, (idx + 1) as u32));
+                }
+            }
+        } else {
+            for seqnum in lo..=hi {
+                if seqnum >= 1 && seqnum <= max_seqnum {
+                    let msg = &messages[(seqnum - 1) as usize];
+                    result.push((msg.uid, seqnum));
+                }
+            }
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1545,5 +1603,109 @@ node_config = "/tmp/test-node.toml"
         assert_eq!(parse_message_size("1GB"), 1024 * 1024 * 1024);
         assert_eq!(parse_message_size("1000"), 1000);
         assert_eq!(parse_message_size("  25MB  "), 25 * 1024 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod sequence_set_tests {
+    use super::resolve_sequence_set;
+    use crate::imap_parse::{SequenceRange, SequenceSet};
+    use crate::imap_store::MessageRow;
+    use crate::message::MESSAGE_ID_LEN;
+
+    fn make_messages(uids: &[u32]) -> Vec<MessageRow> {
+        uids.iter()
+            .map(|&uid| MessageRow {
+                id: uid as i64,
+                mailbox_id: 1,
+                uid,
+                harmony_msg_id: [0u8; MESSAGE_ID_LEN],
+                message_cid: None,
+                internal_date: 1000,
+                rfc822_size: 100,
+            })
+            .collect()
+    }
+
+    fn seq(ranges: Vec<(u32, Option<u32>)>) -> SequenceSet {
+        SequenceSet {
+            ranges: ranges
+                .into_iter()
+                .map(|(start, end)| SequenceRange { start, end })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_uid_mode_single() {
+        let msgs = make_messages(&[1, 3, 5, 7]);
+        let result = resolve_sequence_set(&seq(vec![(3, None)]), true, &msgs);
+        assert_eq!(result, vec![(3, 2)]);
+    }
+
+    #[test]
+    fn resolve_uid_mode_range() {
+        let msgs = make_messages(&[1, 3, 5, 7]);
+        let result = resolve_sequence_set(&seq(vec![(3, Some(5))]), true, &msgs);
+        assert_eq!(result, vec![(3, 2), (5, 3)]);
+    }
+
+    #[test]
+    fn resolve_uid_mode_wildcard() {
+        let msgs = make_messages(&[1, 3, 5, 7]);
+        // 5:* should match UIDs 5 and 7
+        let result = resolve_sequence_set(&seq(vec![(5, Some(u32::MAX))]), true, &msgs);
+        assert_eq!(result, vec![(5, 3), (7, 4)]);
+    }
+
+    #[test]
+    fn resolve_seqnum_mode_single() {
+        let msgs = make_messages(&[10, 20, 30]);
+        // Sequence number 2 -> UID 20
+        let result = resolve_sequence_set(&seq(vec![(2, None)]), false, &msgs);
+        assert_eq!(result, vec![(20, 2)]);
+    }
+
+    #[test]
+    fn resolve_seqnum_mode_range() {
+        let msgs = make_messages(&[10, 20, 30]);
+        // Sequence numbers 1:2 -> UIDs 10, 20
+        let result = resolve_sequence_set(&seq(vec![(1, Some(2))]), false, &msgs);
+        assert_eq!(result, vec![(10, 1), (20, 2)]);
+    }
+
+    #[test]
+    fn resolve_seqnum_mode_wildcard() {
+        let msgs = make_messages(&[10, 20, 30]);
+        // 2:* -> seqnums 2, 3 -> UIDs 20, 30
+        let result = resolve_sequence_set(&seq(vec![(2, Some(u32::MAX))]), false, &msgs);
+        assert_eq!(result, vec![(20, 2), (30, 3)]);
+    }
+
+    #[test]
+    fn resolve_multi_range() {
+        let msgs = make_messages(&[1, 2, 3, 4, 5]);
+        // "1,3:4" in UID mode
+        let result = resolve_sequence_set(
+            &seq(vec![(1, None), (3, Some(4))]),
+            true,
+            &msgs,
+        );
+        assert_eq!(result, vec![(1, 1), (3, 3), (4, 4)]);
+    }
+
+    #[test]
+    fn resolve_empty_mailbox() {
+        let msgs: Vec<MessageRow> = vec![];
+        let result = resolve_sequence_set(&seq(vec![(1, Some(u32::MAX))]), true, &msgs);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_uid_not_found() {
+        let msgs = make_messages(&[1, 3, 5]);
+        // UID 2 doesn't exist — should be skipped
+        let result = resolve_sequence_set(&seq(vec![(2, None)]), true, &msgs);
+        assert!(result.is_empty());
     }
 }
