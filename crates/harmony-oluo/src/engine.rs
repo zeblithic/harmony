@@ -81,7 +81,6 @@ struct EntryMetadata {
     #[allow(dead_code)] // stored for future diagnostics and re-indexing
     ingested_at_ms: u64,
     /// The scope this entry was indexed under.
-    #[allow(dead_code)] // used for scope-filtered search in a future task
     scope: crate::scope::SearchScope,
     /// CIDs of the sidecar records that were merged for this entry.
     #[allow(dead_code)] // used for overlay provenance in a future task
@@ -111,7 +110,6 @@ pub struct OluoEngine {
     cid_to_key: hashbrown::HashMap<[u8; 32], u64>,
     /// Per-scope entry counts: [Personal, Community, NetworkWide].
     /// Used to estimate over-fetch ratio for scope-filtered searches.
-    #[allow(dead_code)] // wired in a future task
     scope_counts: [usize; 3],
 }
 
@@ -226,13 +224,16 @@ impl OluoEngine {
 
         // CID deduplication: if this CID was previously ingested, reuse the key
         // and replace the old entry (mirrors HashMap::insert semantics).
-        let (key, old_metadata) = if let Some(&existing_key) = self.cid_to_key.get(&header.target_cid) {
+        // Scope widens to the broadest seen (never narrows).
+        let (key, old_metadata, effective_scope) = if let Some(&existing_key) = self.cid_to_key.get(&header.target_cid) {
             let old = self.metadata.remove(&existing_key);
-            (existing_key, old)
+            let old_scope = old.as_ref().map(|m| m.scope).unwrap_or(scope);
+            let widened = scope.max(old_scope);
+            (existing_key, old, widened)
         } else {
             let k = self.key_counter;
             self.key_counter += 1;
-            (k, None)
+            (k, None, scope)
         };
 
         let f32_vector = unpack_tier3(&header.tier3);
@@ -259,6 +260,12 @@ impl OluoEngine {
             }];
         }
 
+        // Update scope counters: decrement old (if re-ingest), increment new.
+        if let Some(ref old) = old_metadata {
+            self.scope_counts[old.scope.index()] -= 1;
+        }
+        self.scope_counts[effective_scope.index()] += 1;
+
         self.cid_to_key.insert(header.target_cid, key);
         self.metadata.insert(
             key,
@@ -267,7 +274,7 @@ impl OluoEngine {
                 metadata,
                 expires_at,
                 ingested_at_ms: now_ms,
-                scope,
+                scope: effective_scope,
                 overlay_cids,
             },
         );
@@ -875,5 +882,84 @@ mod tests {
             }
             _ => panic!("expected SearchResults action"),
         }
+    }
+
+    #[test]
+    fn engine_scope_stored_on_ingest() {
+        let mut engine = OluoEngine::new();
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.scope_counts[SearchScope::Community.index()], 1);
+        assert_eq!(engine.scope_counts[SearchScope::Personal.index()], 0);
+    }
+
+    #[test]
+    fn engine_scope_widens_on_reingest() {
+        let mut engine = OluoEngine::new();
+        let cid = [0x42; 32];
+
+        // First ingest as Personal
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.scope_counts[SearchScope::Personal.index()], 1);
+
+        // Re-ingest same CID as Community — should widen
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0xBB; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.entry_count(), 1);
+        assert_eq!(engine.scope_counts[SearchScope::Personal.index()], 0);
+        assert_eq!(engine.scope_counts[SearchScope::Community.index()], 1);
+    }
+
+    #[test]
+    fn engine_scope_does_not_narrow_on_reingest() {
+        let mut engine = OluoEngine::new();
+        let cid = [0x42; 32];
+
+        // First ingest as Community
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0xAA; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Community,
+            overlay_cids: Vec::new(),
+        });
+
+        // Re-ingest same CID as Personal — should NOT narrow
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0xBB; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        assert_eq!(engine.entry_count(), 1);
+        assert_eq!(engine.scope_counts[SearchScope::Personal.index()], 0);
+        assert_eq!(engine.scope_counts[SearchScope::Community.index()], 1);
     }
 }
