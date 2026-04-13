@@ -129,13 +129,11 @@ async fn main() {
                 };
 
                 // Prompt for password
-                eprint!("Password: ");
-                let password = rpassword::read_password().unwrap_or_else(|e| {
+                let password = rpassword::prompt_password_stderr("Password: ").unwrap_or_else(|e| {
                     eprintln!("Error reading password: {e}");
                     std::process::exit(1);
                 });
-                eprint!("Confirm password: ");
-                let confirm = rpassword::read_password().unwrap_or_else(|e| {
+                let confirm = rpassword::prompt_password_stderr("Confirm password: ").unwrap_or_else(|e| {
                     eprintln!("Error reading password: {e}");
                     std::process::exit(1);
                 });

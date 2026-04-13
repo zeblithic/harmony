@@ -302,6 +302,12 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let imap_idle_timeout = Duration::from_secs(config.imap.idle_timeout);
         let imap_max_auth_failures = config.imap.max_auth_failures;
         let content_store_path = PathBuf::from(&config.imap.content_store_path);
+        if !content_store_path.is_dir() {
+            tracing::warn!(
+                path = %content_store_path.display(),
+                "IMAP content store path is not a directory — FETCH will skip all messages"
+            );
+        }
 
         // Port 993: IMAP implicit TLS
         if let Some(ref acceptor) = tls_acceptor {
