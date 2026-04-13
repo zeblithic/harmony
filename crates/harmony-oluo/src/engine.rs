@@ -1160,4 +1160,111 @@ mod tests {
 
         assert_eq!(engine.scope_counts[SearchScope::Community.index()], 0);
     }
+
+    #[test]
+    fn engine_overlay_cids_appear_in_search_results() {
+        let mut engine = OluoEngine::new();
+
+        let overlay1 = [0xA1; 32];
+        let overlay2 = [0xA2; 32];
+
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: vec![overlay1, overlay2],
+        });
+
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 1, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].overlays.len(), 2);
+                assert_eq!(results[0].overlays[0], overlay1);
+                assert_eq!(results[0].overlays[1], overlay2);
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
+
+    #[test]
+    fn engine_empty_overlay_cids_convention() {
+        let mut engine = OluoEngine::new();
+
+        // Single sidecar, no overlays
+        engine.handle(OluoEvent::Ingest {
+            header: test_header([0x01; 32], [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: Vec::new(),
+        });
+
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 1, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert!(results[0].overlays.is_empty());
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
+
+    #[test]
+    fn engine_reingest_replaces_overlay_cids() {
+        let mut engine = OluoEngine::new();
+        let cid = [0x42; 32];
+
+        // First ingest with overlay A
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_000,
+            scope: SearchScope::Personal,
+            overlay_cids: vec![[0xA1; 32]],
+        });
+
+        // Re-ingest with overlay B — should replace, not accumulate
+        engine.handle(OluoEvent::Ingest {
+            header: test_header(cid, [0x00; 32]),
+            metadata: SidecarMetadata::default(),
+            decision: IngestDecision::IndexFull,
+            now_ms: 1_700_000_000_001,
+            scope: SearchScope::Personal,
+            overlay_cids: vec![[0xB1; 32], [0xB2; 32]],
+        });
+
+        let query = SearchQuery {
+            embedding: [0x00; 32],
+            tier: EmbeddingTier::T3,
+            scope: SearchScope::Personal,
+            max_results: 10,
+        };
+        let actions = engine.handle(OluoEvent::Search { query_id: 1, query });
+        match &actions[0] {
+            OluoAction::SearchResults { results, .. } => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].overlays.len(), 2);
+                assert_eq!(results[0].overlays[0], [0xB1; 32]);
+                assert_eq!(results[0].overlays[1], [0xB2; 32]);
+            }
+            _ => panic!("expected SearchResults"),
+        }
+    }
 }
