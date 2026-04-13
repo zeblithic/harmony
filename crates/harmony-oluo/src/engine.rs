@@ -198,23 +198,23 @@ impl OluoEngine {
 
         // CID deduplication: if this CID was previously ingested, reuse the key
         // and replace the old entry (mirrors HashMap::insert semantics).
-        let key = if let Some(&existing_key) = self.cid_to_key.get(&header.target_cid) {
-            // Remove old metadata (the index key is reused via CompoundIndex::add
-            // which handles duplicate keys internally).
-            self.metadata.remove(&existing_key);
-            existing_key
+        let (key, old_metadata) = if let Some(&existing_key) = self.cid_to_key.get(&header.target_cid) {
+            let old = self.metadata.remove(&existing_key);
+            (existing_key, old)
         } else {
             let k = self.key_counter;
             self.key_counter += 1;
-            k
+            (k, None)
         };
 
         let f32_vector = unpack_tier3(&header.tier3);
 
-        // Add to HNSW index — on failure, emit an error action.
+        // Add to HNSW index — on failure, roll back and emit error.
         if let Err(e) = self.index.add(key, &f32_vector) {
-            // Roll back key counter if we allocated a new one.
-            if !self.cid_to_key.contains_key(&header.target_cid) {
+            // Restore previous state
+            if let Some(old) = old_metadata {
+                self.metadata.insert(key, old);
+            } else {
                 self.key_counter -= 1;
             }
             return vec![OluoAction::Error {
@@ -237,9 +237,9 @@ impl OluoEngine {
 
         // Check if compaction is needed.
         if self.index.should_compact() {
-            self.compact_generation += 1;
             match self.index.compact() {
                 Ok(bytes) => {
+                    self.compact_generation += 1;
                     actions.push(OluoAction::CompactRequest {
                         bytes,
                         generation: self.compact_generation,
@@ -296,7 +296,11 @@ impl OluoEngine {
         let mut results: Vec<RawSearchResult> = Vec::new();
         for m in matches {
             if let Some(entry) = self.metadata.get(&m.key) {
-                let score = m.distance / 256.0;
+                // USearch Hamming on f32 XORs raw bytes and counts bits.
+                // For 0.0/1.0 encoding: each differing dimension contributes
+                // popcount(0x3F800000 XOR 0x00000000) = 8 bits.
+                // Max distance = 256 dimensions * 8 bits = 2048.
+                let score = m.distance / 2048.0;
                 results.push(RawSearchResult {
                     target_cid: entry.target_cid,
                     score,
