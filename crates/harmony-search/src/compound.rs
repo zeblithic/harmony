@@ -433,17 +433,21 @@ mod tests {
         assert!(results[0].distance < 0.01);
     }
 
+    /// Verifies that dimension validation rejects the update before any
+    /// mutation occurs — the old vector is never removed, so no rollback
+    /// is needed. The post-remove rollback path (restore old vector on
+    /// USearch add failure) cannot be exercised without mocking USearch.
     #[test]
-    fn failed_update_preserves_original() {
+    fn wrong_dimensions_rejected_before_mutation() {
         let mut idx = CompoundIndex::new(test_config(), 100).unwrap();
 
         // Add key 1 with a valid vector
         idx.add(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
 
-        // Try to "update" with wrong dimensions — should fail
+        // Try to "update" with wrong dimensions — rejected at validation
         assert!(idx.add(1, &[1.0, 0.0]).is_err());
 
-        // Original should still be searchable
+        // Original should still be searchable (no mutation occurred)
         assert_eq!(idx.delta_len(), 1);
         let results = idx.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(results[0].key, 1);

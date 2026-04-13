@@ -92,6 +92,9 @@ pub struct OluoEngine {
     /// Monotonic generation counter for compaction. Incremented each time
     /// a `CompactRequest` is emitted; used to reject stale `CompactComplete`.
     compact_generation: u64,
+    /// Whether at least one `CompactRequest` has been emitted. Guards against
+    /// spurious `CompactComplete { generation: 0 }` before any compaction.
+    has_compacted: bool,
     /// Reverse lookup: CID -> index key. Ensures re-ingesting the same CID
     /// replaces the previous entry (deduplication).
     cid_to_key: hashbrown::HashMap<[u8; 32], u64>,
@@ -134,6 +137,7 @@ impl OluoEngine {
             metadata: hashbrown::HashMap::new(),
             key_counter: 0,
             compact_generation: 0,
+            has_compacted: false,
             cid_to_key: hashbrown::HashMap::new(),
         }
     }
@@ -147,6 +151,7 @@ impl OluoEngine {
             metadata: hashbrown::HashMap::new(),
             key_counter: 0,
             compact_generation: 0,
+            has_compacted: false,
             cid_to_key: hashbrown::HashMap::new(),
         }
     }
@@ -251,6 +256,7 @@ impl OluoEngine {
             match self.index.compact() {
                 Ok(bytes) => {
                     self.compact_generation += 1;
+                    self.has_compacted = true;
                     actions.push(OluoAction::CompactRequest {
                         bytes,
                         generation: self.compact_generation,
@@ -350,11 +356,9 @@ impl OluoEngine {
     }
 
     fn handle_compact_complete(&mut self, path: &str, generation: u64) -> Vec<OluoAction> {
-        // Reject stale CompactComplete: only accept if the generation matches
-        // the current compact_generation. A newer compaction has been issued
-        // since this one was started; loading the old base would overwrite
-        // a newer in-memory base.
-        if generation != self.compact_generation {
+        // Reject if no compaction has ever been issued, or if the generation
+        // doesn't match the most recent CompactRequest.
+        if !self.has_compacted || generation != self.compact_generation {
             return Vec::new();
         }
         if let Err(e) = self.index.load_base(path) {
