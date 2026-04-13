@@ -1,76 +1,64 @@
 use crate::error::DbError;
-use crate::table::Table;
-use crate::types::Entry;
 use harmony_content::{ContentFlags, ContentId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
-const INDEX_VERSION: u32 = 1;
+const ROOTS_VERSION: u32 = 2;
 const MAX_SNIPPET_BYTES: usize = 256;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct IndexFile {
+pub(crate) struct RootsFile {
     pub version: u32,
     #[serde(
         serialize_with = "crate::types::ser_opt_cid",
         deserialize_with = "crate::types::de_opt_cid"
     )]
     pub head: Option<ContentId>,
-    pub tables: HashMap<String, TableFile>,
+    pub table_roots: BTreeMap<String, String>, // name → root CID hex
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct TableFile {
-    pub entries: Vec<Entry>,
-}
-
-pub(crate) fn load_index(data_dir: &Path) -> (Option<ContentId>, HashMap<String, Table>) {
+pub(crate) fn load_roots(
+    data_dir: &Path,
+) -> (Option<ContentId>, BTreeMap<String, ContentId>) {
     let path = data_dir.join("index.json");
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
-        Err(_) => return (None, HashMap::new()),
+        Err(_) => return (None, BTreeMap::new()),
     };
-    let idx: IndexFile = match serde_json::from_slice::<IndexFile>(&bytes) {
-        Ok(i) if i.version == INDEX_VERSION => i,
-        _ => return (None, HashMap::new()),
+    let rf: RootsFile = match serde_json::from_slice::<RootsFile>(&bytes) {
+        Ok(r) if r.version == ROOTS_VERSION => r,
+        _ => return (None, BTreeMap::new()),
     };
-    let tables = idx
-        .tables
+    let table_roots = rf
+        .table_roots
         .into_iter()
-        .map(|(name, tf)| {
-            let mut table = Table::new();
-            for entry in tf.entries {
-                table.upsert(entry);
-            }
-            (name, table)
+        .filter_map(|(name, hex_str)| {
+            let bytes: [u8; 32] = hex::decode(&hex_str).ok()?.try_into().ok()?;
+            Some((name, ContentId::from_bytes(bytes)))
         })
         .collect();
-    (idx.head, tables)
+    (rf.head, table_roots)
 }
 
-pub(crate) fn save_index(
+pub(crate) fn save_roots(
     data_dir: &Path,
     head: Option<ContentId>,
-    tables: &HashMap<String, Table>,
+    table_roots: &BTreeMap<String, Option<ContentId>>,
 ) -> Result<(), DbError> {
-    let idx = IndexFile {
-        version: INDEX_VERSION,
+    let filtered: BTreeMap<String, String> = table_roots
+        .iter()
+        .filter_map(|(name, opt_cid)| {
+            opt_cid.map(|cid| (name.clone(), hex::encode(cid.to_bytes())))
+        })
+        .collect();
+    let rf = RootsFile {
+        version: ROOTS_VERSION,
         head,
-        tables: tables
-            .iter()
-            .map(|(name, table)| {
-                (
-                    name.clone(),
-                    TableFile {
-                        entries: table.entries().to_vec(),
-                    },
-                )
-            })
-            .collect(),
+        table_roots: filtered,
     };
     let bytes =
-        serde_json::to_vec_pretty(&idx).map_err(|e| DbError::Serialize(e.to_string()))?;
+        serde_json::to_vec_pretty(&rf).map_err(|e| DbError::Serialize(e.to_string()))?;
     atomic_write(&data_dir.join("index.json"), &bytes)
 }
 
@@ -146,7 +134,6 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::EntryMeta;
 
     #[test]
     fn write_and_read_blob() {
@@ -176,47 +163,34 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_index_round_trip() {
+    fn save_and_load_roots_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         ensure_dirs(dir.path()).unwrap();
-        let mut tables = HashMap::new();
-        let mut t = Table::new();
         let cid = ContentId::for_book(b"val", ContentFlags::default()).unwrap();
-        t.upsert(Entry {
-            key: b"mykey".to_vec(),
-            value_cid: cid,
-            timestamp: 42,
-            metadata: EntryMeta {
-                flags: 1,
-                snippet: "test".into(),
-            },
-        });
-        tables.insert("inbox".to_string(), t);
-        save_index(dir.path(), None, &tables).unwrap();
-        let (head, loaded) = load_index(dir.path());
+        let mut table_roots = BTreeMap::new();
+        table_roots.insert("inbox".to_string(), Some(cid));
+        save_roots(dir.path(), None, &table_roots).unwrap();
+        let (head, loaded) = load_roots(dir.path());
         assert!(head.is_none());
-        assert_eq!(loaded["inbox"].len(), 1);
-        assert_eq!(
-            loaded["inbox"].get_entry(b"mykey").unwrap().metadata.snippet,
-            "test"
-        );
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["inbox"], cid);
     }
 
     #[test]
-    fn load_missing_index_returns_empty() {
+    fn load_missing_roots_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let (head, tables) = load_index(dir.path());
+        let (head, table_roots) = load_roots(dir.path());
         assert!(head.is_none());
-        assert!(tables.is_empty());
+        assert!(table_roots.is_empty());
     }
 
     #[test]
-    fn load_corrupt_index_returns_empty() {
+    fn load_corrupt_roots_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.json"), b"not json{{{").unwrap();
-        let (head, tables) = load_index(dir.path());
+        let (head, table_roots) = load_roots(dir.path());
         assert!(head.is_none());
-        assert!(tables.is_empty());
+        assert!(table_roots.is_empty());
     }
 
     #[test]
