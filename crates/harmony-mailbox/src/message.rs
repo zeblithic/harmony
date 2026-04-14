@@ -76,9 +76,25 @@ pub fn unique_message_id() -> [u8; MESSAGE_ID_LEN] {
         .as_nanos();
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
 
+    compute_message_id(salt, now, seq)
+}
+
+/// Pure, testable core of `unique_message_id`: hash a `(salt, time, seq)`
+/// triple into 16 bytes. Split out so tests can pin all three inputs and
+/// prove that the salt is actually fed into the hash (i.e. swapping the
+/// salt while keeping time+seq constant changes the output).
+///
+/// `pub(crate)` (not `pub`) because callers outside the crate should use
+/// `unique_message_id()` and get the real entropy sources; the helper is
+/// an internal seam for verification only.
+pub(crate) fn compute_message_id(
+    salt: &[u8; 16],
+    time_nanos: u128,
+    seq: u64,
+) -> [u8; MESSAGE_ID_LEN] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(salt);
-    hasher.update(&now.to_le_bytes());
+    hasher.update(&time_nanos.to_le_bytes());
     hasher.update(&seq.to_le_bytes());
     let hash = hasher.finalize();
     let mut id = [0u8; MESSAGE_ID_LEN];
@@ -1021,24 +1037,42 @@ mod tests {
     }
 
     #[test]
-    fn unique_message_id_uses_startup_salt() {
-        // The salt is process-global, so all IDs in this process share the
-        // same entropy source. We cannot directly observe the salt, but we
-        // can confirm the outputs look well-distributed (no obvious
-        // structure from time/counter alone).
-        let id1 = unique_message_id();
-        let id2 = unique_message_id();
-        // Trivial sanity checks that would fail if salt injection broke
-        // the hash (e.g., if we accidentally returned raw counter bytes):
-        assert_ne!(id1, [0u8; MESSAGE_ID_LEN]);
-        assert_ne!(id2, [0u8; MESSAGE_ID_LEN]);
-        assert_ne!(id1, id2);
-        // At least one byte differs beyond the first few (if the output
-        // were just a counter, most bytes would be zero).
-        let nonzero = id1.iter().filter(|b| **b != 0).count();
-        assert!(
-            nonzero >= 8,
-            "ID looks suspiciously structured: {nonzero} non-zero bytes of 16"
+    fn compute_message_id_actually_mixes_salt() {
+        // Pin (time, seq) and vary only the salt: if hasher.update(salt)
+        // were removed, these outputs would be identical. This is the
+        // direct proof that the salt is load-bearing — replaces the
+        // previous test that only checked for non-zero bytes (which
+        // would have passed even with the salt ignored).
+        let salt_a = [0xAAu8; 16];
+        let salt_b = [0xBBu8; 16];
+        let time = 1_234_567_890u128;
+        let seq = 42u64;
+
+        let id_a = compute_message_id(&salt_a, time, seq);
+        let id_b = compute_message_id(&salt_b, time, seq);
+
+        assert_ne!(
+            id_a, id_b,
+            "salt must change the hash output — if this fails, salt is being ignored"
         );
+    }
+
+    #[test]
+    fn compute_message_id_is_deterministic() {
+        // Same inputs → same output. Regression guard against accidentally
+        // mixing in any non-argument state (e.g., a stray timestamp read).
+        let salt = [0xCCu8; 16];
+        let a = compute_message_id(&salt, 100, 1);
+        let b = compute_message_id(&salt, 100, 1);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compute_message_id_distinguishes_counter_values() {
+        // Pin (salt, time), vary seq: confirms the counter is fed in.
+        let salt = [0xDDu8; 16];
+        let a = compute_message_id(&salt, 100, 1);
+        let b = compute_message_id(&salt, 100, 2);
+        assert_ne!(a, b);
     }
 }

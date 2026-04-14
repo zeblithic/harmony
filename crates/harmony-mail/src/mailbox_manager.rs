@@ -137,12 +137,41 @@ impl ZenohPublisher {
                 };
                 for (addr_hex, root_cid) in snapshot {
                     let topic = format!("harmony/mail/v1/{addr_hex}/root");
-                    if let Err(e) = drain_session.put(&topic, &root_cid[..]).await {
-                        tracing::warn!(
-                            error = %e,
-                            %topic,
-                            "Zenoh root CID publish failed"
-                        );
+                    // Wrap the put in a timeout + cancel race so a stalled
+                    // Zenoh link cannot block the drain task indefinitely —
+                    // without this, shutdown hangs on the root-publish path
+                    // until the runtime forcibly tears the task down.
+                    tokio::select! {
+                        res = tokio::time::timeout(
+                            RAW_PUBLISH_TIMEOUT,
+                            drain_session.put(&topic, &root_cid[..]),
+                        ) => match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    %topic,
+                                    "Zenoh root CID publish failed"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    %topic,
+                                    timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                                    "Zenoh root CID publish timed out — aborted"
+                                );
+                            }
+                        },
+                        _ = drain_cancel.cancelled() => {
+                            // Cancellation observed mid-snapshot. Stop draining
+                            // the rest of the snapshot and fall through to
+                            // drop(session) for a clean disconnect. Any unsent
+                            // entries will arrive on the next session after
+                            // restart — root updates are idempotent, so the
+                            // client sees the latest CID eventually.
+                            cancelled = true;
+                            break;
+                        }
                     }
                 }
                 if cancelled {
@@ -213,15 +242,23 @@ impl ZenohPublisher {
     ///   to many recipients without per-recipient payload copies —
     ///   `Arc::clone` is a refcount bump, and the spawned task dereferences
     ///   to `&[u8]` for `session.put`.
-    /// - Concurrent in-flight publishes are capped by `RAW_PUBLISH_CONCURRENCY`
-    ///   permits; excess spawns block on the semaphore rather than piling
-    ///   up unbounded Zenoh calls if the session stalls.
+    /// - Permits are acquired **synchronously at the call site** via
+    ///   `try_acquire_owned`. If all `RAW_PUBLISH_CONCURRENCY` permits are
+    ///   held, the publish is dropped (logged) rather than queued — this
+    ///   bounds both concurrent `session.put` calls AND the number of
+    ///   pending tokio tasks. Without call-site acquire, nothing would cap
+    ///   how many task frames can pile up waiting for a permit.
     /// - Each publish has a `RAW_PUBLISH_TIMEOUT` hard cap and observes the
     ///   shared cancellation token, so stalled puts are aborted instead of
     ///   holding a permit forever.
     ///
-    /// Short-circuits when the cancel token has already fired before we even
-    /// spawn — prevents post-shutdown spawns from keeping the runtime alive.
+    /// Raw publishes are a best-effort real-time notification. IMAP delivery
+    /// and the Merkle root publish remain the durable paths — a dropped
+    /// raw publish just means the client catches up on its next poll or
+    /// root refresh.
+    ///
+    /// Short-circuits when the cancel token has already fired — prevents
+    /// post-shutdown spawns from keeping the runtime alive.
     pub fn publish_raw_mail(&self, addr_hex: String, bytes: Arc<Vec<u8>>) {
         match &self.raw_sink {
             RawSink::Session {
@@ -232,22 +269,31 @@ impl ZenohPublisher {
                 if cancel.is_cancelled() {
                     return;
                 }
+                // Acquire at the CALL SITE, not inside the spawn. Dropping
+                // on backpressure prevents unbounded task accumulation
+                // during a Zenoh stall — if we spawned first and acquired
+                // second, every waiting spawn would hold its Arc<Vec<u8>>
+                // refcount and task frame open for minutes.
+                let permit = match Arc::clone(permits).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        tracing::warn!(
+                            addr = %addr_hex,
+                            "raw-mail publish dropped: in-flight limit ({}) reached — best-effort path, client will catch up via IMAP/root",
+                            RAW_PUBLISH_CONCURRENCY,
+                        );
+                        return;
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => return,
+                };
                 let session = session.clone();
                 let cancel = cancel.clone();
-                let permits = Arc::clone(permits);
                 let topic = format!("harmony/mail/v1/{addr_hex}");
                 tokio::spawn(async move {
-                    // Backpressure: wait for a permit OR cancellation. If
-                    // the semaphore is closed or cancelled, just exit.
-                    let _permit = tokio::select! {
-                        permit = permits.acquire_owned() => match permit {
-                            Ok(p) => p,
-                            Err(_) => return, // semaphore closed
-                        },
-                        _ = cancel.cancelled() => return,
-                    };
-                    // Timeout-bounded, cancel-aware put. Whichever arm fires
-                    // first, the permit drops on return and is released.
+                    // Move the already-acquired permit into the task so it
+                    // releases on completion/timeout/cancel. Timeout-bounded,
+                    // cancel-aware put.
+                    let _permit = permit;
                     tokio::select! {
                         res = tokio::time::timeout(
                             RAW_PUBLISH_TIMEOUT,
