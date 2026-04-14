@@ -1058,11 +1058,13 @@ async fn handle_imap_connection_starttls(
             let tls_actions = session.handle(ImapEvent::TlsCompleted);
             let mut tls_writer = tls_writer;
             execute_imap_actions(&tls_actions, &mut tls_writer).await?;
-            // Continue the session over TLS
+            // Continue the session over TLS — mark TLS as active so LOGIN is permitted
+            let mut tls_config = config_clone;
+            tls_config.tls_active = true;
             handle_imap_connection(
                 tls_reader,
                 tls_writer,
-                config_clone,
+                tls_config,
                 store,
                 idle_timeout,
                 content_store_path,
@@ -2335,6 +2337,125 @@ node_config = "/tmp/test-node.toml"
         assert!(quit_resp.starts_with("221 "), "QUIT: {quit_resp}");
 
         server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn imap_starttls_upgrade() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        // Generate self-signed cert
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut cert_file, cert_pem.as_bytes()).unwrap();
+        std::io::Write::flush(&mut cert_file).unwrap();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut key_file, key_pem.as_bytes()).unwrap();
+        std::io::Write::flush(&mut key_file).unwrap();
+
+        let acceptor = tls::load_tls_config(cert_file.path(), key_file.path()).unwrap();
+        let acceptor = std::sync::Arc::new(acceptor);
+
+        // Set up IMAP store
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let store = crate::imap_store::ImapStore::open(&db_path).unwrap();
+        store.initialize_default_mailboxes().unwrap();
+        store.create_user("testuser", "testpass", &[0xAAu8; crate::message::ADDRESS_HASH_LEN]).unwrap();
+        let store = std::sync::Arc::new(store);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let csp = dir.path().join("content");
+
+        let server_acceptor = acceptor.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let config = crate::imap::ImapConfig {
+                domain: "localhost".to_string(),
+                tls_active: false,
+                tls_available: true,
+                max_auth_failures: 3,
+            };
+            let _ = handle_imap_connection_starttls(
+                reader,
+                writer,
+                config,
+                store,
+                Duration::from_secs(30),
+                Some(server_acceptor),
+                csp,
+            )
+            .await;
+        });
+
+        // Client: connect plaintext
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = tcp.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Read greeting
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("OK"), "expected greeting, got: {line}");
+
+        // Send CAPABILITY — should advertise STARTTLS
+        line.clear();
+        write_half.write_all(b"a1 CAPABILITY\r\n").await.unwrap();
+        // Read untagged capability
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("STARTTLS"), "expected STARTTLS in capabilities: {line}");
+        // Read tagged OK
+        let mut ok_line = String::new();
+        reader.read_line(&mut ok_line).await.unwrap();
+        assert!(ok_line.contains("a1 OK"), "expected tagged OK: {ok_line}");
+
+        // Send STARTTLS
+        line.clear();
+        write_half.write_all(b"a2 STARTTLS\r\n").await.unwrap();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("a2 OK"), "expected STARTTLS OK: {line}");
+
+        // Perform TLS handshake
+        let tcp_stream = reader.into_inner().reunite(write_half).unwrap();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut root_store = rustls::RootCertStore::empty();
+        let certs = tls::load_certs(cert_file.path()).unwrap();
+        for c in &certs {
+            root_store.add(c.clone()).unwrap();
+        }
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+        let (tls_read, mut tls_write) = tokio::io::split(tls_stream);
+        let mut tls_reader = BufReader::new(tls_read);
+
+        // Post-TLS: read the new greeting sent by handle_imap_connection
+        line.clear();
+        tls_reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("OK"), "expected post-TLS greeting, got: {line}");
+
+        // LOGIN should work over TLS
+        line.clear();
+        tls_write.write_all(b"a3 LOGIN testuser testpass\r\n").await.unwrap();
+        tls_reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("a3 OK"), "expected LOGIN OK: {line}");
+
+        // QUIT
+        tls_write.write_all(b"a4 LOGOUT\r\n").await.unwrap();
+        line.clear();
+        tls_reader.read_line(&mut line).await.unwrap(); // * BYE
+        line.clear();
+        tls_reader.read_line(&mut line).await.unwrap(); // a4 OK
+
+        server.await.unwrap();
     }
 
     #[test]
