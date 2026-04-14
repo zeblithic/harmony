@@ -7,6 +7,7 @@
 use ed25519_dalek::{Signature, Verifier};
 use harmony_identity::identity::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use harmony_identity::{Identity, PrivateIdentity};
+use harmony_mailbox::MailboxError;
 
 use crate::error::{check_u16_len, MailError};
 
@@ -166,9 +167,10 @@ impl NameRegistration {
 
         // Identity: 64 bytes
         if data.len() < pos + PUBLIC_KEY_LENGTH {
-            return Err(MailError::Truncated {
+            return Err(MailboxError::Truncated {
                 expected: (pos + PUBLIC_KEY_LENGTH) - data.len(),
-            });
+            }
+            .into());
         }
         let identity = Identity::from_public_bytes(&data[pos..pos + PUBLIC_KEY_LENGTH])
             .map_err(|_| MailError::InvalidIdentity)?;
@@ -176,18 +178,20 @@ impl NameRegistration {
 
         // registered_at: u64 big-endian
         if data.len() < pos + 8 {
-            return Err(MailError::Truncated {
+            return Err(MailboxError::Truncated {
                 expected: (pos + 8) - data.len(),
-            });
+            }
+            .into());
         }
         let registered_at = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
 
         // user_signature: 64 bytes
         if data.len() < pos + SIGNATURE_LENGTH {
-            return Err(MailError::Truncated {
+            return Err(MailboxError::Truncated {
                 expected: (pos + SIGNATURE_LENGTH) - data.len(),
-            });
+            }
+            .into());
         }
         let mut user_signature = [0u8; SIGNATURE_LENGTH];
         user_signature.copy_from_slice(&data[pos..pos + SIGNATURE_LENGTH]);
@@ -195,18 +199,20 @@ impl NameRegistration {
 
         // domain_signature: 64 bytes
         if data.len() < pos + SIGNATURE_LENGTH {
-            return Err(MailError::Truncated {
+            return Err(MailboxError::Truncated {
                 expected: (pos + SIGNATURE_LENGTH) - data.len(),
-            });
+            }
+            .into());
         }
         let mut domain_signature = [0u8; SIGNATURE_LENGTH];
         domain_signature.copy_from_slice(&data[pos..pos + SIGNATURE_LENGTH]);
         pos += SIGNATURE_LENGTH;
 
         if pos != data.len() {
-            return Err(MailError::TrailingBytes {
+            return Err(MailboxError::TrailingBytes {
                 count: data.len() - pos,
-            });
+            }
+            .into());
         }
 
         Ok(Self {
@@ -227,20 +233,22 @@ impl NameRegistration {
         field: &'static str,
     ) -> Result<String, MailError> {
         if data.len() < *pos + 2 {
-            return Err(MailError::Truncated {
+            return Err(MailboxError::Truncated {
                 expected: (*pos + 2) - data.len(),
-            });
+            }
+            .into());
         }
         let len = u16::from_be_bytes(data[*pos..*pos + 2].try_into().unwrap()) as usize;
         *pos += 2;
 
         if data.len() < *pos + len {
-            return Err(MailError::Truncated {
+            return Err(MailboxError::Truncated {
                 expected: (*pos + len) - data.len(),
-            });
+            }
+            .into());
         }
         let s = std::str::from_utf8(&data[*pos..*pos + len])
-            .map_err(|_| MailError::InvalidUtf8 { field })?;
+            .map_err(|_| MailboxError::InvalidUtf8 { field })?;
         *pos += len;
 
         Ok(s.to_string())
@@ -354,7 +362,7 @@ mod tests {
         bytes.push(0xFF); // append garbage
 
         match NameRegistration::from_bytes(&bytes) {
-            Err(MailError::TrailingBytes { count: 1 }) => {}
+            Err(MailError::Mailbox(MailboxError::TrailingBytes { count: 1 })) => {}
             Err(other) => panic!("expected TrailingBytes {{ count: 1 }}, got {other:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }

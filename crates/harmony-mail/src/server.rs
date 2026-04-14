@@ -263,8 +263,103 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-    // Shared cancellation token for graceful shutdown of all tasks
+    // Shared cancellation token for graceful shutdown of all tasks.
+    // Created before the Zenoh block so ZenohPublisher's drain task can
+    // participate in the same shutdown signal as listener loops and
+    // cleanup tasks below.
     let cancel = tokio_util::sync::CancellationToken::new();
+
+    // ── Zenoh session (mailbox root CID notifications) ──────────────
+    {
+        use crate::mailbox_manager::ZenohPublisher;
+
+        let zenoh_enabled = config.zenoh.as_ref().map(|z| z.enabled).unwrap_or(false);
+        if zenoh_enabled && mailbox_mgr.is_none() {
+            // Opening the session here would spawn a ZenohPublisher drain task
+            // that captures the session by move. With no MailboxManager to
+            // attach the publisher to, the publisher would be dropped while
+            // the drain task kept the session alive forever — a leak.
+            tracing::warn!(
+                "Zenoh enabled but MailboxManager unavailable — skipping session open to avoid leaking the drain task"
+            );
+        } else if zenoh_enabled {
+            // Build Zenoh config. The gateway is a publisher only — we never
+            // want it to open a listening socket. Default config would run in
+            // peer mode and bind a random TCP port, which is unexpected for
+            // a gateway and a security concern. Force client mode and clear
+            // listen endpoints before handing off to `zenoh::open()`.
+            let mut zenoh_config = zenoh::Config::default();
+            let endpoint = config.zenoh.as_ref().and_then(|z| z.endpoint.as_ref());
+            let mut config_ok = true;
+
+            // Force client mode (connect-only, no incoming listener).
+            if let Err(e) = zenoh_config.insert_json5("mode", "\"client\"") {
+                tracing::error!(error = %e, "Zenoh client-mode config rejected, mailbox notifications disabled");
+                config_ok = false;
+            }
+            // Belt-and-suspenders: explicitly zero the listen endpoints.
+            if config_ok {
+                if let Err(e) = zenoh_config.insert_json5("listen/endpoints", "[]") {
+                    tracing::error!(error = %e, "Zenoh listen-endpoints config rejected, mailbox notifications disabled");
+                    config_ok = false;
+                }
+            }
+
+            if config_ok {
+                if let Some(ep) = endpoint {
+                    match serde_json::to_string(ep) {
+                        Ok(ep_json) => {
+                            if let Err(e) = zenoh_config
+                                .insert_json5("connect/endpoints", &format!("[{ep_json}]"))
+                            {
+                                tracing::error!(error = %e, endpoint = %ep, "Zenoh endpoint config rejected, mailbox notifications disabled");
+                                config_ok = false;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, endpoint = %ep, "Zenoh endpoint JSON-encode failed, mailbox notifications disabled");
+                            config_ok = false;
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        "Zenoh enabled without explicit endpoint — running in client mode with peer discovery"
+                    );
+                }
+            }
+
+            if config_ok {
+                // The outer gate guarantees mailbox_mgr.is_some() here, so it
+                // is safe to open the session without risking a leaked drain
+                // task with no consumer.
+                let mgr_arc = mailbox_mgr
+                    .as_ref()
+                    .expect("mailbox_mgr.is_some() checked by outer gate");
+                match zenoh::open(zenoh_config).await {
+                    Ok(session) => {
+                        tracing::info!("Zenoh session opened for mailbox notifications");
+                        let publisher = ZenohPublisher::new(session, cancel.clone());
+                        // Recover from a poisoned mutex rather than silently
+                        // skipping publisher attachment — Merkle mailbox
+                        // updates are low-severity but we want visibility
+                        // into lock state to match the rest of the server.
+                        match mgr_arc.lock() {
+                            Ok(mut mgr) => mgr.set_publisher(publisher),
+                            Err(poisoned) => {
+                                tracing::warn!("MailboxManager mutex poisoned during Zenoh publisher attach, recovering");
+                                poisoned.into_inner().set_publisher(publisher);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Zenoh open failed, mailbox notifications disabled");
+                    }
+                }
+            }
+        } else {
+            tracing::debug!("Zenoh mailbox notifications disabled");
+        }
+    }
 
     // Background cleanup task for per-IP tracking
     let cleanup_shared = Arc::clone(&shared);
@@ -1152,7 +1247,12 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                         let sender_address = sender_address;
                         let subject_snippet = subject_snippet.clone();
                         let delivered_to = delivered_to.clone();
-                        tokio::task::spawn_blocking(move || {
+                        // Fire-and-forget, but surface panics via a tiny
+                        // supervisor task that awaits the JoinHandle. Without
+                        // this, a panic inside insert_message (e.g., on a
+                        // runtime shutdown race) would be silently swallowed
+                        // when the handle dropped.
+                        let join = tokio::task::spawn_blocking(move || {
                             let mut guard = match mgr.lock() {
                                 Ok(g) => g,
                                 Err(poisoned) => {
@@ -1173,6 +1273,20 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                                         recipient = hex::encode(addr),
                                         error = %e,
                                         "Merkle mailbox update failed, IMAP delivery unaffected"
+                                    );
+                                }
+                            }
+                        });
+                        tokio::spawn(async move {
+                            if let Err(e) = join.await {
+                                if e.is_panic() {
+                                    tracing::error!(
+                                        error = ?e,
+                                        "Merkle mailbox update task panicked — IMAP delivery unaffected"
+                                    );
+                                } else if e.is_cancelled() {
+                                    tracing::debug!(
+                                        "Merkle mailbox update task cancelled during shutdown"
                                     );
                                 }
                             }
