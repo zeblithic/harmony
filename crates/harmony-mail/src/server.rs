@@ -398,7 +398,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                 let csp = csp_outer.clone();
                                 tokio::spawn(async move {
                                     let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
-                                    let (reader, writer) = tokio::io::split(stream);
+                                    let (reader, writer) = stream.into_split();
                                     let imap_cfg = ImapConfig {
                                         domain: d,
                                         tls_active: false,
@@ -928,23 +928,152 @@ where
 }
 
 /// Handle an IMAP connection on port 143 (plaintext with optional STARTTLS).
-async fn handle_imap_connection_starttls<R, W>(
-    reader: R,
-    writer: W,
+async fn handle_imap_connection_starttls(
+    reader: tokio::net::tcp::OwnedReadHalf,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
     config: ImapConfig,
     store: Arc<ImapStore>,
     idle_timeout: Duration,
-    _tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     content_store_path: PathBuf,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    // For v1.1, STARTTLS on IMAP port 143 is not yet wired — use the
-    // generic handler. Full STARTTLS upgrade (similar to SMTP's
-    // handle_connection) will be added when needed.
-    handle_imap_connection(reader, writer, config, store, idle_timeout, content_store_path).await
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let domain = config.domain.clone();
+    let config_clone = config.clone();
+    let mut session = ImapSession::new(config);
+    let codec = ImapCodec::new();
+
+    // Send greeting
+    let actions = session.handle(ImapEvent::Connected);
+    execute_imap_actions(&actions, &mut writer).await?;
+
+    let mut framed = FramedRead::new(reader, codec);
+
+    loop {
+        let timeout_dur = match session.state {
+            ImapState::Idling { .. } => idle_timeout,
+            _ => IMAP_COMMAND_TIMEOUT,
+        };
+
+        let frame = tokio::time::timeout(timeout_dur, framed.next()).await;
+
+        match frame {
+            Ok(Some(Ok(imap_frame))) => match imap_frame {
+                ImapFrame::CommandLine(line) => match imap_parse::parse_command(&line) {
+                    Ok(cmd) => {
+                        let actions = session.handle(ImapEvent::Command(cmd));
+                        let should_close = execute_imap_actions(&actions, &mut writer).await?;
+                        let needs_starttls = process_imap_async_actions(
+                            &actions,
+                            &mut session,
+                            &mut writer,
+                            &store,
+                            &mut framed,
+                            &content_store_path,
+                            &domain,
+                        )
+                        .await?;
+
+                        if needs_starttls {
+                            break;
+                        }
+                        if should_close || session.state == ImapState::Logout {
+                            let _ = writer.shutdown().await;
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => {
+                        let response = if let Some(tag) = e.tag() {
+                            format!("{tag} BAD {e}\r\n")
+                        } else {
+                            format!("* BAD {e}\r\n")
+                        };
+                        writer.write_all(response.as_bytes()).await?;
+                        writer.flush().await?;
+                    }
+                },
+                ImapFrame::NeedsContinuation { .. } => {
+                    writer.write_all(b"+ Ready\r\n").await?;
+                    writer.flush().await?;
+                    framed.decoder_mut().acknowledge_continuation();
+                }
+                ImapFrame::Done => {
+                    let actions = session.handle(ImapEvent::IdleDone);
+                    execute_imap_actions(&actions, &mut writer).await?;
+                    framed.decoder_mut().exit_idle_mode();
+                }
+            },
+            Ok(Some(Err(e))) => {
+                tracing::debug!(error = %e, "IMAP codec error");
+                writer.write_all(b"* BYE protocol error\r\n").await?;
+                let _ = writer.shutdown().await;
+                return Ok(());
+            }
+            Ok(None) => {
+                let _ = writer.shutdown().await;
+                return Ok(());
+            }
+            Err(_) => {
+                writer.write_all(b"* BYE connection timed out\r\n").await?;
+                let _ = writer.shutdown().await;
+                return Ok(());
+            }
+        }
+    }
+
+    // ── STARTTLS upgrade ──────────────────────────────────────────
+    let acceptor = match tls_acceptor {
+        Some(ref acc) => acc,
+        None => {
+            writer.write_all(b"* BYE TLS not available\r\n").await?;
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+    };
+
+    writer.flush().await?;
+
+    let parts = framed.into_parts();
+    let tcp_reader = parts.io;
+
+    if !parts.read_buf.is_empty() {
+        tracing::warn!(
+            buffered_bytes = parts.read_buf.len(),
+            "IMAP STARTTLS: rejecting — client sent data before OK response"
+        );
+        let mut stream = tcp_reader
+            .reunite(writer)
+            .map_err(|e| format!("failed to reunite: {e}"))?;
+        let _ = stream.write_all(b"* BYE STARTTLS protocol error\r\n").await;
+        return Ok(());
+    }
+
+    let tcp_stream = tcp_reader
+        .reunite(writer)
+        .map_err(|e| format!("failed to reunite TCP halves: {e}"))?;
+
+    match tls::starttls_upgrade(tcp_stream, acceptor).await {
+        Ok(tls_stream) => {
+            let (tls_reader, tls_writer) = tokio::io::split(tls_stream);
+            // Feed TlsCompleted to state machine
+            let tls_actions = session.handle(ImapEvent::TlsCompleted);
+            let mut tls_writer = tls_writer;
+            execute_imap_actions(&tls_actions, &mut tls_writer).await?;
+            // Continue the session over TLS
+            handle_imap_connection(
+                tls_reader,
+                tls_writer,
+                config_clone,
+                store,
+                idle_timeout,
+                content_store_path,
+            )
+            .await
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "IMAP STARTTLS handshake failed");
+            Ok(())
+        }
+    }
 }
 
 /// Execute IMAP actions by writing responses to the client.
