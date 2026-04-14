@@ -258,7 +258,17 @@ impl HarmonyMessage {
         // message_type: 1 byte
         buf.push(self.message_type as u8);
         // flags: 1 byte
-        buf.push(self.flags.bits());
+        //
+        // Derive structural bits (has_attachments, is_reply) from the actual
+        // payload so the serialized bitfield can never contradict the message
+        // contents. Preserve is_forward from the caller-supplied flags — it
+        // has no payload-derivable source today and is advisory metadata.
+        let derived_flags = MessageFlags::new(
+            !self.attachments.is_empty(),
+            self.in_reply_to.is_some(),
+            self.flags.is_forward(),
+        );
+        buf.push(derived_flags.bits());
         // timestamp: 8 bytes big-endian
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
         // message_id: 16 bytes
@@ -366,10 +376,19 @@ impl HarmonyMessage {
         }
 
         // each recipient: 16 bytes address_hash + 1 byte type
+        //
+        // The wire format strips Bcc recipients on encode (to prevent address
+        // leaks to non-Bcc recipients). Reject Bcc on decode too — a forged or
+        // corrupt blob must not be able to reintroduce hidden recipients into
+        // client-visible state.
         let mut recipients = Vec::with_capacity(recipient_count);
         for _ in 0..recipient_count {
             let address_hash = read_fixed::<ADDRESS_HASH_LEN>(data, &mut pos)?;
-            let rtype = RecipientType::from_u8(read_u8(data, &mut pos)?)?;
+            let rtype_byte = read_u8(data, &mut pos)?;
+            let rtype = RecipientType::from_u8(rtype_byte)?;
+            if rtype == RecipientType::Bcc {
+                return Err(MailboxError::InvalidRecipientType(rtype_byte));
+            }
             recipients.push(Recipient {
                 address_hash,
                 recipient_type: rtype,
@@ -683,10 +702,14 @@ mod tests {
 
     #[test]
     fn receipt_message_roundtrip() {
+        // `flags.is_reply` must be set when in_reply_to is populated —
+        // to_bytes now derives structural flag bits from the payload, so
+        // constructing the message with matching flags keeps round-trip
+        // equality meaningful.
         let msg = HarmonyMessage {
             version: VERSION,
             message_type: MailMessageType::Receipt,
-            flags: MessageFlags::new(false, false, false),
+            flags: MessageFlags::new(false, true, false),
             timestamp: 1_709_654_400,
             message_id: [0x03; MESSAGE_ID_LEN],
             in_reply_to: Some([0x01; MESSAGE_ID_LEN]),
@@ -708,10 +731,12 @@ mod tests {
 
     #[test]
     fn bounce_message_roundtrip() {
+        // Bounces are structurally replies to the original message, so the
+        // is_reply flag must be set. to_bytes derives this from in_reply_to.
         let msg = HarmonyMessage {
             version: VERSION,
             message_type: MailMessageType::Bounce,
-            flags: MessageFlags::new(false, false, false),
+            flags: MessageFlags::new(false, true, false),
             timestamp: 1_709_654_400,
             message_id: [0x04; MESSAGE_ID_LEN],
             in_reply_to: Some([0x01; MESSAGE_ID_LEN]),
@@ -764,6 +789,86 @@ mod tests {
         assert_eq!(decoded.recipients.len(), 1);
         assert_eq!(decoded.recipients[0].recipient_type, RecipientType::To);
         assert_eq!(decoded.recipients[0].address_hash, [0xBB; ADDRESS_HASH_LEN]);
+    }
+
+    #[test]
+    fn decoder_rejects_bcc_in_wire_format() {
+        // Hand-craft a blob that claims to have a Bcc recipient. The wire
+        // format forbids this — a forged or corrupt payload must NOT be able
+        // to resurrect hidden recipients into client-visible state.
+        let msg = HarmonyMessage {
+            version: VERSION,
+            message_type: MailMessageType::Email,
+            flags: MessageFlags::new(false, false, false),
+            timestamp: 1_709_654_400,
+            message_id: [0x01; MESSAGE_ID_LEN],
+            in_reply_to: None,
+            sender_address: [0xAA; ADDRESS_HASH_LEN],
+            recipients: vec![Recipient {
+                address_hash: [0xBB; ADDRESS_HASH_LEN],
+                recipient_type: RecipientType::To,
+            }],
+            subject: "test".to_string(),
+            body: "test".to_string(),
+            attachments: vec![],
+        };
+        let mut bytes = msg.to_bytes().unwrap();
+
+        // Locate the single recipient's type byte (immediately after the
+        // 16-byte address_hash) and flip it from To (0x00) to Bcc (0x02).
+        // Layout before the recipients: version(1) + type(1) + flags(1)
+        //   + timestamp(8) + message_id(16) + in_reply_to_flag(1)
+        //   + sender_address(16) + recipient_count(1) = 45 bytes
+        //   then 16-byte address_hash, then the type byte at offset 61.
+        let type_byte_offset = 1 + 1 + 1 + 8 + MESSAGE_ID_LEN + 1 + ADDRESS_HASH_LEN + 1 + ADDRESS_HASH_LEN;
+        assert_eq!(bytes[type_byte_offset], RecipientType::To as u8);
+        bytes[type_byte_offset] = RecipientType::Bcc as u8;
+
+        let err = HarmonyMessage::from_bytes(&bytes).unwrap_err();
+        assert!(
+            matches!(err, MailboxError::InvalidRecipientType(0x02)),
+            "expected InvalidRecipientType(0x02), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn encoder_normalizes_inconsistent_flags() {
+        // A caller constructs a message with flags that contradict the
+        // payload (claims no reply, but sets in_reply_to; claims no
+        // attachments, but supplies an attachment). to_bytes must derive
+        // the structural bits from the payload so the wire format is
+        // always internally consistent.
+        let msg = HarmonyMessage {
+            version: VERSION,
+            message_type: MailMessageType::Email,
+            // Intentionally wrong: none of these bits reflect the payload.
+            flags: MessageFlags::new(false, false, false),
+            timestamp: 1_709_654_400,
+            message_id: [0x02; MESSAGE_ID_LEN],
+            in_reply_to: Some([0x01; MESSAGE_ID_LEN]),
+            sender_address: [0xAA; ADDRESS_HASH_LEN],
+            recipients: vec![Recipient {
+                address_hash: [0xBB; ADDRESS_HASH_LEN],
+                recipient_type: RecipientType::To,
+            }],
+            subject: "Re: Hi".to_string(),
+            body: "attached".to_string(),
+            attachments: vec![AttachmentRef {
+                cid: [0xDD; CID_LEN],
+                filename: "f.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                size: 7,
+            }],
+        };
+
+        let bytes = msg.to_bytes().unwrap();
+        let decoded = HarmonyMessage::from_bytes(&bytes).unwrap();
+
+        // Decoded flags MUST match the payload, regardless of what the
+        // caller put in `msg.flags`.
+        assert!(decoded.flags.is_reply(), "is_reply should be derived from in_reply_to");
+        assert!(decoded.flags.has_attachments(), "has_attachments should be derived from attachments");
+        assert!(!decoded.flags.is_forward(), "is_forward should pass through unchanged");
     }
 
     #[test]

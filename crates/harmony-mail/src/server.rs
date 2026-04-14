@@ -269,29 +269,50 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
         let zenoh_enabled = config.zenoh.as_ref().map(|z| z.enabled).unwrap_or(false);
         if zenoh_enabled {
-            // Build Zenoh config. An explicit endpoint override is treated
-            // as required — silently falling back to peer-discovery defaults
-            // would open an inbound listener the operator didn't ask for.
+            // Build Zenoh config. The gateway is a publisher only — we never
+            // want it to open a listening socket. Default config would run in
+            // peer mode and bind a random TCP port, which is unexpected for
+            // a gateway and a security concern. Force client mode and clear
+            // listen endpoints before handing off to `zenoh::open()`.
             let mut zenoh_config = zenoh::Config::default();
             let endpoint = config.zenoh.as_ref().and_then(|z| z.endpoint.as_ref());
-            let config_ok = match endpoint {
-                Some(ep) => match serde_json::to_string(ep) {
-                    Ok(ep_json) => {
-                        match zenoh_config.insert_json5("connect/endpoints", &format!("[{ep_json}]")) {
-                            Ok(()) => true,
-                            Err(e) => {
+            let mut config_ok = true;
+
+            // Force client mode (connect-only, no incoming listener).
+            if let Err(e) = zenoh_config.insert_json5("mode", "\"client\"") {
+                tracing::error!(error = %e, "Zenoh client-mode config rejected, mailbox notifications disabled");
+                config_ok = false;
+            }
+            // Belt-and-suspenders: explicitly zero the listen endpoints.
+            if config_ok {
+                if let Err(e) = zenoh_config.insert_json5("listen/endpoints", "[]") {
+                    tracing::error!(error = %e, "Zenoh listen-endpoints config rejected, mailbox notifications disabled");
+                    config_ok = false;
+                }
+            }
+
+            if config_ok {
+                if let Some(ep) = endpoint {
+                    match serde_json::to_string(ep) {
+                        Ok(ep_json) => {
+                            if let Err(e) = zenoh_config
+                                .insert_json5("connect/endpoints", &format!("[{ep_json}]"))
+                            {
                                 tracing::error!(error = %e, endpoint = %ep, "Zenoh endpoint config rejected, mailbox notifications disabled");
-                                false
+                                config_ok = false;
                             }
                         }
+                        Err(e) => {
+                            tracing::error!(error = %e, endpoint = %ep, "Zenoh endpoint JSON-encode failed, mailbox notifications disabled");
+                            config_ok = false;
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(error = %e, endpoint = %ep, "Zenoh endpoint JSON-encode failed, mailbox notifications disabled");
-                        false
-                    }
-                },
-                None => true,
-            };
+                } else {
+                    tracing::info!(
+                        "Zenoh enabled without explicit endpoint — running in client mode with peer discovery"
+                    );
+                }
+            }
 
             if config_ok {
                 match zenoh::open(zenoh_config).await {

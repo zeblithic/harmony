@@ -805,4 +805,70 @@ mod tests {
         // Root CID should be present in memory.
         assert!(mgr.get_root(&addr).is_some());
     }
+
+    /// Exercises the REAL `ZenohPublisher::new()` drain task (not the mpsc
+    /// test double) end-to-end: opens two in-process Zenoh sessions in peer
+    /// mode over loopback, creates the publisher with one session, declares
+    /// a subscriber on the other, inserts a message, and verifies the raw
+    /// root CID bytes reach the subscriber through `session.put()`.
+    ///
+    /// This catches regressions the `from_sender` test cannot — e.g., if the
+    /// drain task stops spawning, if the topic format breaks, or if
+    /// `session.put()` starts returning errors silently.
+    ///
+    /// `#[ignore]`'d by default: starts two Zenoh sessions which bind sockets
+    /// and rely on peer discovery; can be flaky under loaded CI runners.
+    /// Run locally with `cargo test -p harmony-mail -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn mailbox_manager_real_zenoh_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("roots.db");
+        let cas_path = dir.path().join("content");
+        std::fs::create_dir_all(cas_path.join("commits")).unwrap();
+        std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
+
+        // Two peer-mode sessions that discover each other on localhost.
+        let pub_session = zenoh::open(zenoh::Config::default()).await.unwrap();
+        let sub_session = zenoh::open(zenoh::Config::default()).await.unwrap();
+
+        let addr = [0xCCu8; ADDRESS_HASH_LEN];
+        let addr_hex = hex::encode(addr);
+        let topic = format!("harmony/mail/v1/{addr_hex}/root");
+
+        let subscriber = sub_session.declare_subscriber(&topic).await.unwrap();
+
+        // Brief settle time for peer discovery on loopback.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let publisher = ZenohPublisher::new(pub_session);
+
+        let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
+        mgr.set_publisher(publisher);
+        mgr.ensure_user_mailbox(&addr).unwrap();
+
+        mgr.insert_message(
+            &addr,
+            &dummy_msg_cid(7),
+            &dummy_msg_id(7),
+            &dummy_sender(),
+            1700000042,
+            "Real Zenoh",
+        )
+        .unwrap();
+
+        // The drain task must pick up the mpsc message and run session.put().
+        let sample = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            subscriber.recv_async(),
+        )
+        .await
+        .expect("subscriber never received the real zenoh publish within 5s")
+        .expect("subscriber channel closed");
+
+        let payload = sample.payload().to_bytes();
+        assert_eq!(payload.len(), CID_LEN);
+        let received_cid: [u8; CID_LEN] = (&payload[..]).try_into().unwrap();
+        assert_eq!(received_cid, *mgr.get_root(&addr).unwrap());
+    }
 }
