@@ -853,12 +853,31 @@ where
 {
     let domain = config.domain.clone();
     let mut session = ImapSession::new(config);
-    let codec = ImapCodec::new();
 
     // Send greeting
     let actions = session.handle(ImapEvent::Connected);
     execute_imap_actions(&actions, &mut writer).await?;
 
+    handle_imap_session(reader, writer, session, store, idle_timeout, content_store_path, &domain).await
+}
+
+/// Run the IMAP command loop with an existing session (no greeting sent).
+/// Used by both `handle_imap_connection` (after greeting) and
+/// `handle_imap_connection_starttls` (after TLS upgrade, no greeting).
+async fn handle_imap_session<R, W>(
+    reader: R,
+    mut writer: W,
+    mut session: ImapSession,
+    store: Arc<ImapStore>,
+    idle_timeout: Duration,
+    content_store_path: PathBuf,
+    domain: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let codec = ImapCodec::new();
     let mut framed = FramedRead::new(reader, codec);
 
     loop {
@@ -882,7 +901,7 @@ where
                             &store,
                             &mut framed,
                             &content_store_path,
-                            &domain,
+                            domain,
                         )
                         .await?;
                         if should_close || session.state == ImapState::Logout {
@@ -938,7 +957,6 @@ async fn handle_imap_connection_starttls(
     content_store_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let domain = config.domain.clone();
-    let config_clone = config.clone();
     let mut session = ImapSession::new(config);
     let codec = ImapCodec::new();
 
@@ -1054,20 +1072,19 @@ async fn handle_imap_connection_starttls(
     match tls::starttls_upgrade(tcp_stream, acceptor).await {
         Ok(tls_stream) => {
             let (tls_reader, tls_writer) = tokio::io::split(tls_stream);
-            // Feed TlsCompleted to state machine
+            // Feed TlsCompleted to state machine (sets tls_active=true, resets to NotAuthenticated)
             let tls_actions = session.handle(ImapEvent::TlsCompleted);
             let mut tls_writer = tls_writer;
             execute_imap_actions(&tls_actions, &mut tls_writer).await?;
-            // Continue the session over TLS — mark TLS as active so LOGIN is permitted
-            let mut tls_config = config_clone;
-            tls_config.tls_active = true;
-            handle_imap_connection(
+            // Continue with existing session — no new greeting per RFC 2595 §3
+            handle_imap_session(
                 tls_reader,
                 tls_writer,
-                tls_config,
+                session,
                 store,
                 idle_timeout,
                 content_store_path,
+                &domain,
             )
             .await
         }
@@ -2437,11 +2454,7 @@ node_config = "/tmp/test-node.toml"
         let (tls_read, mut tls_write) = tokio::io::split(tls_stream);
         let mut tls_reader = BufReader::new(tls_read);
 
-        // Post-TLS: read the new greeting sent by handle_imap_connection
-        line.clear();
-        tls_reader.read_line(&mut line).await.unwrap();
-        assert!(line.contains("OK"), "expected post-TLS greeting, got: {line}");
-
+        // Post-TLS: no greeting — per RFC 2595 §3, LOGIN directly
         // LOGIN should work over TLS
         line.clear();
         tls_write.write_all(b"a3 LOGIN testuser testpass\r\n").await.unwrap();
