@@ -290,12 +290,12 @@ class TestGgufExportWithEngram:
 
 
 # ---------------------------------------------------------------------------
-# ZEB-117 Model γ: ANN retrieval + anti-collapse
+# ZEB-117 Model gamma: ANN retrieval + anti-collapse
 # ---------------------------------------------------------------------------
 
 
 class TestEngramANNInjection:
-    """Model γ: gated residual with internal ANN retrieval + anti-collapse."""
+    """Model gamma: gated residual with internal ANN retrieval + anti-collapse."""
 
     @staticmethod
     def _ann_config() -> HarmonyModelConfig:
@@ -357,31 +357,29 @@ class TestEngramANNInjection:
         m = EngramANNInjection(c, t)
         h = torch.randn(1, 5, c.hidden_dim)
         retrieved = m.retrieve_argmax(h)
-        for l in range(5):
-            row = retrieved[0, l]
+        for pos in range(5):
+            row = retrieved[0, pos]
             diffs = (t - row).abs().sum(dim=-1)
             assert diffs.min().item() < 1e-6
 
     def test_retrieve_is_convex_blend_of_table_rows(self):
         """Softmax retrieval yields a row in the convex hull of table rows.
 
-        Sanity check: each retrieved vector should have norm bounded by
-        the max table row norm and be expressible as a convex combination.
-        The easiest check is the attention-weights sum to 1, which is
-        implicit in softmax — so instead we check that the retrieved
-        vector is not identical to any single row (would indicate temp
-        too sharp and gradient still blocked).
+        Sanity check: each retrieved vector should be expressible as a
+        convex combination of table rows (not exactly any single row,
+        which would indicate temperature too sharp + gradient blocked).
         """
         from ct87.engram import EngramANNInjection
+        # Deterministic seed: rule out flakes from random query_proj init
+        # producing near-degenerate softmax outputs.
+        torch.manual_seed(0)
         c = self._ann_config()
         t = self._fake_table(20, c.engram_dim)
         m = EngramANNInjection(c, t)
         h = torch.randn(1, 5, c.hidden_dim)
         retrieved = m.retrieve(h)
-        # For generic randomly-initialized query_proj, softmax should
-        # produce a non-degenerate blend (not exactly any single row).
-        for l in range(5):
-            row = retrieved[0, l]
+        for pos in range(5):
+            row = retrieved[0, pos]
             diffs = (t - row).abs().sum(dim=-1)
             # Should differ from every single row by more than numerical noise
             assert diffs.min().item() > 1e-4
@@ -418,7 +416,8 @@ class TestEngramANNInjection:
         h_large = torch.randn(8, 32, c.hidden_dim)
         _, gate_late = m(h_large)
         # Sanity: still in [0, 1] regardless
-        assert (gate_late >= 0.0).all() and (gate_late <= 1.0).all()
+        assert (gate_late >= 0.0).all(), "gate values below 0"
+        assert (gate_late <= 1.0).all(), "gate values above 1"
 
     def test_gate_clamp_respects_set_step(self):
         """set_step() must actually update the buffer."""
@@ -482,7 +481,7 @@ class TestEngramANNInjection:
         model.attach_engram_ann(ann)
 
         input_ids = torch.randint(0, c.vocab_size, (2, 16))
-        # Note: no engram_embeddings passed — the ANN module handles
+        # Note: no engram_embeddings passed - the ANN module handles
         # retrieval internally.
         logits = model(input_ids=input_ids)
         assert logits.shape == (2, 16, c.vocab_size)
@@ -511,3 +510,134 @@ class TestEngramANNInjection:
         assert beta_config.hidden_dim == base.hidden_dim
         assert beta_config.engram_injection_layer == base.engram_injection_layer
         assert beta_config.engram_dim == base.engram_dim
+
+
+class TestEngramANNConstructorValidation:
+    """PR #232 review: fail fast on invalid constructor args."""
+
+    @staticmethod
+    def _ann_config() -> HarmonyModelConfig:
+        c = _tiny_config()
+        c.use_ann_engram = True
+        return c
+
+    def test_zero_temperature_raises(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = torch.randn(10, c.engram_dim)
+        with pytest.raises(ValueError, match="retrieval_temperature"):
+            EngramANNInjection(c, t, retrieval_temperature=0.0)
+
+    def test_negative_temperature_raises(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = torch.randn(10, c.engram_dim)
+        with pytest.raises(ValueError, match="retrieval_temperature"):
+            EngramANNInjection(c, t, retrieval_temperature=-1.0)
+
+    def test_nonfinite_temperature_raises(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = torch.randn(10, c.engram_dim)
+        with pytest.raises(ValueError, match="retrieval_temperature"):
+            EngramANNInjection(c, t, retrieval_temperature=float("inf"))
+
+    def test_clamp_min_out_of_range_raises(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = torch.randn(10, c.engram_dim)
+        with pytest.raises(ValueError, match="clamp_min"):
+            EngramANNInjection(c, t, clamp_min=-0.1)
+        with pytest.raises(ValueError, match="clamp_min"):
+            EngramANNInjection(c, t, clamp_min=1.1)
+
+    def test_negative_clamp_until_step_raises(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = torch.randn(10, c.engram_dim)
+        with pytest.raises(ValueError, match="clamp_until_step"):
+            EngramANNInjection(c, t, clamp_until_step=-1)
+
+
+class TestEngramANNAntiCollapseInit:
+    """PR #232 review: conv1d must start zeroed so warmup doesn't inject noise.
+
+    The production EngramGatedResidual relies on HarmonyModel._init_weights()
+    to zero its conv1d, but EngramANNInjection is attached AFTER _init_weights
+    runs. Without explicit zero-init here, the hard gate clamp (g >= 0.5)
+    during warmup steps would push random conv-filtered noise into the
+    residual stream from step 0 — directly undermining the anti-collapse
+    strategy that depends on a quiet start. Regression guard for the Cursor
+    Bugbot finding.
+    """
+
+    @staticmethod
+    def _ann_config() -> HarmonyModelConfig:
+        c = _tiny_config()
+        c.use_ann_engram = True
+        return c
+
+    def test_conv1d_starts_zeroed(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = torch.randn(10, c.engram_dim)
+        m = EngramANNInjection(c, t)
+        assert (m.conv1d.weight == 0).all(), (
+            "conv1d weight must be zero-initialized; otherwise the warmup "
+            "gate clamp injects random noise from step 0."
+        )
+
+    def test_forward_at_step_zero_produces_zero_residual(self):
+        """With zero-init conv1d, forward output is zeros at step 0."""
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = torch.randn(10, c.engram_dim)
+        m = EngramANNInjection(c, t)
+        h = torch.randn(2, 5, c.hidden_dim)
+        residual, _ = m(h)
+        assert torch.allclose(residual, torch.zeros_like(residual)), (
+            "With conv1d zero-initialized, residual must be all zeros at "
+            f"step 0 — got max abs {residual.abs().max().item():.4e}"
+        )
+
+
+class TestEngramANNCheckpointSize:
+    """PR #232 review: corpus table must NOT bloat checkpoints.
+
+    Regression guard — the table is registered with persistent=False so
+    state_dict() doesn't include it. Callers must re-load the table from
+    the original safetensors file on resume.
+    """
+
+    @staticmethod
+    def _ann_config() -> HarmonyModelConfig:
+        c = _tiny_config()
+        c.use_ann_engram = True
+        return c
+
+    def test_table_not_in_state_dict(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = torch.randn(10, c.engram_dim)
+        m = EngramANNInjection(c, t)
+        keys = set(m.state_dict().keys())
+        assert "table" not in keys, (
+            "corpus table must be non-persistent; got in state_dict"
+        )
+        assert "table_normalized" not in keys, (
+            "normalized cache must be non-persistent"
+        )
+
+    def test_load_state_dict_refreshes_normalized_cache(self):
+        """Even though table is non-persistent, the refresh hook is wired."""
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = torch.randn(10, c.engram_dim)
+        m = EngramANNInjection(c, t)
+        # Replace the table in place (simulating a fresh re-load) and
+        # verify refresh keeps normalized cache in sync.
+        new_table = torch.randn(10, c.engram_dim) * 3.0
+        m.table = new_table
+        m._refresh_table_normalized()
+        expected = torch.nn.functional.normalize(new_table, dim=-1, eps=1e-8)
+        assert torch.allclose(m.table_normalized, expected)

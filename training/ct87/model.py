@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _gradient_checkpoint
+
+if TYPE_CHECKING:
+    from ct87.engram import EngramANNInjection
 
 
 @dataclass
@@ -27,7 +31,7 @@ class HarmonyModelConfig:
     when True, the model skips construction of the production
     `EngramGatedResidual` module and expects the training script to
     attach an `EngramANNInjection` module via `attach_engram_ann()`. Used
-    by ZEB-117 Model γ. Configs that set this flag are not GGUF-portable.
+    by ZEB-117 Model gamma. Configs that set this flag are not GGUF-portable.
     """
 
     num_layers: int
@@ -99,15 +103,15 @@ class HarmonyModelConfig:
 
     @staticmethod
     def tiny_engram_ann() -> HarmonyModelConfig:
-        """Model γ — gated-residual + ANN retrieval + anti-collapse (ZEB-117).
+        """Model gamma - gated-residual + ANN retrieval + anti-collapse (ZEB-117).
 
         Structurally identical to tiny(); differs only in that the model
         expects an externally-attached `EngramANNInjection` module instead
         of constructing the production `EngramGatedResidual`. Not
-        GGUF-portable — no Rust mirror.
+        GGUF-portable - no Rust mirror.
 
         See docs/research/2026-04-14-engram-injection-mechanism-findings.md
-        for the anti-collapse measures (§3.3) and the ZEB-117 bake-off
+        for the anti-collapse measures (s3.3) and the ZEB-117 bake-off
         design.
         """
         base = HarmonyModelConfig.tiny()
@@ -324,13 +328,13 @@ class HarmonyModel(nn.Module):
         # Engram gated residual injection module. The production
         # `EngramGatedResidual` is always constructed (keeps weight layout
         # stable for GGUF export even when the ANN engram is attached).
-        # Model γ sets `config.use_ann_engram=True` and attaches an
+        # Model gamma sets `config.use_ann_engram=True` and attaches an
         # `EngramANNInjection` via `attach_engram_ann()` after model
         # construction; when both are present, the ANN path is used at
         # the injection layer and `engram_embeddings` is ignored.
         from ct87.engram import EngramGatedResidual
         self.engram_residual = EngramGatedResidual(config)
-        self.engram_ann: "EngramANNInjection | None" = None
+        self.engram_ann: EngramANNInjection | None = None
         # Side channel for the training loop to read the gate after each
         # forward (used for entropy regularization and optional
         # reconstruction loss). Reset every forward that uses the ANN
@@ -345,8 +349,8 @@ class HarmonyModel(nn.Module):
 
         self._init_weights()
 
-    def attach_engram_ann(self, module: "EngramANNInjection") -> None:
-        """Attach a Model-γ ANN engram injection module.
+    def attach_engram_ann(self, module: EngramANNInjection) -> None:
+        """Attach a Model-gamma ANN engram injection module.
 
         Called by the training script after constructing the model and
         loading the corpus table. The module is registered as a
@@ -360,7 +364,7 @@ class HarmonyModel(nn.Module):
         if not self.config.use_ann_engram:
             raise ValueError(
                 "attach_engram_ann() called but config.use_ann_engram is "
-                "False — set the flag (e.g. via "
+                "False - set the flag (e.g. via "
                 "HarmonyModelConfig.tiny_engram_ann()) before attaching."
             )
         self.engram_ann = module
@@ -451,7 +455,7 @@ class HarmonyModel(nn.Module):
                 h = layer(h)
 
             # Engram injection at the configured layer.
-            # Model γ: ANN path takes precedence when attached.
+            # Model gamma: ANN path takes precedence when attached.
             if i == self.config.engram_injection_layer:
                 if self.engram_ann is not None:
                     residual, gate = self.engram_ann(h)

@@ -79,7 +79,7 @@ The most direct and widely utilized method to combat gate collapse in MoE and re
 
 The gate entropy loss is formally defined as:
 
-```
+```text
 L_entropy = -λ_ent · H(p) = λ_ent · [p log p + (1-p) log(1-p)]
 ```
 
@@ -89,7 +89,7 @@ where `λ_ent` is a hyperparameter controlling the regularization strength. By m
 
 To address the fundamental semantic mismatch between the residual stream and the retrieved embedding, an auxiliary loss can be applied that forces the transformer's internal hidden state to explicitly reconstruct or predict the contents of the retrieved memory:
 
-```
+```text
 L_rec = ||φ(h_t) - e_mem||₂²
 ```
 
@@ -99,7 +99,7 @@ This acts as a strong inductive bias, communicating to the optimizer that the re
 
 A structural bypass to early gate collapse involves overriding the learned gate entirely during the initial phases of pretraining. By implementing a scheduled interpolation:
 
-```
+```text
 g_effective = τ_t · g_min + (1 - τ_t) · σ(W_g · h_t)
 ```
 
