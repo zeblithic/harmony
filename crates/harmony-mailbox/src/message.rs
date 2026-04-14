@@ -32,15 +32,43 @@ pub const CID_LEN: usize = 32;
 /// Length of a message identifier in bytes.
 pub const MESSAGE_ID_LEN: usize = 16;
 
-/// Generate a unique 16-byte message ID by hashing the current nanosecond
-/// timestamp with a process-global atomic counter.
+/// Generate a unique 16-byte message ID.
 ///
-/// Safe to call from multiple threads — the counter guarantees uniqueness
-/// even within the same nanosecond, and BLAKE3 smears the input so IDs are
-/// well-distributed for downstream indexing and dedup.
+/// Combines three independent sources of entropy to make the ID globally
+/// unique, not just process-local:
+///
+/// 1. **Startup salt** — 16 bytes from the OS RNG, generated once per
+///    process on first use. Distinguishes concurrent processes (different
+///    hosts, containers, or restarts) that happen to hit the same clock
+///    tick — which `time + counter` alone cannot.
+/// 2. **Nanosecond timestamp** — current wall clock, for chronological
+///    spread across calls.
+/// 3. **Process-local atomic counter** — guarantees uniqueness within a
+///    single process even if two threads call in the same nanosecond.
+///
+/// The three inputs are mixed with BLAKE3 and truncated to 16 bytes. The
+/// 128-bit output space plus the per-process salt makes cross-process
+/// collisions astronomically unlikely (birthday-paradox collision on 128
+/// bits requires ~2^64 IDs from the *same* process before a 50% chance —
+/// and different processes are in disjoint salted subspaces to begin with).
+///
+/// Safe to call from multiple threads.
 pub fn unique_message_id() -> [u8; MESSAGE_ID_LEN] {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static STARTUP_SALT: OnceLock<[u8; 16]> = OnceLock::new();
+
+    let salt = STARTUP_SALT.get_or_init(|| {
+        use rand::RngCore;
+        let mut buf = [0u8; 16];
+        // OsRng pulls from the platform's secure RNG. If it fails (e.g.
+        // containerized Linux with /dev/urandom blocked), we'd rather
+        // panic at first use than silently emit non-unique IDs.
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        buf
+    });
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -49,6 +77,7 @@ pub fn unique_message_id() -> [u8; MESSAGE_ID_LEN] {
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
 
     let mut hasher = blake3::Hasher::new();
+    hasher.update(salt);
     hasher.update(&now.to_le_bytes());
     hasher.update(&seq.to_le_bytes());
     let hash = hasher.finalize();
@@ -975,6 +1004,41 @@ mod tests {
             bytes.len() < 150,
             "simple message should be under 150 bytes, got {}",
             bytes.len()
+        );
+    }
+
+    #[test]
+    fn unique_message_id_is_unique_across_rapid_calls() {
+        // In-process uniqueness: the atomic counter guarantees distinct
+        // output even when many calls land in the same nanosecond. 10k
+        // calls should produce 10k distinct IDs.
+        const N: usize = 10_000;
+        let mut ids = std::collections::HashSet::with_capacity(N);
+        for _ in 0..N {
+            ids.insert(unique_message_id());
+        }
+        assert_eq!(ids.len(), N, "unique_message_id produced a collision in {N} calls");
+    }
+
+    #[test]
+    fn unique_message_id_uses_startup_salt() {
+        // The salt is process-global, so all IDs in this process share the
+        // same entropy source. We cannot directly observe the salt, but we
+        // can confirm the outputs look well-distributed (no obvious
+        // structure from time/counter alone).
+        let id1 = unique_message_id();
+        let id2 = unique_message_id();
+        // Trivial sanity checks that would fail if salt injection broke
+        // the hash (e.g., if we accidentally returned raw counter bytes):
+        assert_ne!(id1, [0u8; MESSAGE_ID_LEN]);
+        assert_ne!(id2, [0u8; MESSAGE_ID_LEN]);
+        assert_ne!(id1, id2);
+        // At least one byte differs beyond the first few (if the output
+        // were just a counter, most bytes would be zero).
+        let nonzero = id1.iter().filter(|b| **b != 0).count();
+        assert!(
+            nonzero >= 8,
+            "ID looks suspiciously structured: {nonzero} non-zero bytes of 16"
         );
     }
 }

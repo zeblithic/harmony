@@ -7,9 +7,26 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
+
+/// Maximum in-flight raw-mail publish tasks at any given moment.
+///
+/// Bounded so a stalled Zenoh session cannot let per-recipient spawn tasks
+/// accumulate without limit (each holds an Arc<Vec<u8>> payload). 256 is
+/// larger than MAX_RECIPIENTS (100) so a single max-fan-out message never
+/// pressure-stalls on itself, while leaving headroom for concurrent SMTP
+/// deliveries. Excess spawns wait on the semaphore and are released when
+/// a publish completes, times out, or is cancelled.
+const RAW_PUBLISH_CONCURRENCY: usize = 256;
+
+/// Hard ceiling for a single `session.put()` operation.
+///
+/// A healthy Zenoh put returns in milliseconds — anything beyond this
+/// indicates a stalled link. Abort rather than pile up.
+const RAW_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::mailbox::{FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, FOLDER_COUNT, MAX_SNIPPET_LEN};
 use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
@@ -48,6 +65,11 @@ enum RawSink {
     Session {
         session: zenoh::Session,
         cancel: CancellationToken,
+        /// Caps concurrent in-flight `session.put()` tasks. Acquired inside
+        /// the spawned task so the spawn itself is cheap — backpressure
+        /// happens at the permit-acquire point, with cancellation awareness
+        /// in case the semaphore is saturated during shutdown.
+        permits: Arc<Semaphore>,
     },
     #[cfg(test)]
     Captured(Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>),
@@ -136,7 +158,11 @@ impl ZenohPublisher {
         Self {
             latest,
             wake,
-            raw_sink: RawSink::Session { session, cancel },
+            raw_sink: RawSink::Session {
+                session,
+                cancel,
+                permits: Arc::new(Semaphore::new(RAW_PUBLISH_CONCURRENCY)),
+            },
         }
     }
 
@@ -182,29 +208,73 @@ impl ZenohPublisher {
     /// bytes produced by `HarmonyMessage::to_bytes()` so subscribers (e.g.
     /// Phase 0 harmony-client) can decode directly.
     ///
-    /// Payload is `Arc<Vec<u8>>` so a single encoded message can fan out to
-    /// many recipients without per-recipient payload copies — Arc::clone is
-    /// a refcount bump, and the spawned task dereferences to `&[u8]` for
-    /// `session.put`. Worst case allocation: one buffer per message instead
-    /// of one per (message × recipient).
+    /// **Resource bounds:**
+    /// - Payload is `Arc<Vec<u8>>` so a single encoded message can fan out
+    ///   to many recipients without per-recipient payload copies —
+    ///   `Arc::clone` is a refcount bump, and the spawned task dereferences
+    ///   to `&[u8]` for `session.put`.
+    /// - Concurrent in-flight publishes are capped by `RAW_PUBLISH_CONCURRENCY`
+    ///   permits; excess spawns block on the semaphore rather than piling
+    ///   up unbounded Zenoh calls if the session stalls.
+    /// - Each publish has a `RAW_PUBLISH_TIMEOUT` hard cap and observes the
+    ///   shared cancellation token, so stalled puts are aborted instead of
+    ///   holding a permit forever.
     ///
-    /// Skips when the shared cancel token has fired — prevents post-shutdown
-    /// spawns from keeping the runtime alive.
+    /// Short-circuits when the cancel token has already fired before we even
+    /// spawn — prevents post-shutdown spawns from keeping the runtime alive.
     pub fn publish_raw_mail(&self, addr_hex: String, bytes: Arc<Vec<u8>>) {
         match &self.raw_sink {
-            RawSink::Session { session, cancel } => {
+            RawSink::Session {
+                session,
+                cancel,
+                permits,
+            } => {
                 if cancel.is_cancelled() {
                     return;
                 }
                 let session = session.clone();
+                let cancel = cancel.clone();
+                let permits = Arc::clone(permits);
                 let topic = format!("harmony/mail/v1/{addr_hex}");
                 tokio::spawn(async move {
-                    if let Err(e) = session.put(&topic, &bytes[..]).await {
-                        tracing::warn!(
-                            error = %e,
-                            %topic,
-                            "Zenoh raw mail publish failed"
-                        );
+                    // Backpressure: wait for a permit OR cancellation. If
+                    // the semaphore is closed or cancelled, just exit.
+                    let _permit = tokio::select! {
+                        permit = permits.acquire_owned() => match permit {
+                            Ok(p) => p,
+                            Err(_) => return, // semaphore closed
+                        },
+                        _ = cancel.cancelled() => return,
+                    };
+                    // Timeout-bounded, cancel-aware put. Whichever arm fires
+                    // first, the permit drops on return and is released.
+                    tokio::select! {
+                        res = tokio::time::timeout(
+                            RAW_PUBLISH_TIMEOUT,
+                            session.put(&topic, &bytes[..]),
+                        ) => match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    %topic,
+                                    "Zenoh raw mail publish failed"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    %topic,
+                                    timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                                    "Zenoh raw mail publish timed out — aborted"
+                                );
+                            }
+                        },
+                        _ = cancel.cancelled() => {
+                            tracing::debug!(
+                                %topic,
+                                "Zenoh raw mail publish cancelled during shutdown"
+                            );
+                        }
                     }
                 });
             }
