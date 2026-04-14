@@ -878,8 +878,21 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 }
             }
-            SmtpAction::CheckSpf { .. } => {
-                // SPF checking tracked in Linear — requires mail_auth SPF resolver integration
+            SmtpAction::CheckSpf { sender_domain, peer_ip } => {
+                if let Some(ref auth) = authenticator {
+                    let spf_params = mail_auth::spf::verify::SpfParameters::verify_ehlo(
+                        *peer_ip,
+                        sender_domain.as_str(),
+                        local_domain,
+                    );
+                    let spf_output = auth.verify_spf(spf_params).await;
+                    *spf_result = crate::auth::map_spf_result(&spf_output);
+                    tracing::debug!(
+                        %sender_domain,
+                        result = ?spf_result,
+                        "SPF check complete"
+                    );
+                }
             }
             SmtpAction::StartTls => {
                 needs_starttls = true;
