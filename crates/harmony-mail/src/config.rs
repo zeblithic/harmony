@@ -12,6 +12,8 @@ pub struct Config {
     pub harmony: HarmonyConfig,
     #[serde(default)]
     pub imap: ImapConfig,
+    #[serde(default)]
+    pub zenoh: Option<ZenohConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +221,18 @@ fn default_idle_timeout() -> u64 {
 }
 fn default_max_auth_failures() -> u32 {
     3
+}
+
+/// Optional Zenoh configuration for Merkle mailbox publication.
+///
+/// If absent or disabled, SMTP delivery still works — messages go to the
+/// IMAP store and CAS, but root CID updates are not published to the network.
+#[derive(Debug, Deserialize)]
+pub struct ZenohConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Explicit Zenoh endpoint. If omitted, uses Zenoh's default peer discovery.
+    pub endpoint: Option<String>,
 }
 
 impl Config {
@@ -490,5 +504,23 @@ identity_key = "/tmp/test.key"
             result.is_err(),
             "should fail when required field is missing"
         );
+    }
+
+    #[test]
+    fn parse_config_with_zenoh() {
+        let config_str = format!(
+            "{}\n\n[zenoh]\nenabled = true\nendpoint = \"tcp/192.168.1.1:7447\"\n",
+            FULL_CONFIG
+        );
+        let config = Config::from_toml(&config_str).expect("should parse with zenoh section");
+        let zenoh = config.zenoh.expect("zenoh should be Some");
+        assert!(zenoh.enabled);
+        assert_eq!(zenoh.endpoint.as_deref(), Some("tcp/192.168.1.1:7447"));
+    }
+
+    #[test]
+    fn parse_config_without_zenoh() {
+        let config = Config::from_toml(FULL_CONFIG).expect("should parse without zenoh section");
+        assert!(config.zenoh.is_none());
     }
 }
