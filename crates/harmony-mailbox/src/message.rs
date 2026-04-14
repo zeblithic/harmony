@@ -205,6 +205,12 @@ impl HarmonyMessage {
     ///
     /// Returns `MailboxError` if any field exceeds its size limit.
     pub fn to_bytes(&self) -> Result<Vec<u8>, MailboxError> {
+        // Validate version: writers must emit the current wire format.
+        // Serializing an unknown/legacy version would produce bytes that every
+        // decoder would reject with UnsupportedVersion, a silent data-loss bug.
+        if self.version != VERSION {
+            return Err(MailboxError::UnsupportedVersion(self.version));
+        }
         // Validate limits
         if self.subject.len() > MAX_SUBJECT_LEN {
             return Err(MailboxError::SubjectTooLong {
@@ -247,8 +253,8 @@ impl HarmonyMessage {
 
         let mut buf = Vec::with_capacity(MIN_HEADER_SIZE);
 
-        // version: 1 byte
-        buf.push(self.version);
+        // version: 1 byte (pinned to VERSION — validated above)
+        buf.push(VERSION);
         // message_type: 1 byte
         buf.push(self.message_type as u8);
         // flags: 1 byte

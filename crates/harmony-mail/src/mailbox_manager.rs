@@ -12,13 +12,27 @@ use tokio::sync::mpsc;
 use crate::mailbox::{FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, FOLDER_COUNT, MAX_SNIPPET_LEN};
 use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 
+/// Bounded channel capacity for Zenoh root CID notifications.
+///
+/// Since only the latest root CID per user is meaningful (older CIDs are
+/// superseded), a modest buffer is sufficient. `try_send` drops updates if
+/// the queue is full — a dropped notification just delays the client's next
+/// refresh, which will pick up the latest root CID on the next successful send.
+const ZENOH_NOTIFY_CAPACITY: usize = 128;
+
 /// Notification channel for Zenoh root CID publications.
 ///
 /// `MailboxManager` runs in sync context (`spawn_blocking`). This struct holds
-/// the send side of an unbounded mpsc channel. A background async task
-/// drains the receiver and calls `session.put()`.
+/// the send side of a bounded mpsc channel. A background async task drains
+/// the receiver and calls `session.put()`.
+///
+/// The channel is bounded to provide backpressure: if Zenoh publishing stalls,
+/// notifications are dropped (with a throttled warn) rather than accumulating
+/// without limit. This is safe because root CID updates are idempotent — the
+/// next successful publish will carry the latest root CID regardless of how
+/// many intermediate notifications were dropped.
 pub struct ZenohPublisher {
-    tx: mpsc::UnboundedSender<(String, [u8; CID_LEN])>,
+    tx: mpsc::Sender<(String, [u8; CID_LEN])>,
 }
 
 impl ZenohPublisher {
@@ -27,7 +41,7 @@ impl ZenohPublisher {
     /// Spawns a background task that drains the channel and publishes
     /// root CID updates to `harmony/messages/{addr_hex}/inbox`.
     pub fn new(session: zenoh::Session) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<(String, [u8; CID_LEN])>();
+        let (tx, mut rx) = mpsc::channel::<(String, [u8; CID_LEN])>(ZENOH_NOTIFY_CAPACITY);
         tokio::spawn(async move {
             while let Some((addr_hex, root_cid)) = rx.recv().await {
                 let topic = format!("harmony/messages/{addr_hex}/inbox");
@@ -41,14 +55,27 @@ impl ZenohPublisher {
 
     /// Create a publisher from a raw sender (for testing).
     #[cfg(test)]
-    pub fn from_sender(tx: mpsc::UnboundedSender<(String, [u8; CID_LEN])>) -> Self {
+    pub fn from_sender(tx: mpsc::Sender<(String, [u8; CID_LEN])>) -> Self {
         Self { tx }
     }
 
     /// Send a root CID update notification.
+    ///
+    /// Uses `try_send` to avoid blocking the calling thread. If the channel
+    /// is full (Zenoh publishing is stalled), the notification is dropped
+    /// and logged. This is safe because root CID updates supersede each other
+    /// — the next successful send carries the latest state.
     pub fn notify(&self, addr_hex: String, root_cid: [u8; CID_LEN]) {
-        if let Err(e) = self.tx.send((addr_hex, root_cid)) {
-            tracing::warn!(error = %e, "ZenohPublisher channel closed");
+        match self.tx.try_send((addr_hex, root_cid)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    "ZenohPublisher channel full — root CID notification dropped (client will catch up on next update)"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("ZenohPublisher channel closed");
+            }
         }
     }
 }
@@ -723,7 +750,7 @@ mod tests {
         std::fs::create_dir_all(cas_path.join("commits")).unwrap();
         std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
         let publisher = ZenohPublisher::from_sender(tx);
 
         let addr = [0xAAu8; ADDRESS_HASH_LEN];
@@ -741,10 +768,14 @@ mod tests {
         )
         .unwrap();
 
-        // Verify the publisher received the notification.
-        let (received_addr, received_cid) = rx.recv().await.unwrap();
-        assert_eq!(received_addr, hex::encode(addr));
-        assert_eq!(received_cid, *mgr.get_root(&addr).unwrap());
+        // Verify the publisher received the notification within a bounded time
+        // so a broken notification path fails fast instead of hanging CI.
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("ZenohPublisher did not notify within 2s")
+            .expect("notification channel closed unexpectedly");
+        assert_eq!(received.0, hex::encode(addr));
+        assert_eq!(received.1, *mgr.get_root(&addr).unwrap());
     }
 
     #[tokio::test]

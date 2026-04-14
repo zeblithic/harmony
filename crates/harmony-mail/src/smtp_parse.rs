@@ -2,8 +2,6 @@
 //!
 //! Parses raw SMTP command lines into [`SmtpCommand`] variants.
 
-use harmony_mailbox::MailboxError;
-
 use crate::error::MailError;
 use crate::smtp::SmtpCommand;
 
@@ -19,8 +17,7 @@ pub fn parse_command(line: &[u8]) -> Result<SmtpCommand, MailError> {
         other => other,
     };
 
-    let text =
-        std::str::from_utf8(line).map_err(|_| MailboxError::InvalidUtf8 { field: "command" })?;
+    let text = std::str::from_utf8(line).map_err(|_| MailError::InvalidSmtpUtf8)?;
 
     let text = text.trim();
     if text.is_empty() {

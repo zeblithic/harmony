@@ -269,25 +269,54 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
         let zenoh_enabled = config.zenoh.as_ref().map(|z| z.enabled).unwrap_or(false);
         if zenoh_enabled {
+            // Build Zenoh config. An explicit endpoint override is treated
+            // as required — silently falling back to peer-discovery defaults
+            // would open an inbound listener the operator didn't ask for.
             let mut zenoh_config = zenoh::Config::default();
-            if let Some(ref ep) = config.zenoh.as_ref().and_then(|z| z.endpoint.as_ref()) {
-                if let Ok(ep_json) = serde_json::to_string(ep) {
-                    let _ = zenoh_config.insert_json5("connect/endpoints", &format!("[{ep_json}]"));
-                }
-            }
-
-            match zenoh::open(zenoh_config).await {
-                Ok(session) => {
-                    tracing::info!("Zenoh session opened for mailbox notifications");
-                    let publisher = ZenohPublisher::new(session);
-                    if let Some(ref mgr_arc) = mailbox_mgr {
-                        if let Ok(mut mgr) = mgr_arc.lock() {
-                            mgr.set_publisher(publisher);
+            let endpoint = config.zenoh.as_ref().and_then(|z| z.endpoint.as_ref());
+            let config_ok = match endpoint {
+                Some(ep) => match serde_json::to_string(ep) {
+                    Ok(ep_json) => {
+                        match zenoh_config.insert_json5("connect/endpoints", &format!("[{ep_json}]")) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::error!(error = %e, endpoint = %ep, "Zenoh endpoint config rejected, mailbox notifications disabled");
+                                false
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Zenoh open failed, mailbox notifications disabled");
+                    Err(e) => {
+                        tracing::error!(error = %e, endpoint = %ep, "Zenoh endpoint JSON-encode failed, mailbox notifications disabled");
+                        false
+                    }
+                },
+                None => true,
+            };
+
+            if config_ok {
+                match zenoh::open(zenoh_config).await {
+                    Ok(session) => {
+                        tracing::info!("Zenoh session opened for mailbox notifications");
+                        let publisher = ZenohPublisher::new(session);
+                        if let Some(ref mgr_arc) = mailbox_mgr {
+                            // Recover from a poisoned mutex rather than silently
+                            // skipping publisher attachment — Merkle mailbox
+                            // updates are low-severity but we want visibility
+                            // into lock state to match the rest of the server.
+                            match mgr_arc.lock() {
+                                Ok(mut mgr) => mgr.set_publisher(publisher),
+                                Err(poisoned) => {
+                                    tracing::warn!("MailboxManager mutex poisoned during Zenoh publisher attach, recovering");
+                                    poisoned.into_inner().set_publisher(publisher);
+                                }
+                            }
+                        } else {
+                            tracing::warn!("MailboxManager unavailable, Zenoh publisher not attached");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Zenoh open failed, mailbox notifications disabled");
+                    }
                 }
             }
         } else {

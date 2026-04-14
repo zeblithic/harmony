@@ -9,6 +9,9 @@ pub enum MailError {
     #[error("unknown SMTP command: {0}")]
     UnknownCommand(String),
 
+    #[error("invalid UTF-8 in SMTP command line")]
+    InvalidSmtpUtf8,
+
     #[error("invalid identity bytes in registration")]
     InvalidIdentity,
 }

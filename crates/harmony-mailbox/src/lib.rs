@@ -15,7 +15,7 @@ pub use mailbox::{
     ROOT_MAGIC,
 };
 pub use message::{
-    AttachmentRef, HarmonyMessage, MailMessageType, MessageFlags, Recipient, ADDRESS_HASH_LEN,
-    CID_LEN, MAX_ATTACHMENTS, MAX_BODY_LEN, MAX_RECIPIENTS, MAX_SUBJECT_LEN, MESSAGE_ID_LEN,
-    VERSION,
+    AttachmentRef, HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType,
+    ADDRESS_HASH_LEN, CID_LEN, MAX_ATTACHMENTS, MAX_BODY_LEN, MAX_RECIPIENTS, MAX_SUBJECT_LEN,
+    MESSAGE_ID_LEN, VERSION,
 };
