@@ -892,10 +892,121 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 }
             }
-            SmtpAction::DeliverToHarmony { .. } => {
-                // Stub: delivery always succeeds.
-                // Real implementation will deliver to Harmony network.
-                let callback_actions = session.handle(SmtpEvent::DeliveryResult { success: true });
+            SmtpAction::DeliverToHarmony { recipients, data } => {
+                use crate::message::ADDRESS_HASH_LEN;
+
+                // Phase 1: Spam scoring
+                let signals = crate::spam::SpamSignals {
+                    dnsbl_listed: false,
+                    fcrdns_pass: true,
+                    spf_result: spf_result.clone(),
+                    dkim_result: crate::spam::DkimResult::Missing,
+                    dmarc_result: crate::spam::DmarcResult::None,
+                    has_executable_attachment: false,
+                    url_count: 0,
+                    empty_subject: false,
+                    known_harmony_sender: false,
+                    gateway_trust: None,
+                    first_contact: true,
+                };
+                let verdict = crate::spam::score(&signals, reject_threshold);
+                if matches!(verdict.action, crate::spam::SpamAction::Reject) {
+                    tracing::info!(score = verdict.score, "message rejected by spam filter");
+                    let callback_actions = session.handle(SmtpEvent::DeliveryResult { success: false });
+                    execute_actions_generic(&callback_actions, writer).await?;
+                    continue;
+                }
+
+                // Phase 2: Translate RFC 5322 -> HarmonyMessage
+                let translated = match crate::translate::translate_inbound(data) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "message translation failed");
+                        let callback_actions = session.handle(SmtpEvent::DeliveryResult { success: false });
+                        execute_actions_generic(&callback_actions, writer).await?;
+                        continue;
+                    }
+                };
+
+                // Phase 3: Store in CAS
+                let message_cid = match translated.message.to_bytes() {
+                    Ok(msg_bytes) => {
+                        let csp = content_store_path.to_path_buf();
+                        let cid_result = tokio::task::spawn_blocking(move || {
+                            let mut book_store = harmony_db::DiskBookStore::new(&csp);
+                            harmony_content::dag::ingest(
+                                &msg_bytes,
+                                &harmony_content::chunker::ChunkerConfig::DEFAULT,
+                                &mut book_store,
+                            )
+                        })
+                        .await
+                        .map_err(|e| format!("CAS task panicked: {e}"))?;
+                        match cid_result {
+                            Ok(cid) => Some(cid.to_bytes()),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "CAS storage failed, delivering without CID");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "message serialization failed, delivering without CID");
+                        None
+                    }
+                };
+
+                // Phase 4: Deliver to local IMAP mailboxes
+                let mut delivered_count = 0u32;
+                let timestamp = translated.message.timestamp;
+                let rfc822_size = data.len() as u32;
+                let msg_id = translated.message.message_id;
+
+                for recipient_hash in recipients {
+                    match imap_store.get_user_by_address(recipient_hash) {
+                        Ok(Some(_user)) => {
+                            let cid_ref = message_cid.as_ref();
+                            match imap_store.insert_message(
+                                "INBOX",
+                                &msg_id,
+                                cid_ref,
+                                timestamp,
+                                rfc822_size,
+                            ) {
+                                Ok(_uid) => {
+                                    delivered_count += 1;
+                                    tracing::debug!(
+                                        recipient = hex::encode(recipient_hash),
+                                        "delivered to local INBOX"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        recipient = hex::encode(recipient_hash),
+                                        error = %e,
+                                        "failed to insert message into INBOX"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                recipient = hex::encode(recipient_hash),
+                                "no local user for recipient"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                recipient = hex::encode(recipient_hash),
+                                error = %e,
+                                "user lookup failed"
+                            );
+                        }
+                    }
+                }
+
+                let success = delivered_count > 0;
+                let callback_actions = session.handle(SmtpEvent::DeliveryResult { success });
                 execute_actions_generic(&callback_actions, writer).await?;
                 for a in &callback_actions {
                     if matches!(
