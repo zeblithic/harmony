@@ -72,6 +72,68 @@ class TestHarmonyModelConfig:
         c = HarmonyModelConfig.tiny()
         assert c.num_kv_groups == 2  # 8 / 4
 
+    def test_layer_ffn_dim_default(self):
+        """Without overrides, layer_ffn_dim returns the global ffn_dim."""
+        c = HarmonyModelConfig.tiny()
+        assert c.ffn_dim_overrides is None
+        for i in range(c.num_layers):
+            assert c.layer_ffn_dim(i) == 1365
+
+    def test_layer_ffn_dim_with_override(self):
+        """Override applies only to the listed layer."""
+        c = HarmonyModelConfig.tiny()
+        c.ffn_dim_overrides = {2: 1877}
+        assert c.layer_ffn_dim(0) == 1365
+        assert c.layer_ffn_dim(1) == 1365
+        assert c.layer_ffn_dim(2) == 1877
+        assert c.layer_ffn_dim(3) == 1365
+
+
+class TestModelBeta:
+    """ZEB-117 Model β: params-matched dense control via FFN expansion."""
+
+    def test_tiny_ffn_expanded_factory(self):
+        beta = HarmonyModelConfig.tiny_ffn_expanded()
+        base = HarmonyModelConfig.tiny()
+        # Identical to tiny() except for ffn_dim_overrides at the
+        # engram-injection layer.
+        assert beta.num_layers == base.num_layers
+        assert beta.hidden_dim == base.hidden_dim
+        assert beta.ffn_dim == base.ffn_dim
+        assert beta.engram_injection_layer == base.engram_injection_layer
+        assert beta.ffn_dim_overrides == {base.engram_injection_layer: 1877}
+
+    def test_param_delta_matches_cross_attention_overhead(self):
+        """Model β must add exactly 786,432 params over Model α (tiny baseline).
+
+        This matches the parameter overhead of an independent cross-attention
+        block (3 × 512 × 512 = W_k, W_v, W_o for hidden_dim=512), per the
+        Gemini research report Table 3 / section 5.2.
+        """
+        # Use small vocab to avoid the embedding dominating the count when
+        # comparing — embeddings are identical between α and β so they cancel.
+        alpha = HarmonyModelConfig.tiny()
+        beta = HarmonyModelConfig.tiny_ffn_expanded()
+        m_alpha = HarmonyModel(alpha)
+        m_beta = HarmonyModel(beta)
+        n_alpha = sum(p.numel() for p in m_alpha.parameters())
+        n_beta = sum(p.numel() for p in m_beta.parameters())
+        delta = n_beta - n_alpha
+        assert delta == 786_432, (
+            f"Expected +786,432 params (3 × 512 × 512), got +{delta}"
+        )
+
+    def test_beta_model_forward_shape(self):
+        """Model β should run a forward pass with correct output shape."""
+        beta = HarmonyModelConfig.tiny_ffn_expanded()
+        # Shrink for fast test: keep architecture but smaller dims.
+        beta.vocab_size = 128
+        beta.max_seq_len = 64
+        model = HarmonyModel(beta)
+        input_ids = torch.randint(0, 128, (2, 16))
+        logits = model(input_ids=input_ids)
+        assert logits.shape == (2, 16, 128)
+
 
 # ---------------------------------------------------------------------------
 # Shared helper

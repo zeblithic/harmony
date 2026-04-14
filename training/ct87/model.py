@@ -22,6 +22,13 @@ class HarmonyModelConfig:
 
     Field names and values match the Rust HarmonyModelConfig in
     crates/harmony-inference/src/harmony_model.rs.
+
+    The `ffn_dim_overrides` field is research-only (not mirrored in Rust):
+    when set to a non-empty mapping, the listed layer indices use a
+    different feed-forward intermediate dimension. Used by ZEB-117 Model β
+    as a params-matched dense control for the engram-injection bake-off.
+    Configs that set overrides are not GGUF-portable and will fail the
+    Rust-parity tests.
     """
 
     num_layers: int
@@ -41,6 +48,16 @@ class HarmonyModelConfig:
     think_token_id: int | None = None
     ct_max_steps: int | None = None
     ct_confidence_threshold: float | None = None
+    ffn_dim_overrides: dict[int, int] | None = None
+
+    def layer_ffn_dim(self, layer_idx: int) -> int:
+        """Effective FFN intermediate dim for a given layer.
+
+        Returns the override if set for this layer, else the global `ffn_dim`.
+        """
+        if self.ffn_dim_overrides is not None and layer_idx in self.ffn_dim_overrides:
+            return self.ffn_dim_overrides[layer_idx]
+        return self.ffn_dim
 
     @property
     def num_blocks(self) -> int:
@@ -89,6 +106,25 @@ class HarmonyModelConfig:
             engram_dim=128,
             tie_embeddings=True,
         )
+
+    @staticmethod
+    def tiny_ffn_expanded() -> HarmonyModelConfig:
+        """Model β — params-matched dense control for the ZEB-117 bake-off.
+
+        Identical to tiny() except the engram-injection layer's FFN
+        intermediate dimension is expanded from 1365 to 1877. This adds
+        3 × 512 × 512 = 786,432 parameters to that single MLP, matching
+        the overhead of the Model δ cross-attention block (independent
+        W_k, W_v, W_o). Isolates the retrieval contribution in Models γ
+        and δ from the free-parameter regularization contribution
+        established by ZEB-102 Phase 0 ablations.
+
+        See docs/research/2026-04-14-engram-injection-mechanism-findings.md
+        for methodology (Table 3 / section 5.2).
+        """
+        base = HarmonyModelConfig.tiny()
+        base.ffn_dim_overrides = {base.engram_injection_layer: 1877}
+        return base
 
 
 # ---------------------------------------------------------------------------
@@ -175,23 +211,29 @@ class Attention(nn.Module):
 
 
 class Mlp(nn.Module):
-    def __init__(self, config: HarmonyModelConfig):
+    def __init__(self, config: HarmonyModelConfig, ffn_dim: int | None = None):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_dim, config.ffn_dim, bias=False)
-        self.up_proj = nn.Linear(config.hidden_dim, config.ffn_dim, bias=False)
-        self.down_proj = nn.Linear(config.ffn_dim, config.hidden_dim, bias=False)
+        effective_ffn_dim = config.ffn_dim if ffn_dim is None else ffn_dim
+        self.gate_proj = nn.Linear(config.hidden_dim, effective_ffn_dim, bias=False)
+        self.up_proj = nn.Linear(config.hidden_dim, effective_ffn_dim, bias=False)
+        self.down_proj = nn.Linear(effective_ffn_dim, config.hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, config: HarmonyModelConfig, rotary_emb: RotaryEmbedding):
+    def __init__(
+        self,
+        config: HarmonyModelConfig,
+        rotary_emb: RotaryEmbedding,
+        layer_idx: int = 0,
+    ):
         super().__init__()
         self.attn_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
         self.attn = Attention(config, rotary_emb)
         self.ffn_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
-        self.mlp = Mlp(config)
+        self.mlp = Mlp(config, ffn_dim=config.layer_ffn_dim(layer_idx))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x + self.attn(self.attn_norm(x))
@@ -283,7 +325,8 @@ class HarmonyModel(nn.Module):
 
         rotary_emb = RotaryEmbedding(config.head_dim, config.max_seq_len, config.rope_theta)
         self.layers = nn.ModuleList([
-            TransformerLayer(config, rotary_emb) for _ in range(config.num_layers)
+            TransformerLayer(config, rotary_emb, layer_idx=i)
+            for i in range(config.num_layers)
         ])
 
         self.final_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
