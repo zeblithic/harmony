@@ -50,11 +50,36 @@ class HarmonyModelConfig:
     ct_confidence_threshold: float | None = None
     ffn_dim_overrides: dict[int, int] | None = None
 
+    def __post_init__(self) -> None:
+        """Validate `ffn_dim_overrides` up front so misconfigurations fail fast.
+
+        Catches silent typos (out-of-range layer indices that would never
+        be queried) and invalid dims (<=0) before model construction.
+        """
+        if self.ffn_dim_overrides is None:
+            return
+        for layer_idx, dim in self.ffn_dim_overrides.items():
+            if not (0 <= layer_idx < self.num_layers):
+                raise ValueError(
+                    f"ffn_dim_overrides has layer_idx={layer_idx} outside "
+                    f"[0, {self.num_layers}) — would be silently ignored "
+                    "at model construction."
+                )
+            if not isinstance(dim, int) or dim <= 0:
+                raise ValueError(
+                    f"ffn_dim_overrides[{layer_idx}]={dim!r} must be a "
+                    "positive int."
+                )
+
     def layer_ffn_dim(self, layer_idx: int) -> int:
         """Effective FFN intermediate dim for a given layer.
 
         Returns the override if set for this layer, else the global `ffn_dim`.
         """
+        if not (0 <= layer_idx < self.num_layers):
+            raise ValueError(
+                f"layer_idx={layer_idx} must be in [0, {self.num_layers})"
+            )
         if self.ffn_dim_overrides is not None and layer_idx in self.ffn_dim_overrides:
             return self.ffn_dim_overrides[layer_idx]
         return self.ffn_dim
@@ -109,21 +134,23 @@ class HarmonyModelConfig:
 
     @staticmethod
     def tiny_ffn_expanded() -> HarmonyModelConfig:
-        """Model β — params-matched dense control for the ZEB-117 bake-off.
+        """Model beta - params-matched dense control for the ZEB-117 bake-off.
 
         Identical to tiny() except the engram-injection layer's FFN
         intermediate dimension is expanded from 1365 to 1877. This adds
-        3 × 512 × 512 = 786,432 parameters to that single MLP, matching
-        the overhead of the Model δ cross-attention block (independent
-        W_k, W_v, W_o). Isolates the retrieval contribution in Models γ
-        and δ from the free-parameter regularization contribution
-        established by ZEB-102 Phase 0 ablations.
+        3 x 512 x 512 = 786,432 parameters to that single MLP, matching
+        the overhead of the Model delta cross-attention block (independent
+        W_k, W_v, W_o). Isolates the retrieval contribution in Models
+        gamma and delta from the free-parameter regularization
+        contribution established by ZEB-102 Phase 0 ablations.
 
         See docs/research/2026-04-14-engram-injection-mechanism-findings.md
         for methodology (Table 3 / section 5.2).
         """
         base = HarmonyModelConfig.tiny()
         base.ffn_dim_overrides = {base.engram_injection_layer: 1877}
+        # Re-validate since we mutated the dataclass after construction.
+        base.__post_init__()
         return base
 
 
@@ -227,7 +254,7 @@ class TransformerLayer(nn.Module):
         self,
         config: HarmonyModelConfig,
         rotary_emb: RotaryEmbedding,
-        layer_idx: int = 0,
+        layer_idx: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)

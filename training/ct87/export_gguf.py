@@ -200,6 +200,21 @@ def export_gguf(
     if name is None:
         name = "ct87"
 
+    # Per-layer FFN overrides change tensor shapes for overridden layers,
+    # but the GGUF format records a single global feed_forward_length.
+    # Refuse to export rather than write metadata that contradicts the
+    # tensors. Research-only configs like ZEB-117 Model beta are exactly
+    # the ones that use overrides, and they are not intended to be
+    # GGUF-portable.
+    if config.ffn_dim_overrides:
+        raise ValueError(
+            "GGUF export is not supported for configs with "
+            "ffn_dim_overrides set. The format records a single "
+            "feed_forward_length in metadata, which cannot represent "
+            "per-layer FFN widths. Overrides found: "
+            f"{dict(config.ffn_dim_overrides)}"
+        )
+
     naming_map = build_naming_map(config)
 
     # Validate completeness
