@@ -681,6 +681,28 @@ impl ImapStore {
             .optional()?;
         Ok(row)
     }
+
+    /// List all registered users.
+    pub fn list_users(&self) -> Result<Vec<UserRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, username, harmony_address, created_at FROM users ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let harmony_blob: Vec<u8> = row.get(2)?;
+            let mut harmony_address = [0u8; ADDRESS_HASH_LEN];
+            if harmony_blob.len() == ADDRESS_HASH_LEN {
+                harmony_address.copy_from_slice(&harmony_blob);
+            }
+            Ok(UserRow {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                harmony_address,
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1056,6 +1078,33 @@ mod tests {
 
         let missing = store.get_user_by_address(&[0xCC; ADDRESS_HASH_LEN]).unwrap();
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn list_users_returns_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImapStore::open(&dir.path().join("test.db")).unwrap();
+        store.initialize_default_mailboxes().unwrap();
+
+        let addr1 = [0xAAu8; ADDRESS_HASH_LEN];
+        let addr2 = [0xBBu8; ADDRESS_HASH_LEN];
+        store.create_user("alice", "pass1", &addr1).unwrap();
+        store.create_user("bob", "pass2", &addr2).unwrap();
+
+        let users = store.list_users().unwrap();
+        assert_eq!(users.len(), 2);
+        let usernames: Vec<&str> = users.iter().map(|u| u.username.as_str()).collect();
+        assert!(usernames.contains(&"alice"));
+        assert!(usernames.contains(&"bob"));
+    }
+
+    #[test]
+    fn list_users_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImapStore::open(&dir.path().join("test.db")).unwrap();
+        store.initialize_default_mailboxes().unwrap();
+        let users = store.list_users().unwrap();
+        assert!(users.is_empty());
     }
 
     #[test]
