@@ -655,6 +655,32 @@ impl ImapStore {
             .optional()?;
         Ok(row)
     }
+
+    pub fn get_user_by_address(
+        &self,
+        address: &[u8; ADDRESS_HASH_LEN],
+    ) -> Result<Option<UserRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, username, harmony_address, created_at FROM users WHERE harmony_address = ?1",
+        )?;
+        let row = stmt
+            .query_row([address.as_slice()], |row| {
+                let harmony_blob: Vec<u8> = row.get(2)?;
+                let mut harmony_address = [0u8; ADDRESS_HASH_LEN];
+                if harmony_blob.len() == ADDRESS_HASH_LEN {
+                    harmony_address.copy_from_slice(&harmony_blob);
+                }
+                Ok(UserRow {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    harmony_address,
+                    created_at: row.get(3)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1012,6 +1038,24 @@ mod tests {
             .unwrap();
         let user = store.get_user("bob").unwrap().unwrap();
         assert_eq!(user.username, "bob");
+    }
+
+    #[test]
+    fn get_user_by_address() {
+        let store = test_store();
+        let addr_a = [0xAA; ADDRESS_HASH_LEN];
+        let addr_b = [0xBB; ADDRESS_HASH_LEN];
+        store.create_user("alice", "pass", &addr_a).unwrap();
+        store.create_user("bob", "pass", &addr_b).unwrap();
+
+        let user = store.get_user_by_address(&addr_a).unwrap().unwrap();
+        assert_eq!(user.username, "alice");
+
+        let user = store.get_user_by_address(&addr_b).unwrap().unwrap();
+        assert_eq!(user.username, "bob");
+
+        let missing = store.get_user_by_address(&[0xCC; ADDRESS_HASH_LEN]).unwrap();
+        assert!(missing.is_none());
     }
 
     #[test]
