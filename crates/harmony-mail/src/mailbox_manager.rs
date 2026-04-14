@@ -135,72 +135,49 @@ impl ZenohPublisher {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     map.drain().collect()
                 };
+                // Publish every entry in the snapshot, timeout-bounded, with
+                // no inner cancel race. Two reasons:
+                //
+                // 1. Once a snapshot is drained from the coalescing map, the
+                //    entries are consumed — if we abort mid-snapshot, those
+                //    updates are lost until the next `insert_message` bumps
+                //    the same addr. Committing to the full snapshot (each
+                //    entry timeout-bounded) preserves the "drain at least
+                //    once" invariant the coalescing contract depends on.
+                // 2. `RAW_PUBLISH_TIMEOUT` (10s) already caps stall risk per
+                //    entry. Total shutdown latency is bounded by
+                //    (timeout × snapshot_len); cancel is observed at the
+                //    outer `select!` between iterations, which is plenty
+                //    responsive for a typical snapshot size (bounded by the
+                //    number of active users whose mailboxes updated in the
+                //    current wake cycle).
+                //
+                // Cancel fires during a put → the current put's timeout
+                // still applies (worst case 10s to notice), then the outer
+                // loop's select observes cancel, snapshots once more to
+                // catch any late arrivals, drains, and breaks.
                 for (addr_hex, root_cid) in snapshot {
                     let topic = format!("harmony/mail/v1/{addr_hex}/root");
-                    if cancelled {
-                        // Final drain pass. The cancel token is already
-                        // fired, so racing against `drain_cancel.cancelled()`
-                        // inside this select would resolve immediately on
-                        // every iteration and skip the put entirely —
-                        // defeating the whole point of the final drain. Use
-                        // the timeout alone: each entry gets up to
-                        // RAW_PUBLISH_TIMEOUT to complete, which bounds
-                        // shutdown latency at (timeout × snapshot_len) while
-                        // still delivering entries that can actually reach
-                        // the router.
-                        match tokio::time::timeout(
-                            RAW_PUBLISH_TIMEOUT,
-                            drain_session.put(&topic, &root_cid[..]),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    %topic,
-                                    "Zenoh root CID publish failed during shutdown drain"
-                                );
-                            }
-                            Err(_elapsed) => {
-                                tracing::warn!(
-                                    %topic,
-                                    timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
-                                    "Zenoh root CID publish timed out during shutdown drain"
-                                );
-                            }
+                    match tokio::time::timeout(
+                        RAW_PUBLISH_TIMEOUT,
+                        drain_session.put(&topic, &root_cid[..]),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                %topic,
+                                "Zenoh root CID publish failed"
+                            );
                         }
-                    } else {
-                        // Pre-cancel path: race put vs cancel. If cancel
-                        // fires during the put, break out so the outer loop
-                        // snapshots again with `cancelled = true` and the
-                        // final-drain branch above handles anything that
-                        // arrived concurrently.
-                        tokio::select! {
-                            res = tokio::time::timeout(
-                                RAW_PUBLISH_TIMEOUT,
-                                drain_session.put(&topic, &root_cid[..]),
-                            ) => match res {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        %topic,
-                                        "Zenoh root CID publish failed"
-                                    );
-                                }
-                                Err(_elapsed) => {
-                                    tracing::warn!(
-                                        %topic,
-                                        timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
-                                        "Zenoh root CID publish timed out — aborted"
-                                    );
-                                }
-                            },
-                            _ = drain_cancel.cancelled() => {
-                                cancelled = true;
-                                break;
-                            }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                %topic,
+                                timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                                "Zenoh root CID publish timed out — aborted"
+                            );
                         }
                     }
                 }

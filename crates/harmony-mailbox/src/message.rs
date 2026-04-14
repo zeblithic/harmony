@@ -80,14 +80,15 @@ pub fn unique_message_id() -> [u8; MESSAGE_ID_LEN] {
 }
 
 /// Pure, testable core of `unique_message_id`: hash a `(salt, time, seq)`
-/// triple into 16 bytes. Split out so tests can pin all three inputs and
-/// prove that the salt is actually fed into the hash (i.e. swapping the
-/// salt while keeping time+seq constant changes the output).
+/// triple into 16 bytes. Split out so in-module tests can pin all three
+/// inputs and prove that the salt is actually fed into the hash (i.e.
+/// swapping the salt while keeping time+seq constant changes the output).
 ///
-/// `pub(crate)` (not `pub`) because callers outside the crate should use
-/// `unique_message_id()` and get the real entropy sources; the helper is
-/// an internal seam for verification only.
-pub(crate) fn compute_message_id(
+/// Private (not `pub(crate)`): callers outside this module — even within
+/// the crate — should use `unique_message_id()` and get the real entropy
+/// sources. The helper is an internal verification seam only; the module
+/// test submodule can still reach it via `super::*`.
+fn compute_message_id(
     salt: &[u8; 16],
     time_nanos: u128,
     seq: u64,
