@@ -106,9 +106,12 @@ pub enum SmtpAction {
     },
     /// Initiate TLS upgrade.
     StartTls,
-    /// Check SPF for the sender domain.
+    /// Check SPF for the MAIL FROM identity (RFC 7208 §2.4).
     CheckSpf {
-        sender_domain: String,
+        /// Full MAIL FROM address (e.g. "user@example.com").
+        mail_from: String,
+        /// EHLO/HELO domain for fallback (RFC 7208 §2.3).
+        ehlo_domain: String,
         peer_ip: IpAddr,
     },
     /// Resolve a local part to a Harmony identity.
@@ -314,15 +317,17 @@ impl SmtpSession {
             )];
         }
         let sender_domain = extract_domain(&address);
-        self.mail_from = Some(address);
+        self.mail_from = Some(address.clone());
         self.state = SmtpState::MailFromReceived;
 
         let mut actions = vec![SmtpAction::SendResponse(250, "OK".to_string())];
         // Skip SPF for null sender (MAIL FROM:<>) — RFC 5321 §4.5.5 bounce/DSN.
         if !sender_domain.is_empty() {
             if let Some(peer_ip) = self.peer_ip {
+                let ehlo = self.ehlo_domain.clone().unwrap_or_default();
                 actions.push(SmtpAction::CheckSpf {
-                    sender_domain,
+                    mail_from: address,
+                    ehlo_domain: ehlo,
                     peer_ip,
                 });
             }
@@ -609,7 +614,7 @@ mod tests {
     fn ready_session() -> SmtpSession {
         let mut session = connected_session();
         session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
-            domain: "sender.example.com".to_string(),
+            domain: "client.example.com".to_string(),
         }));
         session
     }
@@ -750,13 +755,15 @@ mod tests {
         // First action: 250 OK
         assert_eq!(actions[0], SmtpAction::SendResponse(250, "OK".to_string()));
 
-        // Second action: CheckSpf
+        // Second action: CheckSpf with full MAIL FROM and EHLO domain
         match &actions[1] {
             SmtpAction::CheckSpf {
-                sender_domain,
+                mail_from,
+                ehlo_domain,
                 peer_ip: _,
             } => {
-                assert_eq!(sender_domain, "sender.example.com");
+                assert_eq!(mail_from, "alice@sender.example.com");
+                assert_eq!(ehlo_domain, "client.example.com");
             }
             other => panic!("expected CheckSpf, got {other:?}"),
         }

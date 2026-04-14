@@ -25,7 +25,7 @@ use crate::imap_parse;
 use crate::imap_parse::StoreOperation;
 use crate::imap_store::{self, ImapStore};
 use crate::io::{SmtpCodec, SmtpFrame};
-use crate::smtp::{SmtpAction, SmtpConfig, SmtpEvent, SmtpSession, SmtpState};
+use crate::smtp::{SmtpAction, SmtpCommand, SmtpConfig, SmtpEvent, SmtpSession, SmtpState};
 use crate::smtp_parse::parse_command;
 use crate::tls;
 
@@ -213,6 +213,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         };
 
     let content_store_path = PathBuf::from(&config.imap.content_store_path);
+    // Ensure CAS subdirectories exist (DiskBookStore requires commits/ and blobs/).
+    std::fs::create_dir_all(content_store_path.join("commits"))
+        .map_err(|e| format!("failed to create CAS commits dir: {e}"))?;
+    std::fs::create_dir_all(content_store_path.join("blobs"))
+        .map_err(|e| format!("failed to create CAS blobs dir: {e}"))?;
     let reject_threshold = config.spam.reject_threshold;
     let local_domain = config.domain.name.clone();
 
@@ -546,6 +551,13 @@ async fn handle_connection(
                 let actions = match smtp_frame {
                     SmtpFrame::Line(line) => match parse_command(line.as_bytes()) {
                         Ok(cmd) => {
+                            // Reset SPF result at the start of each transaction
+                            // so a prior message's verdict can't leak into a new
+                            // transaction (especially null-sender where CheckSpf
+                            // is skipped).
+                            if matches!(cmd, SmtpCommand::MailFrom { .. }) {
+                                spf_result = crate::spam::SpfResult::None;
+                            }
                             let actions = session.handle(SmtpEvent::Command(cmd));
                             if session.state == SmtpState::DataReceiving {
                                 framed.decoder_mut().enter_data_mode();
@@ -647,6 +659,7 @@ async fn handle_connection(
                     // all transaction state (mail_from, recipients, pending_rcpt).
                     framed.decoder_mut().enter_command_mode();
                     session.reset_transaction();
+                    spf_result = crate::spam::SpfResult::None;
                 } else {
                     tracing::debug!(%peer_ip, error = %e, "codec error");
                     let _ = writer
@@ -711,6 +724,9 @@ where
                 let actions = match smtp_frame {
                     SmtpFrame::Line(line) => match parse_command(line.as_bytes()) {
                         Ok(cmd) => {
+                            if matches!(cmd, SmtpCommand::MailFrom { .. }) {
+                                spf_result = crate::spam::SpfResult::None;
+                            }
                             let actions = session.handle(SmtpEvent::Command(cmd));
                             if session.state == SmtpState::DataReceiving {
                                 framed.decoder_mut().enter_data_mode();
@@ -744,6 +760,7 @@ where
                     let _ = writer.write_all(b"552 5.3.4 Message too large\r\n").await;
                     framed.decoder_mut().enter_command_mode();
                     session.reset_transaction();
+                    spf_result = crate::spam::SpfResult::None;
                 } else {
                     tracing::debug!(%peer_ip, error = %e, "codec error");
                     let _ = writer
@@ -842,7 +859,17 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 let identity = if domain.eq_ignore_ascii_case(local_domain) {
                     // Local domain: resolve against our user store
                     match address::parse_local_part(local_part) {
-                        LocalPart::Hex(hash) => Some(hash),
+                        LocalPart::Hex(hash) => {
+                            // Verify the hex address belongs to a known user
+                            match imap_store.get_user_by_address(&hash) {
+                                Ok(Some(user)) => Some(user.harmony_address),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "hex address lookup failed");
+                                    None
+                                }
+                            }
+                        }
                         LocalPart::Named { name, .. } => {
                             match imap_store.get_user(&name) {
                                 Ok(Some(user)) => Some(user.harmony_address),
@@ -893,8 +920,6 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 }
             }
             SmtpAction::DeliverToHarmony { recipients, data } => {
-                use crate::message::ADDRESS_HASH_LEN;
-
                 // Phase 1: Spam scoring
                 let signals = crate::spam::SpamSignals {
                     dnsbl_listed: false,
@@ -928,39 +953,75 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 };
 
-                // Phase 3: Store in CAS
-                let message_cid = match translated.message.to_bytes() {
-                    Ok(msg_bytes) => {
-                        let csp = content_store_path.to_path_buf();
-                        let cid_result = tokio::task::spawn_blocking(move || {
-                            let mut book_store = harmony_db::DiskBookStore::new(&csp);
-                            harmony_content::dag::ingest(
-                                &msg_bytes,
-                                &harmony_content::chunker::ChunkerConfig::DEFAULT,
-                                &mut book_store,
-                            )
-                        })
-                        .await
-                        .map_err(|e| format!("CAS task panicked: {e}"))?;
-                        match cid_result {
-                            Ok(cid) => Some(cid.to_bytes()),
+                // Phase 3: Store attachments + message in CAS
+                //
+                // Ingest attachment blobs first so their CAS CIDs can be
+                // written into the HarmonyMessage before it is serialized.
+                let msg_timestamp = translated.message.timestamp;
+                let msg_id = translated.message.message_id;
+                let mut message = translated.message;
+                let csp = content_store_path.to_path_buf();
+                let attachment_data = translated.attachment_data;
+                let cas_result = tokio::task::spawn_blocking(move || -> Result<Option<[u8; 32]>, String> {
+                    let config = &harmony_content::chunker::ChunkerConfig::DEFAULT;
+                    let mut book_store = harmony_db::DiskBookStore::new(&csp);
+
+                    // Ingest each attachment blob and update the message's CIDs
+                    for (i, blob) in attachment_data.iter().enumerate() {
+                        if blob.is_empty() {
+                            continue;
+                        }
+                        match harmony_content::dag::ingest(blob, config, &mut book_store) {
+                            Ok(cid) => {
+                                if i < message.attachments.len() {
+                                    message.attachments[i].cid = cid.to_bytes();
+                                }
+                            }
                             Err(e) => {
-                                tracing::warn!(error = %e, "CAS storage failed, delivering without CID");
-                                None
+                                tracing::warn!(
+                                    attachment_index = i,
+                                    error = %e,
+                                    "attachment CAS ingest failed, keeping BLAKE3 CID"
+                                );
                             }
                         }
                     }
+
+                    // Serialize and ingest the message itself
+                    match message.to_bytes() {
+                        Ok(msg_bytes) => {
+                            match harmony_content::dag::ingest(&msg_bytes, config, &mut book_store) {
+                                Ok(cid) => Ok(Some(cid.to_bytes())),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "CAS storage failed, delivering without CID");
+                                    Ok(None)
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "message serialization failed, delivering without CID");
+                            Ok(None)
+                        }
+                    }
+                })
+                .await
+                .map_err(|e| format!("CAS task panicked: {e}"))?;
+                let message_cid = match cas_result {
+                    Ok(cid) => cid,
                     Err(e) => {
-                        tracing::warn!(error = %e, "message serialization failed, delivering without CID");
+                        tracing::warn!(error = %e, "CAS task error, delivering without CID");
                         None
                     }
                 };
 
                 // Phase 4: Deliver to local IMAP mailboxes
+                //
+                // NOTE: The IMAP store currently uses a single-user mailbox
+                // model (mailboxes are global, not per-user). Multi-user
+                // mailbox isolation is tracked separately in ZEB-112.
                 let mut delivered_count = 0u32;
-                let timestamp = translated.message.timestamp;
+                let timestamp = msg_timestamp;
                 let rfc822_size = data.len() as u32;
-                let msg_id = translated.message.message_id;
 
                 for recipient_hash in recipients {
                     match imap_store.get_user_by_address(recipient_hash) {
@@ -1021,17 +1082,18 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 }
             }
-            SmtpAction::CheckSpf { sender_domain, peer_ip } => {
+            SmtpAction::CheckSpf { mail_from, ehlo_domain, peer_ip } => {
                 if let Some(ref auth) = authenticator {
-                    let spf_params = mail_auth::spf::verify::SpfParameters::verify_ehlo(
+                    let spf_params = mail_auth::spf::verify::SpfParameters::verify_mail_from(
                         *peer_ip,
-                        sender_domain.as_str(),
+                        ehlo_domain.as_str(),
                         local_domain,
+                        mail_from.as_str(),
                     );
                     let spf_output = auth.verify_spf(spf_params).await;
                     *spf_result = crate::auth::map_spf_result(&spf_output);
                     tracing::debug!(
-                        %sender_domain,
+                        %mail_from,
                         result = ?spf_result,
                         "SPF check complete"
                     );
@@ -2720,6 +2782,8 @@ node_config = "/tmp/test-node.toml"
         store.create_user("alice", "alicepass", &alice_addr).unwrap();
 
         let content_path = smtp_test_dir.path().join("content");
+        std::fs::create_dir_all(content_path.join("commits")).unwrap();
+        std::fs::create_dir_all(content_path.join("blobs")).unwrap();
         let store_clone = store.clone();
         let content_path_clone = content_path.clone();
 
@@ -2813,6 +2877,11 @@ node_config = "/tmp/test-node.toml"
             messages[0].rfc822_size > 0,
             "expected rfc822_size > 0, got {}",
             messages[0].rfc822_size
+        );
+        // CAS storage should have produced a CID for the message
+        assert!(
+            messages[0].message_cid.is_some(),
+            "expected message_cid to be set after CAS ingest"
         );
     }
 
