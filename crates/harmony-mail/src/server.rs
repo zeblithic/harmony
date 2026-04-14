@@ -1493,28 +1493,198 @@ where
                     }
                 }
             }
-            ImapAction::Search { .. } => {
-                // Not yet wired to store search
-                if let Some(tag) = session.pending_tag.take() {
-                    writer
-                        .write_all(
-                            format!("{tag} NO [CANNOT] SEARCH not yet implemented\r\n").as_bytes(),
-                        )
-                        .await?;
+            ImapAction::Search { criteria, uid_mode } => {
+                let search_result: Result<Vec<u32>, String> = (|| {
+                    let mailbox_name = match &session.state {
+                        ImapState::Selected { mailbox, .. } => mailbox.name.clone(),
+                        _ => return Err("no mailbox selected".to_string()),
+                    };
+                    let mbox = store
+                        .get_mailbox(&mailbox_name)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "mailbox not found".to_string())?;
+                    let all_msgs = store.get_messages(mbox.id).map_err(|e| e.to_string())?;
+
+                    // Check if any criterion needs CAS content
+                    let needs_cas = criteria_need_cas(criteria);
+                    let max_uid = all_msgs.last().map(|m| m.uid).unwrap_or(0);
+                    let max_seqnum = all_msgs.len() as u32;
+                    let book_store = if needs_cas {
+                        Some(harmony_db::DiskBookStore::new(&content_store_path))
+                    } else {
+                        None
+                    };
+
+                    let mut results = Vec::new();
+                    for (idx, msg_row) in all_msgs.iter().enumerate() {
+                        let seqnum = (idx + 1) as u32;
+                        let flags = store.get_flags(msg_row.id).map_err(|e| e.to_string())?;
+
+                        let harmony_msg = if let Some(ref bs) = book_store {
+                            match msg_row.message_cid {
+                                Some(cid_bytes) => {
+                                    let content_id = harmony_content::cid::ContentId::from_bytes(cid_bytes);
+                                    match harmony_content::dag::reassemble(&content_id, bs) {
+                                        Ok(bytes) => crate::message::HarmonyMessage::from_bytes(&bytes).ok(),
+                                        Err(_) => None,
+                                    }
+                                }
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        if matches_criteria(criteria, msg_row, &flags, seqnum, harmony_msg.as_ref(), max_uid, max_seqnum) {
+                            results.push(if *uid_mode { msg_row.uid } else { seqnum });
+                        }
+                    }
+
+                    Ok(results)
+                })();
+
+                match search_result {
+                    Ok(results) => {
+                        let callback = session.handle(ImapEvent::SearchComplete { results });
+                        execute_imap_actions(&callback, writer).await?;
+                    }
+                    Err(reason) => {
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                                .await?;
+                            writer.flush().await?;
+                        }
+                    }
                 }
-                writer.flush().await?;
             }
-            ImapAction::CopyMessages { .. } => {
-                // Not yet wired to store copy
-                if let Some(tag) = session.pending_tag.take() {
-                    writer
-                        .write_all(
-                            format!("{tag} NO [CANNOT] COPY/MOVE not yet implemented\r\n")
-                                .as_bytes(),
-                        )
-                        .await?;
+            ImapAction::CopyMessages {
+                sequence_set,
+                destination,
+                uid_mode,
+                is_move,
+            } => {
+                // Phase 1: sync — resolve mailbox, sequence set, do the copy
+                enum CopyOutcome {
+                    Done(Vec<(u32, u32)>, Vec<imap_store::MessageRow>, i64), // mapping, all_msgs, mailbox_id
+                    Empty,
+                    TryCreate,
                 }
-                writer.flush().await?;
+
+                let copy_result: Result<CopyOutcome, String> = (|| {
+                    let mailbox_name = match &session.state {
+                        ImapState::Selected { mailbox, .. } => mailbox.name.clone(),
+                        _ => return Err("no mailbox selected".to_string()),
+                    };
+                    let mbox = store
+                        .get_mailbox(&mailbox_name)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "mailbox not found".to_string())?;
+                    let all_msgs = store.get_messages(mbox.id).map_err(|e| e.to_string())?;
+                    let resolved = resolve_sequence_set(sequence_set, *uid_mode, &all_msgs);
+                    let uids: Vec<u32> = resolved.iter().map(|(uid, _)| *uid).collect();
+
+                    if uids.is_empty() {
+                        return Ok(CopyOutcome::Empty);
+                    }
+
+                    match store.copy_messages(mbox.id, &uids, destination) {
+                        Ok(mapping) => Ok(CopyOutcome::Done(mapping, all_msgs, mbox.id)),
+                        Err(imap_store::StoreError::MailboxNotFound(_)) => Ok(CopyOutcome::TryCreate),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })();
+
+                // Phase 2: async — write responses, handle MOVE expunge
+                match copy_result {
+                    Ok(CopyOutcome::Done(mapping, all_msgs, mailbox_id)) => {
+                        if *is_move {
+                            // Flag source messages as \Deleted and expunge only those UIDs
+                            let src_uids: Vec<u32> = mapping.iter().map(|(src, _)| *src).collect();
+                            let rows_by_uid: std::collections::HashMap<u32, &imap_store::MessageRow> =
+                                all_msgs.iter().map(|m| (m.uid, m)).collect();
+
+                            let move_result: Result<Vec<u32>, String> = (|| {
+                                for &src_uid in &src_uids {
+                                    if let Some(row) = rows_by_uid.get(&src_uid) {
+                                        store.add_flags(row.id, &["\\Deleted"]).map_err(|e| e.to_string())?;
+                                    }
+                                }
+                                store.expunge_uids(mailbox_id, &src_uids).map_err(|e| e.to_string())
+                            })();
+
+                            match move_result {
+                                Ok(expunged_uids) => {
+                                    let uid_to_seqnum: std::collections::HashMap<u32, u32> = all_msgs
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, m)| (m.uid, (i + 1) as u32))
+                                        .collect();
+                                    let mut seqnums: Vec<u32> = expunged_uids
+                                        .iter()
+                                        .filter_map(|uid| uid_to_seqnum.get(uid).copied())
+                                        .collect();
+                                    // Descending order: higher seqnums emitted first so lower
+                                    // seqnums remain valid (each EXPUNGE renumbers only above).
+                                    seqnums.sort_unstable_by(|a, b| b.cmp(a));
+
+                                    for seqnum in &seqnums {
+                                        writer
+                                            .write_all(format!("* {seqnum} EXPUNGE\r\n").as_bytes())
+                                            .await?;
+                                    }
+
+                                    if let Some(tag) = session.pending_tag.take() {
+                                        writer
+                                            .write_all(format!("{tag} OK MOVE completed\r\n").as_bytes())
+                                            .await?;
+                                    }
+                                }
+                                Err(reason) => {
+                                    if let Some(tag) = session.pending_tag.take() {
+                                        writer
+                                            .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                                            .await?;
+                                    }
+                                }
+                            }
+                        } else {
+                            if let Some(tag) = session.pending_tag.take() {
+                                writer
+                                    .write_all(format!("{tag} OK COPY completed\r\n").as_bytes())
+                                    .await?;
+                            }
+                        }
+                        writer.flush().await?;
+                    }
+                    Ok(CopyOutcome::Empty) => {
+                        let cmd = if *is_move { "MOVE" } else { "COPY" };
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} OK {cmd} completed\r\n").as_bytes())
+                                .await?;
+                        }
+                        writer.flush().await?;
+                    }
+                    Ok(CopyOutcome::TryCreate) => {
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(
+                                    format!("{tag} NO [TRYCREATE] mailbox not found\r\n").as_bytes(),
+                                )
+                                .await?;
+                        }
+                        writer.flush().await?;
+                    }
+                    Err(reason) => {
+                        if let Some(tag) = session.pending_tag.take() {
+                            writer
+                                .write_all(format!("{tag} NO {reason}\r\n").as_bytes())
+                                .await?;
+                            writer.flush().await?;
+                        }
+                    }
+                }
             }
             ImapAction::StartIdle { .. } => {
                 framed.decoder_mut().enter_idle_mode();
@@ -1645,6 +1815,220 @@ fn resolve_sequence_set(
     }
 
     result
+}
+
+/// Parse an IMAP date string ("DD-Mon-YYYY") to a Unix timestamp (midnight UTC).
+/// Returns None if the format is invalid.
+fn parse_imap_date(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let day: u32 = parts[0].parse().ok()?;
+    if day == 0 || day > 31 {
+        return None;
+    }
+    let month: u32 = match parts[1].to_ascii_lowercase().as_str() {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => return None,
+    };
+    let year: u64 = parts[2].parse().ok()?;
+    if year < 1970 || year > 9999 {
+        return None;
+    }
+
+    // Validate day against actual month length
+    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let max_day = if month == 2 && is_leap(year) {
+        29
+    } else {
+        month_days[month as usize]
+    };
+    if day > max_day {
+        return None;
+    }
+
+    // Days from epoch to start of year
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    // Days from start of year to start of month
+    for m in 1..month {
+        days += month_days[m as usize] as u64;
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+    days += (day - 1) as u64;
+    Some(days * 86400)
+}
+
+fn is_leap(year: u64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Check if any search criterion requires CAS message content.
+fn criteria_need_cas(criteria: &[imap_parse::SearchKey]) -> bool {
+    use imap_parse::SearchKey;
+    criteria.iter().any(|key| match key {
+        SearchKey::From(_) | SearchKey::To(_) | SearchKey::Subject(_)
+        | SearchKey::Body(_) | SearchKey::Header(_, _) => true,
+        SearchKey::Not(inner) => criteria_need_cas(std::slice::from_ref(inner.as_ref())),
+        SearchKey::Or(a, b) => {
+            criteria_need_cas(std::slice::from_ref(a.as_ref()))
+                || criteria_need_cas(std::slice::from_ref(b.as_ref()))
+        }
+        _ => false,
+    })
+}
+
+/// Check if a value is contained in an IMAP SequenceSet.
+/// `star_value` is what `*` resolves to (max_uid or max_seqnum).
+fn sequence_set_contains(set: &imap_parse::SequenceSet, value: u32, star_value: u32) -> bool {
+    for range in &set.ranges {
+        let s = if range.start == u32::MAX { star_value } else { range.start };
+        let e = match range.end {
+            None => s,
+            Some(u32::MAX) => star_value,
+            Some(e) => e,
+        };
+        let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+        if value >= lo && value <= hi {
+            return true;
+        }
+    }
+    false
+}
+
+/// Evaluate IMAP SEARCH criteria against a message.
+/// Multiple criteria are AND'd per RFC 9051.
+fn matches_criteria(
+    criteria: &[imap_parse::SearchKey],
+    msg_row: &imap_store::MessageRow,
+    flags: &[String],
+    seqnum: u32,
+    msg: Option<&crate::message::HarmonyMessage>,
+    max_uid: u32,
+    max_seqnum: u32,
+) -> bool {
+    criteria.iter().all(|key| matches_single_criterion(key, msg_row, flags, seqnum, msg, max_uid, max_seqnum))
+}
+
+/// Evaluate a single IMAP SEARCH criterion.
+fn matches_single_criterion(
+    key: &imap_parse::SearchKey,
+    msg_row: &imap_store::MessageRow,
+    flags: &[String],
+    seqnum: u32,
+    msg: Option<&crate::message::HarmonyMessage>,
+    max_uid: u32,
+    max_seqnum: u32,
+) -> bool {
+    use imap_parse::SearchKey;
+
+    let has_flag = |f: &str| flags.iter().any(|fl| fl == f);
+
+    match key {
+        SearchKey::All => true,
+        SearchKey::Seen => has_flag("\\Seen"),
+        SearchKey::Unseen => !has_flag("\\Seen"),
+        SearchKey::Flagged => has_flag("\\Flagged"),
+        SearchKey::Unflagged => !has_flag("\\Flagged"),
+        SearchKey::Answered => has_flag("\\Answered"),
+        SearchKey::Unanswered => !has_flag("\\Answered"),
+        SearchKey::Deleted => has_flag("\\Deleted"),
+        SearchKey::Undeleted => !has_flag("\\Deleted"),
+        SearchKey::Draft => has_flag("\\Draft"),
+        SearchKey::Undraft => !has_flag("\\Draft"),
+        SearchKey::Recent => has_flag("\\Recent"),
+        SearchKey::New => has_flag("\\Recent") && !has_flag("\\Seen"),
+        SearchKey::Old => !has_flag("\\Recent"),
+        SearchKey::Keyword(s) => has_flag(s),
+        SearchKey::Unkeyword(s) => !has_flag(s),
+
+        SearchKey::Larger(n) => msg_row.rfc822_size > *n,
+        SearchKey::Smaller(n) => msg_row.rfc822_size < *n,
+
+        SearchKey::Since(date) => {
+            parse_imap_date(date).map_or(false, |d| msg_row.internal_date >= d)
+        }
+        SearchKey::Before(date) => {
+            parse_imap_date(date).map_or(false, |d| msg_row.internal_date < d)
+        }
+        SearchKey::On(date) => {
+            parse_imap_date(date).map_or(false, |d| {
+                msg_row.internal_date >= d && msg_row.internal_date < d + 86400
+            })
+        }
+
+        SearchKey::Uid(set) => sequence_set_contains(set, msg_row.uid, max_uid),
+        SearchKey::SequenceSet(set) => sequence_set_contains(set, seqnum, max_seqnum),
+
+        SearchKey::Subject(s) => {
+            msg.map_or(false, |m| m.subject.to_lowercase().contains(&s.to_lowercase()))
+        }
+        SearchKey::Body(s) => {
+            msg.map_or(false, |m| m.body.to_lowercase().contains(&s.to_lowercase()))
+        }
+        SearchKey::From(s) => {
+            msg.map_or(false, |m| {
+                let sender_hex = hex::encode(m.sender_address);
+                sender_hex.to_lowercase().contains(&s.to_lowercase())
+            })
+        }
+        SearchKey::To(s) => {
+            let needle = s.to_lowercase();
+            msg.map_or(false, |m| {
+                m.recipients.iter().any(|r| {
+                    r.recipient_type == crate::message::RecipientType::To && {
+                        let addr_hex = hex::encode(r.address_hash);
+                        addr_hex.to_lowercase().contains(&needle)
+                    }
+                })
+            })
+        }
+        SearchKey::Header(name, value) => {
+            msg.map_or(false, |m| {
+                let val_lower = value.to_lowercase();
+                match name.to_lowercase().as_str() {
+                    "subject" => m.subject.to_lowercase().contains(&val_lower),
+                    "from" => {
+                        let sender_hex = hex::encode(m.sender_address);
+                        sender_hex.to_lowercase().contains(&val_lower)
+                    }
+                    "to" => {
+                        m.recipients.iter().any(|r| {
+                            if r.recipient_type == crate::message::RecipientType::To {
+                                let addr_hex = hex::encode(r.address_hash);
+                                addr_hex.to_lowercase().contains(&val_lower)
+                            } else {
+                                false
+                            }
+                        })
+                    }
+                    _ => false,
+                }
+            })
+        }
+
+        SearchKey::Not(inner) => !matches_single_criterion(inner, msg_row, flags, seqnum, msg, max_uid, max_seqnum),
+        SearchKey::Or(a, b) => {
+            matches_single_criterion(a, msg_row, flags, seqnum, msg, max_uid, max_seqnum)
+                || matches_single_criterion(b, msg_row, flags, seqnum, msg, max_uid, max_seqnum)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2130,5 +2514,423 @@ mod sequence_set_tests {
         imap_store.remove_flags(msg_id, &["\\Answered"]).unwrap();
         let flags = imap_store.get_flags(msg_id).unwrap();
         assert_eq!(flags, vec!["\\Flagged"]);
+    }
+
+    #[test]
+    fn parse_imap_date_standard() {
+        // 13-Apr-2026 00:00:00 UTC
+        let ts = super::parse_imap_date("13-Apr-2026");
+        // 2026-04-13 = days since epoch: 20,556 * 86400 = 1776038400
+        assert!(ts.is_some());
+        let t = ts.unwrap();
+        // April 13, 2026 is 20556 days after Jan 1 1970
+        assert_eq!(t, 20556 * 86400);
+    }
+
+    #[test]
+    fn parse_imap_date_all_months() {
+        assert!(super::parse_imap_date("01-Jan-2000").is_some());
+        assert!(super::parse_imap_date("01-Feb-2000").is_some());
+        assert!(super::parse_imap_date("01-Mar-2000").is_some());
+        assert!(super::parse_imap_date("01-Apr-2000").is_some());
+        assert!(super::parse_imap_date("01-May-2000").is_some());
+        assert!(super::parse_imap_date("01-Jun-2000").is_some());
+        assert!(super::parse_imap_date("01-Jul-2000").is_some());
+        assert!(super::parse_imap_date("01-Aug-2000").is_some());
+        assert!(super::parse_imap_date("01-Sep-2000").is_some());
+        assert!(super::parse_imap_date("01-Oct-2000").is_some());
+        assert!(super::parse_imap_date("01-Nov-2000").is_some());
+        assert!(super::parse_imap_date("01-Dec-2000").is_some());
+    }
+
+    #[test]
+    fn parse_imap_date_epoch() {
+        let ts = super::parse_imap_date("01-Jan-1970");
+        assert_eq!(ts, Some(0));
+    }
+
+    #[test]
+    fn parse_imap_date_invalid() {
+        assert!(super::parse_imap_date("invalid").is_none());
+        assert!(super::parse_imap_date("32-Jan-2026").is_none());
+        assert!(super::parse_imap_date("01-Xyz-2026").is_none());
+    }
+
+    #[test]
+    fn copy_messages_preserves_flags() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let imap_store = ImapStore::open(&db_path).unwrap();
+        imap_store.initialize_default_mailboxes().unwrap();
+        imap_store.create_mailbox("Archive").unwrap();
+
+        // Insert message with flags
+        let uid = imap_store.insert_message("INBOX", &[1u8; MESSAGE_ID_LEN], None, 1000, 100).unwrap();
+        let mbox = imap_store.get_mailbox("INBOX").unwrap().unwrap();
+        let msgs = imap_store.get_messages(mbox.id).unwrap();
+        imap_store.add_flags(msgs[0].id, &["\\Seen", "\\Flagged"]).unwrap();
+
+        // Copy to Archive
+        let mapping = imap_store.copy_messages(mbox.id, &[uid], "Archive").unwrap();
+        assert_eq!(mapping.len(), 1);
+        let (src_uid, dst_uid) = mapping[0];
+        assert_eq!(src_uid, uid);
+
+        // Verify source still exists
+        let src_msgs = imap_store.get_messages(mbox.id).unwrap();
+        assert_eq!(src_msgs.len(), 1);
+
+        // Verify destination has the message with flags
+        let dst_mbox = imap_store.get_mailbox("Archive").unwrap().unwrap();
+        let dst_msgs = imap_store.get_messages(dst_mbox.id).unwrap();
+        assert_eq!(dst_msgs.len(), 1);
+        assert_eq!(dst_msgs[0].uid, dst_uid);
+        let dst_flags = imap_store.get_flags(dst_msgs[0].id).unwrap();
+        assert!(dst_flags.contains(&"\\Flagged".to_string()));
+        assert!(dst_flags.contains(&"\\Seen".to_string()));
+    }
+
+    #[test]
+    fn move_removes_source() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let imap_store = ImapStore::open(&db_path).unwrap();
+        imap_store.initialize_default_mailboxes().unwrap();
+        // "Trash" is already created by initialize_default_mailboxes
+
+        // Insert 2 messages
+        let uid1 = imap_store.insert_message("INBOX", &[1u8; MESSAGE_ID_LEN], None, 1000, 100).unwrap();
+        let uid2 = imap_store.insert_message("INBOX", &[2u8; MESSAGE_ID_LEN], None, 2000, 200).unwrap();
+        let mbox = imap_store.get_mailbox("INBOX").unwrap().unwrap();
+
+        // Move uid1 to Trash (copy + flag \Deleted + expunge)
+        let mapping = imap_store.copy_messages(mbox.id, &[uid1], "Trash").unwrap();
+        assert_eq!(mapping.len(), 1);
+
+        // Flag source as deleted
+        let msgs = imap_store.get_messages(mbox.id).unwrap();
+        let msg1 = msgs.iter().find(|m| m.uid == uid1).unwrap();
+        imap_store.add_flags(msg1.id, &["\\Deleted"]).unwrap();
+
+        // Expunge
+        let expunged = imap_store.expunge(mbox.id).unwrap();
+        assert_eq!(expunged, vec![uid1]);
+
+        // Verify source only has uid2
+        let remaining = imap_store.get_messages(mbox.id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].uid, uid2);
+
+        // Verify destination has the moved message
+        let dst_mbox = imap_store.get_mailbox("Trash").unwrap().unwrap();
+        let dst_msgs = imap_store.get_messages(dst_mbox.id).unwrap();
+        assert_eq!(dst_msgs.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use crate::imap_parse::SearchKey;
+    use crate::message::{
+        HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType, ADDRESS_HASH_LEN,
+        MESSAGE_ID_LEN, VERSION,
+    };
+
+    fn msg_row_with(uid: u32, internal_date: u64, rfc822_size: u32) -> imap_store::MessageRow {
+        imap_store::MessageRow {
+            id: uid as i64,
+            mailbox_id: 1,
+            uid,
+            harmony_msg_id: [0u8; MESSAGE_ID_LEN],
+            message_cid: None,
+            internal_date,
+            rfc822_size,
+        }
+    }
+
+    fn test_message() -> HarmonyMessage {
+        HarmonyMessage {
+            version: VERSION,
+            message_type: MailMessageType::Email,
+            flags: MessageFlags::new(false, false, false),
+            timestamp: 1713000000,
+            message_id: [1u8; MESSAGE_ID_LEN],
+            in_reply_to: None,
+            sender_address: [0xAA; ADDRESS_HASH_LEN],
+            recipients: vec![Recipient {
+                address_hash: [0xBB; ADDRESS_HASH_LEN],
+                recipient_type: RecipientType::To,
+            }],
+            subject: "Test subject".to_string(),
+            body: "Hello, world!".to_string(),
+            attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn search_all() {
+        let row = msg_row_with(1, 1000, 100);
+        assert!(super::matches_criteria(&[SearchKey::All], &row, &[], 1, None, 100, 100));
+    }
+
+    #[test]
+    fn search_flag_seen() {
+        let row = msg_row_with(1, 1000, 100);
+        let seen = vec!["\\Seen".to_string()];
+        assert!(super::matches_criteria(&[SearchKey::Seen], &row, &seen, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Unseen], &row, &seen, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Seen], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Unseen], &row, &[], 1, None, 100, 100));
+    }
+
+    #[test]
+    fn search_flag_deleted_draft_flagged_answered() {
+        let row = msg_row_with(1, 1000, 100);
+        let flags = vec!["\\Deleted".to_string(), "\\Draft".to_string()];
+        assert!(super::matches_criteria(&[SearchKey::Deleted], &row, &flags, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Draft], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Undeleted], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Undraft], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Flagged], &row, &flags, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Unflagged], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Answered], &row, &flags, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Unanswered], &row, &flags, 1, None, 100, 100));
+    }
+
+    #[test]
+    fn search_recent_new_old() {
+        let row = msg_row_with(1, 1000, 100);
+        let recent = vec!["\\Recent".to_string()];
+        let recent_seen = vec!["\\Recent".to_string(), "\\Seen".to_string()];
+        assert!(super::matches_criteria(&[SearchKey::Recent], &row, &recent, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Old], &row, &recent, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::New], &row, &recent, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::New], &row, &recent_seen, 1, None, 100, 100));
+    }
+
+    #[test]
+    fn search_size() {
+        let row = msg_row_with(1, 1000, 500);
+        assert!(super::matches_criteria(&[SearchKey::Larger(499)], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Larger(500)], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Smaller(501)], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Smaller(500)], &row, &[], 1, None, 100, 100));
+    }
+
+    #[test]
+    fn search_date_since_before_on() {
+        // internal_date = 86400 (Jan 2, 1970)
+        let row = msg_row_with(1, 86400, 100);
+        assert!(super::matches_criteria(&[SearchKey::Since("02-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Since("01-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Since("03-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Before("03-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Before("02-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::On("02-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::On("01-Jan-1970".to_string())], &row, &[], 1, None, 100, 100));
+    }
+
+    #[test]
+    fn search_not_and_or() {
+        let row = msg_row_with(1, 1000, 100);
+        let seen = vec!["\\Seen".to_string()];
+        assert!(!super::matches_criteria(&[SearchKey::Not(Box::new(SearchKey::Seen))], &row, &seen, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Not(Box::new(SearchKey::Seen))], &row, &[], 1, None, 100, 100));
+        assert!(super::matches_criteria(
+            &[SearchKey::Or(Box::new(SearchKey::Seen), Box::new(SearchKey::Flagged))],
+            &row, &seen, 1, None, 100, 100
+        ));
+        assert!(!super::matches_criteria(
+            &[SearchKey::Or(Box::new(SearchKey::Flagged), Box::new(SearchKey::Deleted))],
+            &row, &[], 1, None, 100, 100
+        ));
+    }
+
+    #[test]
+    fn search_multi_criteria_and() {
+        let row = msg_row_with(1, 1000, 500);
+        let seen = vec!["\\Seen".to_string()];
+        assert!(super::matches_criteria(&[SearchKey::Seen, SearchKey::Larger(100)], &row, &seen, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Seen, SearchKey::Larger(600)], &row, &seen, 1, None, 100, 100));
+    }
+
+    #[test]
+    fn search_subject_body() {
+        let row = msg_row_with(1, 1000, 100);
+        let msg = test_message();
+        assert!(super::matches_criteria(
+            &[SearchKey::Subject("test".to_string())], &row, &[], 1, Some(&msg), 100, 100
+        ));
+        assert!(super::matches_criteria(
+            &[SearchKey::Subject("TEST SUBJECT".to_string())], &row, &[], 1, Some(&msg), 100, 100
+        ));
+        assert!(!super::matches_criteria(
+            &[SearchKey::Subject("missing".to_string())], &row, &[], 1, Some(&msg), 100, 100
+        ));
+        assert!(super::matches_criteria(
+            &[SearchKey::Body("hello".to_string())], &row, &[], 1, Some(&msg), 100, 100
+        ));
+        assert!(!super::matches_criteria(
+            &[SearchKey::Body("missing".to_string())], &row, &[], 1, Some(&msg), 100, 100
+        ));
+    }
+
+    #[test]
+    fn search_content_without_message_returns_false() {
+        let row = msg_row_with(1, 1000, 100);
+        assert!(!super::matches_criteria(&[SearchKey::Subject("test".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Body("hello".to_string())], &row, &[], 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::From("user".to_string())], &row, &[], 1, None, 100, 100));
+    }
+
+    #[test]
+    fn search_keyword() {
+        let row = msg_row_with(1, 1000, 100);
+        let flags = vec!["$Important".to_string()];
+        assert!(super::matches_criteria(&[SearchKey::Keyword("$Important".to_string())], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Keyword("$Other".to_string())], &row, &flags, 1, None, 100, 100));
+        assert!(!super::matches_criteria(&[SearchKey::Unkeyword("$Important".to_string())], &row, &flags, 1, None, 100, 100));
+        assert!(super::matches_criteria(&[SearchKey::Unkeyword("$Other".to_string())], &row, &flags, 1, None, 100, 100));
+    }
+
+    #[test]
+    fn search_by_flags_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let imap_store = crate::imap_store::ImapStore::open(&db_path).unwrap();
+        imap_store.initialize_default_mailboxes().unwrap();
+
+        // Insert 3 messages
+        let uid1 = imap_store.insert_message("INBOX", &[1u8; MESSAGE_ID_LEN], None, 1000, 100).unwrap();
+        let uid2 = imap_store.insert_message("INBOX", &[2u8; MESSAGE_ID_LEN], None, 2000, 200).unwrap();
+        let uid3 = imap_store.insert_message("INBOX", &[3u8; MESSAGE_ID_LEN], None, 3000, 300).unwrap();
+
+        // Flag message 1 as Seen, message 2 as Seen+Flagged
+        let mbox = imap_store.get_mailbox("INBOX").unwrap().unwrap();
+        let msgs = imap_store.get_messages(mbox.id).unwrap();
+        imap_store.add_flags(msgs[0].id, &["\\Seen"]).unwrap();
+        imap_store.add_flags(msgs[1].id, &["\\Seen", "\\Flagged"]).unwrap();
+
+        let max_uid = msgs.last().map(|m| m.uid).unwrap_or(0);
+        let max_seqnum = msgs.len() as u32;
+
+        // SEARCH SEEN should match UIDs 1 and 2
+        let mut results = Vec::new();
+        for (idx, msg) in msgs.iter().enumerate() {
+            let flags = imap_store.get_flags(msg.id).unwrap();
+            if super::matches_criteria(&[SearchKey::Seen], msg, &flags, (idx + 1) as u32, None, max_uid, max_seqnum) {
+                results.push(msg.uid);
+            }
+        }
+        assert_eq!(results, vec![uid1, uid2]);
+
+        // SEARCH FLAGGED should match UID 2 only
+        let mut results = Vec::new();
+        for (idx, msg) in msgs.iter().enumerate() {
+            let flags = imap_store.get_flags(msg.id).unwrap();
+            if super::matches_criteria(&[SearchKey::Flagged], msg, &flags, (idx + 1) as u32, None, max_uid, max_seqnum) {
+                results.push(msg.uid);
+            }
+        }
+        assert_eq!(results, vec![uid2]);
+
+        // SEARCH UNSEEN should match UID 3 only
+        let mut results = Vec::new();
+        for (idx, msg) in msgs.iter().enumerate() {
+            let flags = imap_store.get_flags(msg.id).unwrap();
+            if super::matches_criteria(&[SearchKey::Unseen], msg, &flags, (idx + 1) as u32, None, max_uid, max_seqnum) {
+                results.push(msg.uid);
+            }
+        }
+        assert_eq!(results, vec![uid3]);
+    }
+
+    #[test]
+    fn sequence_set_contains_single() {
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 3, end: None }] };
+        assert!(super::sequence_set_contains(&set, 3, 10));
+        assert!(!super::sequence_set_contains(&set, 4, 10));
+    }
+
+    #[test]
+    fn sequence_set_contains_range() {
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 2, end: Some(5) }] };
+        assert!(!super::sequence_set_contains(&set, 1, 10));
+        assert!(super::sequence_set_contains(&set, 2, 10));
+        assert!(super::sequence_set_contains(&set, 5, 10));
+        assert!(!super::sequence_set_contains(&set, 6, 10));
+    }
+
+    #[test]
+    fn sequence_set_contains_wildcard() {
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        // 5:* with max=10 should match 5..=10
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 5, end: Some(u32::MAX) }] };
+        assert!(!super::sequence_set_contains(&set, 4, 10));
+        assert!(super::sequence_set_contains(&set, 5, 10));
+        assert!(super::sequence_set_contains(&set, 10, 10));
+        assert!(!super::sequence_set_contains(&set, 11, 10));
+    }
+
+    #[test]
+    fn sequence_set_contains_wildcard_beyond_max() {
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        // UID 20:* with max_uid=10 should not match anything < 10, reversed range 10..=10
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 20, end: Some(u32::MAX) }] };
+        assert!(super::sequence_set_contains(&set, 10, 10)); // reversed: 10..=20
+        assert!(!super::sequence_set_contains(&set, 9, 10));
+    }
+
+    #[test]
+    fn search_uid_set() {
+        let row = msg_row_with(5, 1000, 100);
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        // UID 3:7 with max_uid=10, msg uid=5 -> match
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 3, end: Some(7) }] };
+        assert!(super::matches_criteria(
+            &[SearchKey::Uid(set.clone())], &row, &[], 2, None, 10, 5
+        ));
+        // UID 6:* with max_uid=10, msg uid=5 -> no match
+        let set2 = SequenceSet { ranges: vec![SequenceRange { start: 6, end: Some(u32::MAX) }] };
+        assert!(!super::matches_criteria(
+            &[SearchKey::Uid(set2)], &row, &[], 2, None, 10, 5
+        ));
+    }
+
+    #[test]
+    fn search_seqnum_set() {
+        let row = msg_row_with(10, 1000, 100);
+        use crate::imap_parse::{SequenceRange, SequenceSet};
+        // seqnum=3, set 2:4, max_seqnum=5 -> match
+        let set = SequenceSet { ranges: vec![SequenceRange { start: 2, end: Some(4) }] };
+        assert!(super::matches_criteria(
+            &[SearchKey::SequenceSet(set)], &row, &[], 3, None, 10, 5
+        ));
+        // seqnum=3, set 4:5, max_seqnum=5 -> no match
+        let set2 = SequenceSet { ranges: vec![SequenceRange { start: 4, end: Some(5) }] };
+        assert!(!super::matches_criteria(
+            &[SearchKey::SequenceSet(set2)], &row, &[], 3, None, 10, 5
+        ));
+    }
+
+    #[test]
+    fn parse_date_rejects_invalid_day() {
+        // April has 30 days
+        assert!(super::parse_imap_date("30-Apr-2026").is_some());
+        assert!(super::parse_imap_date("31-Apr-2026").is_none());
+        // Feb non-leap
+        assert!(super::parse_imap_date("28-Feb-2025").is_some());
+        assert!(super::parse_imap_date("29-Feb-2025").is_none());
+        // Feb leap
+        assert!(super::parse_imap_date("29-Feb-2024").is_some());
+    }
+
+    #[test]
+    fn parse_date_rejects_extreme_year() {
+        assert!(super::parse_imap_date("01-Jan-10000").is_none());
+        assert!(super::parse_imap_date("01-Jan-9999").is_some());
     }
 }

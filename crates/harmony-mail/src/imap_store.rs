@@ -501,6 +501,32 @@ impl ImapStore {
         Ok(uids)
     }
 
+    /// Expunge specific messages by UID (for MOVE — does not affect other \Deleted messages).
+    /// Only deletes messages that still have the \Deleted flag set, within a transaction.
+    pub fn expunge_uids(&self, mailbox_id: i64, uids: &[u32]) -> Result<Vec<u32>, StoreError> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let mut deleted = Vec::new();
+        for &uid in uids {
+            let rows = tx.execute(
+                "DELETE FROM messages WHERE id IN (
+                    SELECT m.id FROM messages m
+                    JOIN flags f ON f.message_id = m.id
+                    WHERE m.mailbox_id = ?1 AND m.uid = ?2 AND f.flag = '\\Deleted'
+                )",
+                rusqlite::params![mailbox_id, uid],
+            )?;
+            if rows > 0 {
+                deleted.push(uid);
+            }
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     // ── Copy ────────────────────────────────────────────────────────
 
     pub fn copy_messages(
@@ -514,7 +540,7 @@ impl ImapStore {
 
         let (dst_id, mut dst_uid_next): (i64, u32) = tx
             .query_row(
-                "SELECT id, uid_next FROM mailboxes WHERE name = ?1",
+                "SELECT id, uid_next FROM mailboxes WHERE name = ?1 COLLATE NOCASE",
                 [dst_mailbox_name],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
