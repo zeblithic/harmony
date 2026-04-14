@@ -242,9 +242,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train ct87 model")
     parser.add_argument(
         "--config",
-        choices=["tiny", "target", "tiny_engram_ann"],
+        choices=["tiny", "target", "tiny_ffn_expanded", "tiny_engram_ann"],
         default="tiny",
-        help="Model config. 'tiny_engram_ann' enables ZEB-117 Model gamma "
+        help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
+             "dense control). 'tiny_engram_ann' enables ZEB-117 Model gamma "
              "(ANN retrieval + gated residual + anti-collapse); requires "
              "--engram-ann-table.",
     )
@@ -264,6 +265,10 @@ def main() -> None:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-file", type=str, default=None, help="Path to CSV log file")
+    parser.add_argument(
+        "--resume-from", type=str, default=None,
+        help="Path to safetensors checkpoint to resume/fine-tune from",
+    )
     parser.add_argument(
         "--gradient-checkpoint", action="store_true",
         help="Enable gradient checkpointing (recompute activations to save VRAM)",
@@ -478,6 +483,8 @@ def main() -> None:
 
     if args.config == "tiny":
         config = HarmonyModelConfig.tiny()
+    elif args.config == "tiny_ffn_expanded":
+        config = HarmonyModelConfig.tiny_ffn_expanded()
     elif args.config == "tiny_engram_ann":
         config = HarmonyModelConfig.tiny_engram_ann()
     else:
@@ -613,6 +620,31 @@ def main() -> None:
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
+
+    # Resume from checkpoint after all modules are attached (including ANN)
+    # so their weights are loaded. strict=False handles tied embeddings where
+    # lm_head shares embed_tokens weights (missing key is expected).
+    if args.resume_from is not None:
+        from safetensors import safe_open
+        with safe_open(args.resume_from, framework="pt") as f:
+            ckpt_keys = set(f.keys())
+        model_keys = set(model.state_dict().keys())
+        missing = model_keys - ckpt_keys
+        unexpected = ckpt_keys - model_keys
+        # lm_head.weight is expected missing when tied to embed_tokens
+        expected_missing = {"lm_head.weight"}
+        real_missing = missing - expected_missing
+        if real_missing:
+            print(f"Warning: {len(real_missing)} missing keys in checkpoint: "
+                  f"{sorted(real_missing)[:5]}{'...' if len(real_missing) > 5 else ''}",
+                  file=sys.stderr)
+        if unexpected:
+            print(f"Warning: {len(unexpected)} unexpected keys in checkpoint: "
+                  f"{sorted(unexpected)[:5]}{'...' if len(unexpected) > 5 else ''}",
+                  file=sys.stderr)
+        from safetensors.torch import load_model
+        load_model(model, args.resume_from, strict=False)
+        print(f"Resumed from checkpoint: {args.resume_from}")
 
     # Load Engram table if provided
     engram_table = None
