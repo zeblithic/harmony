@@ -32,6 +32,31 @@ pub const CID_LEN: usize = 32;
 /// Length of a message identifier in bytes.
 pub const MESSAGE_ID_LEN: usize = 16;
 
+/// Generate a unique 16-byte message ID by hashing the current nanosecond
+/// timestamp with a process-global atomic counter.
+///
+/// Safe to call from multiple threads — the counter guarantees uniqueness
+/// even within the same nanosecond, and BLAKE3 smears the input so IDs are
+/// well-distributed for downstream indexing and dedup.
+pub fn unique_message_id() -> [u8; MESSAGE_ID_LEN] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&now.to_le_bytes());
+    hasher.update(&seq.to_le_bytes());
+    let hash = hasher.finalize();
+    let mut id = [0u8; MESSAGE_ID_LEN];
+    id.copy_from_slice(&hash.as_bytes()[..MESSAGE_ID_LEN]);
+    id
+}
+
 // ── Minimum wire size ──────────────────────────────────────────────────
 // version(1) + type(1) + flags(1) + timestamp(8) + message_id(16)
 // + in_reply_to_flag(1) + sender_address(16) + recipient_count(1)

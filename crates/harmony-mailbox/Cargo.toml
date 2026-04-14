@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blake3.workspace = true
 harmony-identity.workspace = true
 thiserror.workspace = true
 
