@@ -137,40 +137,70 @@ impl ZenohPublisher {
                 };
                 for (addr_hex, root_cid) in snapshot {
                     let topic = format!("harmony/mail/v1/{addr_hex}/root");
-                    // Wrap the put in a timeout + cancel race so a stalled
-                    // Zenoh link cannot block the drain task indefinitely —
-                    // without this, shutdown hangs on the root-publish path
-                    // until the runtime forcibly tears the task down.
-                    tokio::select! {
-                        res = tokio::time::timeout(
+                    if cancelled {
+                        // Final drain pass. The cancel token is already
+                        // fired, so racing against `drain_cancel.cancelled()`
+                        // inside this select would resolve immediately on
+                        // every iteration and skip the put entirely —
+                        // defeating the whole point of the final drain. Use
+                        // the timeout alone: each entry gets up to
+                        // RAW_PUBLISH_TIMEOUT to complete, which bounds
+                        // shutdown latency at (timeout × snapshot_len) while
+                        // still delivering entries that can actually reach
+                        // the router.
+                        match tokio::time::timeout(
                             RAW_PUBLISH_TIMEOUT,
                             drain_session.put(&topic, &root_cid[..]),
-                        ) => match res {
+                        )
+                        .await
+                        {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
                                 tracing::warn!(
                                     error = %e,
                                     %topic,
-                                    "Zenoh root CID publish failed"
+                                    "Zenoh root CID publish failed during shutdown drain"
                                 );
                             }
                             Err(_elapsed) => {
                                 tracing::warn!(
                                     %topic,
                                     timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
-                                    "Zenoh root CID publish timed out — aborted"
+                                    "Zenoh root CID publish timed out during shutdown drain"
                                 );
                             }
-                        },
-                        _ = drain_cancel.cancelled() => {
-                            // Cancellation observed mid-snapshot. Stop draining
-                            // the rest of the snapshot and fall through to
-                            // drop(session) for a clean disconnect. Any unsent
-                            // entries will arrive on the next session after
-                            // restart — root updates are idempotent, so the
-                            // client sees the latest CID eventually.
-                            cancelled = true;
-                            break;
+                        }
+                    } else {
+                        // Pre-cancel path: race put vs cancel. If cancel
+                        // fires during the put, break out so the outer loop
+                        // snapshots again with `cancelled = true` and the
+                        // final-drain branch above handles anything that
+                        // arrived concurrently.
+                        tokio::select! {
+                            res = tokio::time::timeout(
+                                RAW_PUBLISH_TIMEOUT,
+                                drain_session.put(&topic, &root_cid[..]),
+                            ) => match res {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        %topic,
+                                        "Zenoh root CID publish failed"
+                                    );
+                                }
+                                Err(_elapsed) => {
+                                    tracing::warn!(
+                                        %topic,
+                                        timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                                        "Zenoh root CID publish timed out — aborted"
+                                    );
+                                }
+                            },
+                            _ = drain_cancel.cancelled() => {
+                                cancelled = true;
+                                break;
+                            }
                         }
                     }
                 }
