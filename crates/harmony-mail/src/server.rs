@@ -232,12 +232,22 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         ) {
             Ok(mut mgr) => {
                 // Initialize Merkle trees for all registered users
-                for user in imap_store.list_users().unwrap_or_default() {
-                    if let Err(e) = mgr.ensure_user_mailbox(&user.harmony_address) {
+                match imap_store.list_users() {
+                    Ok(users) => {
+                        for user in &users {
+                            if let Err(e) = mgr.ensure_user_mailbox(&user.harmony_address) {
+                                tracing::warn!(
+                                    user = %user.username,
+                                    error = %e,
+                                    "failed to init Merkle mailbox"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
                         tracing::warn!(
-                            user = %user.username,
                             error = %e,
-                            "failed to init Merkle mailbox"
+                            "failed to list users for Merkle mailbox init, trees will be created on demand"
                         );
                     }
                 }
@@ -1129,25 +1139,44 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
 
                 let success = !delivered_to.is_empty();
 
-                // Phase 5: Update Merkle mailbox (non-critical)
+                // Phase 5: Update Merkle mailbox (non-critical, fire-and-forget)
+                //
+                // Runs in spawn_blocking because insert_message does synchronous
+                // CAS I/O and SQLite writes. Not awaited — the SMTP 250 response
+                // should not wait on the Merkle write path.
                 if let Some(ref mgr) = mailbox_manager {
                     if let Some(ref msg_cid) = message_cid {
-                        for addr in &delivered_to {
-                            if let Err(e) = mgr.lock().unwrap().insert_message(
-                                addr,
-                                msg_cid,
-                                &msg_id,
-                                &sender_address,
-                                timestamp,
-                                &subject_snippet,
-                            ) {
-                                tracing::warn!(
-                                    recipient = hex::encode(addr),
-                                    error = %e,
-                                    "Merkle mailbox update failed, IMAP delivery unaffected"
-                                );
+                        let mgr = Arc::clone(mgr);
+                        let msg_cid = *msg_cid;
+                        let msg_id = msg_id;
+                        let sender_address = sender_address;
+                        let subject_snippet = subject_snippet.clone();
+                        let delivered_to = delivered_to.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let mut guard = match mgr.lock() {
+                                Ok(g) => g,
+                                Err(poisoned) => {
+                                    tracing::warn!("Merkle mailbox mutex poisoned, recovering");
+                                    poisoned.into_inner()
+                                }
+                            };
+                            for addr in &delivered_to {
+                                if let Err(e) = guard.insert_message(
+                                    addr,
+                                    &msg_cid,
+                                    &msg_id,
+                                    &sender_address,
+                                    timestamp,
+                                    &subject_snippet,
+                                ) {
+                                    tracing::warn!(
+                                        recipient = hex::encode(addr),
+                                        error = %e,
+                                        "Merkle mailbox update failed, IMAP delivery unaffected"
+                                    );
+                                }
                             }
-                        }
+                        });
                     }
                 }
 
@@ -3093,6 +3122,10 @@ node_config = "/tmp/test-node.toml"
         assert!(quit_resp.starts_with("221 "), "QUIT: {quit_resp}");
 
         server_handle.await.unwrap();
+
+        // Phase 5 runs in spawn_blocking (fire-and-forget), so give it
+        // a moment to complete before checking the Merkle tree.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Verify: message appears in IMAP store
         let mbox = store

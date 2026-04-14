@@ -171,6 +171,11 @@ impl MailboxManager {
         timestamp: u64,
         subject: &str,
     ) -> Result<(), MailboxError> {
+        // Auto-initialize if this user doesn't have a Merkle tree yet
+        // (e.g., user created after startup, or roots DB was reset).
+        if !self.roots.contains_key(user_address) {
+            self.ensure_user_mailbox(user_address)?;
+        }
         let root_cid = *self
             .roots
             .get(user_address)
