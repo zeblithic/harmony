@@ -402,9 +402,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                     let imap_cfg = ImapConfig {
                                         domain: d,
                                         tls_active: false,
-                                        // STARTTLS upgrade not yet wired on port 143 — don't
-                                        // advertise it until the upgrade path is implemented
-                                        tls_available: false,
+                                        tls_available: acc.is_some(),
                                         max_auth_failures: imap_max_auth_failures,
                                     };
                                     if let Err(e) = handle_imap_connection_starttls(reader, writer, imap_cfg, st, imap_idle_timeout, acc, csp).await {
@@ -1003,7 +1001,7 @@ async fn process_imap_async_actions<R, W>(
     framed: &mut FramedRead<R, ImapCodec>,
     content_store_path: &Path,
     domain: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
@@ -1705,8 +1703,7 @@ where
                 writer.flush().await?;
             }
             ImapAction::StartTls => {
-                // STARTTLS for IMAP — not yet wired (tls_available=false prevents advertisement)
-                tracing::debug!("IMAP STARTTLS requested but not yet implemented");
+                return Ok(true);
             }
             // Synchronous actions already handled by execute_imap_actions
             ImapAction::SendUntagged(_)
@@ -1715,7 +1712,7 @@ where
             | ImapAction::Close => {}
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Quote a mailbox name for safe inclusion in IMAP responses.
