@@ -493,8 +493,14 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        if args.engram_ann_entropy_weight < 0:
-            print("Error: --engram-ann-entropy-weight must be >= 0", file=sys.stderr)
+        if (
+            not math.isfinite(args.engram_ann_entropy_weight)
+            or not (0.0 <= args.engram_ann_entropy_weight <= 1.0)
+        ):
+            print(
+                "Error: --engram-ann-entropy-weight must be finite and in [0.0, 1.0]",
+                file=sys.stderr,
+            )
             sys.exit(1)
         if args.engram_ann_warmup_steps < 0:
             print("Error: --engram-ann-warmup-steps must be >= 0", file=sys.stderr)
@@ -1037,7 +1043,7 @@ def main() -> None:
                 model.engram_ann is not None
                 and engram_ann_entropy_bounds is not None
                 and args.grad_accum_steps > 0
-                and step >= args.engram_ann_warmup_steps
+                and step >= model.engram_ann.clamp_until_step
             ):
                 mean_gate = accum_ann_gate_mean / args.grad_accum_steps
                 low, high = engram_ann_entropy_bounds
