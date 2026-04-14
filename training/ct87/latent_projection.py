@@ -271,7 +271,7 @@ def contrastive_loss(
 
     # Scale projected similarities by temperature, mask diagonal
     logits = sim_proj / temperature
-    diag_mask = torch.full((n, n), 0.0, device=projected.device)
+    diag_mask = torch.full((n, n), 0.0, device=projected.device, dtype=sim_proj.dtype)
     diag_mask.fill_diagonal_(-1e9)
     logits = logits + diag_mask
 
@@ -281,7 +281,7 @@ def contrastive_loss(
         orig_data.fill_diagonal_(float("-inf"))  # exclude self
         _, top_indices = orig_data.topk(k, dim=1)
 
-        target_logits = torch.full((n, n), float("-inf"), device=projected.device)
+        target_logits = torch.full((n, n), float("-inf"), device=projected.device, dtype=sim_orig.dtype)
         target_logits.scatter_(1, top_indices, sim_orig.gather(1, top_indices))
         targets = torch.softmax(target_logits, dim=1)
 

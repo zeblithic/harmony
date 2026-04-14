@@ -242,9 +242,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train ct87 model")
     parser.add_argument(
         "--config",
-        choices=["tiny", "target", "tiny_engram_ann"],
+        choices=["tiny", "target", "tiny_ffn_expanded", "tiny_engram_ann"],
         default="tiny",
-        help="Model config. 'tiny_engram_ann' enables ZEB-117 Model gamma "
+        help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
+             "dense control). 'tiny_engram_ann' enables ZEB-117 Model gamma "
              "(ANN retrieval + gated residual + anti-collapse); requires "
              "--engram-ann-table.",
     )
@@ -264,6 +265,10 @@ def main() -> None:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-file", type=str, default=None, help="Path to CSV log file")
+    parser.add_argument(
+        "--resume-from", type=str, default=None,
+        help="Path to safetensors checkpoint to resume/fine-tune from",
+    )
     parser.add_argument(
         "--gradient-checkpoint", action="store_true",
         help="Enable gradient checkpointing (recompute activations to save VRAM)",
@@ -478,6 +483,8 @@ def main() -> None:
 
     if args.config == "tiny":
         config = HarmonyModelConfig.tiny()
+    elif args.config == "tiny_ffn_expanded":
+        config = HarmonyModelConfig.tiny_ffn_expanded()
     elif args.config == "tiny_engram_ann":
         config = HarmonyModelConfig.tiny_engram_ann()
     else:
@@ -559,6 +566,10 @@ def main() -> None:
     print(f"Config: {args.config}, device: {device}, seq_len: {seq_len}, dtype: {args.dtype}")
 
     model = HarmonyModel(config).to(device)
+    if args.resume_from is not None:
+        from safetensors.torch import load_model
+        load_model(model, args.resume_from, strict=False)
+        print(f"Resumed from checkpoint: {args.resume_from}")
     if args.gradient_checkpoint:
         model.set_gradient_checkpointing(True)
         print("Gradient checkpointing enabled")

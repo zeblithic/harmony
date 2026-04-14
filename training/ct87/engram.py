@@ -345,13 +345,25 @@ class EngramTable:
         positions: list[int] = []
         table_indices: list[int] = []
 
+        try:
+            import xxhash
+            _fast_hash = xxhash.xxh64_intdigest
+        except ImportError:
+            _fast_hash = None
+
+        total_entries = self.total_entries
+        seeds = self.hash_seeds
+
         for b in range(batch_size):
             emb = embeddings[b : b + 1]  # [1, seq_len, hidden_dim]
             proj_keys, proj_positions = projection.project_ngrams(emb, seq_len)
 
             for key_bytes, pos in zip(proj_keys, proj_positions):
-                for seed in self.hash_seeds:
-                    idx = _xxhash64(key_bytes, seed) % self.total_entries
+                for seed in seeds:
+                    if _fast_hash is not None:
+                        idx = _fast_hash(key_bytes, seed=seed) % total_entries
+                    else:
+                        idx = _xxhash64(key_bytes, seed) % total_entries
                     batch_indices.append(b)
                     positions.append(pos)
                     table_indices.append(idx)
@@ -364,8 +376,14 @@ class EngramTable:
             idx_t = torch.tensor(table_indices, dtype=torch.long)
             embs = self.table[idx_t]  # [n, engram_dim]
 
-            for i, (b, pos) in enumerate(zip(batch_indices, positions)):
-                result[b, pos] += embs[i]
+            # Vectorized scatter-add
+            flat = result.view(-1, self.engram_dim)
+            linear_idx = torch.tensor(
+                [b * seq_len + p for b, p in zip(batch_indices, positions)],
+                dtype=torch.long,
+            )
+            scatter_idx = linear_idx.unsqueeze(1).expand_as(embs)
+            flat.scatter_add_(0, scatter_idx, embs)
 
         return result.to(self.device)
 
@@ -405,9 +423,21 @@ class EngramTable:
         pos_list: list[int] = []
         table_indices: list[int] = []
 
+        try:
+            import xxhash
+            _fast_hash = xxhash.xxh64_intdigest
+        except ImportError:
+            _fast_hash = None
+
+        total_entries = self.total_entries
+        seeds = self.hash_seeds
+
         for key_bytes, pos in zip(binary_keys, positions):
-            for seed in self.hash_seeds:
-                idx = _xxhash64(key_bytes, seed) % self.total_entries
+            for seed in seeds:
+                if _fast_hash is not None:
+                    idx = _fast_hash(key_bytes, seed=seed) % total_entries
+                else:
+                    idx = _xxhash64(key_bytes, seed) % total_entries
                 batch_indices.append(0)
                 pos_list.append(pos)
                 table_indices.append(idx)
@@ -420,8 +450,14 @@ class EngramTable:
             idx_t = torch.tensor(table_indices, dtype=torch.long)
             embs = self.table[idx_t]
 
-            for i, (b, pos) in enumerate(zip(batch_indices, pos_list)):
-                result[b, pos] += embs[i]
+            # Vectorized scatter-add
+            flat = result.view(-1, self.engram_dim)
+            linear_idx = torch.tensor(
+                [b * seq_len + p for b, p in zip(batch_indices, pos_list)],
+                dtype=torch.long,
+            )
+            scatter_idx = linear_idx.unsqueeze(1).expand_as(embs)
+            flat.scatter_add_(0, scatter_idx, embs)
 
         return result.to(self.device)
 
