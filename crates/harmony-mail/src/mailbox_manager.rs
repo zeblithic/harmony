@@ -39,12 +39,16 @@ impl ZenohPublisher {
     /// Create a new publisher backed by a Zenoh session.
     ///
     /// Spawns a background task that drains the channel and publishes
-    /// root CID updates to `harmony/messages/{addr_hex}/inbox`.
+    /// root CID updates to `harmony/mail/v1/{addr_hex}/root`.
+    ///
+    /// Topic namespace: `harmony/mail/v1/*` is the canonical mail prefix
+    /// (Phase 0 client consumes `harmony/mail/v1/{addr}` for raw messages
+    /// and reserves the `/root` suffix for root CID updates).
     pub fn new(session: zenoh::Session) -> Self {
         let (tx, mut rx) = mpsc::channel::<(String, [u8; CID_LEN])>(ZENOH_NOTIFY_CAPACITY);
         tokio::spawn(async move {
             while let Some((addr_hex, root_cid)) = rx.recv().await {
-                let topic = format!("harmony/messages/{addr_hex}/inbox");
+                let topic = format!("harmony/mail/v1/{addr_hex}/root");
                 if let Err(e) = session.put(&topic, &root_cid[..]).await {
                     tracing::warn!(error = %e, %topic, "Zenoh root CID publish failed");
                 }
