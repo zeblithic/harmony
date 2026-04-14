@@ -3498,6 +3498,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-mailbox"
+version = "0.1.0"
+dependencies = [
+ "harmony-identity",
+ "hex",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harmony-memo"
 version = "0.1.0"
 dependencies = [
