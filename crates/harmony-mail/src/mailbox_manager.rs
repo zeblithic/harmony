@@ -12,7 +12,7 @@ use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 
 /// Errors from mailbox manager operations.
 #[derive(Debug, thiserror::Error)]
-pub enum MailboxError {
+pub enum ManagerError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("CAS error: {0}")]
@@ -21,6 +21,12 @@ pub enum MailboxError {
     Format(#[from] crate::error::MailError),
     #[error("no mailbox for user {}", hex::encode(.0))]
     NoMailbox([u8; ADDRESS_HASH_LEN]),
+}
+
+impl From<harmony_mailbox::MailboxError> for ManagerError {
+    fn from(e: harmony_mailbox::MailboxError) -> Self {
+        ManagerError::Format(crate::error::MailError::Mailbox(e))
+    }
 }
 
 pub struct MailboxManager {
@@ -41,7 +47,7 @@ CREATE TABLE IF NOT EXISTS mailbox_roots (
 
 impl MailboxManager {
     /// Open or create the mailbox roots database.
-    pub fn open(db_path: &Path, content_store_path: &Path) -> Result<Self, MailboxError> {
+    pub fn open(db_path: &Path, content_store_path: &Path) -> Result<Self, ManagerError> {
         let db = rusqlite::Connection::open(db_path)?;
         db.execute_batch(SCHEMA_SQL)?;
 
@@ -60,7 +66,7 @@ impl MailboxManager {
                 .collect::<Result<_, _>>()?;
             for (addr_blob, cid_blob) in pairs {
                 if addr_blob.len() != ADDRESS_HASH_LEN || cid_blob.len() != CID_LEN {
-                    return Err(MailboxError::Cas(format!(
+                    return Err(ManagerError::Cas(format!(
                         "corrupt mailbox_roots row: address_len={}, root_cid_len={}",
                         addr_blob.len(),
                         cid_blob.len()
@@ -92,23 +98,23 @@ impl MailboxManager {
     }
 
     /// Ingest raw bytes into CAS and return the resulting CID as a 32-byte array.
-    fn cas_ingest(&self, data: &[u8]) -> Result<[u8; CID_LEN], MailboxError> {
+    fn cas_ingest(&self, data: &[u8]) -> Result<[u8; CID_LEN], ManagerError> {
         let mut book = harmony_db::DiskBookStore::new(&self.content_store_path);
         let cid = harmony_content::dag::ingest(
             data,
             &harmony_content::chunker::ChunkerConfig::DEFAULT,
             &mut book,
         )
-        .map_err(|e| MailboxError::Cas(e.to_string()))?;
+        .map_err(|e| ManagerError::Cas(e.to_string()))?;
         Ok(cid.to_bytes())
     }
 
     /// Load raw bytes from CAS by CID, reassembling chunked DAG entries.
-    fn cas_load(&self, cid: &[u8; CID_LEN]) -> Result<Vec<u8>, MailboxError> {
+    fn cas_load(&self, cid: &[u8; CID_LEN]) -> Result<Vec<u8>, ManagerError> {
         let book = harmony_db::DiskBookStore::new(&self.content_store_path);
         let content_id = harmony_content::cid::ContentId::from_bytes(*cid);
         harmony_content::dag::reassemble(&content_id, &book)
-            .map_err(|e| MailboxError::Cas(e.to_string()))
+            .map_err(|e| ManagerError::Cas(e.to_string()))
     }
 
     /// Ensure a user has a Merkle mailbox tree. If one already exists, this is a no-op.
@@ -117,7 +123,7 @@ impl MailboxManager {
     pub fn ensure_user_mailbox(
         &mut self,
         address: &[u8; ADDRESS_HASH_LEN],
-    ) -> Result<(), MailboxError> {
+    ) -> Result<(), ManagerError> {
         if self.roots.contains_key(address) {
             return Ok(());
         }
@@ -172,7 +178,7 @@ impl MailboxManager {
         sender_address: &[u8; ADDRESS_HASH_LEN],
         timestamp: u64,
         subject: &str,
-    ) -> Result<(), MailboxError> {
+    ) -> Result<(), ManagerError> {
         // Auto-initialize if this user doesn't have a Merkle tree yet
         // (e.g., user created after startup, or roots DB was reset).
         if !self.roots.contains_key(user_address) {
@@ -181,7 +187,7 @@ impl MailboxManager {
         let root_cid = *self
             .roots
             .get(user_address)
-            .ok_or(MailboxError::NoMailbox(*user_address))?;
+            .ok_or(ManagerError::NoMailbox(*user_address))?;
 
         // Load current root
         let root_bytes = self.cas_load(&root_cid)?;
@@ -264,7 +270,7 @@ impl MailboxManager {
         &mut self,
         address: &[u8; ADDRESS_HASH_LEN],
         root_cid: &[u8; CID_LEN],
-    ) -> Result<(), MailboxError> {
+    ) -> Result<(), ManagerError> {
         self.db.execute(
             "INSERT INTO mailbox_roots (address, root_cid) VALUES (?1, ?2)
              ON CONFLICT(address) DO UPDATE SET root_cid = excluded.root_cid",
