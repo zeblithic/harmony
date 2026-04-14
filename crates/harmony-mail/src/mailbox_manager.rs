@@ -53,7 +53,13 @@ use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 /// Both paths skip new publishes once `cancel` fires, and the drain task
 /// drops its session clone on cancel for clean disconnect.
 pub struct ZenohPublisher {
+    /// Coalescing map: pending root CIDs to publish. Drained by the
+    /// background task on each wake.
     latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
+    /// Current root CID per address (never drained). Populated by every
+    /// notify() call. Read by the root queryable for cold-start sync so
+    /// replies are deterministic regardless of drain-task timing.
+    current: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
     wake: Arc<Notify>,
     raw_sink: RawSink,
 }
@@ -81,6 +87,7 @@ enum RawSink {
 #[cfg(test)]
 pub struct InertHandles {
     pub latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
+    pub current: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
     pub raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
 }
 
@@ -101,6 +108,8 @@ impl ZenohPublisher {
     /// Tokio runtime is dropped.
     pub fn new(session: zenoh::Session, cancel: CancellationToken) -> Self {
         let latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let current: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let wake = Arc::new(Notify::new());
 
@@ -198,7 +207,7 @@ impl ZenohPublisher {
         // queries and puts independently. Reply payload is the raw 32 bytes, or
         // an empty reply if the address has no mail yet.
         let query_session = session.clone();
-        let query_latest = Arc::clone(&latest);
+        let query_current = Arc::clone(&current);
         let query_cancel = cancel.clone();
         // Reply payload is the raw 32-byte CID for the address, OR an empty
         // payload if the address has no mail yet (sentinel for "no root yet").
@@ -228,7 +237,7 @@ impl ZenohPublisher {
                             let _ = query.reply_err("invalid key").await;
                             continue;
                         };
-                        let payload: Option<[u8; CID_LEN]> = query_latest
+                        let payload: Option<[u8; CID_LEN]> = query_current
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .get(addr_hex)
@@ -249,6 +258,7 @@ impl ZenohPublisher {
 
         Self {
             latest,
+            current,
             wake,
             raw_sink: RawSink::Session {
                 session,
@@ -267,14 +277,17 @@ impl ZenohPublisher {
     pub fn inert_for_test() -> (Self, InertHandles) {
         let latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let current: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>> = Arc::new(Mutex::new(Vec::new()));
         let wake = Arc::new(Notify::new());
         let publisher = Self {
             latest: Arc::clone(&latest),
+            current: Arc::clone(&current),
             wake,
             raw_sink: RawSink::Captured(Arc::clone(&raw)),
         };
-        (publisher, InertHandles { latest, raw })
+        (publisher, InertHandles { latest, current, raw })
     }
 
     /// Announce a new root CID for a user.
@@ -282,13 +295,18 @@ impl ZenohPublisher {
     /// Overwrites any previous pending CID for the same address and wakes the
     /// drain task. Callable from sync context.
     pub fn notify(&self, addr_hex: String, root_cid: [u8; CID_LEN]) {
-        {
-            let mut map = self
-                .latest
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            map.insert(addr_hex, root_cid);
-        }
+        let mut latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        latest.insert(addr_hex.clone(), root_cid);
+        current.insert(addr_hex, root_cid);
+        drop(latest);
+        drop(current);
         self.wake.notify_one();
     }
 
@@ -1371,37 +1389,132 @@ mod tests {
 
         let addr_hex = "00112233445566778899aabbccddeeff".to_string();
         let root_cid = [0xAB; CID_LEN];
-        let topic = format!("harmony/mail/v1/{addr_hex}/root");
+        publisher.notify(addr_hex.clone(), root_cid);
 
-        // NOTE (G1-only): the `latest` map is consumed by the drain task, so a
-        // query racing a drain returns empty. G3 adds a parallel never-drained
-        // `current` map that eliminates this race. For G1, we retry the insert
-        // + query in a tight loop; whenever the query-side lock wins, the
-        // assertion passes. On a healthy scheduler one of the first few
-        // iterations wins well before the timeout.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut got: Option<Vec<u8>> = None;
-        while std::time::Instant::now() < deadline {
-            publisher.notify(addr_hex.clone(), root_cid);
-            let replies = session.get(&topic).await.unwrap();
-            let mut this_reply: Option<Vec<u8>> = None;
-            while let Ok(reply) = replies.recv_async().await {
-                if let Ok(sample) = reply.result() {
-                    assert_eq!(
-                        sample.key_expr().as_str(),
-                        &topic,
-                        "reply key should match query topic"
-                    );
-                    this_reply = Some(sample.payload().to_bytes().to_vec());
-                    break;
-                }
-            }
-            if this_reply.as_deref() == Some(&root_cid[..]) {
-                got = this_reply;
-                break;
+        // Wait long enough that the drain task definitely consumed `latest`.
+        // The queryable reads from `current`, which is never drained, so the
+        // reply is deterministic regardless of drain-task timing.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Drain all replies from the `session.get()` channel. Because every
+        // test in this module opens its own Zenoh session on loopback, peer
+        // scouting discovers sibling publishers running in parallel tests,
+        // and each of their queryables will also receive our query and reply
+        // with an empty payload (addr not in their `current`). We accept those
+        // empty cross-session replies and assert our own queryable returned
+        // the expected CID at least once. `ConsolidationMode::None` disables
+        // Zenoh's default reply consolidation so we see every replier's
+        // payload (consolidation would otherwise collapse them into one).
+        let topic = format!("harmony/mail/v1/{addr_hex}/root");
+        let replies = session
+            .get(&topic)
+            .consolidation(zenoh::query::ConsolidationMode::None)
+            .await
+            .unwrap();
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        while let Ok(reply) = replies.recv_async().await {
+            if let Ok(sample) = reply.result() {
+                assert_eq!(
+                    sample.key_expr().as_str(),
+                    &topic,
+                    "reply key should match query topic"
+                );
+                payloads.push(sample.payload().to_bytes().to_vec());
             }
         }
-        assert_eq!(got.as_deref(), Some(&root_cid[..]));
+        assert!(
+            payloads.iter().any(|p| p.as_slice() == &root_cid[..]),
+            "expected at least one reply with the root CID; got {payloads:?}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_queryable_empty_for_unknown_addr() {
+        let cancel = CancellationToken::new();
+        let session = zenoh::open(zenoh::Config::default()).await.unwrap();
+        let _publisher = ZenohPublisher::new(session.clone(), cancel.clone());
+
+        // Allow the queryable declaration to settle before querying.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drain every reply. With gossip scouting across parallel tests,
+        // multiple queryables may reply, but none of them should have this
+        // addr in `current`, so every reply must carry an empty payload.
+        // `ConsolidationMode::None` disables reply consolidation so we see
+        // every replier — including our own session-local queryable.
+        let unknown = "ffffffffffffffffffffffffffffffff".to_string();
+        let topic = format!("harmony/mail/v1/{unknown}/root");
+        let replies = session
+            .get(&topic)
+            .consolidation(zenoh::query::ConsolidationMode::None)
+            .await
+            .unwrap();
+        let mut got_any = false;
+        while let Ok(reply) = replies.recv_async().await {
+            if let Ok(sample) = reply.result() {
+                got_any = true;
+                let bytes = sample.payload().to_bytes();
+                assert!(
+                    bytes.is_empty(),
+                    "unknown address must yield an empty payload; got {bytes:?}"
+                );
+            }
+        }
+        assert!(got_any, "expected at least one reply from our queryable");
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_queryable_returns_latest_after_multiple_updates() {
+        let cancel = CancellationToken::new();
+        let session = zenoh::open(zenoh::Config::default()).await.unwrap();
+        let publisher = ZenohPublisher::new(session.clone(), cancel.clone());
+
+        // Allow the queryable declaration to settle before querying.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let addr_hex = "11223344556677889900aabbccddeeff".to_string();
+        publisher.notify(addr_hex.clone(), [0x01; CID_LEN]);
+        publisher.notify(addr_hex.clone(), [0x02; CID_LEN]);
+        publisher.notify(addr_hex.clone(), [0x03; CID_LEN]);
+
+        // Wait long enough that the drain task has definitely consumed
+        // `latest`. Queryable reads from `current` which is never drained, so
+        // this is deterministic.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // As in the other queryable tests: drain all replies, tolerate empty
+        // replies from sibling-test queryables (peer-discovered on loopback),
+        // and assert our own queryable returned the latest CID at least once.
+        // Specifically, no earlier CID (0x01 or 0x02) should ever appear —
+        // `current` is strictly last-write-wins, not drained.
+        // `ConsolidationMode::None` disables reply consolidation so every
+        // replier's payload is delivered (our own local one included).
+        let topic = format!("harmony/mail/v1/{addr_hex}/root");
+        let replies = session
+            .get(&topic)
+            .consolidation(zenoh::query::ConsolidationMode::None)
+            .await
+            .unwrap();
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        while let Ok(reply) = replies.recv_async().await {
+            if let Ok(sample) = reply.result() {
+                payloads.push(sample.payload().to_bytes().to_vec());
+            }
+        }
+        let expected = [0x03; CID_LEN];
+        assert!(
+            payloads.iter().any(|p| p.as_slice() == &expected[..]),
+            "queryable should return the latest CID after multiple updates; got {payloads:?}"
+        );
+        // Neither of the earlier CIDs should leak through — last-write-wins.
+        for bad in [[0x01u8; CID_LEN], [0x02u8; CID_LEN]] {
+            assert!(
+                !payloads.iter().any(|p| p.as_slice() == &bad[..]),
+                "queryable must not return a stale CID {bad:?}; got {payloads:?}"
+            );
+        }
         cancel.cancel();
     }
 }
