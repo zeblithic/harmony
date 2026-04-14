@@ -68,7 +68,7 @@ pub const EMPTY_CID: [u8; CID_LEN] = [0u8; CID_LEN];
 
 /// Truncate a UTF-8 string to at most `max_bytes` without splitting
 /// multi-byte characters. Returns the longest valid prefix.
-fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }

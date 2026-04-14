@@ -9,6 +9,7 @@ pub mod imap_render;
 pub mod imap_store;
 pub mod io;
 pub mod mailbox;
+pub mod mailbox_manager;
 pub mod message;
 pub mod outbound;
 pub mod registry;
