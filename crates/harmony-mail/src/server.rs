@@ -398,13 +398,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                 let csp = csp_outer.clone();
                                 tokio::spawn(async move {
                                     let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
-                                    let (reader, writer) = tokio::io::split(stream);
+                                    let (reader, writer) = stream.into_split();
                                     let imap_cfg = ImapConfig {
                                         domain: d,
                                         tls_active: false,
-                                        // STARTTLS upgrade not yet wired on port 143 — don't
-                                        // advertise it until the upgrade path is implemented
-                                        tls_available: false,
+                                        tls_available: acc.is_some(),
                                         max_auth_failures: imap_max_auth_failures,
                                     };
                                     if let Err(e) = handle_imap_connection_starttls(reader, writer, imap_cfg, st, imap_idle_timeout, acc, csp).await {
@@ -855,12 +853,31 @@ where
 {
     let domain = config.domain.clone();
     let mut session = ImapSession::new(config);
-    let codec = ImapCodec::new();
 
     // Send greeting
     let actions = session.handle(ImapEvent::Connected);
     execute_imap_actions(&actions, &mut writer).await?;
 
+    handle_imap_session(reader, writer, session, store, idle_timeout, content_store_path, &domain).await
+}
+
+/// Run the IMAP command loop with an existing session (no greeting sent).
+/// Used by both `handle_imap_connection` (after greeting) and
+/// `handle_imap_connection_starttls` (after TLS upgrade, no greeting).
+async fn handle_imap_session<R, W>(
+    reader: R,
+    mut writer: W,
+    mut session: ImapSession,
+    store: Arc<ImapStore>,
+    idle_timeout: Duration,
+    content_store_path: PathBuf,
+    domain: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let codec = ImapCodec::new();
     let mut framed = FramedRead::new(reader, codec);
 
     loop {
@@ -884,7 +901,7 @@ where
                             &store,
                             &mut framed,
                             &content_store_path,
-                            &domain,
+                            domain,
                         )
                         .await?;
                         if should_close || session.state == ImapState::Logout {
@@ -930,23 +947,152 @@ where
 }
 
 /// Handle an IMAP connection on port 143 (plaintext with optional STARTTLS).
-async fn handle_imap_connection_starttls<R, W>(
-    reader: R,
-    writer: W,
+async fn handle_imap_connection_starttls(
+    reader: tokio::net::tcp::OwnedReadHalf,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
     config: ImapConfig,
     store: Arc<ImapStore>,
     idle_timeout: Duration,
-    _tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     content_store_path: PathBuf,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    // For v1.1, STARTTLS on IMAP port 143 is not yet wired — use the
-    // generic handler. Full STARTTLS upgrade (similar to SMTP's
-    // handle_connection) will be added when needed.
-    handle_imap_connection(reader, writer, config, store, idle_timeout, content_store_path).await
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let domain = config.domain.clone();
+    let mut session = ImapSession::new(config);
+    let codec = ImapCodec::new();
+
+    // Send greeting
+    let actions = session.handle(ImapEvent::Connected);
+    execute_imap_actions(&actions, &mut writer).await?;
+
+    let mut framed = FramedRead::new(reader, codec);
+
+    loop {
+        let timeout_dur = match session.state {
+            ImapState::Idling { .. } => idle_timeout,
+            _ => IMAP_COMMAND_TIMEOUT,
+        };
+
+        let frame = tokio::time::timeout(timeout_dur, framed.next()).await;
+
+        match frame {
+            Ok(Some(Ok(imap_frame))) => match imap_frame {
+                ImapFrame::CommandLine(line) => match imap_parse::parse_command(&line) {
+                    Ok(cmd) => {
+                        let actions = session.handle(ImapEvent::Command(cmd));
+                        let should_close = execute_imap_actions(&actions, &mut writer).await?;
+                        let needs_starttls = process_imap_async_actions(
+                            &actions,
+                            &mut session,
+                            &mut writer,
+                            &store,
+                            &mut framed,
+                            &content_store_path,
+                            &domain,
+                        )
+                        .await?;
+
+                        if needs_starttls {
+                            break;
+                        }
+                        if should_close || session.state == ImapState::Logout {
+                            let _ = writer.shutdown().await;
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => {
+                        let response = if let Some(tag) = e.tag() {
+                            format!("{tag} BAD {e}\r\n")
+                        } else {
+                            format!("* BAD {e}\r\n")
+                        };
+                        writer.write_all(response.as_bytes()).await?;
+                        writer.flush().await?;
+                    }
+                },
+                ImapFrame::NeedsContinuation { .. } => {
+                    writer.write_all(b"+ Ready\r\n").await?;
+                    writer.flush().await?;
+                    framed.decoder_mut().acknowledge_continuation();
+                }
+                ImapFrame::Done => {
+                    let actions = session.handle(ImapEvent::IdleDone);
+                    execute_imap_actions(&actions, &mut writer).await?;
+                    framed.decoder_mut().exit_idle_mode();
+                }
+            },
+            Ok(Some(Err(e))) => {
+                tracing::debug!(error = %e, "IMAP codec error");
+                writer.write_all(b"* BYE protocol error\r\n").await?;
+                let _ = writer.shutdown().await;
+                return Ok(());
+            }
+            Ok(None) => {
+                let _ = writer.shutdown().await;
+                return Ok(());
+            }
+            Err(_) => {
+                writer.write_all(b"* BYE connection timed out\r\n").await?;
+                let _ = writer.shutdown().await;
+                return Ok(());
+            }
+        }
+    }
+
+    // ── STARTTLS upgrade ──────────────────────────────────────────
+    let acceptor = match tls_acceptor {
+        Some(ref acc) => acc,
+        None => {
+            writer.write_all(b"* BYE TLS not available\r\n").await?;
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+    };
+
+    writer.flush().await?;
+
+    let parts = framed.into_parts();
+    let tcp_reader = parts.io;
+
+    if !parts.read_buf.is_empty() {
+        tracing::warn!(
+            buffered_bytes = parts.read_buf.len(),
+            "IMAP STARTTLS: rejecting — client sent data before OK response"
+        );
+        let mut stream = tcp_reader
+            .reunite(writer)
+            .map_err(|e| format!("failed to reunite: {e}"))?;
+        let _ = stream.write_all(b"* BYE STARTTLS protocol error\r\n").await;
+        return Ok(());
+    }
+
+    let tcp_stream = tcp_reader
+        .reunite(writer)
+        .map_err(|e| format!("failed to reunite TCP halves: {e}"))?;
+
+    match tls::starttls_upgrade(tcp_stream, acceptor).await {
+        Ok(tls_stream) => {
+            let (tls_reader, tls_writer) = tokio::io::split(tls_stream);
+            // Feed TlsCompleted to state machine (sets tls_active=true, resets to NotAuthenticated)
+            let tls_actions = session.handle(ImapEvent::TlsCompleted);
+            let mut tls_writer = tls_writer;
+            execute_imap_actions(&tls_actions, &mut tls_writer).await?;
+            // Continue with existing session — no new greeting per RFC 2595 §3
+            handle_imap_session(
+                tls_reader,
+                tls_writer,
+                session,
+                store,
+                idle_timeout,
+                content_store_path,
+                &domain,
+            )
+            .await
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "IMAP STARTTLS handshake failed");
+            Ok(())
+        }
+    }
 }
 
 /// Execute IMAP actions by writing responses to the client.
@@ -1003,7 +1149,7 @@ async fn process_imap_async_actions<R, W>(
     framed: &mut FramedRead<R, ImapCodec>,
     content_store_path: &Path,
     domain: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
@@ -1705,8 +1851,7 @@ where
                 writer.flush().await?;
             }
             ImapAction::StartTls => {
-                // STARTTLS for IMAP — not yet wired (tls_available=false prevents advertisement)
-                tracing::debug!("IMAP STARTTLS requested but not yet implemented");
+                return Ok(true);
             }
             // Synchronous actions already handled by execute_imap_actions
             ImapAction::SendUntagged(_)
@@ -1715,7 +1860,7 @@ where
             | ImapAction::Close => {}
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Quote a mailbox name for safe inclusion in IMAP responses.
@@ -2209,6 +2354,121 @@ node_config = "/tmp/test-node.toml"
         assert!(quit_resp.starts_with("221 "), "QUIT: {quit_resp}");
 
         server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn imap_starttls_upgrade() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        // Generate self-signed cert
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut cert_file, cert_pem.as_bytes()).unwrap();
+        std::io::Write::flush(&mut cert_file).unwrap();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut key_file, key_pem.as_bytes()).unwrap();
+        std::io::Write::flush(&mut key_file).unwrap();
+
+        let acceptor = tls::load_tls_config(cert_file.path(), key_file.path()).unwrap();
+        let acceptor = std::sync::Arc::new(acceptor);
+
+        // Set up IMAP store
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("imap.db");
+        let store = crate::imap_store::ImapStore::open(&db_path).unwrap();
+        store.initialize_default_mailboxes().unwrap();
+        store.create_user("testuser", "testpass", &[0xAAu8; crate::message::ADDRESS_HASH_LEN]).unwrap();
+        let store = std::sync::Arc::new(store);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let csp = dir.path().join("content");
+
+        let server_acceptor = acceptor.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let config = crate::imap::ImapConfig {
+                domain: "localhost".to_string(),
+                tls_active: false,
+                tls_available: true,
+                max_auth_failures: 3,
+            };
+            let _ = handle_imap_connection_starttls(
+                reader,
+                writer,
+                config,
+                store,
+                Duration::from_secs(30),
+                Some(server_acceptor),
+                csp,
+            )
+            .await;
+        });
+
+        // Client: connect plaintext
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = tcp.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Read greeting
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("OK"), "expected greeting, got: {line}");
+
+        // Send CAPABILITY — should advertise STARTTLS
+        line.clear();
+        write_half.write_all(b"a1 CAPABILITY\r\n").await.unwrap();
+        // Read untagged capability
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("STARTTLS"), "expected STARTTLS in capabilities: {line}");
+        // Read tagged OK
+        let mut ok_line = String::new();
+        reader.read_line(&mut ok_line).await.unwrap();
+        assert!(ok_line.contains("a1 OK"), "expected tagged OK: {ok_line}");
+
+        // Send STARTTLS
+        line.clear();
+        write_half.write_all(b"a2 STARTTLS\r\n").await.unwrap();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("a2 OK"), "expected STARTTLS OK: {line}");
+
+        // Perform TLS handshake
+        let tcp_stream = reader.into_inner().reunite(write_half).unwrap();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut root_store = rustls::RootCertStore::empty();
+        let certs = tls::load_certs(cert_file.path()).unwrap();
+        for c in &certs {
+            root_store.add(c.clone()).unwrap();
+        }
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+        let (tls_read, mut tls_write) = tokio::io::split(tls_stream);
+        let mut tls_reader = BufReader::new(tls_read);
+
+        // Post-TLS: no greeting — per RFC 2595 §3, LOGIN directly
+        // LOGIN should work over TLS
+        line.clear();
+        tls_write.write_all(b"a3 LOGIN testuser testpass\r\n").await.unwrap();
+        tls_reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("a3 OK"), "expected LOGIN OK: {line}");
+
+        // QUIT
+        tls_write.write_all(b"a4 LOGOUT\r\n").await.unwrap();
+        line.clear();
+        tls_reader.read_line(&mut line).await.unwrap(); // * BYE
+        line.clear();
+        tls_reader.read_line(&mut line).await.unwrap(); // a4 OK
+
+        server.await.unwrap();
     }
 
     #[test]
