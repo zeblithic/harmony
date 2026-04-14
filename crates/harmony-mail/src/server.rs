@@ -2698,6 +2698,124 @@ node_config = "/tmp/test-node.toml"
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn smtp_delivers_to_local_imap() {
+        let config = test_config();
+        let max_message_size = parse_message_size(&config.spam.max_message_size);
+        let smtp_config = SmtpConfig {
+            domain: config.domain.name.clone(),
+            mx_host: config.domain.mx_host.clone(),
+            max_message_size,
+            max_recipients: 100,
+            tls_available: false,
+        };
+
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("imap.db")).unwrap(),
+        );
+        store.initialize_default_mailboxes().unwrap();
+        // Create alice with a known harmony address
+        let alice_addr = [0xAAu8; crate::message::ADDRESS_HASH_LEN];
+        store.create_user("alice", "alicepass", &alice_addr).unwrap();
+
+        let content_path = smtp_test_dir.path().join("content");
+        let store_clone = store.clone();
+        let content_path_clone = content_path.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            handle_connection(
+                stream,
+                peer_addr.ip(),
+                smtp_config,
+                max_message_size,
+                None,
+                store_clone,
+                None,
+                "test.example.com".to_string(),
+                content_path_clone,
+                5,
+            )
+            .await
+            .unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Read 220 greeting
+        let greeting = read_smtp_response(&mut reader).await;
+        assert!(greeting.starts_with("220 "), "greeting: {greeting}");
+
+        // EHLO
+        write_half.write_all(b"EHLO sender.test.com\r\n").await.unwrap();
+        let ehlo_resp = read_smtp_response(&mut reader).await;
+        assert!(ehlo_resp.contains("250"), "EHLO: {ehlo_resp}");
+
+        // MAIL FROM
+        write_half
+            .write_all(b"MAIL FROM:<sender@test.com>\r\n")
+            .await
+            .unwrap();
+        let mail_resp = read_smtp_response(&mut reader).await;
+        assert!(mail_resp.contains("250"), "MAIL FROM: {mail_resp}");
+
+        // RCPT TO alice — local domain, resolves by username
+        write_half
+            .write_all(b"RCPT TO:<alice@test.example.com>\r\n")
+            .await
+            .unwrap();
+        let rcpt_resp = read_smtp_response(&mut reader).await;
+        assert!(rcpt_resp.contains("250"), "RCPT TO: {rcpt_resp}");
+
+        // DATA
+        write_half.write_all(b"DATA\r\n").await.unwrap();
+        let data_resp = read_smtp_response(&mut reader).await;
+        assert!(data_resp.starts_with("354"), "DATA: {data_resp}");
+
+        // Send RFC 5322 message body with proper headers
+        write_half
+            .write_all(
+                b"From: sender@test.com\r\n\
+                  To: alice@test.example.com\r\n\
+                  Subject: Integration Test\r\n\
+                  Message-ID: <test-deliver-001@test.com>\r\n\
+                  Date: Mon, 13 Apr 2026 00:00:00 +0000\r\n\
+                  \r\n\
+                  Hello Alice, this is a delivery test.\r\n\
+                  .\r\n",
+            )
+            .await
+            .unwrap();
+        let deliver_resp = read_smtp_response(&mut reader).await;
+        assert!(deliver_resp.contains("250"), "delivery: {deliver_resp}");
+
+        // QUIT
+        write_half.write_all(b"QUIT\r\n").await.unwrap();
+        let quit_resp = read_smtp_response(&mut reader).await;
+        assert!(quit_resp.starts_with("221 "), "QUIT: {quit_resp}");
+
+        server_handle.await.unwrap();
+
+        // Verify: message appears in alice's INBOX
+        let mbox = store
+            .get_mailbox("INBOX")
+            .expect("get_mailbox ok")
+            .expect("INBOX exists");
+        let messages = store.get_messages(mbox.id).expect("get_messages ok");
+        assert_eq!(messages.len(), 1, "expected 1 message in INBOX, got {}", messages.len());
+        assert!(
+            messages[0].rfc822_size > 0,
+            "expected rfc822_size > 0, got {}",
+            messages[0].rfc822_size
+        );
+    }
+
     #[test]
     fn per_ip_rate_limiting() {
         let shared = SharedState::new(2);
