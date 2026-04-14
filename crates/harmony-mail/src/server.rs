@@ -268,7 +268,15 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         use crate::mailbox_manager::ZenohPublisher;
 
         let zenoh_enabled = config.zenoh.as_ref().map(|z| z.enabled).unwrap_or(false);
-        if zenoh_enabled {
+        if zenoh_enabled && mailbox_mgr.is_none() {
+            // Opening the session here would spawn a ZenohPublisher drain task
+            // that captures the session by move. With no MailboxManager to
+            // attach the publisher to, the publisher would be dropped while
+            // the drain task kept the session alive forever — a leak.
+            tracing::warn!(
+                "Zenoh enabled but MailboxManager unavailable — skipping session open to avoid leaking the drain task"
+            );
+        } else if zenoh_enabled {
             // Build Zenoh config. The gateway is a publisher only — we never
             // want it to open a listening socket. Default config would run in
             // peer mode and bind a random TCP port, which is unexpected for
@@ -315,24 +323,26 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if config_ok {
+                // The outer gate guarantees mailbox_mgr.is_some() here, so it
+                // is safe to open the session without risking a leaked drain
+                // task with no consumer.
+                let mgr_arc = mailbox_mgr
+                    .as_ref()
+                    .expect("mailbox_mgr.is_some() checked by outer gate");
                 match zenoh::open(zenoh_config).await {
                     Ok(session) => {
                         tracing::info!("Zenoh session opened for mailbox notifications");
                         let publisher = ZenohPublisher::new(session);
-                        if let Some(ref mgr_arc) = mailbox_mgr {
-                            // Recover from a poisoned mutex rather than silently
-                            // skipping publisher attachment — Merkle mailbox
-                            // updates are low-severity but we want visibility
-                            // into lock state to match the rest of the server.
-                            match mgr_arc.lock() {
-                                Ok(mut mgr) => mgr.set_publisher(publisher),
-                                Err(poisoned) => {
-                                    tracing::warn!("MailboxManager mutex poisoned during Zenoh publisher attach, recovering");
-                                    poisoned.into_inner().set_publisher(publisher);
-                                }
+                        // Recover from a poisoned mutex rather than silently
+                        // skipping publisher attachment — Merkle mailbox
+                        // updates are low-severity but we want visibility
+                        // into lock state to match the rest of the server.
+                        match mgr_arc.lock() {
+                            Ok(mut mgr) => mgr.set_publisher(publisher),
+                            Err(poisoned) => {
+                                tracing::warn!("MailboxManager mutex poisoned during Zenoh publisher attach, recovering");
+                                poisoned.into_inner().set_publisher(publisher);
                             }
-                        } else {
-                            tracing::warn!("MailboxManager unavailable, Zenoh publisher not attached");
                         }
                     }
                     Err(e) => {
