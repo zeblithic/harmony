@@ -83,6 +83,11 @@ impl MailboxManager {
         self.roots.get(address)
     }
 
+    /// Number of users with initialized Merkle mailboxes.
+    pub fn user_count(&self) -> usize {
+        self.roots.len()
+    }
+
     /// Ingest raw bytes into CAS and return the resulting CID as a 32-byte array.
     fn cas_ingest(&self, data: &[u8]) -> Result<[u8; CID_LEN], MailboxError> {
         let mut book = harmony_db::DiskBookStore::new(&self.content_store_path);

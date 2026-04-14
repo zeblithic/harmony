@@ -221,6 +221,38 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let reject_threshold = config.spam.reject_threshold;
     let local_domain = config.domain.name.clone();
 
+    // ── Merkle mailbox manager ────────────────────────────────────────
+    let store_dir = Path::new(&config.imap.store_path)
+        .parent()
+        .unwrap_or(Path::new("."));
+    let mailbox_mgr: Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>> =
+        match crate::mailbox_manager::MailboxManager::open(
+            &store_dir.join("mailbox_roots.db"),
+            &content_store_path,
+        ) {
+            Ok(mut mgr) => {
+                // Initialize Merkle trees for all registered users
+                for user in imap_store.list_users().unwrap_or_default() {
+                    if let Err(e) = mgr.ensure_user_mailbox(&user.harmony_address) {
+                        tracing::warn!(
+                            user = %user.username,
+                            error = %e,
+                            "failed to init Merkle mailbox"
+                        );
+                    }
+                }
+                tracing::info!(
+                    users = mgr.user_count(),
+                    "Merkle mailbox manager initialized"
+                );
+                Some(Arc::new(std::sync::Mutex::new(mgr)))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open Merkle mailbox manager, Merkle writes disabled");
+                None
+            }
+        };
+
     // Shared cancellation token for graceful shutdown of all tasks
     let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -249,6 +281,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let mail_authenticator_465 = mail_authenticator.clone();
         let local_domain_465 = local_domain.clone();
         let content_store_path_465 = content_store_path.clone();
+        let mailbox_mgr_465 = mailbox_mgr.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -269,13 +302,14 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let auth = mail_authenticator_465.clone();
                         let domain = local_domain_465.clone();
                         let csp = content_store_path_465.clone();
+                        let mgr_clone = mailbox_mgr_465.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                             match tls::implicit_tls_wrap(stream, &acc).await {
                                 Ok(tls_stream) => {
                                     let (reader, writer) = tokio::io::split(tls_stream);
                                     let session = SmtpSession::new(cfg);
-                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold).await {
+                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold, mgr_clone).await {
                                         tracing::debug!(%peer_ip, error = %e, "implicit TLS connection ended with error");
                                     }
                                 }
@@ -299,6 +333,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let mail_authenticator_587 = mail_authenticator.clone();
         let local_domain_587 = local_domain.clone();
         let content_store_path_587 = content_store_path.clone();
+        let mailbox_mgr_587 = mailbox_mgr.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -319,9 +354,10 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let auth = mail_authenticator_587.clone();
                         let domain = local_domain_587.clone();
                         let csp = content_store_path_587.clone();
+                        let mgr_clone = mailbox_mgr_587.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
-                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold).await {
+                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold, mgr_clone).await {
                                 tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
                             }
                         });
@@ -486,11 +522,12 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let auth = mail_authenticator.clone();
                 let domain = local_domain.clone();
                 let csp = content_store_path.clone();
+                let mgr_clone = mailbox_mgr.clone();
 
                 tokio::spawn(async move {
                     let _guard = ConnectionGuard { shared: Arc::clone(&shared), ip: peer_ip };
                     let acc = acceptor.as_ref().map(|a| (**a).clone());
-                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold).await {
+                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold, mgr_clone).await {
                         tracing::debug!(%peer_ip, error = %e, "connection ended with error");
                     }
                 });
@@ -522,6 +559,7 @@ async fn handle_connection(
     local_domain: String,
     content_store_path: PathBuf,
     reject_threshold: i32,
+    mailbox_manager: Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut spf_result = crate::spam::SpfResult::None;
     let mut session = SmtpSession::new(smtp_config);
@@ -579,7 +617,7 @@ async fn handle_connection(
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
                 let needs_starttls =
-                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold).await?;
+                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager).await?;
 
                 // STARTTLS: upgrade the connection to TLS
                 if needs_starttls {
@@ -630,6 +668,7 @@ async fn handle_connection(
                                     local_domain,
                                     content_store_path,
                                     reject_threshold,
+                                    mailbox_manager,
                                 )
                                 .await;
                             }
@@ -696,6 +735,7 @@ async fn handle_connection_generic<R, W>(
     local_domain: String,
     content_store_path: PathBuf,
     reject_threshold: i32,
+    mailbox_manager: Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
@@ -747,7 +787,7 @@ where
                 };
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
-                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold).await?;
+                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager).await?;
 
                 if should_close || session.state == SmtpState::Closed {
                     break;
@@ -849,6 +889,7 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
     content_store_path: &Path,
     spf_result: &mut crate::spam::SpfResult,
     reject_threshold: i32,
+    mailbox_manager: &Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut needs_starttls = false;
     for action in actions {
@@ -965,6 +1006,14 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 };
 
+                // Extract sender/subject before Phase 3 moves `translated.message`
+                let sender_address = translated.message.sender_address;
+                let subject_snippet = crate::mailbox::truncate_utf8(
+                    &translated.message.subject,
+                    crate::mailbox::MAX_SNIPPET_LEN,
+                )
+                .to_string();
+
                 // Phase 3: Store attachments + message in CAS
                 //
                 // Ingest attachment blobs first so their CAS CIDs can be
@@ -1031,7 +1080,7 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 // NOTE: The IMAP store currently uses a single-user mailbox
                 // model (mailboxes are global, not per-user). Multi-user
                 // mailbox isolation is tracked separately in ZEB-112.
-                let mut delivered_count = 0u32;
+                let mut delivered_to: Vec<[u8; crate::message::ADDRESS_HASH_LEN]> = Vec::new();
                 let timestamp = msg_timestamp;
                 let rfc822_size = data.len() as u32;
 
@@ -1047,7 +1096,7 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                                 rfc822_size,
                             ) {
                                 Ok(_uid) => {
-                                    delivered_count += 1;
+                                    delivered_to.push(*recipient_hash);
                                     tracing::debug!(
                                         recipient = hex::encode(recipient_hash),
                                         "delivered to local INBOX"
@@ -1078,7 +1127,30 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 }
 
-                let success = delivered_count > 0;
+                let success = !delivered_to.is_empty();
+
+                // Phase 5: Update Merkle mailbox (non-critical)
+                if let Some(ref mgr) = mailbox_manager {
+                    if let Some(ref msg_cid) = message_cid {
+                        for addr in &delivered_to {
+                            if let Err(e) = mgr.lock().unwrap().insert_message(
+                                addr,
+                                msg_cid,
+                                &msg_id,
+                                &sender_address,
+                                timestamp,
+                                &subject_snippet,
+                            ) {
+                                tracing::warn!(
+                                    recipient = hex::encode(addr),
+                                    error = %e,
+                                    "Merkle mailbox update failed, IMAP delivery unaffected"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let callback_actions = session.handle(SmtpEvent::DeliveryResult { success });
                 execute_actions_generic(&callback_actions, writer).await?;
                 for a in &callback_actions {
@@ -2539,7 +2611,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None)
                 .await
                 .unwrap();
         });
@@ -2602,7 +2674,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None)
                 .await
                 .unwrap();
         });
@@ -2815,6 +2887,7 @@ node_config = "/tmp/test-node.toml"
                 "test.example.com".to_string(),
                 content_path_clone,
                 5,
+                None,
             )
             .await
             .unwrap();
@@ -2894,6 +2967,187 @@ node_config = "/tmp/test-node.toml"
         assert!(
             messages[0].message_cid.is_some(),
             "expected message_cid to be set after CAS ingest"
+        );
+    }
+
+    #[tokio::test]
+    async fn smtp_delivers_to_merkle_mailbox() {
+        use harmony_content::book::BookStore as _;
+
+        let config = test_config();
+        let max_message_size = parse_message_size(&config.spam.max_message_size);
+        let smtp_config = SmtpConfig {
+            domain: config.domain.name.clone(),
+            mx_host: config.domain.mx_host.clone(),
+            max_message_size,
+            max_recipients: 100,
+            tls_available: false,
+        };
+
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db")).unwrap(),
+        );
+        store.initialize_default_mailboxes().unwrap();
+
+        let alice_addr = [0xAAu8; crate::message::ADDRESS_HASH_LEN];
+        store.create_user("alice", "pass", &alice_addr).unwrap();
+
+        // Set up CAS content store
+        let content_path = smtp_test_dir.path().join("content");
+        std::fs::create_dir_all(content_path.join("commits")).unwrap();
+        std::fs::create_dir_all(content_path.join("blobs")).unwrap();
+
+        // Set up Merkle mailbox manager
+        let db_path = smtp_test_dir.path().join("mailbox_roots.db");
+        let mut mgr =
+            crate::mailbox_manager::MailboxManager::open(&db_path, &content_path).unwrap();
+        mgr.ensure_user_mailbox(&alice_addr).unwrap();
+        let mailbox_mgr: Option<
+            Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>,
+        > = Some(Arc::new(std::sync::Mutex::new(mgr)));
+
+        let store_clone = store.clone();
+        let content_path_clone = content_path.clone();
+        let mgr_clone = mailbox_mgr.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            handle_connection(
+                stream,
+                peer_addr.ip(),
+                smtp_config,
+                max_message_size,
+                None,
+                store_clone,
+                None,
+                "test.example.com".to_string(),
+                content_path_clone,
+                5,
+                mgr_clone,
+            )
+            .await
+            .unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Read 220 greeting
+        let greeting = read_smtp_response(&mut reader).await;
+        assert!(greeting.starts_with("220 "), "greeting: {greeting}");
+
+        // EHLO
+        write_half
+            .write_all(b"EHLO sender.test.com\r\n")
+            .await
+            .unwrap();
+        let ehlo_resp = read_smtp_response(&mut reader).await;
+        assert!(ehlo_resp.contains("250"), "EHLO: {ehlo_resp}");
+
+        // MAIL FROM
+        write_half
+            .write_all(b"MAIL FROM:<sender@test.com>\r\n")
+            .await
+            .unwrap();
+        let mail_resp = read_smtp_response(&mut reader).await;
+        assert!(mail_resp.contains("250"), "MAIL FROM: {mail_resp}");
+
+        // RCPT TO alice
+        write_half
+            .write_all(b"RCPT TO:<alice@test.example.com>\r\n")
+            .await
+            .unwrap();
+        let rcpt_resp = read_smtp_response(&mut reader).await;
+        assert!(rcpt_resp.contains("250"), "RCPT TO: {rcpt_resp}");
+
+        // DATA
+        write_half.write_all(b"DATA\r\n").await.unwrap();
+        let data_resp = read_smtp_response(&mut reader).await;
+        assert!(data_resp.starts_with("354"), "DATA: {data_resp}");
+
+        // Send RFC 5322 message
+        write_half
+            .write_all(
+                b"From: sender@test.com\r\n\
+                  To: alice@test.example.com\r\n\
+                  Subject: Merkle Test\r\n\
+                  Message-ID: <merkle-test-001@test.com>\r\n\
+                  Date: Mon, 13 Apr 2026 00:00:00 +0000\r\n\
+                  \r\n\
+                  Hello Alice, this tests dual-write to IMAP + Merkle.\r\n\
+                  .\r\n",
+            )
+            .await
+            .unwrap();
+        let deliver_resp = read_smtp_response(&mut reader).await;
+        assert!(deliver_resp.contains("250"), "delivery: {deliver_resp}");
+
+        // QUIT
+        write_half.write_all(b"QUIT\r\n").await.unwrap();
+        let quit_resp = read_smtp_response(&mut reader).await;
+        assert!(quit_resp.starts_with("221 "), "QUIT: {quit_resp}");
+
+        server_handle.await.unwrap();
+
+        // Verify: message appears in IMAP store
+        let mbox = store
+            .get_mailbox("INBOX")
+            .expect("get_mailbox ok")
+            .expect("INBOX exists");
+        let messages = store.get_messages(mbox.id).expect("get_messages ok");
+        assert_eq!(
+            messages.len(),
+            1,
+            "expected 1 message in INBOX, got {}",
+            messages.len()
+        );
+        let imap_cid = messages[0]
+            .message_cid
+            .as_ref()
+            .expect("IMAP message should have a CID");
+
+        // Verify: message appears in Merkle mailbox
+        let mgr = mailbox_mgr.as_ref().unwrap().lock().unwrap();
+        let root_cid = mgr
+            .get_root(&alice_addr)
+            .expect("alice should have a Merkle root");
+        // Load the tree and check the inbox
+        let book = harmony_db::DiskBookStore::new(&content_path);
+        let root = crate::mailbox::MailRoot::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(*root_cid))
+                .expect("root should be in CAS"),
+        )
+        .unwrap();
+        let inbox_cid = root.folder_cid(crate::mailbox::FolderKind::Inbox);
+        let folder = crate::mailbox::MailFolder::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(*inbox_cid))
+                .expect("inbox folder should be in CAS"),
+        )
+        .unwrap();
+        assert_eq!(folder.message_count, 1);
+        assert_eq!(folder.unread_count, 1);
+
+        let page = crate::mailbox::MailPage::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(folder.page_cids[0]))
+                .expect("page should be in CAS"),
+        )
+        .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(
+            page.entries[0].subject_snippet, "Merkle Test",
+            "subject snippet mismatch"
+        );
+
+        // Key assertion: both stores reference the same CAS message CID
+        assert_eq!(
+            &page.entries[0].message_cid,
+            imap_cid,
+            "Merkle and IMAP message CIDs must match (dual-write consistency)"
         );
     }
 
