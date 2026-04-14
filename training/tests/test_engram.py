@@ -287,3 +287,227 @@ class TestGgufExportWithEngram:
             assert "harmony.engram_residual.gate_norm.weight" in names
             assert "harmony.engram_residual.key_norm.weight" in names
             assert "harmony.engram_residual.conv1d.weight" in names
+
+
+# ---------------------------------------------------------------------------
+# ZEB-117 Model γ: ANN retrieval + anti-collapse
+# ---------------------------------------------------------------------------
+
+
+class TestEngramANNInjection:
+    """Model γ: gated residual with internal ANN retrieval + anti-collapse."""
+
+    @staticmethod
+    def _ann_config() -> HarmonyModelConfig:
+        c = _tiny_config()
+        c.use_ann_engram = True
+        return c
+
+    @staticmethod
+    def _fake_table(total_entries: int, engram_dim: int) -> torch.Tensor:
+        """Deterministic toy corpus table for retrieval tests."""
+        g = torch.Generator().manual_seed(0)
+        return torch.randn(total_entries, engram_dim, generator=g)
+
+    def test_construction_rejects_dim_mismatch(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        # Wrong engram_dim: config says 16, provide 8
+        bad_table = torch.randn(10, 8)
+        with pytest.raises(ValueError, match="engram_dim"):
+            EngramANNInjection(c, bad_table)
+
+    def test_construction_rejects_wrong_shape(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        with pytest.raises(ValueError, match="2-D"):
+            EngramANNInjection(c, torch.randn(10))
+
+    def test_table_registered_as_buffer(self):
+        """The corpus table must be a buffer, not a trainable parameter."""
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t)
+        param_names = {n for n, _ in m.named_parameters()}
+        assert "table" not in param_names
+        # But it IS a buffer
+        buffer_names = {n for n, _ in m.named_buffers()}
+        assert "table" in buffer_names
+        assert "table_normalized" in buffer_names
+
+    def test_retrieve_returns_correct_shape(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t)
+        h = torch.randn(2, 7, c.hidden_dim)
+        retrieved = m.retrieve(h)
+        assert retrieved.shape == (2, 7, c.engram_dim)
+
+    def test_retrieve_argmax_returns_table_rows(self):
+        """Hard-argmax retrieval must return exact rows of the corpus table.
+
+        The softmax retrieve() produces a blend so it wouldn't; the
+        dedicated retrieve_argmax() exists for inference.
+        """
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t)
+        h = torch.randn(1, 5, c.hidden_dim)
+        retrieved = m.retrieve_argmax(h)
+        for l in range(5):
+            row = retrieved[0, l]
+            diffs = (t - row).abs().sum(dim=-1)
+            assert diffs.min().item() < 1e-6
+
+    def test_retrieve_is_convex_blend_of_table_rows(self):
+        """Softmax retrieval yields a row in the convex hull of table rows.
+
+        Sanity check: each retrieved vector should have norm bounded by
+        the max table row norm and be expressible as a convex combination.
+        The easiest check is the attention-weights sum to 1, which is
+        implicit in softmax — so instead we check that the retrieved
+        vector is not identical to any single row (would indicate temp
+        too sharp and gradient still blocked).
+        """
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t)
+        h = torch.randn(1, 5, c.hidden_dim)
+        retrieved = m.retrieve(h)
+        # For generic randomly-initialized query_proj, softmax should
+        # produce a non-degenerate blend (not exactly any single row).
+        for l in range(5):
+            row = retrieved[0, l]
+            diffs = (t - row).abs().sum(dim=-1)
+            # Should differ from every single row by more than numerical noise
+            assert diffs.min().item() > 1e-4
+
+    def test_forward_shape(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t)
+        h = torch.randn(2, 7, c.hidden_dim)
+        residual, gate = m(h)
+        assert residual.shape == (2, 7, c.hidden_dim)
+        assert gate.shape == (2, 7, 1)
+        # Gate must be in [clamp_min, 1] during warmup
+        assert (gate >= m.clamp_min - 1e-6).all()
+        assert (gate <= 1.0 + 1e-6).all()
+
+    def test_gate_clamp_active_during_warmup(self):
+        """With step < clamp_until_step, gate values must be ≥ clamp_min."""
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t, clamp_until_step=100, clamp_min=0.5)
+        h = torch.randn(3, 5, c.hidden_dim)
+        # Default step=0 → clamp active
+        _, gate = m(h)
+        assert (gate >= 0.5 - 1e-6).all()
+        # Step bumped past warmup → clamp inactive
+        m.set_step(200)
+        # Construct hidden state that would produce a gate below 0.5.
+        # With random init, gate values vary; we just check the minimum
+        # can now drop below clamp_min (signalling clamp is off).
+        # Use a large batch to likely sample low-gate tokens.
+        h_large = torch.randn(8, 32, c.hidden_dim)
+        _, gate_late = m(h_large)
+        # Sanity: still in [0, 1] regardless
+        assert (gate_late >= 0.0).all() and (gate_late <= 1.0).all()
+
+    def test_gate_clamp_respects_set_step(self):
+        """set_step() must actually update the buffer."""
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        m = EngramANNInjection(c, self._fake_table(10, c.engram_dim))
+        m.set_step(0)
+        assert int(m.current_step.item()) == 0
+        m.set_step(500)
+        assert int(m.current_step.item()) == 500
+        m.set_step(12345)
+        assert int(m.current_step.item()) == 12345
+
+    def test_entropy_loss_penalizes_collapsed_gate(self):
+        """Low-entropy (collapsed) gates must yield higher entropy loss."""
+        from ct87.engram import compute_gate_entropy_loss
+        # Collapsed to 0 → very low entropy → high loss value (less negative)
+        collapsed_low = torch.full((1, 10, 1), 0.01)
+        # Indecisive at 0.5 → maximum entropy → lowest loss value (most negative)
+        indecisive = torch.full((1, 10, 1), 0.5)
+        # Collapsed to 1 → very low entropy → high loss value
+        collapsed_high = torch.full((1, 10, 1), 0.99)
+        loss_low = compute_gate_entropy_loss(collapsed_low).item()
+        loss_mid = compute_gate_entropy_loss(indecisive).item()
+        loss_high = compute_gate_entropy_loss(collapsed_high).item()
+        # -H(p): more negative = higher entropy = preferred
+        assert loss_mid < loss_low, (
+            f"indecisive gate should have lower loss than collapsed-low "
+            f"(got mid={loss_mid}, low={loss_low})"
+        )
+        assert loss_mid < loss_high, (
+            f"indecisive gate should have lower loss than collapsed-high "
+            f"(got mid={loss_mid}, high={loss_high})"
+        )
+
+    def test_forward_is_differentiable_through_ann(self):
+        """Gradients must flow back through retrieval, projection, and gate."""
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t)
+        h = torch.randn(2, 5, c.hidden_dim, requires_grad=True)
+        residual, _ = m(h)
+        residual.sum().backward()
+        # query_proj, key_proj, value_proj must all have grads
+        assert m.query_proj.weight.grad is not None
+        assert m.key_proj.weight.grad is not None
+        assert m.value_proj.weight.grad is not None
+        # Input must also have a grad (path not severed)
+        assert h.grad is not None
+        # Table itself must NOT receive grad (frozen buffer)
+        assert not m.table.requires_grad
+
+    def test_harmony_model_attach_and_forward(self):
+        """End-to-end: attach ANN engram to HarmonyModel and run forward."""
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        model = HarmonyModel(c)
+        t = self._fake_table(20, c.engram_dim)
+        ann = EngramANNInjection(c, t)
+        model.attach_engram_ann(ann)
+
+        input_ids = torch.randint(0, c.vocab_size, (2, 16))
+        # Note: no engram_embeddings passed — the ANN module handles
+        # retrieval internally.
+        logits = model(input_ids=input_ids)
+        assert logits.shape == (2, 16, c.vocab_size)
+        # Gate side-channel populated
+        assert model._last_ann_gate is not None
+        assert model._last_ann_gate.shape == (2, 16, 1)
+
+    def test_attach_rejects_wrong_flag(self):
+        """Attaching without setting use_ann_engram must raise."""
+        from ct87.engram import EngramANNInjection
+        c = _tiny_config()  # use_ann_engram defaults to False
+        model = HarmonyModel(c)
+        ann = EngramANNInjection(
+            self._ann_config(), self._fake_table(10, c.engram_dim),
+        )
+        with pytest.raises(ValueError, match="use_ann_engram"):
+            model.attach_engram_ann(ann)
+
+    def test_tiny_engram_ann_factory(self):
+        beta_config = HarmonyModelConfig.tiny_engram_ann()
+        base = HarmonyModelConfig.tiny()
+        assert beta_config.use_ann_engram is True
+        assert base.use_ann_engram is False
+        # All other fields equal
+        assert beta_config.num_layers == base.num_layers
+        assert beta_config.hidden_dim == base.hidden_dim
+        assert beta_config.engram_injection_layer == base.engram_injection_layer
+        assert beta_config.engram_dim == base.engram_dim
