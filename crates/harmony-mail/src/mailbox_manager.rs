@@ -6,81 +6,110 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 use crate::mailbox::{FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, FOLDER_COUNT, MAX_SNIPPET_LEN};
 use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 
-/// Bounded channel capacity for Zenoh root CID notifications.
+/// Per-address coalescing publisher for root CID notifications.
 ///
-/// Since only the latest root CID per user is meaningful (older CIDs are
-/// superseded), a modest buffer is sufficient. `try_send` drops updates if
-/// the queue is full — a dropped notification just delays the client's next
-/// refresh, which will pick up the latest root CID on the next successful send.
-const ZENOH_NOTIFY_CAPACITY: usize = 128;
-
-/// Notification channel for Zenoh root CID publications.
+/// `MailboxManager` runs in sync context (`spawn_blocking`) and calls `notify`
+/// whenever a user's mailbox root CID changes. The publisher stores a
+/// latest-only map keyed by address hex and wakes a background async drain
+/// task. The drain snapshots the map and issues one `session.put()` per user
+/// carrying their most recent root CID.
 ///
-/// `MailboxManager` runs in sync context (`spawn_blocking`). This struct holds
-/// the send side of a bounded mpsc channel. A background async task drains
-/// the receiver and calls `session.put()`.
-///
-/// The channel is bounded to provide backpressure: if Zenoh publishing stalls,
-/// notifications are dropped (with a throttled warn) rather than accumulating
-/// without limit. This is safe because root CID updates are idempotent — the
-/// next successful publish will carry the latest root CID regardless of how
-/// many intermediate notifications were dropped.
+/// Why coalesce rather than queue?
+/// - No update is lost: `notify` overwrites the entry and wakes the drain, so
+///   the drain always observes the newest value per addr.
+/// - No log storm: there is no drop path — updates are O(1) mutex-guarded map
+///   inserts; storage is bounded by the number of distinct active users, not
+///   by update rate.
+/// - Stale roots cannot outrun fresh ones: bursts collapse into a single
+///   publish of the newest CID rather than replaying a backlog.
 pub struct ZenohPublisher {
-    tx: mpsc::Sender<(String, [u8; CID_LEN])>,
+    latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
+    wake: Arc<Notify>,
 }
 
 impl ZenohPublisher {
     /// Create a new publisher backed by a Zenoh session.
     ///
-    /// Spawns a background task that drains the channel and publishes
-    /// root CID updates to `harmony/mail/v1/{addr_hex}/root`.
+    /// Spawns a background task that waits for wake-ups, drains the latest
+    /// map, and publishes each user's most recent root CID to
+    /// `harmony/mail/v1/{addr_hex}/root`.
     ///
     /// Topic namespace: `harmony/mail/v1/*` is the canonical mail prefix
     /// (Phase 0 client consumes `harmony/mail/v1/{addr}` for raw messages
     /// and reserves the `/root` suffix for root CID updates).
     pub fn new(session: zenoh::Session) -> Self {
-        let (tx, mut rx) = mpsc::channel::<(String, [u8; CID_LEN])>(ZENOH_NOTIFY_CAPACITY);
+        let latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let wake = Arc::new(Notify::new());
+
+        let drain_latest = Arc::clone(&latest);
+        let drain_wake = Arc::clone(&wake);
         tokio::spawn(async move {
-            while let Some((addr_hex, root_cid)) = rx.recv().await {
-                let topic = format!("harmony/mail/v1/{addr_hex}/root");
-                if let Err(e) = session.put(&topic, &root_cid[..]).await {
-                    tracing::warn!(error = %e, %topic, "Zenoh root CID publish failed");
+            loop {
+                drain_wake.notified().await;
+                // Snapshot+clear under the sync lock so notify() can keep
+                // inserting while we publish. Held briefly (O(active users));
+                // no .await inside this scope.
+                let snapshot: Vec<(String, [u8; CID_LEN])> = {
+                    let mut map = drain_latest
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    map.drain().collect()
+                };
+                for (addr_hex, root_cid) in snapshot {
+                    let topic = format!("harmony/mail/v1/{addr_hex}/root");
+                    if let Err(e) = session.put(&topic, &root_cid[..]).await {
+                        tracing::warn!(
+                            error = %e,
+                            %topic,
+                            "Zenoh root CID publish failed"
+                        );
+                    }
                 }
             }
         });
-        Self { tx }
+
+        Self { latest, wake }
     }
 
-    /// Create a publisher from a raw sender (for testing).
+    /// Test-only: create a publisher with no drain task, exposing the
+    /// coalescing map for assertions. `notify()` still updates the map so
+    /// callers can observe which addresses/CIDs would have been published.
     #[cfg(test)]
-    pub fn from_sender(tx: mpsc::Sender<(String, [u8; CID_LEN])>) -> Self {
-        Self { tx }
+    #[allow(clippy::type_complexity)]
+    pub fn inert_for_test() -> (Self, Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>) {
+        let latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let wake = Arc::new(Notify::new());
+        (
+            Self {
+                latest: Arc::clone(&latest),
+                wake,
+            },
+            latest,
+        )
     }
 
-    /// Send a root CID update notification.
+    /// Announce a new root CID for a user.
     ///
-    /// Uses `try_send` to avoid blocking the calling thread. If the channel
-    /// is full (Zenoh publishing is stalled), the notification is dropped
-    /// and logged. This is safe because root CID updates supersede each other
-    /// — the next successful send carries the latest state.
+    /// Overwrites any previous pending CID for the same address and wakes the
+    /// drain task. Callable from sync context.
     pub fn notify(&self, addr_hex: String, root_cid: [u8; CID_LEN]) {
-        match self.tx.try_send((addr_hex, root_cid)) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    "ZenohPublisher channel full — root CID notification dropped (client will catch up on next update)"
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::warn!("ZenohPublisher channel closed");
-            }
+        {
+            let mut map = self
+                .latest
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            map.insert(addr_hex, root_cid);
         }
+        self.wake.notify_one();
     }
 }
 
@@ -754,8 +783,7 @@ mod tests {
         std::fs::create_dir_all(cas_path.join("commits")).unwrap();
         std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
 
-        let (tx, mut rx) = mpsc::channel(16);
-        let publisher = ZenohPublisher::from_sender(tx);
+        let (publisher, latest) = ZenohPublisher::inert_for_test();
 
         let addr = [0xAAu8; ADDRESS_HASH_LEN];
         let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
@@ -772,14 +800,64 @@ mod tests {
         )
         .unwrap();
 
-        // Verify the publisher received the notification within a bounded time
-        // so a broken notification path fails fast instead of hanging CI.
-        let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("ZenohPublisher did not notify within 2s")
-            .expect("notification channel closed unexpectedly");
-        assert_eq!(received.0, hex::encode(addr));
-        assert_eq!(received.1, *mgr.get_root(&addr).unwrap());
+        // notify() is synchronous: the coalescing map is updated before
+        // insert_message returns, so no polling or timeout is needed.
+        let map = latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expected_addr_hex = hex::encode(addr);
+        let cid = map
+            .get(&expected_addr_hex)
+            .expect("ZenohPublisher did not record a notification");
+        assert_eq!(*cid, *mgr.get_root(&addr).unwrap());
+        assert_eq!(map.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn zenoh_publisher_coalesces_per_addr() {
+        // Two bursts of notifications for the same addr must collapse to the
+        // latest CID, and the drain task must snapshot the newest value.
+        let (publisher, latest) = ZenohPublisher::inert_for_test();
+
+        let addr_hex = "aa".repeat(ADDRESS_HASH_LEN);
+        let cid_old = [0x01u8; CID_LEN];
+        let cid_mid = [0x02u8; CID_LEN];
+        let cid_new = [0x03u8; CID_LEN];
+
+        publisher.notify(addr_hex.clone(), cid_old);
+        publisher.notify(addr_hex.clone(), cid_mid);
+        publisher.notify(addr_hex.clone(), cid_new);
+
+        let map = latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(map.len(), 1, "coalescing must keep one entry per addr");
+        assert_eq!(
+            map.get(&addr_hex).copied(),
+            Some(cid_new),
+            "latest CID must win; older values must not linger"
+        );
+    }
+
+    #[tokio::test]
+    async fn zenoh_publisher_keeps_distinct_addrs_separate() {
+        // Updates for different addrs must not clobber each other.
+        let (publisher, latest) = ZenohPublisher::inert_for_test();
+
+        let alice_hex = "aa".repeat(ADDRESS_HASH_LEN);
+        let bob_hex = "bb".repeat(ADDRESS_HASH_LEN);
+        let alice_cid = [0x11u8; CID_LEN];
+        let bob_cid = [0x22u8; CID_LEN];
+
+        publisher.notify(alice_hex.clone(), alice_cid);
+        publisher.notify(bob_hex.clone(), bob_cid);
+
+        let map = latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&alice_hex).copied(), Some(alice_cid));
+        assert_eq!(map.get(&bob_hex).copied(), Some(bob_cid));
     }
 
     #[tokio::test]
