@@ -636,6 +636,16 @@ impl MailboxManager {
         let root_cid = self.cas_ingest(&root_bytes)?;
 
         self.persist_root(address, &root_cid)?;
+
+        // Mirror the new root into the queryable's `current` map so cold-start
+        // queries succeed immediately after creation (without waiting for the
+        // first `notify()` or a restart-time `seed_current` backfill).
+        // Deliberately does NOT touch `latest` — that would cause a publish of
+        // an unchanged root.
+        if let Some(ref publisher) = self.publisher {
+            publisher.seed_current(*address, root_cid);
+        }
+
         Ok(())
     }
 
@@ -1689,6 +1699,65 @@ mod tests {
         assert!(
             found_persisted,
             "expected persisted root in replies; got payloads: {payloads:?}"
+        );
+        cancel.cancel();
+    }
+
+    /// Regression test for the create-path sync: when a user's mailbox is
+    /// created AFTER the publisher is attached (i.e., a brand-new user hits
+    /// the gateway for the first time), the persisted root must appear in the
+    /// queryable's `current` map immediately — without waiting for a first
+    /// incoming message to trigger `notify()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_queryable_returns_root_for_freshly_created_mailbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("roots.db");
+        let cas_path = dir.path().join("content");
+        std::fs::create_dir_all(cas_path.join("commits")).unwrap();
+        std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
+
+        let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
+
+        // Attach the publisher FIRST, then create the mailbox — this exercises
+        // the create-path mirror (not the startup seed path).
+        let cancel = CancellationToken::new();
+        let session = zenoh::open(zenoh::Config::default()).await.unwrap();
+        let publisher = Arc::new(ZenohPublisher::new(session.clone(), cancel.clone()));
+        mgr.set_publisher(Arc::clone(&publisher));
+
+        let addr = [0xEFu8; ADDRESS_HASH_LEN];
+        mgr.ensure_user_mailbox(&addr).unwrap();
+        let expected_root = *mgr.get_root(&addr).unwrap();
+
+        // Allow queryable declaration to settle.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let addr_hex = hex::encode(addr);
+        let topic = format!("harmony/mail/v1/{addr_hex}/root");
+        let replies = session
+            .get(&topic)
+            .consolidation(zenoh::query::ConsolidationMode::None)
+            .await
+            .unwrap();
+
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        let drain_result = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Ok(reply) = replies.recv_async().await {
+                if let Ok(sample) = reply.result() {
+                    payloads.push(sample.payload().to_bytes().to_vec());
+                }
+            }
+        })
+        .await;
+        assert!(
+            drain_result.is_ok(),
+            "drain timed out; collected: {payloads:?}"
+        );
+
+        let found = payloads.iter().any(|p| p.as_slice() == &expected_root[..]);
+        assert!(
+            found,
+            "expected freshly-created mailbox root in replies; got payloads: {payloads:?}"
         );
         cancel.cancel();
     }
