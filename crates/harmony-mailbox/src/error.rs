@@ -62,6 +62,9 @@ pub enum MailboxError {
         len: usize,
         max: usize,
     },
+
+    #[error("message flags contradict payload: expected {expected:#04x}, got {actual:#04x}")]
+    InconsistentFlags { expected: u8, actual: u8 },
 }
 
 /// Validate that a string's length fits in a u16 for length-prefixed encoding.

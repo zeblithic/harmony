@@ -58,10 +58,18 @@ impl ZenohPublisher {
         let drain_latest = Arc::clone(&latest);
         let drain_wake = Arc::clone(&wake);
         tokio::spawn(async move {
+            let mut cancelled = false;
             loop {
-                tokio::select! {
-                    _ = drain_wake.notified() => {}
-                    _ = cancel.cancelled() => break,
+                if !cancelled {
+                    // Wait for a wake-up OR cancellation. If both are pending
+                    // simultaneously, `select!` may pick either branch — so
+                    // we always drain at least once more AFTER observing cancel
+                    // (see the post-loop final-drain pass below) to ensure an
+                    // update that raced the cancel signal is still published.
+                    tokio::select! {
+                        _ = drain_wake.notified() => {}
+                        _ = cancel.cancelled() => { cancelled = true; }
+                    }
                 }
                 // Snapshot+clear under the sync lock so notify() can keep
                 // inserting while we publish. Held briefly (O(active users));
@@ -81,6 +89,9 @@ impl ZenohPublisher {
                             "Zenoh root CID publish failed"
                         );
                     }
+                }
+                if cancelled {
+                    break;
                 }
             }
             // Explicit drop ensures Zenoh disconnects promptly on shutdown

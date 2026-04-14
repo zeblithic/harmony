@@ -259,16 +259,32 @@ impl HarmonyMessage {
         buf.push(self.message_type as u8);
         // flags: 1 byte
         //
-        // Derive structural bits (has_attachments, is_reply) from the actual
-        // payload so the serialized bitfield can never contradict the message
-        // contents. Preserve is_forward from the caller-supplied flags — it
-        // has no payload-derivable source today and is advisory metadata.
-        let derived_flags = MessageFlags::new(
-            !self.attachments.is_empty(),
-            self.in_reply_to.is_some(),
-            self.flags.is_forward(),
-        );
-        buf.push(derived_flags.bits());
+        // Structural bits (has_attachments, is_reply) must match the payload
+        // — the bitfield exists for cheap decode-side filtering, so on-wire
+        // consistency is an invariant. Reject inconsistent flags at encode
+        // time rather than silently normalizing: silent normalization would
+        // mean `from_bytes(to_bytes(msg)) != msg` for malformed input, which
+        // violates roundtrip equality. Forcing an error makes the caller's
+        // bug visible and preserves roundtrip for all encodable messages.
+        //
+        // `is_forward` has no payload-derivable source today and passes
+        // through unchanged as advisory metadata.
+        let expected_has_attachments = !self.attachments.is_empty();
+        let expected_is_reply = self.in_reply_to.is_some();
+        if self.flags.has_attachments() != expected_has_attachments
+            || self.flags.is_reply() != expected_is_reply
+        {
+            let expected = MessageFlags::new(
+                expected_has_attachments,
+                expected_is_reply,
+                self.flags.is_forward(),
+            );
+            return Err(MailboxError::InconsistentFlags {
+                expected: expected.bits(),
+                actual: self.flags.bits(),
+            });
+        }
+        buf.push(self.flags.bits());
         // timestamp: 8 bytes big-endian
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
         // message_id: 16 bytes
@@ -832,12 +848,13 @@ mod tests {
     }
 
     #[test]
-    fn encoder_normalizes_inconsistent_flags() {
+    fn encoder_rejects_inconsistent_flags() {
         // A caller constructs a message with flags that contradict the
         // payload (claims no reply, but sets in_reply_to; claims no
-        // attachments, but supplies an attachment). to_bytes must derive
-        // the structural bits from the payload so the wire format is
-        // always internally consistent.
+        // attachments, but supplies an attachment). to_bytes must reject
+        // this rather than silently normalizing, so the caller's bug
+        // surfaces AND roundtrip equality (from_bytes(to_bytes(msg)) == msg)
+        // holds for every message that successfully encodes.
         let msg = HarmonyMessage {
             version: VERSION,
             message_type: MailMessageType::Email,
@@ -861,14 +878,60 @@ mod tests {
             }],
         };
 
-        let bytes = msg.to_bytes().unwrap();
-        let decoded = HarmonyMessage::from_bytes(&bytes).unwrap();
+        let err = msg.to_bytes().unwrap_err();
+        match err {
+            MailboxError::InconsistentFlags { expected, actual } => {
+                // Expected flags: has_attachments=1, is_reply=1, is_forward=0.
+                let want = MessageFlags::new(true, true, false).bits();
+                assert_eq!(expected, want, "expected bits should match derivation");
+                assert_eq!(
+                    actual,
+                    MessageFlags::new(false, false, false).bits(),
+                    "actual bits should echo caller input"
+                );
+            }
+            other => panic!("expected InconsistentFlags, got {other:?}"),
+        }
+    }
 
-        // Decoded flags MUST match the payload, regardless of what the
-        // caller put in `msg.flags`.
-        assert!(decoded.flags.is_reply(), "is_reply should be derived from in_reply_to");
-        assert!(decoded.flags.has_attachments(), "has_attachments should be derived from attachments");
-        assert!(!decoded.flags.is_forward(), "is_forward should pass through unchanged");
+    #[test]
+    fn roundtrip_preserves_caller_flags_when_consistent() {
+        // Regression guard for the "silent normalization breaks equality"
+        // failure mode. A message whose flags already match the payload
+        // must roundtrip with byte-for-byte identical flag bits, including
+        // the caller's is_forward choice.
+        let msg = HarmonyMessage {
+            version: VERSION,
+            message_type: MailMessageType::Email,
+            flags: MessageFlags::new(true, true, true),
+            timestamp: 1_709_654_400,
+            message_id: [0x02; MESSAGE_ID_LEN],
+            in_reply_to: Some([0x01; MESSAGE_ID_LEN]),
+            sender_address: [0xAA; ADDRESS_HASH_LEN],
+            recipients: vec![Recipient {
+                address_hash: [0xBB; ADDRESS_HASH_LEN],
+                recipient_type: RecipientType::To,
+            }],
+            subject: "Fwd: Re: Hi".to_string(),
+            body: "attached".to_string(),
+            attachments: vec![AttachmentRef {
+                cid: [0xDD; CID_LEN],
+                filename: "f.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                size: 7,
+            }],
+        };
+
+        let bytes = msg.to_bytes().expect("consistent flags must encode");
+        let decoded = HarmonyMessage::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded.flags.bits(),
+            msg.flags.bits(),
+            "consistent flags must roundtrip unchanged"
+        );
+        assert!(decoded.flags.is_forward(), "is_forward must survive roundtrip");
+        assert!(decoded.flags.is_reply());
+        assert!(decoded.flags.has_attachments());
     }
 
     #[test]
