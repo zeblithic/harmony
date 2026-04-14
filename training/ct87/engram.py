@@ -20,6 +20,12 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+try:
+    import xxhash
+    _fast_hash = xxhash.xxh64_intdigest
+except ImportError:
+    _fast_hash = None
 import torch.nn.functional as F
 
 from ct87.model import HarmonyModelConfig, RMSNorm
@@ -345,12 +351,6 @@ class EngramTable:
         positions: list[int] = []
         table_indices: list[int] = []
 
-        try:
-            import xxhash
-            _fast_hash = xxhash.xxh64_intdigest
-        except ImportError:
-            _fast_hash = None
-
         total_entries = self.total_entries
         seeds = self.hash_seeds
 
@@ -376,14 +376,11 @@ class EngramTable:
             idx_t = torch.tensor(table_indices, dtype=torch.long)
             embs = self.table[idx_t]  # [n, engram_dim]
 
-            # Vectorized scatter-add
             flat = result.view(-1, self.engram_dim)
-            linear_idx = torch.tensor(
-                [b * seq_len + p for b, p in zip(batch_indices, positions)],
-                dtype=torch.long,
-            )
-            scatter_idx = linear_idx.unsqueeze(1).expand_as(embs)
-            flat.scatter_add_(0, scatter_idx, embs)
+            b_idx = torch.tensor(batch_indices, dtype=torch.long)
+            p_idx = torch.tensor(positions, dtype=torch.long)
+            linear_idx = b_idx * seq_len + p_idx
+            flat.index_add_(0, linear_idx, embs)
 
         return result.to(self.device)
 
@@ -423,12 +420,6 @@ class EngramTable:
         pos_list: list[int] = []
         table_indices: list[int] = []
 
-        try:
-            import xxhash
-            _fast_hash = xxhash.xxh64_intdigest
-        except ImportError:
-            _fast_hash = None
-
         total_entries = self.total_entries
         seeds = self.hash_seeds
 
@@ -450,14 +441,11 @@ class EngramTable:
             idx_t = torch.tensor(table_indices, dtype=torch.long)
             embs = self.table[idx_t]
 
-            # Vectorized scatter-add
             flat = result.view(-1, self.engram_dim)
-            linear_idx = torch.tensor(
-                [b * seq_len + p for b, p in zip(batch_indices, pos_list)],
-                dtype=torch.long,
-            )
-            scatter_idx = linear_idx.unsqueeze(1).expand_as(embs)
-            flat.scatter_add_(0, scatter_idx, embs)
+            b_idx = torch.tensor(batch_indices, dtype=torch.long)
+            p_idx = torch.tensor(pos_list, dtype=torch.long)
+            linear_idx = b_idx * seq_len + p_idx
+            flat.index_add_(0, linear_idx, embs)
 
         return result.to(self.device)
 

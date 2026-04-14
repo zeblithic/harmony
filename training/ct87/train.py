@@ -566,10 +566,6 @@ def main() -> None:
     print(f"Config: {args.config}, device: {device}, seq_len: {seq_len}, dtype: {args.dtype}")
 
     model = HarmonyModel(config).to(device)
-    if args.resume_from is not None:
-        from safetensors.torch import load_model
-        load_model(model, args.resume_from, strict=False)
-        print(f"Resumed from checkpoint: {args.resume_from}")
     if args.gradient_checkpoint:
         model.set_gradient_checkpointing(True)
         print("Gradient checkpointing enabled")
@@ -618,6 +614,30 @@ def main() -> None:
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
+
+    # Resume from checkpoint after all modules are attached (including ANN)
+    # so their weights are loaded. strict=False handles tied embeddings where
+    # lm_head shares embed_tokens weights (missing key is expected).
+    if args.resume_from is not None:
+        from safetensors.torch import load_file
+        ckpt_keys = set(load_file(args.resume_from).keys())
+        model_keys = set(model.state_dict().keys())
+        missing = model_keys - ckpt_keys
+        unexpected = ckpt_keys - model_keys
+        # lm_head.weight is expected missing when tied to embed_tokens
+        expected_missing = {"lm_head.weight"}
+        real_missing = missing - expected_missing
+        if real_missing:
+            print(f"Warning: {len(real_missing)} missing keys in checkpoint: "
+                  f"{sorted(real_missing)[:5]}{'...' if len(real_missing) > 5 else ''}",
+                  file=sys.stderr)
+        if unexpected:
+            print(f"Warning: {len(unexpected)} unexpected keys in checkpoint: "
+                  f"{sorted(unexpected)[:5]}{'...' if len(unexpected) > 5 else ''}",
+                  file=sys.stderr)
+        from safetensors.torch import load_model
+        load_model(model, args.resume_from, strict=False)
+        print(f"Resumed from checkpoint: {args.resume_from}")
 
     # Load Engram table if provided
     engram_table = None
