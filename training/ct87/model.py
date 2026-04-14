@@ -27,11 +27,18 @@ class HarmonyModelConfig:
     Field names and values match the Rust HarmonyModelConfig in
     crates/harmony-inference/src/harmony_model.rs.
 
-    The `use_ann_engram` flag is research-only (not mirrored in Rust):
-    when True, the model skips construction of the production
-    `EngramGatedResidual` module and expects the training script to
-    attach an `EngramANNInjection` module via `attach_engram_ann()`. Used
-    by ZEB-117 Model gamma. Configs that set this flag are not GGUF-portable.
+    The `ffn_dim_overrides` field is research-only (not mirrored in Rust):
+    when set to a non-empty mapping, the listed layer indices use a
+    different feed-forward intermediate dimension. Used by ZEB-117 Model
+    beta as a params-matched dense control for the engram-injection
+    bake-off. Configs that set overrides are not GGUF-portable and will
+    fail the Rust-parity tests.
+
+    The `use_ann_engram` flag is also research-only (not mirrored in
+    Rust): when True, the model expects the training script to attach an
+    `EngramANNInjection` module via `attach_engram_ann()` after
+    construction. Used by ZEB-117 Model gamma. Configs that set this
+    flag are not GGUF-portable.
     """
 
     num_layers: int
@@ -52,6 +59,41 @@ class HarmonyModelConfig:
     ct_max_steps: int | None = None
     ct_confidence_threshold: float | None = None
     use_ann_engram: bool = False
+    ffn_dim_overrides: dict[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        """Validate `ffn_dim_overrides` up front so misconfigurations fail fast.
+
+        Catches silent typos (out-of-range layer indices that would never
+        be queried) and invalid dims (<=0) before model construction.
+        """
+        if self.ffn_dim_overrides is None:
+            return
+        for layer_idx, dim in self.ffn_dim_overrides.items():
+            if not (0 <= layer_idx < self.num_layers):
+                raise ValueError(
+                    f"ffn_dim_overrides has layer_idx={layer_idx} outside "
+                    f"[0, {self.num_layers}) - would be silently ignored "
+                    "at model construction."
+                )
+            if not isinstance(dim, int) or dim <= 0:
+                raise ValueError(
+                    f"ffn_dim_overrides[{layer_idx}]={dim!r} must be a "
+                    "positive int."
+                )
+
+    def layer_ffn_dim(self, layer_idx: int) -> int:
+        """Effective FFN intermediate dim for a given layer.
+
+        Returns the override if set for this layer, else the global `ffn_dim`.
+        """
+        if not (0 <= layer_idx < self.num_layers):
+            raise ValueError(
+                f"layer_idx={layer_idx} must be in [0, {self.num_layers})"
+            )
+        if self.ffn_dim_overrides is not None and layer_idx in self.ffn_dim_overrides:
+            return self.ffn_dim_overrides[layer_idx]
+        return self.ffn_dim
 
     @property
     def num_blocks(self) -> int:
@@ -100,6 +142,27 @@ class HarmonyModelConfig:
             engram_dim=128,
             tie_embeddings=True,
         )
+
+    @staticmethod
+    def tiny_ffn_expanded() -> HarmonyModelConfig:
+        """Model beta - params-matched dense control for the ZEB-117 bake-off.
+
+        Identical to tiny() except the engram-injection layer's FFN
+        intermediate dimension is expanded from 1365 to 1877. This adds
+        3 x 512 x 512 = 786,432 parameters to that single MLP, matching
+        the overhead of the Model delta cross-attention block (independent
+        W_k, W_v, W_o). Isolates the retrieval contribution in Models
+        gamma and delta from the free-parameter regularization
+        contribution established by ZEB-102 Phase 0 ablations.
+
+        See docs/research/2026-04-14-engram-injection-mechanism-findings.md
+        for methodology (Table 3 / section 5.2).
+        """
+        base = HarmonyModelConfig.tiny()
+        base.ffn_dim_overrides = {base.engram_injection_layer: 1877}
+        # Re-validate since we mutated the dataclass after construction.
+        base.__post_init__()
+        return base
 
     @staticmethod
     def tiny_engram_ann() -> HarmonyModelConfig:
@@ -203,23 +266,29 @@ class Attention(nn.Module):
 
 
 class Mlp(nn.Module):
-    def __init__(self, config: HarmonyModelConfig):
+    def __init__(self, config: HarmonyModelConfig, ffn_dim: int | None = None):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_dim, config.ffn_dim, bias=False)
-        self.up_proj = nn.Linear(config.hidden_dim, config.ffn_dim, bias=False)
-        self.down_proj = nn.Linear(config.ffn_dim, config.hidden_dim, bias=False)
+        effective_ffn_dim = config.ffn_dim if ffn_dim is None else ffn_dim
+        self.gate_proj = nn.Linear(config.hidden_dim, effective_ffn_dim, bias=False)
+        self.up_proj = nn.Linear(config.hidden_dim, effective_ffn_dim, bias=False)
+        self.down_proj = nn.Linear(effective_ffn_dim, config.hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, config: HarmonyModelConfig, rotary_emb: RotaryEmbedding):
+    def __init__(
+        self,
+        config: HarmonyModelConfig,
+        rotary_emb: RotaryEmbedding,
+        layer_idx: int,
+    ):
         super().__init__()
         self.attn_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
         self.attn = Attention(config, rotary_emb)
         self.ffn_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
-        self.mlp = Mlp(config)
+        self.mlp = Mlp(config, ffn_dim=config.layer_ffn_dim(layer_idx))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x + self.attn(self.attn_norm(x))
@@ -311,7 +380,8 @@ class HarmonyModel(nn.Module):
 
         rotary_emb = RotaryEmbedding(config.head_dim, config.max_seq_len, config.rope_theta)
         self.layers = nn.ModuleList([
-            TransformerLayer(config, rotary_emb) for _ in range(config.num_layers)
+            TransformerLayer(config, rotary_emb, layer_idx=i)
+            for i in range(config.num_layers)
         ])
 
         self.final_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)

@@ -3473,6 +3473,7 @@ dependencies = [
  "harmony-content",
  "harmony-db",
  "harmony-identity",
+ "harmony-mailbox",
  "hex",
  "lettre",
  "mail-auth",
@@ -3495,6 +3496,16 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zenoh",
+]
+
+[[package]]
+name = "harmony-mailbox"
+version = "0.1.0"
+dependencies = [
+ "harmony-identity",
+ "hex",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

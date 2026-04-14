@@ -72,6 +72,152 @@ class TestHarmonyModelConfig:
         c = HarmonyModelConfig.tiny()
         assert c.num_kv_groups == 2  # 8 / 4
 
+    def test_layer_ffn_dim_default(self):
+        """Without overrides, layer_ffn_dim returns the global ffn_dim."""
+        c = HarmonyModelConfig.tiny()
+        assert c.ffn_dim_overrides is None
+        for i in range(c.num_layers):
+            assert c.layer_ffn_dim(i) == 1365
+
+    def test_layer_ffn_dim_with_override(self):
+        """Override applies only to the listed layer."""
+        c = HarmonyModelConfig.tiny()
+        c.ffn_dim_overrides = {2: 1877}
+        assert c.layer_ffn_dim(0) == 1365
+        assert c.layer_ffn_dim(1) == 1365
+        assert c.layer_ffn_dim(2) == 1877
+        assert c.layer_ffn_dim(3) == 1365
+
+
+class TestModelBeta:
+    """ZEB-117 Model beta: params-matched dense control via FFN expansion."""
+
+    def test_tiny_ffn_expanded_factory(self):
+        beta = HarmonyModelConfig.tiny_ffn_expanded()
+        base = HarmonyModelConfig.tiny()
+        # Identical to tiny() except for ffn_dim_overrides at the
+        # engram-injection layer.
+        assert beta.num_layers == base.num_layers
+        assert beta.hidden_dim == base.hidden_dim
+        assert beta.ffn_dim == base.ffn_dim
+        assert beta.engram_injection_layer == base.engram_injection_layer
+        assert beta.ffn_dim_overrides == {base.engram_injection_layer: 1877}
+
+    def test_param_delta_matches_cross_attention_overhead(self):
+        """Model beta must add exactly 786,432 params over alpha (tiny baseline).
+
+        This matches the parameter overhead of an independent cross-attention
+        block (3 * 512 * 512 = W_k, W_v, W_o for hidden_dim=512), per the
+        Gemini research report Table 3 / section 5.2.
+        """
+        # Shrink vocab so the tied-embedding table doesn't dominate CI
+        # memory/time. Embeddings are identical between alpha and beta,
+        # so they cancel in the delta regardless of vocab size.
+        alpha = HarmonyModelConfig.tiny()
+        beta = HarmonyModelConfig.tiny_ffn_expanded()
+        for cfg in (alpha, beta):
+            cfg.vocab_size = 128
+            cfg.max_seq_len = 64
+        m_alpha = HarmonyModel(alpha)
+        m_beta = HarmonyModel(beta)
+        n_alpha = sum(p.numel() for p in m_alpha.parameters())
+        n_beta = sum(p.numel() for p in m_beta.parameters())
+        delta = n_beta - n_alpha
+        assert delta == 786_432, (
+            f"Expected +786,432 params (3 * 512 * 512), got +{delta}"
+        )
+
+    def test_beta_model_forward_shape(self):
+        """Model beta should run a forward pass with correct output shape."""
+        beta = HarmonyModelConfig.tiny_ffn_expanded()
+        # Shrink for fast test: keep architecture but smaller dims.
+        beta.vocab_size = 128
+        beta.max_seq_len = 64
+        model = HarmonyModel(beta)
+        input_ids = torch.randint(0, 128, (2, 16))
+        logits = model(input_ids=input_ids)
+        assert logits.shape == (2, 16, 128)
+
+
+class TestFfnOverrideValidation:
+    """Fail-fast validation for ffn_dim_overrides (PR #231 review)."""
+
+    def _make_override(self, overrides: dict[int, int]) -> HarmonyModelConfig:
+        c = HarmonyModelConfig.tiny()
+        c.ffn_dim_overrides = overrides
+        c.__post_init__()
+        return c
+
+    def test_out_of_range_layer_idx_raises(self):
+        # tiny() has num_layers=8; 8 is outside [0, 8)
+        with pytest.raises(ValueError, match="outside"):
+            self._make_override({8: 1877})
+
+    def test_negative_layer_idx_raises(self):
+        with pytest.raises(ValueError, match="outside"):
+            self._make_override({-1: 1877})
+
+    def test_non_positive_dim_raises(self):
+        with pytest.raises(ValueError, match="positive int"):
+            self._make_override({2: 0})
+        with pytest.raises(ValueError, match="positive int"):
+            self._make_override({2: -512})
+
+    def test_non_int_dim_raises(self):
+        with pytest.raises(ValueError, match="positive int"):
+            # Ignore type check at runtime — the validator catches it.
+            self._make_override({2: 1877.5})  # type: ignore[dict-item]
+
+    def test_layer_ffn_dim_rejects_out_of_range_query(self):
+        c = HarmonyModelConfig.tiny()
+        with pytest.raises(ValueError, match=r"\[0, 8\)"):
+            c.layer_ffn_dim(8)
+        with pytest.raises(ValueError, match=r"\[0, 8\)"):
+            c.layer_ffn_dim(-1)
+
+
+class TestGgufExportOverrideGuard:
+    """GGUF export must refuse configs with ffn_dim_overrides (PR #231 review).
+
+    The format stores a single feed_forward_length in metadata and cannot
+    represent per-layer FFN widths; silently exporting would produce a
+    GGUF whose metadata disagrees with its tensors.
+    """
+
+    def test_export_raises_when_overrides_present(self):
+        import tempfile
+        from pathlib import Path
+        from ct87.export_gguf import export_gguf
+
+        beta = HarmonyModelConfig.tiny_ffn_expanded()
+        beta.vocab_size = 128
+        beta.max_seq_len = 64
+        model = HarmonyModel(beta)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "beta.gguf"
+            with pytest.raises(
+                ValueError, match="ffn_dim_overrides",
+            ):
+                export_gguf(model.state_dict(), beta, out)
+
+    def test_export_succeeds_when_overrides_absent(self):
+        """Regression: plain tiny() configs must still export cleanly."""
+        import tempfile
+        from pathlib import Path
+        from ct87.export_gguf import export_gguf
+
+        alpha = HarmonyModelConfig.tiny()
+        alpha.vocab_size = 128
+        alpha.max_seq_len = 64
+        model = HarmonyModel(alpha)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "alpha.gguf"
+            # Should not raise
+            export_gguf(model.state_dict(), alpha, out)
+            assert out.exists() and out.stat().st_size > 0
+
 
 # ---------------------------------------------------------------------------
 # Shared helper
@@ -181,7 +327,7 @@ class TestTransformerLayer:
     def test_output_shape(self):
         cfg = _tiny_config()
         rope = RotaryEmbedding(cfg.head_dim, cfg.max_seq_len, cfg.rope_theta)
-        layer = TransformerLayer(cfg, rope)
+        layer = TransformerLayer(cfg, rope, layer_idx=0)
         x = torch.randn(2, 10, cfg.hidden_dim)
         out = layer(x)
         assert out.shape == x.shape
@@ -190,7 +336,7 @@ class TestTransformerLayer:
         """Zero-init o_proj and down_proj to verify residual pass-through."""
         cfg = _tiny_config()
         rope = RotaryEmbedding(cfg.head_dim, cfg.max_seq_len, cfg.rope_theta)
-        layer = TransformerLayer(cfg, rope)
+        layer = TransformerLayer(cfg, rope, layer_idx=0)
         # Zero out output projections so attn and mlp contribute nothing
         nn.init.zeros_(layer.attn.o_proj.weight)
         nn.init.zeros_(layer.mlp.down_proj.weight)

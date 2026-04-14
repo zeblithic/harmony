@@ -12,6 +12,7 @@ name = "harmony-mail"
 path = "src/main.rs"
 
 [dependencies]
+harmony-mailbox.workspace = true
 harmony-identity.workspace = true
 ed25519-dalek.workspace = true
 thiserror.workspace = true
@@ -40,6 +41,7 @@ base64 = { workspace = true }
 harmony-content = { workspace = true, features = ["std"] }
 harmony-db = { workspace = true }
 rpassword = "5"
+zenoh.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
