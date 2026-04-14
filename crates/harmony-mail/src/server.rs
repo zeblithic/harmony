@@ -263,6 +263,12 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+    // Shared cancellation token for graceful shutdown of all tasks.
+    // Created before the Zenoh block so ZenohPublisher's drain task can
+    // participate in the same shutdown signal as listener loops and
+    // cleanup tasks below.
+    let cancel = tokio_util::sync::CancellationToken::new();
+
     // ── Zenoh session (mailbox root CID notifications) ──────────────
     {
         use crate::mailbox_manager::ZenohPublisher;
@@ -332,7 +338,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 match zenoh::open(zenoh_config).await {
                     Ok(session) => {
                         tracing::info!("Zenoh session opened for mailbox notifications");
-                        let publisher = ZenohPublisher::new(session);
+                        let publisher = ZenohPublisher::new(session, cancel.clone());
                         // Recover from a poisoned mutex rather than silently
                         // skipping publisher attachment — Merkle mailbox
                         // updates are low-severity but we want visibility
@@ -354,9 +360,6 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             tracing::debug!("Zenoh mailbox notifications disabled");
         }
     }
-
-    // Shared cancellation token for graceful shutdown of all tasks
-    let cancel = tokio_util::sync::CancellationToken::new();
 
     // Background cleanup task for per-IP tracking
     let cleanup_shared = Arc::clone(&shared);
@@ -1244,7 +1247,12 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                         let sender_address = sender_address;
                         let subject_snippet = subject_snippet.clone();
                         let delivered_to = delivered_to.clone();
-                        tokio::task::spawn_blocking(move || {
+                        // Fire-and-forget, but surface panics via a tiny
+                        // supervisor task that awaits the JoinHandle. Without
+                        // this, a panic inside insert_message (e.g., on a
+                        // runtime shutdown race) would be silently swallowed
+                        // when the handle dropped.
+                        let join = tokio::task::spawn_blocking(move || {
                             let mut guard = match mgr.lock() {
                                 Ok(g) => g,
                                 Err(poisoned) => {
@@ -1265,6 +1273,20 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                                         recipient = hex::encode(addr),
                                         error = %e,
                                         "Merkle mailbox update failed, IMAP delivery unaffected"
+                                    );
+                                }
+                            }
+                        });
+                        tokio::spawn(async move {
+                            if let Err(e) = join.await {
+                                if e.is_panic() {
+                                    tracing::error!(
+                                        error = ?e,
+                                        "Merkle mailbox update task panicked — IMAP delivery unaffected"
+                                    );
+                                } else if e.is_cancelled() {
+                                    tracing::debug!(
+                                        "Merkle mailbox update task cancelled during shutdown"
                                     );
                                 }
                             }

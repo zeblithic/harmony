@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::mailbox::{FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, FOLDER_COUNT, MAX_SNIPPET_LEN};
 use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
@@ -44,7 +45,12 @@ impl ZenohPublisher {
     /// Topic namespace: `harmony/mail/v1/*` is the canonical mail prefix
     /// (Phase 0 client consumes `harmony/mail/v1/{addr}` for raw messages
     /// and reserves the `/root` suffix for root CID updates).
-    pub fn new(session: zenoh::Session) -> Self {
+    ///
+    /// The drain task observes `cancel`: on cancellation the loop exits and
+    /// the Zenoh session is dropped explicitly, allowing a clean disconnect
+    /// during graceful shutdown rather than holding the socket until the
+    /// Tokio runtime is dropped.
+    pub fn new(session: zenoh::Session, cancel: CancellationToken) -> Self {
         let latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let wake = Arc::new(Notify::new());
@@ -53,7 +59,10 @@ impl ZenohPublisher {
         let drain_wake = Arc::clone(&wake);
         tokio::spawn(async move {
             loop {
-                drain_wake.notified().await;
+                tokio::select! {
+                    _ = drain_wake.notified() => {}
+                    _ = cancel.cancelled() => break,
+                }
                 // Snapshot+clear under the sync lock so notify() can keep
                 // inserting while we publish. Held briefly (O(active users));
                 // no .await inside this scope.
@@ -74,6 +83,10 @@ impl ZenohPublisher {
                     }
                 }
             }
+            // Explicit drop ensures Zenoh disconnects promptly on shutdown
+            // rather than waiting for the runtime tear-down.
+            drop(session);
+            tracing::debug!("ZenohPublisher drain task exited on cancel");
         });
 
         Self { latest, wake }
@@ -919,7 +932,8 @@ mod tests {
         // Brief settle time for peer discovery on loopback.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let publisher = ZenohPublisher::new(pub_session);
+        let cancel = CancellationToken::new();
+        let publisher = ZenohPublisher::new(pub_session, cancel.clone());
 
         let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
         mgr.set_publisher(publisher);
@@ -935,7 +949,8 @@ mod tests {
         )
         .unwrap();
 
-        // The drain task must pick up the mpsc message and run session.put().
+        // The drain task must pick up the coalesced update and run
+        // session.put().
         let sample = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             subscriber.recv_async(),
@@ -948,5 +963,63 @@ mod tests {
         assert_eq!(payload.len(), CID_LEN);
         let received_cid: [u8; CID_LEN] = (&payload[..]).try_into().unwrap();
         assert_eq!(received_cid, *mgr.get_root(&addr).unwrap());
+
+        // Signal shutdown and give the drain task a chance to exit cleanly.
+        cancel.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    /// Regression test for the drain-task shutdown path.
+    ///
+    /// The publisher's drain task must observe the shared `CancellationToken`
+    /// so graceful shutdown can tear it down deterministically instead of
+    /// leaking it until runtime drop. This test opens a real Zenoh session
+    /// (so we exercise the real `new` path, not the `inert_for_test` scaffold),
+    /// cancels the token, and confirms a subsequent `notify()` produces no
+    /// publish — i.e., the drain task has stopped consuming wake-ups.
+    ///
+    /// `#[ignore]`'d for the same reason as the end-to-end test — relies on
+    /// peer discovery over loopback.
+    #[tokio::test]
+    #[ignore]
+    async fn zenoh_publisher_drain_task_stops_on_cancel() {
+        let pub_session = zenoh::open(zenoh::Config::default()).await.unwrap();
+        let sub_session = zenoh::open(zenoh::Config::default()).await.unwrap();
+
+        let addr_hex = "dd".repeat(ADDRESS_HASH_LEN);
+        let topic = format!("harmony/mail/v1/{addr_hex}/root");
+        let subscriber = sub_session.declare_subscriber(&topic).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let cancel = CancellationToken::new();
+        let publisher = ZenohPublisher::new(pub_session, cancel.clone());
+
+        // Sanity: the drain task is alive and publishes before cancel.
+        publisher.notify(addr_hex.clone(), [0x01u8; CID_LEN]);
+        let before = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            subscriber.recv_async(),
+        )
+        .await
+        .expect("pre-cancel publish should succeed")
+        .expect("subscriber channel closed");
+        assert_eq!(before.payload().to_bytes().len(), CID_LEN);
+
+        // Cancel and give the drain task a moment to exit.
+        cancel.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // A post-cancel notify should wake nothing — no further publish
+        // arrives within a short window.
+        publisher.notify(addr_hex.clone(), [0x02u8; CID_LEN]);
+        let after = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            subscriber.recv_async(),
+        )
+        .await;
+        assert!(
+            after.is_err(),
+            "drain task should have stopped after cancel; got unexpected publish"
+        );
     }
 }
