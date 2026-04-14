@@ -193,6 +193,29 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // ── Shared IMAP store (used by both SMTP delivery and IMAP) ────
+    let imap_store = Arc::new(
+        ImapStore::open(Path::new(&config.imap.store_path))
+            .map_err(|e| format!("failed to open IMAP store: {e}"))?,
+    );
+    imap_store
+        .initialize_default_mailboxes()
+        .map_err(|e| format!("failed to init IMAP mailboxes: {e}"))?;
+
+    // ── SPF authenticator ──────────────────────────────────────────
+    let mail_authenticator: Option<Arc<mail_auth::MessageAuthenticator>> =
+        match crate::auth::create_authenticator() {
+            Ok(auth) => Some(Arc::new(auth)),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create mail authenticator, SPF disabled");
+                None
+            }
+        };
+
+    let content_store_path = PathBuf::from(&config.imap.content_store_path);
+    let reject_threshold = config.spam.reject_threshold;
+    let local_domain = config.domain.name.clone();
+
     // Shared cancellation token for graceful shutdown of all tasks
     let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -217,6 +240,10 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let shared = Arc::clone(&shared);
         let acceptor = tls_acceptor.clone().unwrap();
         let listener_cancel = cancel.clone();
+        let imap_store_465 = Arc::clone(&imap_store);
+        let mail_authenticator_465 = mail_authenticator.clone();
+        let local_domain_465 = local_domain.clone();
+        let content_store_path_465 = content_store_path.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -233,13 +260,17 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let cfg = smtp_config.clone();
                         let sh = Arc::clone(&shared);
                         let acc = Arc::clone(&acceptor);
+                        let store = Arc::clone(&imap_store_465);
+                        let auth = mail_authenticator_465.clone();
+                        let domain = local_domain_465.clone();
+                        let csp = content_store_path_465.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                             match tls::implicit_tls_wrap(stream, &acc).await {
                                 Ok(tls_stream) => {
                                     let (reader, writer) = tokio::io::split(tls_stream);
                                     let session = SmtpSession::new(cfg);
-                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None).await {
+                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold).await {
                                         tracing::debug!(%peer_ip, error = %e, "implicit TLS connection ended with error");
                                     }
                                 }
@@ -259,6 +290,10 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let shared = Arc::clone(&shared);
         let acceptor = tls_acceptor.clone().unwrap();
         let listener_cancel = cancel.clone();
+        let imap_store_587 = Arc::clone(&imap_store);
+        let mail_authenticator_587 = mail_authenticator.clone();
+        let local_domain_587 = local_domain.clone();
+        let content_store_path_587 = content_store_path.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -275,9 +310,13 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let cfg = smtp_config.clone();
                         let sh = Arc::clone(&shared);
                         let acc = Arc::clone(&acceptor);
+                        let store = Arc::clone(&imap_store_587);
+                        let auth = mail_authenticator_587.clone();
+                        let domain = local_domain_587.clone();
+                        let csp = content_store_path_587.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
-                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone())).await {
+                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold).await {
                                 tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
                             }
                         });
@@ -290,18 +329,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // ── IMAP setup ───────────────────────────────────────────────────
     if config.imap.enabled {
-        let imap_store = Arc::new(
-            ImapStore::open(Path::new(&config.imap.store_path))
-                .map_err(|e| format!("failed to open IMAP store: {e}"))?,
-        );
-        imap_store
-            .initialize_default_mailboxes()
-            .map_err(|e| format!("failed to init IMAP mailboxes: {e}"))?;
-
         let imap_domain = config.domain.name.clone();
         let imap_idle_timeout = Duration::from_secs(config.imap.idle_timeout);
         let imap_max_auth_failures = config.imap.max_auth_failures;
-        let content_store_path = PathBuf::from(&config.imap.content_store_path);
         if !content_store_path.is_dir() {
             tracing::warn!(
                 path = %content_store_path.display(),
@@ -447,11 +477,15 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let smtp_config = smtp_config.clone();
                 let shared = Arc::clone(&shared);
                 let acceptor = tls_acceptor.clone();
+                let store = Arc::clone(&imap_store);
+                let auth = mail_authenticator.clone();
+                let domain = local_domain.clone();
+                let csp = content_store_path.clone();
 
                 tokio::spawn(async move {
                     let _guard = ConnectionGuard { shared: Arc::clone(&shared), ip: peer_ip };
                     let acc = acceptor.as_ref().map(|a| (**a).clone());
-                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc).await {
+                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold).await {
                         tracing::debug!(%peer_ip, error = %e, "connection ended with error");
                     }
                 });
@@ -478,7 +512,13 @@ async fn handle_connection(
     smtp_config: SmtpConfig,
     max_message_size: usize,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    imap_store: Arc<ImapStore>,
+    authenticator: Option<Arc<mail_auth::MessageAuthenticator>>,
+    local_domain: String,
+    content_store_path: PathBuf,
+    reject_threshold: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut spf_result = crate::spam::SpfResult::None;
     let mut session = SmtpSession::new(smtp_config);
 
     // Send initial greeting on plaintext
@@ -527,7 +567,7 @@ async fn handle_connection(
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
                 let needs_starttls =
-                    process_async_actions(&actions, &mut session, &mut writer).await?;
+                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold).await?;
 
                 // STARTTLS: upgrade the connection to TLS
                 if needs_starttls {
@@ -573,6 +613,11 @@ async fn handle_connection(
                                     session,
                                     max_message_size,
                                     None,
+                                    imap_store,
+                                    authenticator,
+                                    local_domain,
+                                    content_store_path,
+                                    reject_threshold,
                                 )
                                 .await;
                             }
@@ -633,11 +678,17 @@ async fn handle_connection_generic<R, W>(
     mut session: SmtpSession,
     max_message_size: usize,
     _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    imap_store: Arc<ImapStore>,
+    authenticator: Option<Arc<mail_auth::MessageAuthenticator>>,
+    local_domain: String,
+    content_store_path: PathBuf,
+    reject_threshold: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
+    let mut spf_result = crate::spam::SpfResult::None;
     // For implicit TLS, send the greeting if session is fresh
     if session.state == SmtpState::Connected {
         let actions = session.handle(SmtpEvent::Connected { peer_ip, tls: true });
@@ -680,7 +731,7 @@ where
                 };
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
-                let _ = process_async_actions(&actions, &mut session, &mut writer).await?;
+                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold).await?;
 
                 if should_close || session.state == SmtpState::Closed {
                     break;
@@ -775,6 +826,12 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
     actions: &[SmtpAction],
     session: &mut SmtpSession,
     writer: &mut W,
+    imap_store: &Arc<ImapStore>,
+    authenticator: &Option<Arc<mail_auth::MessageAuthenticator>>,
+    local_domain: &str,
+    content_store_path: &Path,
+    spf_result: &mut crate::spam::SpfResult,
+    reject_threshold: i32,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut needs_starttls = false;
     for action in actions {
@@ -2241,12 +2298,18 @@ node_config = "/tmp/test-node.toml"
             tls_available: false,
         };
 
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let smtp_store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db")).unwrap()
+        );
+        smtp_store.initialize_default_mailboxes().unwrap();
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5)
                 .await
                 .unwrap();
         });
@@ -2296,12 +2359,18 @@ node_config = "/tmp/test-node.toml"
             tls_available: false,
         };
 
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let smtp_store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db")).unwrap()
+        );
+        smtp_store.initialize_default_mailboxes().unwrap();
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5)
                 .await
                 .unwrap();
         });
