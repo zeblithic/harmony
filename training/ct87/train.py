@@ -777,8 +777,8 @@ def main() -> None:
     # step based on whether the mean drifted out of band.
     dynamic_entropy_lambda = float(args.engram_ann_entropy_weight)
     ENTROPY_LAMBDA_SCALE_UP = 1.10
-    ENTROPY_LAMBDA_SCALE_DOWN = 0.90
-    ENTROPY_LAMBDA_MIN = 1e-6
+    ENTROPY_LAMBDA_SCALE_DOWN = 0.95
+    ENTROPY_LAMBDA_MIN = float(args.engram_ann_entropy_weight)
     ENTROPY_LAMBDA_MAX = 1.0
 
     try:
@@ -1031,10 +1031,13 @@ def main() -> None:
             # (mean drifts below low bound → raise lambda) and saturation
             # (mean drifts above high bound → lower lambda, let the gate
             # sparsify naturally).
+            # Skip during warmup clamp: the gate is artificially held high,
+            # so scaling down would drain lambda before it's ever needed.
             if (
                 model.engram_ann is not None
                 and engram_ann_entropy_bounds is not None
                 and args.grad_accum_steps > 0
+                and step >= args.engram_ann_warmup_steps
             ):
                 mean_gate = accum_ann_gate_mean / args.grad_accum_steps
                 low, high = engram_ann_entropy_bounds
