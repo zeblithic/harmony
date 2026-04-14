@@ -937,8 +937,20 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 let verdict = crate::spam::score(&signals, reject_threshold);
                 if matches!(verdict.action, crate::spam::SpamAction::Reject) {
                     tracing::info!(score = verdict.score, "message rejected by spam filter");
-                    let callback_actions = session.handle(SmtpEvent::DeliveryResult { success: false });
-                    execute_actions_generic(&callback_actions, writer).await?;
+                    // Spam rejection is a permanent policy decision — send 550
+                    // (not 451 via DeliveryResult) so remote MTAs don't retry.
+                    // Bypass the state machine and reset directly, same pattern
+                    // as the oversize DATA handler.
+                    execute_actions_generic(
+                        &[SmtpAction::SendResponse(
+                            550,
+                            "5.7.1 Message rejected".to_string(),
+                        )],
+                        writer,
+                    )
+                    .await?;
+                    session.reset_transaction();
+                    *spf_result = crate::spam::SpfResult::None;
                     continue;
                 }
 
