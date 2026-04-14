@@ -587,4 +587,58 @@ mod tests {
         .unwrap();
         assert_eq!(bob_folder.message_count, 1);
     }
+
+    #[test]
+    fn root_cid_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("roots.db");
+        let cas_path = dir.path().join("content");
+        std::fs::create_dir_all(cas_path.join("commits")).unwrap();
+        std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
+
+        let addr = [0xAAu8; ADDRESS_HASH_LEN];
+
+        // First session: create tree and insert messages
+        {
+            let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
+            mgr.ensure_user_mailbox(&addr).unwrap();
+            for i in 0..3u8 {
+                mgr.insert_message(
+                    &addr,
+                    &dummy_msg_cid(i),
+                    &dummy_msg_id(i),
+                    &dummy_sender(),
+                    1700000000 + i as u64,
+                    &format!("msg {i}"),
+                )
+                .unwrap();
+            }
+        }
+
+        // Second session: reopen and verify
+        {
+            let mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
+            let root_cid = mgr.get_root(&addr).expect("root should persist");
+
+            let book = harmony_db::DiskBookStore::new(&cas_path);
+            let root = MailRoot::from_bytes(
+                book.get(&harmony_content::cid::ContentId::from_bytes(*root_cid)).unwrap(),
+            )
+            .unwrap();
+            let folder = MailFolder::from_bytes(
+                book.get(&harmony_content::cid::ContentId::from_bytes(*root.folder_cid(FolderKind::Inbox))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(folder.message_count, 3);
+
+            let page = MailPage::from_bytes(
+                book.get(&harmony_content::cid::ContentId::from_bytes(folder.page_cids[0])).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(page.entries.len(), 3);
+            // Newest first
+            assert_eq!(page.entries[0].message_cid, dummy_msg_cid(2));
+            assert_eq!(page.entries[2].message_cid, dummy_msg_cid(0));
+        }
+    }
 }
