@@ -246,6 +246,10 @@ impl ZenohPublisher {
                             .strip_prefix("harmony/mail/v1/")
                             .and_then(|s| s.strip_suffix("/root"))
                         else {
+                            tracing::debug!(
+                                %key,
+                                "root queryable rejected malformed key (missing prefix/suffix)"
+                            );
                             let _ = query.reply_err("invalid key").await;
                             continue;
                         };
