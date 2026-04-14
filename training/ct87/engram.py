@@ -1,4 +1,4 @@
-"""Engram conditional memory — gated residual injection and table lookup.
+"""Engram conditional memory -- gated residual injection and table lookup.
 
 Mirrors crates/harmony-inference/src/engram_residual.rs (EngramGatedResidual)
 and crates/harmony-engram/src/hash.rs (xxhash64 N-gram lookups).
@@ -13,7 +13,9 @@ N-gram hash lookups to produce per-position Engram embeddings.
 
 from __future__ import annotations
 
+import math
 import struct
+import warnings
 from pathlib import Path
 
 import torch
@@ -123,7 +125,7 @@ def _xxhash64(data: bytes, seed: int) -> int:
     """Pure-Python xxhash64 implementation for N-gram hashing.
 
     Must produce identical results to xxhash_rust::xxh64::xxh64 used in
-    crates/harmony-engram/src/hash.rs. The algorithm is fixed — any
+    crates/harmony-engram/src/hash.rs. The algorithm is fixed - any
     divergence breaks Engram table compatibility.
     """
     PRIME1 = 11400714785074694791
@@ -228,7 +230,7 @@ class EngramTable:
     embedding table, then performs xxhash64 N-gram lookups to produce
     per-position embeddings matching the Rust harmony-engram pipeline.
 
-    For training, the table is NOT a trainable parameter — it provides
+    For training, the table is NOT a trainable parameter - it provides
     external knowledge that the model learns to gate and use via
     EngramGatedResidual.
     """
@@ -284,7 +286,7 @@ class EngramTable:
 
         All table lookups are collected into a single batched index_select
         on the CPU table, then scatter-added to the output and moved to
-        the target device — avoiding per-row CUDA kernel launches.
+        the target device - avoiding per-row CUDA kernel launches.
 
         Args:
             input_ids: [batch, seq_len] token IDs
@@ -376,7 +378,7 @@ class EngramTable:
     ) -> torch.Tensor:
         """Look up Engram embeddings from pre-computed binary keys.
 
-        Unlike lookup_batch_projected(), this does not run the projection —
+        Unlike lookup_batch_projected(), this does not run the projection -
         it takes pre-computed keys directly. Used by contrastive co-training
         where keys are computed once (with grad) and reused for both
         contrastive loss and table lookup.
@@ -451,3 +453,306 @@ class EngramTable:
                 batch_indices.append(batch_idx)
                 positions.append(i + 2)
                 table_indices.append(idx)
+
+
+# ---------------------------------------------------------------------------
+# ZEB-117 Model gamma: ANN retrieval + gated residual + anti-collapse
+# ---------------------------------------------------------------------------
+#
+# Research-only: NOT mirrored in Rust (crates/harmony-inference). Configs
+# that use this are not GGUF-portable. Implements the recommendations in
+# docs/research/2026-04-14-engram-injection-mechanism-findings.md:
+#
+#   - brute-force k=1 cosine retrieval against a fixed corpus table (s1)
+#   - layer-norm on retrieved embeddings pre-projection (s8.1 mitigation)
+#   - hard gate clamp g_min during warmup steps (s3.3.3, s7.3 phase 1)
+#   - gate-probability side output for the training loop to apply entropy
+#     regularization (s3.3.1) and optional auxiliary reconstruction loss
+#     (s3.3.2)
+
+
+# Warning threshold for the full-table softmax retrieval
+# (batch * seq_len * table_entries). Retrieval scales linearly in this
+# product; at or above this threshold we emit a one-time RuntimeWarning
+# so the user knows to consider chunked/top-k retrieval before scaling
+# further.
+_ANN_RETRIEVAL_SIZE_WARN_THRESHOLD = 16 * 1024 * 1024
+_ann_retrieval_warned = False
+
+
+class EngramANNInjection(nn.Module):
+    """Gated residual injection with internal ANN retrieval and anti-collapse.
+
+    Differences from `EngramGatedResidual`:
+      * Retrieval is internal: projects hidden state to engram space and
+        does brute-force k=1 cosine nearest-neighbor lookup against a
+        fixed corpus table.
+      * LayerNorm on retrieved embeddings before key/value projection.
+      * Forward returns (residual, gate_probs) so the training loop can
+        apply entropy regularization and optional reconstruction loss.
+      * Supports a hard gate clamp for the first `clamp_until_step` steps
+        to force gradient flow through the memory path during the
+        chaotic-alignment phase of pretraining.
+
+    The table is a non-trainable buffer - retrieved embeddings flow
+    through learnable projections but the table itself is frozen, matching
+    the Memorizing-Transformer and RETRO paradigm.
+    """
+
+    def __init__(
+        self,
+        config: HarmonyModelConfig,
+        table: torch.Tensor,
+        conv_kernel_size: int = CONV_KERNEL_SIZE,
+        clamp_until_step: int = 800,
+        clamp_min: float = 0.5,
+        retrieval_temperature: float | None = None,
+    ):
+        super().__init__()
+        if table.dim() != 2:
+            raise ValueError(
+                f"table must be 2-D [total_entries, engram_dim], got {table.shape}"
+            )
+        if table.shape[1] != config.engram_dim:
+            raise ValueError(
+                f"table engram_dim {table.shape[1]} != config.engram_dim "
+                f"{config.engram_dim}"
+            )
+
+        self.hidden_dim = config.hidden_dim
+        self.engram_dim = config.engram_dim
+        self.conv_kernel_size = conv_kernel_size
+        self.clamp_until_step = int(clamp_until_step)
+        self.clamp_min = float(clamp_min)
+        # Temperature for softmax attention over the table. Defaults to
+        # the standard scaled-dot-product value so the softmax is sharp
+        # enough to approximate k=1 retrieval while remaining
+        # differentiable. At inference, hard argmax can replace softmax
+        # as a speed optimization with minimal accuracy loss once the
+        # query projection is trained.
+        self.retrieval_temperature = (
+            float(retrieval_temperature)
+            if retrieval_temperature is not None
+            else 1.0 / (config.engram_dim ** 0.5)
+        )
+        if (
+            not math.isfinite(self.retrieval_temperature)
+            or self.retrieval_temperature <= 0
+        ):
+            raise ValueError(
+                f"retrieval_temperature must be a positive finite float, "
+                f"got {self.retrieval_temperature!r}"
+            )
+        if not (0.0 <= self.clamp_min <= 1.0):
+            raise ValueError(
+                f"clamp_min must be in [0.0, 1.0], got {self.clamp_min!r}"
+            )
+        if self.clamp_until_step < 0:
+            raise ValueError(
+                f"clamp_until_step must be >= 0, got {self.clamp_until_step!r}"
+            )
+
+        # Corpus table: non-persistent buffer. Checkpoints do NOT include
+        # the table (keeps artifacts small and forces the table to be
+        # re-loaded from --engram-ann-table on resume, keeping train and
+        # eval configurations explicit).
+        self.register_buffer("table", table.float(), persistent=False)
+        self.register_buffer(
+            "table_normalized",
+            F.normalize(table.float(), dim=-1, eps=1e-8),
+            persistent=False,
+        )
+
+        self.query_proj = nn.Linear(config.hidden_dim, config.engram_dim, bias=False)
+        self.retrieval_norm = nn.LayerNorm(config.engram_dim, eps=config.rms_norm_eps)
+        self.key_proj = nn.Linear(config.engram_dim, config.hidden_dim, bias=False)
+        self.value_proj = nn.Linear(config.engram_dim, config.hidden_dim, bias=False)
+        self.gate_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
+        self.key_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
+        self.conv1d = nn.Conv1d(
+            in_channels=config.hidden_dim,
+            out_channels=config.hidden_dim,
+            kernel_size=conv_kernel_size,
+            groups=config.hidden_dim,
+            bias=False,
+            padding=0,
+        )
+        # Match EngramGatedResidual's zero-init on the causal depthwise
+        # conv (production path has it in HarmonyModel._init_weights()
+        # but this module is attached AFTER _init_weights runs, so we
+        # must zero conv1d here). Without this, the hard gate clamp
+        # during warmup injects random conv-filtered noise into the
+        # residual stream from step 0, undermining the anti-collapse
+        # strategy that depends on a quiet start.
+        nn.init.zeros_(self.conv1d.weight)
+
+        self.register_buffer(
+            "current_step", torch.zeros((), dtype=torch.long), persistent=False,
+        )
+        # Cache the current step as a Python int to avoid per-forward
+        # GPU->CPU sync via .item().
+        self._current_step_int: int = 0
+
+    def set_step(self, step: int) -> None:
+        """Update the current training step for gate-clamp scheduling."""
+        step_int = int(step)
+        self.current_step.fill_(step_int)
+        self._current_step_int = step_int
+
+    def _refresh_table_normalized(self) -> None:
+        """Recompute the cached normalized table from `self.table`.
+
+        Call this whenever `self.table` is replaced (e.g., after
+        `load_state_dict` replaces the buffer, or if a caller mutates
+        the table in place). The normalized cache is non-persistent and
+        must stay in sync for retrieval to be correct.
+        """
+        self.table_normalized = F.normalize(self.table, dim=-1, eps=1e-8)
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata,
+        strict, missing_keys, unexpected_keys, error_msgs,
+    ):
+        """Refresh the normalized-table cache after state-dict loading.
+
+        The base table is non-persistent so it usually isn't in the
+        state_dict, but if a caller attaches a module and then loads a
+        checkpoint that DOES contain the table (legacy checkpoints), we
+        must re-derive `table_normalized` to keep retrieval consistent.
+        """
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata,
+            strict, missing_keys, unexpected_keys, error_msgs,
+        )
+        # Always refresh: cheap for research-sized tables and keeps
+        # invariants explicit.
+        self._refresh_table_normalized()
+
+    @property
+    def total_entries(self) -> int:
+        return int(self.table.shape[0])
+
+    def retrieve(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Brute-force differentiable retrieval over the corpus table.
+
+        Uses softmax attention (temperature = `retrieval_temperature`) over
+        cosine similarities. A sharp temperature (default `1/sqrt(engram_dim)`)
+        makes the attention approximate k=1 retrieval while preserving
+        gradient flow through `query_proj` - essential for the projection
+        to actually learn. At inference the softmax can be replaced by
+        hard argmax with minimal accuracy loss once the projection has
+        converged.
+
+        Args:
+            hidden_state: [batch, seq_len, hidden_dim]
+
+        Returns:
+            [batch, seq_len, engram_dim] - softmax-attended blend of
+            table rows (raw, not layer-normed; caller applies
+            `retrieval_norm`).
+        """
+        q = self.query_proj(hidden_state)
+        q_norm = F.normalize(q, dim=-1, eps=1e-8)
+        batch, seq_len = q.shape[0], q.shape[1]
+        retrieval_product = batch * seq_len * self.total_entries
+        global _ann_retrieval_warned
+        if (
+            retrieval_product >= _ANN_RETRIEVAL_SIZE_WARN_THRESHOLD
+            and not _ann_retrieval_warned
+        ):
+            warnings.warn(
+                f"EngramANNInjection full-table softmax retrieval allocates "
+                f"[batch, seq_len, total_entries] = [{batch}, {seq_len}, "
+                f"{self.total_entries}] = {retrieval_product:,} elements "
+                f"per forward pass. This scales linearly in table size. "
+                f"Consider chunked top-k retrieval before growing further.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _ann_retrieval_warned = True
+        # Cosine similarity [batch, seq_len, total_entries]
+        sims = torch.einsum("ble,te->blt", q_norm, self.table_normalized)
+        weights = F.softmax(sims / self.retrieval_temperature, dim=-1)
+        # Weighted blend of table rows [batch, seq_len, engram_dim]
+        return weights @ self.table
+
+    def retrieve_argmax(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Inference-only hard k=1 retrieval (non-differentiable).
+
+        Included for future evaluation of how much accuracy is lost when
+        softmax is replaced by argmax after training. Not used in the
+        standard forward path.
+        """
+        q = self.query_proj(hidden_state)
+        q_norm = F.normalize(q, dim=-1, eps=1e-8)
+        sims = torch.einsum("ble,te->blt", q_norm, self.table_normalized)
+        idx = sims.argmax(dim=-1)
+        return self.table[idx]
+
+    def forward(
+        self, hidden_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute gated residual with ANN retrieval.
+
+        Returns:
+            (residual, gate):
+              residual: [batch, seq_len, hidden_dim] - caller adds to h.
+              gate:     [batch, seq_len, 1] - post-clamp probabilities,
+                        used by the training loop for entropy and
+                        reconstruction losses.
+        """
+        retrieved = self.retrieve(hidden_state)
+        retrieved = self.retrieval_norm(retrieved)
+
+        key = self.key_proj(retrieved)
+        value = self.value_proj(retrieved)
+
+        h_norm = self.gate_norm(hidden_state)
+        k_norm = self.key_norm(key)
+
+        dot = (h_norm * k_norm).sum(dim=-1, keepdim=True)
+        raw_gate = torch.sigmoid(dot / (self.hidden_dim ** 0.5))
+
+        if self._current_step_int < self.clamp_until_step:
+            gate = torch.clamp(raw_gate, min=self.clamp_min)
+        else:
+            gate = raw_gate
+
+        gated_value = gate * value
+
+        ncl = gated_value.transpose(1, 2)
+        padded = F.pad(ncl, (self.conv_kernel_size - 1, 0))
+        conv_out = self.conv1d(padded)
+        nlc = conv_out.transpose(1, 2)
+
+        return F.silu(nlc), gate
+
+    @staticmethod
+    def load_corpus_table(
+        path: str | Path,
+        tensor_name: str = "engram.weight",
+    ) -> torch.Tensor:
+        """Load the corpus table from a safetensors file as a CPU tensor."""
+        from safetensors.torch import load_file
+        tensors = load_file(str(path))
+        if tensor_name not in tensors:
+            raise KeyError(
+                f"Tensor '{tensor_name}' not found in {path}; "
+                f"available: {list(tensors.keys())}"
+            )
+        return tensors[tensor_name].float()
+
+
+def compute_gate_entropy_loss(
+    gate: torch.Tensor, eps: float = 1e-6,
+) -> torch.Tensor:
+    """Bernoulli-entropy loss to prevent gate collapse.
+
+    Minimizing `-H(p)` where `H(p) = -[p log p + (1-p) log(1-p)]` is
+    equivalent to maximizing gate-probability entropy, keeping the gate
+    indecisive and preserving gradient flow through the memory path. See
+    s3.3.1 of the research report.
+    """
+    p = gate.clamp(eps, 1.0 - eps)
+    bernoulli_entropy = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
+    return -bernoulli_entropy.mean()

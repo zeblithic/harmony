@@ -240,7 +240,14 @@ def detect_device(requested: str | None) -> torch.device:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train ct87 model")
-    parser.add_argument("--config", choices=["tiny", "target"], default="tiny")
+    parser.add_argument(
+        "--config",
+        choices=["tiny", "target", "tiny_engram_ann"],
+        default="tiny",
+        help="Model config. 'tiny_engram_ann' enables ZEB-117 Model gamma "
+             "(ANN retrieval + gated residual + anti-collapse); requires "
+             "--engram-ann-table.",
+    )
     parser.add_argument("--data", type=str, default=None, help="Path to pre-tokenized HF dataset")
     parser.add_argument("--val-data", type=str, default=None, help="Path to validation HF dataset (optional)")
     parser.add_argument("--synthetic", action="store_true", help="Use synthetic random data")
@@ -273,6 +280,36 @@ def main() -> None:
         "--latent-projection", type=str, default=None,
         help="Path to frozen latent projection checkpoint (switches engram lookup "
              "from xxhash to projection-generated keys for fine-tuning)",
+    )
+
+    # ---- ZEB-117 Model gamma: ANN engram injection + anti-collapse ----
+    parser.add_argument(
+        "--engram-ann-table", type=str, default=None,
+        help="Path to corpus engram safetensors for Model gamma ANN retrieval. "
+             "Required when --config=tiny_engram_ann.",
+    )
+    parser.add_argument(
+        "--engram-ann-warmup-steps", type=int, default=800,
+        help="Gate hard-clamp duration (steps) for Model gamma (default: 800). "
+             "Before this step count the gate is clamped to min "
+             "--engram-ann-gate-clamp-min to force gradient flow through "
+             "the memory path during the chaotic-alignment phase.",
+    )
+    parser.add_argument(
+        "--engram-ann-gate-clamp-min", type=float, default=0.5,
+        help="Minimum gate value during warmup (default: 0.5).",
+    )
+    parser.add_argument(
+        "--engram-ann-entropy-weight", type=float, default=5e-3,
+        help="lambda_ent for gate-entropy regularization (default: 0.005). "
+             "Recommended range: [1e-3, 1e-2]. See research report s3.3.1.",
+    )
+    parser.add_argument(
+        "--engram-ann-entropy-bounds", type=str, default="0.1,0.4",
+        help="Comma-separated (low, high) bounds on moving-average gate "
+             "probability; lambda_ent is dynamically scaled to keep the mean "
+             "inside this band. Default '0.1,0.4'. Pass 'off' to disable "
+             "dynamic scaling.",
     )
     parser.add_argument(
         "--latent-intermediate-dim", type=int, default=None,
@@ -439,8 +476,35 @@ def main() -> None:
             )
             sys.exit(1)
 
-    config = HarmonyModelConfig.tiny() if args.config == "tiny" else HarmonyModelConfig.target()
-    seq_len = args.seq_len or (512 if args.config == "tiny" else 2048)
+    if args.config == "tiny":
+        config = HarmonyModelConfig.tiny()
+    elif args.config == "tiny_engram_ann":
+        config = HarmonyModelConfig.tiny_engram_ann()
+    else:
+        config = HarmonyModelConfig.target()
+    seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
+
+    # Model gamma arg validation (ZEB-117)
+    if args.config == "tiny_engram_ann":
+        if args.engram_ann_table is None:
+            print(
+                "Error: --config=tiny_engram_ann requires --engram-ann-table "
+                "(path to corpus safetensors table)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.engram_ann_entropy_weight < 0:
+            print("Error: --engram-ann-entropy-weight must be >= 0", file=sys.stderr)
+            sys.exit(1)
+        if args.engram_ann_warmup_steps < 0:
+            print("Error: --engram-ann-warmup-steps must be >= 0", file=sys.stderr)
+            sys.exit(1)
+        if not (0.0 <= args.engram_ann_gate_clamp_min <= 1.0):
+            print(
+                "Error: --engram-ann-gate-clamp-min must be in [0.0, 1.0]",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if args.coconut:
         if args.think_token_id < 0:
@@ -498,6 +562,49 @@ def main() -> None:
     if args.gradient_checkpoint:
         model.set_gradient_checkpointing(True)
         print("Gradient checkpointing enabled")
+
+    # ZEB-117 Model gamma: attach ANN injection module if configured.
+    engram_ann_entropy_bounds: tuple[float, float] | None = None
+    if config.use_ann_engram:
+        from ct87.engram import EngramANNInjection
+
+        ann_table = EngramANNInjection.load_corpus_table(args.engram_ann_table)
+        ann_module = EngramANNInjection(
+            config,
+            ann_table,
+            clamp_until_step=args.engram_ann_warmup_steps,
+            clamp_min=args.engram_ann_gate_clamp_min,
+        ).to(device)
+        model.attach_engram_ann(ann_module)
+        print(
+            f"Model gamma ANN engram attached: {ann_module.total_entries:,} table "
+            f"entries, engram_dim={ann_module.engram_dim}, "
+            f"clamp_until_step={ann_module.clamp_until_step}, "
+            f"clamp_min={ann_module.clamp_min}, "
+            f"entropy_weight={args.engram_ann_entropy_weight}"
+        )
+        if args.engram_ann_entropy_bounds.lower() != "off":
+            try:
+                parts = args.engram_ann_entropy_bounds.split(",")
+                if len(parts) != 2:
+                    raise ValueError("expected exactly two comma-separated values")
+                lo, hi = float(parts[0]), float(parts[1])
+            except ValueError as e:
+                print(
+                    f"Error: --engram-ann-entropy-bounds must be 'low,high' "
+                    f"with 0 < low < high < 1 (or 'off'): {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if not (0.0 < lo < hi < 1.0):
+                print(
+                    "Error: --engram-ann-entropy-bounds must be 'low,high' "
+                    "with 0 < low < high < 1",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            engram_ann_entropy_bounds = (lo, hi)
+
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
 
@@ -514,7 +621,7 @@ def main() -> None:
             f"dim={engram_table.engram_dim}, heads={engram_table.num_heads}"
         )
 
-    # Latent projection setup — three modes:
+    # Latent projection setup - three modes:
     # 1. --latent-projection + --contrastive-loss: load from checkpoint, trainable
     # 2. --latent-projection (no contrastive): load from checkpoint, frozen
     # 3. --latent-projection-init: randomly initialize, trainable
@@ -619,19 +726,33 @@ def main() -> None:
     csv_file = None
     csv_writer = None
     if args.log_file:
-        expected_header = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
-        legacy_header = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
+        expected_header = [
+            "step", "loss", "uq_loss", "mtp_loss", "cl_loss",
+            "ann_ent_loss", "ann_gate_mean", "ann_lambda_ent",
+            "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms",
+        ]
+        legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
+        legacy_header_no_ann = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         if os.path.exists(args.log_file) and os.path.getsize(args.log_file) > 0:
             with open(args.log_file, newline="") as existing:
                 header = next(csv.reader(existing), [])
-            if header == legacy_header:
-                # Migrate: rewrite file with new header so row widths match
+            migrations_needed = []
+            if header == legacy_header_no_cl:
+                migrations_needed.append("cl_loss")
+            if header in (legacy_header_no_cl, legacy_header_no_ann):
+                migrations_needed.append("ann")
+            if migrations_needed:
                 with open(args.log_file, newline="") as f:
                     rows = list(csv.reader(f))
                 rows[0] = expected_header
-                # Insert empty cl_loss column (index 4) into each data row
                 for i in range(1, len(rows)):
-                    rows[i].insert(4, "")
+                    if "cl_loss" in migrations_needed:
+                        # Insert empty cl_loss column (index 4)
+                        rows[i].insert(4, "")
+                    if "ann" in migrations_needed:
+                        # Insert three empty ann columns after cl_loss
+                        for offset in (5, 5, 5):
+                            rows[i].insert(offset, "")
                 with open(args.log_file, "w", newline="") as f:
                     csv.writer(f).writerows(rows)
             elif header and header != expected_header:
@@ -651,9 +772,22 @@ def main() -> None:
     else:
         qat_start_step = args.steps + 1
 
+    # Dynamic lambda_ent for Model gamma: adjusted up/down to keep mean gate prob
+    # inside engram_ann_entropy_bounds. Scales multiplicatively after each
+    # step based on whether the mean drifted out of band.
+    dynamic_entropy_lambda = float(args.engram_ann_entropy_weight)
+    ENTROPY_LAMBDA_SCALE_UP = 1.10
+    ENTROPY_LAMBDA_SCALE_DOWN = 0.90
+    ENTROPY_LAMBDA_MIN = 1e-6
+    ENTROPY_LAMBDA_MAX = 1.0
+
     try:
         for step in range(args.steps):
-            # Activate QAT at the configured step (base model only —
+            # Model gamma: propagate current step to the ANN engram so it
+            # knows whether to apply the hard gate clamp.
+            if model.engram_ann is not None:
+                model.engram_ann.set_step(step)
+            # Activate QAT at the configured step (base model only -
             # UQ head, ThoughtNorm, MTP head are separate modules)
             if args.qat and not qat_enabled and step >= qat_start_step:
                 from ct87.qat import enable_qat
@@ -670,6 +804,8 @@ def main() -> None:
             accum_uq_loss = 0.0
             accum_mtp_loss = 0.0
             accum_cl_loss = 0.0
+            accum_ann_ent_loss = 0.0
+            accum_ann_gate_mean = 0.0
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
             need_hidden = mtp_head is not None
             use_coconut = args.coconut and num_thoughts > 0
@@ -687,7 +823,7 @@ def main() -> None:
                     # use them for engram retrieval
                     from ct87.latent_projection import compute_ngram_averages
 
-                    # Embeddings for key generation don't need grad —
+                    # Embeddings for key generation don't need grad -
                     # everything is detached before projection anyway.
                     # CE gradients flow through the model's own forward pass.
                     with torch.no_grad():
@@ -851,6 +987,25 @@ def main() -> None:
                         loss = loss + args.contrastive_loss_weight * cl_total
                         accum_cl_loss += cl_total.item()
 
+                    # Model gamma: gate-entropy regularization (ZEB-117).
+                    # Reads the gate stored by HarmonyModel during the
+                    # forward; penalizes low-entropy (collapsed) gate
+                    # distributions to preserve gradient flow through
+                    # the memory path. See research report s3.3.1.
+                    if model.engram_ann is not None and model._last_ann_gate is not None:
+                        from ct87.engram import compute_gate_entropy_loss
+                        gate = model._last_ann_gate
+                        # Clear the side-channel immediately so the model
+                        # doesn't hold a reference to the grad-history
+                        # tensor longer than needed. The next forward
+                        # would overwrite it anyway; clearing here makes
+                        # the lifetime explicit.
+                        model._last_ann_gate = None
+                        ent_loss = compute_gate_entropy_loss(gate)
+                        loss = loss + dynamic_entropy_lambda * ent_loss
+                        accum_ann_ent_loss += ent_loss.item()
+                        accum_ann_gate_mean += gate.mean().item()
+
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
 
@@ -871,6 +1026,29 @@ def main() -> None:
 
             optimizer.step()
 
+            # Model gamma: adapt lambda_ent to keep the mean gate probability
+            # inside the configured band. Prevents both gate collapse
+            # (mean drifts below low bound → raise lambda) and saturation
+            # (mean drifts above high bound → lower lambda, let the gate
+            # sparsify naturally).
+            if (
+                model.engram_ann is not None
+                and engram_ann_entropy_bounds is not None
+                and args.grad_accum_steps > 0
+            ):
+                mean_gate = accum_ann_gate_mean / args.grad_accum_steps
+                low, high = engram_ann_entropy_bounds
+                if mean_gate < low:
+                    dynamic_entropy_lambda = min(
+                        ENTROPY_LAMBDA_MAX,
+                        dynamic_entropy_lambda * ENTROPY_LAMBDA_SCALE_UP,
+                    )
+                elif mean_gate > high:
+                    dynamic_entropy_lambda = max(
+                        ENTROPY_LAMBDA_MIN,
+                        dynamic_entropy_lambda * ENTROPY_LAMBDA_SCALE_DOWN,
+                    )
+
             dt_ms = (time.time() - step_start) * 1000
             raw_loss = accum_loss / args.grad_accum_steps
             current_lr = optimizer.param_groups[0]["lr"]
@@ -889,7 +1067,19 @@ def main() -> None:
                 if args.contrastive_loss:
                     raw_cl = accum_cl_loss / args.grad_accum_steps
                     cl_str = f"  cl_loss={raw_cl:.4f}"
-                print(f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}{ct_str}{uq_str}{mtp_str}{cl_str}")
+                ann_str = ""
+                if model.engram_ann is not None:
+                    raw_ent = accum_ann_ent_loss / args.grad_accum_steps
+                    raw_gate = accum_ann_gate_mean / args.grad_accum_steps
+                    ann_str = (
+                        f"  ann_ent={raw_ent:.4f}"
+                        f"  ann_gate={raw_gate:.3f}"
+                        f"  lambda_ent={dynamic_entropy_lambda:.4f}"
+                    )
+                print(
+                    f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
+                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}"
+                )
 
             val_loss_str = ""
             if args.save_every > 0 and step > 0 and step % args.save_every == 0:
@@ -925,12 +1115,22 @@ def main() -> None:
                 cl_loss_str = ""
                 if args.contrastive_loss:
                     cl_loss_str = f"{accum_cl_loss / args.grad_accum_steps:.6f}"
+                ann_ent_str = ""
+                ann_gate_str = ""
+                ann_lambda_str = ""
+                if model.engram_ann is not None:
+                    ann_ent_str = f"{accum_ann_ent_loss / args.grad_accum_steps:.6f}"
+                    ann_gate_str = f"{accum_ann_gate_mean / args.grad_accum_steps:.6f}"
+                    ann_lambda_str = f"{dynamic_entropy_lambda:.6f}"
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
                     uq_loss_str,
                     mtp_loss_str,
                     cl_loss_str,
+                    ann_ent_str,
+                    ann_gate_str,
+                    ann_lambda_str,
                     val_loss_str,
                     f"{current_lr:.8f}",
                     f"{grad_norm:.6f}" if grad_norm is not None else "",
