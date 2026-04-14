@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use harmony_content::book::BookStore as _;
 
-use crate::mailbox::{MailFolder, MailPage, MailRoot, FOLDER_COUNT};
-use crate::message::{ADDRESS_HASH_LEN, CID_LEN};
+use crate::mailbox::{FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, FOLDER_COUNT, MAX_SNIPPET_LEN};
+use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 
 /// Errors from mailbox manager operations.
 #[derive(Debug, thiserror::Error)]
@@ -96,7 +96,6 @@ impl MailboxManager {
     }
 
     /// Load raw bytes from CAS by CID.
-    #[allow(dead_code)]
     fn cas_load(&self, cid: &[u8; CID_LEN]) -> Result<Vec<u8>, MailboxError> {
         let book = harmony_db::DiskBookStore::new(&self.content_store_path);
         let content_id = harmony_content::cid::ContentId::from_bytes(*cid);
@@ -153,6 +152,101 @@ impl MailboxManager {
         Ok(())
     }
 
+    /// Insert a message into a user's inbox Merkle tree.
+    ///
+    /// Loads the current tree from CAS, prepends the entry to the head page
+    /// (splitting if full), writes all changed blobs to CAS, and persists the
+    /// new root CID.
+    pub fn insert_message(
+        &mut self,
+        user_address: &[u8; ADDRESS_HASH_LEN],
+        message_cid: &[u8; CID_LEN],
+        msg_id: &[u8; MESSAGE_ID_LEN],
+        sender_address: &[u8; ADDRESS_HASH_LEN],
+        timestamp: u64,
+        subject: &str,
+    ) -> Result<(), MailboxError> {
+        let root_cid = *self
+            .roots
+            .get(user_address)
+            .ok_or(MailboxError::NoMailbox(*user_address))?;
+
+        // Load current root
+        let root_bytes = self.cas_load(&root_cid)?;
+        let root = MailRoot::from_bytes(&root_bytes)?;
+
+        // Load inbox folder
+        let inbox_cid = *root.folder_cid(FolderKind::Inbox);
+        let folder_bytes = self.cas_load(&inbox_cid)?;
+        let mut folder = MailFolder::from_bytes(&folder_bytes)?;
+
+        // Build the new entry
+        let snippet = crate::mailbox::truncate_utf8(subject, MAX_SNIPPET_LEN).to_string();
+        let entry = MessageEntry {
+            message_cid: *message_cid,
+            message_id: *msg_id,
+            sender_address: *sender_address,
+            timestamp,
+            subject_snippet: snippet,
+            read: false,
+        };
+
+        // Load head page (or create one if folder has no pages)
+        if folder.page_cids.is_empty() {
+            // No pages yet — create one with just this entry
+            let page = MailPage {
+                version: crate::mailbox::MAILBOX_VERSION,
+                next_page: None,
+                entries: vec![entry],
+            };
+            let page_cid = self.cas_ingest(&page.to_bytes()?)?;
+            folder.page_cids.push(page_cid);
+        } else {
+            let head_cid = folder.page_cids[0];
+            let head_bytes = self.cas_load(&head_cid)?;
+            let mut head_page = MailPage::from_bytes(&head_bytes)?;
+
+            if head_page.is_full() {
+                // Page is full — create a new head page with just this entry.
+                // The old head page becomes the second page (unchanged in CAS).
+                let new_page = MailPage {
+                    version: crate::mailbox::MAILBOX_VERSION,
+                    next_page: Some(head_cid),
+                    entries: vec![entry],
+                };
+                let new_page_cid = self.cas_ingest(&new_page.to_bytes()?)?;
+                folder.page_cids.insert(0, new_page_cid);
+            } else {
+                // Prepend to existing head page
+                head_page.entries.insert(0, entry);
+                // Update next_page pointer if there's a following page
+                head_page.next_page = folder.page_cids.get(1).copied();
+                let new_head_cid = self.cas_ingest(&head_page.to_bytes()?)?;
+                folder.page_cids[0] = new_head_cid;
+            }
+        }
+
+        // Update folder counts
+        folder.message_count += 1;
+        folder.unread_count += 1;
+
+        // Write updated folder to CAS
+        let new_folder_cid = self.cas_ingest(&folder.to_bytes()?)?;
+
+        // Update root with new inbox CID
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let new_root = root.with_folder(FolderKind::Inbox, new_folder_cid, now);
+        let new_root_cid = self.cas_ingest(&new_root.to_bytes())?;
+
+        // Persist
+        self.persist_root(user_address, &new_root_cid)?;
+
+        Ok(())
+    }
+
     /// Persist a root CID for a user (inserts or updates).
     fn persist_root(
         &mut self,
@@ -172,7 +266,22 @@ impl MailboxManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mailbox::FolderKind;
+    use crate::mailbox::{FolderKind, PAGE_CAPACITY};
+    use crate::message::MESSAGE_ID_LEN;
+
+    fn dummy_msg_cid(tag: u8) -> [u8; CID_LEN] {
+        let mut cid = [0u8; CID_LEN];
+        cid[0] = tag;
+        cid
+    }
+
+    fn dummy_msg_id(tag: u8) -> [u8; MESSAGE_ID_LEN] {
+        [tag; MESSAGE_ID_LEN]
+    }
+
+    fn dummy_sender() -> [u8; ADDRESS_HASH_LEN] {
+        [0xEEu8; ADDRESS_HASH_LEN]
+    }
 
     #[test]
     fn open_creates_schema() {
@@ -287,5 +396,190 @@ mod tests {
         mgr.ensure_user_mailbox(&addr).unwrap();
         let cid2 = *mgr.get_root(&addr).unwrap();
         assert_eq!(cid1, cid2);
+    }
+
+    #[test]
+    fn insert_into_empty_mailbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("roots.db");
+        let cas_path = dir.path().join("content");
+        std::fs::create_dir_all(cas_path.join("commits")).unwrap();
+        std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
+
+        let addr = [0xAAu8; ADDRESS_HASH_LEN];
+        let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
+        mgr.ensure_user_mailbox(&addr).unwrap();
+        let initial_cid = *mgr.get_root(&addr).unwrap();
+
+        mgr.insert_message(
+            &addr,
+            &dummy_msg_cid(1),
+            &dummy_msg_id(1),
+            &dummy_sender(),
+            1700000000,
+            "Hello World",
+        )
+        .unwrap();
+
+        // Root CID should have changed
+        let new_cid = *mgr.get_root(&addr).unwrap();
+        assert_ne!(initial_cid, new_cid);
+
+        // Load and verify the tree
+        let book = harmony_db::DiskBookStore::new(&cas_path);
+        let root = MailRoot::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(new_cid)).unwrap(),
+        )
+        .unwrap();
+
+        let inbox_cid = root.folder_cid(FolderKind::Inbox);
+        let folder = MailFolder::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(*inbox_cid)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(folder.message_count, 1);
+        assert_eq!(folder.unread_count, 1);
+
+        let page = MailPage::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(folder.page_cids[0])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].message_cid, dummy_msg_cid(1));
+        assert_eq!(page.entries[0].subject_snippet, "Hello World");
+        assert!(!page.entries[0].read);
+    }
+
+    #[test]
+    fn insert_splits_page_at_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("roots.db");
+        let cas_path = dir.path().join("content");
+        std::fs::create_dir_all(cas_path.join("commits")).unwrap();
+        std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
+
+        let addr = [0xAAu8; ADDRESS_HASH_LEN];
+        let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
+        mgr.ensure_user_mailbox(&addr).unwrap();
+
+        // Fill first page to capacity
+        for i in 0..PAGE_CAPACITY {
+            mgr.insert_message(
+                &addr,
+                &dummy_msg_cid(i as u8),
+                &dummy_msg_id(i as u8),
+                &dummy_sender(),
+                1700000000 + i as u64,
+                &format!("msg {i}"),
+            )
+            .unwrap();
+        }
+
+        // Verify: 1 page with PAGE_CAPACITY entries
+        let book = harmony_db::DiskBookStore::new(&cas_path);
+        let root_cid = *mgr.get_root(&addr).unwrap();
+        let root = MailRoot::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(root_cid)).unwrap(),
+        )
+        .unwrap();
+        let folder = MailFolder::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(*root.folder_cid(FolderKind::Inbox))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(folder.message_count as usize, PAGE_CAPACITY);
+        // The initial empty page + PAGE_CAPACITY replacements = still 1 page CID
+        assert_eq!(folder.page_cids.len(), 1);
+
+        // Insert one more — should trigger page split
+        mgr.insert_message(
+            &addr,
+            &dummy_msg_cid(0xFF),
+            &dummy_msg_id(0xFF),
+            &dummy_sender(),
+            1700000000 + PAGE_CAPACITY as u64,
+            "overflow",
+        )
+        .unwrap();
+
+        // Verify: 2 pages now
+        let root_cid = *mgr.get_root(&addr).unwrap();
+        let root = MailRoot::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(root_cid)).unwrap(),
+        )
+        .unwrap();
+        let folder = MailFolder::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(*root.folder_cid(FolderKind::Inbox))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(folder.message_count as usize, PAGE_CAPACITY + 1);
+        assert_eq!(folder.page_cids.len(), 2);
+
+        // Head page has 1 entry (the newest)
+        let head_page = MailPage::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(folder.page_cids[0])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head_page.entries.len(), 1);
+        assert_eq!(head_page.entries[0].message_cid, dummy_msg_cid(0xFF));
+    }
+
+    #[test]
+    fn per_user_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("roots.db");
+        let cas_path = dir.path().join("content");
+        std::fs::create_dir_all(cas_path.join("commits")).unwrap();
+        std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
+
+        let alice = [0xAAu8; ADDRESS_HASH_LEN];
+        let bob = [0xBBu8; ADDRESS_HASH_LEN];
+        let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
+        mgr.ensure_user_mailbox(&alice).unwrap();
+        mgr.ensure_user_mailbox(&bob).unwrap();
+
+        // Send 3 messages to alice, 1 to bob
+        for i in 0..3u8 {
+            mgr.insert_message(
+                &alice,
+                &dummy_msg_cid(i),
+                &dummy_msg_id(i),
+                &dummy_sender(),
+                1700000000 + i as u64,
+                &format!("alice msg {i}"),
+            )
+            .unwrap();
+        }
+        mgr.insert_message(
+            &bob,
+            &dummy_msg_cid(10),
+            &dummy_msg_id(10),
+            &dummy_sender(),
+            1700000000,
+            "bob msg",
+        )
+        .unwrap();
+
+        // Verify alice has 3, bob has 1
+        let book = harmony_db::DiskBookStore::new(&cas_path);
+
+        let alice_root = MailRoot::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(*mgr.get_root(&alice).unwrap())).unwrap(),
+        )
+        .unwrap();
+        let alice_folder = MailFolder::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(*alice_root.folder_cid(FolderKind::Inbox))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(alice_folder.message_count, 3);
+
+        let bob_root = MailRoot::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(*mgr.get_root(&bob).unwrap())).unwrap(),
+        )
+        .unwrap();
+        let bob_folder = MailFolder::from_bytes(
+            book.get(&harmony_content::cid::ContentId::from_bytes(*bob_root.folder_cid(FolderKind::Inbox))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bob_folder.message_count, 1);
     }
 }
