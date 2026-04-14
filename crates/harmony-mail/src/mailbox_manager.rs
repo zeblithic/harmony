@@ -7,32 +7,81 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
+
+/// Maximum in-flight raw-mail publish tasks at any given moment.
+///
+/// Bounded so a stalled Zenoh session cannot let per-recipient spawn tasks
+/// accumulate without limit (each holds an Arc<Vec<u8>> payload). 256 is
+/// larger than MAX_RECIPIENTS (100) so a single max-fan-out message never
+/// pressure-stalls on itself, while leaving headroom for concurrent SMTP
+/// deliveries. Excess spawns wait on the semaphore and are released when
+/// a publish completes, times out, or is cancelled.
+const RAW_PUBLISH_CONCURRENCY: usize = 256;
+
+/// Hard ceiling for a single `session.put()` operation.
+///
+/// A healthy Zenoh put returns in milliseconds — anything beyond this
+/// indicates a stalled link. Abort rather than pile up.
+const RAW_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::mailbox::{FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, FOLDER_COUNT, MAX_SNIPPET_LEN};
 use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 
-/// Per-address coalescing publisher for root CID notifications.
+/// Zenoh publisher for mailbox notifications.
 ///
-/// `MailboxManager` runs in sync context (`spawn_blocking`) and calls `notify`
-/// whenever a user's mailbox root CID changes. The publisher stores a
-/// latest-only map keyed by address hex and wakes a background async drain
-/// task. The drain snapshots the map and issues one `session.put()` per user
-/// carrying their most recent root CID.
+/// Two independent publish paths share one Zenoh session:
 ///
-/// Why coalesce rather than queue?
-/// - No update is lost: `notify` overwrites the entry and wakes the drain, so
-///   the drain always observes the newest value per addr.
-/// - No log storm: there is no drop path — updates are O(1) mutex-guarded map
-///   inserts; storage is bounded by the number of distinct active users, not
-///   by update rate.
-/// - Stale roots cannot outrun fresh ones: bursts collapse into a single
-///   publish of the newest CID rather than replaying a backlog.
+/// 1. **Root CID updates** (`notify` → `harmony/mail/v1/{addr}/root`): coalesced
+///    per-address. `MailboxManager` runs in sync context (`spawn_blocking`) and
+///    calls `notify` whenever a user's mailbox root CID changes. A latest-only
+///    map bounded by active user count is drained by a background task that
+///    wakes on `Notify`. Stale roots never outrun fresh ones, and there is no
+///    drop/queue-full path (so no log storm on stall).
+///
+/// 2. **Raw message bytes** (`publish_raw_mail` → `harmony/mail/v1/{addr}`):
+///    fire-and-forget per-message. Each SMTP-delivered recipient gets one
+///    tokio::spawn that issues a `session.put(bytes)`. No coalescing — each
+///    message is distinct content and must be delivered individually.
+///    Compatible with the Phase 0 harmony-client, which subscribes to
+///    `harmony/mail/v1/{own_hex}` and decodes the payload via
+///    `HarmonyMessage::from_bytes`.
+///
+/// Both paths skip new publishes once `cancel` fires, and the drain task
+/// drops its session clone on cancel for clean disconnect.
 pub struct ZenohPublisher {
     latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
     wake: Arc<Notify>,
+    raw_sink: RawSink,
+}
+
+/// Back-end for raw-mail publishes. Real builds hold a session + cancel
+/// token; test builds capture publish attempts into a shared vec for
+/// assertions without opening a Zenoh session.
+enum RawSink {
+    Session {
+        session: zenoh::Session,
+        cancel: CancellationToken,
+        /// Caps concurrent in-flight `session.put()` tasks. Acquired inside
+        /// the spawned task so the spawn itself is cheap — backpressure
+        /// happens at the permit-acquire point, with cancellation awareness
+        /// in case the semaphore is saturated during shutdown.
+        permits: Arc<Semaphore>,
+    },
+    #[cfg(test)]
+    Captured(Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>),
+}
+
+/// Test handles returned by `ZenohPublisher::inert_for_test` so callers can
+/// assert on both coalesced root-CID updates and raw-mail publishes without
+/// spawning a drain task or opening a Zenoh session.
+#[cfg(test)]
+pub struct InertHandles {
+    pub latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
+    pub raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
 }
 
 impl ZenohPublisher {
@@ -55,8 +104,14 @@ impl ZenohPublisher {
             Arc::new(Mutex::new(HashMap::new()));
         let wake = Arc::new(Notify::new());
 
+        // zenoh::Session is Arc-internal, so cloning just bumps the refcount.
+        // The drain task owns one clone (dropped on cancel for clean
+        // disconnect); we keep another on the publisher for raw publishes.
+        let drain_session = session.clone();
+
         let drain_latest = Arc::clone(&latest);
         let drain_wake = Arc::clone(&wake);
+        let drain_cancel = cancel.clone();
         tokio::spawn(async move {
             let mut cancelled = false;
             loop {
@@ -68,7 +123,7 @@ impl ZenohPublisher {
                     // update that raced the cancel signal is still published.
                     tokio::select! {
                         _ = drain_wake.notified() => {}
-                        _ = cancel.cancelled() => { cancelled = true; }
+                        _ = drain_cancel.cancelled() => { cancelled = true; }
                     }
                 }
                 // Snapshot+clear under the sync lock so notify() can keep
@@ -80,14 +135,50 @@ impl ZenohPublisher {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     map.drain().collect()
                 };
+                // Publish every entry in the snapshot, timeout-bounded, with
+                // no inner cancel race. Two reasons:
+                //
+                // 1. Once a snapshot is drained from the coalescing map, the
+                //    entries are consumed — if we abort mid-snapshot, those
+                //    updates are lost until the next `insert_message` bumps
+                //    the same addr. Committing to the full snapshot (each
+                //    entry timeout-bounded) preserves the "drain at least
+                //    once" invariant the coalescing contract depends on.
+                // 2. `RAW_PUBLISH_TIMEOUT` (10s) already caps stall risk per
+                //    entry. Total shutdown latency is bounded by
+                //    (timeout × snapshot_len); cancel is observed at the
+                //    outer `select!` between iterations, which is plenty
+                //    responsive for a typical snapshot size (bounded by the
+                //    number of active users whose mailboxes updated in the
+                //    current wake cycle).
+                //
+                // Cancel fires during a put → the current put's timeout
+                // still applies (worst case 10s to notice), then the outer
+                // loop's select observes cancel, snapshots once more to
+                // catch any late arrivals, drains, and breaks.
                 for (addr_hex, root_cid) in snapshot {
                     let topic = format!("harmony/mail/v1/{addr_hex}/root");
-                    if let Err(e) = session.put(&topic, &root_cid[..]).await {
-                        tracing::warn!(
-                            error = %e,
-                            %topic,
-                            "Zenoh root CID publish failed"
-                        );
+                    match tokio::time::timeout(
+                        RAW_PUBLISH_TIMEOUT,
+                        drain_session.put(&topic, &root_cid[..]),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                %topic,
+                                "Zenoh root CID publish failed"
+                            );
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                %topic,
+                                timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                                "Zenoh root CID publish timed out — aborted"
+                            );
+                        }
                     }
                 }
                 if cancelled {
@@ -96,29 +187,38 @@ impl ZenohPublisher {
             }
             // Explicit drop ensures Zenoh disconnects promptly on shutdown
             // rather than waiting for the runtime tear-down.
-            drop(session);
+            drop(drain_session);
             tracing::debug!("ZenohPublisher drain task exited on cancel");
         });
 
-        Self { latest, wake }
+        Self {
+            latest,
+            wake,
+            raw_sink: RawSink::Session {
+                session,
+                cancel,
+                permits: Arc::new(Semaphore::new(RAW_PUBLISH_CONCURRENCY)),
+            },
+        }
     }
 
     /// Test-only: create a publisher with no drain task, exposing the
-    /// coalescing map for assertions. `notify()` still updates the map so
-    /// callers can observe which addresses/CIDs would have been published.
+    /// coalescing map and the raw-publish capture buffer for assertions.
+    /// `notify()` still updates the map and `publish_raw_mail()` still
+    /// appends to the raw buffer, so callers can observe what would have
+    /// been published without opening a Zenoh session.
     #[cfg(test)]
-    #[allow(clippy::type_complexity)]
-    pub fn inert_for_test() -> (Self, Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>) {
+    pub fn inert_for_test() -> (Self, InertHandles) {
         let latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>> = Arc::new(Mutex::new(Vec::new()));
         let wake = Arc::new(Notify::new());
-        (
-            Self {
-                latest: Arc::clone(&latest),
-                wake,
-            },
-            latest,
-        )
+        let publisher = Self {
+            latest: Arc::clone(&latest),
+            wake,
+            raw_sink: RawSink::Captured(Arc::clone(&raw)),
+        };
+        (publisher, InertHandles { latest, raw })
     }
 
     /// Announce a new root CID for a user.
@@ -134,6 +234,110 @@ impl ZenohPublisher {
             map.insert(addr_hex, root_cid);
         }
         self.wake.notify_one();
+    }
+
+    /// Publish raw `HarmonyMessage` bytes to `harmony/mail/v1/{addr_hex}`.
+    ///
+    /// Fire-and-forget: spawns a task that issues one `session.put()` and
+    /// logs on failure. Each call is a distinct message; the publisher does
+    /// no coalescing or retry. Callers are expected to hand in the exact
+    /// bytes produced by `HarmonyMessage::to_bytes()` so subscribers (e.g.
+    /// Phase 0 harmony-client) can decode directly.
+    ///
+    /// **Resource bounds:**
+    /// - Payload is `Arc<Vec<u8>>` so a single encoded message can fan out
+    ///   to many recipients without per-recipient payload copies —
+    ///   `Arc::clone` is a refcount bump, and the spawned task dereferences
+    ///   to `&[u8]` for `session.put`.
+    /// - Permits are acquired **synchronously at the call site** via
+    ///   `try_acquire_owned`. If all `RAW_PUBLISH_CONCURRENCY` permits are
+    ///   held, the publish is dropped (logged) rather than queued — this
+    ///   bounds both concurrent `session.put` calls AND the number of
+    ///   pending tokio tasks. Without call-site acquire, nothing would cap
+    ///   how many task frames can pile up waiting for a permit.
+    /// - Each publish has a `RAW_PUBLISH_TIMEOUT` hard cap and observes the
+    ///   shared cancellation token, so stalled puts are aborted instead of
+    ///   holding a permit forever.
+    ///
+    /// Raw publishes are a best-effort real-time notification. IMAP delivery
+    /// and the Merkle root publish remain the durable paths — a dropped
+    /// raw publish just means the client catches up on its next poll or
+    /// root refresh.
+    ///
+    /// Short-circuits when the cancel token has already fired — prevents
+    /// post-shutdown spawns from keeping the runtime alive.
+    pub fn publish_raw_mail(&self, addr_hex: String, bytes: Arc<Vec<u8>>) {
+        match &self.raw_sink {
+            RawSink::Session {
+                session,
+                cancel,
+                permits,
+            } => {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                // Acquire at the CALL SITE, not inside the spawn. Dropping
+                // on backpressure prevents unbounded task accumulation
+                // during a Zenoh stall — if we spawned first and acquired
+                // second, every waiting spawn would hold its Arc<Vec<u8>>
+                // refcount and task frame open for minutes.
+                let permit = match Arc::clone(permits).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        tracing::warn!(
+                            addr = %addr_hex,
+                            "raw-mail publish dropped: in-flight limit ({}) reached — best-effort path, client will catch up via IMAP/root",
+                            RAW_PUBLISH_CONCURRENCY,
+                        );
+                        return;
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => return,
+                };
+                let session = session.clone();
+                let cancel = cancel.clone();
+                let topic = format!("harmony/mail/v1/{addr_hex}");
+                tokio::spawn(async move {
+                    // Move the already-acquired permit into the task so it
+                    // releases on completion/timeout/cancel. Timeout-bounded,
+                    // cancel-aware put.
+                    let _permit = permit;
+                    tokio::select! {
+                        res = tokio::time::timeout(
+                            RAW_PUBLISH_TIMEOUT,
+                            session.put(&topic, &bytes[..]),
+                        ) => match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    %topic,
+                                    "Zenoh raw mail publish failed"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    %topic,
+                                    timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                                    "Zenoh raw mail publish timed out — aborted"
+                                );
+                            }
+                        },
+                        _ = cancel.cancelled() => {
+                            tracing::debug!(
+                                %topic,
+                                "Zenoh raw mail publish cancelled during shutdown"
+                            );
+                        }
+                    }
+                });
+            }
+            #[cfg(test)]
+            RawSink::Captured(buf) => {
+                buf.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((addr_hex, bytes));
+            }
+        }
     }
 }
 
@@ -164,7 +368,7 @@ pub struct MailboxManager {
     /// Persistence for root CID pointers.
     db: rusqlite::Connection,
     /// Optional Zenoh publisher for root CID notifications.
-    publisher: Option<ZenohPublisher>,
+    publisher: Option<Arc<ZenohPublisher>>,
 }
 
 const SCHEMA_SQL: &str = "
@@ -219,8 +423,13 @@ impl MailboxManager {
 
     /// Attach a Zenoh publisher for root CID notifications.
     ///
+    /// Takes `Arc<ZenohPublisher>` so the same publisher can be shared with
+    /// the SMTP server's raw-publish path without routing raw publishes
+    /// through this manager's mutex (raw publish doesn't need the manager
+    /// state, only the publisher).
+    ///
     /// Call this after opening the manager if Zenoh is configured and enabled.
-    pub fn set_publisher(&mut self, publisher: ZenohPublisher) {
+    pub fn set_publisher(&mut self, publisher: Arc<ZenohPublisher>) {
         self.publisher = Some(publisher);
     }
 
@@ -807,11 +1016,12 @@ mod tests {
         std::fs::create_dir_all(cas_path.join("commits")).unwrap();
         std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
 
-        let (publisher, latest) = ZenohPublisher::inert_for_test();
+        let (publisher, handles) = ZenohPublisher::inert_for_test();
+        let latest = handles.latest;
 
         let addr = [0xAAu8; ADDRESS_HASH_LEN];
         let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
-        mgr.set_publisher(publisher);
+        mgr.set_publisher(Arc::new(publisher));
         mgr.ensure_user_mailbox(&addr).unwrap();
 
         mgr.insert_message(
@@ -841,7 +1051,8 @@ mod tests {
     async fn zenoh_publisher_coalesces_per_addr() {
         // Two bursts of notifications for the same addr must collapse to the
         // latest CID, and the drain task must snapshot the newest value.
-        let (publisher, latest) = ZenohPublisher::inert_for_test();
+        let (publisher, handles) = ZenohPublisher::inert_for_test();
+        let latest = handles.latest;
 
         let addr_hex = "aa".repeat(ADDRESS_HASH_LEN);
         let cid_old = [0x01u8; CID_LEN];
@@ -866,7 +1077,8 @@ mod tests {
     #[tokio::test]
     async fn zenoh_publisher_keeps_distinct_addrs_separate() {
         // Updates for different addrs must not clobber each other.
-        let (publisher, latest) = ZenohPublisher::inert_for_test();
+        let (publisher, handles) = ZenohPublisher::inert_for_test();
+        let latest = handles.latest;
 
         let alice_hex = "aa".repeat(ADDRESS_HASH_LEN);
         let bob_hex = "bb".repeat(ADDRESS_HASH_LEN);
@@ -882,6 +1094,63 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&alice_hex).copied(), Some(alice_cid));
         assert_eq!(map.get(&bob_hex).copied(), Some(bob_cid));
+    }
+
+    #[tokio::test]
+    async fn zenoh_publisher_captures_raw_mail() {
+        // publish_raw_mail must route each call into the raw capture buffer
+        // (in production this is a Zenoh put; the inert scaffold records it
+        // so tests can assert on what would have been published). Payloads
+        // flow through as `Arc<Vec<u8>>` so fan-out callers can clone a
+        // refcount handle instead of duplicating the buffer.
+        let (publisher, handles) = ZenohPublisher::inert_for_test();
+
+        let alice_hex = "aa".repeat(ADDRESS_HASH_LEN);
+        let bob_hex = "bb".repeat(ADDRESS_HASH_LEN);
+        let payload_a = Arc::new(vec![0x01, 0x02, 0x03]);
+        let payload_b = Arc::new(vec![0xFFu8]);
+        let payload_c = Arc::new(vec![0x04, 0x05]);
+        publisher.publish_raw_mail(alice_hex.clone(), Arc::clone(&payload_a));
+        publisher.publish_raw_mail(bob_hex.clone(), Arc::clone(&payload_b));
+        publisher.publish_raw_mail(alice_hex.clone(), Arc::clone(&payload_c));
+
+        let raw = handles
+            .raw
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(raw.len(), 3, "each call must record one publish — no coalescing");
+        assert_eq!(raw[0].0, alice_hex);
+        assert!(Arc::ptr_eq(&raw[0].1, &payload_a), "shared-buffer handle must be preserved");
+        assert_eq!(raw[1].0, bob_hex);
+        assert!(Arc::ptr_eq(&raw[1].1, &payload_b));
+        assert_eq!(raw[2].0, alice_hex);
+        assert!(Arc::ptr_eq(&raw[2].1, &payload_c));
+    }
+
+    #[tokio::test]
+    async fn zenoh_publisher_fanout_shares_buffer() {
+        // Fanning out one payload to many recipients must Arc::clone the same
+        // allocation rather than duplicate it — this is the fix for the
+        // Qodo-reported OOM hazard (16MiB × 100 recipients ≈ 1.6GiB copies).
+        let (publisher, handles) = ZenohPublisher::inert_for_test();
+        let payload = Arc::new(vec![0xAAu8; 64]);
+
+        for i in 0..10u8 {
+            let addr_hex = format!("{:02x}", i).repeat(ADDRESS_HASH_LEN);
+            publisher.publish_raw_mail(addr_hex, Arc::clone(&payload));
+        }
+
+        let raw = handles
+            .raw
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(raw.len(), 10);
+        for entry in raw.iter() {
+            assert!(
+                Arc::ptr_eq(&entry.1, &payload),
+                "every fan-out recipient must share the same underlying buffer"
+            );
+        }
     }
 
     #[tokio::test]
@@ -947,7 +1216,7 @@ mod tests {
         let publisher = ZenohPublisher::new(pub_session, cancel.clone());
 
         let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
-        mgr.set_publisher(publisher);
+        mgr.set_publisher(Arc::new(publisher));
         mgr.ensure_user_mailbox(&addr).unwrap();
 
         mgr.insert_message(

@@ -269,6 +269,14 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // cleanup tasks below.
     let cancel = tokio_util::sync::CancellationToken::new();
 
+    // Standalone handle on the Zenoh publisher. The MailboxManager gets its
+    // own Arc clone for internal root-CID notify() calls (which run inside
+    // its mutex, on spawn_blocking); this handle is for the raw-mail publish
+    // path, which runs in async context and must not take the manager's
+    // mutex (doing so could block a Tokio worker thread behind a concurrent
+    // spawn_blocking CAS/SQLite write).
+    let mut mailbox_publisher: Option<Arc<crate::mailbox_manager::ZenohPublisher>> = None;
+
     // ── Zenoh session (mailbox root CID notifications) ──────────────
     {
         use crate::mailbox_manager::ZenohPublisher;
@@ -338,18 +346,19 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 match zenoh::open(zenoh_config).await {
                     Ok(session) => {
                         tracing::info!("Zenoh session opened for mailbox notifications");
-                        let publisher = ZenohPublisher::new(session, cancel.clone());
-                        // Recover from a poisoned mutex rather than silently
-                        // skipping publisher attachment — Merkle mailbox
-                        // updates are low-severity but we want visibility
-                        // into lock state to match the rest of the server.
+                        let publisher_arc = Arc::new(ZenohPublisher::new(session, cancel.clone()));
+                        // Give the manager its own refcount bump so root-CID
+                        // notify() calls inside insert_message keep working;
+                        // keep a separate handle for the async raw-publish
+                        // path below.
                         match mgr_arc.lock() {
-                            Ok(mut mgr) => mgr.set_publisher(publisher),
+                            Ok(mut mgr) => mgr.set_publisher(Arc::clone(&publisher_arc)),
                             Err(poisoned) => {
                                 tracing::warn!("MailboxManager mutex poisoned during Zenoh publisher attach, recovering");
-                                poisoned.into_inner().set_publisher(publisher);
+                                poisoned.into_inner().set_publisher(Arc::clone(&publisher_arc));
                             }
                         }
+                        mailbox_publisher = Some(publisher_arc);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Zenoh open failed, mailbox notifications disabled");
@@ -387,6 +396,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let local_domain_465 = local_domain.clone();
         let content_store_path_465 = content_store_path.clone();
         let mailbox_mgr_465 = mailbox_mgr.clone();
+        let mailbox_publisher_465 = mailbox_publisher.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -408,13 +418,14 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let domain = local_domain_465.clone();
                         let csp = content_store_path_465.clone();
                         let mgr_clone = mailbox_mgr_465.clone();
+                        let pub_clone = mailbox_publisher_465.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                             match tls::implicit_tls_wrap(stream, &acc).await {
                                 Ok(tls_stream) => {
                                     let (reader, writer) = tokio::io::split(tls_stream);
                                     let session = SmtpSession::new(cfg);
-                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold, mgr_clone).await {
+                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone).await {
                                         tracing::debug!(%peer_ip, error = %e, "implicit TLS connection ended with error");
                                     }
                                 }
@@ -439,6 +450,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let local_domain_587 = local_domain.clone();
         let content_store_path_587 = content_store_path.clone();
         let mailbox_mgr_587 = mailbox_mgr.clone();
+        let mailbox_publisher_587 = mailbox_publisher.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -460,9 +472,10 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let domain = local_domain_587.clone();
                         let csp = content_store_path_587.clone();
                         let mgr_clone = mailbox_mgr_587.clone();
+                        let pub_clone = mailbox_publisher_587.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
-                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold, mgr_clone).await {
+                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone).await {
                                 tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
                             }
                         });
@@ -628,11 +641,12 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let domain = local_domain.clone();
                 let csp = content_store_path.clone();
                 let mgr_clone = mailbox_mgr.clone();
+                let pub_clone = mailbox_publisher.clone();
 
                 tokio::spawn(async move {
                     let _guard = ConnectionGuard { shared: Arc::clone(&shared), ip: peer_ip };
                     let acc = acceptor.as_ref().map(|a| (**a).clone());
-                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold, mgr_clone).await {
+                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone).await {
                         tracing::debug!(%peer_ip, error = %e, "connection ended with error");
                     }
                 });
@@ -653,6 +667,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Handle a single plaintext SMTP connection with optional STARTTLS support.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     peer_ip: IpAddr,
@@ -665,6 +680,7 @@ async fn handle_connection(
     content_store_path: PathBuf,
     reject_threshold: i32,
     mailbox_manager: Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
+    mailbox_publisher: Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut spf_result = crate::spam::SpfResult::None;
     let mut session = SmtpSession::new(smtp_config);
@@ -722,7 +738,7 @@ async fn handle_connection(
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
                 let needs_starttls =
-                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager).await?;
+                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher).await?;
 
                 // STARTTLS: upgrade the connection to TLS
                 if needs_starttls {
@@ -774,6 +790,7 @@ async fn handle_connection(
                                     content_store_path,
                                     reject_threshold,
                                     mailbox_manager,
+                                    mailbox_publisher,
                                 )
                                 .await;
                             }
@@ -828,6 +845,7 @@ async fn handle_connection(
 
 /// Generic connection handler over any AsyncRead + AsyncWrite (used after TLS upgrade
 /// and for implicit TLS connections).
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection_generic<R, W>(
     reader: R,
     mut writer: W,
@@ -841,6 +859,7 @@ async fn handle_connection_generic<R, W>(
     content_store_path: PathBuf,
     reject_threshold: i32,
     mailbox_manager: Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
+    mailbox_publisher: Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
@@ -892,7 +911,7 @@ where
                 };
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
-                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager).await?;
+                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher).await?;
 
                 if should_close || session.state == SmtpState::Closed {
                     break;
@@ -984,6 +1003,7 @@ async fn execute_actions_generic<W: AsyncWrite + Unpin>(
 
 /// Process async action callbacks (address resolution, delivery, SPF).
 /// Returns true if a StartTls action was encountered.
+#[allow(clippy::too_many_arguments)]
 async fn process_async_actions<W: AsyncWrite + Unpin>(
     actions: &[SmtpAction],
     session: &mut SmtpSession,
@@ -995,6 +1015,7 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
     spf_result: &mut crate::spam::SpfResult,
     reject_threshold: i32,
     mailbox_manager: &Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
+    mailbox_publisher: &Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut needs_starttls = false;
     for action in actions {
@@ -1128,55 +1149,66 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 let mut message = translated.message;
                 let csp = content_store_path.to_path_buf();
                 let attachment_data = translated.attachment_data;
-                let cas_result = tokio::task::spawn_blocking(move || -> Result<Option<[u8; 32]>, String> {
-                    let config = &harmony_content::chunker::ChunkerConfig::DEFAULT;
-                    let mut book_store = harmony_db::DiskBookStore::new(&csp);
+                // Returns both the CAS CID (for IMAP/Merkle references) and the
+                // serialized bytes (for Zenoh raw-mail publish). Raw bytes are
+                // returned even if CAS ingest fails, because the Phase 0 client
+                // consumes raw bytes directly and is independent of gateway
+                // CAS state. Both fields become None only if serialization
+                // itself failed.
+                let cas_result = tokio::task::spawn_blocking(
+                    move || -> Result<(Option<[u8; 32]>, Option<Vec<u8>>), String> {
+                        let config = &harmony_content::chunker::ChunkerConfig::DEFAULT;
+                        let mut book_store = harmony_db::DiskBookStore::new(&csp);
 
-                    // Ingest each attachment blob and update the message's CIDs
-                    for (i, blob) in attachment_data.iter().enumerate() {
-                        if blob.is_empty() {
-                            continue;
+                        // Ingest each attachment blob and update the message's CIDs
+                        for (i, blob) in attachment_data.iter().enumerate() {
+                            if blob.is_empty() {
+                                continue;
+                            }
+                            match harmony_content::dag::ingest(blob, config, &mut book_store) {
+                                Ok(cid) => {
+                                    if i < message.attachments.len() {
+                                        message.attachments[i].cid = cid.to_bytes();
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        attachment_index = i,
+                                        error = %e,
+                                        "attachment CAS ingest failed, keeping BLAKE3 CID"
+                                    );
+                                }
+                            }
                         }
-                        match harmony_content::dag::ingest(blob, config, &mut book_store) {
-                            Ok(cid) => {
-                                if i < message.attachments.len() {
-                                    message.attachments[i].cid = cid.to_bytes();
+
+                        // Serialize once, then attempt CAS ingest. Keep the
+                        // bytes regardless of ingest outcome so the raw-mail
+                        // publish can still go out if CAS failed.
+                        match message.to_bytes() {
+                            Ok(msg_bytes) => {
+                                match harmony_content::dag::ingest(&msg_bytes, config, &mut book_store) {
+                                    Ok(cid) => Ok((Some(cid.to_bytes()), Some(msg_bytes))),
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "CAS storage failed, delivering without CID");
+                                        Ok((None, Some(msg_bytes)))
+                                    }
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    attachment_index = i,
-                                    error = %e,
-                                    "attachment CAS ingest failed, keeping BLAKE3 CID"
-                                );
+                                tracing::warn!(error = %e, "message serialization failed, delivering without CID");
+                                Ok((None, None))
                             }
                         }
-                    }
-
-                    // Serialize and ingest the message itself
-                    match message.to_bytes() {
-                        Ok(msg_bytes) => {
-                            match harmony_content::dag::ingest(&msg_bytes, config, &mut book_store) {
-                                Ok(cid) => Ok(Some(cid.to_bytes())),
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "CAS storage failed, delivering without CID");
-                                    Ok(None)
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "message serialization failed, delivering without CID");
-                            Ok(None)
-                        }
-                    }
-                })
+                    },
+                )
                 .await
                 .map_err(|e| format!("CAS task panicked: {e}"))?;
-                let message_cid = match cas_result {
-                    Ok(cid) => cid,
+                let (message_cid, msg_bytes): (Option<[u8; 32]>, Option<Vec<u8>>) = match cas_result
+                {
+                    Ok(pair) => pair,
                     Err(e) => {
                         tracing::warn!(error = %e, "CAS task error, delivering without CID");
-                        None
+                        (None, None)
                     }
                 };
 
@@ -1233,6 +1265,36 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 }
 
                 let success = !delivered_to.is_empty();
+
+                // Raw-mail publish: notify Zenoh subscribers (e.g., Phase 0
+                // harmony-client) that a new message arrived for each
+                // successfully-delivered recipient. Fire-and-forget — the
+                // publisher spawns one task per recipient. Skipped entirely
+                // if Zenoh is disabled (mailbox_publisher is None) or if
+                // serialization failed upstream (msg_bytes is None). IMAP
+                // delivery succeeded before this point and does not wait
+                // on Zenoh.
+                //
+                // This path intentionally does NOT take the MailboxManager
+                // mutex. Raw publish only needs the publisher handle; taking
+                // the manager mutex in async context could block a Tokio
+                // worker thread behind a concurrent spawn_blocking Merkle
+                // update that holds the same mutex while doing CAS/SQLite
+                // I/O. The publisher is kept in a separate Arc for that
+                // reason.
+                //
+                // Payload is hoisted into an Arc<Vec<u8>> once so every
+                // recipient in delivered_to shares the same underlying
+                // buffer via refcount-only clones. Worst case (100 RCPT TO,
+                // 16 MiB body): one 16 MiB allocation instead of 100.
+                if let Some(bytes) = msg_bytes {
+                    if let Some(ref publisher) = mailbox_publisher {
+                        let shared: Arc<Vec<u8>> = Arc::new(bytes);
+                        for addr in &delivered_to {
+                            publisher.publish_raw_mail(hex::encode(addr), Arc::clone(&shared));
+                        }
+                    }
+                }
 
                 // Phase 5: Update Merkle mailbox (non-critical, fire-and-forget)
                 //
@@ -2754,7 +2816,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None)
                 .await
                 .unwrap();
         });
@@ -2817,7 +2879,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None)
                 .await
                 .unwrap();
         });
@@ -3031,6 +3093,7 @@ node_config = "/tmp/test-node.toml"
                 content_path_clone,
                 5,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3141,18 +3204,30 @@ node_config = "/tmp/test-node.toml"
         std::fs::create_dir_all(content_path.join("commits")).unwrap();
         std::fs::create_dir_all(content_path.join("blobs")).unwrap();
 
-        // Set up Merkle mailbox manager
+        // Set up Merkle mailbox manager + an inert Zenoh publisher so we can
+        // assert that raw-mail publish also fires on delivery (exercises the
+        // same SMTP ingest → translate → CAS → publish wiring).
         let db_path = smtp_test_dir.path().join("mailbox_roots.db");
         let mut mgr =
             crate::mailbox_manager::MailboxManager::open(&db_path, &content_path).unwrap();
         mgr.ensure_user_mailbox(&alice_addr).unwrap();
+        let (publisher, publisher_handles) =
+            crate::mailbox_manager::ZenohPublisher::inert_for_test();
+        // Share one publisher between the manager (for internal root-CID
+        // notify() under the manager mutex) and the SMTP handler (for raw
+        // publish via the Arc-only path that bypasses the mutex).
+        let publisher_arc = Arc::new(publisher);
+        mgr.set_publisher(Arc::clone(&publisher_arc));
         let mailbox_mgr: Option<
             Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>,
         > = Some(Arc::new(std::sync::Mutex::new(mgr)));
+        let mailbox_publisher: Option<Arc<crate::mailbox_manager::ZenohPublisher>> =
+            Some(publisher_arc);
 
         let store_clone = store.clone();
         let content_path_clone = content_path.clone();
         let mgr_clone = mailbox_mgr.clone();
+        let pub_clone = mailbox_publisher.clone();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3171,6 +3246,7 @@ node_config = "/tmp/test-node.toml"
                 content_path_clone,
                 5,
                 mgr_clone,
+                pub_clone,
             )
             .await
             .unwrap();
@@ -3329,6 +3405,27 @@ node_config = "/tmp/test-node.toml"
             imap_cid,
             "Merkle and IMAP message CIDs must match (dual-write consistency)"
         );
+
+        // Raw-mail publish assertion: exactly one publish to alice's topic,
+        // bytes must decode as the HarmonyMessage we just delivered. This is
+        // the Phase 0 harmony-client path — subscribers consume these bytes
+        // directly without going through CAS.
+        let raw = publisher_handles
+            .raw
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            raw.len(),
+            1,
+            "expected 1 raw-mail publish for the 1 delivered recipient, got {}",
+            raw.len()
+        );
+        let (pub_addr_hex, pub_bytes) = &raw[0];
+        assert_eq!(pub_addr_hex, &hex::encode(alice_addr));
+        let decoded = crate::message::HarmonyMessage::from_bytes(pub_bytes.as_slice())
+            .expect("raw bytes must decode");
+        assert_eq!(decoded.subject, "Merkle Test");
+        assert_eq!(decoded.sender_address.len(), 16);
     }
 
     #[test]

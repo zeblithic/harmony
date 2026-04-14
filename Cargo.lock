@@ -3503,8 +3503,10 @@ dependencies = [
 name = "harmony-mailbox"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "harmony-identity",
  "hex",
+ "rand 0.8.5",
  "thiserror 2.0.18",
 ]
 

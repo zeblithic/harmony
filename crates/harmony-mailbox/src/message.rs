@@ -32,6 +32,77 @@ pub const CID_LEN: usize = 32;
 /// Length of a message identifier in bytes.
 pub const MESSAGE_ID_LEN: usize = 16;
 
+/// Generate a unique 16-byte message ID.
+///
+/// Combines three independent sources of entropy to make the ID globally
+/// unique, not just process-local:
+///
+/// 1. **Startup salt** — 16 bytes from the OS RNG, generated once per
+///    process on first use. Distinguishes concurrent processes (different
+///    hosts, containers, or restarts) that happen to hit the same clock
+///    tick — which `time + counter` alone cannot.
+/// 2. **Nanosecond timestamp** — current wall clock, for chronological
+///    spread across calls.
+/// 3. **Process-local atomic counter** — guarantees uniqueness within a
+///    single process even if two threads call in the same nanosecond.
+///
+/// The three inputs are mixed with BLAKE3 and truncated to 16 bytes. The
+/// 128-bit output space plus the per-process salt makes cross-process
+/// collisions astronomically unlikely (birthday-paradox collision on 128
+/// bits requires ~2^64 IDs from the *same* process before a 50% chance —
+/// and different processes are in disjoint salted subspaces to begin with).
+///
+/// Safe to call from multiple threads.
+pub fn unique_message_id() -> [u8; MESSAGE_ID_LEN] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static STARTUP_SALT: OnceLock<[u8; 16]> = OnceLock::new();
+
+    let salt = STARTUP_SALT.get_or_init(|| {
+        use rand::RngCore;
+        let mut buf = [0u8; 16];
+        // OsRng pulls from the platform's secure RNG. If it fails (e.g.
+        // containerized Linux with /dev/urandom blocked), we'd rather
+        // panic at first use than silently emit non-unique IDs.
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        buf
+    });
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    compute_message_id(salt, now, seq)
+}
+
+/// Pure, testable core of `unique_message_id`: hash a `(salt, time, seq)`
+/// triple into 16 bytes. Split out so in-module tests can pin all three
+/// inputs and prove that the salt is actually fed into the hash (i.e.
+/// swapping the salt while keeping time+seq constant changes the output).
+///
+/// Private (not `pub(crate)`): callers outside this module — even within
+/// the crate — should use `unique_message_id()` and get the real entropy
+/// sources. The helper is an internal verification seam only; the module
+/// test submodule can still reach it via `super::*`.
+fn compute_message_id(
+    salt: &[u8; 16],
+    time_nanos: u128,
+    seq: u64,
+) -> [u8; MESSAGE_ID_LEN] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(salt);
+    hasher.update(&time_nanos.to_le_bytes());
+    hasher.update(&seq.to_le_bytes());
+    let hash = hasher.finalize();
+    let mut id = [0u8; MESSAGE_ID_LEN];
+    id.copy_from_slice(&hash.as_bytes()[..MESSAGE_ID_LEN]);
+    id
+}
+
 // ── Minimum wire size ──────────────────────────────────────────────────
 // version(1) + type(1) + flags(1) + timestamp(8) + message_id(16)
 // + in_reply_to_flag(1) + sender_address(16) + recipient_count(1)
@@ -951,5 +1022,58 @@ mod tests {
             "simple message should be under 150 bytes, got {}",
             bytes.len()
         );
+    }
+
+    #[test]
+    fn unique_message_id_is_unique_across_rapid_calls() {
+        // In-process uniqueness: the atomic counter guarantees distinct
+        // output even when many calls land in the same nanosecond. 10k
+        // calls should produce 10k distinct IDs.
+        const N: usize = 10_000;
+        let mut ids = std::collections::HashSet::with_capacity(N);
+        for _ in 0..N {
+            ids.insert(unique_message_id());
+        }
+        assert_eq!(ids.len(), N, "unique_message_id produced a collision in {N} calls");
+    }
+
+    #[test]
+    fn compute_message_id_actually_mixes_salt() {
+        // Pin (time, seq) and vary only the salt: if hasher.update(salt)
+        // were removed, these outputs would be identical. This is the
+        // direct proof that the salt is load-bearing — replaces the
+        // previous test that only checked for non-zero bytes (which
+        // would have passed even with the salt ignored).
+        let salt_a = [0xAAu8; 16];
+        let salt_b = [0xBBu8; 16];
+        let time = 1_234_567_890u128;
+        let seq = 42u64;
+
+        let id_a = compute_message_id(&salt_a, time, seq);
+        let id_b = compute_message_id(&salt_b, time, seq);
+
+        assert_ne!(
+            id_a, id_b,
+            "salt must change the hash output — if this fails, salt is being ignored"
+        );
+    }
+
+    #[test]
+    fn compute_message_id_is_deterministic() {
+        // Same inputs → same output. Regression guard against accidentally
+        // mixing in any non-argument state (e.g., a stray timestamp read).
+        let salt = [0xCCu8; 16];
+        let a = compute_message_id(&salt, 100, 1);
+        let b = compute_message_id(&salt, 100, 1);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compute_message_id_distinguishes_counter_values() {
+        // Pin (salt, time), vary seq: confirms the counter is fed in.
+        let salt = [0xDDu8; 16];
+        let a = compute_message_id(&salt, 100, 1);
+        let b = compute_message_id(&salt, 100, 2);
+        assert_ne!(a, b);
     }
 }
