@@ -191,6 +191,62 @@ impl ZenohPublisher {
             tracing::debug!("ZenohPublisher drain task exited on cancel");
         });
 
+        // ── Queryable: respond to root-CID lookups (cold-start sync support) ──
+        //
+        // Clients query `harmony/mail/v1/{addr_hex}/root` to retrieve the current
+        // root CID for an address. Same key as the publish topic — Zenoh routes
+        // queries and puts independently. Reply payload is the raw 32 bytes, or
+        // an empty reply if the address has no mail yet.
+        let query_session = session.clone();
+        let query_latest = Arc::clone(&latest);
+        let query_cancel = cancel.clone();
+        // Reply payload is the raw 32-byte CID for the address, OR an empty
+        // payload if the address has no mail yet (sentinel for "no root yet").
+        // Clients distinguish empty from absent reply by checking payload length.
+        tokio::spawn(async move {
+            let queryable = match query_session
+                .declare_queryable("harmony/mail/v1/*/root")
+                .await
+            {
+                Ok(q) => q,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to declare root queryable; cold-start sync unavailable");
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    _ = query_cancel.cancelled() => break,
+                    query = queryable.recv_async() => {
+                        let Ok(query) = query else { break };
+                        let key = query.key_expr().as_str().to_owned();
+                        // Extract addr_hex between "harmony/mail/v1/" and "/root".
+                        let Some(addr_hex) = key
+                            .strip_prefix("harmony/mail/v1/")
+                            .and_then(|s| s.strip_suffix("/root"))
+                        else {
+                            let _ = query.reply_err("invalid key").await;
+                            continue;
+                        };
+                        let payload: Option<[u8; CID_LEN]> = query_latest
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(addr_hex)
+                            .copied();
+                        let reply_result = match payload {
+                            Some(cid) => query.reply(&key, &cid[..]).await,
+                            None => query.reply(&key, &[][..]).await,
+                        };
+                        if let Err(e) = reply_result {
+                            tracing::warn!(error = %e, %key, "failed to reply to root query");
+                        }
+                    }
+                }
+            }
+            drop(query_session);
+            tracing::debug!("ZenohPublisher root queryable task exited on cancel");
+        });
+
         Self {
             latest,
             wake,
@@ -1301,5 +1357,51 @@ mod tests {
             after.is_err(),
             "drain task should have stopped after cancel; got unexpected publish"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_queryable_returns_current_root() {
+        let cancel = CancellationToken::new();
+        let session = zenoh::open(zenoh::Config::default()).await.unwrap();
+        let publisher = ZenohPublisher::new(session.clone(), cancel.clone());
+
+        // Allow the queryable declaration to settle within the session before
+        // the first query.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let addr_hex = "00112233445566778899aabbccddeeff".to_string();
+        let root_cid = [0xAB; CID_LEN];
+        let topic = format!("harmony/mail/v1/{addr_hex}/root");
+
+        // NOTE (G1-only): the `latest` map is consumed by the drain task, so a
+        // query racing a drain returns empty. G3 adds a parallel never-drained
+        // `current` map that eliminates this race. For G1, we retry the insert
+        // + query in a tight loop; whenever the query-side lock wins, the
+        // assertion passes. On a healthy scheduler one of the first few
+        // iterations wins well before the timeout.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got: Option<Vec<u8>> = None;
+        while std::time::Instant::now() < deadline {
+            publisher.notify(addr_hex.clone(), root_cid);
+            let replies = session.get(&topic).await.unwrap();
+            let mut this_reply: Option<Vec<u8>> = None;
+            while let Ok(reply) = replies.recv_async().await {
+                if let Ok(sample) = reply.result() {
+                    assert_eq!(
+                        sample.key_expr().as_str(),
+                        &topic,
+                        "reply key should match query topic"
+                    );
+                    this_reply = Some(sample.payload().to_bytes().to_vec());
+                    break;
+                }
+            }
+            if this_reply.as_deref() == Some(&root_cid[..]) {
+                got = this_reply;
+                break;
+            }
+        }
+        assert_eq!(got.as_deref(), Some(&root_cid[..]));
+        cancel.cancel();
     }
 }
