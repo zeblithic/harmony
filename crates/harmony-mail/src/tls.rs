@@ -29,7 +29,7 @@ pub fn load_tls_config(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor,
 }
 
 /// Load PEM-encoded certificates from a file.
-fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
+pub(crate) fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
     let file = std::fs::File::open(path).map_err(|e| {
         TlsError::Io(format!(
             "failed to open cert file {}: {}",
