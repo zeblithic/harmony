@@ -1128,55 +1128,66 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 let mut message = translated.message;
                 let csp = content_store_path.to_path_buf();
                 let attachment_data = translated.attachment_data;
-                let cas_result = tokio::task::spawn_blocking(move || -> Result<Option<[u8; 32]>, String> {
-                    let config = &harmony_content::chunker::ChunkerConfig::DEFAULT;
-                    let mut book_store = harmony_db::DiskBookStore::new(&csp);
+                // Returns both the CAS CID (for IMAP/Merkle references) and the
+                // serialized bytes (for Zenoh raw-mail publish). Raw bytes are
+                // returned even if CAS ingest fails, because the Phase 0 client
+                // consumes raw bytes directly and is independent of gateway
+                // CAS state. Both fields become None only if serialization
+                // itself failed.
+                let cas_result = tokio::task::spawn_blocking(
+                    move || -> Result<(Option<[u8; 32]>, Option<Vec<u8>>), String> {
+                        let config = &harmony_content::chunker::ChunkerConfig::DEFAULT;
+                        let mut book_store = harmony_db::DiskBookStore::new(&csp);
 
-                    // Ingest each attachment blob and update the message's CIDs
-                    for (i, blob) in attachment_data.iter().enumerate() {
-                        if blob.is_empty() {
-                            continue;
+                        // Ingest each attachment blob and update the message's CIDs
+                        for (i, blob) in attachment_data.iter().enumerate() {
+                            if blob.is_empty() {
+                                continue;
+                            }
+                            match harmony_content::dag::ingest(blob, config, &mut book_store) {
+                                Ok(cid) => {
+                                    if i < message.attachments.len() {
+                                        message.attachments[i].cid = cid.to_bytes();
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        attachment_index = i,
+                                        error = %e,
+                                        "attachment CAS ingest failed, keeping BLAKE3 CID"
+                                    );
+                                }
+                            }
                         }
-                        match harmony_content::dag::ingest(blob, config, &mut book_store) {
-                            Ok(cid) => {
-                                if i < message.attachments.len() {
-                                    message.attachments[i].cid = cid.to_bytes();
+
+                        // Serialize once, then attempt CAS ingest. Keep the
+                        // bytes regardless of ingest outcome so the raw-mail
+                        // publish can still go out if CAS failed.
+                        match message.to_bytes() {
+                            Ok(msg_bytes) => {
+                                match harmony_content::dag::ingest(&msg_bytes, config, &mut book_store) {
+                                    Ok(cid) => Ok((Some(cid.to_bytes()), Some(msg_bytes))),
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "CAS storage failed, delivering without CID");
+                                        Ok((None, Some(msg_bytes)))
+                                    }
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    attachment_index = i,
-                                    error = %e,
-                                    "attachment CAS ingest failed, keeping BLAKE3 CID"
-                                );
+                                tracing::warn!(error = %e, "message serialization failed, delivering without CID");
+                                Ok((None, None))
                             }
                         }
-                    }
-
-                    // Serialize and ingest the message itself
-                    match message.to_bytes() {
-                        Ok(msg_bytes) => {
-                            match harmony_content::dag::ingest(&msg_bytes, config, &mut book_store) {
-                                Ok(cid) => Ok(Some(cid.to_bytes())),
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "CAS storage failed, delivering without CID");
-                                    Ok(None)
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "message serialization failed, delivering without CID");
-                            Ok(None)
-                        }
-                    }
-                })
+                    },
+                )
                 .await
                 .map_err(|e| format!("CAS task panicked: {e}"))?;
-                let message_cid = match cas_result {
-                    Ok(cid) => cid,
+                let (message_cid, msg_bytes): (Option<[u8; 32]>, Option<Vec<u8>>) = match cas_result
+                {
+                    Ok(pair) => pair,
                     Err(e) => {
                         tracing::warn!(error = %e, "CAS task error, delivering without CID");
-                        None
+                        (None, None)
                     }
                 };
 
@@ -1233,6 +1244,29 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 }
 
                 let success = !delivered_to.is_empty();
+
+                // Raw-mail publish: notify Zenoh subscribers (e.g., Phase 0
+                // harmony-client) that a new message arrived for each
+                // successfully-delivered recipient. Fire-and-forget — the
+                // publisher spawns one task per (addr, bytes) pair. Skipped
+                // entirely if Zenoh is disabled (mailbox_manager.publisher
+                // is None) or if serialization failed upstream (msg_bytes
+                // is None). IMAP delivery succeeded before this point and
+                // does not wait on Zenoh.
+                if let (Some(ref mgr), Some(ref bytes)) = (&mailbox_manager, &msg_bytes) {
+                    let guard = match mgr.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => {
+                            tracing::warn!(
+                                "Merkle mailbox mutex poisoned during raw-mail publish, recovering"
+                            );
+                            poisoned.into_inner()
+                        }
+                    };
+                    for addr in &delivered_to {
+                        guard.publish_raw_mail(hex::encode(addr), bytes.clone());
+                    }
+                }
 
                 // Phase 5: Update Merkle mailbox (non-critical, fire-and-forget)
                 //
@@ -3141,11 +3175,16 @@ node_config = "/tmp/test-node.toml"
         std::fs::create_dir_all(content_path.join("commits")).unwrap();
         std::fs::create_dir_all(content_path.join("blobs")).unwrap();
 
-        // Set up Merkle mailbox manager
+        // Set up Merkle mailbox manager + an inert Zenoh publisher so we can
+        // assert that raw-mail publish also fires on delivery (exercises the
+        // same SMTP ingest → translate → CAS → publish wiring).
         let db_path = smtp_test_dir.path().join("mailbox_roots.db");
         let mut mgr =
             crate::mailbox_manager::MailboxManager::open(&db_path, &content_path).unwrap();
         mgr.ensure_user_mailbox(&alice_addr).unwrap();
+        let (publisher, publisher_handles) =
+            crate::mailbox_manager::ZenohPublisher::inert_for_test();
+        mgr.set_publisher(publisher);
         let mailbox_mgr: Option<
             Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>,
         > = Some(Arc::new(std::sync::Mutex::new(mgr)));
@@ -3329,6 +3368,27 @@ node_config = "/tmp/test-node.toml"
             imap_cid,
             "Merkle and IMAP message CIDs must match (dual-write consistency)"
         );
+
+        // Raw-mail publish assertion: exactly one publish to alice's topic,
+        // bytes must decode as the HarmonyMessage we just delivered. This is
+        // the Phase 0 harmony-client path — subscribers consume these bytes
+        // directly without going through CAS.
+        let raw = publisher_handles
+            .raw
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            raw.len(),
+            1,
+            "expected 1 raw-mail publish for the 1 delivered recipient, got {}",
+            raw.len()
+        );
+        let (pub_addr_hex, pub_bytes) = &raw[0];
+        assert_eq!(pub_addr_hex, &hex::encode(alice_addr));
+        let decoded =
+            crate::message::HarmonyMessage::from_bytes(pub_bytes).expect("raw bytes must decode");
+        assert_eq!(decoded.subject, "Merkle Test");
+        assert_eq!(decoded.sender_address.len(), 16);
     }
 
     #[test]
