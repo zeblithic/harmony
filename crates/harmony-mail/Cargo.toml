@@ -41,6 +41,7 @@ base64 = { workspace = true }
 harmony-content = { workspace = true, features = ["std"] }
 harmony-db = { workspace = true }
 rpassword = "5"
+zenoh.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

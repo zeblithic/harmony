@@ -263,6 +263,38 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+    // ── Zenoh session (mailbox root CID notifications) ──────────────
+    {
+        use crate::mailbox_manager::ZenohPublisher;
+
+        let zenoh_enabled = config.zenoh.as_ref().map(|z| z.enabled).unwrap_or(false);
+        if zenoh_enabled {
+            let mut zenoh_config = zenoh::Config::default();
+            if let Some(ref ep) = config.zenoh.as_ref().and_then(|z| z.endpoint.as_ref()) {
+                if let Ok(ep_json) = serde_json::to_string(ep) {
+                    let _ = zenoh_config.insert_json5("connect/endpoints", &format!("[{ep_json}]"));
+                }
+            }
+
+            match zenoh::open(zenoh_config).await {
+                Ok(session) => {
+                    tracing::info!("Zenoh session opened for mailbox notifications");
+                    let publisher = ZenohPublisher::new(session);
+                    if let Some(ref mgr_arc) = mailbox_mgr {
+                        if let Ok(mut mgr) = mgr_arc.lock() {
+                            mgr.set_publisher(publisher);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Zenoh open failed, mailbox notifications disabled");
+                }
+            }
+        } else {
+            tracing::debug!("Zenoh mailbox notifications disabled");
+        }
+    }
+
     // Shared cancellation token for graceful shutdown of all tasks
     let cancel = tokio_util::sync::CancellationToken::new();
 

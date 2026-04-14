@@ -7,8 +7,51 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use tokio::sync::mpsc;
+
 use crate::mailbox::{FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, FOLDER_COUNT, MAX_SNIPPET_LEN};
 use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
+
+/// Notification channel for Zenoh root CID publications.
+///
+/// `MailboxManager` runs in sync context (`spawn_blocking`). This struct holds
+/// the send side of an unbounded mpsc channel. A background async task
+/// drains the receiver and calls `session.put()`.
+pub struct ZenohPublisher {
+    tx: mpsc::UnboundedSender<(String, [u8; CID_LEN])>,
+}
+
+impl ZenohPublisher {
+    /// Create a new publisher backed by a Zenoh session.
+    ///
+    /// Spawns a background task that drains the channel and publishes
+    /// root CID updates to `harmony/messages/{addr_hex}/inbox`.
+    pub fn new(session: zenoh::Session) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<(String, [u8; CID_LEN])>();
+        tokio::spawn(async move {
+            while let Some((addr_hex, root_cid)) = rx.recv().await {
+                let topic = format!("harmony/messages/{addr_hex}/inbox");
+                if let Err(e) = session.put(&topic, &root_cid[..]).await {
+                    tracing::warn!(error = %e, %topic, "Zenoh root CID publish failed");
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    /// Create a publisher from a raw sender (for testing).
+    #[cfg(test)]
+    pub fn from_sender(tx: mpsc::UnboundedSender<(String, [u8; CID_LEN])>) -> Self {
+        Self { tx }
+    }
+
+    /// Send a root CID update notification.
+    pub fn notify(&self, addr_hex: String, root_cid: [u8; CID_LEN]) {
+        if let Err(e) = self.tx.send((addr_hex, root_cid)) {
+            tracing::warn!(error = %e, "ZenohPublisher channel closed");
+        }
+    }
+}
 
 /// Errors from mailbox manager operations.
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +79,8 @@ pub struct MailboxManager {
     content_store_path: PathBuf,
     /// Persistence for root CID pointers.
     db: rusqlite::Connection,
+    /// Optional Zenoh publisher for root CID notifications.
+    publisher: Option<ZenohPublisher>,
 }
 
 const SCHEMA_SQL: &str = "
@@ -84,7 +129,15 @@ impl MailboxManager {
             roots,
             content_store_path: content_store_path.to_path_buf(),
             db,
+            publisher: None,
         })
+    }
+
+    /// Attach a Zenoh publisher for root CID notifications.
+    ///
+    /// Call this after opening the manager if Zenoh is configured and enabled.
+    pub fn set_publisher(&mut self, publisher: ZenohPublisher) {
+        self.publisher = Some(publisher);
     }
 
     /// Get the current root CID for a user, if one exists.
@@ -261,6 +314,12 @@ impl MailboxManager {
 
         // Persist
         self.persist_root(user_address, &new_root_cid)?;
+
+        // Notify Zenoh publisher (non-critical path — errors are logged and swallowed).
+        if let Some(ref publisher) = self.publisher {
+            let addr_hex = hex::encode(user_address);
+            publisher.notify(addr_hex, new_root_cid);
+        }
 
         Ok(())
     }
@@ -654,5 +713,61 @@ mod tests {
             assert_eq!(page.entries[0].message_cid, dummy_msg_cid(2));
             assert_eq!(page.entries[2].message_cid, dummy_msg_cid(0));
         }
+    }
+
+    #[tokio::test]
+    async fn mailbox_manager_publishes_root_cid() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("roots.db");
+        let cas_path = dir.path().join("content");
+        std::fs::create_dir_all(cas_path.join("commits")).unwrap();
+        std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let publisher = ZenohPublisher::from_sender(tx);
+
+        let addr = [0xAAu8; ADDRESS_HASH_LEN];
+        let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
+        mgr.set_publisher(publisher);
+        mgr.ensure_user_mailbox(&addr).unwrap();
+
+        mgr.insert_message(
+            &addr,
+            &dummy_msg_cid(1),
+            &dummy_msg_id(1),
+            &dummy_sender(),
+            1700000000,
+            "Test Subject",
+        )
+        .unwrap();
+
+        // Verify the publisher received the notification.
+        let (received_addr, received_cid) = rx.recv().await.unwrap();
+        assert_eq!(received_addr, hex::encode(addr));
+        assert_eq!(received_cid, *mgr.get_root(&addr).unwrap());
+    }
+
+    #[tokio::test]
+    async fn mailbox_manager_no_publish_without_publisher() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("roots.db");
+        let cas_path = dir.path().join("content");
+        std::fs::create_dir_all(cas_path.join("commits")).unwrap();
+        std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
+
+        let addr = [0xBBu8; ADDRESS_HASH_LEN];
+        let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
+        // No publisher set — insert_message should succeed silently.
+        mgr.insert_message(
+            &addr,
+            &dummy_msg_cid(2),
+            &dummy_msg_id(2),
+            &dummy_sender(),
+            1700000001,
+            "No Publisher",
+        )
+        .unwrap();
+        // Root CID should be present in memory.
+        assert!(mgr.get_root(&addr).is_some());
     }
 }
