@@ -25,7 +25,7 @@ use crate::imap_parse;
 use crate::imap_parse::StoreOperation;
 use crate::imap_store::{self, ImapStore};
 use crate::io::{SmtpCodec, SmtpFrame};
-use crate::smtp::{SmtpAction, SmtpConfig, SmtpEvent, SmtpSession, SmtpState};
+use crate::smtp::{SmtpAction, SmtpCommand, SmtpConfig, SmtpEvent, SmtpSession, SmtpState};
 use crate::smtp_parse::parse_command;
 use crate::tls;
 
@@ -193,6 +193,34 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // ── Shared IMAP store (used by both SMTP delivery and IMAP) ────
+    let imap_store = Arc::new(
+        ImapStore::open(Path::new(&config.imap.store_path))
+            .map_err(|e| format!("failed to open IMAP store: {e}"))?,
+    );
+    imap_store
+        .initialize_default_mailboxes()
+        .map_err(|e| format!("failed to init IMAP mailboxes: {e}"))?;
+
+    // ── SPF authenticator ──────────────────────────────────────────
+    let mail_authenticator: Option<Arc<mail_auth::MessageAuthenticator>> =
+        match crate::auth::create_authenticator() {
+            Ok(auth) => Some(Arc::new(auth)),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create mail authenticator, SPF disabled");
+                None
+            }
+        };
+
+    let content_store_path = PathBuf::from(&config.imap.content_store_path);
+    // Ensure CAS subdirectories exist (DiskBookStore requires commits/ and blobs/).
+    std::fs::create_dir_all(content_store_path.join("commits"))
+        .map_err(|e| format!("failed to create CAS commits dir: {e}"))?;
+    std::fs::create_dir_all(content_store_path.join("blobs"))
+        .map_err(|e| format!("failed to create CAS blobs dir: {e}"))?;
+    let reject_threshold = config.spam.reject_threshold;
+    let local_domain = config.domain.name.clone();
+
     // Shared cancellation token for graceful shutdown of all tasks
     let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -217,6 +245,10 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let shared = Arc::clone(&shared);
         let acceptor = tls_acceptor.clone().unwrap();
         let listener_cancel = cancel.clone();
+        let imap_store_465 = Arc::clone(&imap_store);
+        let mail_authenticator_465 = mail_authenticator.clone();
+        let local_domain_465 = local_domain.clone();
+        let content_store_path_465 = content_store_path.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -233,13 +265,17 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let cfg = smtp_config.clone();
                         let sh = Arc::clone(&shared);
                         let acc = Arc::clone(&acceptor);
+                        let store = Arc::clone(&imap_store_465);
+                        let auth = mail_authenticator_465.clone();
+                        let domain = local_domain_465.clone();
+                        let csp = content_store_path_465.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                             match tls::implicit_tls_wrap(stream, &acc).await {
                                 Ok(tls_stream) => {
                                     let (reader, writer) = tokio::io::split(tls_stream);
                                     let session = SmtpSession::new(cfg);
-                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None).await {
+                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold).await {
                                         tracing::debug!(%peer_ip, error = %e, "implicit TLS connection ended with error");
                                     }
                                 }
@@ -259,6 +295,10 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let shared = Arc::clone(&shared);
         let acceptor = tls_acceptor.clone().unwrap();
         let listener_cancel = cancel.clone();
+        let imap_store_587 = Arc::clone(&imap_store);
+        let mail_authenticator_587 = mail_authenticator.clone();
+        let local_domain_587 = local_domain.clone();
+        let content_store_path_587 = content_store_path.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -275,9 +315,13 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let cfg = smtp_config.clone();
                         let sh = Arc::clone(&shared);
                         let acc = Arc::clone(&acceptor);
+                        let store = Arc::clone(&imap_store_587);
+                        let auth = mail_authenticator_587.clone();
+                        let domain = local_domain_587.clone();
+                        let csp = content_store_path_587.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
-                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone())).await {
+                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold).await {
                                 tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
                             }
                         });
@@ -290,18 +334,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // ── IMAP setup ───────────────────────────────────────────────────
     if config.imap.enabled {
-        let imap_store = Arc::new(
-            ImapStore::open(Path::new(&config.imap.store_path))
-                .map_err(|e| format!("failed to open IMAP store: {e}"))?,
-        );
-        imap_store
-            .initialize_default_mailboxes()
-            .map_err(|e| format!("failed to init IMAP mailboxes: {e}"))?;
-
         let imap_domain = config.domain.name.clone();
         let imap_idle_timeout = Duration::from_secs(config.imap.idle_timeout);
         let imap_max_auth_failures = config.imap.max_auth_failures;
-        let content_store_path = PathBuf::from(&config.imap.content_store_path);
         if !content_store_path.is_dir() {
             tracing::warn!(
                 path = %content_store_path.display(),
@@ -447,11 +482,15 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let smtp_config = smtp_config.clone();
                 let shared = Arc::clone(&shared);
                 let acceptor = tls_acceptor.clone();
+                let store = Arc::clone(&imap_store);
+                let auth = mail_authenticator.clone();
+                let domain = local_domain.clone();
+                let csp = content_store_path.clone();
 
                 tokio::spawn(async move {
                     let _guard = ConnectionGuard { shared: Arc::clone(&shared), ip: peer_ip };
                     let acc = acceptor.as_ref().map(|a| (**a).clone());
-                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc).await {
+                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold).await {
                         tracing::debug!(%peer_ip, error = %e, "connection ended with error");
                     }
                 });
@@ -478,7 +517,13 @@ async fn handle_connection(
     smtp_config: SmtpConfig,
     max_message_size: usize,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    imap_store: Arc<ImapStore>,
+    authenticator: Option<Arc<mail_auth::MessageAuthenticator>>,
+    local_domain: String,
+    content_store_path: PathBuf,
+    reject_threshold: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut spf_result = crate::spam::SpfResult::None;
     let mut session = SmtpSession::new(smtp_config);
 
     // Send initial greeting on plaintext
@@ -506,6 +551,13 @@ async fn handle_connection(
                 let actions = match smtp_frame {
                     SmtpFrame::Line(line) => match parse_command(line.as_bytes()) {
                         Ok(cmd) => {
+                            // Reset SPF result at the start of each transaction
+                            // so a prior message's verdict can't leak into a new
+                            // transaction (especially null-sender where CheckSpf
+                            // is skipped).
+                            if matches!(cmd, SmtpCommand::MailFrom { .. }) {
+                                spf_result = crate::spam::SpfResult::None;
+                            }
                             let actions = session.handle(SmtpEvent::Command(cmd));
                             if session.state == SmtpState::DataReceiving {
                                 framed.decoder_mut().enter_data_mode();
@@ -527,7 +579,7 @@ async fn handle_connection(
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
                 let needs_starttls =
-                    process_async_actions(&actions, &mut session, &mut writer).await?;
+                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold).await?;
 
                 // STARTTLS: upgrade the connection to TLS
                 if needs_starttls {
@@ -573,6 +625,11 @@ async fn handle_connection(
                                     session,
                                     max_message_size,
                                     None,
+                                    imap_store,
+                                    authenticator,
+                                    local_domain,
+                                    content_store_path,
+                                    reject_threshold,
                                 )
                                 .await;
                             }
@@ -602,6 +659,7 @@ async fn handle_connection(
                     // all transaction state (mail_from, recipients, pending_rcpt).
                     framed.decoder_mut().enter_command_mode();
                     session.reset_transaction();
+                    spf_result = crate::spam::SpfResult::None;
                 } else {
                     tracing::debug!(%peer_ip, error = %e, "codec error");
                     let _ = writer
@@ -633,11 +691,17 @@ async fn handle_connection_generic<R, W>(
     mut session: SmtpSession,
     max_message_size: usize,
     _tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    imap_store: Arc<ImapStore>,
+    authenticator: Option<Arc<mail_auth::MessageAuthenticator>>,
+    local_domain: String,
+    content_store_path: PathBuf,
+    reject_threshold: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
+    let mut spf_result = crate::spam::SpfResult::None;
     // For implicit TLS, send the greeting if session is fresh
     if session.state == SmtpState::Connected {
         let actions = session.handle(SmtpEvent::Connected { peer_ip, tls: true });
@@ -660,6 +724,9 @@ where
                 let actions = match smtp_frame {
                     SmtpFrame::Line(line) => match parse_command(line.as_bytes()) {
                         Ok(cmd) => {
+                            if matches!(cmd, SmtpCommand::MailFrom { .. }) {
+                                spf_result = crate::spam::SpfResult::None;
+                            }
                             let actions = session.handle(SmtpEvent::Command(cmd));
                             if session.state == SmtpState::DataReceiving {
                                 framed.decoder_mut().enter_data_mode();
@@ -680,7 +747,7 @@ where
                 };
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
-                let _ = process_async_actions(&actions, &mut session, &mut writer).await?;
+                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold).await?;
 
                 if should_close || session.state == SmtpState::Closed {
                     break;
@@ -693,6 +760,7 @@ where
                     let _ = writer.write_all(b"552 5.3.4 Message too large\r\n").await;
                     framed.decoder_mut().enter_command_mode();
                     session.reset_transaction();
+                    spf_result = crate::spam::SpfResult::None;
                 } else {
                     tracing::debug!(%peer_ip, error = %e, "codec error");
                     let _ = writer
@@ -775,21 +843,69 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
     actions: &[SmtpAction],
     session: &mut SmtpSession,
     writer: &mut W,
+    imap_store: &Arc<ImapStore>,
+    authenticator: &Option<Arc<mail_auth::MessageAuthenticator>>,
+    local_domain: &str,
+    content_store_path: &Path,
+    spf_result: &mut crate::spam::SpfResult,
+    reject_threshold: i32,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut needs_starttls = false;
     for action in actions {
         match action {
-            SmtpAction::ResolveHarmonyAddress { local_part, .. } => {
-                use crate::message::ADDRESS_HASH_LEN;
-                // Stub: all addresses resolve to a dummy identity.
-                // Real implementation will query the announce cache.
-                let identity = Some([0u8; ADDRESS_HASH_LEN]);
+            SmtpAction::ResolveHarmonyAddress { local_part, domain } => {
+                use crate::address::{self, LocalPart};
+
+                let identity = if domain.eq_ignore_ascii_case(local_domain) {
+                    // Local domain: resolve against our user store
+                    match address::parse_local_part(local_part) {
+                        LocalPart::Hex(hash) => {
+                            // Verify the hex address belongs to a known user
+                            match imap_store.get_user_by_address(&hash) {
+                                Ok(Some(user)) => Some(user.harmony_address),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "hex address lookup failed");
+                                    None
+                                }
+                            }
+                        }
+                        LocalPart::Named { name, .. } => {
+                            match imap_store.get_user(&name) {
+                                Ok(Some(user)) => Some(user.harmony_address),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    tracing::warn!(name = %name, error = %e, "user lookup failed");
+                                    None
+                                }
+                            }
+                        }
+                        LocalPart::Alias(alias) => {
+                            match imap_store.get_user(&alias) {
+                                Ok(Some(user)) => Some(user.harmony_address),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    tracing::warn!(alias = %alias, error = %e, "alias lookup failed");
+                                    None
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Non-local domain: remote delivery not yet supported (ZEB-113)
+                    tracing::debug!(
+                        %domain,
+                        local_domain = %local_domain,
+                        "non-local domain, rejecting (remote delivery tracked in ZEB-113)"
+                    );
+                    None
+                };
+
                 let callback_actions = session.handle(SmtpEvent::HarmonyResolved {
                     local_part: local_part.clone(),
                     identity,
                 });
                 execute_actions_generic(&callback_actions, writer).await?;
-                // Warn if callbacks produced further async actions (not yet handled)
                 for a in &callback_actions {
                     if matches!(
                         a,
@@ -803,10 +919,167 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 }
             }
-            SmtpAction::DeliverToHarmony { .. } => {
-                // Stub: delivery always succeeds.
-                // Real implementation will deliver to Harmony network.
-                let callback_actions = session.handle(SmtpEvent::DeliveryResult { success: true });
+            SmtpAction::DeliverToHarmony { recipients, data } => {
+                // Phase 1: Spam scoring
+                let signals = crate::spam::SpamSignals {
+                    dnsbl_listed: false,
+                    fcrdns_pass: true,
+                    spf_result: spf_result.clone(),
+                    dkim_result: crate::spam::DkimResult::Missing,
+                    dmarc_result: crate::spam::DmarcResult::None,
+                    has_executable_attachment: false,
+                    url_count: 0,
+                    empty_subject: false,
+                    known_harmony_sender: false,
+                    gateway_trust: None,
+                    first_contact: true,
+                };
+                let verdict = crate::spam::score(&signals, reject_threshold);
+                if matches!(verdict.action, crate::spam::SpamAction::Reject) {
+                    tracing::info!(score = verdict.score, "message rejected by spam filter");
+                    // Spam rejection is a permanent policy decision — send 550
+                    // (not 451 via DeliveryResult) so remote MTAs don't retry.
+                    // Bypass the state machine and reset directly, same pattern
+                    // as the oversize DATA handler.
+                    execute_actions_generic(
+                        &[SmtpAction::SendResponse(
+                            550,
+                            "5.7.1 Message rejected".to_string(),
+                        )],
+                        writer,
+                    )
+                    .await?;
+                    session.reset_transaction();
+                    *spf_result = crate::spam::SpfResult::None;
+                    continue;
+                }
+
+                // Phase 2: Translate RFC 5322 -> HarmonyMessage
+                let translated = match crate::translate::translate_inbound(data) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "message translation failed");
+                        let callback_actions = session.handle(SmtpEvent::DeliveryResult { success: false });
+                        execute_actions_generic(&callback_actions, writer).await?;
+                        continue;
+                    }
+                };
+
+                // Phase 3: Store attachments + message in CAS
+                //
+                // Ingest attachment blobs first so their CAS CIDs can be
+                // written into the HarmonyMessage before it is serialized.
+                let msg_timestamp = translated.message.timestamp;
+                let msg_id = translated.message.message_id;
+                let mut message = translated.message;
+                let csp = content_store_path.to_path_buf();
+                let attachment_data = translated.attachment_data;
+                let cas_result = tokio::task::spawn_blocking(move || -> Result<Option<[u8; 32]>, String> {
+                    let config = &harmony_content::chunker::ChunkerConfig::DEFAULT;
+                    let mut book_store = harmony_db::DiskBookStore::new(&csp);
+
+                    // Ingest each attachment blob and update the message's CIDs
+                    for (i, blob) in attachment_data.iter().enumerate() {
+                        if blob.is_empty() {
+                            continue;
+                        }
+                        match harmony_content::dag::ingest(blob, config, &mut book_store) {
+                            Ok(cid) => {
+                                if i < message.attachments.len() {
+                                    message.attachments[i].cid = cid.to_bytes();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    attachment_index = i,
+                                    error = %e,
+                                    "attachment CAS ingest failed, keeping BLAKE3 CID"
+                                );
+                            }
+                        }
+                    }
+
+                    // Serialize and ingest the message itself
+                    match message.to_bytes() {
+                        Ok(msg_bytes) => {
+                            match harmony_content::dag::ingest(&msg_bytes, config, &mut book_store) {
+                                Ok(cid) => Ok(Some(cid.to_bytes())),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "CAS storage failed, delivering without CID");
+                                    Ok(None)
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "message serialization failed, delivering without CID");
+                            Ok(None)
+                        }
+                    }
+                })
+                .await
+                .map_err(|e| format!("CAS task panicked: {e}"))?;
+                let message_cid = match cas_result {
+                    Ok(cid) => cid,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "CAS task error, delivering without CID");
+                        None
+                    }
+                };
+
+                // Phase 4: Deliver to local IMAP mailboxes
+                //
+                // NOTE: The IMAP store currently uses a single-user mailbox
+                // model (mailboxes are global, not per-user). Multi-user
+                // mailbox isolation is tracked separately in ZEB-112.
+                let mut delivered_count = 0u32;
+                let timestamp = msg_timestamp;
+                let rfc822_size = data.len() as u32;
+
+                for recipient_hash in recipients {
+                    match imap_store.get_user_by_address(recipient_hash) {
+                        Ok(Some(_user)) => {
+                            let cid_ref = message_cid.as_ref();
+                            match imap_store.insert_message(
+                                "INBOX",
+                                &msg_id,
+                                cid_ref,
+                                timestamp,
+                                rfc822_size,
+                            ) {
+                                Ok(_uid) => {
+                                    delivered_count += 1;
+                                    tracing::debug!(
+                                        recipient = hex::encode(recipient_hash),
+                                        "delivered to local INBOX"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        recipient = hex::encode(recipient_hash),
+                                        error = %e,
+                                        "failed to insert message into INBOX"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                recipient = hex::encode(recipient_hash),
+                                "no local user for recipient"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                recipient = hex::encode(recipient_hash),
+                                error = %e,
+                                "user lookup failed"
+                            );
+                        }
+                    }
+                }
+
+                let success = delivered_count > 0;
+                let callback_actions = session.handle(SmtpEvent::DeliveryResult { success });
                 execute_actions_generic(&callback_actions, writer).await?;
                 for a in &callback_actions {
                     if matches!(
@@ -821,8 +1094,22 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 }
             }
-            SmtpAction::CheckSpf { .. } => {
-                // SPF checking tracked in Linear — requires mail_auth SPF resolver integration
+            SmtpAction::CheckSpf { mail_from, ehlo_domain, peer_ip } => {
+                if let Some(ref auth) = authenticator {
+                    let spf_params = mail_auth::spf::verify::SpfParameters::verify_mail_from(
+                        *peer_ip,
+                        ehlo_domain.as_str(),
+                        local_domain,
+                        mail_from.as_str(),
+                    );
+                    let spf_output = auth.verify_spf(spf_params).await;
+                    *spf_result = crate::auth::map_spf_result(&spf_output);
+                    tracing::debug!(
+                        %mail_from,
+                        result = ?spf_result,
+                        "SPF check complete"
+                    );
+                }
             }
             SmtpAction::StartTls => {
                 needs_starttls = true;
@@ -2241,12 +2528,18 @@ node_config = "/tmp/test-node.toml"
             tls_available: false,
         };
 
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let smtp_store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db")).unwrap()
+        );
+        smtp_store.initialize_default_mailboxes().unwrap();
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5)
                 .await
                 .unwrap();
         });
@@ -2296,12 +2589,20 @@ node_config = "/tmp/test-node.toml"
             tls_available: false,
         };
 
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let smtp_store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db")).unwrap()
+        );
+        smtp_store.initialize_default_mailboxes().unwrap();
+        // Create the recipient user so address resolution succeeds for RCPT TO:<user@test.example.com>
+        smtp_store.create_user("user", "pass", &[0x01u8; crate::message::ADDRESS_HASH_LEN]).unwrap();
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5)
                 .await
                 .unwrap();
         });
@@ -2469,6 +2770,131 @@ node_config = "/tmp/test-node.toml"
         tls_reader.read_line(&mut line).await.unwrap(); // a4 OK
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn smtp_delivers_to_local_imap() {
+        let config = test_config();
+        let max_message_size = parse_message_size(&config.spam.max_message_size);
+        let smtp_config = SmtpConfig {
+            domain: config.domain.name.clone(),
+            mx_host: config.domain.mx_host.clone(),
+            max_message_size,
+            max_recipients: 100,
+            tls_available: false,
+        };
+
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("imap.db")).unwrap(),
+        );
+        store.initialize_default_mailboxes().unwrap();
+        // Create alice with a known harmony address
+        let alice_addr = [0xAAu8; crate::message::ADDRESS_HASH_LEN];
+        store.create_user("alice", "alicepass", &alice_addr).unwrap();
+
+        let content_path = smtp_test_dir.path().join("content");
+        std::fs::create_dir_all(content_path.join("commits")).unwrap();
+        std::fs::create_dir_all(content_path.join("blobs")).unwrap();
+        let store_clone = store.clone();
+        let content_path_clone = content_path.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            handle_connection(
+                stream,
+                peer_addr.ip(),
+                smtp_config,
+                max_message_size,
+                None,
+                store_clone,
+                None,
+                "test.example.com".to_string(),
+                content_path_clone,
+                5,
+            )
+            .await
+            .unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Read 220 greeting
+        let greeting = read_smtp_response(&mut reader).await;
+        assert!(greeting.starts_with("220 "), "greeting: {greeting}");
+
+        // EHLO
+        write_half.write_all(b"EHLO sender.test.com\r\n").await.unwrap();
+        let ehlo_resp = read_smtp_response(&mut reader).await;
+        assert!(ehlo_resp.contains("250"), "EHLO: {ehlo_resp}");
+
+        // MAIL FROM
+        write_half
+            .write_all(b"MAIL FROM:<sender@test.com>\r\n")
+            .await
+            .unwrap();
+        let mail_resp = read_smtp_response(&mut reader).await;
+        assert!(mail_resp.contains("250"), "MAIL FROM: {mail_resp}");
+
+        // RCPT TO alice — local domain, resolves by username
+        write_half
+            .write_all(b"RCPT TO:<alice@test.example.com>\r\n")
+            .await
+            .unwrap();
+        let rcpt_resp = read_smtp_response(&mut reader).await;
+        assert!(rcpt_resp.contains("250"), "RCPT TO: {rcpt_resp}");
+
+        // DATA
+        write_half.write_all(b"DATA\r\n").await.unwrap();
+        let data_resp = read_smtp_response(&mut reader).await;
+        assert!(data_resp.starts_with("354"), "DATA: {data_resp}");
+
+        // Send RFC 5322 message body with proper headers
+        write_half
+            .write_all(
+                b"From: sender@test.com\r\n\
+                  To: alice@test.example.com\r\n\
+                  Subject: Integration Test\r\n\
+                  Message-ID: <test-deliver-001@test.com>\r\n\
+                  Date: Mon, 13 Apr 2026 00:00:00 +0000\r\n\
+                  \r\n\
+                  Hello Alice, this is a delivery test.\r\n\
+                  .\r\n",
+            )
+            .await
+            .unwrap();
+        let deliver_resp = read_smtp_response(&mut reader).await;
+        assert!(deliver_resp.contains("250"), "delivery: {deliver_resp}");
+
+        // QUIT
+        write_half.write_all(b"QUIT\r\n").await.unwrap();
+        let quit_resp = read_smtp_response(&mut reader).await;
+        assert!(quit_resp.starts_with("221 "), "QUIT: {quit_resp}");
+
+        server_handle.await.unwrap();
+
+        // Verify: message appears in alice's INBOX
+        let mbox = store
+            .get_mailbox("INBOX")
+            .expect("get_mailbox ok")
+            .expect("INBOX exists");
+        let messages = store.get_messages(mbox.id).expect("get_messages ok");
+        assert_eq!(messages.len(), 1, "expected 1 message in INBOX, got {}", messages.len());
+        assert!(
+            messages[0].rfc822_size > 0,
+            "expected rfc822_size > 0, got {}",
+            messages[0].rfc822_size
+        );
+        // CAS storage should have produced a CID for the message
+        assert!(
+            messages[0].message_cid.is_some(),
+            "expected message_cid to be set after CAS ingest"
+        );
     }
 
     #[test]
