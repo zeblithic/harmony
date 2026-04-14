@@ -7,8 +7,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use harmony_content::book::BookStore as _;
-
 use crate::mailbox::{FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, FOLDER_COUNT, MAX_SNIPPET_LEN};
 use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 
@@ -61,13 +59,18 @@ impl MailboxManager {
                 })?
                 .collect::<Result<_, _>>()?;
             for (addr_blob, cid_blob) in pairs {
-                if addr_blob.len() == ADDRESS_HASH_LEN && cid_blob.len() == CID_LEN {
-                    let mut addr = [0u8; ADDRESS_HASH_LEN];
-                    addr.copy_from_slice(&addr_blob);
-                    let mut cid = [0u8; CID_LEN];
-                    cid.copy_from_slice(&cid_blob);
-                    roots.insert(addr, cid);
+                if addr_blob.len() != ADDRESS_HASH_LEN || cid_blob.len() != CID_LEN {
+                    return Err(MailboxError::Cas(format!(
+                        "corrupt mailbox_roots row: address_len={}, root_cid_len={}",
+                        addr_blob.len(),
+                        cid_blob.len()
+                    )));
                 }
+                let mut addr = [0u8; ADDRESS_HASH_LEN];
+                addr.copy_from_slice(&addr_blob);
+                let mut cid = [0u8; CID_LEN];
+                cid.copy_from_slice(&cid_blob);
+                roots.insert(addr, cid);
             }
         }
 
@@ -100,13 +103,12 @@ impl MailboxManager {
         Ok(cid.to_bytes())
     }
 
-    /// Load raw bytes from CAS by CID.
+    /// Load raw bytes from CAS by CID, reassembling chunked DAG entries.
     fn cas_load(&self, cid: &[u8; CID_LEN]) -> Result<Vec<u8>, MailboxError> {
         let book = harmony_db::DiskBookStore::new(&self.content_store_path);
         let content_id = harmony_content::cid::ContentId::from_bytes(*cid);
-        book.get(&content_id)
-            .map(|b: &[u8]| b.to_vec())
-            .ok_or_else(|| MailboxError::Cas(format!("CID not found: {}", hex::encode(cid))))
+        harmony_content::dag::reassemble(&content_id, &book)
+            .map_err(|e| MailboxError::Cas(e.to_string()))
     }
 
     /// Ensure a user has a Merkle mailbox tree. If one already exists, this is a no-op.
@@ -276,6 +278,7 @@ impl MailboxManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harmony_content::book::BookStore as _;
     use crate::mailbox::{FolderKind, PAGE_CAPACITY};
     use crate::message::MESSAGE_ID_LEN;
 

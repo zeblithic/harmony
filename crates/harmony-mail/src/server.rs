@@ -3123,9 +3123,42 @@ node_config = "/tmp/test-node.toml"
 
         server_handle.await.unwrap();
 
-        // Phase 5 runs in spawn_blocking (fire-and-forget), so give it
-        // a moment to complete before checking the Merkle tree.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Phase 5 runs in spawn_blocking (fire-and-forget). Poll until
+        // the Merkle tree reflects the delivery rather than using a fixed sleep.
+        let merkle_ready = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                loop {
+                    {
+                        let mgr = mailbox_mgr.as_ref().unwrap().lock().unwrap();
+                        if let Some(root_cid) = mgr.get_root(&alice_addr) {
+                            let book = harmony_db::DiskBookStore::new(&content_path);
+                            if let Ok(root_bytes) = harmony_content::dag::reassemble(
+                                &harmony_content::cid::ContentId::from_bytes(*root_cid),
+                                &book,
+                            ) {
+                                if let Ok(root) = crate::mailbox::MailRoot::from_bytes(&root_bytes) {
+                                    let inbox_cid = root.folder_cid(crate::mailbox::FolderKind::Inbox);
+                                    if let Ok(folder_bytes) = harmony_content::dag::reassemble(
+                                        &harmony_content::cid::ContentId::from_bytes(*inbox_cid),
+                                        &book,
+                                    ) {
+                                        if let Ok(folder) = crate::mailbox::MailFolder::from_bytes(&folder_bytes) {
+                                            if folder.message_count > 0 {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await;
+        assert!(merkle_ready.is_ok(), "Merkle mailbox not updated within 5s");
 
         // Verify: message appears in IMAP store
         let mbox = store
