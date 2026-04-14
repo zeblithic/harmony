@@ -50,7 +50,7 @@ enum RawSink {
         cancel: CancellationToken,
     },
     #[cfg(test)]
-    Captured(Arc<Mutex<Vec<(String, Vec<u8>)>>>),
+    Captured(Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>),
 }
 
 /// Test handles returned by `ZenohPublisher::inert_for_test` so callers can
@@ -59,7 +59,7 @@ enum RawSink {
 #[cfg(test)]
 pub struct InertHandles {
     pub latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
-    pub raw: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    pub raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
 }
 
 impl ZenohPublisher {
@@ -149,7 +149,7 @@ impl ZenohPublisher {
     pub fn inert_for_test() -> (Self, InertHandles) {
         let latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let raw: Arc<Mutex<Vec<(String, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>> = Arc::new(Mutex::new(Vec::new()));
         let wake = Arc::new(Notify::new());
         let publisher = Self {
             latest: Arc::clone(&latest),
@@ -182,9 +182,15 @@ impl ZenohPublisher {
     /// bytes produced by `HarmonyMessage::to_bytes()` so subscribers (e.g.
     /// Phase 0 harmony-client) can decode directly.
     ///
+    /// Payload is `Arc<Vec<u8>>` so a single encoded message can fan out to
+    /// many recipients without per-recipient payload copies — Arc::clone is
+    /// a refcount bump, and the spawned task dereferences to `&[u8]` for
+    /// `session.put`. Worst case allocation: one buffer per message instead
+    /// of one per (message × recipient).
+    ///
     /// Skips when the shared cancel token has fired — prevents post-shutdown
     /// spawns from keeping the runtime alive.
-    pub fn publish_raw_mail(&self, addr_hex: String, bytes: Vec<u8>) {
+    pub fn publish_raw_mail(&self, addr_hex: String, bytes: Arc<Vec<u8>>) {
         match &self.raw_sink {
             RawSink::Session { session, cancel } => {
                 if cancel.is_cancelled() {
@@ -193,7 +199,7 @@ impl ZenohPublisher {
                 let session = session.clone();
                 let topic = format!("harmony/mail/v1/{addr_hex}");
                 tokio::spawn(async move {
-                    if let Err(e) = session.put(&topic, bytes).await {
+                    if let Err(e) = session.put(&topic, &bytes[..]).await {
                         tracing::warn!(
                             error = %e,
                             %topic,
@@ -239,7 +245,7 @@ pub struct MailboxManager {
     /// Persistence for root CID pointers.
     db: rusqlite::Connection,
     /// Optional Zenoh publisher for root CID notifications.
-    publisher: Option<ZenohPublisher>,
+    publisher: Option<Arc<ZenohPublisher>>,
 }
 
 const SCHEMA_SQL: &str = "
@@ -294,8 +300,13 @@ impl MailboxManager {
 
     /// Attach a Zenoh publisher for root CID notifications.
     ///
+    /// Takes `Arc<ZenohPublisher>` so the same publisher can be shared with
+    /// the SMTP server's raw-publish path without routing raw publishes
+    /// through this manager's mutex (raw publish doesn't need the manager
+    /// state, only the publisher).
+    ///
     /// Call this after opening the manager if Zenoh is configured and enabled.
-    pub fn set_publisher(&mut self, publisher: ZenohPublisher) {
+    pub fn set_publisher(&mut self, publisher: Arc<ZenohPublisher>) {
         self.publisher = Some(publisher);
     }
 
@@ -307,17 +318,6 @@ impl MailboxManager {
     /// Number of users with initialized Merkle mailboxes.
     pub fn user_count(&self) -> usize {
         self.roots.len()
-    }
-
-    /// Forward a raw-mail publish to the Zenoh publisher, if one is attached.
-    ///
-    /// No-op when Zenoh is disabled — IMAP delivery remains the canonical
-    /// path, and raw publish is a best-effort real-time notification for
-    /// subscribers on `harmony/mail/v1/{addr_hex}`.
-    pub fn publish_raw_mail(&self, addr_hex: String, bytes: Vec<u8>) {
-        if let Some(ref publisher) = self.publisher {
-            publisher.publish_raw_mail(addr_hex, bytes);
-        }
     }
 
     /// Ingest raw bytes into CAS and return the resulting CID as a 32-byte array.
@@ -898,7 +898,7 @@ mod tests {
 
         let addr = [0xAAu8; ADDRESS_HASH_LEN];
         let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
-        mgr.set_publisher(publisher);
+        mgr.set_publisher(Arc::new(publisher));
         mgr.ensure_user_mailbox(&addr).unwrap();
 
         mgr.insert_message(
@@ -977,56 +977,57 @@ mod tests {
     async fn zenoh_publisher_captures_raw_mail() {
         // publish_raw_mail must route each call into the raw capture buffer
         // (in production this is a Zenoh put; the inert scaffold records it
-        // so tests can assert on what would have been published).
+        // so tests can assert on what would have been published). Payloads
+        // flow through as `Arc<Vec<u8>>` so fan-out callers can clone a
+        // refcount handle instead of duplicating the buffer.
         let (publisher, handles) = ZenohPublisher::inert_for_test();
 
         let alice_hex = "aa".repeat(ADDRESS_HASH_LEN);
         let bob_hex = "bb".repeat(ADDRESS_HASH_LEN);
-        publisher.publish_raw_mail(alice_hex.clone(), vec![0x01, 0x02, 0x03]);
-        publisher.publish_raw_mail(bob_hex.clone(), vec![0xFF]);
-        publisher.publish_raw_mail(alice_hex.clone(), vec![0x04, 0x05]);
+        let payload_a = Arc::new(vec![0x01, 0x02, 0x03]);
+        let payload_b = Arc::new(vec![0xFFu8]);
+        let payload_c = Arc::new(vec![0x04, 0x05]);
+        publisher.publish_raw_mail(alice_hex.clone(), Arc::clone(&payload_a));
+        publisher.publish_raw_mail(bob_hex.clone(), Arc::clone(&payload_b));
+        publisher.publish_raw_mail(alice_hex.clone(), Arc::clone(&payload_c));
 
         let raw = handles
             .raw
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(raw.len(), 3, "each call must record one publish — no coalescing");
-        assert_eq!(raw[0], (alice_hex.clone(), vec![0x01, 0x02, 0x03]));
-        assert_eq!(raw[1], (bob_hex, vec![0xFF]));
-        assert_eq!(raw[2], (alice_hex, vec![0x04, 0x05]));
+        assert_eq!(raw[0].0, alice_hex);
+        assert!(Arc::ptr_eq(&raw[0].1, &payload_a), "shared-buffer handle must be preserved");
+        assert_eq!(raw[1].0, bob_hex);
+        assert!(Arc::ptr_eq(&raw[1].1, &payload_b));
+        assert_eq!(raw[2].0, alice_hex);
+        assert!(Arc::ptr_eq(&raw[2].1, &payload_c));
     }
 
     #[tokio::test]
-    async fn mailbox_manager_forwards_raw_mail() {
-        // MailboxManager::publish_raw_mail must forward to the attached
-        // publisher. When no publisher is set it's a silent no-op so
-        // raw-mail publish does not block SMTP delivery on Zenoh availability.
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("roots.db");
-        let cas_path = dir.path().join("content");
-        std::fs::create_dir_all(cas_path.join("commits")).unwrap();
-        std::fs::create_dir_all(cas_path.join("blobs")).unwrap();
-
-        let addr = [0xCCu8; ADDRESS_HASH_LEN];
-        let addr_hex = hex::encode(addr);
-
-        // No publisher: call must be a silent no-op.
-        let mgr_no_pub = MailboxManager::open(&db_path, &cas_path).unwrap();
-        mgr_no_pub.publish_raw_mail(addr_hex.clone(), vec![0xAB, 0xCD]);
-        drop(mgr_no_pub);
-
-        // With publisher: forwarded call must appear in the capture buffer.
+    async fn zenoh_publisher_fanout_shares_buffer() {
+        // Fanning out one payload to many recipients must Arc::clone the same
+        // allocation rather than duplicate it — this is the fix for the
+        // Qodo-reported OOM hazard (16MiB × 100 recipients ≈ 1.6GiB copies).
         let (publisher, handles) = ZenohPublisher::inert_for_test();
-        let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
-        mgr.set_publisher(publisher);
-        mgr.publish_raw_mail(addr_hex.clone(), vec![0xAB, 0xCD]);
+        let payload = Arc::new(vec![0xAAu8; 64]);
+
+        for i in 0..10u8 {
+            let addr_hex = format!("{:02x}", i).repeat(ADDRESS_HASH_LEN);
+            publisher.publish_raw_mail(addr_hex, Arc::clone(&payload));
+        }
 
         let raw = handles
             .raw
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(raw.len(), 1);
-        assert_eq!(raw[0], (addr_hex, vec![0xAB, 0xCD]));
+        assert_eq!(raw.len(), 10);
+        for entry in raw.iter() {
+            assert!(
+                Arc::ptr_eq(&entry.1, &payload),
+                "every fan-out recipient must share the same underlying buffer"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1092,7 +1093,7 @@ mod tests {
         let publisher = ZenohPublisher::new(pub_session, cancel.clone());
 
         let mut mgr = MailboxManager::open(&db_path, &cas_path).unwrap();
-        mgr.set_publisher(publisher);
+        mgr.set_publisher(Arc::new(publisher));
         mgr.ensure_user_mailbox(&addr).unwrap();
 
         mgr.insert_message(
