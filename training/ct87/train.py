@@ -619,8 +619,9 @@ def main() -> None:
     # so their weights are loaded. strict=False handles tied embeddings where
     # lm_head shares embed_tokens weights (missing key is expected).
     if args.resume_from is not None:
-        from safetensors.torch import load_file
-        ckpt_keys = set(load_file(args.resume_from).keys())
+        from safetensors import safe_open
+        with safe_open(args.resume_from, framework="pt") as f:
+            ckpt_keys = set(f.keys())
         model_keys = set(model.state_dict().keys())
         missing = model_keys - ckpt_keys
         unexpected = ckpt_keys - model_keys
