@@ -836,17 +836,49 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
     let mut needs_starttls = false;
     for action in actions {
         match action {
-            SmtpAction::ResolveHarmonyAddress { local_part, .. } => {
-                use crate::message::ADDRESS_HASH_LEN;
-                // Stub: all addresses resolve to a dummy identity.
-                // Real implementation will query the announce cache.
-                let identity = Some([0u8; ADDRESS_HASH_LEN]);
+            SmtpAction::ResolveHarmonyAddress { local_part, domain } => {
+                use crate::address::{self, LocalPart};
+
+                let identity = if domain.eq_ignore_ascii_case(local_domain) {
+                    // Local domain: resolve against our user store
+                    match address::parse_local_part(local_part) {
+                        LocalPart::Hex(hash) => Some(hash),
+                        LocalPart::Named { name, .. } => {
+                            match imap_store.get_user(&name) {
+                                Ok(Some(user)) => Some(user.harmony_address),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    tracing::warn!(name = %name, error = %e, "user lookup failed");
+                                    None
+                                }
+                            }
+                        }
+                        LocalPart::Alias(alias) => {
+                            match imap_store.get_user(&alias) {
+                                Ok(Some(user)) => Some(user.harmony_address),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    tracing::warn!(alias = %alias, error = %e, "alias lookup failed");
+                                    None
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Non-local domain: remote delivery not yet supported (ZEB-113)
+                    tracing::debug!(
+                        %domain,
+                        local_domain = %local_domain,
+                        "non-local domain, rejecting (remote delivery tracked in ZEB-113)"
+                    );
+                    None
+                };
+
                 let callback_actions = session.handle(SmtpEvent::HarmonyResolved {
                     local_part: local_part.clone(),
                     identity,
                 });
                 execute_actions_generic(&callback_actions, writer).await?;
-                // Warn if callbacks produced further async actions (not yet handled)
                 for a in &callback_actions {
                     if matches!(
                         a,
@@ -2377,6 +2409,8 @@ node_config = "/tmp/test-node.toml"
             crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db")).unwrap()
         );
         smtp_store.initialize_default_mailboxes().unwrap();
+        // Create the recipient user so address resolution succeeds for RCPT TO:<user@test.example.com>
+        smtp_store.create_user("user", "pass", &[0x01u8; crate::message::ADDRESS_HASH_LEN]).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
