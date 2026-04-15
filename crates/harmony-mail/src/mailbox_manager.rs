@@ -414,63 +414,16 @@ impl ZenohPublisher {
                 cancel,
                 permits,
             } => {
-                if cancel.is_cancelled() {
-                    return;
-                }
-                // Acquire at the CALL SITE, not inside the spawn. Dropping
-                // on backpressure prevents unbounded task accumulation
-                // during a Zenoh stall — if we spawned first and acquired
-                // second, every waiting spawn would hold its Arc<Vec<u8>>
-                // refcount and task frame open for minutes.
-                let permit = match Arc::clone(permits).try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(tokio::sync::TryAcquireError::NoPermits) => {
-                        tracing::warn!(
-                            addr = %addr_hex,
-                            "raw-mail publish dropped: in-flight limit ({}) reached — best-effort path, client will catch up via IMAP/root",
-                            RAW_PUBLISH_CONCURRENCY,
-                        );
-                        return;
-                    }
-                    Err(tokio::sync::TryAcquireError::Closed) => return,
-                };
-                let session = session.clone();
-                let cancel = cancel.clone();
                 let topic = format!("harmony/mail/v1/{addr_hex}");
-                tokio::spawn(async move {
-                    // Move the already-acquired permit into the task so it
-                    // releases on completion/timeout/cancel. Timeout-bounded,
-                    // cancel-aware put.
-                    let _permit = permit;
-                    tokio::select! {
-                        res = tokio::time::timeout(
-                            RAW_PUBLISH_TIMEOUT,
-                            session.put(&topic, &bytes[..]),
-                        ) => match res {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    %topic,
-                                    "Zenoh raw mail publish failed"
-                                );
-                            }
-                            Err(_elapsed) => {
-                                tracing::warn!(
-                                    %topic,
-                                    timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
-                                    "Zenoh raw mail publish timed out — aborted"
-                                );
-                            }
-                        },
-                        _ = cancel.cancelled() => {
-                            tracing::debug!(
-                                %topic,
-                                "Zenoh raw mail publish cancelled during shutdown"
-                            );
-                        }
-                    }
-                });
+                Self::spawn_session_publish(
+                    session,
+                    cancel,
+                    permits,
+                    topic,
+                    bytes,
+                    "raw-mail",
+                    ("addr", &addr_hex),
+                );
             }
             #[cfg(test)]
             RawSink::Captured { raw, .. } => {
@@ -509,55 +462,16 @@ impl ZenohPublisher {
                 cancel,
                 permits,
             } => {
-                if cancel.is_cancelled() {
-                    return;
-                }
-                let permit = match Arc::clone(permits).try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(tokio::sync::TryAcquireError::NoPermits) => {
-                        tracing::warn!(
-                            recipient = %recipient_hash_hex,
-                            "sealed-unicast publish dropped: in-flight limit ({}) reached — best-effort path",
-                            RAW_PUBLISH_CONCURRENCY,
-                        );
-                        return;
-                    }
-                    Err(tokio::sync::TryAcquireError::Closed) => return,
-                };
-                let session = session.clone();
-                let cancel = cancel.clone();
                 let topic = harmony_zenoh::namespace::msg::unicast_key(&recipient_hash_hex);
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    tokio::select! {
-                        res = tokio::time::timeout(
-                            RAW_PUBLISH_TIMEOUT,
-                            session.put(&topic, &envelope[..]),
-                        ) => match res {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    %topic,
-                                    "Zenoh sealed-unicast publish failed"
-                                );
-                            }
-                            Err(_elapsed) => {
-                                tracing::warn!(
-                                    %topic,
-                                    timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
-                                    "Zenoh sealed-unicast publish timed out — aborted"
-                                );
-                            }
-                        },
-                        _ = cancel.cancelled() => {
-                            tracing::debug!(
-                                %topic,
-                                "Zenoh sealed-unicast publish cancelled during shutdown"
-                            );
-                        }
-                    }
-                });
+                Self::spawn_session_publish(
+                    session,
+                    cancel,
+                    permits,
+                    topic,
+                    envelope,
+                    "sealed-unicast",
+                    ("recipient", &recipient_hash_hex),
+                );
             }
             #[cfg(test)]
             RawSink::Captured { sealed_unicast, .. } => {
@@ -568,6 +482,90 @@ impl ZenohPublisher {
                     .push((topic, envelope));
             }
         }
+    }
+
+    /// Shared spawn/permit/timeout/cancel machinery for background Zenoh
+    /// put publishes. Both `publish_raw_mail` and `publish_sealed_unicast`
+    /// delegate here — they differ only in the topic string and in log
+    /// identifiers.
+    ///
+    /// - `kind`: short noun for tracing messages ("raw-mail" or
+    ///   "sealed-unicast"), interpolated into the log message strings.
+    /// - `label_field`: tracing field pair recorded in the drop-warning —
+    ///   `("addr", &addr_hex)` or `("recipient", &recipient_hash_hex)`.
+    ///   Encoded as `role = <field-name>, publish_target = <value>` so the
+    ///   warning's semantic shape is preserved without requiring dynamic
+    ///   tracing field-name syntax.
+    ///
+    /// Only called from the `RawSink::Session` branch — the `Captured`
+    /// branch is test-only and each caller pushes into its own dedicated
+    /// Vec (raw vs sealed_unicast).
+    fn spawn_session_publish(
+        session: &zenoh::Session,
+        cancel: &CancellationToken,
+        permits: &Arc<Semaphore>,
+        topic: String,
+        bytes: Arc<Vec<u8>>,
+        kind: &'static str,
+        label_field: (&'static str, &str),
+    ) {
+        if cancel.is_cancelled() {
+            return;
+        }
+        // Acquire at the CALL SITE, not inside the spawn. Dropping on
+        // backpressure prevents unbounded task accumulation during a
+        // Zenoh stall — if we spawned first and acquired second, every
+        // waiting spawn would hold its Arc<Vec<u8>> refcount and task
+        // frame open for minutes.
+        let permit = match Arc::clone(permits).try_acquire_owned() {
+            Ok(p) => p,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                tracing::warn!(
+                    role = label_field.0,
+                    publish_target = %label_field.1,
+                    "{kind} publish dropped: in-flight limit ({}) reached — best-effort path",
+                    RAW_PUBLISH_CONCURRENCY,
+                );
+                return;
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => return,
+        };
+        let session = session.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            // Move the already-acquired permit into the task so it
+            // releases on completion/timeout/cancel. Timeout-bounded,
+            // cancel-aware put.
+            let _permit = permit;
+            tokio::select! {
+                res = tokio::time::timeout(
+                    RAW_PUBLISH_TIMEOUT,
+                    session.put(&topic, &bytes[..]),
+                ) => match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            %topic,
+                            "Zenoh {kind} publish failed"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            %topic,
+                            timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                            "Zenoh {kind} publish timed out — aborted"
+                        );
+                    }
+                },
+                _ = cancel.cancelled() => {
+                    tracing::debug!(
+                        %topic,
+                        "Zenoh {kind} publish cancelled during shutdown"
+                    );
+                }
+            }
+        });
     }
 }
 
