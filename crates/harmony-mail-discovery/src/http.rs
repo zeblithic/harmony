@@ -11,6 +11,14 @@ use crate::claim::{RevocationList, SignedClaim};
 /// HTTP server. Production impl is `ReqwestHttpClient`.
 #[async_trait]
 pub trait HttpClient: Send + Sync + 'static {
+    /// Fetch `url` and return the response.
+    ///
+    /// Implementors MUST enforce a body-size cap and surface oversize
+    /// responses as [`HttpError::BodyTooLarge`] — the `fetch_*` helpers
+    /// in this module pass `body` straight to the CBOR parser and do
+    /// not guard against unbounded input. Implementors MUST also refuse
+    /// redirects (return [`HttpError::RedirectRefused`]) to prevent
+    /// downgrade attacks on the `.well-known` endpoints.
     async fn get(&self, url: &str) -> Result<HttpResponse, HttpError>;
 }
 
@@ -21,6 +29,7 @@ pub struct HttpResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum HttpError {
     #[error("connect: {0}")]
     Connect(String),
@@ -37,6 +46,7 @@ pub enum HttpError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum HttpFetchError {
     #[error("transport: {0}")]
     Transport(#[from] HttpError),
