@@ -218,3 +218,28 @@ impl<'a> ClaimBuilder<'a> {
         }
     }
 }
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::cache::TimeSource;
+
+#[derive(Debug)]
+pub struct FakeTimeSource(AtomicU64);
+
+impl FakeTimeSource {
+    pub fn new(start: u64) -> Self {
+        Self(AtomicU64::new(start))
+    }
+    pub fn advance(&self, secs: u64) {
+        self.0.fetch_add(secs, Ordering::Relaxed);
+    }
+    pub fn set(&self, secs: u64) {
+        self.0.store(secs, Ordering::Relaxed);
+    }
+}
+
+impl TimeSource for FakeTimeSource {
+    fn now(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
