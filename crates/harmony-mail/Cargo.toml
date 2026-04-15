@@ -49,7 +49,6 @@ zenoh.workspace = true
 [dev-dependencies]
 hex.workspace = true
 rand.workspace = true
-rand_core.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
 rcgen = "0.13"
 tempfile = "3"

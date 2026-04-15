@@ -415,14 +415,52 @@ impl ZenohPublisher {
                 permits,
             } => {
                 let topic = format!("harmony/mail/v1/{addr_hex}");
+                // Closures below preserve the original operator-facing
+                // tracing field names (`addr = %addr_hex`) and message
+                // literals ("raw mail …") that ops log queries key on.
+                // The DRY helper handles spawn/permit/timeout/cancel; each
+                // caller renders its own tracing events so the observable
+                // shape does not drift when the scaffolding is shared.
+                let addr_drop = addr_hex.clone();
+                let addr_fail = addr_hex.clone();
+                let addr_timeout = addr_hex.clone();
+                let addr_cancel = addr_hex.clone();
                 Self::spawn_session_publish(
                     session,
                     cancel,
                     permits,
                     topic,
                     bytes,
-                    "raw-mail",
-                    ("addr", &addr_hex),
+                    move || {
+                        tracing::warn!(
+                            addr = %addr_drop,
+                            "raw mail publish dropped: in-flight limit ({}) reached — best-effort path, client will catch up via IMAP/root",
+                            RAW_PUBLISH_CONCURRENCY,
+                        );
+                    },
+                    move |err, topic| {
+                        tracing::warn!(
+                            addr = %addr_fail,
+                            error = %err,
+                            %topic,
+                            "Zenoh raw mail publish failed"
+                        );
+                    },
+                    move |topic| {
+                        tracing::warn!(
+                            addr = %addr_timeout,
+                            %topic,
+                            timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                            "Zenoh raw mail publish timed out — aborted"
+                        );
+                    },
+                    move |topic| {
+                        tracing::debug!(
+                            addr = %addr_cancel,
+                            %topic,
+                            "Zenoh raw mail publish cancelled during shutdown"
+                        );
+                    },
                 );
             }
             #[cfg(test)]
@@ -463,14 +501,49 @@ impl ZenohPublisher {
                 permits,
             } => {
                 let topic = harmony_zenoh::namespace::msg::unicast_key(&recipient_hash_hex);
+                // Parallel to publish_raw_mail but with its own field name
+                // (`recipient`) and "sealed-unicast" message literal so ops
+                // log queries can distinguish the two paths.
+                let rcpt_drop = recipient_hash_hex.clone();
+                let rcpt_fail = recipient_hash_hex.clone();
+                let rcpt_timeout = recipient_hash_hex.clone();
+                let rcpt_cancel = recipient_hash_hex.clone();
                 Self::spawn_session_publish(
                     session,
                     cancel,
                     permits,
                     topic,
                     envelope,
-                    "sealed-unicast",
-                    ("recipient", &recipient_hash_hex),
+                    move || {
+                        tracing::warn!(
+                            recipient = %rcpt_drop,
+                            "sealed-unicast publish dropped: in-flight limit ({}) reached — best-effort path",
+                            RAW_PUBLISH_CONCURRENCY,
+                        );
+                    },
+                    move |err, topic| {
+                        tracing::warn!(
+                            recipient = %rcpt_fail,
+                            error = %err,
+                            %topic,
+                            "Zenoh sealed-unicast publish failed"
+                        );
+                    },
+                    move |topic| {
+                        tracing::warn!(
+                            recipient = %rcpt_timeout,
+                            %topic,
+                            timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                            "Zenoh sealed-unicast publish timed out — aborted"
+                        );
+                    },
+                    move |topic| {
+                        tracing::debug!(
+                            recipient = %rcpt_cancel,
+                            %topic,
+                            "Zenoh sealed-unicast publish cancelled during shutdown"
+                        );
+                    },
                 );
             }
             #[cfg(test)]
@@ -486,16 +559,15 @@ impl ZenohPublisher {
 
     /// Shared spawn/permit/timeout/cancel machinery for background Zenoh
     /// put publishes. Both `publish_raw_mail` and `publish_sealed_unicast`
-    /// delegate here — they differ only in the topic string and in log
-    /// identifiers.
+    /// delegate here — they differ only in the topic string and in the
+    /// tracing events they emit.
     ///
-    /// - `kind`: short noun for tracing messages ("raw-mail" or
-    ///   "sealed-unicast"), interpolated into the log message strings.
-    /// - `label_field`: tracing field pair recorded in the drop-warning —
-    ///   `("addr", &addr_hex)` or `("recipient", &recipient_hash_hex)`.
-    ///   Encoded as `role = <field-name>, publish_target = <value>` so the
-    ///   warning's semantic shape is preserved without requiring dynamic
-    ///   tracing field-name syntax.
+    /// Tracing is handled by caller-supplied closures (`on_dropped`,
+    /// `on_failed`, `on_timed_out`, `on_cancelled`) so each path keeps its
+    /// own operator-facing field names (`addr` vs `recipient`) and message
+    /// literals ("raw mail" vs "sealed-unicast") without the helper having
+    /// to synthesize dynamic tracing field names. The scaffolding
+    /// (permit acquisition, spawn, timeout, cancel select!) stays DRY.
     ///
     /// Only called from the `RawSink::Session` branch — the `Captured`
     /// branch is test-only and each caller pushes into its own dedicated
@@ -506,8 +578,10 @@ impl ZenohPublisher {
         permits: &Arc<Semaphore>,
         topic: String,
         bytes: Arc<Vec<u8>>,
-        kind: &'static str,
-        label_field: (&'static str, &str),
+        on_dropped: impl FnOnce() + Send + 'static,
+        on_failed: impl FnOnce(zenoh::Error, &str) + Send + 'static,
+        on_timed_out: impl FnOnce(&str) + Send + 'static,
+        on_cancelled: impl FnOnce(&str) + Send + 'static,
     ) {
         if cancel.is_cancelled() {
             return;
@@ -520,12 +594,7 @@ impl ZenohPublisher {
         let permit = match Arc::clone(permits).try_acquire_owned() {
             Ok(p) => p,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                tracing::warn!(
-                    role = label_field.0,
-                    publish_target = %label_field.1,
-                    "{kind} publish dropped: in-flight limit ({}) reached — best-effort path",
-                    RAW_PUBLISH_CONCURRENCY,
-                );
+                on_dropped();
                 return;
             }
             Err(tokio::sync::TryAcquireError::Closed) => return,
@@ -543,27 +612,10 @@ impl ZenohPublisher {
                     session.put(&topic, &bytes[..]),
                 ) => match res {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            error = %e,
-                            %topic,
-                            "Zenoh {kind} publish failed"
-                        );
-                    }
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            %topic,
-                            timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
-                            "Zenoh {kind} publish timed out — aborted"
-                        );
-                    }
+                    Ok(Err(e)) => on_failed(e, &topic),
+                    Err(_elapsed) => on_timed_out(&topic),
                 },
-                _ = cancel.cancelled() => {
-                    tracing::debug!(
-                        %topic,
-                        "Zenoh {kind} publish cancelled during shutdown"
-                    );
-                }
+                _ = cancel.cancelled() => on_cancelled(&topic),
             }
         });
     }
