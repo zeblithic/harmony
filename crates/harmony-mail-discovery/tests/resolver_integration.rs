@@ -391,3 +391,75 @@ async fn claim_serial_rollback_on_refetch_returns_transient() {
         other => panic!("expected Transient(claim_serial_rollback), got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn stale_revocation_past_24h_returns_transient() {
+    let (d, dns, http, time, resolver) = setup();
+    let mut rng = OsRng;
+    let sk = d.mint_signing_key(&mut rng, NOW - 100, NOW + 90 * 86_400);
+    let claim = ClaimBuilder::new(&d, &sk, NOW).build();
+
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    http.set(
+        &harmony_mail_discovery::http::claim_url(&d.domain, &claim.payload.hashed_local_part),
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&claim).unwrap(),
+        }),
+    );
+    http.set_not_found(&harmony_mail_discovery::http::revocation_url(&d.domain));
+
+    // First resolve succeeds, populates revocation cache with last_refreshed = NOW.
+    assert!(matches!(
+        resolver.resolve("alice", "q8.fyi").await,
+        ResolveOutcome::Resolved(_)
+    ));
+
+    // Advance past 24h. Future revocation fetches fail.
+    time.advance(25 * 3600);
+    http.set(
+        &harmony_mail_discovery::http::revocation_url(&d.domain),
+        Ok(HttpResponse {
+            status: 500,
+            body: vec![],
+        }),
+    );
+
+    match resolver.resolve("alice", "q8.fyi").await {
+        ResolveOutcome::Transient { reason } => assert_eq!(reason, "revocation_stale"),
+        other => panic!("expected revocation_stale, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn soft_fail_expires_after_72h_and_returns_does_not_participate() {
+    let (d, dns, http, time, resolver) = setup();
+    let mut rng = OsRng;
+    let sk = d.mint_signing_key(&mut rng, NOW - 100, NOW + 100 * 86_400);
+    let claim = ClaimBuilder::new(&d, &sk, NOW).build();
+
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    http.set(
+        &harmony_mail_discovery::http::claim_url(&d.domain, &claim.payload.hashed_local_part),
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&claim).unwrap(),
+        }),
+    );
+    http.set_not_found(&harmony_mail_discovery::http::revocation_url(&d.domain));
+
+    // Establish domain as "seen".
+    assert!(matches!(
+        resolver.resolve("alice", "q8.fyi").await,
+        ResolveOutcome::Resolved(_)
+    ));
+
+    // Advance past 72h + past DNS TTL. Domain's seen-window has expired.
+    time.advance(73 * 3600);
+    dns.set("_harmony.q8.fyi", Err(DnsError::NoRecord));
+
+    assert_eq!(
+        resolver.resolve("alice", "q8.fyi").await,
+        ResolveOutcome::DomainDoesNotParticipate,
+    );
+}
