@@ -641,3 +641,262 @@ class TestEngramANNCheckpointSize:
         m._refresh_table_normalized()
         expected = torch.nn.functional.normalize(new_table, dim=-1, eps=1e-8)
         assert torch.allclose(m.table_normalized, expected)
+
+
+class TestEngramCrossAttention:
+    """Model delta: cross-attention injection with top-k retrieval (ZEB-117)."""
+
+    @staticmethod
+    def _xattn_config() -> HarmonyModelConfig:
+        c = _tiny_config()
+        c.use_xattn_engram = True
+        return c
+
+    @staticmethod
+    def _fake_table(total_entries: int, engram_dim: int) -> torch.Tensor:
+        g = torch.Generator().manual_seed(0)
+        return torch.randn(total_entries, engram_dim, generator=g)
+
+    def test_construction_rejects_dim_mismatch(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        bad_table = torch.randn(16, 8)
+        with pytest.raises(ValueError, match="engram_dim"):
+            EngramCrossAttention(c, bad_table)
+
+    def test_construction_rejects_wrong_shape(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        with pytest.raises(ValueError, match="2-D"):
+            EngramCrossAttention(c, torch.randn(10))
+
+    def test_construction_rejects_k_too_large(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(4, c.engram_dim)
+        with pytest.raises(ValueError, match="k_retrieved"):
+            EngramCrossAttention(c, t, k_retrieved=10)
+
+    def test_construction_rejects_zero_k(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        with pytest.raises(ValueError, match="k_retrieved"):
+            EngramCrossAttention(c, t, k_retrieved=0)
+
+    def test_construction_rejects_indivisible_hidden_dim(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        # hidden_dim=32 is not divisible by num_heads=5
+        with pytest.raises(ValueError, match="divisible"):
+            EngramCrossAttention(c, t, num_heads=5)
+
+    def test_construction_rejects_nonfinite_bias_weight(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        with pytest.raises(ValueError, match="retrieval_bias_weight"):
+            EngramCrossAttention(c, t, retrieval_bias_weight=float("nan"))
+
+    def test_construction_rejects_zero_temperature(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        with pytest.raises(ValueError, match="retrieval_temperature"):
+            EngramCrossAttention(c, t, retrieval_temperature=0.0)
+
+    def test_table_registered_as_buffer_not_parameter(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t)
+        param_names = {n for n, _ in m.named_parameters()}
+        buffer_names = {n for n, _ in m.named_buffers()}
+        assert "table" not in param_names
+        assert "table" in buffer_names
+        assert "table_normalized" in buffer_names
+
+    def test_retrieve_topk_shapes(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t, k_retrieved=4)
+        h = torch.randn(2, 6, c.hidden_dim)
+        retrieved, sims = m.retrieve_topk(h)
+        assert retrieved.shape == (2, 6, 4, c.engram_dim)
+        assert sims.shape == (2, 6, 4)
+
+    def test_retrieve_topk_returns_actual_table_rows(self):
+        """Top-k gather must return exact table rows (cosine similarity order)."""
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t, k_retrieved=3)
+        h = torch.randn(1, 4, c.hidden_dim)
+        retrieved, _ = m.retrieve_topk(h)
+        # Each retrieved vector must exactly match some row of the table.
+        for pos in range(4):
+            for j in range(3):
+                row = retrieved[0, pos, j]
+                diffs = (t - row).abs().sum(dim=-1)
+                assert diffs.min().item() < 1e-6
+
+    def test_forward_shape(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t)
+        h = torch.randn(2, 7, c.hidden_dim)
+        out = m(h)
+        assert out.shape == (2, 7, c.hidden_dim)
+
+    def test_forward_at_step_zero_produces_zero_residual(self):
+        """With o_proj zero-initialized, forward output is identically zero.
+
+        This is the anti-collapse mechanism: the model trains as if
+        unattached until o_proj learns a nontrivial direction. Regression
+        guard for the residual-zero init.
+        """
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t)
+        h = torch.randn(3, 8, c.hidden_dim)
+        out = m(h)
+        assert torch.allclose(out, torch.zeros_like(out)), (
+            "o_proj must start zeroed so the cross-attention residual is "
+            f"0 at step 0; got max abs {out.abs().max().item():.4e}"
+        )
+
+    def test_o_proj_zero_init(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(10, c.engram_dim)
+        m = EngramCrossAttention(c, t)
+        assert (m.o_proj.weight == 0).all(), (
+            "o_proj must be zero-initialized for residual-zero anti-collapse"
+        )
+
+    def test_gradient_flows_through_all_learnable_projections(self):
+        """Every trainable projection must receive gradient from the loss.
+
+        Critical: the retrieval-similarity bias is the ONLY path through
+        which retrieval_query_proj learns (top-k gather is
+        non-differentiable). If that bias path breaks, retrieval stops
+        learning - same failure mode that would have killed gamma if we
+        hadn't used differentiable softmax retrieval.
+        """
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t)
+        h = torch.randn(2, 5, c.hidden_dim, requires_grad=True)
+        # o_proj starts at zero so downstream gradients would all be zero.
+        # Perturb o_proj so attention outputs propagate to the loss.
+        with torch.no_grad():
+            m.o_proj.weight.add_(torch.randn_like(m.o_proj.weight) * 0.01)
+        out = m(h)
+        out.sum().backward()
+        assert m.q_proj.weight.grad is not None
+        assert m.k_proj.weight.grad is not None
+        assert m.v_proj.weight.grad is not None
+        assert m.o_proj.weight.grad is not None
+        assert m.retrieval_query_proj.weight.grad is not None, (
+            "retrieval_query_proj must receive gradient via the "
+            "retrieval-similarity bias path."
+        )
+        assert m.retrieval_query_proj.weight.grad.abs().sum().item() > 0
+        assert h.grad is not None
+        assert not m.table.requires_grad
+
+    def test_retrieval_query_grad_vanishes_without_bias(self):
+        """Sanity check on the bias path: with bias_weight=0, the retrieval
+        query projection loses its gradient path (bias is the only route).
+        """
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t, retrieval_bias_weight=0.0)
+        with torch.no_grad():
+            m.o_proj.weight.add_(torch.randn_like(m.o_proj.weight) * 0.01)
+        h = torch.randn(2, 5, c.hidden_dim)
+        out = m(h)
+        out.sum().backward()
+        grad = m.retrieval_query_proj.weight.grad
+        # Gradient is either None (autograd skipped it) or exactly zero.
+        assert grad is None or grad.abs().sum().item() == 0.0, (
+            "With retrieval_bias_weight=0, retrieval_query_proj must have "
+            "no gradient path - confirms the bias is the only route."
+        )
+
+    def test_table_not_in_state_dict(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(10, c.engram_dim)
+        m = EngramCrossAttention(c, t)
+        keys = set(m.state_dict().keys())
+        assert "table" not in keys
+        assert "table_normalized" not in keys
+
+    def test_harmony_model_attach_and_forward(self):
+        """End-to-end: attach xattn engram to HarmonyModel and run forward."""
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        model = HarmonyModel(c)
+        t = self._fake_table(20, c.engram_dim)
+        xattn = EngramCrossAttention(c, t)
+        model.attach_engram_xattn(xattn)
+        input_ids = torch.randint(0, c.vocab_size, (2, 16))
+        logits = model(input_ids=input_ids)
+        assert logits.shape == (2, 16, c.vocab_size)
+        # xattn does not populate the ANN gate side-channel
+        assert model._last_ann_gate is None
+
+    def test_attach_rejects_wrong_flag(self):
+        from ct87.engram import EngramCrossAttention
+        c = _tiny_config()  # use_xattn_engram defaults to False
+        model = HarmonyModel(c)
+        xattn = EngramCrossAttention(
+            self._xattn_config(), self._fake_table(10, c.engram_dim),
+        )
+        with pytest.raises(ValueError, match="use_xattn_engram"):
+            model.attach_engram_xattn(xattn)
+
+    def test_attach_rejects_if_ann_already_attached(self):
+        """Gamma and delta must be mutually exclusive at attach-time."""
+        from ct87.engram import EngramANNInjection, EngramCrossAttention
+        c = self._xattn_config()
+        c.use_ann_engram = False  # only xattn flag set
+        model = HarmonyModel(c)
+        # Force-attach gamma (via bypass, simulating a misconfiguration)
+        ann_cfg = _tiny_config()
+        ann_cfg.use_ann_engram = True
+        model.engram_ann = EngramANNInjection(
+            ann_cfg, self._fake_table(10, c.engram_dim),
+        )
+        xattn = EngramCrossAttention(c, self._fake_table(10, c.engram_dim))
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            model.attach_engram_xattn(xattn)
+
+    def test_config_mutual_exclusion_validation(self):
+        """Setting both flags on the config must raise at __post_init__."""
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            HarmonyModelConfig(
+                num_layers=4, hidden_dim=32, num_query_heads=4, num_kv_heads=2,
+                head_dim=8, ffn_dim=64, vocab_size=128, max_seq_len=64,
+                rope_theta=10000.0, rms_norm_eps=1e-6, layers_per_block=2,
+                engram_injection_layer=1, engram_dim=16, tie_embeddings=True,
+                use_ann_engram=True, use_xattn_engram=True,
+            )
+
+    def test_tiny_engram_xattn_factory(self):
+        delta_config = HarmonyModelConfig.tiny_engram_xattn()
+        base = HarmonyModelConfig.tiny()
+        assert delta_config.use_xattn_engram is True
+        assert delta_config.use_ann_engram is False
+        assert base.use_xattn_engram is False
+        assert delta_config.num_layers == base.num_layers
+        assert delta_config.hidden_dim == base.hidden_dim
+        assert delta_config.engram_injection_layer == base.engram_injection_layer
+        assert delta_config.engram_dim == base.engram_dim

@@ -780,3 +780,246 @@ def compute_gate_entropy_loss(
     p = gate.clamp(eps, 1.0 - eps)
     bernoulli_entropy = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
     return -bernoulli_entropy.mean()
+
+
+# ---------------------------------------------------------------------------
+# ZEB-117 Model delta: cross-attention to external memory with top-k retrieval
+# ---------------------------------------------------------------------------
+#
+# Research-only: NOT mirrored in Rust (crates/harmony-inference). Configs
+# that use this are not GGUF-portable.
+#
+# Design rationale:
+#   - Memorizing-Transformer-style injection: dedicated cross-attention
+#     block with independent W_q/W_k/W_v/W_o projections, attached at the
+#     configured injection layer, residual-adds to the hidden state.
+#   - Top-k retrieval (k>1): each position attends over its own k nearest
+#     corpus neighbors, letting the softmax pick the useful ones rather
+#     than being forced into a pre-blended k=1 summary as in gamma.
+#   - W_o zero-initialized: the residual add is a no-op at step 0, so
+#     training starts from the alpha baseline and ramps injection in
+#     smoothly as W_o learns. This replaces gamma's gate-clamp + entropy
+#     regularization with a structurally simpler anti-collapse mechanism.
+#   - Differentiable retrieval bias: top-k gather is non-differentiable,
+#     so the retrieval projection would not learn from the main loss if
+#     the cross-attention only saw Q*K scores. We add the raw top-k
+#     cosine similarities as an additive bias to the attention logits,
+#     preserving gradient flow into `retrieval_query_proj`. Bias weight
+#     is configurable.
+
+
+class EngramCrossAttention(nn.Module):
+    """Cross-attention injection to a fixed corpus memory table.
+
+    Attached to `HarmonyModel` at `config.engram_injection_layer` via
+    `HarmonyModel.attach_engram_xattn()`. Produces a residual the caller
+    adds to the hidden state:
+
+        h = h + engram_xattn(h)
+
+    Unlike `EngramANNInjection` this module has no gate, no clamp, and
+    no entropy side-channel. Anti-collapse is structural: `o_proj.weight`
+    starts at zero, so the residual is identically zero at step 0 and
+    the model trains as if unattached until `o_proj` learns a nontrivial
+    direction.
+
+    The corpus table is a non-persistent buffer (checkpoints exclude it;
+    caller must re-load via `load_corpus_table()` on resume), mirroring
+    the gamma contract so both models share a single corpus-table file.
+    """
+
+    def __init__(
+        self,
+        config: HarmonyModelConfig,
+        table: torch.Tensor,
+        num_heads: int | None = None,
+        k_retrieved: int = 8,
+        retrieval_temperature: float | None = None,
+        retrieval_bias_weight: float = 1.0,
+    ):
+        super().__init__()
+        if table.dim() != 2:
+            raise ValueError(
+                f"table must be 2-D [total_entries, engram_dim], got {table.shape}"
+            )
+        if table.shape[1] != config.engram_dim:
+            raise ValueError(
+                f"table engram_dim {table.shape[1]} != config.engram_dim "
+                f"{config.engram_dim}"
+            )
+
+        resolved_heads = config.num_query_heads if num_heads is None else int(num_heads)
+        if resolved_heads <= 0:
+            raise ValueError(f"num_heads must be > 0, got {resolved_heads}")
+        if config.hidden_dim % resolved_heads != 0:
+            raise ValueError(
+                f"hidden_dim {config.hidden_dim} must be divisible by "
+                f"num_heads {resolved_heads}"
+            )
+        if k_retrieved <= 0:
+            raise ValueError(f"k_retrieved must be > 0, got {k_retrieved}")
+        if k_retrieved > table.shape[0]:
+            raise ValueError(
+                f"k_retrieved {k_retrieved} exceeds table size {table.shape[0]}"
+            )
+        if not math.isfinite(retrieval_bias_weight):
+            raise ValueError(
+                f"retrieval_bias_weight must be finite, got {retrieval_bias_weight!r}"
+            )
+
+        self.hidden_dim = config.hidden_dim
+        self.engram_dim = config.engram_dim
+        self.num_heads = resolved_heads
+        self.head_dim = config.hidden_dim // resolved_heads
+        self.k_retrieved = int(k_retrieved)
+        self.retrieval_bias_weight = float(retrieval_bias_weight)
+        self.retrieval_temperature = (
+            float(retrieval_temperature)
+            if retrieval_temperature is not None
+            else 1.0 / (config.engram_dim ** 0.5)
+        )
+        if (
+            not math.isfinite(self.retrieval_temperature)
+            or self.retrieval_temperature <= 0
+        ):
+            raise ValueError(
+                f"retrieval_temperature must be a positive finite float, "
+                f"got {self.retrieval_temperature!r}"
+            )
+
+        # Shared corpus table buffers (non-persistent, excluded from
+        # checkpoints). Kept in float32 on CPU/GPU alongside module
+        # parameters via `.to(device)`.
+        self.register_buffer("table", table.float(), persistent=False)
+        self.register_buffer(
+            "table_normalized",
+            F.normalize(table.float(), dim=-1, eps=1e-8),
+            persistent=False,
+        )
+
+        self.retrieval_query_proj = nn.Linear(
+            config.hidden_dim, config.engram_dim, bias=False,
+        )
+        self.retrieval_norm = nn.LayerNorm(
+            config.engram_dim, eps=config.rms_norm_eps,
+        )
+
+        # Independent Q/K/V/O projections. Attention inner dim is
+        # hidden_dim (head_dim * num_heads); K/V project directly from
+        # engram_dim rather than promoting retrieved embeddings to
+        # hidden_dim first - keeps the parameter count close to the
+        # Model-beta FFN-expansion control.
+        self.q_proj = nn.Linear(
+            config.hidden_dim, config.hidden_dim, bias=False,
+        )
+        self.k_proj = nn.Linear(
+            config.engram_dim, config.hidden_dim, bias=False,
+        )
+        self.v_proj = nn.Linear(
+            config.engram_dim, config.hidden_dim, bias=False,
+        )
+        self.o_proj = nn.Linear(
+            config.hidden_dim, config.hidden_dim, bias=False,
+        )
+        # Per-head RMSNorm matching the main attention block's QK-norm
+        # pattern. Stabilizes the dot product when retrieval magnitudes
+        # drift from hidden-state magnitudes.
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        # Residual-zero: o_proj starts at zero so the module is a no-op
+        # at step 0. HarmonyModel._init_weights() runs BEFORE this module
+        # is attached, so we must zero-init here explicitly (same pattern
+        # as EngramANNInjection.conv1d).
+        nn.init.zeros_(self.o_proj.weight)
+
+    def _refresh_table_normalized(self) -> None:
+        """Recompute the normalized-table cache after `self.table` changes."""
+        self.table_normalized = F.normalize(self.table, dim=-1, eps=1e-8)
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata,
+        strict, missing_keys, unexpected_keys, error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata,
+            strict, missing_keys, unexpected_keys, error_msgs,
+        )
+        self._refresh_table_normalized()
+
+    @property
+    def total_entries(self) -> int:
+        return int(self.table.shape[0])
+
+    def retrieve_topk(
+        self, hidden_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Retrieve top-k nearest corpus embeddings per position.
+
+        The top-k gather is non-differentiable, but `topk_sims` is a
+        differentiable function of `retrieval_query_proj.weight`. Adding
+        `topk_sims` as an attention-logit bias in `forward()` preserves
+        gradient flow into the retrieval projection.
+
+        Args:
+            hidden_state: [batch, seq_len, hidden_dim]
+
+        Returns:
+            retrieved:  [batch, seq_len, k_retrieved, engram_dim]
+            topk_sims:  [batch, seq_len, k_retrieved] (raw cosine sims)
+        """
+        q = self.retrieval_query_proj(hidden_state)
+        q_norm = F.normalize(q, dim=-1, eps=1e-8)
+        sims = torch.einsum("ble,te->blt", q_norm, self.table_normalized)
+        topk_sims, topk_idx = sims.topk(self.k_retrieved, dim=-1)
+        retrieved = self.table[topk_idx]
+        return retrieved, topk_sims
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Compute cross-attention residual for the injection layer.
+
+        Args:
+            hidden_state: [batch, seq_len, hidden_dim]
+
+        Returns:
+            [batch, seq_len, hidden_dim] residual. Zero at step 0 due to
+            `o_proj` zero-init; caller adds to hidden state.
+        """
+        B, L, _ = hidden_state.shape
+        H, D, k = self.num_heads, self.head_dim, self.k_retrieved
+
+        retrieved, topk_sims = self.retrieve_topk(hidden_state)
+        retrieved = self.retrieval_norm(retrieved)
+
+        q = self.q_proj(hidden_state).view(B, L, H, D)
+        q = self.q_norm(q)
+        k_tensor = self.k_proj(retrieved).view(B, L, k, H, D)
+        k_tensor = self.k_norm(k_tensor)
+        v_tensor = self.v_proj(retrieved).view(B, L, k, H, D)
+
+        # Per-position cross-attention: [B, L, H, k]
+        scores = torch.einsum("blhd,blkhd->blhk", q, k_tensor) / (D ** 0.5)
+        # Broadcast the retrieval-similarity bias across heads. This is
+        # the only path through which `retrieval_query_proj` receives
+        # gradient from the main loss (topk gather blocks the rest).
+        scores = scores + self.retrieval_bias_weight * topk_sims.unsqueeze(2)
+        attn = F.softmax(scores, dim=-1)
+
+        # [B, L, H, D] -> [B, L, hidden_dim]
+        out = torch.einsum("blhk,blkhd->blhd", attn, v_tensor).reshape(
+            B, L, H * D,
+        )
+        return self.o_proj(out)
+
+    @staticmethod
+    def load_corpus_table(
+        path: str | Path,
+        tensor_name: str = "engram.weight",
+    ) -> torch.Tensor:
+        """Load the corpus table from a safetensors file as a CPU tensor.
+
+        Alias for `EngramANNInjection.load_corpus_table`; duplicated here
+        so callers don't need to know which research-only engram module
+        they're using to load the shared table.
+        """
+        return EngramANNInjection.load_corpus_table(path, tensor_name)

@@ -242,12 +242,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train ct87 model")
     parser.add_argument(
         "--config",
-        choices=["tiny", "target", "tiny_ffn_expanded", "tiny_engram_ann"],
+        choices=[
+            "tiny", "target", "tiny_ffn_expanded",
+            "tiny_engram_ann", "tiny_engram_xattn",
+        ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
              "dense control). 'tiny_engram_ann' enables ZEB-117 Model gamma "
              "(ANN retrieval + gated residual + anti-collapse); requires "
-             "--engram-ann-table.",
+             "--engram-ann-table. 'tiny_engram_xattn' enables ZEB-117 Model "
+             "delta (cross-attention to memory + top-k retrieval); requires "
+             "--engram-xattn-table.",
     )
     parser.add_argument("--data", type=str, default=None, help="Path to pre-tokenized HF dataset")
     parser.add_argument("--val-data", type=str, default=None, help="Path to validation HF dataset (optional)")
@@ -315,6 +320,30 @@ def main() -> None:
              "probability; lambda_ent is dynamically scaled to keep the mean "
              "inside this band. Default '0.1,0.4'. Pass 'off' to disable "
              "dynamic scaling.",
+    )
+
+    # ---- ZEB-117 Model delta: cross-attention engram injection ----
+    parser.add_argument(
+        "--engram-xattn-table", type=str, default=None,
+        help="Path to corpus engram safetensors for Model delta cross-attention "
+             "retrieval. Required when --config=tiny_engram_xattn. Same format "
+             "as --engram-ann-table.",
+    )
+    parser.add_argument(
+        "--engram-xattn-k-retrieved", type=int, default=8,
+        help="Number of top-k corpus neighbors each position attends to "
+             "(default: 8). Memory scales linearly.",
+    )
+    parser.add_argument(
+        "--engram-xattn-retrieval-bias-weight", type=float, default=1.0,
+        help="Weight on the retrieval-similarity bias added to cross-attention "
+             "logits (default: 1.0). Preserves gradient flow into the "
+             "retrieval-query projection (top-k gather is non-differentiable).",
+    )
+    parser.add_argument(
+        "--engram-xattn-num-heads", type=int, default=None,
+        help="Override the cross-attention head count (default: inherit "
+             "config.num_query_heads). hidden_dim must be divisible by this value.",
     )
     parser.add_argument(
         "--latent-intermediate-dim", type=int, default=None,
@@ -487,6 +516,8 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_ffn_expanded()
     elif args.config == "tiny_engram_ann":
         config = HarmonyModelConfig.tiny_engram_ann()
+    elif args.config == "tiny_engram_xattn":
+        config = HarmonyModelConfig.tiny_engram_xattn()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
@@ -515,6 +546,37 @@ def main() -> None:
         if not (0.0 <= args.engram_ann_gate_clamp_min <= 1.0):
             print(
                 "Error: --engram-ann-gate-clamp-min must be in [0.0, 1.0]",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Model delta arg validation (ZEB-117)
+    if args.config == "tiny_engram_xattn":
+        if args.engram_xattn_table is None:
+            print(
+                "Error: --config=tiny_engram_xattn requires --engram-xattn-table "
+                "(path to corpus safetensors table)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.engram_xattn_k_retrieved <= 0:
+            print(
+                "Error: --engram-xattn-k-retrieved must be > 0",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not math.isfinite(args.engram_xattn_retrieval_bias_weight):
+            print(
+                "Error: --engram-xattn-retrieval-bias-weight must be finite",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if (
+            args.engram_xattn_num_heads is not None
+            and args.engram_xattn_num_heads <= 0
+        ):
+            print(
+                "Error: --engram-xattn-num-heads must be > 0 when specified",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -617,6 +679,30 @@ def main() -> None:
                 )
                 sys.exit(1)
             engram_ann_entropy_bounds = (lo, hi)
+
+    # ZEB-117 Model delta: attach cross-attention engram injection.
+    if config.use_xattn_engram:
+        from ct87.engram import EngramCrossAttention
+
+        xattn_table = EngramCrossAttention.load_corpus_table(
+            args.engram_xattn_table,
+        )
+        xattn_module = EngramCrossAttention(
+            config,
+            xattn_table,
+            num_heads=args.engram_xattn_num_heads,
+            k_retrieved=args.engram_xattn_k_retrieved,
+            retrieval_bias_weight=args.engram_xattn_retrieval_bias_weight,
+        ).to(device)
+        model.attach_engram_xattn(xattn_module)
+        print(
+            f"Model delta xattn engram attached: "
+            f"{xattn_module.total_entries:,} table entries, "
+            f"engram_dim={xattn_module.engram_dim}, "
+            f"num_heads={xattn_module.num_heads}, "
+            f"k_retrieved={xattn_module.k_retrieved}, "
+            f"bias_weight={xattn_module.retrieval_bias_weight}"
+        )
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")

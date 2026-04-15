@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _gradient_checkpoint
 
 if TYPE_CHECKING:
-    from ct87.engram import EngramANNInjection
+    from ct87.engram import EngramANNInjection, EngramCrossAttention
 
 
 @dataclass
@@ -39,6 +39,12 @@ class HarmonyModelConfig:
     `EngramANNInjection` module via `attach_engram_ann()` after
     construction. Used by ZEB-117 Model gamma. Configs that set this
     flag are not GGUF-portable.
+
+    The `use_xattn_engram` flag is research-only (not mirrored in Rust):
+    when True, the model expects the training script to attach an
+    `EngramCrossAttention` module via `attach_engram_xattn()` after
+    construction. Used by ZEB-117 Model delta. Configs that set this
+    flag are not GGUF-portable. Mutually exclusive with `use_ann_engram`.
     """
 
     num_layers: int
@@ -59,6 +65,7 @@ class HarmonyModelConfig:
     ct_max_steps: int | None = None
     ct_confidence_threshold: float | None = None
     use_ann_engram: bool = False
+    use_xattn_engram: bool = False
     ffn_dim_overrides: dict[int, int] | None = None
 
     def __post_init__(self) -> None:
@@ -67,6 +74,12 @@ class HarmonyModelConfig:
         Catches silent typos (out-of-range layer indices that would never
         be queried) and invalid dims (<=0) before model construction.
         """
+        if self.use_ann_engram and self.use_xattn_engram:
+            raise ValueError(
+                "use_ann_engram and use_xattn_engram are mutually "
+                "exclusive - only one research-only engram injection "
+                "module can be attached at a time."
+            )
         if self.ffn_dim_overrides is None:
             return
         for layer_idx, dim in self.ffn_dim_overrides.items():
@@ -162,6 +175,23 @@ class HarmonyModelConfig:
         base.ffn_dim_overrides = {base.engram_injection_layer: 1877}
         # Re-validate since we mutated the dataclass after construction.
         base.__post_init__()
+        return base
+
+    @staticmethod
+    def tiny_engram_xattn() -> HarmonyModelConfig:
+        """Model delta - cross-attention to memory + top-k retrieval (ZEB-117).
+
+        Structurally identical to tiny(); differs only in that the model
+        expects an externally-attached `EngramCrossAttention` module
+        instead of constructing the production `EngramGatedResidual`.
+        Not GGUF-portable - no Rust mirror.
+
+        See docs/research/2026-04-14-engram-injection-mechanism-findings.md
+        for the cross-attention injection rationale (s4) and the ZEB-117
+        bake-off design.
+        """
+        base = HarmonyModelConfig.tiny()
+        base.use_xattn_engram = True
         return base
 
     @staticmethod
@@ -405,6 +435,7 @@ class HarmonyModel(nn.Module):
         from ct87.engram import EngramGatedResidual
         self.engram_residual = EngramGatedResidual(config)
         self.engram_ann: EngramANNInjection | None = None
+        self.engram_xattn: EngramCrossAttention | None = None
         # Side channel for the training loop to read the gate after each
         # forward (used for entropy regularization and optional
         # reconstruction loss). Reset every forward that uses the ANN
@@ -437,7 +468,39 @@ class HarmonyModel(nn.Module):
                 "False - set the flag (e.g. via "
                 "HarmonyModelConfig.tiny_engram_ann()) before attaching."
             )
+        if self.engram_xattn is not None:
+            raise ValueError(
+                "Cannot attach Model gamma (ANN) after Model delta "
+                "(cross-attention) - the two research engram modules are "
+                "mutually exclusive."
+            )
         self.engram_ann = module
+
+    def attach_engram_xattn(self, module: EngramCrossAttention) -> None:
+        """Attach a Model-delta cross-attention engram injection module.
+
+        Called by the training script after constructing the model and
+        loading the corpus table. The module is registered as a
+        submodule so its parameters are discovered by the optimizer and
+        its buffers move with `.to(device)`.
+
+        When an xattn module is attached, the forward pass uses it at
+        the configured injection layer and ignores any `engram_embeddings`
+        argument passed to `forward()`.
+        """
+        if not self.config.use_xattn_engram:
+            raise ValueError(
+                "attach_engram_xattn() called but config.use_xattn_engram "
+                "is False - set the flag (e.g. via "
+                "HarmonyModelConfig.tiny_engram_xattn()) before attaching."
+            )
+        if self.engram_ann is not None:
+            raise ValueError(
+                "Cannot attach Model delta (cross-attention) after Model "
+                "gamma (ANN) - the two research engram modules are "
+                "mutually exclusive."
+            )
+        self.engram_xattn = module
 
     def _init_weights(self):
         """Initialize weights matching candle HarmonyModel::new().
@@ -525,9 +588,12 @@ class HarmonyModel(nn.Module):
                 h = layer(h)
 
             # Engram injection at the configured layer.
-            # Model gamma: ANN path takes precedence when attached.
+            # Precedence (mutually exclusive by construction):
+            #   Model delta (xattn) > Model gamma (ANN) > production (embeddings)
             if i == self.config.engram_injection_layer:
-                if self.engram_ann is not None:
+                if self.engram_xattn is not None:
+                    h = h + self.engram_xattn(h)
+                elif self.engram_ann is not None:
                     residual, gate = self.engram_ann(h)
                     h = h + residual
                     self._last_ann_gate = gate
