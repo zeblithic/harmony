@@ -1039,7 +1039,6 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
     gateway_identity: &Option<Arc<harmony_identity::PrivateIdentity>>,
     recipient_resolver: &Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let _ = (gateway_identity, recipient_resolver);
     let mut needs_starttls = false;
     for action in actions {
         match action {
@@ -1244,6 +1243,32 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 let timestamp = msg_timestamp;
                 let rfc822_size = data.len() as u32;
 
+                // Pre-compute a reusable remote-delivery context when all four
+                // ingredients are present. If any is missing (no gateway
+                // identity, no resolver, no publisher, or message
+                // serialization failed), remote delivery is effectively
+                // disabled and every non-local recipient falls through to a
+                // debug log.
+                let remote_ctx: Option<(
+                    Arc<harmony_identity::PrivateIdentity>,
+                    Arc<dyn crate::remote_delivery::RecipientResolver>,
+                    Arc<crate::mailbox_manager::ZenohPublisher>,
+                    Vec<u8>,
+                )> = match (
+                    gateway_identity.as_ref(),
+                    recipient_resolver.as_ref(),
+                    mailbox_publisher.as_ref(),
+                    msg_bytes.as_ref(),
+                ) {
+                    (Some(gw), Some(res), Some(pub_), Some(bytes)) => Some((
+                        Arc::clone(gw),
+                        Arc::clone(res),
+                        Arc::clone(pub_),
+                        bytes.clone(),
+                    )),
+                    _ => None,
+                };
+
                 for recipient_hash in recipients {
                     match imap_store.get_user_by_address(recipient_hash) {
                         Ok(Some(_user)) => {
@@ -1272,10 +1297,52 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                             }
                         }
                         Ok(None) => {
-                            tracing::debug!(
-                                recipient = hex::encode(recipient_hash),
-                                "no local user for recipient"
-                            );
+                            // Recipient is not homed on this gateway. Attempt
+                            // remote delivery via Zenoh if the gateway is
+                            // configured for it. Per-recipient success/failure
+                            // — the overall SMTP transaction still succeeds if
+                            // any recipient (local or remote) succeeded.
+                            if let Some((gw_id, resolver, publisher, bytes)) =
+                                remote_ctx.as_ref()
+                            {
+                                match resolver.resolve(recipient_hash) {
+                                    Some(recipient_identity) => {
+                                        let mut rng = rand_core::OsRng;
+                                        match crate::remote_delivery::seal_for_recipient(
+                                            &mut rng,
+                                            gw_id.as_ref(),
+                                            &recipient_identity,
+                                            bytes,
+                                        ) {
+                                            Ok(sealed) => {
+                                                let hash_hex = hex::encode(recipient_hash);
+                                                publisher.publish_sealed_unicast(
+                                                    hash_hex,
+                                                    Arc::new(sealed),
+                                                );
+                                                tracing::debug!(
+                                                    recipient = %hex::encode(recipient_hash),
+                                                    "remote recipient sealed + published",
+                                                );
+                                            }
+                                            Err(e) => tracing::warn!(
+                                                recipient = %hex::encode(recipient_hash),
+                                                error = %e,
+                                                "seal failed for remote recipient",
+                                            ),
+                                        }
+                                    }
+                                    None => tracing::warn!(
+                                        recipient = %hex::encode(recipient_hash),
+                                        "no announce record for remote recipient; skipping (offline store-and-forward in ZEB-113 PR B)",
+                                    ),
+                                }
+                            } else {
+                                tracing::debug!(
+                                    recipient = %hex::encode(recipient_hash),
+                                    "no local user and remote delivery not configured; dropping",
+                                );
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -3489,6 +3556,90 @@ node_config = "/tmp/test-node.toml"
         // through run / handle_connection / handle_connection_generic /
         // process_async_actions.
         let _ = (gateway_identity, recipient_resolver);
+    }
+
+    #[tokio::test]
+    async fn delivers_remote_warn_and_skip_when_resolver_returns_none() {
+        use crate::remote_delivery::RecipientResolver;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct NullResolver(Arc<AtomicUsize>);
+        impl RecipientResolver for NullResolver {
+            fn resolve(
+                &self,
+                _addr: &harmony_identity::IdentityHash,
+            ) -> Option<harmony_identity::Identity> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        }
+
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db"))
+                .unwrap(),
+        );
+
+        let (publisher, handles) = crate::mailbox_manager::ZenohPublisher::inert_for_test();
+        let publisher = Arc::new(publisher);
+        let mut rng = rand::rngs::OsRng;
+        let gateway_id = Arc::new(harmony_identity::PrivateIdentity::generate(&mut rng));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver: Arc<dyn RecipientResolver> = Arc::new(NullResolver(Arc::clone(&calls)));
+
+        // RFC 5322 blob that translate_inbound can parse successfully.
+        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Tue, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113@local.example>\r\n\r\nhello\r\n";
+
+        // Recipient hash NOT in the imap_store → Ok(None) branch fires.
+        let recipient_hash = [0xAAu8; crate::message::ADDRESS_HASH_LEN];
+
+        let actions = vec![SmtpAction::DeliverToHarmony {
+            recipients: vec![recipient_hash],
+            data: rfc822.to_vec(),
+        }];
+
+        let smtp_config = SmtpConfig {
+            domain: "local".to_string(),
+            mx_host: "mail.local".to_string(),
+            max_message_size: 10 * 1024 * 1024,
+            max_recipients: 100,
+            tls_available: false,
+        };
+        let mut session = SmtpSession::new(smtp_config);
+        let mut writer = Vec::<u8>::new();
+        let mut spf_result = crate::spam::SpfResult::None;
+
+        process_async_actions(
+            &actions,
+            &mut session,
+            &mut writer,
+            &store,
+            &None,
+            "local",
+            smtp_test_dir.path(),
+            &mut spf_result,
+            1000, // reject_threshold high → no spam rejection
+            &None,
+            &Some(Arc::clone(&publisher)),
+            &Some(Arc::clone(&gateway_id)),
+            &Some(resolver),
+        )
+        .await
+        .expect("process_async_actions should succeed even when remote resolver skips");
+
+        // Resolver was consulted exactly once (for bob).
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Publisher recorded NO sealed-unicast publish.
+        let sealed = handles
+            .sealed_unicast
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(
+            sealed.is_empty(),
+            "no publish should occur when resolver returns None; got {} captures",
+            sealed.len(),
+        );
     }
 }
 
