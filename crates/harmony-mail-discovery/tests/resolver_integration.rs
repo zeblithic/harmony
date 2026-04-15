@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use harmony_mail_discovery::claim::{canonical_cbor, MasterPubkey};
+use harmony_mail_discovery::dns::DnsError;
 use harmony_mail_discovery::http::HttpResponse;
 use harmony_mail_discovery::resolver::{
     DefaultEmailResolver, EmailResolver, ResolveOutcome, ResolverConfig,
@@ -96,7 +97,11 @@ async fn cold_path_resolves_and_caches() {
     );
 }
 
-use harmony_mail_discovery::dns::DnsError;
+// Coverage gap tracked for later: `DnsFetchError::UnsupportedVersion` and
+// `DnsFetchError::MultipleRecords` map to `DomainDoesNotParticipate` and
+// `Transient("dns_multiple_records")` respectively in resolver.rs but are
+// only exercised via dns.rs parser unit tests today. Add resolver-layer
+// assertions when Task 18 expands soft-fail / safety-valve coverage.
 
 #[tokio::test]
 async fn dns_nxdomain_returns_domain_does_not_participate() {
@@ -222,7 +227,9 @@ async fn revocation_bootstrap_failure_fails_closed() {
             body: canonical_cbor(&claim).unwrap(),
         }),
     );
-    // Revocation URL returns 5xx → no prior cache → fail closed.
+    // The claim response above is scripted for completeness, but should
+    // never be consumed: `ensure_revocation_view` runs before claim fetch,
+    // and it fails closed on a 5xx with no prior cache.
     http.set(
         &harmony_mail_discovery::http::revocation_url(&d.domain),
         Ok(HttpResponse {
