@@ -95,3 +95,143 @@ async fn cold_path_resolves_and_caches() {
         "no new HTTP calls on cache hit"
     );
 }
+
+use harmony_mail_discovery::dns::DnsError;
+
+#[tokio::test]
+async fn dns_nxdomain_returns_domain_does_not_participate() {
+    let (_d, dns, _http, _time, resolver) = setup();
+    dns.set("_harmony.q8.fyi", Err(DnsError::NoRecord));
+    assert_eq!(
+        resolver.resolve("alice", "q8.fyi").await,
+        ResolveOutcome::DomainDoesNotParticipate,
+    );
+}
+
+#[tokio::test]
+async fn dns_nxdomain_within_soft_fail_window_returns_transient() {
+    let (d, dns, http, time, resolver) = setup();
+    let mut rng = OsRng;
+    let sk = d.mint_signing_key(&mut rng, NOW - 100, NOW + 90 * 86_400);
+    let claim = ClaimBuilder::new(&d, &sk, NOW).build();
+    // First, succeed once so the domain is "seen".
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    http.set(
+        &harmony_mail_discovery::http::claim_url(&d.domain, &claim.payload.hashed_local_part),
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&claim).unwrap(),
+        }),
+    );
+    http.set_not_found(&harmony_mail_discovery::http::revocation_url(&d.domain));
+    assert!(matches!(
+        resolver.resolve("alice", "q8.fyi").await,
+        ResolveOutcome::Resolved(_)
+    ));
+
+    // Now expire the master-key cache and flip DNS to NXDOMAIN.
+    time.advance(2 * 3600); // past 1h DNS TTL
+    dns.set("_harmony.q8.fyi", Err(DnsError::NoRecord));
+    match resolver.resolve("alice", "q8.fyi").await {
+        ResolveOutcome::Transient { reason } => {
+            assert_eq!(reason, "dns_no_record_soft_fail");
+        }
+        other => panic!("expected Transient soft-fail, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dns_timeout_returns_transient() {
+    let (_d, dns, _http, _time, resolver) = setup();
+    dns.set(
+        "_harmony.q8.fyi",
+        Err(DnsError::Transient("timeout".into())),
+    );
+    match resolver.resolve("alice", "q8.fyi").await {
+        ResolveOutcome::Transient { reason } => assert_eq!(reason, "dns_error"),
+        other => panic!("expected Transient, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn http_404_returns_user_unknown_and_is_negative_cached() {
+    let (d, dns, http, _time, resolver) = setup();
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    // Claim 404 — but we still need revocation list to bootstrap.
+    http.set_not_found(&harmony_mail_discovery::http::revocation_url(&d.domain));
+    // The claim URL is for "alice" so we don't set it — default is 404.
+    let out = resolver.resolve("alice", "q8.fyi").await;
+    assert_eq!(out, ResolveOutcome::UserUnknown);
+
+    let pre_http = http.call_count();
+    let _ = resolver.resolve("alice", "q8.fyi").await;
+    // Re-query hits negative cache, no new HTTP call for the claim URL.
+    assert_eq!(http.call_count(), pre_http, "negative cache short-circuits");
+}
+
+#[tokio::test]
+async fn http_500_returns_transient() {
+    let (d, dns, http, _time, resolver) = setup();
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    http.set_not_found(&harmony_mail_discovery::http::revocation_url(&d.domain));
+    // FakeHttpClient matches on exact URL; compute the exact hash for alice.
+    let h = harmony_mail_discovery::claim::hashed_local_part("alice", &d.salt);
+    http.set(
+        &harmony_mail_discovery::http::claim_url(&d.domain, &h),
+        Ok(HttpResponse {
+            status: 500,
+            body: vec![],
+        }),
+    );
+    match resolver.resolve("alice", "q8.fyi").await {
+        ResolveOutcome::Transient { reason } => assert_eq!(reason, "http_error"),
+        other => panic!("expected Transient, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn http_malformed_cbor_returns_transient() {
+    let (d, dns, http, _time, resolver) = setup();
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    http.set_not_found(&harmony_mail_discovery::http::revocation_url(&d.domain));
+    let h = harmony_mail_discovery::claim::hashed_local_part("alice", &d.salt);
+    http.set(
+        &harmony_mail_discovery::http::claim_url(&d.domain, &h),
+        Ok(HttpResponse {
+            status: 200,
+            body: vec![0xff, 0xff, 0xff],
+        }),
+    );
+    match resolver.resolve("alice", "q8.fyi").await {
+        ResolveOutcome::Transient { reason } => assert_eq!(reason, "claim_parse"),
+        other => panic!("expected Transient, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn revocation_bootstrap_failure_fails_closed() {
+    let (d, dns, http, _time, resolver) = setup();
+    let mut rng = OsRng;
+    let sk = d.mint_signing_key(&mut rng, NOW - 100, NOW + 90 * 86_400);
+    let claim = ClaimBuilder::new(&d, &sk, NOW).build();
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    http.set(
+        &harmony_mail_discovery::http::claim_url(&d.domain, &claim.payload.hashed_local_part),
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&claim).unwrap(),
+        }),
+    );
+    // Revocation URL returns 5xx → no prior cache → fail closed.
+    http.set(
+        &harmony_mail_discovery::http::revocation_url(&d.domain),
+        Ok(HttpResponse {
+            status: 500,
+            body: vec![],
+        }),
+    );
+    match resolver.resolve("alice", "q8.fyi").await {
+        ResolveOutcome::Transient { reason } => assert_eq!(reason, "revocation_bootstrap_failed"),
+        other => panic!("expected bootstrap-closed Transient, got {other:?}"),
+    }
+}
