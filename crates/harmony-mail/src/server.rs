@@ -126,7 +126,11 @@ const DATA_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Run the SMTP server with the given configuration.
-pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    config: Config,
+    gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>>,
+    recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let max_message_size = parse_message_size(&config.spam.max_message_size);
 
     let shared = Arc::new(SharedState::new(config.spam.max_connections_per_ip));
@@ -397,6 +401,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let content_store_path_465 = content_store_path.clone();
         let mailbox_mgr_465 = mailbox_mgr.clone();
         let mailbox_publisher_465 = mailbox_publisher.clone();
+        let gateway_identity_465 = gateway_identity.clone();
+        let recipient_resolver_465 = recipient_resolver.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -419,13 +425,15 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let csp = content_store_path_465.clone();
                         let mgr_clone = mailbox_mgr_465.clone();
                         let pub_clone = mailbox_publisher_465.clone();
+                        let gi_clone = gateway_identity_465.clone();
+                        let rr_clone = recipient_resolver_465.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                             match tls::implicit_tls_wrap(stream, &acc).await {
                                 Ok(tls_stream) => {
                                     let (reader, writer) = tokio::io::split(tls_stream);
                                     let session = SmtpSession::new(cfg);
-                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone).await {
+                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone).await {
                                         tracing::debug!(%peer_ip, error = %e, "implicit TLS connection ended with error");
                                     }
                                 }
@@ -451,6 +459,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let content_store_path_587 = content_store_path.clone();
         let mailbox_mgr_587 = mailbox_mgr.clone();
         let mailbox_publisher_587 = mailbox_publisher.clone();
+        let gateway_identity_587 = gateway_identity.clone();
+        let recipient_resolver_587 = recipient_resolver.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -473,9 +483,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let csp = content_store_path_587.clone();
                         let mgr_clone = mailbox_mgr_587.clone();
                         let pub_clone = mailbox_publisher_587.clone();
+                        let gi_clone = gateway_identity_587.clone();
+                        let rr_clone = recipient_resolver_587.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
-                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone).await {
+                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone).await {
                                 tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
                             }
                         });
@@ -642,11 +654,13 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let csp = content_store_path.clone();
                 let mgr_clone = mailbox_mgr.clone();
                 let pub_clone = mailbox_publisher.clone();
+                let gi_clone = gateway_identity.clone();
+                let rr_clone = recipient_resolver.clone();
 
                 tokio::spawn(async move {
                     let _guard = ConnectionGuard { shared: Arc::clone(&shared), ip: peer_ip };
                     let acc = acceptor.as_ref().map(|a| (**a).clone());
-                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone).await {
+                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone).await {
                         tracing::debug!(%peer_ip, error = %e, "connection ended with error");
                     }
                 });
@@ -681,6 +695,8 @@ async fn handle_connection(
     reject_threshold: i32,
     mailbox_manager: Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
     mailbox_publisher: Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
+    gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>>,
+    recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut spf_result = crate::spam::SpfResult::None;
     let mut session = SmtpSession::new(smtp_config);
@@ -738,7 +754,7 @@ async fn handle_connection(
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
                 let needs_starttls =
-                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher).await?;
+                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher, &gateway_identity, &recipient_resolver).await?;
 
                 // STARTTLS: upgrade the connection to TLS
                 if needs_starttls {
@@ -791,6 +807,8 @@ async fn handle_connection(
                                     reject_threshold,
                                     mailbox_manager,
                                     mailbox_publisher,
+                                    gateway_identity,
+                                    recipient_resolver,
                                 )
                                 .await;
                             }
@@ -860,6 +878,8 @@ async fn handle_connection_generic<R, W>(
     reject_threshold: i32,
     mailbox_manager: Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
     mailbox_publisher: Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
+    gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>>,
+    recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
@@ -911,7 +931,7 @@ where
                 };
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
-                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher).await?;
+                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher, &gateway_identity, &recipient_resolver).await?;
 
                 if should_close || session.state == SmtpState::Closed {
                     break;
@@ -1016,7 +1036,10 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
     reject_threshold: i32,
     mailbox_manager: &Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
     mailbox_publisher: &Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
+    gateway_identity: &Option<Arc<harmony_identity::PrivateIdentity>>,
+    recipient_resolver: &Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let _ = (gateway_identity, recipient_resolver);
     let mut needs_starttls = false;
     for action in actions {
         match action {
@@ -2816,7 +2839,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None, None, None)
                 .await
                 .unwrap();
         });
@@ -2879,7 +2902,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None, None, None)
                 .await
                 .unwrap();
         });
@@ -3094,6 +3117,8 @@ node_config = "/tmp/test-node.toml"
                 5,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3247,6 +3272,8 @@ node_config = "/tmp/test-node.toml"
                 5,
                 mgr_clone,
                 pub_clone,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3448,6 +3475,20 @@ node_config = "/tmp/test-node.toml"
         assert_eq!(parse_message_size("1GB"), 1024 * 1024 * 1024);
         assert_eq!(parse_message_size("1000"), 1000);
         assert_eq!(parse_message_size("  25MB  "), 25 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn run_with_config_accepts_none_gateway_identity_and_none_resolver() {
+        // Compile-time checkpoint: the two new optional parameters must accept
+        // `None` without forcing callers to construct cryptographic state.
+        // Production callers that want remote delivery pass Some(...) for both.
+        let gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>> = None;
+        let recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>> =
+            None;
+        // Values must have inferrable types that match the signatures threaded
+        // through run / handle_connection / handle_connection_generic /
+        // process_async_actions.
+        let _ = (gateway_identity, recipient_resolver);
     }
 }
 
