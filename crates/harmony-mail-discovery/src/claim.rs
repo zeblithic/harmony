@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Every byte range covered by a signature is the canonical-CBOR encoding
 /// of the payload struct. Signers encode *once* and keep that byte slice
 /// until the signature is produced; verifiers re-encode and compare.
-pub fn canonical_cbor<T: Serialize>(value: &T) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
+pub fn canonical_cbor<T: Serialize>(
+    value: &T,
+) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
     let mut buf = Vec::new();
     ciborium::ser::into_writer(value, &mut buf)?;
     Ok(buf)
@@ -36,7 +38,8 @@ mod serde_byte_array {
                 write!(f, "a byte string of exactly {N} bytes")
             }
             fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<[u8; N], E> {
-                v.try_into().map_err(|_| E::custom(format!("expected {N} bytes, got {}", v.len())))
+                v.try_into()
+                    .map_err(|_| E::custom(format!("expected {N} bytes, got {}", v.len())))
             }
             fn visit_borrowed_bytes<E: serde::de::Error>(self, v: &'de [u8]) -> Result<[u8; N], E> {
                 self.visit_bytes(v)
@@ -291,12 +294,7 @@ impl SignedClaim {
         }
 
         // 3. hashed_local_part consistency.
-        let local_part = self
-            .payload
-            .email
-            .split('@')
-            .next()
-            .unwrap_or("");
+        let local_part = self.payload.email.split('@').next().unwrap_or("");
         let computed = hashed_local_part(local_part, &domain_record.domain_salt);
         if computed != self.payload.hashed_local_part {
             return Err(VerifyError::HashedLocalPartMismatch);
@@ -304,11 +302,12 @@ impl SignedClaim {
 
         // 4. Master signature over the cert.
         let master_vk = match domain_record.master_pubkey {
-            MasterPubkey::Ed25519(bytes) => VerifyingKey::from_bytes(&bytes)
-                .map_err(|_| VerifyError::CertSignatureInvalid)?,
+            MasterPubkey::Ed25519(bytes) => {
+                VerifyingKey::from_bytes(&bytes).map_err(|_| VerifyError::CertSignatureInvalid)?
+            }
         };
-        let cert_bytes = canonical_cbor(&self.cert.signable())
-            .map_err(|_| VerifyError::EncodingFailed)?;
+        let cert_bytes =
+            canonical_cbor(&self.cert.signable()).map_err(|_| VerifyError::EncodingFailed)?;
         let master_sig = match self.cert.master_signature {
             Signature::Ed25519(s) => EdSignature::from_bytes(&s),
         };
@@ -338,11 +337,12 @@ impl SignedClaim {
 
         // 7. Claim signature under the signing key.
         let signing_vk = match self.cert.signing_pubkey {
-            SigningPubkey::Ed25519(bytes) => VerifyingKey::from_bytes(&bytes)
-                .map_err(|_| VerifyError::ClaimSignatureInvalid)?,
+            SigningPubkey::Ed25519(bytes) => {
+                VerifyingKey::from_bytes(&bytes).map_err(|_| VerifyError::ClaimSignatureInvalid)?
+            }
         };
-        let payload_bytes = canonical_cbor(&self.payload)
-            .map_err(|_| VerifyError::EncodingFailed)?;
+        let payload_bytes =
+            canonical_cbor(&self.payload).map_err(|_| VerifyError::EncodingFailed)?;
         let claim_sig = match self.claim_signature {
             Signature::Ed25519(s) => EdSignature::from_bytes(&s),
         };
@@ -490,7 +490,9 @@ mod tests {
         let claim = ClaimBuilder::new(&d, &sk, NOW)
             .payload_domain_override("attacker.example")
             .build();
-        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        let err = claim
+            .verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .unwrap_err();
         assert_eq!(err, VerifyError::DomainMismatch);
     }
 
@@ -500,7 +502,13 @@ mod tests {
         let (d, sk) = fresh(NOW);
         let claim = ClaimBuilder::new(&d, &sk, NOW).build();
         let err = claim
-            .verify_against("other.example", &d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .verify_against(
+                "other.example",
+                &d.record(),
+                &RevocationView::empty(),
+                NOW,
+                TOLERANCE,
+            )
             .unwrap_err();
         assert_eq!(err, VerifyError::DomainMismatch);
     }
@@ -512,7 +520,9 @@ mod tests {
         let claim = ClaimBuilder::new(&d, &sk, NOW)
             .hashed_local_part_override([0xaau8; 32])
             .build();
-        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        let err = claim
+            .verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .unwrap_err();
         assert_eq!(err, VerifyError::HashedLocalPartMismatch);
     }
 
@@ -520,8 +530,12 @@ mod tests {
     #[test]
     fn rejects_tampered_claim_signature() {
         let (d, sk) = fresh(NOW);
-        let claim = ClaimBuilder::new(&d, &sk, NOW).tamper_claim_signature().build();
-        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        let claim = ClaimBuilder::new(&d, &sk, NOW)
+            .tamper_claim_signature()
+            .build();
+        let err = claim
+            .verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .unwrap_err();
         assert_eq!(err, VerifyError::ClaimSignatureInvalid);
     }
 
@@ -533,8 +547,13 @@ mod tests {
         // valid_from in the far future, outside tolerance.
         let sk = d.mint_signing_key(&mut rng, NOW + 10_000, NOW + 90 * 86_400);
         let claim = ClaimBuilder::new(&d, &sk, NOW).build();
-        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
-        assert!(matches!(err, VerifyError::CertNotYetValid { .. }), "{err:?}");
+        let err = claim
+            .verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .unwrap_err();
+        assert!(
+            matches!(err, VerifyError::CertNotYetValid { .. }),
+            "{err:?}"
+        );
     }
 
     #[cfg(feature = "test-support")]
@@ -544,7 +563,9 @@ mod tests {
         let d = TestDomain::new(&mut rng, "q8.fyi");
         let sk = d.mint_signing_key(&mut rng, NOW - 200_000, NOW - 100_000);
         let claim = ClaimBuilder::new(&d, &sk, NOW - 150_000).build();
-        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        let err = claim
+            .verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .unwrap_err();
         assert!(matches!(err, VerifyError::CertExpired { .. }), "{err:?}");
     }
 
@@ -556,7 +577,9 @@ mod tests {
             .issued_at(NOW - 10 * 86_400)
             .expires_at(NOW - 3 * 86_400) // 3 days past, outside tolerance
             .build();
-        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        let err = claim
+            .verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .unwrap_err();
         assert!(matches!(err, VerifyError::ClaimExpired { .. }), "{err:?}");
     }
 
@@ -568,7 +591,9 @@ mod tests {
         let mut revocations = RevocationView::empty();
         // Revoked 1000 seconds before claim issuance.
         revocations.insert(sk.cert.signing_key_id, NOW - 1000);
-        let err = claim.verify(&d.record(), &revocations, NOW, TOLERANCE).unwrap_err();
+        let err = claim
+            .verify(&d.record(), &revocations, NOW, TOLERANCE)
+            .unwrap_err();
         assert!(matches!(err, VerifyError::CertRevoked { .. }), "{err:?}");
     }
 
@@ -576,10 +601,14 @@ mod tests {
     #[test]
     fn grandfathers_claim_issued_before_revocation() {
         let (d, sk) = fresh(NOW);
-        let claim = ClaimBuilder::new(&d, &sk, NOW).issued_at(NOW - 10_000).build();
+        let claim = ClaimBuilder::new(&d, &sk, NOW)
+            .issued_at(NOW - 10_000)
+            .build();
         let mut revocations = RevocationView::empty();
         revocations.insert(sk.cert.signing_key_id, NOW - 1000); // revoked AFTER claim issuance
-        let binding = claim.verify(&d.record(), &revocations, NOW, TOLERANCE).expect("grandfathered");
+        let binding = claim
+            .verify(&d.record(), &revocations, NOW, TOLERANCE)
+            .expect("grandfathered");
         assert_eq!(binding.signing_key_id, sk.cert.signing_key_id);
     }
 
@@ -588,7 +617,9 @@ mod tests {
     fn rejects_unsupported_claim_version() {
         let (d, sk) = fresh(NOW);
         let claim = ClaimBuilder::new(&d, &sk, NOW).payload_version(99).build();
-        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        let err = claim
+            .verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .unwrap_err();
         assert_eq!(err, VerifyError::UnsupportedVersion(99));
     }
 
@@ -600,7 +631,9 @@ mod tests {
         // valid_from is 30s in the future — inside 60s tolerance.
         let sk = d.mint_signing_key(&mut rng, NOW + 30, NOW + 86_400);
         let claim = ClaimBuilder::new(&d, &sk, NOW + 30).build();
-        claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).expect("accepts with tolerance");
+        claim
+            .verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .expect("accepts with tolerance");
     }
 
     #[cfg(feature = "test-support")]
@@ -610,6 +643,8 @@ mod tests {
         let claim = ClaimBuilder::new(&d, &sk, NOW - 100)
             .expires_at(NOW - 30) // expired 30s ago
             .build();
-        claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).expect("accepts with tolerance");
+        claim
+            .verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .expect("accepts with tolerance");
     }
 }

@@ -74,9 +74,9 @@ fn parse_single_harmony_txt(txt: &str) -> Result<DomainRecord, DnsFetchError> {
         if field.is_empty() {
             continue;
         }
-        let (name, value) = field.split_once('=').ok_or_else(|| {
-            DnsFetchError::Malformed(format!("field missing '=': {field}"))
-        })?;
+        let (name, value) = field
+            .split_once('=')
+            .ok_or_else(|| DnsFetchError::Malformed(format!("field missing '=': {field}")))?;
         match name.trim() {
             "v" => {
                 if value.trim() != "harmony1" {
@@ -85,9 +85,9 @@ fn parse_single_harmony_txt(txt: &str) -> Result<DomainRecord, DnsFetchError> {
                 version = Some(1);
             }
             "k" => {
-                let bytes = URL_SAFE_NO_PAD.decode(value.trim()).map_err(|e| {
-                    DnsFetchError::Malformed(format!("k base64url: {e}"))
-                })?;
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(value.trim())
+                    .map_err(|e| DnsFetchError::Malformed(format!("k base64url: {e}")))?;
                 if bytes.len() != 32 {
                     return Err(DnsFetchError::Malformed(format!(
                         "k length {} != 32",
@@ -99,9 +99,9 @@ fn parse_single_harmony_txt(txt: &str) -> Result<DomainRecord, DnsFetchError> {
                 k = Some(arr);
             }
             "salt" => {
-                let bytes = URL_SAFE_NO_PAD.decode(value.trim()).map_err(|e| {
-                    DnsFetchError::Malformed(format!("salt base64url: {e}"))
-                })?;
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(value.trim())
+                    .map_err(|e| DnsFetchError::Malformed(format!("salt base64url: {e}")))?;
                 if bytes.len() != 16 {
                     return Err(DnsFetchError::Malformed(format!(
                         "salt length {} != 16",
@@ -122,13 +122,11 @@ fn parse_single_harmony_txt(txt: &str) -> Result<DomainRecord, DnsFetchError> {
         }
     }
     Ok(DomainRecord {
-        version: version
-            .ok_or_else(|| DnsFetchError::Malformed("missing v".into()))?,
+        version: version.ok_or_else(|| DnsFetchError::Malformed("missing v".into()))?,
         master_pubkey: MasterPubkey::Ed25519(
             k.ok_or_else(|| DnsFetchError::Malformed("missing k".into()))?,
         ),
-        domain_salt: salt
-            .ok_or_else(|| DnsFetchError::Malformed("missing salt".into()))?,
+        domain_salt: salt.ok_or_else(|| DnsFetchError::Malformed("missing salt".into()))?,
         alg: alg.ok_or_else(|| DnsFetchError::Malformed("missing alg".into()))?,
     })
 }
@@ -220,7 +218,10 @@ mod tests {
     fn rejects_unknown_v_version() {
         let txt = "v=harmony2; k=AA; salt=AA; alg=ed25519".to_string();
         let err = parse_harmony_txts(&[txt]).unwrap_err();
-        assert!(matches!(err, DnsFetchError::UnsupportedVersion(_)), "{err:?}");
+        assert!(
+            matches!(err, DnsFetchError::UnsupportedVersion(_)),
+            "{err:?}"
+        );
     }
 
     #[test]

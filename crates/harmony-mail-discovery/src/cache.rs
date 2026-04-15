@@ -141,7 +141,11 @@ impl ResolverCaches {
         expires_at: u64,
         _recency_hint: u64,
     ) {
-        let entry = CacheEntry { value, expires_at, recency: self.recency.tick() };
+        let entry = CacheEntry {
+            value,
+            expires_at,
+            recency: self.recency.tick(),
+        };
         self.claim.insert(key, entry);
         self.enforce_bound(&self.claim, self.limits.claim_max);
     }
@@ -162,7 +166,11 @@ impl ResolverCaches {
         cert: SigningKeyCert,
         expires_at: u64,
     ) {
-        let entry = CacheEntry { value: cert, expires_at, recency: self.recency.tick() };
+        let entry = CacheEntry {
+            value: cert,
+            expires_at,
+            recency: self.recency.tick(),
+        };
         self.signing_key.insert(key, entry);
         self.enforce_bound(&self.signing_key, self.limits.signing_key_max);
     }
@@ -182,7 +190,11 @@ impl ResolverCaches {
     // --- Master-key (DomainRecord) cache ---
 
     pub fn put_master_key(&self, domain: &str, rec: DomainRecord, expires_at: u64) {
-        let entry = CacheEntry { value: rec, expires_at, recency: self.recency.tick() };
+        let entry = CacheEntry {
+            value: rec,
+            expires_at,
+            recency: self.recency.tick(),
+        };
         self.master_key.insert(domain.to_ascii_lowercase(), entry);
         self.enforce_bound(&self.master_key, self.limits.master_key_max);
     }
@@ -204,7 +216,11 @@ impl ResolverCaches {
         expires_at: u64,
         last_refreshed: u64,
     ) {
-        let entry = CacheEntry { value: view, expires_at, recency: self.recency.tick() };
+        let entry = CacheEntry {
+            value: view,
+            expires_at,
+            recency: self.recency.tick(),
+        };
         let d = domain.to_ascii_lowercase();
         self.revocation.insert(d.clone(), entry);
         self.revocation_last_refreshed.insert(d, last_refreshed);
@@ -217,17 +233,26 @@ impl ResolverCaches {
     pub fn get_revocation(
         &self,
         domain: &str,
-    ) -> Option<(RevocationView, /* expires_at */ u64, /* last_refreshed */ u64)> {
+    ) -> Option<(
+        RevocationView,
+        /* expires_at */ u64,
+        /* last_refreshed */ u64,
+    )> {
         let d = domain.to_ascii_lowercase();
         let e = self.revocation.get(&d)?;
-        let last_refreshed = self.revocation_last_refreshed.get(&d).map(|v| *v).unwrap_or(0);
+        let last_refreshed = self
+            .revocation_last_refreshed
+            .get(&d)
+            .map(|v| *v)
+            .unwrap_or(0);
         Some((e.value.clone(), e.expires_at, last_refreshed))
     }
 
     // --- Domain last-seen (72h soft-fail window) ---
 
     pub fn mark_domain_seen(&self, domain: &str, now: u64) {
-        self.domain_last_seen.insert(domain.to_ascii_lowercase(), now);
+        self.domain_last_seen
+            .insert(domain.to_ascii_lowercase(), now);
     }
 
     pub fn was_domain_seen_within(&self, domain: &str, now: u64, window_secs: u64) -> bool {
@@ -270,8 +295,10 @@ impl ResolverCaches {
         if map.len() <= max {
             return;
         }
-        let mut pairs: Vec<_> =
-            map.iter().map(|e| (e.value().recency, e.key().clone())).collect();
+        let mut pairs: Vec<_> = map
+            .iter()
+            .map(|e| (e.value().recency, e.key().clone()))
+            .collect();
         pairs.sort_by_key(|(r, _)| *r);
         let excess = map.len().saturating_sub(max);
         for (_, k) in pairs.into_iter().take(excess) {
@@ -351,13 +378,19 @@ mod tests {
         let claim = build_claim();
         caches.put_claim(key.clone(), claim, 1000, 100);
         assert!(caches.get_claim(&key, 999).is_some());
-        assert!(caches.get_claim(&key, 1000).is_none(), "expires_at is exclusive");
+        assert!(
+            caches.get_claim(&key, 1000).is_none(),
+            "expires_at is exclusive"
+        );
         assert!(caches.get_claim(&key, 1500).is_none());
     }
 
     #[test]
     fn claim_cache_lru_bound_evicts_oldest() {
-        let limits = CacheLimits { claim_max: 3, ..CacheLimits::default() };
+        let limits = CacheLimits {
+            claim_max: 3,
+            ..CacheLimits::default()
+        };
         let caches = ResolverCaches::new(limits);
         let claim = build_claim();
         for i in 0..5u8 {
@@ -365,10 +398,18 @@ mod tests {
             caches.put_claim(key, claim.clone(), 10_000, i as u64);
         }
         // After inserting 5, only the 3 most recent (i=2,3,4) should remain.
-        assert!(caches.get_claim(&("q8.fyi".to_string(), [0; 32]), 100).is_none());
-        assert!(caches.get_claim(&("q8.fyi".to_string(), [1; 32]), 100).is_none());
-        assert!(caches.get_claim(&("q8.fyi".to_string(), [2; 32]), 100).is_some());
-        assert!(caches.get_claim(&("q8.fyi".to_string(), [4; 32]), 100).is_some());
+        assert!(caches
+            .get_claim(&("q8.fyi".to_string(), [0; 32]), 100)
+            .is_none());
+        assert!(caches
+            .get_claim(&("q8.fyi".to_string(), [1; 32]), 100)
+            .is_none());
+        assert!(caches
+            .get_claim(&("q8.fyi".to_string(), [2; 32]), 100)
+            .is_some());
+        assert!(caches
+            .get_claim(&("q8.fyi".to_string(), [4; 32]), 100)
+            .is_some());
     }
 
     #[test]

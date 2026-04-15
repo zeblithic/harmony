@@ -37,3 +37,4 @@ hex.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 rand_core = { workspace = true, features = ["std", "getrandom"] }
+base64 = { workspace = true }
