@@ -63,7 +63,7 @@ These were checked during plan authoring but should be re-verified in the implem
 
 - [ ] **Verify build is green on branch base:**
 
-Run: `cd /Users/zeblith/work/zeblithic/harmony/.claude/worktrees/zeb-113-smtp-remote-delivery && cargo build -p harmony-mail -p harmony-zenoh`
+Run: `cd $REPO_ROOT && cargo build -p harmony-mail -p harmony-zenoh`
 Expected: clean build, warnings OK.
 
 - [ ] **Verify `Identity::from_public_keys` signature hasn't drifted:**
@@ -159,7 +159,7 @@ Expected: `test result: ok. 2 passed`.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony/.claude/worktrees/zeb-113-smtp-remote-delivery
+cd $REPO_ROOT
 git add crates/harmony-zenoh/src/namespace.rs
 git commit -m "feat(zenoh): add msg/v1/unicast namespace for sealed sender-to-recipient messages (ZEB-113)"
 ```
@@ -1182,7 +1182,7 @@ git commit -m "test(mail): integration test for ZEB-113 end-to-end sealed unicas
 Run:
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony/.claude/worktrees/zeb-113-smtp-remote-delivery
+cd $REPO_ROOT
 grep -E '^(harmony-discovery|harmony-identity|harmony-zenoh|hex|rand|rand_core|tokio-util)' crates/harmony-mail/Cargo.toml
 ```
 
@@ -1239,7 +1239,7 @@ git commit -m "docs(mail): document ZEB-113 PR A remote delivery branch in serve
 - [ ] **Push branch and open PR against `main`:**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony/.claude/worktrees/zeb-113-smtp-remote-delivery
+cd $REPO_ROOT
 git push -u origin zeb-113-smtp-remote-delivery
 gh pr create --title "feat(mail): SMTP remote delivery over Zenoh (ZEB-113 PR A)" \
   --body "$(cat <<'EOF'

@@ -1264,6 +1264,12 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                 // model (mailboxes are global, not per-user). Multi-user
                 // mailbox isolation is tracked separately in ZEB-112.
                 let mut delivered_to: Vec<[u8; crate::message::ADDRESS_HASH_LEN]> = Vec::new();
+                // Tracks whether at least one remote recipient was sealed + published
+                // via the unicast keyspace. Kept separate from `delivered_to`, which
+                // only carries local recipients (used below to drive the raw-mail
+                // publish loop). `success` for the SMTP reply is `local || remote`
+                // so remote-only transactions return 250 instead of 451.
+                let mut remote_accepted = false;
                 let timestamp = msg_timestamp;
                 let rfc822_size = data.len() as u32;
 
@@ -1332,28 +1338,43 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                             {
                                 match resolver.resolve(recipient_hash) {
                                     Some(recipient_identity) => {
-                                        let mut rng = rand_core::OsRng;
-                                        match crate::remote_delivery::seal_for_recipient(
-                                            &mut rng,
-                                            gw_id.as_ref(),
-                                            &recipient_identity,
-                                            *bytes,
-                                        ) {
-                                            Ok(sealed) => {
-                                                publisher.publish_sealed_unicast(
-                                                    hash_hex.clone(),
-                                                    Arc::new(sealed),
-                                                );
-                                                tracing::debug!(
+                                        // Defensive guard: the resolver's contract
+                                        // requires the returned identity to match the
+                                        // requested address_hash. A mismatch means we'd
+                                        // publish to the correct topic but seal to the
+                                        // wrong public keys — the subscriber could not
+                                        // decrypt, silent data loss. Skip and warn.
+                                        if recipient_identity.address_hash != *recipient_hash {
+                                            tracing::warn!(
+                                                expected = %hash_hex,
+                                                got = %hex::encode(recipient_identity.address_hash),
+                                                "resolver returned identity with mismatched address_hash; skipping",
+                                            );
+                                        } else {
+                                            let mut rng = rand_core::OsRng;
+                                            match crate::remote_delivery::seal_for_recipient(
+                                                &mut rng,
+                                                gw_id.as_ref(),
+                                                &recipient_identity,
+                                                *bytes,
+                                            ) {
+                                                Ok(sealed) => {
+                                                    publisher.publish_sealed_unicast(
+                                                        hash_hex.clone(),
+                                                        Arc::new(sealed),
+                                                    );
+                                                    remote_accepted = true;
+                                                    tracing::debug!(
+                                                        recipient = %hash_hex,
+                                                        "remote recipient sealed + published",
+                                                    );
+                                                }
+                                                Err(e) => tracing::warn!(
                                                     recipient = %hash_hex,
-                                                    "remote recipient sealed + published",
-                                                );
+                                                    error = %e,
+                                                    "seal failed for remote recipient",
+                                                ),
                                             }
-                                            Err(e) => tracing::warn!(
-                                                recipient = %hash_hex,
-                                                error = %e,
-                                                "seal failed for remote recipient",
-                                            ),
                                         }
                                     }
                                     None => tracing::warn!(
@@ -1378,7 +1399,7 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 }
 
-                let success = !delivered_to.is_empty();
+                let success = !delivered_to.is_empty() || remote_accepted;
 
                 // Raw-mail publish: notify Zenoh subscribers (e.g., Phase 0
                 // harmony-client) that a new message arrived for each
@@ -3727,6 +3748,119 @@ node_config = "/tmp/test-node.toml"
             sealed.is_empty(),
             "no publish should occur when remote delivery is not configured; got {} captures",
             sealed.len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_only_delivery_reports_success_to_smtp_client() {
+        // Regression guard for PR 240 review (Qodo/Cursor/CodeRabbit):
+        // a transaction whose only recipient is remote must return 250 OK,
+        // not 451. Before the fix, `success = !delivered_to.is_empty()`
+        // ignored successful remote seal+publish and returned 451, which
+        // caused sending MTAs to retry and duplicate messages.
+        use crate::remote_delivery::RecipientResolver;
+
+        // Resolver that returns a matching Identity for any requested hash,
+        // by generating a PrivateIdentity whose public form we reuse.
+        struct FixedResolver {
+            identity: harmony_identity::Identity,
+            want_hash: harmony_identity::IdentityHash,
+        }
+        impl RecipientResolver for FixedResolver {
+            fn resolve(
+                &self,
+                addr: &harmony_identity::IdentityHash,
+            ) -> Option<harmony_identity::Identity> {
+                if *addr == self.want_hash {
+                    Some(self.identity.clone())
+                } else {
+                    None
+                }
+            }
+        }
+
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db"))
+                .unwrap(),
+        );
+        let (publisher, handles) = crate::mailbox_manager::ZenohPublisher::inert_for_test();
+        let publisher = Arc::new(publisher);
+
+        let mut rng = rand::rngs::OsRng;
+        let gateway_id = Arc::new(harmony_identity::PrivateIdentity::generate(&mut rng));
+        let bob = harmony_identity::PrivateIdentity::generate(&mut rng);
+        let bob_pub = bob.public_identity().clone();
+        // The SMTP handler's Ok(None) branch looks up by the recipient hash
+        // passed in the action; we mint one that the resolver can match.
+        let recipient_hash = bob_pub.address_hash;
+
+        let resolver: Arc<dyn RecipientResolver> = Arc::new(FixedResolver {
+            identity: bob_pub,
+            want_hash: recipient_hash,
+        });
+
+        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Tue, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113-success@local.example>\r\n\r\nhello\r\n";
+        let actions = vec![SmtpAction::DeliverToHarmony {
+            recipients: vec![recipient_hash],
+            data: rfc822.to_vec(),
+        }];
+
+        let smtp_config = SmtpConfig {
+            domain: "local".to_string(),
+            mx_host: "mail.local".to_string(),
+            max_message_size: 10 * 1024 * 1024,
+            max_recipients: 100,
+            tls_available: false,
+        };
+        // The SMTP state machine must be in DeliveryPending for
+        // handle_delivery_result to emit a SendResponse. Drive it there
+        // directly — the full EHLO/MAIL/RCPT/DATA dance is exercised by
+        // the higher-level smtp_delivers_to_local_imap test.
+        let mut session = SmtpSession::new(smtp_config);
+        session.state = crate::smtp::SmtpState::DeliveryPending;
+
+        let mut writer = Vec::<u8>::new();
+        let mut spf_result = crate::spam::SpfResult::None;
+
+        process_async_actions(
+            &actions,
+            &mut session,
+            &mut writer,
+            &store,
+            &None,
+            "local",
+            smtp_test_dir.path(),
+            &mut spf_result,
+            1000,
+            &None,
+            &Some(Arc::clone(&publisher)),
+            &Some(Arc::clone(&gateway_id)),
+            &Some(resolver),
+        )
+        .await
+        .expect("process_async_actions should succeed for remote-only delivery");
+
+        // The publisher captured exactly one sealed-unicast envelope.
+        let sealed = handles
+            .sealed_unicast
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            sealed.len(),
+            1,
+            "expected exactly one sealed-unicast publish for one remote recipient",
+        );
+
+        // SMTP state machine produced a 250 OK (success=true) — NOT 451.
+        let response = String::from_utf8_lossy(&writer);
+        assert!(
+            response.contains("250"),
+            "remote-only delivery should yield 250 OK; got response: {response:?}",
+        );
+        assert!(
+            !response.contains("451"),
+            "remote-only delivery should NOT yield 451; got response: {response:?}",
         );
     }
 }

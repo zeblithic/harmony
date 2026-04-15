@@ -126,6 +126,14 @@ pub fn identity_from_announce_record(
 /// succeeded. A future `OfflineResolver` integration (ZEB-113 PR B) will
 /// be wired behind this same trait, so the SMTP-handler side does not
 /// need to change when store-and-forward lands.
+///
+/// # Contract
+///
+/// If `resolve(h)` returns `Some(id)`, then `id.address_hash == *h`.
+/// The caller verifies this at runtime and skips (warn-log) on
+/// mismatch to guard against buggy/stale resolvers that would cause
+/// silent data loss by publishing to the correct topic but sealing to
+/// the wrong public keys.
 pub trait RecipientResolver: Send + Sync + 'static {
     fn resolve(&self, address_hash: &IdentityHash) -> Option<Identity>;
 }
