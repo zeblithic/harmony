@@ -1265,16 +1265,19 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                 // mailbox isolation is tracked separately in ZEB-112.
                 let mut delivered_to: Vec<[u8; crate::message::ADDRESS_HASH_LEN]> = Vec::new();
                 // Tracks whether at least one remote recipient was "handled" —
-                // either sealed+published to the unicast keyspace, or knowingly
-                // skipped with a warn/debug log (no announce, resolver hash
-                // mismatch, or remote delivery not configured). Per the
-                // per-recipient MX-like semantics in the PR spec ("do NOT fail
-                // the overall SMTP transaction"), any of these outcomes is
-                // non-fatal for the SMTP reply. Kept separate from
-                // `delivered_to`, which only carries local recipients (used
-                // below to drive the raw-mail publish loop). The SMTP
-                // transaction 250s iff `local || remote_handled`. Only a seal
-                // failure (genuine runtime error) leaves this false.
+                // either sealed+published to the unicast keyspace, or
+                // knowingly skipped in a way that sender-retry cannot fix
+                // (no announce per the PR spec, or resolver hash mismatch).
+                // Kept separate from `delivered_to`, which only carries
+                // local recipients (used below to drive the raw-mail
+                // publish loop). The SMTP transaction 250s iff
+                // `local || remote_handled`.
+                //
+                // NOT set (→ 451) for:
+                //  - seal failure: genuine AEAD/RNG runtime error, retry may help
+                //  - remote delivery not configured: gateway has no mechanism
+                //    to try at all — 250 would be a silent drop. Retry helps
+                //    once operator wires up gateway_identity + resolver.
                 let mut remote_handled = false;
                 let timestamp = msg_timestamp;
                 let rfc822_size = data.len() as u32;
@@ -1407,14 +1410,21 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                                 }
                             } else {
                                 // Remote delivery not configured on this
-                                // gateway — knowingly drop. Sender retry
-                                // won't help; operator must configure the
-                                // gateway. Non-fatal for the transaction.
+                                // gateway. Unlike the "configured but miss"
+                                // cases above, the gateway has NO mechanism
+                                // to attempt delivery — accepting 250 here
+                                // would silently drop the message and lie
+                                // to the sender. Sender retry DOES help
+                                // once the operator wires up
+                                // gateway_identity + recipient_resolver,
+                                // so leave remote_handled = false and let
+                                // the transaction 451. Preserves pre-PR
+                                // behavior for gateways that haven't
+                                // enabled remote delivery.
                                 tracing::debug!(
                                     recipient = %hash_hex,
-                                    "no local user and remote delivery not configured; dropping",
+                                    "no local user and remote delivery not configured; will 451 retry",
                                 );
-                                remote_handled = true;
                             }
                         }
                         Err(e) => {
@@ -3866,17 +3876,22 @@ node_config = "/tmp/test-node.toml"
             sealed.len(),
         );
 
-        // Remote delivery not configured on this gateway is a
-        // misconfiguration the sender cannot fix by retrying. 250 + debug
-        // log is the documented per-recipient "knowingly drop" behavior.
+        // Regression guard for PR 240 CodeRabbit round 3 (Cursor Bugbot):
+        // when remote delivery is not configured, the gateway has no
+        // mechanism to try. 250 + drop would silently lie to the sender.
+        // 451 lets the sender retry (which becomes useful once the
+        // operator wires up gateway_identity + resolver, and eventually
+        // bounces to the original sender if wiring never arrives).
+        // Preserves pre-PR behavior for the current `main.rs` shipping
+        // state of `None, None`.
         let response = String::from_utf8_lossy(&writer);
         assert!(
-            response.contains("250"),
-            "remote delivery not configured should yield 250 OK; got: {response:?}",
+            response.contains("451"),
+            "remote delivery not configured should yield 451 so sender retries/bounces; got: {response:?}",
         );
         assert!(
-            !response.contains("451"),
-            "remote delivery not configured must NOT yield 451; got: {response:?}",
+            !response.contains("250"),
+            "remote delivery not configured must NOT yield 250 (silent drop); got: {response:?}",
         );
     }
 
