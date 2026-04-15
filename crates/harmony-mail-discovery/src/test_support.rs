@@ -8,7 +8,9 @@
 
 // `canonical_cbor` panics only when the encoder fails on well-formed
 // structs — that is the correct loud-failure behaviour in test fixtures.
+// Mutex::lock().unwrap() is intentional in test-only fakes.
 #![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 
 use ed25519_dalek::{Signer, SigningKey as EdSigningKey, VerifyingKey as EdVerifyingKey};
 use rand_core::{CryptoRng, RngCore};
@@ -189,9 +191,9 @@ impl<'a> ClaimBuilder<'a> {
 
     pub fn build(self) -> SignedClaim {
         let local_part = self.email.split('@').next().unwrap_or("").to_string();
-        let h = self.override_hashed_local_part.unwrap_or_else(|| {
-            hashed_local_part(&local_part, &self.domain.salt)
-        });
+        let h = self
+            .override_hashed_local_part
+            .unwrap_or_else(|| hashed_local_part(&local_part, &self.domain.salt));
         let payload = ClaimPayload {
             version: self.payload_version,
             domain: self
@@ -241,5 +243,108 @@ impl FakeTimeSource {
 impl TimeSource for FakeTimeSource {
     fn now(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
+    }
+}
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+
+use crate::dns::{DnsClient, DnsError};
+use crate::http::{HttpClient, HttpError, HttpResponse};
+
+/// Scripted DNS responder. Keys are fully-qualified names
+/// (e.g. `_harmony.q8.fyi`). Default response is `NoRecord`.
+#[derive(Default)]
+pub struct FakeDnsClient {
+    answers: Mutex<HashMap<String, Result<Vec<String>, DnsError>>>,
+    call_count: Mutex<usize>,
+}
+
+impl FakeDnsClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn set(&self, name: &str, answer: Result<Vec<String>, DnsError>) {
+        self.answers
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), answer);
+    }
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+#[async_trait]
+impl DnsClient for FakeDnsClient {
+    async fn fetch_txt(&self, name: &str) -> Result<Vec<String>, DnsError> {
+        *self.call_count.lock().unwrap() += 1;
+        self.answers
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or(Err(DnsError::NoRecord))
+    }
+}
+
+/// Scripted HTTP responder keyed on exact URL. Default response is 404.
+#[derive(Default)]
+pub struct FakeHttpClient {
+    answers: Mutex<HashMap<String, Result<HttpResponse, HttpError>>>,
+    call_count: Mutex<usize>,
+    calls_by_url: Mutex<HashMap<String, usize>>,
+}
+
+impl FakeHttpClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn set(&self, url: &str, answer: Result<HttpResponse, HttpError>) {
+        self.answers.lock().unwrap().insert(url.to_string(), answer);
+    }
+    pub fn set_not_found(&self, url: &str) {
+        self.set(
+            url,
+            Ok(HttpResponse {
+                status: 404,
+                body: vec![],
+            }),
+        );
+    }
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+    pub fn call_count_for(&self, url: &str) -> usize {
+        self.calls_by_url
+            .lock()
+            .unwrap()
+            .get(url)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+#[async_trait]
+impl HttpClient for FakeHttpClient {
+    async fn get(&self, url: &str) -> Result<HttpResponse, HttpError> {
+        *self.call_count.lock().unwrap() += 1;
+        *self
+            .calls_by_url
+            .lock()
+            .unwrap()
+            .entry(url.to_string())
+            .or_default() += 1;
+        self.answers
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .unwrap_or(Ok(HttpResponse {
+                status: 404,
+                body: vec![],
+            }))
     }
 }

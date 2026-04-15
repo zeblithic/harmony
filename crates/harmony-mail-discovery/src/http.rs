@@ -208,11 +208,7 @@ mod tests {
 
     #[test]
     fn reqwest_client_builds_with_sensible_params() {
-        ReqwestHttpClient::new(
-            Duration::from_secs(3),
-            Duration::from_secs(5),
-            1024 * 1024,
-        )
-        .expect("builder should accept normal timeouts + 1 MiB cap");
+        ReqwestHttpClient::new(Duration::from_secs(3), Duration::from_secs(5), 1024 * 1024)
+            .expect("builder should accept normal timeouts + 1 MiB cap");
     }
 }
