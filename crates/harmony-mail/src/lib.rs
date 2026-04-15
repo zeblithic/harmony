@@ -13,6 +13,7 @@ pub mod mailbox_manager;
 pub mod message;
 pub mod outbound;
 pub mod registry;
+pub mod remote_delivery;
 pub mod server;
 pub mod smtp;
 pub mod smtp_parse;

@@ -90,7 +90,10 @@ enum RawSink {
         permits: Arc<Semaphore>,
     },
     #[cfg(test)]
-    Captured(Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>),
+    Captured {
+        raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
+        sealed_unicast: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
+    },
 }
 
 /// Test handles returned by `ZenohPublisher::inert_for_test` so callers can
@@ -101,6 +104,7 @@ pub struct InertHandles {
     pub latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
     pub current: Arc<Mutex<HashMap<[u8; ADDRESS_HASH_LEN], [u8; CID_LEN]>>>,
     pub raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
+    pub sealed_unicast: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
 }
 
 impl ZenohPublisher {
@@ -307,14 +311,27 @@ impl ZenohPublisher {
         let current: Arc<Mutex<HashMap<[u8; ADDRESS_HASH_LEN], [u8; CID_LEN]>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sealed_unicast: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let wake = Arc::new(Notify::new());
         let publisher = Self {
             latest: Arc::clone(&latest),
             current: Arc::clone(&current),
             wake,
-            raw_sink: RawSink::Captured(Arc::clone(&raw)),
+            raw_sink: RawSink::Captured {
+                raw: Arc::clone(&raw),
+                sealed_unicast: Arc::clone(&sealed_unicast),
+            },
         };
-        (publisher, InertHandles { latest, current, raw })
+        (
+            publisher,
+            InertHandles {
+                latest,
+                current,
+                raw,
+                sealed_unicast,
+            },
+        )
     }
 
     /// Announce a new root CID for a user.
@@ -390,78 +407,239 @@ impl ZenohPublisher {
     ///
     /// Short-circuits when the cancel token has already fired — prevents
     /// post-shutdown spawns from keeping the runtime alive.
-    pub fn publish_raw_mail(&self, addr_hex: String, bytes: Arc<Vec<u8>>) {
+    pub fn publish_raw_mail(&self, addr_hex: String, bytes: Arc<Vec<u8>>) -> bool {
         match &self.raw_sink {
             RawSink::Session {
                 session,
                 cancel,
                 permits,
             } => {
-                if cancel.is_cancelled() {
-                    return;
-                }
-                // Acquire at the CALL SITE, not inside the spawn. Dropping
-                // on backpressure prevents unbounded task accumulation
-                // during a Zenoh stall — if we spawned first and acquired
-                // second, every waiting spawn would hold its Arc<Vec<u8>>
-                // refcount and task frame open for minutes.
-                let permit = match Arc::clone(permits).try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                let topic = format!("harmony/mail/v1/{addr_hex}");
+                // Closures below preserve the original operator-facing
+                // tracing field names (`addr = %addr_hex`) and message
+                // literals ("raw-mail publish dropped" hyphenated; other
+                // failure messages use "raw mail") that ops log queries
+                // key on. The DRY helper handles spawn/permit/timeout/
+                // cancel; each caller renders its own tracing events so
+                // the observable shape does not drift when the
+                // scaffolding is shared.
+                let addr_drop = addr_hex.clone();
+                let addr_fail = addr_hex.clone();
+                let addr_timeout = addr_hex.clone();
+                let addr_cancel = addr_hex.clone();
+                Self::spawn_session_publish(
+                    session,
+                    cancel,
+                    permits,
+                    topic,
+                    bytes,
+                    move || {
                         tracing::warn!(
-                            addr = %addr_hex,
+                            addr = %addr_drop,
                             "raw-mail publish dropped: in-flight limit ({}) reached — best-effort path, client will catch up via IMAP/root",
                             RAW_PUBLISH_CONCURRENCY,
                         );
-                        return;
-                    }
-                    Err(tokio::sync::TryAcquireError::Closed) => return,
-                };
-                let session = session.clone();
-                let cancel = cancel.clone();
-                let topic = format!("harmony/mail/v1/{addr_hex}");
-                tokio::spawn(async move {
-                    // Move the already-acquired permit into the task so it
-                    // releases on completion/timeout/cancel. Timeout-bounded,
-                    // cancel-aware put.
-                    let _permit = permit;
-                    tokio::select! {
-                        res = tokio::time::timeout(
-                            RAW_PUBLISH_TIMEOUT,
-                            session.put(&topic, &bytes[..]),
-                        ) => match res {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    %topic,
-                                    "Zenoh raw mail publish failed"
-                                );
-                            }
-                            Err(_elapsed) => {
-                                tracing::warn!(
-                                    %topic,
-                                    timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
-                                    "Zenoh raw mail publish timed out — aborted"
-                                );
-                            }
-                        },
-                        _ = cancel.cancelled() => {
-                            tracing::debug!(
-                                %topic,
-                                "Zenoh raw mail publish cancelled during shutdown"
-                            );
-                        }
-                    }
-                });
+                    },
+                    move |err, topic| {
+                        tracing::warn!(
+                            addr = %addr_fail,
+                            error = %err,
+                            %topic,
+                            "Zenoh raw mail publish failed"
+                        );
+                    },
+                    move |topic| {
+                        tracing::warn!(
+                            addr = %addr_timeout,
+                            %topic,
+                            timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                            "Zenoh raw mail publish timed out — aborted"
+                        );
+                    },
+                    move |topic| {
+                        tracing::debug!(
+                            addr = %addr_cancel,
+                            %topic,
+                            "Zenoh raw mail publish cancelled during shutdown"
+                        );
+                    },
+                )
             }
             #[cfg(test)]
-            RawSink::Captured(buf) => {
-                buf.lock()
+            RawSink::Captured { raw, .. } => {
+                raw.lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push((addr_hex, bytes));
+                true
             }
         }
+    }
+
+    /// Publish a sealed unicast envelope to
+    /// `harmony/msg/v1/unicast/{recipient_hash_hex}`.
+    ///
+    /// Fire-and-forget: spawns a task that issues one `session.put()` and
+    /// logs on failure. Mirrors `publish_raw_mail` in structure — shares the
+    /// same permit pool and timeout/cancellation machinery — but targets the
+    /// `msg::unicast` keyspace used by sender-to-recipient sealed delivery
+    /// (ZEB-113). Callers hand in the already-encoded sealed envelope bytes
+    /// so recipients can decode without further transformation.
+    ///
+    /// Sharing `RAW_PUBLISH_CONCURRENCY` / `RAW_PUBLISH_TIMEOUT` with
+    /// `publish_raw_mail` is intentional: a single SMTP delivery fans out
+    /// through one or the other, not both, so a shared budget bounds total
+    /// outbound puts without over-provisioning two independent pools.
+    ///
+    /// Short-circuits when the cancel token has already fired — prevents
+    /// post-shutdown spawns from keeping the runtime alive.
+    /// Returns `true` when the gateway accepted responsibility for the
+    /// publish: permit acquired + task spawned (in the production
+    /// session branch) or captured (in the test branch). Returns
+    /// `false` when backpressure dropped the put or the cancel token
+    /// had already fired. Callers use this to drive SMTP-level
+    /// accept/reject semantics — the downstream Zenoh put may still
+    /// fail asynchronously, but by then the SMTP response has already
+    /// been committed and eventual failure is recorded only in logs.
+    pub fn publish_sealed_unicast(
+        &self,
+        recipient_hash_hex: String,
+        envelope: Arc<Vec<u8>>,
+    ) -> bool {
+        match &self.raw_sink {
+            RawSink::Session {
+                session,
+                cancel,
+                permits,
+            } => {
+                let topic = harmony_zenoh::namespace::msg::unicast_key(&recipient_hash_hex);
+                // Parallel to publish_raw_mail but with its own field name
+                // (`recipient`) and "sealed-unicast" message literal so ops
+                // log queries can distinguish the two paths.
+                let rcpt_drop = recipient_hash_hex.clone();
+                let rcpt_fail = recipient_hash_hex.clone();
+                let rcpt_timeout = recipient_hash_hex.clone();
+                let rcpt_cancel = recipient_hash_hex.clone();
+                Self::spawn_session_publish(
+                    session,
+                    cancel,
+                    permits,
+                    topic,
+                    envelope,
+                    move || {
+                        tracing::warn!(
+                            recipient = %rcpt_drop,
+                            "sealed-unicast publish dropped: in-flight limit ({}) reached — best-effort path",
+                            RAW_PUBLISH_CONCURRENCY,
+                        );
+                    },
+                    move |err, topic| {
+                        tracing::warn!(
+                            recipient = %rcpt_fail,
+                            error = %err,
+                            %topic,
+                            "Zenoh sealed-unicast publish failed"
+                        );
+                    },
+                    move |topic| {
+                        tracing::warn!(
+                            recipient = %rcpt_timeout,
+                            %topic,
+                            timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                            "Zenoh sealed-unicast publish timed out — aborted"
+                        );
+                    },
+                    move |topic| {
+                        tracing::debug!(
+                            recipient = %rcpt_cancel,
+                            %topic,
+                            "Zenoh sealed-unicast publish cancelled during shutdown"
+                        );
+                    },
+                )
+            }
+            #[cfg(test)]
+            RawSink::Captured { sealed_unicast, .. } => {
+                let topic = harmony_zenoh::namespace::msg::unicast_key(&recipient_hash_hex);
+                sealed_unicast
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((topic, envelope));
+                true
+            }
+        }
+    }
+
+    /// Shared spawn/permit/timeout/cancel machinery for background Zenoh
+    /// put publishes. Both `publish_raw_mail` and `publish_sealed_unicast`
+    /// delegate here — they differ only in the topic string and in the
+    /// tracing events they emit.
+    ///
+    /// Tracing is handled by caller-supplied closures (`on_dropped`,
+    /// `on_failed`, `on_timed_out`, `on_cancelled`) so each path keeps its
+    /// own operator-facing field names (`addr` vs `recipient`) and message
+    /// literals ("raw mail" vs "sealed-unicast") without the helper having
+    /// to synthesize dynamic tracing field names. The scaffolding
+    /// (permit acquisition, spawn, timeout, cancel select!) stays DRY.
+    ///
+    /// Only called from the `RawSink::Session` branch — the `Captured`
+    /// branch is test-only and each caller pushes into its own dedicated
+    /// Vec (raw vs sealed_unicast).
+    /// Returns `true` when the permit was acquired and the publish task
+    /// was spawned (enqueue success — the caller can treat this as "my
+    /// gateway accepted responsibility for the publish"). Returns
+    /// `false` when backpressure dropped the put, the cancel token had
+    /// already fired, or the semaphore was closed. The downstream put
+    /// itself is still fire-and-forget — an eventual Zenoh-side failure
+    /// is logged via the caller-supplied closures but not reported
+    /// back, because the caller has already committed to SMTP semantics
+    /// by the time the task runs.
+    fn spawn_session_publish(
+        session: &zenoh::Session,
+        cancel: &CancellationToken,
+        permits: &Arc<Semaphore>,
+        topic: String,
+        bytes: Arc<Vec<u8>>,
+        on_dropped: impl FnOnce() + Send + 'static,
+        on_failed: impl FnOnce(zenoh::Error, &str) + Send + 'static,
+        on_timed_out: impl FnOnce(&str) + Send + 'static,
+        on_cancelled: impl FnOnce(&str) + Send + 'static,
+    ) -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        // Acquire at the CALL SITE, not inside the spawn. Dropping on
+        // backpressure prevents unbounded task accumulation during a
+        // Zenoh stall — if we spawned first and acquired second, every
+        // waiting spawn would hold its Arc<Vec<u8>> refcount and task
+        // frame open for minutes.
+        let permit = match Arc::clone(permits).try_acquire_owned() {
+            Ok(p) => p,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                on_dropped();
+                return false;
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => return false,
+        };
+        let session = session.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            // Move the already-acquired permit into the task so it
+            // releases on completion/timeout/cancel. Timeout-bounded,
+            // cancel-aware put.
+            let _permit = permit;
+            tokio::select! {
+                res = tokio::time::timeout(
+                    RAW_PUBLISH_TIMEOUT,
+                    session.put(&topic, &bytes[..]),
+                ) => match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => on_failed(e, &topic),
+                    Err(_elapsed) => on_timed_out(&topic),
+                },
+                _ = cancel.cancelled() => on_cancelled(&topic),
+            }
+        });
+        true
     }
 }
 
@@ -1295,6 +1473,24 @@ mod tests {
                 "every fan-out recipient must share the same underlying buffer"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn publish_sealed_unicast_captures_notification_on_test_publisher() {
+        let (publisher, handles) = ZenohPublisher::inert_for_test();
+        let recipient_hash_hex = "aabbccddeeff00112233445566778899".to_string();
+        let envelope: Arc<Vec<u8>> = Arc::new(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        publisher.publish_sealed_unicast(recipient_hash_hex.clone(), Arc::clone(&envelope));
+
+        let sealed = handles
+            .sealed_unicast
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(sealed.len(), 1, "expected exactly one sealed-unicast capture");
+        let (key, payload) = &sealed[0];
+        assert_eq!(key, "harmony/msg/v1/unicast/aabbccddeeff00112233445566778899");
+        assert_eq!(payload.as_slice(), envelope.as_slice());
     }
 
     #[tokio::test]

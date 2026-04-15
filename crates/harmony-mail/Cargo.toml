@@ -40,13 +40,15 @@ argon2 = { workspace = true, features = ["std"] }
 base64 = { workspace = true }
 harmony-content = { workspace = true, features = ["std"] }
 harmony-db = { workspace = true }
+harmony-discovery = { workspace = true }
+harmony-zenoh.workspace = true
+rand_core = { workspace = true, features = ["std", "getrandom"] }
 rpassword = "5"
 zenoh.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
 rand.workspace = true
-rand_core.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
 rcgen = "0.13"
 tempfile = "3"

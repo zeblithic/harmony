@@ -3,6 +3,21 @@
 //! Binds to configured SMTP ports, accepts connections, and spawns per-connection
 //! async tasks that wire [`SmtpCodec`](crate::io::SmtpCodec) frames to the
 //! [`SmtpSession`](crate::smtp::SmtpSession) sans-I/O state machine.
+//!
+//! ## Remote delivery (ZEB-113 PR A)
+//!
+//! When a recipient is NOT homed on this gateway (`imap_store` has no user
+//! for the recipient's address hash), the `DeliverToHarmony` action
+//! attempts remote delivery via the optional `gateway_identity` and
+//! `recipient_resolver` parameters. A hit resolves the recipient's
+//! classical [`Identity`](harmony_identity::Identity) from their
+//! [`AnnounceRecord`](harmony_discovery::AnnounceRecord), seals the
+//! serialized [`HarmonyMessage`](crate::message::HarmonyMessage) via
+//! [`HarmonyEnvelope::seal`](harmony_zenoh::envelope::HarmonyEnvelope::seal),
+//! and publishes to the per-recipient key
+//! `harmony/msg/v1/unicast/{recipient_hash_hex}`. Offline recipients
+//! (`resolver.resolve` returns `None`) are warned-and-skipped; persistent
+//! store-and-forward is a separate follow-up (ZEB-113 PR B).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -126,7 +141,11 @@ const DATA_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Run the SMTP server with the given configuration.
-pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    config: Config,
+    gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>>,
+    recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let max_message_size = parse_message_size(&config.spam.max_message_size);
 
     let shared = Arc::new(SharedState::new(config.spam.max_connections_per_ip));
@@ -397,6 +416,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let content_store_path_465 = content_store_path.clone();
         let mailbox_mgr_465 = mailbox_mgr.clone();
         let mailbox_publisher_465 = mailbox_publisher.clone();
+        let gateway_identity_465 = gateway_identity.clone();
+        let recipient_resolver_465 = recipient_resolver.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -419,13 +440,15 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let csp = content_store_path_465.clone();
                         let mgr_clone = mailbox_mgr_465.clone();
                         let pub_clone = mailbox_publisher_465.clone();
+                        let gi_clone = gateway_identity_465.clone();
+                        let rr_clone = recipient_resolver_465.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                             match tls::implicit_tls_wrap(stream, &acc).await {
                                 Ok(tls_stream) => {
                                     let (reader, writer) = tokio::io::split(tls_stream);
                                     let session = SmtpSession::new(cfg);
-                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone).await {
+                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone).await {
                                         tracing::debug!(%peer_ip, error = %e, "implicit TLS connection ended with error");
                                     }
                                 }
@@ -451,6 +474,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let content_store_path_587 = content_store_path.clone();
         let mailbox_mgr_587 = mailbox_mgr.clone();
         let mailbox_publisher_587 = mailbox_publisher.clone();
+        let gateway_identity_587 = gateway_identity.clone();
+        let recipient_resolver_587 = recipient_resolver.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -473,9 +498,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let csp = content_store_path_587.clone();
                         let mgr_clone = mailbox_mgr_587.clone();
                         let pub_clone = mailbox_publisher_587.clone();
+                        let gi_clone = gateway_identity_587.clone();
+                        let rr_clone = recipient_resolver_587.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
-                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone).await {
+                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone).await {
                                 tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
                             }
                         });
@@ -642,11 +669,13 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let csp = content_store_path.clone();
                 let mgr_clone = mailbox_mgr.clone();
                 let pub_clone = mailbox_publisher.clone();
+                let gi_clone = gateway_identity.clone();
+                let rr_clone = recipient_resolver.clone();
 
                 tokio::spawn(async move {
                     let _guard = ConnectionGuard { shared: Arc::clone(&shared), ip: peer_ip };
                     let acc = acceptor.as_ref().map(|a| (**a).clone());
-                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone).await {
+                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone).await {
                         tracing::debug!(%peer_ip, error = %e, "connection ended with error");
                     }
                 });
@@ -681,6 +710,8 @@ async fn handle_connection(
     reject_threshold: i32,
     mailbox_manager: Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
     mailbox_publisher: Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
+    gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>>,
+    recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut spf_result = crate::spam::SpfResult::None;
     let mut session = SmtpSession::new(smtp_config);
@@ -738,7 +769,7 @@ async fn handle_connection(
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
                 let needs_starttls =
-                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher).await?;
+                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher, &gateway_identity, &recipient_resolver).await?;
 
                 // STARTTLS: upgrade the connection to TLS
                 if needs_starttls {
@@ -791,6 +822,8 @@ async fn handle_connection(
                                     reject_threshold,
                                     mailbox_manager,
                                     mailbox_publisher,
+                                    gateway_identity,
+                                    recipient_resolver,
                                 )
                                 .await;
                             }
@@ -860,6 +893,8 @@ async fn handle_connection_generic<R, W>(
     reject_threshold: i32,
     mailbox_manager: Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
     mailbox_publisher: Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
+    gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>>,
+    recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
@@ -911,7 +946,7 @@ where
                 };
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
-                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher).await?;
+                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher, &gateway_identity, &recipient_resolver).await?;
 
                 if should_close || session.state == SmtpState::Closed {
                     break;
@@ -1003,8 +1038,17 @@ async fn execute_actions_generic<W: AsyncWrite + Unpin>(
 
 /// Process async action callbacks (address resolution, delivery, SPF).
 /// Returns true if a StartTls action was encountered.
+///
+/// # Stability
+///
+/// This function is exposed publicly **only** to support crate-external
+/// integration tests under `tests/`. The parameter list is unstable:
+/// it tracks the internal needs of [`handle_connection`] and will change
+/// without notice as SMTP features are added. Production callers must
+/// route through the main server entry point, `run`, not this function
+/// directly.
 #[allow(clippy::too_many_arguments)]
-async fn process_async_actions<W: AsyncWrite + Unpin>(
+pub async fn process_async_actions<W: AsyncWrite + Unpin>(
     actions: &[SmtpAction],
     session: &mut SmtpSession,
     writer: &mut W,
@@ -1016,6 +1060,8 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
     reject_threshold: i32,
     mailbox_manager: &Option<Arc<std::sync::Mutex<crate::mailbox_manager::MailboxManager>>>,
     mailbox_publisher: &Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
+    gateway_identity: &Option<Arc<harmony_identity::PrivateIdentity>>,
+    recipient_resolver: &Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut needs_starttls = false;
     for action in actions {
@@ -1059,11 +1105,30 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                         }
                     }
                 } else {
-                    // Non-local domain: remote delivery not yet supported (ZEB-113)
+                    // Non-local domain. ZEB-113 PR A (this PR) added the
+                    // DOWNSTREAM delivery machinery — the remote_ctx /
+                    // seal / publish_sealed_unicast flow in
+                    // `process_async_actions` — but the UPSTREAM RCPT
+                    // admission path still rejects non-local domains
+                    // here. Admitting them requires resolving
+                    // `local_part@domain` to an announced
+                    // `identity.address_hash` (so the gateway's seal path
+                    // targets the right keys + topic), which in turn
+                    // needs discovery-backed email→hash lookup
+                    // infrastructure. That infrastructure is the
+                    // follow-up PR tracked alongside "Production wiring
+                    // in main.rs" — both land together because neither
+                    // is independently useful (identity + resolver are
+                    // both required in `run()` for remote delivery to
+                    // fire). Until then, remote RCPTs fall through to
+                    // None as before; the delivery machinery is
+                    // exercised by unit and integration tests that
+                    // bypass RCPT by constructing `DeliverToHarmony`
+                    // directly.
                     tracing::debug!(
                         %domain,
                         local_domain = %local_domain,
-                        "non-local domain, rejecting (remote delivery tracked in ZEB-113)"
+                        "non-local domain, rejecting at RCPT (remote RCPT admission tracked as ZEB-113 follow-up; delivery machinery landed)"
                     );
                     None
                 };
@@ -1218,8 +1283,56 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                 // model (mailboxes are global, not per-user). Multi-user
                 // mailbox isolation is tracked separately in ZEB-112.
                 let mut delivered_to: Vec<[u8; crate::message::ADDRESS_HASH_LEN]> = Vec::new();
+                // Tracks whether at least one remote recipient was accepted
+                // for delivery: the gateway sealed the envelope AND
+                // `publish_sealed_unicast` returned `true` (permit acquired,
+                // task spawned — the gateway has committed to the put).
+                // Kept separate from `delivered_to`, which only carries
+                // local recipients used below to drive the raw-mail publish
+                // loop. The SMTP transaction 250s iff
+                // `local || remote_accepted`.
+                //
+                // All non-publish outcomes (no announce, resolver hash
+                // mismatch, remote delivery not configured, seal failure,
+                // publisher backpressure) leave this `false`. Per-recipient
+                // MX-like semantics still apply: a single miss within a
+                // multi-recipient batch does NOT fail the batch as long as
+                // at least one recipient (local or remote) was accepted.
+                // If every recipient misses, the transaction 451s and the
+                // sender retries — giving operators a chance to complete
+                // wiring (main.rs follow-up) or recipients a chance to
+                // announce, and eventually bouncing to the original sender
+                // with visibility if nothing lands. Silent 250-and-drop is
+                // specifically avoided.
+                let mut remote_accepted = false;
                 let timestamp = msg_timestamp;
                 let rfc822_size = data.len() as u32;
+
+                // Pre-compute a reusable remote-delivery context when all four
+                // ingredients are present. If any is missing (no gateway
+                // identity, no resolver, no publisher, or message
+                // serialization failed), remote delivery is effectively
+                // disabled and every non-local recipient falls through to a
+                // debug log.
+                let remote_ctx: Option<(
+                    Arc<harmony_identity::PrivateIdentity>,
+                    Arc<dyn crate::remote_delivery::RecipientResolver>,
+                    Arc<crate::mailbox_manager::ZenohPublisher>,
+                    &[u8],
+                )> = match (
+                    gateway_identity.as_ref(),
+                    recipient_resolver.as_ref(),
+                    mailbox_publisher.as_ref(),
+                    msg_bytes.as_deref(),
+                ) {
+                    (Some(gw), Some(res), Some(publisher), Some(bytes)) => Some((
+                        Arc::clone(gw),
+                        Arc::clone(res),
+                        Arc::clone(publisher),
+                        bytes,
+                    )),
+                    _ => None,
+                };
 
                 for recipient_hash in recipients {
                     match imap_store.get_user_by_address(recipient_hash) {
@@ -1249,10 +1362,107 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                             }
                         }
                         Ok(None) => {
-                            tracing::debug!(
-                                recipient = hex::encode(recipient_hash),
-                                "no local user for recipient"
-                            );
+                            // Recipient is not homed on this gateway. Attempt
+                            // remote delivery via Zenoh if the gateway is
+                            // configured for it. Per-recipient success/failure
+                            // — the overall SMTP transaction still succeeds if
+                            // any recipient (local or remote) succeeded.
+                            let hash_hex = hex::encode(recipient_hash);
+                            if let Some((gw_id, resolver, publisher, bytes)) =
+                                remote_ctx.as_ref()
+                            {
+                                match resolver.resolve(recipient_hash) {
+                                    Some(recipient_identity) => {
+                                        // Defensive guard: the resolver's contract
+                                        // requires the returned identity to match the
+                                        // requested address_hash. A mismatch means we'd
+                                        // publish to the correct topic but seal to the
+                                        // wrong public keys — the subscriber could not
+                                        // decrypt, silent data loss. Skip and warn.
+                                        if recipient_identity.address_hash != *recipient_hash {
+                                            // Resolver bug — publish to the
+                                            // correct topic would seal to the
+                                            // wrong keys, silent data loss.
+                                            // Skip this recipient; if others
+                                            // succeed, the batch still 250s.
+                                            // If this is the only recipient,
+                                            // 451 will prompt sender retry
+                                            // (loud warn surfaces the bug).
+                                            tracing::warn!(
+                                                expected = %hash_hex,
+                                                got = %hex::encode(recipient_identity.address_hash),
+                                                "resolver returned identity with mismatched address_hash; skipping",
+                                            );
+                                        } else {
+                                            let mut rng = rand_core::OsRng;
+                                            match crate::remote_delivery::seal_for_recipient(
+                                                &mut rng,
+                                                gw_id.as_ref(),
+                                                &recipient_identity,
+                                                *bytes,
+                                            ) {
+                                                Ok(sealed) => {
+                                                    // Only set remote_accepted
+                                                    // when the publisher
+                                                    // actually took
+                                                    // responsibility (permit
+                                                    // acquired + task
+                                                    // spawned). Backpressure
+                                                    // drop or cancel during
+                                                    // shutdown leaves it false
+                                                    // so the SMTP transaction
+                                                    // can 451 and the sender
+                                                    // retries.
+                                                    if publisher.publish_sealed_unicast(
+                                                        hash_hex.clone(),
+                                                        Arc::new(sealed),
+                                                    ) {
+                                                        remote_accepted = true;
+                                                        tracing::debug!(
+                                                            recipient = %hash_hex,
+                                                            "remote recipient sealed + published",
+                                                        );
+                                                    } else {
+                                                        tracing::warn!(
+                                                            recipient = %hash_hex,
+                                                            "publisher did not accept sealed-unicast (backpressure or shutdown); will 451 retry if sole recipient",
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => tracing::warn!(
+                                                    recipient = %hash_hex,
+                                                    error = %e,
+                                                    "seal failed for remote recipient",
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        // No announce record. Per-recipient
+                                        // miss that doesn't cascade: if other
+                                        // recipients were accepted the batch
+                                        // still 250s. If this is the only
+                                        // recipient, 451 prompts sender
+                                        // retry until PR B's offline
+                                        // store-and-forward can pick it up
+                                        // or the recipient announces.
+                                        tracing::warn!(
+                                            recipient = %hash_hex,
+                                            "no announce record for remote recipient; skipping (offline store-and-forward in ZEB-113 PR B)",
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Remote delivery not configured. Gateway
+                                // has no mechanism to try — 250 here would
+                                // be a silent drop. 451 preserves pre-PR
+                                // behavior and prompts sender retry until
+                                // main.rs wiring (follow-up) lands.
+                                tracing::debug!(
+                                    recipient = %hash_hex,
+                                    "no local user and remote delivery not configured; will 451 retry if sole recipient",
+                                );
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1264,7 +1474,7 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 }
 
-                let success = !delivered_to.is_empty();
+                let success = !delivered_to.is_empty() || remote_accepted;
 
                 // Raw-mail publish: notify Zenoh subscribers (e.g., Phase 0
                 // harmony-client) that a new message arrived for each
@@ -2816,7 +3026,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None, None, None)
                 .await
                 .unwrap();
         });
@@ -2879,7 +3089,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None, None, None)
                 .await
                 .unwrap();
         });
@@ -3094,6 +3304,8 @@ node_config = "/tmp/test-node.toml"
                 5,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3247,6 +3459,8 @@ node_config = "/tmp/test-node.toml"
                 5,
                 mgr_clone,
                 pub_clone,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3448,6 +3662,391 @@ node_config = "/tmp/test-node.toml"
         assert_eq!(parse_message_size("1GB"), 1024 * 1024 * 1024);
         assert_eq!(parse_message_size("1000"), 1000);
         assert_eq!(parse_message_size("  25MB  "), 25 * 1024 * 1024);
+    }
+
+    #[test]
+    fn remote_delivery_plumbing_signatures_compile() {
+        // Compile-time checkpoint: if any of the four signatures below
+        // stops accepting `Option<Arc<PrivateIdentity>>` + `Option<Arc<dyn
+        // RecipientResolver>>`, this test fails to compile. The bodies
+        // are unreachable at runtime — the point is purely that the
+        // compiler must typecheck the call sites. Async fn items have
+        // opaque return types so fn-pointer coercion isn't ergonomic
+        // here; the unreachable-call pattern is both simpler and
+        // catches arity drift, type drift, and order drift equally.
+        #[allow(dead_code, unreachable_code, unused_variables, unused_mut)]
+        async fn _typecheck(
+            config: Config,
+            stream: tokio::net::TcpStream,
+            peer_ip: IpAddr,
+            smtp_config: SmtpConfig,
+            imap_store: Arc<ImapStore>,
+            content_store_path: PathBuf,
+            session: SmtpSession,
+        ) {
+            let gw: Option<Arc<harmony_identity::PrivateIdentity>> = None;
+            let rr: Option<Arc<dyn crate::remote_delivery::RecipientResolver>> = None;
+            let _ = run(config, gw.clone(), rr.clone()).await;
+            let _ = handle_connection(
+                stream,
+                peer_ip,
+                smtp_config.clone(),
+                10,
+                None,
+                Arc::clone(&imap_store),
+                None,
+                "local".to_string(),
+                content_store_path.clone(),
+                5,
+                None,
+                None,
+                gw.clone(),
+                rr.clone(),
+            )
+            .await;
+            let (r, w) = (tokio::io::empty(), tokio::io::sink());
+            let _ = handle_connection_generic(
+                r,
+                w,
+                peer_ip,
+                session,
+                10,
+                None,
+                Arc::clone(&imap_store),
+                None,
+                "local".to_string(),
+                content_store_path,
+                5,
+                None,
+                None,
+                gw.clone(),
+                rr.clone(),
+            )
+            .await;
+            let actions: Vec<SmtpAction> = Vec::new();
+            let mut sess = SmtpSession::new(smtp_config);
+            let mut writer_sink = Vec::<u8>::new();
+            let mut spf = crate::spam::SpfResult::None;
+            let _ = process_async_actions(
+                &actions,
+                &mut sess,
+                &mut writer_sink,
+                &imap_store,
+                &None,
+                "local",
+                std::path::Path::new("/"),
+                &mut spf,
+                5,
+                &None,
+                &None,
+                &gw,
+                &rr,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delivers_remote_warn_and_skip_when_resolver_returns_none() {
+        use crate::remote_delivery::RecipientResolver;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct NullResolver(Arc<AtomicUsize>);
+        impl RecipientResolver for NullResolver {
+            fn resolve(
+                &self,
+                _addr: &harmony_identity::IdentityHash,
+            ) -> Option<harmony_identity::Identity> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        }
+
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db"))
+                .unwrap(),
+        );
+
+        let (publisher, handles) = crate::mailbox_manager::ZenohPublisher::inert_for_test();
+        let publisher = Arc::new(publisher);
+        let mut rng = rand::rngs::OsRng;
+        let gateway_id = Arc::new(harmony_identity::PrivateIdentity::generate(&mut rng));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver: Arc<dyn RecipientResolver> = Arc::new(NullResolver(Arc::clone(&calls)));
+
+        // RFC 5322 blob that translate_inbound can parse successfully.
+        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Wed, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113@local.example>\r\n\r\nhello\r\n";
+
+        // Recipient hash NOT in the imap_store → Ok(None) branch fires.
+        let recipient_hash = [0xAAu8; crate::message::ADDRESS_HASH_LEN];
+
+        let actions = vec![SmtpAction::DeliverToHarmony {
+            recipients: vec![recipient_hash],
+            data: rfc822.to_vec(),
+        }];
+
+        let smtp_config = SmtpConfig {
+            domain: "local".to_string(),
+            mx_host: "mail.local".to_string(),
+            max_message_size: 10 * 1024 * 1024,
+            max_recipients: 100,
+            tls_available: false,
+        };
+        let mut session = SmtpSession::new(smtp_config);
+        // Drive state to DeliveryPending so handle_delivery_result emits
+        // a SendResponse — we now assert on the 250/451 as well as the
+        // publisher side-effect.
+        session.state = crate::smtp::SmtpState::DeliveryPending;
+        let mut writer = Vec::<u8>::new();
+        let mut spf_result = crate::spam::SpfResult::None;
+
+        process_async_actions(
+            &actions,
+            &mut session,
+            &mut writer,
+            &store,
+            &None,
+            "local",
+            smtp_test_dir.path(),
+            &mut spf_result,
+            1000, // reject_threshold high → no spam rejection
+            &None,
+            &Some(Arc::clone(&publisher)),
+            &Some(Arc::clone(&gateway_id)),
+            &Some(resolver),
+        )
+        .await
+        .expect("process_async_actions should succeed even when remote resolver skips");
+
+        // Resolver was consulted exactly once (for bob).
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Publisher recorded NO sealed-unicast publish.
+        let sealed = handles
+            .sealed_unicast
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(
+            sealed.is_empty(),
+            "no publish should occur when resolver returns None; got {} captures",
+            sealed.len(),
+        );
+
+        // Regression guard for PR 240 review round 4 (Greptile P1 /
+        // CodeRabbit): a resolver miss is a per-recipient failure — it
+        // doesn't cascade to other recipients, but on its own it leaves
+        // no remote_accepted. Sole-recipient miss → 451 so the sender
+        // retries until the recipient announces or PR B's offline
+        // store-and-forward lands. Silent 250-and-drop is specifically
+        // avoided. Multi-recipient batches where at least one other
+        // recipient succeeds still 250 (tested separately via the
+        // local+remote combination).
+        let response = String::from_utf8_lossy(&writer);
+        assert!(
+            response.contains("451"),
+            "sole-recipient resolver miss should yield 451 so sender retries; got: {response:?}",
+        );
+        assert!(
+            !response.contains("250"),
+            "sole-recipient resolver miss must NOT yield 250 (silent drop); got: {response:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn delivers_drops_remote_recipient_when_remote_delivery_not_configured() {
+        // When any of the four remote-delivery ingredients is None
+        // (here: no gateway_identity and no resolver), the Ok(None) branch
+        // falls through to a debug log + drop. Preserves Task-4 behavior
+        // for gateways that don't enable remote delivery. SMTP transaction
+        // still returns Ok — per-recipient drop, not a transaction failure.
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db"))
+                .unwrap(),
+        );
+
+        let (publisher, handles) = crate::mailbox_manager::ZenohPublisher::inert_for_test();
+        let publisher = Arc::new(publisher);
+
+        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Wed, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113-b@local.example>\r\n\r\nhello\r\n";
+        let recipient_hash = [0xBBu8; crate::message::ADDRESS_HASH_LEN];
+
+        let actions = vec![SmtpAction::DeliverToHarmony {
+            recipients: vec![recipient_hash],
+            data: rfc822.to_vec(),
+        }];
+
+        let smtp_config = SmtpConfig {
+            domain: "local".to_string(),
+            mx_host: "mail.local".to_string(),
+            max_message_size: 10 * 1024 * 1024,
+            max_recipients: 100,
+            tls_available: false,
+        };
+        let mut session = SmtpSession::new(smtp_config);
+        session.state = crate::smtp::SmtpState::DeliveryPending;
+        let mut writer = Vec::<u8>::new();
+        let mut spf_result = crate::spam::SpfResult::None;
+
+        process_async_actions(
+            &actions,
+            &mut session,
+            &mut writer,
+            &store,
+            &None,
+            "local",
+            smtp_test_dir.path(),
+            &mut spf_result,
+            1000,
+            &None,
+            &Some(Arc::clone(&publisher)), // publisher IS configured ...
+            &None,                         // ... but no gateway identity
+            &None,                         // ... and no resolver
+        )
+        .await
+        .expect("process_async_actions should succeed even with remote delivery disabled");
+
+        let sealed = handles
+            .sealed_unicast
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(
+            sealed.is_empty(),
+            "no publish should occur when remote delivery is not configured; got {} captures",
+            sealed.len(),
+        );
+
+        // Regression guard for PR 240 CodeRabbit round 3 (Cursor Bugbot):
+        // when remote delivery is not configured, the gateway has no
+        // mechanism to try. 250 + drop would silently lie to the sender.
+        // 451 lets the sender retry (which becomes useful once the
+        // operator wires up gateway_identity + resolver, and eventually
+        // bounces to the original sender if wiring never arrives).
+        // Preserves pre-PR behavior for the current `main.rs` shipping
+        // state of `None, None`.
+        let response = String::from_utf8_lossy(&writer);
+        assert!(
+            response.contains("451"),
+            "remote delivery not configured should yield 451 so sender retries/bounces; got: {response:?}",
+        );
+        assert!(
+            !response.contains("250"),
+            "remote delivery not configured must NOT yield 250 (silent drop); got: {response:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_only_delivery_reports_success_to_smtp_client() {
+        // Regression guard for PR 240 review (Qodo/Cursor/CodeRabbit):
+        // a transaction whose only recipient is remote must return 250 OK,
+        // not 451. Before the fix, `success = !delivered_to.is_empty()`
+        // ignored successful remote seal+publish and returned 451, which
+        // caused sending MTAs to retry and duplicate messages.
+        use crate::remote_delivery::RecipientResolver;
+
+        // Resolver that returns a matching Identity for any requested hash,
+        // by generating a PrivateIdentity whose public form we reuse.
+        struct FixedResolver {
+            identity: harmony_identity::Identity,
+            want_hash: harmony_identity::IdentityHash,
+        }
+        impl RecipientResolver for FixedResolver {
+            fn resolve(
+                &self,
+                addr: &harmony_identity::IdentityHash,
+            ) -> Option<harmony_identity::Identity> {
+                if *addr == self.want_hash {
+                    Some(self.identity.clone())
+                } else {
+                    None
+                }
+            }
+        }
+
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db"))
+                .unwrap(),
+        );
+        let (publisher, handles) = crate::mailbox_manager::ZenohPublisher::inert_for_test();
+        let publisher = Arc::new(publisher);
+
+        let mut rng = rand::rngs::OsRng;
+        let gateway_id = Arc::new(harmony_identity::PrivateIdentity::generate(&mut rng));
+        let bob = harmony_identity::PrivateIdentity::generate(&mut rng);
+        let bob_pub = bob.public_identity().clone();
+        // The SMTP handler's Ok(None) branch looks up by the recipient hash
+        // passed in the action; we mint one that the resolver can match.
+        let recipient_hash = bob_pub.address_hash;
+
+        let resolver: Arc<dyn RecipientResolver> = Arc::new(FixedResolver {
+            identity: bob_pub,
+            want_hash: recipient_hash,
+        });
+
+        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Wed, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113-success@local.example>\r\n\r\nhello\r\n";
+        let actions = vec![SmtpAction::DeliverToHarmony {
+            recipients: vec![recipient_hash],
+            data: rfc822.to_vec(),
+        }];
+
+        let smtp_config = SmtpConfig {
+            domain: "local".to_string(),
+            mx_host: "mail.local".to_string(),
+            max_message_size: 10 * 1024 * 1024,
+            max_recipients: 100,
+            tls_available: false,
+        };
+        // The SMTP state machine must be in DeliveryPending for
+        // handle_delivery_result to emit a SendResponse. Drive it there
+        // directly — the full EHLO/MAIL/RCPT/DATA dance is exercised by
+        // the higher-level smtp_delivers_to_local_imap test.
+        let mut session = SmtpSession::new(smtp_config);
+        session.state = crate::smtp::SmtpState::DeliveryPending;
+
+        let mut writer = Vec::<u8>::new();
+        let mut spf_result = crate::spam::SpfResult::None;
+
+        process_async_actions(
+            &actions,
+            &mut session,
+            &mut writer,
+            &store,
+            &None,
+            "local",
+            smtp_test_dir.path(),
+            &mut spf_result,
+            1000,
+            &None,
+            &Some(Arc::clone(&publisher)),
+            &Some(Arc::clone(&gateway_id)),
+            &Some(resolver),
+        )
+        .await
+        .expect("process_async_actions should succeed for remote-only delivery");
+
+        // The publisher captured exactly one sealed-unicast envelope.
+        let sealed = handles
+            .sealed_unicast
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            sealed.len(),
+            1,
+            "expected exactly one sealed-unicast publish for one remote recipient",
+        );
+
+        // SMTP state machine produced a 250 OK (success=true) — NOT 451.
+        let response = String::from_utf8_lossy(&writer);
+        assert!(
+            response.contains("250"),
+            "remote-only delivery should yield 250 OK; got response: {response:?}",
+        );
+        assert!(
+            !response.contains("451"),
+            "remote-only delivery should NOT yield 451; got response: {response:?}",
+        );
     }
 }
 

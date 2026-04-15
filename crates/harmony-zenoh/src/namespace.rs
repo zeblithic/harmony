@@ -791,6 +791,40 @@ pub mod telemetry {
     }
 }
 
+// ── Tier 3: Messaging ─────────────────────────────────────────────
+
+/// Tier 3 / application namespace for unicast sealed messages.
+///
+/// Deliberately separate from `harmony/mail/v1/` — that keyspace carries
+/// gateway-authoritative mailbox tree publications. `harmony/msg/v1/unicast/`
+/// carries sender-sealed `HarmonyEnvelope` payloads addressed to a specific
+/// recipient's address hash. A recipient's gateway (or client) subscribes
+/// on this prefix and calls `HarmonyEnvelope::open` with its
+/// `PrivateIdentity` to recover the plaintext.
+pub mod msg {
+    use alloc::{format, string::String};
+
+    /// Base prefix: `harmony/msg/v1`
+    pub const PREFIX: &str = "harmony/msg/v1";
+
+    /// Unicast prefix: `harmony/msg/v1/unicast`
+    pub const UNICAST_PREFIX: &str = "harmony/msg/v1/unicast";
+
+    /// Subscribe pattern for all unicast messages: `harmony/msg/v1/unicast/*`.
+    /// Gateway observers use this to receive every sealed envelope;
+    /// single-recipient subscribers should use `unicast_key(hash)` instead.
+    pub const UNICAST_SUB: &str = "harmony/msg/v1/unicast/*";
+
+    /// Publish key: `harmony/msg/v1/unicast/{recipient_hash_hex}`.
+    ///
+    /// `recipient_hash_hex` is the lowercase 32-char hex encoding of the
+    /// 16-byte truncated SHA-256 address hash (see
+    /// `harmony_identity::ADDRESS_HASH_LENGTH`).
+    pub fn unicast_key(recipient_hash_hex: &str) -> String {
+        format!("{UNICAST_PREFIX}/{recipient_hash_hex}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1049,22 @@ mod tests {
             compute::CAPACITY_SUB,
             "harmony/compute/capacity/*"
         );
+    }
+
+    // ── Tier 3: Messaging ────────────────────────────────────────
+
+    #[test]
+    fn msg_unicast_key_format() {
+        let hash_hex = "00112233445566778899aabbccddeeff";
+        assert_eq!(
+            msg::unicast_key(hash_hex),
+            "harmony/msg/v1/unicast/00112233445566778899aabbccddeeff"
+        );
+    }
+
+    #[test]
+    fn msg_unicast_sub_pattern() {
+        assert_eq!(msg::UNICAST_SUB, "harmony/msg/v1/unicast/*");
     }
 
     // ── Tier 3: Workflow ────────────────────────────────────────
@@ -1356,6 +1406,7 @@ mod tests {
             page::PREFIX,
             engram::PREFIX,
             telemetry::PREFIX,
+            msg::PREFIX,
         ];
         for prefix in prefixes {
             assert!(
