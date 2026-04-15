@@ -1023,6 +1023,15 @@ async fn execute_actions_generic<W: AsyncWrite + Unpin>(
 
 /// Process async action callbacks (address resolution, delivery, SPF).
 /// Returns true if a StartTls action was encountered.
+///
+/// # Stability
+///
+/// This function is exposed publicly **only** to support crate-external
+/// integration tests under `tests/`. The parameter list is unstable:
+/// it tracks the internal needs of [`handle_connection`] and will change
+/// without notice as SMTP features are added. Production callers must
+/// route through the main server entry point, `run`, not this function
+/// directly.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_async_actions<W: AsyncWrite + Unpin>(
     actions: &[SmtpAction],

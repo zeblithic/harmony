@@ -21,7 +21,7 @@ use harmony_mail::remote_delivery::RecipientResolver;
 use harmony_mail::server::process_async_actions;
 use harmony_mail::smtp::{SmtpAction, SmtpConfig, SmtpSession};
 use harmony_mail::spam::SpfResult;
-use harmony_zenoh::envelope::HarmonyEnvelope;
+use harmony_zenoh::envelope::{HarmonyEnvelope, MessageType};
 use harmony_zenoh::namespace::msg;
 use rand_core::OsRng;
 use tokio_util::sync::CancellationToken;
@@ -50,25 +50,62 @@ async fn smtp_remote_delivery_round_trips_through_zenoh_to_recipient() {
     let bob_hash = bob_pub.address_hash;
 
     // ── Two independent Zenoh sessions ────────────────────────────
-    let session_a = zenoh::open(zenoh::Config::default()).await.unwrap();
-    let session_b = zenoh::open(zenoh::Config::default()).await.unwrap();
+    let session_a = zenoh::open(zenoh::Config::default())
+        .await
+        .expect("open session_a");
+    let session_b = zenoh::open(zenoh::Config::default())
+        .await
+        .expect("open session_b");
 
     // Subscribe Bob's gateway to the unicast key BEFORE we publish.
     let sub_key = msg::unicast_key(&hex::encode(bob_hash));
-    let sub = session_b.declare_subscriber(&sub_key).await.unwrap();
+    let sub = session_b
+        .declare_subscriber(&sub_key)
+        .await
+        .expect("declare subscriber");
 
-    // Readiness wait — auto-peer discovery takes a moment on the loopback
-    // transport. 250ms covers typical CI runners.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Bounded readiness probe — replaces a blind 250ms sleep so the test
+    // fails fast on real propagation issues and doesn't flake on slow
+    // runners. Publish a throwaway byte on a probe keyspace from session_a;
+    // session_b's throwaway subscriber acknowledges first receipt.
+    //
+    // 5s total budget. Empirically the first receipt lands in <50ms on a
+    // warm runner and <400ms cold.
+    //
+    // The probe_key is a distinct literal key from the real `sub_key`
+    // above (non-wildcard exact-key matching in Zenoh 1.x), so the real
+    // subscriber will not observe probe traffic.
+    let probe_key = "harmony/msg/v1/unicast/_readiness_probe_zeb113";
+    let probe_sub = session_b
+        .declare_subscriber(probe_key)
+        .await
+        .expect("probe subscriber declare");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            panic!("peer discovery did not converge within 5s");
+        }
+        session_a
+            .put(probe_key, b"probe".to_vec())
+            .await
+            .expect("probe put");
+        match tokio::time::timeout(Duration::from_millis(100), probe_sub.recv_async()).await {
+            Ok(Ok(_)) => break,
+            _ => continue,
+        }
+    }
+    drop(probe_sub);
 
     // ── ZenohPublisher against session_a (real, not inert) ────────
     let cancel = CancellationToken::new();
     let publisher = Arc::new(ZenohPublisher::new(session_a.clone(), cancel.clone()));
 
     // ── IMAP store with NO local user for bob ──────────────────────
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
     let imap = Arc::new(
-        harmony_mail::imap_store::ImapStore::open(&tmp.path().join("a.db")).unwrap(),
+        harmony_mail::imap_store::ImapStore::open(&tmp.path().join("a.db"))
+            .expect("open imap store"),
     );
 
     // ── Resolver maps bob_hash → bob's public Identity ────────────
@@ -122,10 +159,6 @@ async fn smtp_remote_delivery_round_trips_through_zenoh_to_recipient() {
     .await
     .expect("process_async_actions failed");
 
-    // Give the ZenohPublisher's spawned session-publish task a chance to
-    // run before we start waiting on the subscriber channel.
-    tokio::task::yield_now().await;
-
     // ── Gateway B should receive a sealed envelope on the unicast key ──
     let sample = tokio::time::timeout(Duration::from_secs(3), sub.recv_async())
         .await
@@ -148,6 +181,40 @@ async fn smtp_remote_delivery_round_trips_through_zenoh_to_recipient() {
     assert_eq!(
         opened.sender_address,
         gateway_a_priv.public_identity().address_hash,
+    );
+
+    // Lock in the MessageType decision from the plan (Design Decision #2).
+    assert_eq!(
+        opened.msg_type,
+        MessageType::Put,
+        "envelope msg_type should be Put for mail",
+    );
+
+    // Body survived translation (not just headers).
+    assert!(
+        recovered.body.contains("Hello Bob"),
+        "recovered HarmonyMessage body missing expected text: {:?}",
+        recovered.body,
+    );
+
+    // Recipient list preserved through serialize/seal/open/deserialize.
+    // The recipients Vec inside the HarmonyMessage body is populated by
+    // translate.rs from the RFC 5322 `To:` header, where each address
+    // is hashed via blake3("bob@remote.example") truncated to 16 bytes
+    // — NOT the random `bob_hash` identity used for envelope sealing.
+    let expected_to_hash = {
+        let h = blake3::hash(b"bob@remote.example");
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&h.as_bytes()[..16]);
+        out
+    };
+    assert!(
+        recovered
+            .recipients
+            .iter()
+            .any(|r| r.address_hash == expected_to_hash),
+        "recovered HarmonyMessage recipients missing bob@remote.example hash: {:?}",
+        recovered.recipients,
     );
 
     // ── Clean up: cancel publisher + drop sessions ────────────────
