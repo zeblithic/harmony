@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use harmony_mail_discovery::claim::{canonical_cbor, MasterPubkey};
+use harmony_mail_discovery::cache::TimeSource;
+use harmony_mail_discovery::claim::{canonical_cbor, MasterPubkey, Signature};
 use harmony_mail_discovery::dns::DnsError;
 use harmony_mail_discovery::http::HttpResponse;
 use harmony_mail_discovery::resolver::{
@@ -240,5 +241,153 @@ async fn revocation_bootstrap_failure_fails_closed() {
     match resolver.resolve("alice", "q8.fyi").await {
         ResolveOutcome::Transient { reason } => assert_eq!(reason, "revocation_bootstrap_failed"),
         other => panic!("expected bootstrap-closed Transient, got {other:?}"),
+    }
+}
+
+/// Helper: build a revocation cert for `sk` with `valid_until = revoked_at`,
+/// re-signed by the master key. This keeps `sk` available for claim signing.
+fn make_revocation_cert(
+    d: &TestDomain,
+    sk: &harmony_mail_discovery::test_support::TestSigningKey,
+    revoked_at: u64,
+) -> harmony_mail_discovery::claim::SigningKeyCert {
+    use ed25519_dalek::Signer;
+    let mut revoked = sk.cert.clone();
+    revoked.valid_until = revoked_at;
+    revoked.master_signature = Signature::Ed25519([0u8; 64]);
+    let bytes = canonical_cbor(&revoked.signable()).unwrap();
+    let sig = d.master_sk.sign(&bytes);
+    revoked.master_signature = Signature::Ed25519(sig.to_bytes());
+    revoked
+}
+
+#[tokio::test]
+async fn claim_signed_by_revoked_cert_returns_revoked() {
+    let (d, dns, http, _time, resolver) = setup();
+    let mut rng = OsRng;
+    // Signing key revoked at NOW - 100; claim issued at NOW (after revocation).
+    let sk = d.mint_signing_key(&mut rng, NOW - 1_000, NOW + 90 * 86_400);
+    let revoked_at = NOW - 100;
+    let revocation_cert = make_revocation_cert(&d, &sk, revoked_at);
+    let revocation_list = d.revocation_list(NOW, vec![revocation_cert]);
+    let claim = ClaimBuilder::new(&d, &sk, NOW).build();
+
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    http.set(
+        &harmony_mail_discovery::http::claim_url(&d.domain, &claim.payload.hashed_local_part),
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&claim).unwrap(),
+        }),
+    );
+    http.set(
+        &harmony_mail_discovery::http::revocation_url(&d.domain),
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&revocation_list).unwrap(),
+        }),
+    );
+
+    assert_eq!(
+        resolver.resolve("alice", "q8.fyi").await,
+        ResolveOutcome::Revoked
+    );
+}
+
+#[tokio::test]
+async fn claim_issued_before_revocation_is_grandfathered() {
+    let (d, dns, http, _time, resolver) = setup();
+    let mut rng = OsRng;
+    // Claim issued at NOW - 10_000; signing key revoked at NOW - 5_000.
+    // Since claim.issued_at < revocation.valid_until, the claim is grandfathered.
+    let sk = d.mint_signing_key(&mut rng, NOW - 20_000, NOW + 90 * 86_400);
+    let revoked_at = NOW - 5_000;
+    let claim_issued_at = NOW - 10_000;
+    let revocation_cert = make_revocation_cert(&d, &sk, revoked_at);
+    let revocation_list = d.revocation_list(NOW, vec![revocation_cert]);
+    let claim = ClaimBuilder::new(&d, &sk, NOW)
+        .issued_at(claim_issued_at)
+        .expires_at(NOW + 7 * 86_400)
+        .build();
+
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    http.set(
+        &harmony_mail_discovery::http::claim_url(&d.domain, &claim.payload.hashed_local_part),
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&claim).unwrap(),
+        }),
+    );
+    http.set(
+        &harmony_mail_discovery::http::revocation_url(&d.domain),
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&revocation_list).unwrap(),
+        }),
+    );
+
+    assert!(
+        matches!(
+            resolver.resolve("alice", "q8.fyi").await,
+            ResolveOutcome::Resolved(_)
+        ),
+        "pre-revocation claim should be grandfathered"
+    );
+}
+
+#[tokio::test]
+async fn claim_serial_rollback_on_refetch_returns_transient() {
+    let (d, dns, http, time, resolver) = setup();
+    let mut rng = OsRng;
+    let sk = d.mint_signing_key(&mut rng, NOW - 100, NOW + 90 * 86_400);
+
+    // First claim: serial=5, expires in 60 seconds.
+    let claim_v5 = ClaimBuilder::new(&d, &sk, NOW)
+        .serial(5)
+        .issued_at(NOW)
+        .expires_at(NOW + 60)
+        .build();
+
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    http.set(
+        &harmony_mail_discovery::http::claim_url(&d.domain, &claim_v5.payload.hashed_local_part),
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&claim_v5).unwrap(),
+        }),
+    );
+    http.set_not_found(&harmony_mail_discovery::http::revocation_url(&d.domain));
+
+    // First resolve: should succeed with serial=5.
+    match resolver.resolve("alice", "q8.fyi").await {
+        ResolveOutcome::Resolved(_) => {}
+        other => panic!("expected Resolved on first fetch, got {other:?}"),
+    }
+
+    // Advance time by 120s — past the claim expiry (60s) so it's evicted from cache.
+    time.advance(120);
+
+    // Now serve a stale claim with serial=3 (rollback).
+    let now2 = time.now();
+    let claim_v3 = ClaimBuilder::new(&d, &sk, now2)
+        .serial(3)
+        .issued_at(now2)
+        .expires_at(now2 + 7 * 86_400)
+        .build();
+
+    http.set(
+        &harmony_mail_discovery::http::claim_url(&d.domain, &claim_v3.payload.hashed_local_part),
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&claim_v3).unwrap(),
+        }),
+    );
+
+    // Second resolve: rollback detected → Transient.
+    match resolver.resolve("alice", "q8.fyi").await {
+        ResolveOutcome::Transient { reason } => {
+            assert_eq!(reason, "claim_serial_rollback");
+        }
+        other => panic!("expected Transient(claim_serial_rollback), got {other:?}"),
     }
 }

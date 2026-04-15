@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use ed25519_dalek::{Signature as EdSignature, Verifier, VerifyingKey};
 use harmony_identity::IdentityHash;
 use tokio::sync::{Mutex, Semaphore};
@@ -113,6 +114,11 @@ pub struct DefaultEmailResolver {
     /// a bounded cost, but Task 19's background sweep should evict entries
     /// for domains that have not been seen recently (cf. `domain_last_seen`).
     revocation_refresh_locks: Arc<dashmap::DashMap<String, Arc<Semaphore>>>,
+    /// Highest observed claim serial per `(domain, hashed_local_part)`.
+    /// Used to detect serial rollback attacks: a claim whose serial is
+    /// strictly less than the previously-seen highest is rejected as
+    /// `Transient("claim_serial_rollback")`.
+    highest_serial: Arc<DashMap<(String, [u8; 32]), u64>>,
     /// Handle to the background sweep task; held so the task is cancelled when
     /// the resolver is dropped. Wired up by the background-sweep task (Task 17+).
     #[allow(dead_code)]
@@ -138,6 +144,7 @@ impl DefaultEmailResolver {
             time,
             config,
             revocation_refresh_locks: Arc::new(dashmap::DashMap::new()),
+            highest_serial: Arc::new(DashMap::new()),
             background_task: Mutex::new(None),
         }
     }
@@ -272,6 +279,19 @@ impl EmailResolver for DefaultEmailResolver {
                 let cert_valid_until = claim.cert.valid_until;
                 let claim_expires_at = claim.payload.expires_at;
                 let serial = binding.serial;
+                // Serial rollback check: reject if this claim's serial is
+                // strictly less than the highest serial we have ever seen
+                // for this (domain, hashed_local_part) pair.
+                if let Some(prev) = self.highest_serial.get(&cache_key) {
+                    if serial < *prev {
+                        warn!(%domain, local_part = %local_part, prev = *prev, new = serial,
+                              "claim serial rollback detected");
+                        return ResolveOutcome::Transient {
+                            reason: "claim_serial_rollback",
+                        };
+                    }
+                }
+                self.highest_serial.insert(cache_key.clone(), serial);
                 let cert_clone = claim.cert.clone();
                 self.caches
                     .put_claim(cache_key, claim, claim_expires_at, serial);
