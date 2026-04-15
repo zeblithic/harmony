@@ -17,6 +17,7 @@ default = []
 test-support = []
 
 [dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
 harmony-crypto = { workspace = true, features = ["std"] }
 harmony-identity = { workspace = true, features = ["std"] }
 ed25519-dalek.workspace = true
