@@ -1264,21 +1264,28 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                 // model (mailboxes are global, not per-user). Multi-user
                 // mailbox isolation is tracked separately in ZEB-112.
                 let mut delivered_to: Vec<[u8; crate::message::ADDRESS_HASH_LEN]> = Vec::new();
-                // Tracks whether at least one remote recipient was "handled" —
-                // either sealed+published to the unicast keyspace, or
-                // knowingly skipped in a way that sender-retry cannot fix
-                // (no announce per the PR spec, or resolver hash mismatch).
+                // Tracks whether at least one remote recipient was accepted
+                // for delivery: the gateway sealed the envelope AND
+                // `publish_sealed_unicast` returned `true` (permit acquired,
+                // task spawned — the gateway has committed to the put).
                 // Kept separate from `delivered_to`, which only carries
-                // local recipients (used below to drive the raw-mail
-                // publish loop). The SMTP transaction 250s iff
-                // `local || remote_handled`.
+                // local recipients used below to drive the raw-mail publish
+                // loop. The SMTP transaction 250s iff
+                // `local || remote_accepted`.
                 //
-                // NOT set (→ 451) for:
-                //  - seal failure: genuine AEAD/RNG runtime error, retry may help
-                //  - remote delivery not configured: gateway has no mechanism
-                //    to try at all — 250 would be a silent drop. Retry helps
-                //    once operator wires up gateway_identity + resolver.
-                let mut remote_handled = false;
+                // All non-publish outcomes (no announce, resolver hash
+                // mismatch, remote delivery not configured, seal failure,
+                // publisher backpressure) leave this `false`. Per-recipient
+                // MX-like semantics still apply: a single miss within a
+                // multi-recipient batch does NOT fail the batch as long as
+                // at least one recipient (local or remote) was accepted.
+                // If every recipient misses, the transaction 451s and the
+                // sender retries — giving operators a chance to complete
+                // wiring (main.rs follow-up) or recipients a chance to
+                // announce, and eventually bouncing to the original sender
+                // with visibility if nothing lands. Silent 250-and-drop is
+                // specifically avoided.
+                let mut remote_accepted = false;
                 let timestamp = msg_timestamp;
                 let rfc822_size = data.len() as u32;
 
@@ -1354,14 +1361,19 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                                         // wrong public keys — the subscriber could not
                                         // decrypt, silent data loss. Skip and warn.
                                         if recipient_identity.address_hash != *recipient_hash {
-                                            // Knowingly skip — resolver bug,
-                                            // sender retry won't help. Non-fatal.
+                                            // Resolver bug — publish to the
+                                            // correct topic would seal to the
+                                            // wrong keys, silent data loss.
+                                            // Skip this recipient; if others
+                                            // succeed, the batch still 250s.
+                                            // If this is the only recipient,
+                                            // 451 will prompt sender retry
+                                            // (loud warn surfaces the bug).
                                             tracing::warn!(
                                                 expected = %hash_hex,
                                                 got = %hex::encode(recipient_identity.address_hash),
                                                 "resolver returned identity with mismatched address_hash; skipping",
                                             );
-                                            remote_handled = true;
                                         } else {
                                             let mut rng = rand_core::OsRng;
                                             match crate::remote_delivery::seal_for_recipient(
@@ -1371,22 +1383,33 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                                                 *bytes,
                                             ) {
                                                 Ok(sealed) => {
-                                                    publisher.publish_sealed_unicast(
+                                                    // Only set remote_accepted
+                                                    // when the publisher
+                                                    // actually took
+                                                    // responsibility (permit
+                                                    // acquired + task
+                                                    // spawned). Backpressure
+                                                    // drop or cancel during
+                                                    // shutdown leaves it false
+                                                    // so the SMTP transaction
+                                                    // can 451 and the sender
+                                                    // retries.
+                                                    if publisher.publish_sealed_unicast(
                                                         hash_hex.clone(),
                                                         Arc::new(sealed),
-                                                    );
-                                                    remote_handled = true;
-                                                    tracing::debug!(
-                                                        recipient = %hash_hex,
-                                                        "remote recipient sealed + published",
-                                                    );
+                                                    ) {
+                                                        remote_accepted = true;
+                                                        tracing::debug!(
+                                                            recipient = %hash_hex,
+                                                            "remote recipient sealed + published",
+                                                        );
+                                                    } else {
+                                                        tracing::warn!(
+                                                            recipient = %hash_hex,
+                                                            "publisher did not accept sealed-unicast (backpressure or shutdown); will 451 retry if sole recipient",
+                                                        );
+                                                    }
                                                 }
-                                                // Seal failure is a genuine
-                                                // runtime error (RNG / AEAD) —
-                                                // do NOT set remote_handled, so
-                                                // the SMTP transaction can 451
-                                                // and the sender retries if
-                                                // this was the only recipient.
                                                 Err(e) => tracing::warn!(
                                                     recipient = %hash_hex,
                                                     error = %e,
@@ -1396,34 +1419,29 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                                         }
                                     }
                                     None => {
-                                        // No announce record — per-recipient
-                                        // MX-like "warn and skip". Non-fatal
-                                        // for the SMTP transaction; PR B's
-                                        // OfflineResolver will add
-                                        // store-and-forward for this case.
+                                        // No announce record. Per-recipient
+                                        // miss that doesn't cascade: if other
+                                        // recipients were accepted the batch
+                                        // still 250s. If this is the only
+                                        // recipient, 451 prompts sender
+                                        // retry until PR B's offline
+                                        // store-and-forward can pick it up
+                                        // or the recipient announces.
                                         tracing::warn!(
                                             recipient = %hash_hex,
                                             "no announce record for remote recipient; skipping (offline store-and-forward in ZEB-113 PR B)",
                                         );
-                                        remote_handled = true;
                                     }
                                 }
                             } else {
-                                // Remote delivery not configured on this
-                                // gateway. Unlike the "configured but miss"
-                                // cases above, the gateway has NO mechanism
-                                // to attempt delivery — accepting 250 here
-                                // would silently drop the message and lie
-                                // to the sender. Sender retry DOES help
-                                // once the operator wires up
-                                // gateway_identity + recipient_resolver,
-                                // so leave remote_handled = false and let
-                                // the transaction 451. Preserves pre-PR
-                                // behavior for gateways that haven't
-                                // enabled remote delivery.
+                                // Remote delivery not configured. Gateway
+                                // has no mechanism to try — 250 here would
+                                // be a silent drop. 451 preserves pre-PR
+                                // behavior and prompts sender retry until
+                                // main.rs wiring (follow-up) lands.
                                 tracing::debug!(
                                     recipient = %hash_hex,
-                                    "no local user and remote delivery not configured; will 451 retry",
+                                    "no local user and remote delivery not configured; will 451 retry if sole recipient",
                                 );
                             }
                         }
@@ -1437,7 +1455,7 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 }
 
-                let success = !delivered_to.is_empty() || remote_handled;
+                let success = !delivered_to.is_empty() || remote_accepted;
 
                 // Raw-mail publish: notify Zenoh subscribers (e.g., Phase 0
                 // harmony-client) that a new message arrived for each
@@ -3796,19 +3814,23 @@ node_config = "/tmp/test-node.toml"
             sealed.len(),
         );
 
-        // Regression guard for PR 240 CodeRabbit follow-up: a resolver miss
-        // is per-recipient MX-like "warn and skip" — non-fatal for the SMTP
-        // transaction. Sender retry won't help (the recipient hasn't
-        // announced); PR B's offline store-and-forward will handle this
-        // case. Until then, 250 + warn log is the documented behavior.
+        // Regression guard for PR 240 review round 4 (Greptile P1 /
+        // CodeRabbit): a resolver miss is a per-recipient failure — it
+        // doesn't cascade to other recipients, but on its own it leaves
+        // no remote_accepted. Sole-recipient miss → 451 so the sender
+        // retries until the recipient announces or PR B's offline
+        // store-and-forward lands. Silent 250-and-drop is specifically
+        // avoided. Multi-recipient batches where at least one other
+        // recipient succeeds still 250 (tested separately via the
+        // local+remote combination).
         let response = String::from_utf8_lossy(&writer);
         assert!(
-            response.contains("250"),
-            "resolver miss should yield 250 OK (per-recipient MX-like); got: {response:?}",
+            response.contains("451"),
+            "sole-recipient resolver miss should yield 451 so sender retries; got: {response:?}",
         );
         assert!(
-            !response.contains("451"),
-            "resolver miss must NOT yield 451; got: {response:?}",
+            !response.contains("250"),
+            "sole-recipient resolver miss must NOT yield 250 (silent drop); got: {response:?}",
         );
     }
 

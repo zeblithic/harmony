@@ -407,7 +407,7 @@ impl ZenohPublisher {
     ///
     /// Short-circuits when the cancel token has already fired — prevents
     /// post-shutdown spawns from keeping the runtime alive.
-    pub fn publish_raw_mail(&self, addr_hex: String, bytes: Arc<Vec<u8>>) {
+    pub fn publish_raw_mail(&self, addr_hex: String, bytes: Arc<Vec<u8>>) -> bool {
         match &self.raw_sink {
             RawSink::Session {
                 session,
@@ -417,10 +417,12 @@ impl ZenohPublisher {
                 let topic = format!("harmony/mail/v1/{addr_hex}");
                 // Closures below preserve the original operator-facing
                 // tracing field names (`addr = %addr_hex`) and message
-                // literals ("raw mail …") that ops log queries key on.
-                // The DRY helper handles spawn/permit/timeout/cancel; each
-                // caller renders its own tracing events so the observable
-                // shape does not drift when the scaffolding is shared.
+                // literals ("raw-mail publish dropped" hyphenated; other
+                // failure messages use "raw mail") that ops log queries
+                // key on. The DRY helper handles spawn/permit/timeout/
+                // cancel; each caller renders its own tracing events so
+                // the observable shape does not drift when the
+                // scaffolding is shared.
                 let addr_drop = addr_hex.clone();
                 let addr_fail = addr_hex.clone();
                 let addr_timeout = addr_hex.clone();
@@ -434,7 +436,7 @@ impl ZenohPublisher {
                     move || {
                         tracing::warn!(
                             addr = %addr_drop,
-                            "raw mail publish dropped: in-flight limit ({}) reached — best-effort path, client will catch up via IMAP/root",
+                            "raw-mail publish dropped: in-flight limit ({}) reached — best-effort path, client will catch up via IMAP/root",
                             RAW_PUBLISH_CONCURRENCY,
                         );
                     },
@@ -461,13 +463,14 @@ impl ZenohPublisher {
                             "Zenoh raw mail publish cancelled during shutdown"
                         );
                     },
-                );
+                )
             }
             #[cfg(test)]
             RawSink::Captured { raw, .. } => {
                 raw.lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push((addr_hex, bytes));
+                true
             }
         }
     }
@@ -489,11 +492,19 @@ impl ZenohPublisher {
     ///
     /// Short-circuits when the cancel token has already fired — prevents
     /// post-shutdown spawns from keeping the runtime alive.
+    /// Returns `true` when the gateway accepted responsibility for the
+    /// publish: permit acquired + task spawned (in the production
+    /// session branch) or captured (in the test branch). Returns
+    /// `false` when backpressure dropped the put or the cancel token
+    /// had already fired. Callers use this to drive SMTP-level
+    /// accept/reject semantics — the downstream Zenoh put may still
+    /// fail asynchronously, but by then the SMTP response has already
+    /// been committed and eventual failure is recorded only in logs.
     pub fn publish_sealed_unicast(
         &self,
         recipient_hash_hex: String,
         envelope: Arc<Vec<u8>>,
-    ) {
+    ) -> bool {
         match &self.raw_sink {
             RawSink::Session {
                 session,
@@ -544,7 +555,7 @@ impl ZenohPublisher {
                             "Zenoh sealed-unicast publish cancelled during shutdown"
                         );
                     },
-                );
+                )
             }
             #[cfg(test)]
             RawSink::Captured { sealed_unicast, .. } => {
@@ -553,6 +564,7 @@ impl ZenohPublisher {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push((topic, envelope));
+                true
             }
         }
     }
@@ -572,6 +584,15 @@ impl ZenohPublisher {
     /// Only called from the `RawSink::Session` branch — the `Captured`
     /// branch is test-only and each caller pushes into its own dedicated
     /// Vec (raw vs sealed_unicast).
+    /// Returns `true` when the permit was acquired and the publish task
+    /// was spawned (enqueue success — the caller can treat this as "my
+    /// gateway accepted responsibility for the publish"). Returns
+    /// `false` when backpressure dropped the put, the cancel token had
+    /// already fired, or the semaphore was closed. The downstream put
+    /// itself is still fire-and-forget — an eventual Zenoh-side failure
+    /// is logged via the caller-supplied closures but not reported
+    /// back, because the caller has already committed to SMTP semantics
+    /// by the time the task runs.
     fn spawn_session_publish(
         session: &zenoh::Session,
         cancel: &CancellationToken,
@@ -582,9 +603,9 @@ impl ZenohPublisher {
         on_failed: impl FnOnce(zenoh::Error, &str) + Send + 'static,
         on_timed_out: impl FnOnce(&str) + Send + 'static,
         on_cancelled: impl FnOnce(&str) + Send + 'static,
-    ) {
+    ) -> bool {
         if cancel.is_cancelled() {
-            return;
+            return false;
         }
         // Acquire at the CALL SITE, not inside the spawn. Dropping on
         // backpressure prevents unbounded task accumulation during a
@@ -595,9 +616,9 @@ impl ZenohPublisher {
             Ok(p) => p,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
                 on_dropped();
-                return;
+                return false;
             }
-            Err(tokio::sync::TryAcquireError::Closed) => return,
+            Err(tokio::sync::TryAcquireError::Closed) => return false,
         };
         let session = session.clone();
         let cancel = cancel.clone();
@@ -618,6 +639,7 @@ impl ZenohPublisher {
                 _ = cancel.cancelled() => on_cancelled(&topic),
             }
         });
+        true
     }
 }
 

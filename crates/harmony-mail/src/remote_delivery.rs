@@ -92,7 +92,15 @@ pub fn seal_for_recipient(
 /// Both byte vectors must be exactly 32 bytes for the classical identity
 /// path. Post-quantum records (suite = `MlDsa65`) are outside this helper's
 /// contract — they would need a separate PQ variant.
-pub fn identity_from_announce_record(
+///
+/// Crate-visible (`pub(crate)`) rather than `pub` because the production
+/// `RecipientResolver` that will translate discovery `AnnounceRecord`s
+/// into `Identity` values lives in the follow-up main.rs wiring PR,
+/// within this same crate. External callers have no need for it today.
+/// Exercised by the unit tests below; `#[allow(dead_code)]` covers the
+/// non-test build where no production caller exists yet.
+#[allow(dead_code)]
+pub(crate) fn identity_from_announce_record(
     rec: &AnnounceRecord,
 ) -> Result<Identity, RemoteDeliveryError> {
     if rec.identity_ref.suite != CryptoSuite::Ed25519 {

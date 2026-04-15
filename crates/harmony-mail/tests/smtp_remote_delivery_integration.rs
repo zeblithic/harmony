@@ -199,13 +199,17 @@ async fn smtp_remote_delivery_round_trips_through_zenoh_to_recipient() {
 
     // Recipient list preserved through serialize/seal/open/deserialize.
     // The recipients Vec inside the HarmonyMessage body is populated by
-    // translate.rs from the RFC 5322 `To:` header, where each address
-    // is hashed via blake3("bob@remote.example") truncated to 16 bytes
-    // — NOT the random `bob_hash` identity used for envelope sealing.
+    // `translate::hash_email_to_address` (private to harmony-mail), which
+    // computes `blake3(email_bytes)[..ADDRESS_HASH_LEN]` — NOT the random
+    // `bob_hash` identity used for envelope sealing. We reproduce the
+    // same formula here; any change to the truncation length or hash
+    // algorithm in the mailbox/identity crates will surface as
+    // `ADDRESS_HASH_LEN` drift (or, failing that, as a divergence in
+    // this test's expected value vs the production path).
     let expected_to_hash = {
         let h = blake3::hash(b"bob@remote.example");
-        let mut out = [0u8; 16];
-        out.copy_from_slice(&h.as_bytes()[..16]);
+        let mut out = [0u8; harmony_mail::message::ADDRESS_HASH_LEN];
+        out.copy_from_slice(&h.as_bytes()[..harmony_mail::message::ADDRESS_HASH_LEN]);
         out
     };
     assert!(
