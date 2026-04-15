@@ -118,6 +118,10 @@ pub struct DefaultEmailResolver {
     /// Used to detect serial rollback attacks: a claim whose serial is
     /// strictly less than the previously-seen highest is rejected as
     /// `Transient("claim_serial_rollback")`.
+    ///
+    /// NOTE: this tracker lives only in memory, so a resolver restart
+    /// resets the high-water mark. Persistence is a Phase-2 concern
+    /// (spec §5.4.3 treats this protection as best-effort).
     highest_serial: Arc<DashMap<(String, [u8; 32]), u64>>,
     /// Handle to the background sweep task; held so the task is cancelled when
     /// the resolver is dropped. Wired up by the background-sweep task (Task 17+).
@@ -282,16 +286,29 @@ impl EmailResolver for DefaultEmailResolver {
                 // Serial rollback check: reject if this claim's serial is
                 // strictly less than the highest serial we have ever seen
                 // for this (domain, hashed_local_part) pair.
-                if let Some(prev) = self.highest_serial.get(&cache_key) {
-                    if serial < *prev {
-                        warn!(%domain, local_part = %local_part, prev = *prev, new = serial,
-                              "claim serial rollback detected");
-                        return ResolveOutcome::Transient {
-                            reason: "claim_serial_rollback",
-                        };
-                    }
+                //
+                // Read-and-update is performed inside a single `entry` so the
+                // shard lock keeps check-and-write atomic: two concurrent
+                // resolves observing different serials cannot let the lower
+                // one overwrite the higher after both passed the check.
+                let mut rollback_prev: Option<u64> = None;
+                self.highest_serial
+                    .entry(cache_key.clone())
+                    .and_modify(|stored| {
+                        if serial < *stored {
+                            rollback_prev = Some(*stored);
+                        } else if serial > *stored {
+                            *stored = serial;
+                        }
+                    })
+                    .or_insert(serial);
+                if let Some(prev) = rollback_prev {
+                    warn!(%domain, local_part = %local_part, prev, new = serial,
+                          "claim serial rollback detected");
+                    return ResolveOutcome::Transient {
+                        reason: "claim_serial_rollback",
+                    };
                 }
-                self.highest_serial.insert(cache_key.clone(), serial);
                 let cert_clone = claim.cert.clone();
                 self.caches
                     .put_claim(cache_key, claim, claim_expires_at, serial);
