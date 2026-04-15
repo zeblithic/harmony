@@ -499,3 +499,17 @@ impl DefaultEmailResolver {
         *guard = Some(handle);
     }
 }
+
+impl Drop for DefaultEmailResolver {
+    fn drop(&mut self) {
+        // Abort the background task eagerly so it does not keep running for
+        // up to one sweep interval past the resolver's lifetime. `try_lock`
+        // is safe here because the task holds a `Weak<Self>`, so it cannot
+        // be the current holder of this mutex at drop time.
+        if let Ok(mut guard) = self.background_task.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
+}

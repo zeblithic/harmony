@@ -307,11 +307,14 @@ impl ResolverCaches {
     }
 
     /// Returns the domains whose revocation list is due for a proactive
-    /// refresh: those where `now - last_refreshed >= refresh_secs`.
+    /// refresh: those where `last_refreshed + refresh_secs < now` (spec §6.3).
+    ///
+    /// Strict inequality: at exactly the refresh boundary we wait one more
+    /// tick so that the cadence matches the spec's "every 6h" exactly.
     pub fn revocation_refresh_candidates(&self, now: u64, refresh_secs: u64) -> Vec<String> {
         self.revocation_last_refreshed
             .iter()
-            .filter(|e| now.saturating_sub(*e.value()) >= refresh_secs)
+            .filter(|e| now.saturating_sub(*e.value()) > refresh_secs)
             .map(|e| e.key().clone())
             .collect()
     }
@@ -443,10 +446,13 @@ mod tests {
     #[test]
     fn revocation_refresh_candidates_returns_stale_domains() {
         let caches = ResolverCaches::new(CacheLimits::default());
-        // Put two domains: one refreshed recently, one stale.
+        // last_refreshed: fresh at 1000, stale at 100, boundary at 900.
         caches.put_revocation("fresh.example", RevocationView::empty(), 99999, 1000);
         caches.put_revocation("stale.example", RevocationView::empty(), 99999, 100);
-        // now=1500, refresh_secs=600: fresh (1000) needs refresh in 100s, stale (100) is 1400s old.
+        caches.put_revocation("boundary.example", RevocationView::empty(), 99999, 900);
+        // now=1500, refresh_secs=600. Ages: fresh=500s, stale=1400s, boundary=600s.
+        // Spec §6.3: refresh when last + refresh_secs < now (strict), so
+        // boundary.example (exactly 600s old) must NOT be a candidate.
         let refresh_secs = 600;
         let now = 1500;
         let candidates = caches.revocation_refresh_candidates(now, refresh_secs);
@@ -457,6 +463,10 @@ mod tests {
         assert!(
             !candidates.contains(&"fresh.example".to_string()),
             "fresh domain must not be a candidate"
+        );
+        assert!(
+            !candidates.contains(&"boundary.example".to_string()),
+            "boundary domain (exactly refresh_secs old) must wait one more tick"
         );
     }
 
