@@ -1024,7 +1024,7 @@ async fn execute_actions_generic<W: AsyncWrite + Unpin>(
 /// Process async action callbacks (address resolution, delivery, SPF).
 /// Returns true if a StartTls action was encountered.
 #[allow(clippy::too_many_arguments)]
-async fn process_async_actions<W: AsyncWrite + Unpin>(
+pub async fn process_async_actions<W: AsyncWrite + Unpin>(
     actions: &[SmtpAction],
     session: &mut SmtpSession,
     writer: &mut W,
