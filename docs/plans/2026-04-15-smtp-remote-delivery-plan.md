@@ -1067,7 +1067,7 @@ async fn smtp_remote_delivery_round_trips_through_zenoh_to_recipient() {
     let rfc822 = b"From: alice@local.example\r\n\
                    To: bob@remote.example\r\n\
                    Subject: hello from A\r\n\
-                   Date: Tue, 15 Apr 2026 12:00:00 +0000\r\n\
+                   Date: Wed, 15 Apr 2026 12:00:00 +0000\r\n\
                    Message-ID: <test-zeb113@local.example>\r\n\
                    \r\n\
                    Hello Bob, this is Alice.\r\n";

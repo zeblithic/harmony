@@ -1105,11 +1105,30 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                         }
                     }
                 } else {
-                    // Non-local domain: remote delivery not yet supported (ZEB-113)
+                    // Non-local domain. ZEB-113 PR A (this PR) added the
+                    // DOWNSTREAM delivery machinery — the remote_ctx /
+                    // seal / publish_sealed_unicast flow in
+                    // `process_async_actions` — but the UPSTREAM RCPT
+                    // admission path still rejects non-local domains
+                    // here. Admitting them requires resolving
+                    // `local_part@domain` to an announced
+                    // `identity.address_hash` (so the gateway's seal path
+                    // targets the right keys + topic), which in turn
+                    // needs discovery-backed email→hash lookup
+                    // infrastructure. That infrastructure is the
+                    // follow-up PR tracked alongside "Production wiring
+                    // in main.rs" — both land together because neither
+                    // is independently useful (identity + resolver are
+                    // both required in `run()` for remote delivery to
+                    // fire). Until then, remote RCPTs fall through to
+                    // None as before; the delivery machinery is
+                    // exercised by unit and integration tests that
+                    // bypass RCPT by constructing `DeliverToHarmony`
+                    // directly.
                     tracing::debug!(
                         %domain,
                         local_domain = %local_domain,
-                        "non-local domain, rejecting (remote delivery tracked in ZEB-113)"
+                        "non-local domain, rejecting at RCPT (remote RCPT admission tracked as ZEB-113 follow-up; delivery machinery landed)"
                     );
                     None
                 };
@@ -3757,7 +3776,7 @@ node_config = "/tmp/test-node.toml"
         let resolver: Arc<dyn RecipientResolver> = Arc::new(NullResolver(Arc::clone(&calls)));
 
         // RFC 5322 blob that translate_inbound can parse successfully.
-        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Tue, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113@local.example>\r\n\r\nhello\r\n";
+        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Wed, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113@local.example>\r\n\r\nhello\r\n";
 
         // Recipient hash NOT in the imap_store → Ok(None) branch fires.
         let recipient_hash = [0xAAu8; crate::message::ADDRESS_HASH_LEN];
@@ -3850,7 +3869,7 @@ node_config = "/tmp/test-node.toml"
         let (publisher, handles) = crate::mailbox_manager::ZenohPublisher::inert_for_test();
         let publisher = Arc::new(publisher);
 
-        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Tue, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113-b@local.example>\r\n\r\nhello\r\n";
+        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Wed, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113-b@local.example>\r\n\r\nhello\r\n";
         let recipient_hash = [0xBBu8; crate::message::ADDRESS_HASH_LEN];
 
         let actions = vec![SmtpAction::DeliverToHarmony {
@@ -3966,7 +3985,7 @@ node_config = "/tmp/test-node.toml"
             want_hash: recipient_hash,
         });
 
-        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Tue, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113-success@local.example>\r\n\r\nhello\r\n";
+        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Wed, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113-success@local.example>\r\n\r\nhello\r\n";
         let actions = vec![SmtpAction::DeliverToHarmony {
             recipients: vec![recipient_hash],
             data: rfc822.to_vec(),

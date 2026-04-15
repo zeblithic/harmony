@@ -74,10 +74,16 @@ async fn smtp_remote_delivery_round_trips_through_zenoh_to_recipient() {
     //
     // The probe_key is a distinct literal key from the real `sub_key`
     // above (non-wildcard exact-key matching in Zenoh 1.x), so the real
-    // subscriber will not observe probe traffic.
-    let probe_key = "harmony/msg/v1/unicast/_readiness_probe_zeb113";
+    // subscriber will not observe probe traffic. The key is salted with
+    // bob_hash (random per test run via OsRng above) so parallel tests
+    // running concurrently don't satisfy each other's convergence loops
+    // with unrelated probe traffic.
+    let probe_key = format!(
+        "harmony/msg/v1/unicast/_readiness_probe_zeb113_{}",
+        hex::encode(bob_hash),
+    );
     let probe_sub = session_b
-        .declare_subscriber(probe_key)
+        .declare_subscriber(&probe_key)
         .await
         .expect("probe subscriber declare");
 
@@ -87,7 +93,7 @@ async fn smtp_remote_delivery_round_trips_through_zenoh_to_recipient() {
             panic!("peer discovery did not converge within 5s");
         }
         session_a
-            .put(probe_key, b"probe".to_vec())
+            .put(&probe_key, b"probe".to_vec())
             .await
             .expect("probe put");
         match tokio::time::timeout(Duration::from_millis(100), probe_sub.recv_async()).await {
@@ -119,7 +125,7 @@ async fn smtp_remote_delivery_round_trips_through_zenoh_to_recipient() {
     let rfc822 = b"From: alice@local.example\r\n\
                    To: bob@remote.example\r\n\
                    Subject: hello from A\r\n\
-                   Date: Tue, 15 Apr 2026 12:00:00 +0000\r\n\
+                   Date: Wed, 15 Apr 2026 12:00:00 +0000\r\n\
                    Message-ID: <test-zeb113-integration@local.example>\r\n\
                    \r\n\
                    Hello Bob, this is Alice.\r\n";
