@@ -90,7 +90,10 @@ enum RawSink {
         permits: Arc<Semaphore>,
     },
     #[cfg(test)]
-    Captured(Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>),
+    Captured {
+        raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
+        sealed_unicast: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
+    },
 }
 
 /// Test handles returned by `ZenohPublisher::inert_for_test` so callers can
@@ -101,6 +104,7 @@ pub struct InertHandles {
     pub latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
     pub current: Arc<Mutex<HashMap<[u8; ADDRESS_HASH_LEN], [u8; CID_LEN]>>>,
     pub raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
+    pub sealed_unicast: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
 }
 
 impl ZenohPublisher {
@@ -307,14 +311,27 @@ impl ZenohPublisher {
         let current: Arc<Mutex<HashMap<[u8; ADDRESS_HASH_LEN], [u8; CID_LEN]>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sealed_unicast: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let wake = Arc::new(Notify::new());
         let publisher = Self {
             latest: Arc::clone(&latest),
             current: Arc::clone(&current),
             wake,
-            raw_sink: RawSink::Captured(Arc::clone(&raw)),
+            raw_sink: RawSink::Captured {
+                raw: Arc::clone(&raw),
+                sealed_unicast: Arc::clone(&sealed_unicast),
+            },
         };
-        (publisher, InertHandles { latest, current, raw })
+        (
+            publisher,
+            InertHandles {
+                latest,
+                current,
+                raw,
+                sealed_unicast,
+            },
+        )
     }
 
     /// Announce a new root CID for a user.
@@ -456,10 +473,99 @@ impl ZenohPublisher {
                 });
             }
             #[cfg(test)]
-            RawSink::Captured(buf) => {
-                buf.lock()
+            RawSink::Captured { raw, .. } => {
+                raw.lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push((addr_hex, bytes));
+            }
+        }
+    }
+
+    /// Publish a sealed unicast envelope to
+    /// `harmony/msg/v1/unicast/{recipient_hash_hex}`.
+    ///
+    /// Fire-and-forget: spawns a task that issues one `session.put()` and
+    /// logs on failure. Mirrors `publish_raw_mail` in structure — shares the
+    /// same permit pool and timeout/cancellation machinery — but targets the
+    /// `msg::unicast` keyspace used by sender-to-recipient sealed delivery
+    /// (ZEB-113). Callers hand in the already-encoded sealed envelope bytes
+    /// so recipients can decode without further transformation.
+    ///
+    /// Sharing `RAW_PUBLISH_CONCURRENCY` / `RAW_PUBLISH_TIMEOUT` with
+    /// `publish_raw_mail` is intentional: a single SMTP delivery fans out
+    /// through one or the other, not both, so a shared budget bounds total
+    /// outbound puts without over-provisioning two independent pools.
+    ///
+    /// Short-circuits when the cancel token has already fired — prevents
+    /// post-shutdown spawns from keeping the runtime alive.
+    pub fn publish_sealed_unicast(
+        &self,
+        recipient_hash_hex: String,
+        envelope: Arc<Vec<u8>>,
+    ) {
+        match &self.raw_sink {
+            RawSink::Session {
+                session,
+                cancel,
+                permits,
+            } => {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let permit = match Arc::clone(permits).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        tracing::warn!(
+                            recipient = %recipient_hash_hex,
+                            "sealed-unicast publish dropped: in-flight limit ({}) reached — best-effort path",
+                            RAW_PUBLISH_CONCURRENCY,
+                        );
+                        return;
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => return,
+                };
+                let session = session.clone();
+                let cancel = cancel.clone();
+                let topic = harmony_zenoh::namespace::msg::unicast_key(&recipient_hash_hex);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    tokio::select! {
+                        res = tokio::time::timeout(
+                            RAW_PUBLISH_TIMEOUT,
+                            session.put(&topic, &envelope[..]),
+                        ) => match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    %topic,
+                                    "Zenoh sealed-unicast publish failed"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    %topic,
+                                    timeout_ms = RAW_PUBLISH_TIMEOUT.as_millis() as u64,
+                                    "Zenoh sealed-unicast publish timed out — aborted"
+                                );
+                            }
+                        },
+                        _ = cancel.cancelled() => {
+                            tracing::debug!(
+                                %topic,
+                                "Zenoh sealed-unicast publish cancelled during shutdown"
+                            );
+                        }
+                    }
+                });
+            }
+            #[cfg(test)]
+            RawSink::Captured { sealed_unicast, .. } => {
+                let topic = harmony_zenoh::namespace::msg::unicast_key(&recipient_hash_hex);
+                sealed_unicast
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((topic, envelope));
             }
         }
     }
@@ -1295,6 +1401,24 @@ mod tests {
                 "every fan-out recipient must share the same underlying buffer"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn publish_sealed_unicast_captures_notification_on_test_publisher() {
+        let (publisher, handles) = ZenohPublisher::inert_for_test();
+        let recipient_hash_hex = "aabbccddeeff00112233445566778899".to_string();
+        let envelope: Arc<Vec<u8>> = Arc::new(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        publisher.publish_sealed_unicast(recipient_hash_hex.clone(), Arc::clone(&envelope));
+
+        let sealed = handles
+            .sealed_unicast
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(sealed.len(), 1, "expected exactly one sealed-unicast capture");
+        let (key, payload) = &sealed[0];
+        assert_eq!(key, "harmony/msg/v1/unicast/aabbccddeeff00112233445566778899");
+        assert_eq!(payload.as_slice(), envelope.as_slice());
     }
 
     #[tokio::test]

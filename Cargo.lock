@@ -3474,6 +3474,7 @@ dependencies = [
  "harmony-db",
  "harmony-identity",
  "harmony-mailbox",
+ "harmony-zenoh",
  "hex",
  "lettre",
  "mail-auth",
