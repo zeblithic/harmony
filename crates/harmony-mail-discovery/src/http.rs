@@ -38,8 +38,6 @@ pub enum HttpError {
     Connect(String),
     #[error("timeout")]
     Timeout,
-    #[error("tls: {0}")]
-    Tls(String),
     #[error("body too large (> cap)")]
     BodyTooLarge,
     #[error("redirect refused")]
@@ -206,5 +204,15 @@ mod tests {
             revocation_url("Q8.fyi"),
             "https://q8.fyi/.well-known/harmony-revocations"
         );
+    }
+
+    #[test]
+    fn reqwest_client_builds_with_sensible_params() {
+        ReqwestHttpClient::new(
+            Duration::from_secs(3),
+            Duration::from_secs(5),
+            1024 * 1024,
+        )
+        .expect("builder should accept normal timeouts + 1 MiB cap");
     }
 }
