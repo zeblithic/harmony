@@ -372,7 +372,7 @@ impl SignedClaim {
 mod tests {
     use super::*;
     #[cfg(feature = "test-support")]
-    use crate::test_support::{ClaimBuilder, TestDomain};
+    use crate::test_support::{ClaimBuilder, TestDomain, TestSigningKey};
     #[cfg(feature = "test-support")]
     use rand_core::OsRng;
 
@@ -473,5 +473,143 @@ mod tests {
         assert_eq!(binding.identity_hash.as_slice(), &[0x11; 16]);
         assert_eq!(binding.serial, 1);
         assert_eq!(binding.signing_key_id, sk.cert.signing_key_id);
+    }
+
+    #[cfg(feature = "test-support")]
+    fn fresh(now: u64) -> (TestDomain, TestSigningKey) {
+        let mut rng = OsRng;
+        let d = TestDomain::new(&mut rng, "q8.fyi");
+        let sk = d.mint_signing_key(&mut rng, now - 1000, now + 90 * 86_400);
+        (d, sk)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rejects_domain_mismatch_between_payload_and_cert() {
+        let (d, sk) = fresh(NOW);
+        let claim = ClaimBuilder::new(&d, &sk, NOW)
+            .payload_domain_override("attacker.example")
+            .build();
+        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        assert_eq!(err, VerifyError::DomainMismatch);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rejects_queried_domain_mismatch_on_verify_against() {
+        let (d, sk) = fresh(NOW);
+        let claim = ClaimBuilder::new(&d, &sk, NOW).build();
+        let err = claim
+            .verify_against("other.example", &d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .unwrap_err();
+        assert_eq!(err, VerifyError::DomainMismatch);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rejects_hashed_local_part_mismatch() {
+        let (d, sk) = fresh(NOW);
+        let claim = ClaimBuilder::new(&d, &sk, NOW)
+            .hashed_local_part_override([0xaau8; 32])
+            .build();
+        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        assert_eq!(err, VerifyError::HashedLocalPartMismatch);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rejects_tampered_claim_signature() {
+        let (d, sk) = fresh(NOW);
+        let claim = ClaimBuilder::new(&d, &sk, NOW).tamper_claim_signature().build();
+        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        assert_eq!(err, VerifyError::ClaimSignatureInvalid);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rejects_cert_not_yet_valid() {
+        let mut rng = OsRng;
+        let d = TestDomain::new(&mut rng, "q8.fyi");
+        // valid_from in the far future, outside tolerance.
+        let sk = d.mint_signing_key(&mut rng, NOW + 10_000, NOW + 90 * 86_400);
+        let claim = ClaimBuilder::new(&d, &sk, NOW).build();
+        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        assert!(matches!(err, VerifyError::CertNotYetValid { .. }), "{err:?}");
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rejects_cert_expired() {
+        let mut rng = OsRng;
+        let d = TestDomain::new(&mut rng, "q8.fyi");
+        let sk = d.mint_signing_key(&mut rng, NOW - 200_000, NOW - 100_000);
+        let claim = ClaimBuilder::new(&d, &sk, NOW - 150_000).build();
+        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        assert!(matches!(err, VerifyError::CertExpired { .. }), "{err:?}");
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rejects_claim_expired() {
+        let (d, sk) = fresh(NOW);
+        let claim = ClaimBuilder::new(&d, &sk, NOW)
+            .issued_at(NOW - 10 * 86_400)
+            .expires_at(NOW - 3 * 86_400) // 3 days past, outside tolerance
+            .build();
+        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        assert!(matches!(err, VerifyError::ClaimExpired { .. }), "{err:?}");
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rejects_revoked_cert_when_claim_issued_after_revocation() {
+        let (d, sk) = fresh(NOW);
+        let claim = ClaimBuilder::new(&d, &sk, NOW).issued_at(NOW).build();
+        let mut revocations = RevocationView::empty();
+        // Revoked 1000 seconds before claim issuance.
+        revocations.insert(sk.cert.signing_key_id, NOW - 1000);
+        let err = claim.verify(&d.record(), &revocations, NOW, TOLERANCE).unwrap_err();
+        assert!(matches!(err, VerifyError::CertRevoked { .. }), "{err:?}");
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn grandfathers_claim_issued_before_revocation() {
+        let (d, sk) = fresh(NOW);
+        let claim = ClaimBuilder::new(&d, &sk, NOW).issued_at(NOW - 10_000).build();
+        let mut revocations = RevocationView::empty();
+        revocations.insert(sk.cert.signing_key_id, NOW - 1000); // revoked AFTER claim issuance
+        let binding = claim.verify(&d.record(), &revocations, NOW, TOLERANCE).expect("grandfathered");
+        assert_eq!(binding.signing_key_id, sk.cert.signing_key_id);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rejects_unsupported_claim_version() {
+        let (d, sk) = fresh(NOW);
+        let claim = ClaimBuilder::new(&d, &sk, NOW).payload_version(99).build();
+        let err = claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).unwrap_err();
+        assert_eq!(err, VerifyError::UnsupportedVersion(99));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn tolerance_allows_60s_clock_skew_on_cert_future() {
+        let mut rng = OsRng;
+        let d = TestDomain::new(&mut rng, "q8.fyi");
+        // valid_from is 30s in the future — inside 60s tolerance.
+        let sk = d.mint_signing_key(&mut rng, NOW + 30, NOW + 86_400);
+        let claim = ClaimBuilder::new(&d, &sk, NOW + 30).build();
+        claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).expect("accepts with tolerance");
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn tolerance_allows_60s_clock_skew_on_claim_expiry() {
+        let (d, sk) = fresh(NOW);
+        let claim = ClaimBuilder::new(&d, &sk, NOW - 100)
+            .expires_at(NOW - 30) // expired 30s ago
+            .build();
+        claim.verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE).expect("accepts with tolerance");
     }
 }
