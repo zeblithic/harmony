@@ -1253,18 +1253,18 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                     Arc<harmony_identity::PrivateIdentity>,
                     Arc<dyn crate::remote_delivery::RecipientResolver>,
                     Arc<crate::mailbox_manager::ZenohPublisher>,
-                    Vec<u8>,
+                    &[u8],
                 )> = match (
                     gateway_identity.as_ref(),
                     recipient_resolver.as_ref(),
                     mailbox_publisher.as_ref(),
-                    msg_bytes.as_ref(),
+                    msg_bytes.as_deref(),
                 ) {
-                    (Some(gw), Some(res), Some(pub_), Some(bytes)) => Some((
+                    (Some(gw), Some(res), Some(publisher), Some(bytes)) => Some((
                         Arc::clone(gw),
                         Arc::clone(res),
-                        Arc::clone(pub_),
-                        bytes.clone(),
+                        Arc::clone(publisher),
+                        bytes,
                     )),
                     _ => None,
                 };
@@ -1302,6 +1302,7 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                             // configured for it. Per-recipient success/failure
                             // — the overall SMTP transaction still succeeds if
                             // any recipient (local or remote) succeeded.
+                            let hash_hex = hex::encode(recipient_hash);
                             if let Some((gw_id, resolver, publisher, bytes)) =
                                 remote_ctx.as_ref()
                             {
@@ -1312,34 +1313,33 @@ async fn process_async_actions<W: AsyncWrite + Unpin>(
                                             &mut rng,
                                             gw_id.as_ref(),
                                             &recipient_identity,
-                                            bytes,
+                                            *bytes,
                                         ) {
                                             Ok(sealed) => {
-                                                let hash_hex = hex::encode(recipient_hash);
                                                 publisher.publish_sealed_unicast(
-                                                    hash_hex,
+                                                    hash_hex.clone(),
                                                     Arc::new(sealed),
                                                 );
                                                 tracing::debug!(
-                                                    recipient = %hex::encode(recipient_hash),
+                                                    recipient = %hash_hex,
                                                     "remote recipient sealed + published",
                                                 );
                                             }
                                             Err(e) => tracing::warn!(
-                                                recipient = %hex::encode(recipient_hash),
+                                                recipient = %hash_hex,
                                                 error = %e,
                                                 "seal failed for remote recipient",
                                             ),
                                         }
                                     }
                                     None => tracing::warn!(
-                                        recipient = %hex::encode(recipient_hash),
+                                        recipient = %hash_hex,
                                         "no announce record for remote recipient; skipping (offline store-and-forward in ZEB-113 PR B)",
                                     ),
                                 }
                             } else {
                                 tracing::debug!(
-                                    recipient = %hex::encode(recipient_hash),
+                                    recipient = %hash_hex,
                                     "no local user and remote delivery not configured; dropping",
                                 );
                             }
@@ -3638,6 +3638,70 @@ node_config = "/tmp/test-node.toml"
         assert!(
             sealed.is_empty(),
             "no publish should occur when resolver returns None; got {} captures",
+            sealed.len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn delivers_drops_remote_recipient_when_remote_delivery_not_configured() {
+        // When any of the four remote-delivery ingredients is None
+        // (here: no gateway_identity and no resolver), the Ok(None) branch
+        // falls through to a debug log + drop. Preserves Task-4 behavior
+        // for gateways that don't enable remote delivery. SMTP transaction
+        // still returns Ok — per-recipient drop, not a transaction failure.
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db"))
+                .unwrap(),
+        );
+
+        let (publisher, handles) = crate::mailbox_manager::ZenohPublisher::inert_for_test();
+        let publisher = Arc::new(publisher);
+
+        let rfc822 = b"From: alice@local\r\nTo: bob@remote\r\nSubject: hi\r\nDate: Tue, 15 Apr 2026 12:00:00 +0000\r\nMessage-ID: <test-zeb113-b@local.example>\r\n\r\nhello\r\n";
+        let recipient_hash = [0xBBu8; crate::message::ADDRESS_HASH_LEN];
+
+        let actions = vec![SmtpAction::DeliverToHarmony {
+            recipients: vec![recipient_hash],
+            data: rfc822.to_vec(),
+        }];
+
+        let smtp_config = SmtpConfig {
+            domain: "local".to_string(),
+            mx_host: "mail.local".to_string(),
+            max_message_size: 10 * 1024 * 1024,
+            max_recipients: 100,
+            tls_available: false,
+        };
+        let mut session = SmtpSession::new(smtp_config);
+        let mut writer = Vec::<u8>::new();
+        let mut spf_result = crate::spam::SpfResult::None;
+
+        process_async_actions(
+            &actions,
+            &mut session,
+            &mut writer,
+            &store,
+            &None,
+            "local",
+            smtp_test_dir.path(),
+            &mut spf_result,
+            1000,
+            &None,
+            &Some(Arc::clone(&publisher)), // publisher IS configured ...
+            &None,                         // ... but no gateway identity
+            &None,                         // ... and no resolver
+        )
+        .await
+        .expect("process_async_actions should succeed even with remote delivery disabled");
+
+        let sealed = handles
+            .sealed_unicast
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(
+            sealed.is_empty(),
+            "no publish should occur when remote delivery is not configured; got {} captures",
             sealed.len(),
         );
     }
