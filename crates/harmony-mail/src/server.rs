@@ -1264,12 +1264,18 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                 // model (mailboxes are global, not per-user). Multi-user
                 // mailbox isolation is tracked separately in ZEB-112.
                 let mut delivered_to: Vec<[u8; crate::message::ADDRESS_HASH_LEN]> = Vec::new();
-                // Tracks whether at least one remote recipient was sealed + published
-                // via the unicast keyspace. Kept separate from `delivered_to`, which
-                // only carries local recipients (used below to drive the raw-mail
-                // publish loop). `success` for the SMTP reply is `local || remote`
-                // so remote-only transactions return 250 instead of 451.
-                let mut remote_accepted = false;
+                // Tracks whether at least one remote recipient was "handled" —
+                // either sealed+published to the unicast keyspace, or knowingly
+                // skipped with a warn/debug log (no announce, resolver hash
+                // mismatch, or remote delivery not configured). Per the
+                // per-recipient MX-like semantics in the PR spec ("do NOT fail
+                // the overall SMTP transaction"), any of these outcomes is
+                // non-fatal for the SMTP reply. Kept separate from
+                // `delivered_to`, which only carries local recipients (used
+                // below to drive the raw-mail publish loop). The SMTP
+                // transaction 250s iff `local || remote_handled`. Only a seal
+                // failure (genuine runtime error) leaves this false.
+                let mut remote_handled = false;
                 let timestamp = msg_timestamp;
                 let rfc822_size = data.len() as u32;
 
@@ -1345,11 +1351,14 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                                         // wrong public keys — the subscriber could not
                                         // decrypt, silent data loss. Skip and warn.
                                         if recipient_identity.address_hash != *recipient_hash {
+                                            // Knowingly skip — resolver bug,
+                                            // sender retry won't help. Non-fatal.
                                             tracing::warn!(
                                                 expected = %hash_hex,
                                                 got = %hex::encode(recipient_identity.address_hash),
                                                 "resolver returned identity with mismatched address_hash; skipping",
                                             );
+                                            remote_handled = true;
                                         } else {
                                             let mut rng = rand_core::OsRng;
                                             match crate::remote_delivery::seal_for_recipient(
@@ -1363,12 +1372,18 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                                                         hash_hex.clone(),
                                                         Arc::new(sealed),
                                                     );
-                                                    remote_accepted = true;
+                                                    remote_handled = true;
                                                     tracing::debug!(
                                                         recipient = %hash_hex,
                                                         "remote recipient sealed + published",
                                                     );
                                                 }
+                                                // Seal failure is a genuine
+                                                // runtime error (RNG / AEAD) —
+                                                // do NOT set remote_handled, so
+                                                // the SMTP transaction can 451
+                                                // and the sender retries if
+                                                // this was the only recipient.
                                                 Err(e) => tracing::warn!(
                                                     recipient = %hash_hex,
                                                     error = %e,
@@ -1377,16 +1392,29 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                                             }
                                         }
                                     }
-                                    None => tracing::warn!(
-                                        recipient = %hash_hex,
-                                        "no announce record for remote recipient; skipping (offline store-and-forward in ZEB-113 PR B)",
-                                    ),
+                                    None => {
+                                        // No announce record — per-recipient
+                                        // MX-like "warn and skip". Non-fatal
+                                        // for the SMTP transaction; PR B's
+                                        // OfflineResolver will add
+                                        // store-and-forward for this case.
+                                        tracing::warn!(
+                                            recipient = %hash_hex,
+                                            "no announce record for remote recipient; skipping (offline store-and-forward in ZEB-113 PR B)",
+                                        );
+                                        remote_handled = true;
+                                    }
                                 }
                             } else {
+                                // Remote delivery not configured on this
+                                // gateway — knowingly drop. Sender retry
+                                // won't help; operator must configure the
+                                // gateway. Non-fatal for the transaction.
                                 tracing::debug!(
                                     recipient = %hash_hex,
                                     "no local user and remote delivery not configured; dropping",
                                 );
+                                remote_handled = true;
                             }
                         }
                         Err(e) => {
@@ -1399,7 +1427,7 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                     }
                 }
 
-                let success = !delivered_to.is_empty() || remote_accepted;
+                let success = !delivered_to.is_empty() || remote_handled;
 
                 // Raw-mail publish: notify Zenoh subscribers (e.g., Phase 0
                 // harmony-client) that a new message arrived for each
@@ -3589,18 +3617,86 @@ node_config = "/tmp/test-node.toml"
         assert_eq!(parse_message_size("  25MB  "), 25 * 1024 * 1024);
     }
 
-    #[tokio::test]
-    async fn run_with_config_accepts_none_gateway_identity_and_none_resolver() {
-        // Compile-time checkpoint: the two new optional parameters must accept
-        // `None` without forcing callers to construct cryptographic state.
-        // Production callers that want remote delivery pass Some(...) for both.
-        let gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>> = None;
-        let recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>> =
-            None;
-        // Values must have inferrable types that match the signatures threaded
-        // through run / handle_connection / handle_connection_generic /
-        // process_async_actions.
-        let _ = (gateway_identity, recipient_resolver);
+    #[test]
+    fn remote_delivery_plumbing_signatures_compile() {
+        // Compile-time checkpoint: if any of the four signatures below
+        // stops accepting `Option<Arc<PrivateIdentity>>` + `Option<Arc<dyn
+        // RecipientResolver>>`, this test fails to compile. The bodies
+        // are unreachable at runtime — the point is purely that the
+        // compiler must typecheck the call sites. Async fn items have
+        // opaque return types so fn-pointer coercion isn't ergonomic
+        // here; the unreachable-call pattern is both simpler and
+        // catches arity drift, type drift, and order drift equally.
+        #[allow(dead_code, unreachable_code, unused_variables, unused_mut)]
+        async fn _typecheck(
+            config: Config,
+            stream: tokio::net::TcpStream,
+            peer_ip: IpAddr,
+            smtp_config: SmtpConfig,
+            imap_store: Arc<ImapStore>,
+            content_store_path: PathBuf,
+            session: SmtpSession,
+        ) {
+            let gw: Option<Arc<harmony_identity::PrivateIdentity>> = None;
+            let rr: Option<Arc<dyn crate::remote_delivery::RecipientResolver>> = None;
+            let _ = run(config, gw.clone(), rr.clone()).await;
+            let _ = handle_connection(
+                stream,
+                peer_ip,
+                smtp_config.clone(),
+                10,
+                None,
+                Arc::clone(&imap_store),
+                None,
+                "local".to_string(),
+                content_store_path.clone(),
+                5,
+                None,
+                None,
+                gw.clone(),
+                rr.clone(),
+            )
+            .await;
+            let (r, w) = (tokio::io::empty(), tokio::io::sink());
+            let _ = handle_connection_generic(
+                r,
+                w,
+                peer_ip,
+                session,
+                10,
+                None,
+                Arc::clone(&imap_store),
+                None,
+                "local".to_string(),
+                content_store_path,
+                5,
+                None,
+                None,
+                gw.clone(),
+                rr.clone(),
+            )
+            .await;
+            let actions: Vec<SmtpAction> = Vec::new();
+            let mut sess = SmtpSession::new(smtp_config);
+            let mut writer_sink = Vec::<u8>::new();
+            let mut spf = crate::spam::SpfResult::None;
+            let _ = process_async_actions(
+                &actions,
+                &mut sess,
+                &mut writer_sink,
+                &imap_store,
+                &None,
+                "local",
+                std::path::Path::new("/"),
+                &mut spf,
+                5,
+                &None,
+                &None,
+                &gw,
+                &rr,
+            )
+            .await;
+        }
     }
 
     #[tokio::test]
@@ -3651,6 +3747,10 @@ node_config = "/tmp/test-node.toml"
             tls_available: false,
         };
         let mut session = SmtpSession::new(smtp_config);
+        // Drive state to DeliveryPending so handle_delivery_result emits
+        // a SendResponse — we now assert on the 250/451 as well as the
+        // publisher side-effect.
+        session.state = crate::smtp::SmtpState::DeliveryPending;
         let mut writer = Vec::<u8>::new();
         let mut spf_result = crate::spam::SpfResult::None;
 
@@ -3684,6 +3784,21 @@ node_config = "/tmp/test-node.toml"
             sealed.is_empty(),
             "no publish should occur when resolver returns None; got {} captures",
             sealed.len(),
+        );
+
+        // Regression guard for PR 240 CodeRabbit follow-up: a resolver miss
+        // is per-recipient MX-like "warn and skip" — non-fatal for the SMTP
+        // transaction. Sender retry won't help (the recipient hasn't
+        // announced); PR B's offline store-and-forward will handle this
+        // case. Until then, 250 + warn log is the documented behavior.
+        let response = String::from_utf8_lossy(&writer);
+        assert!(
+            response.contains("250"),
+            "resolver miss should yield 250 OK (per-recipient MX-like); got: {response:?}",
+        );
+        assert!(
+            !response.contains("451"),
+            "resolver miss must NOT yield 451; got: {response:?}",
         );
     }
 
@@ -3719,6 +3834,7 @@ node_config = "/tmp/test-node.toml"
             tls_available: false,
         };
         let mut session = SmtpSession::new(smtp_config);
+        session.state = crate::smtp::SmtpState::DeliveryPending;
         let mut writer = Vec::<u8>::new();
         let mut spf_result = crate::spam::SpfResult::None;
 
@@ -3748,6 +3864,19 @@ node_config = "/tmp/test-node.toml"
             sealed.is_empty(),
             "no publish should occur when remote delivery is not configured; got {} captures",
             sealed.len(),
+        );
+
+        // Remote delivery not configured on this gateway is a
+        // misconfiguration the sender cannot fix by retrying. 250 + debug
+        // log is the documented per-recipient "knowingly drop" behavior.
+        let response = String::from_utf8_lossy(&writer);
+        assert!(
+            response.contains("250"),
+            "remote delivery not configured should yield 250 OK; got: {response:?}",
+        );
+        assert!(
+            !response.contains("451"),
+            "remote delivery not configured must NOT yield 451; got: {response:?}",
         );
     }
 
