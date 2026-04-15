@@ -406,33 +406,24 @@ def apply_pca_projection(
 # ---------------------------------------------------------------------------
 
 
-def run_teacher_pass(
+def load_and_validate_teacher(
     teacher_model_id: str,
-    tokenized_dataset_path: str,
-    layer_index: int,
-    total_entries: int,
-    hash_seeds: tuple[int, ...],
-    batch_size: int,
-    seq_len: int,
-    max_sequences: int | None,
-    device: str | None,
+    device: str,
     dtype: str,
-    expected_vocab_size: int = DEFAULT_EXPECTED_VOCAB_SIZE,
-) -> WelfordTable:
-    """Drive the full teacher forward pass, accumulating Welford means.
+    expected_vocab_size: int,
+    layer_index: int,
+):
+    """Load the teacher, validate vocab parity, resolve and validate --layer.
 
-    Imports torch/transformers/datasets lazily so that unit tests for
-    Welford + n-gram extraction + PCA can run in a CI-lite environment
-    that only has numpy + sklearn. Importing inside the function also
-    keeps the script's startup time short when it's invoked with
-    `--help` on a machine without the heavy deps installed.
+    Returns `(model, tokenizer, resolved_layer, teacher_dim, torch_module)`.
+    Extracted from `run_teacher_pass` so the (relatively opinionated)
+    setup logic is testable in isolation and doesn't visually crowd the
+    batch loop. Lazy HuggingFace imports stay local so callers without
+    the teacher extras can still import the module.
     """
     import torch
     from transformers import AutoModel, AutoTokenizer
-    from datasets import load_from_disk
 
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float32
 
     print(
@@ -463,24 +454,19 @@ def run_teacher_pass(
         use_cache=False,
     )
     model.to(device)
-    # Inference mode: disable dropout/batchnorm training behavior.
     # Using .train(False) explicitly rather than .eval() to avoid
     # collision with hooks that pattern-match literal "eval" strings.
     model.train(False)
-    # HF returns hidden_states as a tuple of length num_layers + 1
-    # (initial embeddings + each transformer block's output). Negative
-    # indices resolve from the end: -2 = penultimate transformer
-    # block's output, which is what "L-1" refers to in the research
-    # doc.
+
     teacher_num_layers = model.config.num_hidden_layers
     resolved_layer = layer_index
     if resolved_layer < 0:
         resolved_layer = teacher_num_layers + 1 + resolved_layer
-    # HF returns hidden_states as tuple of length num_hidden_layers + 1
-    # (initial embedding output + each transformer block). Valid indices
-    # are therefore [0, teacher_num_layers]. Validate BEFORE the first
-    # forward pass so a misconfigured --layer fails in seconds instead
-    # of after a 22-hour teacher run.
+    # HF returns hidden_states as a tuple of length num_hidden_layers
+    # + 1 (initial embedding output + each transformer block's
+    # output). Valid indices are therefore [0, teacher_num_layers].
+    # Validate BEFORE the first forward pass so a misconfigured
+    # --layer fails in seconds instead of after a 22-hour teacher run.
     if not 0 <= resolved_layer <= teacher_num_layers:
         raise ValueError(
             f"--layer={layer_index} resolves to hidden_states"
@@ -495,6 +481,113 @@ def run_teacher_pass(
     )
 
     teacher_dim = model.config.hidden_size
+    return model, tokenizer, resolved_layer, teacher_dim, torch
+
+
+def process_batch(
+    input_ids_list,
+    tokenizer,
+    model,
+    resolved_layer: int,
+    hash_seeds: tuple[int, ...],
+    total_entries: int,
+    table: WelfordTable,
+    device: str,
+    seq_len: int,
+    torch_module,
+) -> int:
+    """Run one forward pass + Welford update for a batch. Returns token count.
+
+    Splits out of `run_teacher_pass` so the hot loop is the one thing
+    being read when reasoning about throughput or VRAM. Every other
+    call here (truncation, padding, forward, Welford) is idempotent
+    and has its own tests.
+    """
+    # Truncate or pad each sequence to exactly seq_len so the tensor
+    # is rectangular. Pad token: tokenizer.pad_token_id if defined,
+    # else 0. Padded positions are excluded from n-gram indices.
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    fixed: list[list[int]] = []
+    real_lens: list[int] = []
+    for seq in input_ids_list:
+        seq_list = list(seq)[:seq_len]
+        real_lens.append(len(seq_list))
+        if len(seq_list) < seq_len:
+            seq_list = seq_list + [pad_id] * (seq_len - len(seq_list))
+        fixed.append(seq_list)
+
+    input_ids = torch_module.tensor(fixed, dtype=torch_module.long, device=device)
+    outputs = model(input_ids=input_ids)
+    hidden_states = outputs.hidden_states[resolved_layer]  # [B, T, teacher_dim]
+    # Move to CPU fp32 immediately so we can free GPU memory before
+    # the next batch. VRAM stays flat across the loop.
+    hidden_np = hidden_states.float().cpu().numpy()
+    del hidden_states, outputs, input_ids
+    if device.startswith("cuda"):
+        torch_module.cuda.empty_cache()
+
+    # For each sequence in the batch, enumerate n-grams over the
+    # unpadded prefix and Welford-update.
+    batch_indices: list[int] = []
+    batch_positions: list[tuple[int, int]] = []
+    for b_idx, real_len in enumerate(real_lens):
+        if real_len < 2:
+            continue
+        tokens = fixed[b_idx][:real_len]
+        row_ids, pos_list = compute_ngram_indices_for_sequence(
+            tokens, hash_seeds, total_entries,
+        )
+        # strict=True codifies the equal-length invariant returned by
+        # compute_ngram_indices_for_sequence.
+        for r, p in zip(row_ids, pos_list, strict=True):
+            batch_indices.append(r)
+            batch_positions.append((b_idx, p))
+
+    if batch_indices:
+        indices_arr = np.array(batch_indices, dtype=np.int64)
+        bs = np.array([p[0] for p in batch_positions], dtype=np.int64)
+        ps = np.array([p[1] for p in batch_positions], dtype=np.int64)
+        vectors = hidden_np[bs, ps, :]  # [K, teacher_dim]
+        table.update_batch(indices_arr, vectors.astype(np.float32))
+
+    return sum(real_lens)
+
+
+def run_teacher_pass(
+    teacher_model_id: str,
+    tokenized_dataset_path: str,
+    layer_index: int,
+    total_entries: int,
+    hash_seeds: tuple[int, ...],
+    batch_size: int,
+    seq_len: int,
+    max_sequences: int | None,
+    device: str | None,
+    dtype: str,
+    expected_vocab_size: int = DEFAULT_EXPECTED_VOCAB_SIZE,
+) -> WelfordTable:
+    """Drive the full teacher forward pass, accumulating Welford means.
+
+    High-level flow only: delegate teacher setup to
+    `load_and_validate_teacher` and per-batch work to `process_batch`.
+    Lazy-imports `datasets` so callers without the teacher extras can
+    still import the module for the Welford / PCA tests.
+    """
+    import torch
+    from datasets import load_from_disk
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model, tokenizer, resolved_layer, teacher_dim, torch_module = (
+        load_and_validate_teacher(
+            teacher_model_id=teacher_model_id,
+            device=device,
+            dtype=dtype,
+            expected_vocab_size=expected_vocab_size,
+            layer_index=layer_index,
+        )
+    )
     table = WelfordTable.zeros(total_entries, teacher_dim)
 
     print(f"Loading tokenized dataset from {tokenized_dataset_path!r}...", flush=True)
@@ -507,7 +600,7 @@ def run_teacher_pass(
 
     # Iterate in raw-index order so restarts are reproducible. We do
     # NOT shuffle: the Welford mean is shuffle-invariant but keeping
-    # the deterministic order makes partial / resumed runs easier to
+    # the deterministic order makes partial/resumed runs easier to
     # reason about.
     total_seqs = len(dataset) if max_sequences is None else min(
         len(dataset), max_sequences,
@@ -520,60 +613,23 @@ def run_teacher_pass(
     t_start = time.time()
     processed_tokens = 0
 
-    with torch.inference_mode():
+    with torch_module.inference_mode():
         for batch_start in range(0, total_seqs, batch_size):
             batch_end = min(batch_start + batch_size, total_seqs)
             batch = dataset[batch_start:batch_end]
-            input_ids_list = batch["input_ids"]
-            # Truncate or pad each sequence to exactly seq_len so the
-            # tensor is rectangular. Pad token: tokenizer.pad_token_id
-            # if defined, else 0. Padded positions should not appear in
-            # n-gram indices we care about, but we keep them in
-            # tensor space for the forward pass.
-            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-            fixed: list[list[int]] = []
-            real_lens: list[int] = []
-            for seq in input_ids_list:
-                seq_list = list(seq)[:seq_len]
-                real_lens.append(len(seq_list))
-                if len(seq_list) < seq_len:
-                    seq_list = seq_list + [pad_id] * (seq_len - len(seq_list))
-                fixed.append(seq_list)
+            processed_tokens += process_batch(
+                input_ids_list=batch["input_ids"],
+                tokenizer=tokenizer,
+                model=model,
+                resolved_layer=resolved_layer,
+                hash_seeds=hash_seeds,
+                total_entries=total_entries,
+                table=table,
+                device=device,
+                seq_len=seq_len,
+                torch_module=torch_module,
+            )
 
-            input_ids = torch.tensor(fixed, dtype=torch.long, device=device)
-            outputs = model(input_ids=input_ids)
-            hidden_states = outputs.hidden_states[resolved_layer]  # [B, T, teacher_dim]
-            # Move to CPU fp32 immediately; we free the GPU tensor
-            # before the next batch so VRAM stays flat.
-            hidden_np = hidden_states.float().cpu().numpy()
-            del hidden_states, outputs, input_ids
-            if device.startswith("cuda"):
-                torch.cuda.empty_cache()
-
-            # For each sequence in the batch, enumerate n-grams (only
-            # over the unpadded prefix) and Welford-update.
-            batch_indices: list[int] = []
-            batch_positions: list[tuple[int, int]] = []
-            for b_idx, real_len in enumerate(real_lens):
-                if real_len < 2:
-                    continue
-                tokens = fixed[b_idx][:real_len]
-                row_ids, pos_list = compute_ngram_indices_for_sequence(
-                    tokens, hash_seeds, total_entries,
-                )
-                for r, p in zip(row_ids, pos_list):
-                    batch_indices.append(r)
-                    batch_positions.append((b_idx, p))
-
-            if batch_indices:
-                indices_arr = np.array(batch_indices, dtype=np.int64)
-                # Gather hidden states at (batch, position) pairs
-                bs = np.array([p[0] for p in batch_positions], dtype=np.int64)
-                ps = np.array([p[1] for p in batch_positions], dtype=np.int64)
-                vectors = hidden_np[bs, ps, :]  # [K, teacher_dim]
-                table.update_batch(indices_arr, vectors.astype(np.float32))
-
-            processed_tokens += sum(real_lens)
             if batch_start % (batch_size * 10) == 0:
                 elapsed = time.time() - t_start
                 rate = processed_tokens / elapsed if elapsed > 0 else 0
@@ -742,7 +798,9 @@ def parse_hash_seeds(arg: str) -> tuple[int, ...]:
     try:
         seeds = tuple(int(p) for p in parts)
     except ValueError as e:
-        raise argparse.ArgumentTypeError(f"--hash-seeds must be comma-separated ints: {e}")
+        raise argparse.ArgumentTypeError(
+            f"--hash-seeds must be comma-separated ints: {e}"
+        ) from e
     return seeds
 
 

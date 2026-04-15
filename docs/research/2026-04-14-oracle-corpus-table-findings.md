@@ -36,20 +36,25 @@ to contain high-density semantic, syntactic, and structural signals,
 the diagnostic perfectly isolates the mechanism's structural capacity
 to route and exploit external signals.
 
-The optimal configuration for this oracle diagnostic involves utilizing
-the Qwen2.5-1.5B architecture as the teacher model. The required
-feature extraction must target the penultimate layer (L-1) at the
-final token position of each identified n-gram. This precise
-configuration leverages the inherent causal masking of the teacher's
-autoregressive attention to prevent future-token label leakage, while
-simultaneously maximizing the contextual awareness of the target
-n-gram prior to final vocabulary logit projection. To reduce the
-high-dimensional 1536-dimensional teacher representation space to
-the constrained 128-dimensional student schema required by the
-architecture, Principal Component Analysis (PCA) fit on a
-representative subset of the corpus is vastly superior to random
-Gaussian projection, as transformer hidden states are notoriously
-anisotropic.
+The optimal configuration for this oracle diagnostic involves using
+`mistralai/Mistral-7B-v0.1` as the teacher model. The original draft of
+this report proposed Qwen2.5-1.5B, but the shipped scaffold requires
+teacher-tokenizer parity with the FineWeb-Edu-POC corpus (32K Mistral
+SentencePiece vocabulary, fixed by `training/ct87/prepare_data.py`),
+so Mistral-7B-v0.1 is the runnable default. Qwen2.5-1.5B remains a
+valid alternative if the corpus is re-tokenized against its
+vocabulary first. The required feature extraction must target the
+penultimate layer (L-1) at the final token position of each
+identified n-gram. This precise configuration leverages the inherent
+causal masking of the teacher's autoregressive attention to prevent
+future-token label leakage, while simultaneously maximizing the
+contextual awareness of the target n-gram prior to final vocabulary
+logit projection. To reduce the high-dimensional teacher
+representation space (d_teacher = 4096 for Mistral-7B; 1536 for the
+Qwen2.5-1.5B alternative) to the constrained 128-dimensional student
+schema, Principal Component Analysis (PCA) fit on a representative
+subset of the corpus is vastly superior to random Gaussian
+projection, as transformer hidden states are notoriously anisotropic.
 
 If the injection mechanisms under study are viable, the introduction
 of the oracle table is projected to yield a validation loss
@@ -326,7 +331,7 @@ from late-stage generation conditioning to deep pretraining
 augmentation. Understanding these precedents provides the necessary
 context for the ZEB-117 mechanisms and the diagnostic itself.
 
-**REALM (Retrieval-Augmented Language Model Pre-training):** Guu et al.
+**REALM (Retrieval-Augmented Language Model Pretraining):** Guu et al.
 (2020) demonstrated that augmenting the pretraining objective with a
 differentiable retriever significantly improves the model's capacity
 to internalize world knowledge. Unlike the ZEB-117 architecture, which
@@ -451,7 +456,7 @@ computation is strictly disabled via `torch.inference_mode()` and
 allocations. The target hidden states are extracted exclusively from
 the penultimate layer (L-1):
 
-```
+```text
 H_{L-1} = Teacher(X) in R^{B x T x d_teacher}
 ```
 
@@ -472,7 +477,7 @@ For a specific n-gram ending at position t in the sequence, the
 representative high-dimensional vector is strictly the hidden state
 at position t:
 
-```
+```text
 v_t = H_{L-1}[b, t, :]
 ```
 
@@ -621,7 +626,7 @@ be prepared.
 
 ### Teacher-Student Distribution Mismatch
 
-The chosen teacher model (Qwen2.5-1.5B) was pretrained on a massive,
+The chosen teacher model (Mistral-7B-v0.1) was pretrained on a massive,
 highly diverse multilingual corpus that drastically differs from the
 specific FineWeb-Edu-POC domain slice. Consequently, the teacher's
 latent representations encode systemic priors and vocabulary
@@ -665,7 +670,7 @@ optimizations.
 Assuming a conservative sustained throughput of 10,000 tokens per
 second:
 
-```
+```text
 800,000,000 total tokens / 10,000 tokens/sec = 80,000 seconds ~ 22.2 hours
 ```
 
@@ -680,7 +685,7 @@ The final matrix serialization poses no storage threat. Assuming a
 large experimental configuration of N = 1,000,000 entries, the
 mathematical dimensions dictate:
 
-```
+```text
 1,000,000 rows x 128 dimensions x 4 bytes (fp32) ~ 512 MB
 ```
 
@@ -779,15 +784,16 @@ critical path for advancing the ZEB-117 research agenda.
 
 ### Ranked Implementation Approaches
 
-1. **Primary Approach: The Qwen2.5 Oracle**
-   - Teacher: Qwen2.5-1.5B (Apache 2.0 / Open Research License).
-   - Extraction Layer: Penultimate Layer (L-1).
+1. **Primary Approach: The Mistral-7B Oracle** (shipped default)
+   - Teacher: `mistralai/Mistral-7B-v0.1` (Apache 2.0).
+   - Extraction Layer: Penultimate Layer (L-1, i.e. layer index -2).
    - Aggregation: Causal Final-Token State Extraction + Welford Online Averaging.
-   - Projection: Global PCA down to 128 dimensions.
-   - Rationale: Maximizes semantic density while maintaining absolute mathematical alignment with the student's retrieval logic.
+   - Projection: IncrementalPCA fit on a 20% populated-row subsample, projected down to 128 dimensions with unpopulated rows re-zeroed.
+   - Rationale: Maximizes semantic density while maintaining exact tokenizer parity with the student's corpus (32K Mistral SentencePiece vocabulary). d_teacher = 4096.
+   - Alternative: the originally-proposed Qwen2.5-1.5B oracle (d_teacher = 1536) remains viable if the corpus is first re-tokenized against Qwen's vocabulary; the scaffold hard-fails on vocab mismatch to prevent silent corruption.
 
-2. **Secondary Approach: The Sparse Uncollided Control**
-   - Rationale: Deployed only if the Primary Approach fails, to isolate hash-collision collapse from architectural injection failure.
+2. **Secondary Approach: The Sparse (Collision-Reduced) Control**
+   - Rationale: Deployed only if the Primary Approach fails, to isolate hash-collision collapse from architectural injection failure. Still routes through xxhash (collisions reduced ~4000× vs full-corpus hashing, not eliminated); a truly collision-free variant requires option (a) from the sparse module docstring and is flagged as a follow-up.
 
 3. **Tertiary Approach: Student-as-Teacher Checkpoint**
    - Rationale: Deployed only if alignment/domain mismatch is suspected of destroying the cross-attention gradient flow.

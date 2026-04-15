@@ -482,7 +482,7 @@ class TestPipelineComposition:
         seeds = (42, 99)
 
         table = WelfordTable.zeros(N_rows, teacher_dim)
-        for seq_idx in range(200):
+        for _ in range(200):
             tokens = rng.integers(0, 100, size=8).tolist()
             # Synthetic "teacher hidden states": low-rank + noise
             hidden = (
@@ -542,7 +542,7 @@ class TestWelfordVectorizedEquivalence:
         indices = rng.integers(0, total_entries, size=k_obs).astype(np.int64)
         vectors = rng.standard_normal((k_obs, dim)).astype(np.float32)
         # Reference: classic per-observation Welford
-        for idx, vec in zip(indices.tolist(), vectors):
+        for idx, vec in zip(indices.tolist(), vectors, strict=True):
             ref_counts[idx] += 1
             c = ref_counts[idx]
             ref_means[idx] += (vec.astype(np.float64) - ref_means[idx]) / c
@@ -739,36 +739,35 @@ class TestSparsePCAGuard:
     """Sparse embedder PCA must fail loudly when n_samples < engram_dim
     instead of letting sklearn raise its less-actionable error."""
 
-    def test_small_n_samples_raises_with_actionable_message(self):
+    def test_small_n_samples_raises_with_actionable_message(self, monkeypatch):
         # 5 vectors, 384-dim native, target 128 -> should refuse.
         from ct87.generate_sparse_uncollided_table import embed_ngram_texts
 
-        # Stub SentenceTransformer so we don't need network/deps: patch
-        # via a simple subclass with a fixed encode return value.
+        # Stub SentenceTransformer so we don't need network/weights:
+        # a minimal shim with a fixed encode return value is enough.
         class _FakeST:
             def __init__(self, *_a, **_k):
                 pass
             def get_sentence_embedding_dimension(self):
                 return 384
             def encode(self, texts, **_kwargs):
-                # Return 5 x 384 to trip the guard against target=128.
+                # Return len(texts) x 384 to trip the guard against target=128.
                 return np.random.default_rng(0).standard_normal(
                     (len(texts), 384)
                 ).astype(np.float32)
 
-        import sentence_transformers as st_mod
-        real_st = st_mod.SentenceTransformer
-        st_mod.SentenceTransformer = _FakeST
-        try:
-            with pytest.raises(ValueError, match="engram-dim"):
-                embed_ngram_texts(
-                    ngram_texts=["a", "b", "c", "d", "e"],
-                    embedder_model_id="mock",
-                    engram_dim=128,
-                    device="cpu",
-                )
-        finally:
-            st_mod.SentenceTransformer = real_st
+        # monkeypatch handles restoration automatically; no try/finally
+        # or manual state management needed.
+        monkeypatch.setattr(
+            "sentence_transformers.SentenceTransformer", _FakeST
+        )
+        with pytest.raises(ValueError, match="engram-dim"):
+            embed_ngram_texts(
+                ngram_texts=["a", "b", "c", "d", "e"],
+                embedder_model_id="mock",
+                engram_dim=128,
+                device="cpu",
+            )
 
 
 @skip_if_no_transformers

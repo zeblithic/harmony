@@ -279,7 +279,7 @@ def build_sparse_table(
     total_entries: int,
     engram_dim: int,
 ) -> tuple[np.ndarray, int, int]:
-    """Place top-N n-gram vectors into a dense table via their hashes.
+    """Place top-N n-gram vectors into a dense table via hashes (collisions expected, averaged via Welford).
 
     For each top-N n-gram we compute its row index under every hash
     seed (matching the student's multi-seed lookup). Write collisions
@@ -309,7 +309,7 @@ def build_sparse_table(
     counts = np.zeros(total_entries, dtype=np.int64)
 
     total_writes = 0
-    for row_idx, (n, tokens, _freq) in enumerate(top_ngrams):
+    for row_idx, (_n, tokens, _freq) in enumerate(top_ngrams):
         vec = ngram_vectors[row_idx]
         for seed in hash_seeds:
             h = _hash_ngram(list(tokens), seed) % total_entries
@@ -345,7 +345,7 @@ def detokenize_ngrams(
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_id)
     texts = []
-    for n, tokens, _freq in top_ngrams:
+    for _n, tokens, _freq in top_ngrams:
         # skip_special_tokens keeps BOS/EOS/PAD out of the text;
         # clean_up_tokenization_spaces normalizes BPE whitespace so
         # the embedder sees readable n-grams.
