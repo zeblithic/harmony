@@ -1,9 +1,12 @@
 //! HTTPS fetch + parse for `.well-known/harmony-users` and
 //! `.well-known/harmony-revocations` (spec §4.5, §5.4).
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use reqwest::redirect::Policy;
 
 use crate::claim::{RevocationList, SignedClaim};
 
@@ -115,6 +118,69 @@ pub async fn fetch_revocation_list(
         }
         404 => Ok(RevocationFetchResult::Empty),
         code => Err(HttpFetchError::Server(code)),
+    }
+}
+
+pub struct ReqwestHttpClient {
+    inner: reqwest::Client,
+    body_cap_bytes: usize,
+}
+
+impl ReqwestHttpClient {
+    pub fn new(
+        connect_timeout: Duration,
+        total_timeout: Duration,
+        body_cap_bytes: usize,
+    ) -> Result<Self, HttpError> {
+        let inner = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .connect_timeout(connect_timeout)
+            .timeout(total_timeout)
+            .https_only(true)
+            .build()
+            .map_err(|e| HttpError::Other(e.to_string()))?;
+        Ok(Self {
+            inner,
+            body_cap_bytes,
+        })
+    }
+}
+
+#[async_trait]
+impl HttpClient for ReqwestHttpClient {
+    async fn get(&self, url: &str) -> Result<HttpResponse, HttpError> {
+        let resp = self.inner.get(url).send().await.map_err(|e| {
+            if e.is_timeout() {
+                HttpError::Timeout
+            } else if e.is_connect() {
+                HttpError::Connect(e.to_string())
+            } else if e.is_redirect() {
+                HttpError::RedirectRefused
+            } else {
+                HttpError::Other(e.to_string())
+            }
+        })?;
+        let status = resp.status().as_u16();
+        // Bounded body read — prevents oversize responses from blowing
+        // memory. reqwest doesn't expose chunked reads cleanly, so we
+        // check Content-Length as a first line of defense, then cap on
+        // the collected bytes as a second.
+        if let Some(len) = resp.content_length() {
+            if len as usize > self.body_cap_bytes {
+                return Err(HttpError::BodyTooLarge);
+            }
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| HttpError::Other(e.to_string()))?;
+        if bytes.len() > self.body_cap_bytes {
+            return Err(HttpError::BodyTooLarge);
+        }
+        Ok(HttpResponse {
+            status,
+            body: bytes.to_vec(),
+        })
     }
 }
 
