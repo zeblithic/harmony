@@ -6,6 +6,7 @@
 //! `dns`, `http` compose onto it, `resolver` orchestrates.
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![forbid(unsafe_code)]
 
 pub mod cache;
