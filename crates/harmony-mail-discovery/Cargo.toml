@@ -14,9 +14,10 @@ required-features = ["test-support"]
 
 [features]
 default = []
-test-support = []
+test-support = ["dep:rand_core"]
 
 [dependencies]
+rand_core = { workspace = true, features = ["std", "getrandom"], optional = true }
 serde = { workspace = true, features = ["derive", "std"] }
 harmony-crypto = { workspace = true, features = ["std"] }
 harmony-identity = { workspace = true, features = ["std"] }
