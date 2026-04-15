@@ -247,6 +247,18 @@ def embed_ngram_texts(
     # native_dim > engram_dim: PCA-reduce
     from sklearn.decomposition import PCA
 
+    # sklearn's PCA requires n_samples >= n_components; small smoke
+    # runs (tiny --max-sequences or --top-ngrams) easily violate this
+    # and would raise a confusing ValueError deep in sklearn. Fail
+    # loudly with a message that points at the CLI flags to adjust.
+    n_samples = raw.shape[0]
+    if n_samples < engram_dim:
+        raise ValueError(
+            f"need at least {engram_dim} n-gram embeddings to PCA-reduce "
+            f"into {engram_dim} dimensions, got {n_samples}. Raise "
+            f"--top-ngrams or --max-sequences, or lower --engram-dim."
+        )
+
     print(f"PCA-reducing {native_dim} -> {engram_dim}...", flush=True)
     pca = PCA(n_components=engram_dim)
     reduced = pca.fit_transform(raw).astype(np.float32)
@@ -395,9 +407,14 @@ def build_argparser() -> argparse.ArgumentParser:
         help=f"Output engram_dim (default: {DEFAULT_ENGRAM_DIM})",
     )
     parser.add_argument(
-        "--hash-seeds", type=str,
-        default=",".join(str(s) for s in DEFAULT_HASH_SEEDS),
-        help="Comma-separated xxhash64 seeds (must match student).",
+        "--hash-seeds",
+        type=parse_hash_seeds,
+        default=DEFAULT_HASH_SEEDS,
+        help=(
+            "Comma-separated xxhash64 seeds. MUST match the student's "
+            "training seeds (default: "
+            f"{','.join(str(s) for s in DEFAULT_HASH_SEEDS)})."
+        ),
     )
     parser.add_argument(
         "--max-sequences", type=int, default=DEFAULT_MAX_SEQUENCES,
@@ -436,7 +453,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    seeds = parse_hash_seeds(args.hash_seeds)
+    # argparse validated --hash-seeds via type=parse_hash_seeds.
+    seeds = args.hash_seeds
 
     print("Phase 1: counting n-gram frequencies...", flush=True)
     freqs = count_ngrams(args.dataset, args.max_sequences)

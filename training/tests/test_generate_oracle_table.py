@@ -57,6 +57,12 @@ try:
 except ImportError:
     _HAS_DATASETS = False
 
+try:
+    import sentence_transformers  # noqa: F401
+    _HAS_ST = True
+except ImportError:
+    _HAS_ST = False
+
 # fit_pca_projection imports sklearn lazily, so unit tests touching PCA
 # paths need this marker to skip cleanly in `.[dev]`-only environments
 # that haven't installed scikit-learn.
@@ -66,6 +72,10 @@ skip_if_no_sklearn = pytest.mark.skipif(
 skip_if_no_transformers = pytest.mark.skipif(
     not (_HAS_TRANSFORMERS and _HAS_DATASETS),
     reason="transformers/datasets not installed (install .[teacher])",
+)
+skip_if_no_sentence_transformers = pytest.mark.skipif(
+    not (_HAS_ST and _HAS_SKLEARN),
+    reason="sentence-transformers/sklearn not installed (install .[teacher])",
 )
 
 
@@ -675,6 +685,137 @@ class TestVocabSizeGuard:
                 teacher_model_id="mock/teacher",
                 tokenized_dataset_path="/tmp/should_not_load",
                 layer_index=-2,
+                total_entries=10,
+                hash_seeds=(42,),
+                batch_size=1,
+                seq_len=4,
+                max_sequences=1,
+                device="cpu",
+                dtype="float32",
+                expected_vocab_size=32000,
+            )
+
+
+class TestHashSeedsArgparse:
+    """--hash-seeds should validate at parse time so invalid CLI input
+    produces a standard argparse usage error, not a raw traceback."""
+
+    def test_valid_tuple_default(self):
+        from ct87.generate_oracle_table import (
+            build_argparser, DEFAULT_HASH_SEEDS,
+        )
+        args = build_argparser().parse_args(
+            ["--dataset", "/tmp/fake", "--output", "/tmp/x.safetensors"]
+        )
+        assert args.hash_seeds == DEFAULT_HASH_SEEDS
+        assert isinstance(args.hash_seeds, tuple)
+
+    def test_custom_comma_string_parses_to_tuple(self):
+        from ct87.generate_oracle_table import build_argparser
+        args = build_argparser().parse_args([
+            "--dataset", "/tmp/fake",
+            "--output", "/tmp/x.safetensors",
+            "--hash-seeds", "1,2,3",
+        ])
+        assert args.hash_seeds == (1, 2, 3)
+
+    def test_invalid_seeds_raise_systemexit_with_usage(self, capsys):
+        from ct87.generate_oracle_table import build_argparser
+        with pytest.raises(SystemExit):
+            build_argparser().parse_args([
+                "--dataset", "/tmp/fake",
+                "--output", "/tmp/x.safetensors",
+                "--hash-seeds", "not,a,number",
+            ])
+        captured = capsys.readouterr()
+        # argparse writes the usage/error to stderr; the key signal is
+        # that we got there via argparse and not a bare ValueError from
+        # main().
+        assert "hash-seeds" in captured.err.lower() or "invalid" in captured.err.lower()
+
+
+@skip_if_no_sentence_transformers
+class TestSparsePCAGuard:
+    """Sparse embedder PCA must fail loudly when n_samples < engram_dim
+    instead of letting sklearn raise its less-actionable error."""
+
+    def test_small_n_samples_raises_with_actionable_message(self):
+        # 5 vectors, 384-dim native, target 128 -> should refuse.
+        from ct87.generate_sparse_uncollided_table import embed_ngram_texts
+
+        # Stub SentenceTransformer so we don't need network/deps: patch
+        # via a simple subclass with a fixed encode return value.
+        class _FakeST:
+            def __init__(self, *_a, **_k):
+                pass
+            def get_sentence_embedding_dimension(self):
+                return 384
+            def encode(self, texts, **_kwargs):
+                # Return 5 x 384 to trip the guard against target=128.
+                return np.random.default_rng(0).standard_normal(
+                    (len(texts), 384)
+                ).astype(np.float32)
+
+        import sentence_transformers as st_mod
+        real_st = st_mod.SentenceTransformer
+        st_mod.SentenceTransformer = _FakeST
+        try:
+            with pytest.raises(ValueError, match="engram-dim"):
+                embed_ngram_texts(
+                    ngram_texts=["a", "b", "c", "d", "e"],
+                    embedder_model_id="mock",
+                    engram_dim=128,
+                    device="cpu",
+                )
+        finally:
+            st_mod.SentenceTransformer = real_st
+
+
+@skip_if_no_transformers
+class TestLayerBoundsGuard:
+    """Out-of-range --layer must fail before the first batch instead of
+    discovering the problem via IndexError after 22 hours of teacher
+    forward passes."""
+
+    def test_layer_too_large_raises(self, monkeypatch):
+        import ct87.generate_oracle_table as gen
+
+        class _FakeTok:
+            vocab_size = 32000
+            pad_token_id = 0
+
+        class _FakeCfg:
+            num_hidden_layers = 12
+            hidden_size = 64
+
+        class _FakeModel:
+            config = _FakeCfg()
+            def to(self, _dev): return self
+            def train(self, _flag): return self
+
+        class _TokCls:
+            @staticmethod
+            def from_pretrained(_id): return _FakeTok()
+
+        class _ModelCls:
+            @staticmethod
+            def from_pretrained(*_args, **_kwargs): return _FakeModel()
+
+        import transformers
+        monkeypatch.setattr(transformers, "AutoTokenizer", _TokCls)
+        monkeypatch.setattr(transformers, "AutoModel", _ModelCls)
+        import datasets as hfds
+        monkeypatch.setattr(
+            hfds, "load_from_disk",
+            lambda _p: (_ for _ in ()).throw(AssertionError("must not load dataset")),
+        )
+
+        # layer_index=50 resolves to 50, out of range [0, 12].
+        with pytest.raises(ValueError, match="--layer=50"):
+            gen.run_teacher_pass(
+                teacher_model_id="mock/teacher",
+                tokenized_dataset_path="/tmp/should_not_load",
+                layer_index=50,
                 total_entries=10,
                 hash_seeds=(42,),
                 batch_size=1,

@@ -476,6 +476,18 @@ def run_teacher_pass(
     resolved_layer = layer_index
     if resolved_layer < 0:
         resolved_layer = teacher_num_layers + 1 + resolved_layer
+    # HF returns hidden_states as tuple of length num_hidden_layers + 1
+    # (initial embedding output + each transformer block). Valid indices
+    # are therefore [0, teacher_num_layers]. Validate BEFORE the first
+    # forward pass so a misconfigured --layer fails in seconds instead
+    # of after a 22-hour teacher run.
+    if not 0 <= resolved_layer <= teacher_num_layers:
+        raise ValueError(
+            f"--layer={layer_index} resolves to hidden_states"
+            f"[{resolved_layer}], but teacher {teacher_model_id!r} exposes "
+            f"only indices [0, {teacher_num_layers}] "
+            f"(accepts negatives in [-{teacher_num_layers + 1}, -1] also)."
+        )
     print(
         f"Teacher has {teacher_num_layers} layers; extracting layer "
         f"index {resolved_layer} (arg: {layer_index}).",
@@ -665,7 +677,9 @@ def build_argparser() -> argparse.ArgumentParser:
         help=f"Output engram_dim after PCA (default: {DEFAULT_ENGRAM_DIM})",
     )
     parser.add_argument(
-        "--hash-seeds", type=str, default=",".join(str(s) for s in DEFAULT_HASH_SEEDS),
+        "--hash-seeds",
+        type=parse_hash_seeds,
+        default=DEFAULT_HASH_SEEDS,
         help=(
             "Comma-separated xxhash64 seeds. MUST match the student's "
             "training seeds (default: "
@@ -745,7 +759,8 @@ def main(argv: list[str] | None = None) -> int:
         print("Error: --entries and --engram-dim must be positive", file=sys.stderr)
         return 2
 
-    seeds = parse_hash_seeds(args.hash_seeds)
+    # argparse already validated --hash-seeds via type=parse_hash_seeds.
+    seeds = args.hash_seeds
 
     rng = np.random.default_rng(args.seed)
 

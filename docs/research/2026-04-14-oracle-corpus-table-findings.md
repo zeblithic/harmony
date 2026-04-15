@@ -428,23 +428,37 @@ computational workflow required to generate the oracle table.
 
 ### Phase 1: Corpus Processing and Forward Pass Evaluation
 
-The diagnostic pipeline instantiates the Qwen2.5-1.5B model in
-bfloat16 precision to prevent quantization degradation in the
-sensitive continuous feature space. The FineWeb-Edu-POC tokenized
-dataset is consumed via a streaming dataloader. To maximize GPU
-saturation and maintain mathematical parity with the student's
-training environment, the sequence length is fixed to match the
-teacher's optimal context window (e.g., T=2048 tokens).
+The diagnostic pipeline instantiates `mistralai/Mistral-7B-v0.1` in
+bfloat16 precision. The teacher choice is constrained by tokenizer
+parity: `training/ct87/prepare_data.py` produces FineWeb-Edu-POC with
+Mistral's 32K SentencePiece BPE vocabulary, and the shipped scaffold
+(`training/ct87/generate_oracle_table.py`) feeds those pre-tokenized
+`input_ids` directly into the teacher. The generator hard-fails
+before model load if `--expected-vocab-size` (default 32000) does not
+match the teacher's tokenizer — so swapping to a non-Mistral teacher
+(e.g., the draft's originally-proposed Qwen2.5-1.5B) requires
+re-tokenizing the corpus against that teacher's vocabulary first.
+
+The FineWeb-Edu-POC tokenized dataset is consumed via a streaming
+dataloader. To maximize GPU saturation and maintain mathematical
+parity with the student's training environment, the sequence length
+is fixed at T=2048 tokens.
 
 For each continuous batch X in R^{B x T}, a forward pass is executed
 with the `output_hidden_states=True` flag enabled. All gradient
-computation is strictly disabled via the `torch.no_grad()` context
-manager to optimize throughput. The target hidden states are extracted
-exclusively from the penultimate layer (L-1):
+computation is strictly disabled via `torch.inference_mode()` and
+`use_cache=False` to optimize throughput and trim KV-cache
+allocations. The target hidden states are extracted exclusively from
+the penultimate layer (L-1):
 
 ```
-H_{L-1} = Teacher(X) in R^{B x T x 1536}
+H_{L-1} = Teacher(X) in R^{B x T x d_teacher}
 ```
+
+Under the Mistral-7B-v0.1 default, d_teacher = 4096; the earlier
+draft's Qwen2.5-1.5B would give d_teacher = 1536. The downstream PCA
+step projects whichever d_teacher the resolved teacher produces into
+the student's `engram_dim = 128`.
 
 ### Phase 2: N-Gram State Aggregation and Online Averaging
 
