@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 
-use crate::claim::{DomainRecord, RevocationView, SigningKeyCert};
+use crate::claim::{DomainRecord, RevocationView, SignedClaim, SigningKeyCert};
 
 /// Clock abstraction. Production uses `SystemTimeSource`; tests use
 /// `FakeTimeSource` (see `test_support`).
@@ -97,7 +97,7 @@ impl Default for CacheLimits {
 
 /// All resolver caches in one place.
 ///
-/// `claim` stores raw wire bytes (String) keyed by (domain, hashed_local_part).
+/// `claim` stores decoded `SignedClaim` values keyed by (domain, hashed_local_part).
 /// The other positive caches store their decoded types.
 pub struct ResolverCaches {
     limits: CacheLimits,
@@ -105,7 +105,7 @@ pub struct ResolverCaches {
     // Positive caches — value is stored in a CacheEntry that tracks
     // expires_at (set by caller to the correct TTL: claim.expires_at,
     // cert.valid_until, DNS TTL, now+6h respectively).
-    claim: DashMap<(String, HashedLocalPart), CacheEntry<String>>,
+    claim: DashMap<(String, HashedLocalPart), CacheEntry<SignedClaim>>,
     signing_key: DashMap<(String, SigningKeyId), CacheEntry<SigningKeyCert>>,
     master_key: DashMap<String, CacheEntry<DomainRecord>>,
     revocation: DashMap<String, CacheEntry<RevocationView>>,
@@ -137,7 +137,7 @@ impl ResolverCaches {
     pub fn put_claim(
         &self,
         key: (String, HashedLocalPart),
-        value: String,
+        value: SignedClaim,
         expires_at: u64,
         _recency_hint: u64,
     ) {
@@ -146,7 +146,7 @@ impl ResolverCaches {
         self.enforce_bound(&self.claim, self.limits.claim_max);
     }
 
-    pub fn get_claim(&self, key: &(String, HashedLocalPart), now: u64) -> Option<String> {
+    pub fn get_claim(&self, key: &(String, HashedLocalPart), now: u64) -> Option<SignedClaim> {
         let entry = self.claim.get(key)?;
         if entry.is_expired(now) {
             return None;
@@ -304,7 +304,15 @@ impl ResolverCaches {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::FakeTimeSource;
+    use crate::test_support::{ClaimBuilder, FakeTimeSource, TestDomain};
+    use rand_core::OsRng;
+
+    fn build_claim() -> crate::claim::SignedClaim {
+        let mut rng = OsRng;
+        let d = TestDomain::new(&mut rng, "q8.fyi");
+        let sk = d.mint_signing_key(&mut rng, 1000, 10_000_000);
+        ClaimBuilder::new(&d, &sk, 1000).build()
+    }
 
     #[test]
     fn cache_entry_is_expired_at_boundary() {
@@ -330,16 +338,18 @@ mod tests {
     fn claim_cache_inserts_and_retrieves() {
         let caches = ResolverCaches::new(CacheLimits::default());
         let key = ("q8.fyi".to_string(), [0x11u8; 32]);
-        caches.put_claim(key.clone(), "claim-bytes-here".to_string(), 1000, 100);
+        let claim = build_claim();
+        caches.put_claim(key.clone(), claim.clone(), 1000, 100);
         let got = caches.get_claim(&key, 500).expect("hit");
-        assert_eq!(got, "claim-bytes-here");
+        assert_eq!(got, claim);
     }
 
     #[test]
     fn claim_cache_ttl_expiry_is_honored() {
         let caches = ResolverCaches::new(CacheLimits::default());
         let key = ("q8.fyi".to_string(), [0x11u8; 32]);
-        caches.put_claim(key.clone(), "v".to_string(), 1000, 100);
+        let claim = build_claim();
+        caches.put_claim(key.clone(), claim, 1000, 100);
         assert!(caches.get_claim(&key, 999).is_some());
         assert!(caches.get_claim(&key, 1000).is_none(), "expires_at is exclusive");
         assert!(caches.get_claim(&key, 1500).is_none());
@@ -349,9 +359,10 @@ mod tests {
     fn claim_cache_lru_bound_evicts_oldest() {
         let limits = CacheLimits { claim_max: 3, ..CacheLimits::default() };
         let caches = ResolverCaches::new(limits);
+        let claim = build_claim();
         for i in 0..5u8 {
             let key = ("q8.fyi".to_string(), [i; 32]);
-            caches.put_claim(key, format!("v{i}"), 10_000, i as u64);
+            caches.put_claim(key, claim.clone(), 10_000, i as u64);
         }
         // After inserting 5, only the 3 most recent (i=2,3,4) should remain.
         assert!(caches.get_claim(&("q8.fyi".to_string(), [0; 32]), 100).is_none());
@@ -381,8 +392,9 @@ mod tests {
     #[test]
     fn sweep_evicts_expired_entries_across_caches() {
         let caches = ResolverCaches::new(CacheLimits::default());
-        caches.put_claim(("a".into(), [1; 32]), "v".into(), 50, 1);
-        caches.put_claim(("b".into(), [2; 32]), "w".into(), 500, 2);
+        let claim = build_claim();
+        caches.put_claim(("a".into(), [1; 32]), claim.clone(), 50, 1);
+        caches.put_claim(("b".into(), [2; 32]), claim, 500, 2);
         caches.sweep_expired(100);
         assert!(caches.get_claim(&("a".into(), [1; 32]), 100).is_none());
         assert!(caches.get_claim(&("b".into(), [2; 32]), 100).is_some());
