@@ -107,6 +107,11 @@ pub struct DefaultEmailResolver {
     config: ResolverConfig,
     /// One `Semaphore(1)` per domain, used to serialise concurrent revocation
     /// refreshes for the same domain without blocking unrelated domains.
+    ///
+    /// NOTE: this map grows once per distinct domain ever resolved and is
+    /// never pruned. For the expected footprint of a single gateway this is
+    /// a bounded cost, but Task 19's background sweep should evict entries
+    /// for domains that have not been seen recently (cf. `domain_last_seen`).
     revocation_refresh_locks: Arc<dashmap::DashMap<String, Arc<Semaphore>>>,
     /// Handle to the background sweep task; held so the task is cancelled when
     /// the resolver is dropped. Wired up by the background-sweep task (Task 17+).

@@ -81,6 +81,10 @@ async fn cold_path_resolves_and_caches() {
     assert_eq!(bytes, [0x42; 16]);
 
     // Subsequent call: zero network.
+    // On the first call the resolver populated (a) the master-key cache,
+    // (b) the revocation cache (from the 404 → authoritative empty), and
+    // (c) the claim cache. All three remain fresh, so the second resolve
+    // must not touch either client.
     let pre_dns = dns.call_count();
     let pre_http = http.call_count();
     let _ = resolver.resolve("alice", "q8.fyi").await;
