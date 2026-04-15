@@ -3,6 +3,21 @@
 //! Binds to configured SMTP ports, accepts connections, and spawns per-connection
 //! async tasks that wire [`SmtpCodec`](crate::io::SmtpCodec) frames to the
 //! [`SmtpSession`](crate::smtp::SmtpSession) sans-I/O state machine.
+//!
+//! ## Remote delivery (ZEB-113 PR A)
+//!
+//! When a recipient is NOT homed on this gateway (`imap_store` has no user
+//! for the recipient's address hash), the `DeliverToHarmony` action
+//! attempts remote delivery via the optional `gateway_identity` and
+//! `recipient_resolver` parameters. A hit resolves the recipient's
+//! classical [`Identity`](harmony_identity::Identity) from their
+//! [`AnnounceRecord`](harmony_discovery::AnnounceRecord), seals the
+//! serialized [`HarmonyMessage`](crate::message::HarmonyMessage) via
+//! [`HarmonyEnvelope::seal`](harmony_zenoh::envelope::HarmonyEnvelope::seal),
+//! and publishes to the per-recipient key
+//! `harmony/msg/v1/unicast/{recipient_hash_hex}`. Offline recipients
+//! (`resolver.resolve` returns `None`) are warned-and-skipped; persistent
+//! store-and-forward is a separate follow-up (ZEB-113 PR B).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
