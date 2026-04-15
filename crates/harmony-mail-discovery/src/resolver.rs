@@ -82,14 +82,14 @@ pub struct ResolverConfig {
 impl Default for ResolverConfig {
     fn default() -> Self {
         Self {
-            soft_fail_window_secs: 72 * 3600,        // 72 hours
-            negative_cache_secs: 60,                 // 1 minute
-            revocation_refresh_secs: 3600,           // 1 hour
-            revocation_safety_valve_secs: 24 * 3600, // 24 hours
-            clock_skew_tolerance_secs: 300,          // 5 minutes
-            dns_ttl_default_secs: 300,               // 5 minutes
+            soft_fail_window_secs: 72 * 3600,        // 72 hours (spec §5.5)
+            negative_cache_secs: 60,                 // 1 minute (spec §6)
+            revocation_refresh_secs: 6 * 3600,       // 6 hours  (spec §5.4)
+            revocation_safety_valve_secs: 24 * 3600, // 24 hours (spec §5.4)
+            clock_skew_tolerance_secs: 60,           // 1 minute (spec §4.3)
+            dns_ttl_default_secs: 3600,              // 1 hour   (spec §5.1)
             cache_limits: CacheLimits::default(),
-            background_sweep_interval: Duration::from_secs(60),
+            background_sweep_interval: Duration::from_secs(15 * 60), // 15 minutes
         }
     }
 }
