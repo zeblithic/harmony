@@ -133,6 +133,57 @@ fn parse_single_harmony_txt(txt: &str) -> Result<DomainRecord, DnsFetchError> {
     })
 }
 
+// ── Production DNS client ─────────────────────────────────────────────────────
+
+use std::time::Duration;
+
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::error::ResolveErrorKind;
+use hickory_resolver::TokioAsyncResolver;
+
+pub struct HickoryDnsClient {
+    inner: TokioAsyncResolver,
+}
+
+impl HickoryDnsClient {
+    /// Build with system-config defaults (honors /etc/resolv.conf on
+    /// Unix). Falls back to Google DNS if system config lookup fails.
+    pub fn from_system(timeout: Duration) -> Self {
+        let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()
+            .unwrap_or_else(|_| (ResolverConfig::google(), ResolverOpts::default()));
+        opts.timeout = timeout;
+        Self {
+            inner: TokioAsyncResolver::tokio(config, opts),
+        }
+    }
+}
+
+#[async_trait]
+impl DnsClient for HickoryDnsClient {
+    async fn fetch_txt(&self, name: &str) -> Result<Vec<String>, DnsError> {
+        match self.inner.txt_lookup(name).await {
+            Ok(lookup) => {
+                let mut out = Vec::new();
+                for record in lookup.iter() {
+                    // A TXT record can hold multiple <character-string>s;
+                    // harmony records always fit in one, but concat to be forgiving.
+                    let joined: String = record
+                        .txt_data()
+                        .iter()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                        .collect();
+                    out.push(joined);
+                }
+                Ok(out)
+            }
+            Err(e) => match e.kind() {
+                ResolveErrorKind::NoRecordsFound { .. } => Err(DnsError::NoRecord),
+                _ => Err(DnsError::Transient(e.to_string())),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
