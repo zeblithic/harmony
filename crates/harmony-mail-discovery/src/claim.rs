@@ -186,6 +186,7 @@ pub fn hashed_local_part(local_part: &str, domain_salt: &[u8; 16]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+use ed25519_dalek::{Signature as EdSignature, Verifier, VerifyingKey};
 use harmony_identity::IdentityHash;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,9 +245,141 @@ impl RevocationView {
     }
 }
 
+impl SignedClaim {
+    /// Spec §4.3 verification algorithm. `queried_domain` must be the
+    /// domain the resolver intended to look up — prevents reflect
+    /// attacks where a signed claim for `attacker.example` is served
+    /// in response to a query for `q8.fyi`.
+    pub fn verify(
+        &self,
+        domain_record: &DomainRecord,
+        revocations: &RevocationView,
+        now: u64,
+        clock_skew_tolerance_secs: u64,
+    ) -> Result<VerifiedBinding, VerifyError> {
+        self.verify_against(
+            &self.payload.domain,
+            domain_record,
+            revocations,
+            now,
+            clock_skew_tolerance_secs,
+        )
+    }
+
+    /// Same as `verify`, but the caller supplies the queried domain
+    /// explicitly. The resolver uses this because it knows which
+    /// domain it actually queried.
+    pub fn verify_against(
+        &self,
+        queried_domain: &str,
+        domain_record: &DomainRecord,
+        revocations: &RevocationView,
+        now: u64,
+        tolerance: u64,
+    ) -> Result<VerifiedBinding, VerifyError> {
+        // 1. Domain agreement.
+        if self.payload.domain != queried_domain || self.cert.domain != queried_domain {
+            return Err(VerifyError::DomainMismatch);
+        }
+
+        // 2. Version bytes.
+        if self.payload.version != 1 {
+            return Err(VerifyError::UnsupportedVersion(self.payload.version));
+        }
+        if self.cert.version != 1 {
+            return Err(VerifyError::UnsupportedVersion(self.cert.version));
+        }
+
+        // 3. hashed_local_part consistency.
+        let local_part = self
+            .payload
+            .email
+            .split('@')
+            .next()
+            .unwrap_or("");
+        let computed = hashed_local_part(local_part, &domain_record.domain_salt);
+        if computed != self.payload.hashed_local_part {
+            return Err(VerifyError::HashedLocalPartMismatch);
+        }
+
+        // 4. Master signature over the cert.
+        let master_vk = match domain_record.master_pubkey {
+            MasterPubkey::Ed25519(bytes) => VerifyingKey::from_bytes(&bytes)
+                .map_err(|_| VerifyError::CertSignatureInvalid)?,
+        };
+        let cert_bytes = canonical_cbor(&self.cert.signable())
+            .map_err(|_| VerifyError::EncodingFailed)?;
+        let master_sig = match self.cert.master_signature {
+            Signature::Ed25519(s) => EdSignature::from_bytes(&s),
+        };
+        master_vk
+            .verify(&cert_bytes, &master_sig)
+            .map_err(|_| VerifyError::CertSignatureInvalid)?;
+
+        // 5. Cert validity window (with tolerance).
+        if now.saturating_add(tolerance) < self.cert.valid_from {
+            return Err(VerifyError::CertNotYetValid {
+                valid_from: self.cert.valid_from,
+            });
+        }
+        if now > self.cert.valid_until.saturating_add(tolerance) {
+            return Err(VerifyError::CertExpired {
+                valid_until: self.cert.valid_until,
+            });
+        }
+
+        // 6. Revocation check with grandfathering.
+        if let Some(&revoked_at) = revocations.revoked.get(&self.cert.signing_key_id) {
+            if self.payload.issued_at > revoked_at {
+                return Err(VerifyError::CertRevoked { revoked_at });
+            }
+            // Grandfathered (issued_at <= revoked_at): continue.
+        }
+
+        // 7. Claim signature under the signing key.
+        let signing_vk = match self.cert.signing_pubkey {
+            SigningPubkey::Ed25519(bytes) => VerifyingKey::from_bytes(&bytes)
+                .map_err(|_| VerifyError::ClaimSignatureInvalid)?,
+        };
+        let payload_bytes = canonical_cbor(&self.payload)
+            .map_err(|_| VerifyError::EncodingFailed)?;
+        let claim_sig = match self.claim_signature {
+            Signature::Ed25519(s) => EdSignature::from_bytes(&s),
+        };
+        signing_vk
+            .verify(&payload_bytes, &claim_sig)
+            .map_err(|_| VerifyError::ClaimSignatureInvalid)?;
+
+        // 8. Claim expiry.
+        if now > self.payload.expires_at.saturating_add(tolerance) {
+            return Err(VerifyError::ClaimExpired {
+                expires_at: self.payload.expires_at,
+            });
+        }
+
+        Ok(VerifiedBinding {
+            domain: self.payload.domain.clone(),
+            email: self.payload.email.clone(),
+            identity_hash: self.payload.identity_hash,
+            serial: self.payload.serial,
+            claim_expires_at: self.payload.expires_at,
+            signing_key_id: self.cert.signing_key_id,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "test-support")]
+    use crate::test_support::{ClaimBuilder, TestDomain};
+    #[cfg(feature = "test-support")]
+    use rand_core::OsRng;
+
+    #[cfg(feature = "test-support")]
+    const NOW: u64 = 2_000_000_000;
+    #[cfg(feature = "test-support")]
+    const TOLERANCE: u64 = 60;
 
     #[test]
     fn domain_record_roundtrips_via_canonical_cbor() {
@@ -321,5 +454,24 @@ mod tests {
         let bytes = canonical_cbor(&payload).expect("encode");
         let decoded: ClaimPayload = ciborium::de::from_reader(&bytes[..]).expect("decode");
         assert_eq!(decoded, payload);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn verify_accepts_well_formed_fresh_claim() {
+        let mut rng = OsRng;
+        let d = TestDomain::new(&mut rng, "q8.fyi");
+        let sk = d.mint_signing_key(&mut rng, NOW - 1000, NOW + 90 * 86_400);
+        let claim = ClaimBuilder::new(&d, &sk, NOW).build();
+
+        let binding = claim
+            .verify(&d.record(), &RevocationView::empty(), NOW, TOLERANCE)
+            .expect("verify");
+
+        assert_eq!(binding.domain, "q8.fyi");
+        assert_eq!(binding.email, "alice@q8.fyi");
+        assert_eq!(binding.identity_hash.as_slice(), &[0x11; 16]);
+        assert_eq!(binding.serial, 1);
+        assert_eq!(binding.signing_key_id, sk.cert.signing_key_id);
     }
 }
