@@ -95,11 +95,6 @@ DEFAULT_LAYER_INDEX = -2  # penultimate layer (L-1) via HF negative index
 DEFAULT_HASH_SEEDS = (42, 99, 137, 251)
 DEFAULT_PCA_SUBSAMPLE = 0.2
 DEFAULT_PCA_BATCH = 512
-# A Welford-updated row is "populated" once it has seen at least one
-# observation; untouched rows stay at zero. For PCA fitting, we ignore
-# zero-count rows so the projection matrix isn't dominated by the
-# geometric origin.
-DEFAULT_MIN_COUNT_FOR_PCA = 1
 
 
 # ---------------------------------------------------------------------------
