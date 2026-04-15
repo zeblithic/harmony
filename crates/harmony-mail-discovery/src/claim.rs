@@ -170,6 +170,80 @@ impl RevocationList {
     }
 }
 
+use sha2::{Digest, Sha256};
+
+/// Canonical hashed_local_part per spec §4.3.
+///
+/// Local-part is NOT lowercased (RFC 5321 §2.3.11 defines local-parts
+/// as case-sensitive). Domain casing is the caller's responsibility —
+/// resolver always lowercases before handing it to anything in this
+/// module.
+pub fn hashed_local_part(local_part: &str, domain_salt: &[u8; 16]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(local_part.as_bytes());
+    hasher.update([0x00]);
+    hasher.update(domain_salt);
+    hasher.finalize().into()
+}
+
+use harmony_identity::IdentityHash;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBinding {
+    pub domain: String,
+    pub email: String,
+    pub identity_hash: IdentityHash,
+    pub serial: u64,
+    pub claim_expires_at: u64,
+    pub signing_key_id: [u8; 8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VerifyError {
+    #[error("claim.domain, cert.domain, and queried_domain must all agree")]
+    DomainMismatch,
+    #[error("hashed_local_part does not match SHA-256(local_part || 0x00 || salt)")]
+    HashedLocalPartMismatch,
+    #[error("master signature over signing-key cert is invalid")]
+    CertSignatureInvalid,
+    #[error("claim signature under signing key is invalid")]
+    ClaimSignatureInvalid,
+    #[error("cert not yet valid (valid_from = {valid_from})")]
+    CertNotYetValid { valid_from: u64 },
+    #[error("cert expired (valid_until = {valid_until})")]
+    CertExpired { valid_until: u64 },
+    #[error("cert revoked at {revoked_at}")]
+    CertRevoked { revoked_at: u64 },
+    #[error("claim expired (expires_at = {expires_at})")]
+    ClaimExpired { expires_at: u64 },
+    #[error("unsupported version byte: {0}")]
+    UnsupportedVersion(u8),
+    #[error("unsupported signature algorithm")]
+    UnsupportedAlgorithm,
+    #[error("canonical CBOR encoding failed (unexpected)")]
+    EncodingFailed,
+}
+
+/// View over the revocation cache passed into `verify`. The resolver
+/// fills this from its revocation cache; tests use a trivial empty or
+/// hand-built view.
+#[derive(Debug, Default, Clone)]
+pub struct RevocationView {
+    /// Map of `signing_key_id -> (revoked_at = cert.valid_until)`. All
+    /// certs in this view have `valid_until` in the past (by
+    /// construction — see `RevocationList::revoked_certs` spec §4.4).
+    pub revoked: std::collections::HashMap<[u8; 8], u64>,
+}
+
+impl RevocationView {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+    pub fn insert(&mut self, signing_key_id: [u8; 8], revoked_at: u64) {
+        self.revoked.insert(signing_key_id, revoked_at);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +279,30 @@ mod tests {
         // Roundtrip safety:
         let decoded: Signature = ciborium::de::from_reader(&bytes[..]).expect("decode");
         assert_eq!(decoded, sig);
+    }
+
+    #[test]
+    fn hashed_local_part_matches_spec_formula() {
+        // SHA-256("alice" || 0x00 || domain_salt)
+        let salt = [0x11u8; 16];
+        let h = hashed_local_part("alice", &salt);
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"alice");
+        hasher.update([0x00]);
+        hasher.update(salt);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(h, expected);
+    }
+
+    #[test]
+    fn hashed_local_part_is_case_preserving() {
+        // Local-parts are case-sensitive per RFC 5321 §2.3.11.
+        let salt = [0u8; 16];
+        assert_ne!(
+            hashed_local_part("Alice", &salt),
+            hashed_local_part("alice", &salt),
+        );
     }
 
     #[test]
