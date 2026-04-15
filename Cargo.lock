@@ -3472,6 +3472,7 @@ dependencies = [
  "futures-util",
  "harmony-content",
  "harmony-db",
+ "harmony-discovery",
  "harmony-identity",
  "harmony-mailbox",
  "harmony-zenoh",
