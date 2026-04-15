@@ -40,7 +40,9 @@ argon2 = { workspace = true, features = ["std"] }
 base64 = { workspace = true }
 harmony-content = { workspace = true, features = ["std"] }
 harmony-db = { workspace = true }
+harmony-discovery = { workspace = true }
 harmony-zenoh.workspace = true
+rand_core = { workspace = true, features = ["std", "getrandom"] }
 rpassword = "5"
 zenoh.workspace = true
 
