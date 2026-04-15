@@ -125,7 +125,6 @@ pub struct DefaultEmailResolver {
     highest_serial: Arc<DashMap<(String, [u8; 32]), u64>>,
     /// Handle to the background sweep task; held so the task is cancelled when
     /// the resolver is dropped. Wired up by the background-sweep task (Task 17+).
-    #[allow(dead_code)]
     background_task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -453,4 +452,50 @@ fn build_revocation_view(list: &RevocationList) -> RevocationView {
         view.insert(cert.signing_key_id, cert.valid_until);
     }
     view
+}
+
+impl DefaultEmailResolver {
+    /// Spawn the background maintenance task. Safe to call multiple
+    /// times — subsequent calls are no-ops. The task exits when the
+    /// resolver is dropped (it holds a Weak reference to caches/time).
+    pub async fn spawn_background_refresh(self: &Arc<Self>) {
+        let mut guard = self.background_task.lock().await;
+        if guard.is_some() {
+            return;
+        }
+
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval({
+                // Upgrade once to read interval, then drop.
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                this.config.background_sweep_interval
+            });
+            ticker.tick().await; // immediate first tick — discard
+            loop {
+                ticker.tick().await;
+                let Some(this) = weak.upgrade() else {
+                    break;
+                };
+                let now = this.time.now();
+                this.caches.sweep_expired(now);
+                // Per-domain revocation refresh scheduling: collect
+                // domains whose last_refreshed + refresh_secs < now.
+                let to_refresh: Vec<String> = this
+                    .caches
+                    .revocation_refresh_candidates(now, this.config.revocation_refresh_secs);
+                for domain in to_refresh {
+                    let this2 = this.clone();
+                    tokio::spawn(async move {
+                        let _ = this2
+                            .refresh_revocation_view(&domain, this2.time.now())
+                            .await;
+                    });
+                }
+            }
+        });
+        *guard = Some(handle);
+    }
 }

@@ -306,6 +306,16 @@ impl ResolverCaches {
         }
     }
 
+    /// Returns the domains whose revocation list is due for a proactive
+    /// refresh: those where `now - last_refreshed >= refresh_secs`.
+    pub fn revocation_refresh_candidates(&self, now: u64, refresh_secs: u64) -> Vec<String> {
+        self.revocation_last_refreshed
+            .iter()
+            .filter(|e| now.saturating_sub(*e.value()) >= refresh_secs)
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
     /// LRU-bound eviction for the negative cache whose values are raw `u64`
     /// expiry timestamps (not `CacheEntry<T>`). Evicts entries with the
     /// lowest expires_at (i.e., inserted earliest, since all entries share
@@ -428,6 +438,26 @@ mod tests {
         assert!(caches.was_domain_seen_within("q8.fyi", 1000 + 3600, 72 * 3600));
         assert!(caches.was_domain_seen_within("q8.fyi", 1000 + 72 * 3600 - 1, 72 * 3600));
         assert!(!caches.was_domain_seen_within("q8.fyi", 1000 + 72 * 3600, 72 * 3600));
+    }
+
+    #[test]
+    fn revocation_refresh_candidates_returns_stale_domains() {
+        let caches = ResolverCaches::new(CacheLimits::default());
+        // Put two domains: one refreshed recently, one stale.
+        caches.put_revocation("fresh.example", RevocationView::empty(), 99999, 1000);
+        caches.put_revocation("stale.example", RevocationView::empty(), 99999, 100);
+        // now=1500, refresh_secs=600: fresh (1000) needs refresh in 100s, stale (100) is 1400s old.
+        let refresh_secs = 600;
+        let now = 1500;
+        let candidates = caches.revocation_refresh_candidates(now, refresh_secs);
+        assert!(
+            candidates.contains(&"stale.example".to_string()),
+            "stale domain must be a candidate"
+        );
+        assert!(
+            !candidates.contains(&"fresh.example".to_string()),
+            "fresh domain must not be a candidate"
+        );
     }
 
     #[test]
