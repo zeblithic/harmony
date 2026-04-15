@@ -11,37 +11,58 @@ pub fn canonical_cbor<T: Serialize>(value: &T) -> Result<Vec<u8>, ciborium::ser:
     Ok(buf)
 }
 
-/// `serde` helper for `[u8; 64]`: the workspace `serde_core` fork only
-/// derives array impls up to `[T; 32]`, so we use a slice/Vec roundtrip
-/// (the same pattern used in `harmony-roxy`'s `serde_sig` module).
-mod serde_bytes64 {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+/// Serde helper for `[u8; N]` fields: encode as a CBOR byte string
+/// (major type 2) instead of the default "array of integers" (major
+/// type 4) that `#[derive(Serialize)]` would emit. Required for the
+/// spec's canonical-CBOR wire format (RFC 8949 §4.2).
+mod serde_byte_array {
+    use serde::{Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error> {
-        bytes.as_slice().serialize(serializer)
+    pub fn serialize<S, const N: usize>(bytes: &[u8; N], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(bytes.as_slice())
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 64], D::Error> {
-        let v: Vec<u8> = Deserialize::deserialize(deserializer)?;
-        v.try_into()
-            .map_err(|_| serde::de::Error::custom("expected exactly 64 bytes"))
+    pub fn deserialize<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor<const N: usize>;
+        impl<'de, const N: usize> serde::de::Visitor<'de> for Visitor<N> {
+            type Value = [u8; N];
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a byte string of exactly {N} bytes")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<[u8; N], E> {
+                v.try_into().map_err(|_| E::custom(format!("expected {N} bytes, got {}", v.len())))
+            }
+            fn visit_borrowed_bytes<E: serde::de::Error>(self, v: &'de [u8]) -> Result<[u8; N], E> {
+                self.visit_bytes(v)
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<[u8; N], E> {
+                self.visit_bytes(&v)
+            }
+        }
+        deserializer.deserialize_bytes(Visitor::<N>)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MasterPubkey {
-    Ed25519([u8; 32]),
+    Ed25519(#[serde(with = "serde_byte_array")] [u8; 32]),
     // MlDsa65(Box<[u8; 1952]>) — reserved; see spec §2.1, §4.1.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SigningPubkey {
-    Ed25519([u8; 32]),
+    Ed25519(#[serde(with = "serde_byte_array")] [u8; 32]),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Signature {
-    Ed25519(#[serde(with = "serde_bytes64")] [u8; 64]),
+    Ed25519(#[serde(with = "serde_byte_array")] [u8; 64]),
     // MlDsa65(Box<[u8; 3309]>), Hybrid(Box<HybridSignature>) — reserved.
 }
 
@@ -54,6 +75,7 @@ pub enum SignatureAlg {
 pub struct DomainRecord {
     pub version: u8,
     pub master_pubkey: MasterPubkey,
+    #[serde(with = "serde_byte_array")]
     pub domain_salt: [u8; 16],
     pub alg: SignatureAlg,
 }
@@ -61,6 +83,7 @@ pub struct DomainRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SigningKeyCert {
     pub version: u8,
+    #[serde(with = "serde_byte_array")]
     pub signing_key_id: [u8; 8],
     pub signing_pubkey: SigningPubkey,
     pub valid_from: u64,
@@ -75,6 +98,7 @@ pub struct SigningKeyCert {
 #[derive(Debug, Serialize)]
 pub struct SigningKeyCertSignable<'a> {
     pub version: u8,
+    #[serde(with = "serde_byte_array")]
     pub signing_key_id: [u8; 8],
     pub signing_pubkey: &'a SigningPubkey,
     pub valid_from: u64,
@@ -99,12 +123,15 @@ impl SigningKeyCert {
 pub struct ClaimPayload {
     pub version: u8,
     pub domain: String,
+    #[serde(with = "serde_byte_array")]
     pub hashed_local_part: [u8; 32],
     pub email: String,
+    #[serde(with = "serde_byte_array")]
     pub identity_hash: [u8; 16],
     pub issued_at: u64,
     pub expires_at: u64,
     pub serial: u64,
+    #[serde(with = "serde_byte_array")]
     pub signing_key_id: [u8; 8],
 }
 
@@ -158,5 +185,43 @@ mod tests {
         let bytes = canonical_cbor(&rec).expect("encode");
         let decoded: DomainRecord = ciborium::de::from_reader(&bytes[..]).expect("decode");
         assert_eq!(decoded, rec);
+    }
+
+    #[test]
+    fn signature_encodes_as_cbor_byte_string_not_array() {
+        // A 64-byte signature must serialize as CBOR major type 2 (byte string),
+        // not major type 4 (array). For N=64, the byte-string prefix is 0x58 0x40
+        // (two bytes), while an array-of-64 would be 0x98 0x40 (two bytes) followed
+        // by 64 one-byte encodings = 130 total payload bytes. Byte string: 2 + 64 = 66.
+        let sig = Signature::Ed25519([0x42u8; 64]);
+        let bytes = canonical_cbor(&sig).expect("encode");
+        // CBOR enum encoding as "Ed25519" + bstr(64). The bstr header must appear.
+        // The 0x58 is the major-type-2 header for a byte string of length 0x40 (64).
+        assert!(
+            bytes.windows(2).any(|w| w == [0x58, 0x40]),
+            "expected CBOR byte-string header 0x58 0x40 in encoded signature, got: {:?}",
+            bytes
+        );
+        // Roundtrip safety:
+        let decoded: Signature = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded, sig);
+    }
+
+    #[test]
+    fn claim_payload_byte_fields_roundtrip() {
+        let payload = ClaimPayload {
+            version: 1,
+            domain: "q8.fyi".into(),
+            hashed_local_part: [0x11u8; 32],
+            email: "alice@q8.fyi".into(),
+            identity_hash: [0x22u8; 16],
+            issued_at: 1_000,
+            expires_at: 2_000,
+            serial: 5,
+            signing_key_id: [0x33u8; 8],
+        };
+        let bytes = canonical_cbor(&payload).expect("encode");
+        let decoded: ClaimPayload = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded, payload);
     }
 }
