@@ -110,7 +110,7 @@ winning ZEB-117 mechanism against it. Specifically:
 |----------------|--------------------------|----------------|
 | gamma or delta beats beta | Oracle much stronger | Corpus quality is the primary lever. Invest in teacher distillation pipeline (ZEB-102 Phase 2). |
 | gamma or delta beats beta | Oracle similar | Mechanism ceiling hit at 40M scale. Next: scale study (80M/160M) with the winning mechanism. |
-| Both match beta | Oracle beats beta cleanly | **Mechanism is the failure mode**, not content. Pivot to alternative mechanisms: product keys, hash layers, adapter-retrieval, chunked RETRO. |
+| Both match beta | Oracle beats beta cleanly | **Content is the failure mode**, not the mechanism. The oracle proves the injection pathway CAN route retrieved signal when the source is high-fidelity. Pivot to corpus quality: teacher distillation pipeline (ZEB-102 Phase 2), contrastive table training, semantic key spaces. |
 | Both match beta | Oracle also matches beta | External memory at 40M scale doesn't transmit signal regardless of content OR mechanism. Engram dead for Harmony v1. Pivot to COCONUT / latent reasoning / just scale the baseline. |
 
 ### What I want the research report to cover

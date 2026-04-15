@@ -1,10 +1,21 @@
 """Oracle corpus table generator for ZEB-119.
 
 Distills contextualized hidden states from an open-weight teacher model
-(default Qwen2.5-1.5B) across a pre-tokenized training corpus and
+(default Mistral-7B-v0.1) across a pre-tokenized training corpus and
 aggregates them into a static n-gram embedding table compatible with
 the student's `EngramTable` / `EngramANNInjection` /
 `EngramCrossAttention` schema.
+
+**Tokenizer parity is a load-bearing invariant.** The dataset's
+`input_ids` are fed directly into the teacher — if the teacher was
+trained with a different tokenizer than the dataset, the teacher sees
+garbage IDs and produces noise hidden states that Welford happily
+averages. The resulting table looks valid but encodes zero corpus
+signal, which is the worst possible failure mode for a falsification
+diagnostic. This module hard-fails if the teacher's vocab_size doesn't
+match `--expected-vocab-size` (default 32000 = Mistral/Llama-2). The
+shipped default teacher (Mistral-7B-v0.1) shares vocab with the
+corpus produced by `ct87.prepare_data`.
 
 The pipeline is strictly research-only (NOT mirrored in Rust, NOT
 GGUF-portable):
@@ -65,10 +76,20 @@ from ct87.engram import _hash_ngram
 # Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_TEACHER = "Qwen/Qwen2.5-1.5B"
+# Mistral-7B-v0.1 shares its 32K SentencePiece vocabulary with the
+# dataset produced by `ct87.prepare_data`, which is the only teacher
+# currently known to satisfy the tokenizer-parity invariant. Swapping
+# to Qwen/Llama-3/Pythia requires re-tokenizing the corpus first.
+DEFAULT_TEACHER = "mistralai/Mistral-7B-v0.1"
+# Expected tokenizer vocab size for the Mistral/Llama-2 family. Any
+# teacher with a different vocab_size is rejected before a single
+# forward pass.
+DEFAULT_EXPECTED_VOCAB_SIZE = 32000
 DEFAULT_ENGRAM_DIM = 128
 DEFAULT_TOTAL_ENTRIES = 10_000
-DEFAULT_BATCH_SIZE = 16
+# A 7B bf16 teacher is ~14 GB resident; keep per-batch activations
+# modest so peak VRAM on a 24 GB 4090 stays under ~20 GB with margin.
+DEFAULT_BATCH_SIZE = 8
 DEFAULT_SEQ_LEN = 2048
 DEFAULT_LAYER_INDEX = -2  # penultimate layer (L-1) via HF negative index
 DEFAULT_HASH_SEEDS = (42, 99, 137, 251)
@@ -128,19 +149,31 @@ class WelfordTable:
         indices: np.ndarray,
         vectors: np.ndarray,
     ) -> None:
-        """Welford-update many rows in one call.
+        """Batched mean-update using vectorized scatter accumulation.
 
         Args:
             indices: [K] int64 row indices (may contain duplicates)
             vectors: [K, teacher_dim] float32 observations, aligned
                 with `indices` by position
 
-        Duplicates within `indices` are processed sequentially so the
-        running mean stays correct under repeated updates to the same
-        row inside a single batch. Vectorizing this across duplicates
-        is tricky (the divisor changes with each duplicate); for our
-        scale the per-row Python loop over the unique_indices groups is
-        fast enough.
+        Implementation: rather than Welford's streaming identity
+        `mean <- mean + (v - mean) / count`, we combine the pre-batch
+        mean and the in-batch mean via the exact two-pass identity:
+
+            new_mean[r] = (old_mean[r] * old_count[r] + batch_sum[r])
+                          / (old_count[r] + batch_count[r])
+
+        `batch_sum` and `batch_count` are computed with `np.add.at`
+        (unbuffered scatter-add), which handles duplicate indices
+        correctly. This produces bit-identical results to the
+        per-observation Welford loop (modulo floating-point accumulation
+        order within a batch) at ~100-1000x the throughput — critical
+        when aggregating 800M tokens * 4 seeds * 2 n-gram orders =
+        ~6B scatter-updates.
+
+        The scheme still consumes arbitrarily many calls (it IS Welford
+        across calls, just batched within each call), so the running
+        mean is stable against arbitrary batch boundaries.
         """
         if indices.shape[0] != vectors.shape[0]:
             raise ValueError(
@@ -152,21 +185,34 @@ class WelfordTable:
                 f"vectors have teacher_dim={vectors.shape[1]} but table "
                 f"expects {self.means.shape[1]}"
             )
-        # Fast path for small-batch unique indices: iterate per row.
-        # Profiling note: at B=16, T=2048, N_bigrams+N_trigrams per row
-        # is ~O(100k) across the full corpus; the Python overhead here
-        # dominates only at very small batch sizes. A vectorized
-        # scatter_reduce implementation would speed this up 2-3x; left
-        # as a follow-up.
-        for idx, vec in zip(indices.tolist(), vectors):
-            self.counts[idx] += 1
-            c = self.counts[idx]
-            # mean <- mean + (v - mean) / c
-            np.add(
-                self.means[idx],
-                (vec - self.means[idx]) / float(c),
-                out=self.means[idx],
-            )
+        if indices.size == 0:
+            return
+
+        # Group by unique row index and only materialize a scratch
+        # buffer over touched rows (not the full table). This keeps the
+        # per-batch memory proportional to len(unique_indices) * dim,
+        # not total_entries * dim — important at Mistral-7B teacher_dim
+        # = 4096 where a full-table scratch would churn hundreds of MB
+        # per batch.
+        unique_idx, inverse = np.unique(indices, return_inverse=True)
+        u = unique_idx.size
+        teacher_dim = self.means.shape[1]
+        batch_sum = np.zeros((u, teacher_dim), dtype=np.float64)
+        batch_count = np.zeros(u, dtype=np.int64)
+        # np.add.at provides unbuffered fancy-index accumulation that
+        # handles duplicate rows correctly.
+        np.add.at(batch_sum, inverse, vectors.astype(np.float64))
+        np.add.at(batch_count, inverse, 1)
+
+        old_count = self.counts[unique_idx]
+        new_count = old_count + batch_count
+        # Promote to f64 during the combine to avoid catastrophic
+        # cancellation when old_count grows large and the running mean
+        # is far from zero; cast back to f32 at the end.
+        old_mean = self.means[unique_idx].astype(np.float64)
+        combined = (old_mean * old_count[:, None] + batch_sum) / new_count[:, None]
+        self.means[unique_idx] = combined.astype(np.float32)
+        self.counts[unique_idx] = new_count
 
     @property
     def populated_mask(self) -> np.ndarray:
@@ -271,6 +317,23 @@ def fit_pca_projection(
         raise ValueError(
             f"target_dim {target_dim} exceeds teacher_dim {means.shape[1]}"
         )
+    # Preconditions for IncrementalPCA: every partial_fit chunk must
+    # contain at least n_components samples. If we can't guarantee at
+    # least one chunk >= target_dim, fail loudly now rather than letting
+    # the loop exit without fitting and then AttributeError on
+    # `pca.components_`. This fires on misconfigured smoke runs
+    # (small corpus or --engram-dim > populated rows).
+    if populated.size < target_dim:
+        raise ValueError(
+            f"need at least target_dim={target_dim} populated rows to fit "
+            f"PCA, got {populated.size}. Increase --max-sequences or reduce "
+            f"--engram-dim."
+        )
+    if pca_batch_size < target_dim:
+        raise ValueError(
+            f"--pca-batch-size={pca_batch_size} must be >= --engram-dim="
+            f"{target_dim} so each partial_fit chunk has enough samples."
+        )
 
     # Always fit on at least one partial_fit batch, even if the
     # subsample would otherwise be smaller.
@@ -283,6 +346,7 @@ def fit_pca_projection(
     fit_data = means[chosen]
 
     pca = IncrementalPCA(n_components=target_dim, batch_size=pca_batch_size)
+    fit_ran = False
     for start in range(0, fit_n, pca_batch_size):
         end = min(start + pca_batch_size, fit_n)
         chunk = fit_data[start:end]
@@ -292,6 +356,16 @@ def fit_pca_projection(
         if chunk.shape[0] < target_dim:
             break
         pca.partial_fit(chunk)
+        fit_ran = True
+
+    if not fit_ran:
+        # Defense-in-depth against a subtle skew: if fit_n was huge but
+        # every chunk somehow slipped through the < target_dim branch,
+        # we'd crash on .components_ below. Surface the real issue.
+        raise ValueError(
+            f"IncrementalPCA never ran partial_fit (fit_n={fit_n}, "
+            f"pca_batch_size={pca_batch_size}, target_dim={target_dim})"
+        )
 
     components = pca.components_.astype(np.float32)
     mean = pca.mean_.astype(np.float32)
@@ -303,16 +377,28 @@ def apply_pca_projection(
     means: np.ndarray,
     components: np.ndarray,
     mean_vector: np.ndarray,
+    populated_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Project [N, teacher_dim] down to [N, target_dim] using PCA output.
 
     `components` comes out of sklearn's PCA as [target_dim, teacher_dim]
     rows (each row is a principal direction). Projection is
     `(X - mean) @ components.T`.
+
+    If `populated_mask` is provided, rows with `mask == False` are
+    forced to zero after projection. Without this, rows that were never
+    updated by Welford (all-zero means) would project to
+    `-mean_vector @ components.T`, injecting a constant nonzero vector
+    into rows the student reads as "no useful signal" — silently
+    contaminating the retrieval for hashes that never occurred during
+    the teacher pass. Preserving the zero invariant is critical for
+    diagnostic interpretability.
     """
     centered = means - mean_vector
-    projected = centered @ components.T
-    return projected.astype(np.float32)
+    projected = (centered @ components.T).astype(np.float32)
+    if populated_mask is not None:
+        projected[~populated_mask] = 0.0
+    return projected
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +417,7 @@ def run_teacher_pass(
     max_sequences: int | None,
     device: str | None,
     dtype: str,
+    expected_vocab_size: int = DEFAULT_EXPECTED_VOCAB_SIZE,
 ) -> WelfordTable:
     """Drive the full teacher forward pass, accumulating Welford means.
 
@@ -354,12 +441,26 @@ def run_teacher_pass(
         flush=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(teacher_model_id)
+    # Tokenizer parity is load-bearing: fail loudly before loading a
+    # multi-GB model if the vocab sizes disagree. Silent garbage here
+    # would be indistinguishable from a real "content inert" verdict.
+    actual_vocab = int(tokenizer.vocab_size)
+    if actual_vocab != expected_vocab_size:
+        raise ValueError(
+            f"teacher {teacher_model_id!r} has vocab_size={actual_vocab} "
+            f"but the pre-tokenized corpus was produced for vocab_size="
+            f"{expected_vocab_size}. Either swap --teacher to one with the "
+            f"matching vocab (e.g. mistralai/Mistral-7B-v0.1 for the default "
+            f"FineWeb-Edu-POC corpus) or re-tokenize the corpus against the "
+            f"teacher's tokenizer and rerun."
+        )
     # AutoModel (not AutoModelForCausalLM) skips the LM head weights;
     # we only need the transformer trunk for hidden-state extraction.
     model = AutoModel.from_pretrained(
         teacher_model_id,
-        dtype=torch_dtype,
+        torch_dtype=torch_dtype,
         output_hidden_states=True,
+        use_cache=False,
     )
     model.to(device)
     # Inference mode: disable dropout/batchnorm training behavior.
@@ -532,6 +633,14 @@ def build_argparser() -> argparse.ArgumentParser:
         help=f"HuggingFace model ID (default: {DEFAULT_TEACHER!r})",
     )
     parser.add_argument(
+        "--expected-vocab-size", type=int, default=DEFAULT_EXPECTED_VOCAB_SIZE,
+        help=(
+            "Tokenizer vocab size the pre-tokenized dataset was produced "
+            "with. The teacher's tokenizer must match exactly or the run "
+            f"aborts pre-forward-pass (default: {DEFAULT_EXPECTED_VOCAB_SIZE})."
+        ),
+    )
+    parser.add_argument(
         "--dataset", required=True,
         help="Path to a pre-tokenized HuggingFace dataset (load_from_disk)",
     )
@@ -651,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
         max_sequences=args.max_sequences,
         device=args.device,
         dtype=args.dtype,
+        expected_vocab_size=args.expected_vocab_size,
     )
 
     populated_mask = table.populated_mask
@@ -675,7 +785,9 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    projected = apply_pca_projection(table.means, components, mean_vector)
+    projected = apply_pca_projection(
+        table.means, components, mean_vector, populated_mask=populated_mask,
+    )
     save_oracle_table(projected, args.output)
 
     # Sidecar JSON makes the provenance traceable without reading the

@@ -485,19 +485,36 @@ all n-grams that hash to that specific row.
 
 Following the comprehensive forward pass over the corpus, the
 high-dimensional matrix M in R^{N x 1536} must be projected down to
-match the student's engram_dim=128. Because computing the covariance
-matrix of a million 1536-dimensional vectors is computationally
-trivial relative to the forward pass, Principal Component Analysis
-can be computed exactly.
+match the student's engram_dim=128. The shipped scaffold uses
+`sklearn.decomposition.IncrementalPCA` rather than exact full-matrix
+SVD — this keeps the pipeline identical whether N is 10K (our current
+default) or 1M (a future, larger-table variant that wouldn't fit a
+single in-memory covariance decomposition).
 
-1. **Centering:** The global mean vector mu = (1/N) sum_{i=1..N} M[i]
-   is calculated and subtracted from every row.
-2. **SVD Decomposition:** Singular Value Decomposition is applied to
-   the covariance matrix of the centered M to extract the top
-   d = 128 principal eigenvectors.
-3. **Projection:** The matrix is projected into the lower-dimensional
-   subspace: `M_128 = (M - mu) @ W_PCA`, where the projection matrix
-   W_PCA in R^{1536 x 128}.
+> **Implementation note (2026-04-15):** the earlier draft of this
+> section described exact full-matrix PCA. The shipped
+> `training/ct87/generate_oracle_table.py` fits IncrementalPCA on a
+> random subsample of *populated* rows, uses the fitted sample mean
+> as mu, and projects the full table against the subsample-fitted
+> components. Explained-variance numbers in run-stats JSON are from
+> IncrementalPCA's `explained_variance_ratio_` attribute on the
+> subsample, not from a full-covariance SVD. Numerically near-identical
+> at our scale, but the provenance differs.
+
+1. **Subsample selection:** a random subsample of populated rows
+   (default 20% via `--pca-subsample-fraction`, with an RNG seed of 42)
+   is drawn. Unpopulated rows are excluded so the projection matrix
+   isn't dominated by the geometric origin.
+2. **IncrementalPCA fit:** `partial_fit` is called on each
+   `--pca-batch-size` (default 512) chunk of the subsample. The
+   estimator converges to a mean vector `mu_sample` and components
+   matrix `W_PCA` shaped `[128, 1536]`.
+3. **Projection:** the full table is projected via
+   `M_128 = (M - mu_sample) @ W_PCA.T`. Rows that were never populated
+   by Welford are explicitly re-zeroed after projection to preserve
+   the "empty row = zero signal" invariant — otherwise zero inputs
+   would project to `-mu_sample @ W_PCA.T` and inject a constant
+   nonzero vector into rows the student reads as absent.
 
 ### Phase 4: Serialization and Student Integration
 
@@ -679,19 +696,36 @@ measurable signal, fallback baselines must be deployed to eliminate
 secondary confounding variables without necessitating another
 24-hour distillation run.
 
-### The Sparse Uncollided Table
+### The Sparse (Collision-Reduced) Table
+
+> **Implementation note (2026-04-15):** the historical name "Sparse
+> Uncollided Table" overstates what the shipped scaffold delivers.
+> The current generator (`training/ct87/generate_sparse_uncollided_table.py`)
+> still routes top-N n-gram embeddings into the 10K-row dense table
+> via the student's xxhash64 — so at N=50K unique n-grams and
+> entries=10K, each row still averages ~5 top-N n-grams × 4 seeds ≈
+> 20 writes per row. This is a ~4000× reduction in per-row collision
+> contamination vs the primary oracle's ~80K-n-gram averaging, but it
+> is NOT fully collision-free. A truly collision-free variant requires
+> a student-side dictionary dispatch (option (a) in the module
+> docstring), which is flagged as a follow-up and not implemented.
+>
+> Interpretation implication: if the sparse baseline succeeds where
+> the primary oracle fails, it is strong evidence (but not airtight
+> proof) that hash topology is the dominant failure mode. For an
+> airtight separation, option (a) must be implemented and run.
 
 As analyzed in the failure modes, hash collisions can induce semantic
-collapse. To completely separate mechanism viability from hash
-contamination, a "Sparse Uncollided Table" must be generated. This
-table operates by bypassing the xxhash64 modulo projection entirely.
-It populates a smaller table with embeddings derived from a standard
-Sentence-Transformer model applied to the explicit textual strings of
-the top 50,000 most frequent unique n-grams in the corpus. If the
-standard hashed oracle fails but the sparse uncollided oracle
-succeeds, the hash mapping itself is proven to be the structural
-failure mode, completely exonerating the cross-attention (delta) and
-gated-residual (gamma) injection mechanisms.
+collapse. To isolate mechanism viability from hash contamination
+(subject to the caveat above), a collision-reduced table is generated:
+populate the hashed table with embeddings derived from a standard
+Sentence-Transformer model applied to the textual strings of the top
+50,000 most frequent unique n-grams. Rows not touched by the top-N
+n-grams stay at zero. If the primary oracle fails but this
+collision-reduced oracle succeeds, hash topology is the most likely
+failure mode, pointing toward the cross-attention (delta) and
+gated-residual (gamma) injection mechanisms being architecturally fine
+but starved of usable content by the hash layer.
 
 ### Student-as-Teacher Oracle
 

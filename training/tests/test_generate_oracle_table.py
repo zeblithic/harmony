@@ -39,6 +39,35 @@ from ct87.generate_oracle_table import (
     save_oracle_table,
 )
 
+try:
+    import sklearn  # noqa: F401
+    _HAS_SKLEARN = True
+except ImportError:
+    _HAS_SKLEARN = False
+
+try:
+    import transformers  # noqa: F401
+    _HAS_TRANSFORMERS = True
+except ImportError:
+    _HAS_TRANSFORMERS = False
+
+try:
+    import datasets  # noqa: F401
+    _HAS_DATASETS = True
+except ImportError:
+    _HAS_DATASETS = False
+
+# fit_pca_projection imports sklearn lazily, so unit tests touching PCA
+# paths need this marker to skip cleanly in `.[dev]`-only environments
+# that haven't installed scikit-learn.
+skip_if_no_sklearn = pytest.mark.skipif(
+    not _HAS_SKLEARN, reason="scikit-learn not installed (install .[teacher])"
+)
+skip_if_no_transformers = pytest.mark.skipif(
+    not (_HAS_TRANSFORMERS and _HAS_DATASETS),
+    reason="transformers/datasets not installed (install .[teacher])",
+)
+
 
 # ---------------------------------------------------------------------------
 # Welford online mean
@@ -235,6 +264,7 @@ class TestNgramIndices:
 # ---------------------------------------------------------------------------
 
 
+@skip_if_no_sklearn
 class TestPCAProjection:
     """PCA fit + apply must preserve shape, respect populated rows, and
     return variance-ratios that are reasonable given the input rank."""
@@ -426,6 +456,7 @@ class TestSafetensorsCompat:
 # ---------------------------------------------------------------------------
 
 
+@skip_if_no_sklearn
 class TestPipelineComposition:
     """A tiny end-to-end test without the teacher model: use synthetic
     'teacher hidden states' + real Welford + real PCA + real save, then
@@ -477,3 +508,179 @@ class TestPipelineComposition:
         save_oracle_table(projected, out)
         loaded = EngramANNInjection.load_corpus_table(out)
         np.testing.assert_allclose(loaded.numpy(), projected, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for PR #239 review feedback
+# ---------------------------------------------------------------------------
+
+
+class TestWelfordVectorizedEquivalence:
+    """The vectorized batch updater must produce the same running mean
+    as the per-observation Welford identity (modulo floating-point
+    accumulation order). A bug here silently corrupts every oracle row.
+    """
+
+    def test_batch_equals_scalar_sequence(self):
+        rng = np.random.default_rng(7)
+        total_entries = 16
+        dim = 8
+        k_obs = 200
+
+        ref_means = np.zeros((total_entries, dim), dtype=np.float64)
+        ref_counts = np.zeros(total_entries, dtype=np.int64)
+        indices = rng.integers(0, total_entries, size=k_obs).astype(np.int64)
+        vectors = rng.standard_normal((k_obs, dim)).astype(np.float32)
+        # Reference: classic per-observation Welford
+        for idx, vec in zip(indices.tolist(), vectors):
+            ref_counts[idx] += 1
+            c = ref_counts[idx]
+            ref_means[idx] += (vec.astype(np.float64) - ref_means[idx]) / c
+
+        # Split the observation stream into two batches and feed through
+        # the vectorized update path. Result must match ref_means to
+        # within f32 precision.
+        table = WelfordTable.zeros(total_entries, dim)
+        half = k_obs // 2
+        table.update_batch(indices[:half], vectors[:half])
+        table.update_batch(indices[half:], vectors[half:])
+
+        np.testing.assert_array_equal(table.counts, ref_counts)
+        np.testing.assert_allclose(table.means, ref_means.astype(np.float32), atol=1e-5)
+
+    def test_empty_batch_is_noop(self):
+        table = WelfordTable.zeros(4, 3)
+        table.update_batch(np.array([], dtype=np.int64), np.zeros((0, 3), dtype=np.float32))
+        assert (table.counts == 0).all()
+        assert (table.means == 0).all()
+
+
+@skip_if_no_sklearn
+class TestPCAPreconditions:
+    """Fail loudly before IncrementalPCA would raise AttributeError on
+    .components_ from an unfit estimator. Smoke runs and
+    misconfigured CLI invocations are the common triggers."""
+
+    def test_raises_when_populated_below_target_dim(self):
+        data = np.random.default_rng(0).standard_normal((5, 16)).astype(np.float32)
+        mask = np.ones(5, dtype=bool)
+        rng = np.random.default_rng(0)
+        with pytest.raises(ValueError, match="populated rows"):
+            fit_pca_projection(
+                means=data, populated_mask=mask, target_dim=8,
+                subsample_fraction=1.0, pca_batch_size=16, rng=rng,
+            )
+
+    def test_raises_when_pca_batch_below_target_dim(self):
+        data = np.random.default_rng(1).standard_normal((100, 16)).astype(np.float32)
+        mask = np.ones(100, dtype=bool)
+        rng = np.random.default_rng(1)
+        with pytest.raises(ValueError, match="pca-batch-size"):
+            fit_pca_projection(
+                means=data, populated_mask=mask, target_dim=8,
+                subsample_fraction=1.0, pca_batch_size=4, rng=rng,
+            )
+
+
+@skip_if_no_sklearn
+class TestPCAPreservesUnpopulatedZero:
+    """Rows never touched by Welford must remain zero after PCA
+    projection when `populated_mask` is passed. Otherwise the student
+    reads a constant -mean@W vector for hashes that never occurred,
+    silently contaminating retrieval."""
+
+    def test_unpopulated_rows_stay_zero(self):
+        rng = np.random.default_rng(99)
+        data = np.zeros((200, 32), dtype=np.float32)
+        # Only the first 150 rows have real data; last 50 stay zero.
+        data[:150] = rng.standard_normal((150, 32)).astype(np.float32) * 4.0
+        mask = np.zeros(200, dtype=bool)
+        mask[:150] = True
+
+        rng_pca = np.random.default_rng(100)
+        components, mean_vec, _ = fit_pca_projection(
+            means=data, populated_mask=mask, target_dim=8,
+            subsample_fraction=1.0, pca_batch_size=16, rng=rng_pca,
+        )
+        projected = apply_pca_projection(
+            data, components, mean_vec, populated_mask=mask,
+        )
+        # Populated rows: at least some nonzero entries (sanity).
+        assert np.any(projected[:150] != 0.0)
+        # Unpopulated rows: must be exactly zero.
+        assert (projected[150:] == 0.0).all(), (
+            "unpopulated rows leaked a nonzero vector after PCA"
+        )
+
+    def test_without_mask_unpopulated_rows_leak(self):
+        """Defensive: passing no mask leaves the old-behavior leak
+        visible, which is the exact regression we added the mask to
+        avoid. Ensures the fix is load-bearing."""
+        data = np.zeros((50, 16), dtype=np.float32)
+        data[:40] = np.random.default_rng(0).standard_normal((40, 16)).astype(np.float32) * 2.0
+        mask = np.zeros(50, dtype=bool)
+        mask[:40] = True
+        rng_pca = np.random.default_rng(1)
+        components, mean_vec, _ = fit_pca_projection(
+            means=data, populated_mask=mask, target_dim=4,
+            subsample_fraction=1.0, pca_batch_size=8, rng=rng_pca,
+        )
+        projected_no_mask = apply_pca_projection(data, components, mean_vec)
+        # The populated-rows mean is non-trivially nonzero, so centering
+        # shifts zero inputs to -mean_vec and projects them to a
+        # nonzero vector. If this assertion ever fires, apply_pca has
+        # changed its behavior and the other test above may also
+        # need review.
+        assert not (projected_no_mask[40:] == 0.0).all()
+
+
+@skip_if_no_transformers
+class TestVocabSizeGuard:
+    """generate_oracle_table.run_teacher_pass must abort before loading
+    the teacher if its tokenizer's vocab_size disagrees with the
+    dataset's. Silent garbage here is the worst-case diagnostic failure.
+    """
+
+    def test_mismatched_vocab_raises_before_model_load(self, monkeypatch):
+        import ct87.generate_oracle_table as gen
+
+        class _FakeTok:
+            vocab_size = 151646  # Qwen-style, wrong for Mistral corpus
+            pad_token_id = 0
+
+        class _TokCls:
+            @staticmethod
+            def from_pretrained(_id):
+                return _FakeTok()
+
+        class _ModelCls:
+            @staticmethod
+            def from_pretrained(*_args, **_kwargs):
+                raise AssertionError("must not reach model load after vocab mismatch")
+
+        # Patch the imports inside run_teacher_pass. We intercept the
+        # two factories it uses and raise from the model path to prove
+        # the vocab guard fires first.
+        import transformers
+        monkeypatch.setattr(transformers, "AutoTokenizer", _TokCls)
+        monkeypatch.setattr(transformers, "AutoModel", _ModelCls)
+        import datasets as hfds
+        monkeypatch.setattr(
+            hfds, "load_from_disk",
+            lambda _p: (_ for _ in ()).throw(AssertionError("must not load dataset")),
+        )
+
+        with pytest.raises(ValueError, match="vocab_size"):
+            gen.run_teacher_pass(
+                teacher_model_id="mock/teacher",
+                tokenized_dataset_path="/tmp/should_not_load",
+                layer_index=-2,
+                total_entries=10,
+                hash_seeds=(42,),
+                batch_size=1,
+                seq_len=4,
+                max_sequences=1,
+                device="cpu",
+                dtype="float32",
+                expected_vocab_size=32000,
+            )

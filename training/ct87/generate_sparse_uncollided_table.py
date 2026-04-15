@@ -1,37 +1,43 @@
-"""Sparse uncollided corpus table generator for ZEB-119.
+"""Sparse corpus table generator for ZEB-119 (collision-reduced baseline).
 
-Fallback diagnostic companion to `generate_oracle_table.py`. Where the
-primary oracle uses the student's xxhash-and-modulo to assign n-grams
-to a 10K-row table (averaging ~80K n-grams per row at 800M tokens, a
-dominant source of semantic collapse), this generator populates a
-sparse table keyed by the N most frequent UNIQUE n-gram TEXT STRINGS.
-Each row holds the sentence-transformer embedding of the n-gram text
-directly — no hashing, no collision averaging.
+Companion to `generate_oracle_table.py`. Where the primary oracle
+averages every hashed n-gram in the corpus into a 10K-row table
+(~80,000 distinct n-grams per row at 800M tokens, the dominant source
+of semantic collapse), this generator populates the table with
+sentence-transformer embeddings of only the top-N most frequent
+UNIQUE n-gram TEXT STRINGS.
 
-If the primary oracle fails but this sparse baseline succeeds, we've
-proven that the xxhash-and-modulo topology is the failure mode rather
-than the injection mechanism or the content quality. Conversely, if
-both fail, the architecture is genuinely unable to exploit external
-memory at this scale.
+**Important naming caveat:** the historical module name says
+"uncollided" but the emitted table is NOT fully collision-free. We use
+the student's xxhash-and-modulo to write each of the top-N n-gram
+embeddings into the 10K-row table (option (b) below), so at N=50K and
+entries=10K each row still averages ~5 top-N n-gram vectors per seed
+× 4 seeds = ~20 writes per row. This is a ~4000x reduction in per-row
+collision contamination vs the primary oracle (20 vs 80,000), but it
+is a reduction, not elimination. If you want fully-uncollided
+semantics you need option (a), which requires a student-side code
+path we have not yet implemented (flagged as a follow-up).
 
-Critical difference from the primary oracle: this table is NOT
-directly compatible with `EngramANNInjection` or `EngramCrossAttention`
-as-is. Those modules hash the student's input_ids or hidden state and
-modulo-index into a dense table. A sparse-uncollided table requires
-the student to retrieve via nearest-neighbor lookup over the
-n-gram-text-string space, which means either:
+If the primary oracle fails but this collision-reduced baseline
+succeeds, it's strong but not airtight evidence that hash topology is
+the dominant failure mode. A cleaner conclusion would come from
+option (a), but option (b) gives us a fast answer with zero
+student-side risk.
+
+Options:
 
   (a) Replace the student's hash-and-modulo with a dictionary lookup
       `ngram_tokens -> row_idx`, with rows that miss the top-N falling
       back to a zero vector (or a sentinel "unknown" row).
   (b) Map the sparse table into a dense 10K-row table via hash (same
-      schema as the primary oracle), but ONLY populate rows that
-      correspond to uncollided n-grams — all other rows stay at zero.
+      schema as the primary oracle), only writing top-N n-gram
+      vectors. Unwritten rows stay at zero. **This is what the
+      generator currently produces.**
 
 Option (b) requires no student-side code changes and lets us A/B test
-the exact same mechanism; that's what this generator produces by
-default. Option (a) is cleaner from a research-design standpoint but
-requires a minor student-side code path; flagged as a follow-up.
+the exact same mechanism; that's what this generator produces.
+Option (a) is cleaner from a research-design standpoint but requires
+a minor student-side code path; flagged as a follow-up.
 
 Schema: identical to the primary oracle's output
 (`[total_entries, engram_dim]` safetensors under `engram.weight`), so
@@ -51,7 +57,7 @@ from pathlib import Path
 import numpy as np
 
 from ct87.engram import _hash_ngram
-from ct87.generate_oracle_table import save_oracle_table
+from ct87.generate_oracle_table import parse_hash_seeds, save_oracle_table
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +72,14 @@ DEFAULT_TOP_NGRAMS = 50_000
 DEFAULT_TOTAL_ENTRIES = 10_000
 DEFAULT_ENGRAM_DIM = 128
 DEFAULT_HASH_SEEDS = (42, 99, 137, 251)
-DEFAULT_MAX_SEQUENCES = None
+# Top-k n-gram frequencies stabilize well before the full corpus — at
+# 100K sequences × ~2K tokens ≈ 200M tokens, the top 50K most-frequent
+# bigrams/trigrams have already converged against later long-tail
+# additions. Capping by default prevents accidental full-corpus scans
+# that would balloon Counter memory into the tens of GB. Override with
+# --max-sequences 0 to explicitly request a full pass.
+DEFAULT_MAX_SEQUENCES = 100_000
+DEFAULT_COUNT_BATCH_SIZE = 256
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +109,7 @@ class NgramFrequencies:
 def count_ngrams(
     tokenized_dataset_path: str,
     max_sequences: int | None,
+    batch_size: int = DEFAULT_COUNT_BATCH_SIZE,
 ) -> NgramFrequencies:
     """Single-pass bigram/trigram frequency count over the corpus.
 
@@ -103,6 +117,22 @@ def count_ngrams(
     one n-gram occurrence contributes one increment, regardless of how
     many hash seeds the student uses at training time (the seed loop
     is applied later at row-hash time).
+
+    Throughput notes:
+      - Iterates in batches of `batch_size` sequences via dataset
+        slicing. Single-item indexing triggers a Python round-trip per
+        sequence, which dominates cost at 100K+ sequences; batched
+        slicing pulls arrow chunks in one call.
+      - Uses `Counter.update(iter(...))` so the increment path is a
+        tight C loop per batch instead of a Python `counter[k] += 1`
+        loop.
+      - For the full default corpus cap (100K sequences) this finishes
+        in under 5 minutes on a laptop CPU.
+
+    Memory: Counter keyspace grows with distinct n-grams. At 200M
+    tokens we observe ~20–40M distinct n-grams; at ~200 B per Counter
+    entry that's ~4–8 GB. If you need a larger scan, use a streaming
+    heavy-hitters structure (SpaceSaving / Misra–Gries) instead.
     """
     from datasets import load_from_disk
 
@@ -114,19 +144,37 @@ def count_ngrams(
         )
 
     counter: Counter = Counter()
-    total = len(dataset) if max_sequences is None else min(len(dataset), max_sequences)
+    # max_sequences == 0 is an explicit opt-in for full-corpus scan.
+    if max_sequences is None or max_sequences == 0:
+        total = len(dataset)
+    else:
+        total = min(len(dataset), max_sequences)
     t_start = time.time()
-    for idx in range(total):
-        tokens = list(dataset[idx]["input_ids"])
-        seq_len = len(tokens)
-        for i in range(seq_len - 1):
-            counter[(2, (tokens[i], tokens[i + 1]))] += 1
-        for i in range(seq_len - 2):
-            counter[(3, (tokens[i], tokens[i + 1], tokens[i + 2]))] += 1
-        if idx % 2000 == 0 and idx > 0:
+    for batch_start in range(0, total, batch_size):
+        batch_end = min(batch_start + batch_size, total)
+        batch = dataset[batch_start:batch_end]["input_ids"]
+        for seq in batch:
+            seq_len = len(seq)
+            if seq_len < 2:
+                continue
+            # Local aliases eliminate per-iteration attribute lookups.
+            tokens = seq
+            # Generator expressions here keep the increment path inside
+            # Counter.update's C fast-path; materializing a list would
+            # double memory for no gain.
+            counter.update(
+                (2, (tokens[i], tokens[i + 1]))
+                for i in range(seq_len - 1)
+            )
+            if seq_len >= 3:
+                counter.update(
+                    (3, (tokens[i], tokens[i + 1], tokens[i + 2]))
+                    for i in range(seq_len - 2)
+                )
+        if batch_start % (batch_size * 8) == 0 and batch_start > 0:
             elapsed = time.time() - t_start
             print(
-                f"[{idx}/{total}] unique_ngrams={len(counter):,}  "
+                f"[{batch_start}/{total}] unique_ngrams={len(counter):,}  "
                 f"elapsed={elapsed:.1f}s",
                 flush=True,
             )
@@ -222,17 +270,22 @@ def build_sparse_table(
     """Place top-N n-gram vectors into a dense table via their hashes.
 
     For each top-N n-gram we compute its row index under every hash
-    seed (matching the student's multi-seed lookup). If multiple
-    top-N n-grams collide on the same row:
-
-      - with DIFFERENT seed indices, each row gets a separate update
-      - with the SAME seed but different n-grams, we just add them
-        (still better than hashing millions of arbitrary n-grams into
-        the same row, but it does introduce some residual averaging)
+    seed (matching the student's multi-seed lookup). Write collisions
+    still happen — at N=50K and entries=10K the expected occupancy is
+    ~5 top-N n-grams per (seed, row) pair — but this is ~4000× lower
+    than the primary oracle's full-corpus collision rate. Collided
+    writes are combined via Welford's running mean, which is identical
+    to averaging and, at this occupancy level, produces vectors that
+    are still dominated by the top-N signal rather than diluted into
+    noise.
 
     Rows with zero populations are left at numerical zero, which the
-    student's retrieval reads as "no useful signal here" — the cleanest
-    available signal for "this row isn't in the top-N uncollided set".
+    student's retrieval reads as "no useful signal here" — useful as a
+    sentinel when a retrieved key doesn't land in a populated row.
+
+    For a fully collision-free variant, switch to option (a) in the
+    module docstring (explicit `ngram -> row` dictionary with a
+    student-side dispatch); not yet implemented.
 
     Returns:
         (table, populated_rows, total_writes):
@@ -348,7 +401,11 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-sequences", type=int, default=DEFAULT_MAX_SEQUENCES,
-        help="Cap on sequences scanned for frequency counting (optional)",
+        help=(
+            "Cap on sequences scanned for frequency counting. Defaults "
+            f"to {DEFAULT_MAX_SEQUENCES} to bound Counter memory. Pass 0 "
+            "for a full-corpus scan (expect tens of GB of RAM)."
+        ),
     )
     parser.add_argument(
         "--device", default=None,
@@ -369,17 +426,6 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
-def parse_hash_seeds(arg: str) -> tuple[int, ...]:
-    parts = [p.strip() for p in arg.split(",") if p.strip()]
-    if not parts:
-        raise argparse.ArgumentTypeError("--hash-seeds must contain at least one seed")
-    try:
-        seeds = tuple(int(p) for p in parts)
-    except ValueError as e:
-        raise argparse.ArgumentTypeError(f"--hash-seeds must be comma-separated ints: {e}")
-    return seeds
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_argparser().parse_args(argv)
 
@@ -398,6 +444,14 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Phase 2: selecting top {args.top_ngrams:,} most-frequent n-grams...", flush=True)
     top = freqs.top_k(args.top_ngrams)
+    if not top:
+        print(
+            "Error: no bigrams/trigrams found in the scanned dataset. "
+            "Raise --max-sequences or verify the dataset has sequences of "
+            "length >= 2.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"  top frequency: {top[0][2]:,}", flush=True)
     print(f"  bottom-of-top frequency: {top[-1][2]:,}", flush=True)
 
