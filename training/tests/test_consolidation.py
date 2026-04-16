@@ -1,5 +1,6 @@
 """Tests for ZEB-128 engram consolidation."""
 import torch
+import torch.nn.functional as F
 import pytest
 
 from ct87.engram import EngramConsolidationDecoder
@@ -196,3 +197,45 @@ class TestConsolidationConfigPresets:
                        "use_head_gates", "use_ann_engram"]:
             assert getattr(a, field) == getattr(b, field) == getattr(c, field), \
                 f"Mismatch in {field}"
+
+
+class TestConsolidationMSELoss:
+
+    def test_mse_loss_computes_correctly(self):
+        from ct87.engram import EngramConsolidationDecoder
+        decoder = EngramConsolidationDecoder(hidden_dim=32)
+        h_pre = torch.randn(2, 8, 32)
+        xattn_out = torch.randn(2, 8, 32)
+
+        prediction = decoder(h_pre)
+        mse = F.mse_loss(prediction, xattn_out.detach())
+
+        assert mse.item() > 0
+        assert mse.requires_grad
+
+    def test_mse_gradient_does_not_flow_to_target(self):
+        from ct87.engram import EngramConsolidationDecoder
+        decoder = EngramConsolidationDecoder(hidden_dim=32)
+        h_pre = torch.randn(2, 8, 32)
+        xattn_out = torch.randn(2, 8, 32, requires_grad=True)
+
+        prediction = decoder(h_pre)
+        mse = F.mse_loss(prediction, xattn_out.detach())
+        mse.backward()
+
+        assert xattn_out.grad is None
+
+
+class TestInjectionMultiplierAnnealing:
+
+    def test_linear_annealing_schedule(self):
+        start_step = 7000
+        total_steps = 10000
+
+        for step, expected in [(0, 1.0), (7000, 1.0), (8500, 0.5), (10000, 0.0)]:
+            if step >= start_step:
+                progress = (step - start_step) / max(1, total_steps - start_step)
+                mult = max(0.0, 1.0 - progress)
+            else:
+                mult = 1.0
+            assert abs(mult - expected) < 1e-6, f"Step {step}: {mult} != {expected}"
