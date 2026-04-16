@@ -320,6 +320,9 @@ def main() -> None:
             "tiny", "target", "tiny_ffn_expanded",
             "tiny_engram_ann", "tiny_engram_ann_routed",
             "tiny_engram_xattn", "tiny_engram_xattn_routed",
+            "tiny_engram_xattn_consol_online",
+            "tiny_engram_xattn_consol_phased",
+            "tiny_engram_xattn_ctrl",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -497,6 +500,32 @@ def main() -> None:
         "--qat-start-pct", type=float, default=0.9,
         help="Fraction of total steps at which to activate QAT (default: 0.9 = last 10%%)",
     )
+    # ---- ZEB-128: Engram consolidation ----
+    parser.add_argument(
+        "--consolidation-mode", choices=["none", "online", "phased"],
+        default="none",
+        help="Consolidation strategy: 'none' (control), 'online' (MSE loss "
+             "throughout), 'phased' (MSE loss after --consolidation-start-step)",
+    )
+    parser.add_argument(
+        "--consolidation-lambda", type=float, default=0.1,
+        help="Weight for consolidation MSE loss (default: 0.1)",
+    )
+    parser.add_argument(
+        "--consolidation-start-step", type=int, default=0,
+        help="Step at which consolidation MSE loss activates (default: 0 for "
+             "online, typically 7000 for phased)",
+    )
+    parser.add_argument(
+        "--consolidation-anneal", action="store_true",
+        help="Linearly anneal injection multiplier from 1.0 to 0.0 during "
+             "consolidation phase (only meaningful with --consolidation-mode=phased)",
+    )
+    parser.add_argument(
+        "--zero-injection-eval", action="store_true",
+        help="Load checkpoint, zero engram injection, run validation, and exit. "
+             "Used for post-removal measurement in consolidation experiments.",
+    )
     args = parser.parse_args()
 
     if args.data is None and not args.synthetic:
@@ -605,6 +634,12 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_engram_xattn()
     elif args.config == "tiny_engram_xattn_routed":
         config = HarmonyModelConfig.tiny_engram_xattn_routed()
+    elif args.config == "tiny_engram_xattn_consol_online":
+        config = HarmonyModelConfig.tiny_engram_xattn_consol_online()
+    elif args.config == "tiny_engram_xattn_consol_phased":
+        config = HarmonyModelConfig.tiny_engram_xattn_consol_phased()
+    elif args.config == "tiny_engram_xattn_ctrl":
+        config = HarmonyModelConfig.tiny_engram_xattn_ctrl()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
@@ -638,7 +673,10 @@ def main() -> None:
             sys.exit(1)
 
     # Model delta arg validation (ZEB-117)
-    if args.config in ("tiny_engram_xattn", "tiny_engram_xattn_routed"):
+    if args.config in ("tiny_engram_xattn", "tiny_engram_xattn_routed",
+                        "tiny_engram_xattn_consol_online",
+                        "tiny_engram_xattn_consol_phased",
+                        "tiny_engram_xattn_ctrl"):
         if args.engram_xattn_table is None:
             print(
                 "Error: --config=tiny_engram_xattn requires --engram-xattn-table "
@@ -667,6 +705,34 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+
+    # ZEB-128 consolidation arg validation
+    if args.consolidation_mode != "none":
+        if not config.use_xattn_engram:
+            print(
+                "Error: --consolidation-mode requires a cross-attention engram "
+                "config (e.g. tiny_engram_xattn_consol_online)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.consolidation_lambda <= 0 or not math.isfinite(args.consolidation_lambda):
+            print(
+                "Error: --consolidation-lambda must be finite and > 0",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.consolidation_start_step < 0:
+            print(
+                "Error: --consolidation-start-step must be >= 0",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    if args.consolidation_anneal and args.consolidation_mode != "phased":
+        print(
+            "Error: --consolidation-anneal only applies to --consolidation-mode=phased",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if args.coconut:
         if args.think_token_id < 0:
