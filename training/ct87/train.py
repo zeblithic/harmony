@@ -779,7 +779,22 @@ def main() -> None:
     # Resume from checkpoint after all modules are attached (including ANN)
     # so their weights are loaded. strict=False handles tied embeddings where
     # lm_head shares embed_tokens weights (missing key is expected).
-    if args.resume_from is not None:
+    start_step = 0
+    _pending_optimizer_state = None
+    if args.resume_from is not None and args.resume_from.endswith(".pt"):
+        print(f"Loading resumable checkpoint from {args.resume_from}")
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        start_step = ckpt["step"]
+        _pending_optimizer_state = ckpt.get("optimizer_state_dict")
+        if "rng_state" in ckpt:
+            restore_rng_state(ckpt["rng_state"])
+        if ckpt.get("best_val_loss") is not None:
+            print(f"  Resumed from step {start_step}, best_val_loss={ckpt['best_val_loss']:.4f}")
+        else:
+            print(f"  Resumed from step {start_step}")
+        del ckpt
+    elif args.resume_from is not None:
         from safetensors import safe_open
         with safe_open(args.resume_from, framework="pt") as f:
             ckpt_keys = set(f.keys())
@@ -904,6 +919,10 @@ def main() -> None:
     if latent_projection is not None and args.contrastive_loss:
         adam_params.extend(latent_projection.parameters())
     optimizer = Muon(muon_params, adam_params, lr=args.lr, adam_lr=args.lr)
+    if _pending_optimizer_state is not None:
+        optimizer.load_state_dict(_pending_optimizer_state)
+        del _pending_optimizer_state
+        print(f"  Optimizer state restored for step {start_step}")
     schedule = WSDSchedule(warmup_steps=args.warmup, total_steps=args.steps)
 
     if args.synthetic:
@@ -975,7 +994,7 @@ def main() -> None:
     ENTROPY_LAMBDA_MAX = 1.0
 
     try:
-        for step in range(args.steps):
+        for step in range(start_step, args.steps):
             # Model gamma: propagate current step to the ANN engram so it
             # knows whether to apply the hard gate clamp.
             if model.engram_ann is not None:
@@ -1300,6 +1319,18 @@ def main() -> None:
                     )
                     val_loss_str = f"{val_loss:.6f}"
                     print(f"  -> val_loss={val_loss:.4f}")
+
+            if (
+                args.checkpoint_interval > 0
+                and step > 0
+                and step % args.checkpoint_interval == 0
+            ):
+                save_resumable_checkpoint(
+                    model, optimizer, step, args.output_dir,
+                    rng_state=capture_rng_state(),
+                    best_val_loss=float(val_loss_str) if val_loss_str else None,
+                )
+                print(f"  -> resumable checkpoint saved at step {step}")
 
             if step % 10 == 0 and csv_writer is not None:
                 uq_loss_str = ""
