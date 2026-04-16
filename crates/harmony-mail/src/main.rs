@@ -74,6 +74,58 @@ enum AliasAction {
     },
 }
 
+async fn build_remote_delivery(
+    config: &harmony_mail::config::Config,
+) -> Result<harmony_mail::RemoteDeliveryContext, Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let identity_bytes = std::fs::read(&config.gateway.identity_key)?;
+    let gateway_identity = Arc::new(
+        harmony_identity::PrivateIdentity::from_private_bytes(&identity_bytes)?
+    );
+
+    let zenoh_session = Arc::new(
+        zenoh::open(zenoh::Config::default())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e.to_string())) })?,
+    );
+
+    let recipient_resolver: Arc<dyn harmony_mail::remote_delivery::RecipientResolver> = Arc::new(
+        harmony_mail::remote_delivery::ZenohRecipientResolver::new(
+            Arc::clone(&zenoh_session),
+            Duration::from_secs(5),
+        ),
+    );
+
+    let dns: Arc<dyn harmony_mail_discovery::dns::DnsClient> = Arc::new(
+        harmony_mail_discovery::dns::HickoryDnsClient::from_system(Duration::from_secs(5)),
+    );
+    let http: Arc<dyn harmony_mail_discovery::http::HttpClient> = Arc::new(
+        harmony_mail_discovery::http::ReqwestHttpClient::new(
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            1_000_000,
+        )?,
+    );
+    let time: Arc<dyn harmony_mail_discovery::cache::TimeSource> =
+        Arc::new(harmony_mail_discovery::cache::SystemTimeSource);
+
+    let email_resolver = Arc::new(
+        harmony_mail_discovery::resolver::DefaultEmailResolver::new(
+            dns, http, time,
+            harmony_mail_discovery::resolver::ResolverConfig::default(),
+        ),
+    );
+    email_resolver.spawn_background_refresh().await;
+
+    Ok(harmony_mail::RemoteDeliveryContext {
+        gateway_identity,
+        recipient_resolver,
+        email_resolver,
+    })
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -95,7 +147,19 @@ async fn main() {
                     eprintln!("Failed to load config from {config_path}: {e}");
                     std::process::exit(1);
                 });
-            if let Err(e) = harmony_mail::server::run(config, None).await {
+
+            let remote_delivery = match build_remote_delivery(&config).await {
+                Ok(ctx) => {
+                    tracing::info!("Remote delivery enabled (gateway + discovery)");
+                    Some(ctx)
+                }
+                Err(e) => {
+                    tracing::warn!("Remote delivery disabled: {e}");
+                    None
+                }
+            };
+
+            if let Err(e) = harmony_mail::server::run(config, remote_delivery).await {
                 eprintln!("Server error: {e}");
                 std::process::exit(1);
             }
