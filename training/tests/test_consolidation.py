@@ -232,16 +232,34 @@ class TestConsolidationMSELoss:
 class TestInjectionMultiplierAnnealing:
 
     def test_linear_annealing_schedule(self):
+        """The training loop runs `step in range(start_step, args.steps)`, so
+        the last executed step is `args.steps - 1`. Denominator is
+        `(args.steps - 1) - start_step` so inject_mult hits 0.0 exactly on
+        that final step.
+        """
         start_step = 7000
         total_steps = 10000
+        last_step = total_steps - 1  # 9999, the last actually-executed step
 
-        for step, expected in [(0, 1.0), (7000, 1.0), (8500, 0.5), (10000, 0.0)]:
+        # step=8499 is the midpoint between 7000 and 9999 (2999/2 rounded down)
+        cases = [
+            (0, 1.0),
+            (7000, 1.0),
+            (last_step, 0.0),  # inject_mult reaches 0 on the final step
+        ]
+        for step, expected in cases:
             if step >= start_step:
-                progress = (step - start_step) / max(1, total_steps - start_step)
+                anneal_steps = max(1, last_step - start_step)
+                progress = (step - start_step) / anneal_steps
                 mult = max(0.0, 1.0 - progress)
             else:
                 mult = 1.0
             assert abs(mult - expected) < 1e-6, f"Step {step}: {mult} != {expected}"
+
+        # Sanity: midpoint of the anneal window is ~0.5
+        mid = start_step + (last_step - start_step) // 2
+        progress = (mid - start_step) / max(1, last_step - start_step)
+        assert abs((1.0 - progress) - 0.5) < 1e-3
 
 
 class TestConsolidationSmoke:
@@ -295,3 +313,72 @@ class TestConsolidationSmoke:
             "--consolidation-mode", "none",
         ], tmp_path, fake_table_path)
         assert result.returncode == 0, f"STDERR:\n{result.stderr}"
+
+    @pytest.fixture
+    def fake_val_dataset(self, tmp_path):
+        """Build a tiny HF dataset on disk for --val-data."""
+        from datasets import Dataset
+        g = torch.Generator().manual_seed(1)
+        examples = [
+            {"input_ids": torch.randint(0, 128, (520,), generator=g).tolist()}
+            for _ in range(4)
+        ]
+        ds = Dataset.from_list(examples)
+        path = str(tmp_path / "val_ds")
+        ds.save_to_disk(path)
+        return path
+
+    def test_zero_injection_eval_requires_resume_from(self, tmp_path, fake_table_path):
+        """--zero-injection-eval must reject missing --resume-from."""
+        result = self._run_train([
+            "--config", "tiny_engram_xattn_ctrl",
+            "--zero-injection-eval",
+        ], tmp_path, fake_table_path)
+        assert result.returncode != 0
+        assert "requires --resume-from" in result.stderr
+
+    def test_zero_injection_eval_end_to_end(
+        self, tmp_path, fake_table_path, fake_val_dataset,
+    ):
+        """Run training briefly to produce a .pt checkpoint, then eval it.
+
+        Exercises the zero-injection-eval code path including:
+        - checkpoint validation (required keys)
+        - val batch materialization and replay
+        - pre/post val_loss measurement with injection toggle
+        """
+        # First: train a handful of steps to produce a resumable checkpoint
+        out_dir = tmp_path / "train_out"
+        result = self._run_train([
+            "--config", "tiny_engram_xattn_ctrl",
+            "--consolidation-mode", "none",
+            "--checkpoint-interval", "5",
+            "--steps", "10",
+            "--batch-size", "2",
+            "--seq-len", "64",
+        ], tmp_path, fake_table_path)
+        assert result.returncode == 0, f"train STDERR:\n{result.stderr}"
+        ckpt_path = tmp_path / "out" / "checkpoint.pt"
+        assert ckpt_path.exists(), f"expected checkpoint at {ckpt_path}"
+
+        # Second: run zero-injection-eval against that checkpoint
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--config", "tiny_engram_xattn_ctrl",
+                "--engram-xattn-table", fake_table_path,
+                "--val-data", fake_val_dataset,
+                "--batch-size", "2",
+                "--seq-len", "64",
+                "--resume-from", str(ckpt_path),
+                "--zero-injection-eval",
+                "--output-dir", str(tmp_path / "eval_out"),
+            ],
+            capture_output=True, text=True,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            timeout=120,
+        )
+        assert result.returncode == 0, f"eval STDERR:\n{result.stderr}"
+        assert "Val loss (with injection):" in result.stdout
+        assert "Val loss (without injection):" in result.stdout
+        assert "Delta (removal cost):" in result.stdout

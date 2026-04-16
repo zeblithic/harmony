@@ -1076,9 +1076,9 @@ git commit -m "test: end-to-end smoke tests for all consolidation modes"
 
 ### Key Architecture Decision: Pre-Injection Hidden State
 
-The MSE decoder needs the hidden state *before* engram injection as input. This is captured via `model._last_pre_injection_hidden` (set with `.detach()` in Task 2's forward pass changes). The `.detach()` is intentional — it means the MSE loss's gradient path is: `loss → decoder params` only. The MSE loss does NOT directly push gradients into the model's transformer layers. The model learns to internalize the engram signal indirectly: the LM loss is the only gradient path into the model, and as the injection multiplier anneals to 0, the model must produce good logits without the engram — which requires it to have internalized the signal parametrically.
+The MSE decoder needs the hidden state *before* engram injection as input. This is captured live (not detached) via `model._last_pre_injection_hidden` in the forward pass. Only the *target* (`_last_xattn_output`) is detached in the training loop. This means MSE gradients flow into the decoder's parameters AND back into the transformer layers below the injection point via the hidden state — shaping the model's internal representations to predict the engram output. The detach on the target still prevents gradients from flowing back through the engram module itself.
 
-If we later want the MSE loss to directly backprop into the transformer, remove the `.detach()` on `_last_pre_injection_hidden`. But that changes the experiment semantics.
+If we wanted the MSE loss to train only the decoder (leaving the transformer untouched by the auxiliary loss), we would re-introduce `.detach()` on `_last_pre_injection_hidden`. That would be a different experiment — the model would only internalize indirectly through LM-loss pressure as the injection multiplier anneals toward zero.
 
 ### Existing Model Side-Channel Pattern
 

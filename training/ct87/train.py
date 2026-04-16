@@ -528,7 +528,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.data is None and not args.synthetic:
+    # --zero-injection-eval is an eval-only early-exit path, so training data
+    # is not required when that flag is set.
+    if (
+        args.data is None
+        and not args.synthetic
+        and not args.zero_injection_eval
+    ):
         print("Error: must provide --data <path> or --synthetic", file=sys.stderr)
         sys.exit(1)
 
@@ -1030,6 +1036,14 @@ def main() -> None:
     if latent_projection is not None and args.contrastive_loss:
         adam_params.extend(latent_projection.parameters())
     optimizer = Muon(muon_params, adam_params, lr=args.lr, adam_lr=args.lr)
+    # Add the consolidation decoder's param group BEFORE loading optimizer
+    # state. Otherwise resuming a consolidation run hits a param-group-count
+    # mismatch in load_state_dict and falls back to a fresh optimizer.
+    if consol_decoder is not None:
+        optimizer.add_param_group({
+            "params": list(consol_decoder.parameters()),
+            "lr": args.lr,
+        })
     if _pending_optimizer_state is not None:
         try:
             optimizer.load_state_dict(_pending_optimizer_state)
@@ -1041,17 +1055,17 @@ def main() -> None:
                 file=sys.stderr,
             )
         del _pending_optimizer_state
-    if consol_decoder is not None:
-        optimizer.add_param_group({
-            "params": list(consol_decoder.parameters()),
-            "lr": args.lr,
-        })
     schedule = WSDSchedule(warmup_steps=args.warmup, total_steps=args.steps)
 
-    if args.synthetic:
-        dataloader = make_synthetic_dataloader(config.vocab_size, seq_len, args.batch_size, args.seed)
-    else:
-        dataloader = make_hf_dataloader(args.data, seq_len, args.batch_size, args.seed)
+    # Skip building the training dataloader for eval-only runs — they never
+    # enter the training loop, and --zero-injection-eval is allowed to omit
+    # --data / --synthetic.
+    dataloader = None
+    if not args.zero_injection_eval:
+        if args.synthetic:
+            dataloader = make_synthetic_dataloader(config.vocab_size, seq_len, args.batch_size, args.seed)
+        else:
+            dataloader = make_hf_dataloader(args.data, seq_len, args.batch_size, args.seed)
 
     val_loader = None
     if args.val_data is not None:
@@ -1062,6 +1076,14 @@ def main() -> None:
     if args.zero_injection_eval:
         if args.resume_from is None:
             print("Error: --zero-injection-eval requires --resume-from", file=sys.stderr)
+            sys.exit(1)
+        if not args.resume_from.endswith(".pt"):
+            print(
+                "Error: --zero-injection-eval requires a resumable .pt "
+                "checkpoint (safetensors checkpoints do not carry the step "
+                "metadata needed for this mode)",
+                file=sys.stderr,
+            )
             sys.exit(1)
         if val_loader is None:
             print("Error: --zero-injection-eval requires --val-data", file=sys.stderr)
@@ -1077,14 +1099,25 @@ def main() -> None:
             sys.exit(1)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         step = ckpt["step"]
+        # Materialize a fixed set of validation batches so pre/post
+        # measurements compare the same data — otherwise delta_removal is
+        # dominated by batch sampling noise rather than the injection toggle.
+        val_batches = [next(val_loader) for _ in range(10)]
+
+        def _replay_batches():
+            for b in val_batches:
+                yield b
+
         val_pre = compute_validation_loss(
-            model, val_loader, config.vocab_size, device,
+            model, _replay_batches(), config.vocab_size, device,
+            num_batches=len(val_batches),
             amp_dtype=amp_dtype, engram_table=engram_table,
             latent_projection=latent_projection,
         )
         model.engram_inject_mult = 0.0
         val_post = compute_validation_loss(
-            model, val_loader, config.vocab_size, device,
+            model, _replay_batches(), config.vocab_size, device,
+            num_batches=len(val_batches),
             amp_dtype=amp_dtype, engram_table=engram_table,
             latent_projection=latent_projection,
         )
@@ -1123,7 +1156,18 @@ def main() -> None:
                 migrations_needed.append("ann")
             if header == legacy_header_no_hg:
                 migrations_needed.append("hg")
-            if migrations_needed:
+            # Generalized trailing-column migration: if the existing header is
+            # a prefix of expected_header, pad rows with empty trailing columns.
+            # Covers pre-consolidation (hg columns present, no mse/consol) and
+            # any future appended-column migrations without needing a named
+            # legacy constant per generation.
+            is_trailing_prefix = (
+                header
+                and header != expected_header
+                and len(header) < len(expected_header)
+                and header == expected_header[: len(header)]
+            )
+            if migrations_needed or is_trailing_prefix:
                 with open(args.log_file, newline="") as f:
                     rows = list(csv.reader(f))
                 rows[0] = expected_header
@@ -1137,7 +1181,8 @@ def main() -> None:
                             rows[i].insert(offset, "")
                     if "hg" in migrations_needed:
                         rows[i].extend([""] * 11)
-                    # Pad any remaining column deficit (covers multi-generation gaps)
+                    # Pad any remaining column deficit (covers multi-generation
+                    # gaps and the generalized trailing-prefix case).
                     deficit = len(expected_header) - len(rows[i])
                     if deficit > 0:
                         rows[i].extend([""] * deficit)
@@ -1203,12 +1248,16 @@ def main() -> None:
             need_hidden = mtp_head is not None
             use_coconut = args.coconut and num_thoughts > 0
 
-            # ZEB-128: Update injection multiplier for phased annealing
+            # ZEB-128: Update injection multiplier for phased annealing.
+            # Denominator uses (args.steps - 1) so inject_mult reaches exactly
+            # 0.0 on the final executed step (range(start, args.steps) stops
+            # at args.steps - 1).
             inject_mult = 1.0
             if args.consolidation_anneal and step >= args.consolidation_start_step:
-                progress = (step - args.consolidation_start_step) / max(
-                    1, args.steps - args.consolidation_start_step
+                anneal_steps = max(
+                    1, (args.steps - 1) - args.consolidation_start_step
                 )
+                progress = (step - args.consolidation_start_step) / anneal_steps
                 inject_mult = max(0.0, 1.0 - progress)
             if model.engram_xattn is not None:
                 model.engram_inject_mult = inject_mult
