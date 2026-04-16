@@ -186,6 +186,7 @@ impl EmailResolver for DefaultEmailResolver {
                         rec.clone(),
                         now.saturating_add(self.config.dns_ttl_default_secs),
                     );
+                    self.caches.mark_domain_seen(&domain, now);
                     rec
                 }
                 Err(DnsFetchError::NoRecord) => {
