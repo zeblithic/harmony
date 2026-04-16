@@ -14,10 +14,11 @@ use crate::types::{GroupOp, OpId};
 /// # Behaviour
 /// - If `remote_tips` is empty, the remote has nothing — all local op IDs are
 ///   returned.
-/// - If a remote tip is unknown locally, it is silently ignored when walking
-///   (we cannot walk its parents) but it still counts as "remote has it."
-///   In practice an unknown tip means the remote is ahead of us on some branch;
-///   we return all of our local ops since we cannot determine overlap.
+/// - If a remote tip is unknown locally, its parents cannot be walked, so
+///   the remote's knowledge cannot be determined from that tip alone.
+///   Any overlap discovered via other known remote tips is still excluded
+///   from the result. Only when *all* tips are unknown does this effectively
+///   return all local ops.
 pub fn ops_to_send(local_ops: &[GroupOp], remote_tips: &[OpId]) -> Vec<OpId> {
     if remote_tips.is_empty() {
         // Remote has nothing — send every local op.

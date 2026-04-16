@@ -39,6 +39,19 @@ impl PartialOrd for ReadyOp {
 /// replaying ops in causal (topological) order with authorization checks.
 ///
 /// This is a pure function: ops in, state out. Invalid ops are silently skipped.
+///
+/// # Security: caller must verify signatures
+///
+/// This crate is sans-I/O and **does not verify signatures**. Authorization
+/// checks assume `op.author` is authentic. Callers **must** verify that each
+/// op was signed by the private key matching `op.author` before passing ops
+/// to this function. Without signature verification, any peer can forge ops
+/// claiming any author identity and bypass all role-based access control.
+///
+/// The recommended integration pattern:
+/// 1. At the network boundary, validate `op.author == authenticated_sender`.
+/// 2. If the protocol supports detached signatures, verify `op.signature`
+///    against the author's public key before calling `resolve()`.
 pub fn resolve(ops: &[GroupOp]) -> Result<GroupState, ResolveError> {
     let dag = Dag::build(ops)?;
     let mut in_deg = dag.in_degrees();
@@ -87,7 +100,10 @@ pub fn resolve(ops: &[GroupOp]) -> Result<GroupState, ResolveError> {
             authorized_ops.insert(op_id);
         }
 
-        // Update in-degrees and enqueue newly ready ops.
+        // Update in-degrees and enqueue newly ready ops. Authority is
+        // intentionally snapshotted at enqueue time so that higher-authority
+        // ops (e.g. Founder promotions) take effect before lower-authority
+        // concurrent ops are batched and validated.
         for &op_id in &batch {
             visited += 1;
             if let Some(children) = dag.children.get(&op_id) {
