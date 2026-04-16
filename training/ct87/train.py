@@ -1051,6 +1051,7 @@ def main() -> None:
     ENTROPY_LAMBDA_SCALE_DOWN = 0.95
     ENTROPY_LAMBDA_MIN = float(args.engram_ann_entropy_weight)
     ENTROPY_LAMBDA_MAX = 1.0
+    num_thoughts = 0
 
     try:
         for step in range(start_step, args.steps):
