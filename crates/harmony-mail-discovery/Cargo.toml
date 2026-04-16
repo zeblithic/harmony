@@ -1,0 +1,41 @@
+[package]
+name = "harmony-mail-discovery"
+description = "DNS + HTTPS discovery-backed email→identity resolution for harmony-mail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "harmony-mail-discovery-debug"
+path = "bin/harmony-mail-discovery-debug.rs"
+required-features = ["test-support"]
+
+[features]
+default = []
+test-support = ["dep:rand_core"]
+
+[dependencies]
+rand_core = { workspace = true, features = ["std", "getrandom"], optional = true }
+serde = { workspace = true, features = ["derive", "std"] }
+harmony-crypto = { workspace = true, features = ["std"] }
+harmony-identity = { workspace = true, features = ["std"] }
+ed25519-dalek.workspace = true
+ciborium = { workspace = true, features = ["std"] }
+sha2 = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true }
+hickory-resolver = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+hex.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+rand_core = { workspace = true, features = ["std", "getrandom"] }
+base64 = { workspace = true }

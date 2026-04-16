@@ -140,12 +140,30 @@ const DATA_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 /// Interval for cleaning up stale per-IP entries.
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// All context needed for remote (non-local) delivery via the Harmony network.
+///
+/// Wrapping the three collaborators in a single struct eliminates the invalid
+/// state where one `Option` is `Some` and the other is `None`.
+#[derive(Clone)]
+pub struct RemoteDeliveryContext {
+    pub gateway_identity: Arc<harmony_identity::PrivateIdentity>,
+    pub recipient_resolver: Arc<dyn crate::remote_delivery::RecipientResolver>,
+    pub email_resolver: Arc<dyn harmony_mail_discovery::resolver::EmailResolver>,
+}
+
 /// Run the SMTP server with the given configuration.
 pub async fn run(
     config: Config,
-    gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>>,
-    recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
+    remote_delivery: Option<RemoteDeliveryContext>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Shadow the old two-Option locals so all downstream code is unchanged.
+    let gateway_identity =
+        remote_delivery.as_ref().map(|ctx| Arc::clone(&ctx.gateway_identity));
+    let recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>> =
+        remote_delivery.as_ref().map(|ctx| Arc::clone(&ctx.recipient_resolver));
+    let email_resolver: Option<Arc<dyn harmony_mail_discovery::resolver::EmailResolver>> =
+        remote_delivery.as_ref().map(|ctx| Arc::clone(&ctx.email_resolver));
+
     let max_message_size = parse_message_size(&config.spam.max_message_size);
 
     let shared = Arc::new(SharedState::new(config.spam.max_connections_per_ip));
@@ -418,6 +436,7 @@ pub async fn run(
         let mailbox_publisher_465 = mailbox_publisher.clone();
         let gateway_identity_465 = gateway_identity.clone();
         let recipient_resolver_465 = recipient_resolver.clone();
+        let email_resolver_465 = email_resolver.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -442,13 +461,14 @@ pub async fn run(
                         let pub_clone = mailbox_publisher_465.clone();
                         let gi_clone = gateway_identity_465.clone();
                         let rr_clone = recipient_resolver_465.clone();
+                        let er_clone = email_resolver_465.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
                             match tls::implicit_tls_wrap(stream, &acc).await {
                                 Ok(tls_stream) => {
                                     let (reader, writer) = tokio::io::split(tls_stream);
                                     let session = SmtpSession::new(cfg);
-                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone).await {
+                                    if let Err(e) = handle_connection_generic(reader, writer, peer_ip, session, max_message_size, None, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone, er_clone).await {
                                         tracing::debug!(%peer_ip, error = %e, "implicit TLS connection ended with error");
                                     }
                                 }
@@ -476,6 +496,7 @@ pub async fn run(
         let mailbox_publisher_587 = mailbox_publisher.clone();
         let gateway_identity_587 = gateway_identity.clone();
         let recipient_resolver_587 = recipient_resolver.clone();
+        let email_resolver_587 = email_resolver.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -500,9 +521,10 @@ pub async fn run(
                         let pub_clone = mailbox_publisher_587.clone();
                         let gi_clone = gateway_identity_587.clone();
                         let rr_clone = recipient_resolver_587.clone();
+                        let er_clone = email_resolver_587.clone();
                         tokio::spawn(async move {
                             let _guard = ConnectionGuard { shared: Arc::clone(&sh), ip: peer_ip };
-                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone).await {
+                            if let Err(e) = handle_connection(stream, peer_ip, cfg, max_message_size, Some((*acc).clone()), store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone, er_clone).await {
                                 tracing::debug!(%peer_ip, error = %e, "STARTTLS submission connection ended with error");
                             }
                         });
@@ -671,11 +693,12 @@ pub async fn run(
                 let pub_clone = mailbox_publisher.clone();
                 let gi_clone = gateway_identity.clone();
                 let rr_clone = recipient_resolver.clone();
+                let er_clone = email_resolver.clone();
 
                 tokio::spawn(async move {
                     let _guard = ConnectionGuard { shared: Arc::clone(&shared), ip: peer_ip };
                     let acc = acceptor.as_ref().map(|a| (**a).clone());
-                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone).await {
+                    if let Err(e) = handle_connection(stream, peer_ip, smtp_config, max_message_size, acc, store, auth, domain, csp, reject_threshold, mgr_clone, pub_clone, gi_clone, rr_clone, er_clone).await {
                         tracing::debug!(%peer_ip, error = %e, "connection ended with error");
                     }
                 });
@@ -712,6 +735,7 @@ async fn handle_connection(
     mailbox_publisher: Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
     gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>>,
     recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
+    email_resolver: Option<Arc<dyn harmony_mail_discovery::resolver::EmailResolver>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut spf_result = crate::spam::SpfResult::None;
     let mut session = SmtpSession::new(smtp_config);
@@ -769,7 +793,7 @@ async fn handle_connection(
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
                 let needs_starttls =
-                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher, &gateway_identity, &recipient_resolver).await?;
+                    process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher, &gateway_identity, &recipient_resolver, &email_resolver).await?;
 
                 // STARTTLS: upgrade the connection to TLS
                 if needs_starttls {
@@ -824,6 +848,7 @@ async fn handle_connection(
                                     mailbox_publisher,
                                     gateway_identity,
                                     recipient_resolver,
+                                    email_resolver,
                                 )
                                 .await;
                             }
@@ -895,6 +920,7 @@ async fn handle_connection_generic<R, W>(
     mailbox_publisher: Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
     gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>>,
     recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
+    email_resolver: Option<Arc<dyn harmony_mail_discovery::resolver::EmailResolver>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
@@ -946,7 +972,7 @@ where
                 };
 
                 let should_close = execute_actions_generic(&actions, &mut writer).await?;
-                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher, &gateway_identity, &recipient_resolver).await?;
+                let _ = process_async_actions(&actions, &mut session, &mut writer, &imap_store, &authenticator, &local_domain, &content_store_path, &mut spf_result, reject_threshold, &mailbox_manager, &mailbox_publisher, &gateway_identity, &recipient_resolver, &email_resolver).await?;
 
                 if should_close || session.state == SmtpState::Closed {
                     break;
@@ -1062,6 +1088,7 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
     mailbox_publisher: &Option<Arc<crate::mailbox_manager::ZenohPublisher>>,
     gateway_identity: &Option<Arc<harmony_identity::PrivateIdentity>>,
     recipient_resolver: &Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
+    email_resolver: &Option<Arc<dyn harmony_mail_discovery::resolver::EmailResolver>>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut needs_starttls = false;
     for action in actions {
@@ -1105,32 +1132,44 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                         }
                     }
                 } else {
-                    // Non-local domain. ZEB-113 PR A (this PR) added the
-                    // DOWNSTREAM delivery machinery — the remote_ctx /
-                    // seal / publish_sealed_unicast flow in
-                    // `process_async_actions` — but the UPSTREAM RCPT
-                    // admission path still rejects non-local domains
-                    // here. Admitting them requires resolving
-                    // `local_part@domain` to an announced
-                    // `identity.address_hash` (so the gateway's seal path
-                    // targets the right keys + topic), which in turn
-                    // needs discovery-backed email→hash lookup
-                    // infrastructure. That infrastructure is the
-                    // follow-up PR tracked alongside "Production wiring
-                    // in main.rs" — both land together because neither
-                    // is independently useful (identity + resolver are
-                    // both required in `run()` for remote delivery to
-                    // fire). Until then, remote RCPTs fall through to
-                    // None as before; the delivery machinery is
-                    // exercised by unit and integration tests that
-                    // bypass RCPT by constructing `DeliverToHarmony`
-                    // directly.
-                    tracing::debug!(
-                        %domain,
-                        local_domain = %local_domain,
-                        "non-local domain, rejecting at RCPT (remote RCPT admission tracked as ZEB-113 follow-up; delivery machinery landed)"
-                    );
-                    None
+                    // Non-local domain: consult the EmailResolver (ZEB-120).
+                    match email_resolver {
+                        Some(er) => {
+                            let outcome = match tokio::time::timeout(
+                                Duration::from_secs(15),
+                                er.resolve(local_part, domain),
+                            ).await {
+                                Ok(o) => o,
+                                Err(_) => harmony_mail_discovery::resolver::ResolveOutcome::Transient {
+                                    reason: "resolver_timeout",
+                                },
+                            };
+                            match outcome {
+                                harmony_mail_discovery::resolver::ResolveOutcome::Resolved(hash) => {
+                                    Some(hash)
+                                }
+                                harmony_mail_discovery::resolver::ResolveOutcome::UserUnknown
+                                | harmony_mail_discovery::resolver::ResolveOutcome::DomainDoesNotParticipate
+                                | harmony_mail_discovery::resolver::ResolveOutcome::Revoked => {
+                                    tracing::info!(local_part, %domain, "RCPT: non-local resolve returned negative");
+                                    None
+                                }
+                                harmony_mail_discovery::resolver::ResolveOutcome::Transient { reason } => {
+                                    tracing::warn!(local_part, %domain, reason, "RCPT: transient resolver failure");
+                                    let callback_actions = session.handle(SmtpEvent::HarmonyResolveTransient {
+                                        local_part: local_part.clone(),
+                                        reason,
+                                    });
+                                    execute_actions_generic(&callback_actions, writer).await?;
+                                    continue;
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::debug!(%domain, "non-local domain, no email resolver configured");
+                            None
+                        }
+                    }
                 };
 
                 let callback_actions = session.handle(SmtpEvent::HarmonyResolved {
@@ -3026,7 +3065,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None, None, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None, None, None, None)
                 .await
                 .unwrap();
         });
@@ -3089,7 +3128,7 @@ node_config = "/tmp/test-node.toml"
 
         let server_handle = tokio::spawn(async move {
             let (stream, peer_addr) = listener.accept().await.unwrap();
-            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None, None, None)
+            handle_connection(stream, peer_addr.ip(), smtp_config, max_message_size, None, smtp_store, None, "test.example.com".to_string(), smtp_test_dir.path().to_path_buf(), 5, None, None, None, None, None)
                 .await
                 .unwrap();
         });
@@ -3306,6 +3345,7 @@ node_config = "/tmp/test-node.toml"
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3459,6 +3499,7 @@ node_config = "/tmp/test-node.toml"
                 5,
                 mgr_clone,
                 pub_clone,
+                None,
                 None,
                 None,
             )
@@ -3686,7 +3727,9 @@ node_config = "/tmp/test-node.toml"
         ) {
             let gw: Option<Arc<harmony_identity::PrivateIdentity>> = None;
             let rr: Option<Arc<dyn crate::remote_delivery::RecipientResolver>> = None;
-            let _ = run(config, gw.clone(), rr.clone()).await;
+            let er: Option<Arc<dyn harmony_mail_discovery::resolver::EmailResolver>> = None;
+            let rd: Option<RemoteDeliveryContext> = None;
+            let _ = run(config, rd).await;
             let _ = handle_connection(
                 stream,
                 peer_ip,
@@ -3702,6 +3745,7 @@ node_config = "/tmp/test-node.toml"
                 None,
                 gw.clone(),
                 rr.clone(),
+                er.clone(),
             )
             .await;
             let (r, w) = (tokio::io::empty(), tokio::io::sink());
@@ -3721,6 +3765,7 @@ node_config = "/tmp/test-node.toml"
                 None,
                 gw.clone(),
                 rr.clone(),
+                er.clone(),
             )
             .await;
             let actions: Vec<SmtpAction> = Vec::new();
@@ -3741,6 +3786,7 @@ node_config = "/tmp/test-node.toml"
                 &None,
                 &gw,
                 &rr,
+                &er,
             )
             .await;
         }
@@ -3815,6 +3861,7 @@ node_config = "/tmp/test-node.toml"
             &Some(Arc::clone(&publisher)),
             &Some(Arc::clone(&gateway_id)),
             &Some(resolver),
+            &None,
         )
         .await
         .expect("process_async_actions should succeed even when remote resolver skips");
@@ -3903,6 +3950,7 @@ node_config = "/tmp/test-node.toml"
             &Some(Arc::clone(&publisher)), // publisher IS configured ...
             &None,                         // ... but no gateway identity
             &None,                         // ... and no resolver
+            &None,
         )
         .await
         .expect("process_async_actions should succeed even with remote delivery disabled");
@@ -4022,6 +4070,7 @@ node_config = "/tmp/test-node.toml"
             &Some(Arc::clone(&publisher)),
             &Some(Arc::clone(&gateway_id)),
             &Some(resolver),
+            &None,
         )
         .await
         .expect("process_async_actions should succeed for remote-only delivery");
@@ -4046,6 +4095,176 @@ node_config = "/tmp/test-node.toml"
         assert!(
             !response.contains("451"),
             "remote-only delivery should NOT yield 451; got response: {response:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn non_local_rcpt_resolves_via_email_resolver() {
+        use harmony_mail_discovery::resolver::ResolveOutcome;
+
+        struct ResolvesAlice([u8; 16]);
+        #[async_trait::async_trait]
+        impl harmony_mail_discovery::resolver::EmailResolver for ResolvesAlice {
+            async fn resolve(&self, local: &str, domain: &str) -> ResolveOutcome {
+                if local == "alice" && domain == "remote.example" {
+                    ResolveOutcome::Resolved(self.0)
+                } else {
+                    ResolveOutcome::UserUnknown
+                }
+            }
+        }
+
+        let expected_hash = [0xCCu8; 16];
+        let er: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> =
+            Arc::new(ResolvesAlice(expected_hash));
+
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db"))
+                .unwrap(),
+        );
+
+        let smtp_config = SmtpConfig {
+            domain: "local".to_string(),
+            mx_host: "mail.local".to_string(),
+            max_message_size: 10 * 1024 * 1024,
+            max_recipients: 100,
+            tls_available: false,
+        };
+        let mut session = SmtpSession::new(smtp_config);
+
+        // Drive state through the proper SMTP event sequence so that
+        // mail_from and pending_rcpt are set correctly.
+        session.handle(SmtpEvent::Connected {
+            peer_ip: "127.0.0.1".parse().unwrap(),
+            tls: false,
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Ehlo { domain: "test".to_string() }));
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "sender@local".to_string(),
+        }));
+
+        // Issue RCPT TO to set pending_rcpt. The state machine emits
+        // ResolveHarmonyAddress which process_async_actions will handle.
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "alice@remote.example".to_string(),
+        }));
+        assert!(
+            actions.iter().any(|a| matches!(a, SmtpAction::ResolveHarmonyAddress { .. })),
+            "RCPT TO should emit ResolveHarmonyAddress; got: {actions:?}",
+        );
+
+        let mut writer = Vec::<u8>::new();
+        let mut spf_result = crate::spam::SpfResult::None;
+
+        process_async_actions(
+            &actions,
+            &mut session,
+            &mut writer,
+            &store,
+            &None,
+            "local",
+            smtp_test_dir.path(),
+            &mut spf_result,
+            1000,
+            &None,
+            &None,
+            &None,
+            &None,
+            &Some(er),
+        )
+        .await
+        .expect("process_async_actions should succeed");
+
+        // The SMTP response should contain "250" (recipient accepted).
+        let response = String::from_utf8_lossy(&writer);
+        assert!(
+            response.contains("250"),
+            "expected 250 OK for resolved non-local recipient; got: {response:?}",
+        );
+        assert!(
+            !response.contains("550"),
+            "should NOT get 550 user-not-found for resolved non-local recipient; got: {response:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn non_local_rcpt_transient_returns_451() {
+        use harmony_mail_discovery::resolver::ResolveOutcome;
+
+        struct TransientResolver;
+        #[async_trait::async_trait]
+        impl harmony_mail_discovery::resolver::EmailResolver for TransientResolver {
+            async fn resolve(&self, _local: &str, _domain: &str) -> ResolveOutcome {
+                ResolveOutcome::Transient { reason: "dns_timeout" }
+            }
+        }
+
+        let er: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> =
+            Arc::new(TransientResolver);
+
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db"))
+                .unwrap(),
+        );
+
+        let smtp_config = SmtpConfig {
+            domain: "local".to_string(),
+            mx_host: "mail.local".to_string(),
+            max_message_size: 10 * 1024 * 1024,
+            max_recipients: 100,
+            tls_available: false,
+        };
+        let mut session = SmtpSession::new(smtp_config);
+
+        session.handle(SmtpEvent::Connected {
+            peer_ip: "127.0.0.1".parse().unwrap(),
+            tls: false,
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Ehlo { domain: "test".to_string() }));
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "sender@local".to_string(),
+        }));
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "alice@remote.example".to_string(),
+        }));
+        assert!(
+            actions.iter().any(|a| matches!(a, SmtpAction::ResolveHarmonyAddress { .. })),
+            "RCPT TO should emit ResolveHarmonyAddress; got: {actions:?}",
+        );
+
+        let mut writer = Vec::<u8>::new();
+        let mut spf_result = crate::spam::SpfResult::None;
+
+        process_async_actions(
+            &actions,
+            &mut session,
+            &mut writer,
+            &store,
+            &None,
+            "local",
+            smtp_test_dir.path(),
+            &mut spf_result,
+            1000,
+            &None,
+            &None,
+            &None,
+            &None,
+            &Some(er),
+        )
+        .await
+        .expect("process_async_actions should succeed");
+
+        let response = String::from_utf8_lossy(&writer);
+        assert!(
+            response.contains("451"),
+            "transient resolver failure should yield 451; got: {response:?}",
+        );
+        assert!(
+            !response.contains("550"),
+            "transient resolver failure should NOT yield 550; got: {response:?}",
         );
     }
 }

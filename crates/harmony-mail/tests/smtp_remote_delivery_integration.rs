@@ -161,6 +161,7 @@ async fn smtp_remote_delivery_round_trips_through_zenoh_to_recipient() {
         &Some(Arc::clone(&publisher)),
         &Some(Arc::clone(&gateway_a_priv)),
         &Some(resolver),
+        &None,
     )
     .await
     .expect("process_async_actions failed");

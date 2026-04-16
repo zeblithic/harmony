@@ -45,8 +45,11 @@ harmony-zenoh.workspace = true
 rand_core = { workspace = true, features = ["std", "getrandom"] }
 rpassword = "5"
 zenoh.workspace = true
+harmony-mail-discovery = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
+harmony-mail-discovery = { workspace = true, features = ["test-support"] }
 hex.workspace = true
 rand.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }

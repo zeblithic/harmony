@@ -21,6 +21,7 @@ members = [
     "crates/harmony-kel",
     "crates/harmony-kitri",
     "crates/harmony-mail",
+    "crates/harmony-mail-discovery",
     "crates/harmony-mailbox",
     "crates/harmony-memo",
     "crates/harmony-node",
@@ -97,6 +98,12 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh64"] }
 ciborium = { version = "0.2", default-features = false }
 
+# Email discovery
+async-trait = "0.1"
+dashmap = "6"
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"] }
+
 # WASM runtime
 wasmi = "1"
 wasmparser = "0.228"
@@ -151,6 +158,7 @@ harmony-jain = { path = "crates/harmony-jain", default-features = false }
 harmony-jcs = { path = "crates/harmony-jcs", default-features = false }
 harmony-kel = { path = "crates/harmony-kel", default-features = false }
 harmony-kitri = { path = "crates/harmony-kitri", default-features = false }
+harmony-mail-discovery = { path = "crates/harmony-mail-discovery", default-features = false }
 # harmony-mailbox requires std (uses std::str, String, Vec) — not part of the
 # bare-metal build graph that harmony-os/harmony-boot consume.
 harmony-mailbox = { path = "crates/harmony-mailbox" }

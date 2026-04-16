@@ -87,6 +87,11 @@ pub enum SmtpEvent {
         local_part: String,
         identity: Option<[u8; ADDRESS_HASH_LEN]>,
     },
+    /// Transient (temporary) resolver failure for a RCPT TO address.
+    HarmonyResolveTransient {
+        local_part: String,
+        reason: &'static str,
+    },
 }
 
 // ── Actions ──────────────────────────────────────────────────────────
@@ -182,6 +187,9 @@ impl SmtpSession {
                 local_part,
                 identity,
             } => self.handle_harmony_resolved(&local_part, identity),
+            SmtpEvent::HarmonyResolveTransient { local_part, reason } => {
+                self.handle_harmony_resolve_transient(&local_part, reason)
+            }
         }
     }
 
@@ -558,6 +566,26 @@ impl SmtpSession {
                 "5.1.1 User not found".to_string(),
             )],
         }
+    }
+
+    fn handle_harmony_resolve_transient(
+        &mut self,
+        local_part: &str,
+        reason: &str,
+    ) -> Vec<SmtpAction> {
+        match self.state {
+            SmtpState::MailFromReceived | SmtpState::RcptToReceived => {}
+            _ => return vec![],
+        }
+        if self.pending_rcpt.as_deref() != Some(local_part) {
+            return vec![];
+        }
+        self.pending_rcpt = None;
+        let _ = reason;
+        vec![SmtpAction::SendResponse(
+            451,
+            "4.3.0 Temporary failure, please retry later".to_string(),
+        )]
     }
 }
 
@@ -1511,6 +1539,37 @@ mod tests {
         }));
         assert!(actions.is_empty(), "HELO on Closed must not emit actions");
         assert_eq!(session.state, SmtpState::Closed);
+    }
+
+    #[test]
+    fn harmony_resolve_transient_emits_451() {
+        let mut session = ready_session();
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "sender@example.com".to_string(),
+        }));
+        assert_eq!(session.state, SmtpState::MailFromReceived);
+        session.pending_rcpt = Some("alice".to_string());
+
+        let actions = session.handle(SmtpEvent::HarmonyResolveTransient {
+            local_part: "alice".to_string(),
+            reason: "dns_timeout",
+        });
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            SmtpAction::SendResponse(code, msg) => {
+                assert_eq!(*code, 451);
+                assert!(msg.contains("please retry"), "message should be generic: {msg}");
+            }
+            other => panic!("expected SendResponse(451), got: {other:?}"),
+        }
+        assert!(
+            session.resolved_recipients.is_empty(),
+            "transient should not add to resolved_recipients"
+        );
+        assert!(
+            session.pending_rcpt.is_none(),
+            "pending_rcpt should be cleared after transient"
+        );
     }
 
     /// Drive a session to DeliveryPending state for tests.
