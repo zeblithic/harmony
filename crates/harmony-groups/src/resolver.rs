@@ -1,7 +1,7 @@
 use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::dag::Dag;
 use crate::error::ResolveError;
@@ -43,6 +43,7 @@ pub fn resolve(ops: &[GroupOp]) -> Result<GroupState, ResolveError> {
     let dag = Dag::build(ops)?;
     let mut in_deg = dag.in_degrees();
     let mut state = GroupState::default();
+    let mut authorized_ops: HashSet<OpId> = HashSet::new();
     let mut visited = 0usize;
 
     // Seed the ready set with zero-in-degree ops (just genesis initially).
@@ -71,7 +72,7 @@ pub fn resolve(ops: &[GroupOp]) -> Result<GroupState, ResolveError> {
         let mut authorized: Vec<OpId> = Vec::new();
         for &op_id in &batch {
             let op = &dag.ops[&op_id];
-            if is_authorized(&state, op, &dag) {
+            if is_authorized(&state, op, &dag, &authorized_ops) {
                 authorized.push(op_id);
             }
         }
@@ -79,10 +80,11 @@ pub fn resolve(ops: &[GroupOp]) -> Result<GroupState, ResolveError> {
         // Sort authorized ops by OpId for deterministic application order.
         authorized.sort_unstable();
 
-        // Apply authorized ops.
+        // Apply authorized ops and record them.
         for &op_id in &authorized {
             let op = &dag.ops[&op_id];
             apply_op(&mut state, op);
+            authorized_ops.insert(op_id);
         }
 
         // Update in-degrees and enqueue newly ready ops.
@@ -128,7 +130,7 @@ fn author_authority(state: &GroupState, op: &GroupOp) -> u8 {
 }
 
 /// Check if an op is authorized against the current group state.
-fn is_authorized(state: &GroupState, op: &GroupOp, dag: &Dag) -> bool {
+fn is_authorized(state: &GroupState, op: &GroupOp, dag: &Dag, authorized_ops: &HashSet<OpId>) -> bool {
     // If the group is dissolved, reject everything.
     if state.dissolved {
         return false;
@@ -160,11 +162,17 @@ fn is_authorized(state: &GroupState, op: &GroupOp, dag: &Dag) -> bool {
         }
 
         GroupAction::Accept { invite_op } => {
-            // Author must not already be a member.
             if state.is_member(&op.author) {
                 return false;
             }
-            // The referenced invite op must exist in the DAG and must target the author.
+            // The invite must have passed authorization during replay.
+            if !authorized_ops.contains(invite_op) {
+                return false;
+            }
+            // The invite must be a causal ancestor of this Accept.
+            if !dag.ancestors(&op.id).contains(invite_op) {
+                return false;
+            }
             match dag.ops.get(invite_op) {
                 Some(inv) => match &inv.action {
                     GroupAction::Invite { invitee } => *invitee == op.author,
@@ -1401,5 +1409,59 @@ mod tests {
         // Founder is the only member.
         assert!(state.is_member(&FOUNDER));
         assert_eq!(state.members.len(), 1);
+    }
+
+    // ── unauthorized invite cannot be accepted ────────────────────────────
+
+    #[test]
+    fn unauthorized_invite_cannot_be_accepted() {
+        let g = genesis(FOUNDER, GroupMode::InviteOnly);
+        let join_alice = op(vec![g.id], ALICE, 1001, GroupAction::Join);
+        // Alice is not a member (InviteOnly), but she crafts an invite for Bob.
+        // This invite is unauthorized (Alice is not a member/officer/founder).
+        let bad_invite = op(
+            vec![g.id],
+            ALICE,
+            1001,
+            GroupAction::Invite { invitee: BOB },
+        );
+        // Bob tries to accept the unauthorized invite.
+        let accept = op(
+            vec![bad_invite.id],
+            BOB,
+            1002,
+            GroupAction::Accept {
+                invite_op: bad_invite.id,
+            },
+        );
+        let state = resolve(&[g, join_alice, bad_invite, accept]).unwrap();
+        assert!(!state.is_member(&BOB));
+        assert!(!state.is_member(&ALICE));
+        assert_eq!(state.members.len(), 1);
+    }
+
+    #[test]
+    fn accept_requires_causal_ancestry() {
+        let g = genesis(FOUNDER, GroupMode::InviteOnly);
+        // Founder invites Alice on one branch.
+        let invite_alice = op(
+            vec![g.id],
+            FOUNDER,
+            1001,
+            GroupAction::Invite { invitee: ALICE },
+        );
+        // Alice accepts, but her Accept op does NOT have invite as a parent —
+        // it branches from genesis directly (not causally linked to the invite).
+        let accept_alice = op(
+            vec![g.id],
+            ALICE,
+            1002,
+            GroupAction::Accept {
+                invite_op: invite_alice.id,
+            },
+        );
+        let state = resolve(&[g, invite_alice, accept_alice]).unwrap();
+        // Accept should be rejected: the invite is not in accept's ancestry.
+        assert!(!state.is_member(&ALICE));
     }
 }

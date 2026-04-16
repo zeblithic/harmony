@@ -8,7 +8,7 @@ pub mod resolver;
 pub mod sync;
 pub mod types;
 
-pub use error::{ResolveError, ValidationError};
+pub use error::ResolveError;
 pub use resolver::resolve;
 pub use sync::ops_to_send;
 pub use types::{

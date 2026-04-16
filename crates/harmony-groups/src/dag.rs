@@ -35,10 +35,12 @@ impl Dag {
             return Err(ResolveError::EmptyDag);
         }
 
-        // Deduplicate by ID (last writer wins for identical IDs, which are
-        // content-addressed and therefore identical in content too).
+        // Verify content-addressed IDs and deduplicate.
         let mut op_map: HashMap<OpId, GroupOp> = HashMap::new();
         for op in ops {
+            if !op.verify_id() {
+                return Err(ResolveError::InvalidOpId { op: op.id });
+            }
             op_map.entry(op.id).or_insert_with(|| op.clone());
         }
 
@@ -88,14 +90,6 @@ impl Dag {
         }
 
         // Cycle detection via Kahn's topological sort (in-degree counting).
-        let mut in_degree: HashMap<OpId, usize> = op_map.keys().map(|&id| (id, 0)).collect();
-        for op in op_map.values() {
-            for &parent in &op.parents {
-                *in_degree.entry(op.id).or_insert(0) += 1;
-                let _ = in_degree.entry(parent).or_insert(0);
-            }
-        }
-        // Recompute properly.
         let mut in_degree: HashMap<OpId, usize> = op_map.keys().map(|&id| (id, 0)).collect();
         for op in op_map.values() {
             for _ in &op.parents {
