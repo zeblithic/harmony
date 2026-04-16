@@ -466,6 +466,8 @@ class HarmonyModel(nn.Module):
         # reconstruction loss). Reset every forward that uses the ANN
         # engram.
         self._last_ann_gate: torch.Tensor | None = None
+        self._last_xattn_output: torch.Tensor | None = None
+        self._last_pre_injection_hidden: torch.Tensor | None = None
 
         # Tied embeddings
         if config.tie_embeddings:
@@ -599,6 +601,8 @@ class HarmonyModel(nn.Module):
         layers_per_block = self.config.layers_per_block
         # Reset gate side-channel at the start of every forward
         self._last_ann_gate = None
+        self._last_xattn_output = None
+        self._last_pre_injection_hidden = None
 
         for i, layer in enumerate(self.layers):
             # Block boundary mixing (blocks > 0)
@@ -617,7 +621,10 @@ class HarmonyModel(nn.Module):
             #   Model delta (xattn) > Model gamma (ANN) > production (embeddings)
             if i == self.config.engram_injection_layer:
                 if self.engram_xattn is not None:
-                    h = h + self.engram_xattn(h)
+                    self._last_pre_injection_hidden = h.detach()
+                    xattn_out = self.engram_xattn(h)
+                    self._last_xattn_output = xattn_out
+                    h = h + xattn_out
                 elif self.engram_ann is not None:
                     residual, gate = self.engram_ann(h)
                     h = h + residual
