@@ -92,7 +92,7 @@ class TestResumableCheckpoint:
             save_resumable_checkpoint(
                 model, optimizer, 50, d,
                 rng_state=capture_rng_state(),
-                best_val_loss=3.648,
+                last_val_loss=3.648,
             )
 
             # Create a fresh model + optimizer and load
@@ -103,7 +103,7 @@ class TestResumableCheckpoint:
             optimizer2.load_state_dict(ckpt["optimizer_state_dict"])
 
             assert ckpt["step"] == 50
-            assert ckpt["best_val_loss"] == 3.648
+            assert ckpt["last_val_loss"] == 3.648
 
             # Model weights should match
             for (n1, p1), (n2, p2) in zip(

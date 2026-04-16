@@ -148,16 +148,23 @@ def save_resumable_checkpoint(
     step: int,
     output_dir: str,
     rng_state: dict | None = None,
-    best_val_loss: float | None = None,
+    last_val_loss: float | None = None,
     dynamic_entropy_lambda: float | None = None,
 ) -> None:
-    """Save a full resumable checkpoint with atomic rename."""
+    """Save a full resumable checkpoint with atomic rename.
+
+    NOTE: Only saves model + optimizer state. Auxiliary modules
+    (thought_norm, uq_head, mtp_head, latent_projection) are NOT
+    included — they're rebuilt from scratch on resume. This is fine
+    for engram experiments (epsilon/ablations) which don't use those
+    modules. Extend when needed.
+    """
     os.makedirs(output_dir, exist_ok=True)
     payload = {
         "step": step,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "best_val_loss": best_val_loss,
+        "last_val_loss": last_val_loss,
     }
     if rng_state is not None:
         payload["rng_state"] = rng_state
@@ -805,8 +812,9 @@ def main() -> None:
             restore_rng_state(ckpt["rng_state"], device)
         if "dynamic_entropy_lambda" in ckpt:
             _pending_entropy_lambda = ckpt["dynamic_entropy_lambda"]
-        if ckpt.get("best_val_loss") is not None:
-            print(f"  Resuming from step {start_step}, best_val_loss={ckpt['best_val_loss']:.4f}")
+        last_val = ckpt.get("last_val_loss") or ckpt.get("best_val_loss")
+        if last_val is not None:
+            print(f"  Resuming from step {start_step}, last_val_loss={last_val:.4f}")
         else:
             print(f"  Resuming from step {start_step}")
         del ckpt
@@ -1378,7 +1386,7 @@ def main() -> None:
                 save_resumable_checkpoint(
                     model, optimizer, step, args.output_dir,
                     rng_state=capture_rng_state(device),
-                    best_val_loss=float(val_loss_str) if val_loss_str else None,
+                    last_val_loss=float(val_loss_str) if val_loss_str else None,
                     dynamic_entropy_lambda=dynamic_entropy_lambda,
                 )
                 print(f"  -> resumable checkpoint saved at step {step}")
@@ -1400,7 +1408,8 @@ def main() -> None:
                     ann_ent_str = f"{accum_ann_ent_loss / args.grad_accum_steps:.6f}"
                     ann_gate_str = f"{accum_ann_gate_mean / args.grad_accum_steps:.6f}"
                     ann_lambda_str = f"{dynamic_entropy_lambda:.6f}"
-                hg_cols = [""] * 11
+                n_hg_slots = len(expected_header) - 13  # 13 base columns before hg_*
+                hg_cols = [""] * n_hg_slots
                 hg_module = None
                 if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
                     hg_module = model.engram_xattn
@@ -1409,11 +1418,12 @@ def main() -> None:
                 if hg_module is not None:
                     with torch.no_grad():
                         gates = torch.sigmoid(hg_module.head_gates)
-                    for i in range(min(8, gates.numel())):
+                    n_logged = min(n_hg_slots - 3, gates.numel())
+                    for i in range(n_logged):
                         hg_cols[i] = f"{gates[i].item():.6f}"
-                    hg_cols[8] = f"{gates.std().item():.6f}"
-                    hg_cols[9] = f"{gates.min().item():.6f}"
-                    hg_cols[10] = f"{gates.max().item():.6f}"
+                    hg_cols[-3] = f"{gates.std().item():.6f}"
+                    hg_cols[-2] = f"{gates.min().item():.6f}"
+                    hg_cols[-1] = f"{gates.max().item():.6f}"
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
