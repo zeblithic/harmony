@@ -494,8 +494,10 @@ impl DefaultEmailResolver {
                 let now = this.time.now();
                 this.caches.sweep_expired(now);
                 this.highest_serial.retain(|k, _| this.caches.has_claim_key(k));
+                let window = this.config.soft_fail_window_secs;
                 this.revocation_refresh_locks
-                    .retain(|domain, _| this.caches.is_domain_seen(domain));
+                    .retain(|domain, _| this.caches.was_domain_seen_within(domain, now, window));
+                this.caches.sweep_domain_last_seen(now, window);
                 // Per-domain revocation refresh scheduling: collect
                 // domains whose last_refreshed + refresh_secs < now.
                 let to_refresh: Vec<String> = this
@@ -569,20 +571,30 @@ mod tests {
     }
 
     #[test]
-    fn sweep_prunes_revocation_locks_for_unseen_domains() {
+    fn sweep_prunes_revocation_locks_outside_soft_fail_window() {
         let r = make_resolver();
+        let window = r.config.soft_fail_window_secs; // 72h
 
-        r.caches.mark_domain_seen("live.com", 1_000_000);
+        // "recent.com" seen at NOW (within window)
+        r.caches.mark_domain_seen("recent.com", NOW);
+        // "old.com" seen long ago (outside window)
+        r.caches.mark_domain_seen("old.com", NOW - window - 1);
+        // "never.com" never seen at all
         r.revocation_refresh_locks
-            .insert("live.com".into(), Arc::new(Semaphore::new(1)));
+            .insert("recent.com".into(), Arc::new(Semaphore::new(1)));
         r.revocation_refresh_locks
-            .insert("stale.com".into(), Arc::new(Semaphore::new(1)));
-        assert_eq!(r.revocation_refresh_locks.len(), 2);
+            .insert("old.com".into(), Arc::new(Semaphore::new(1)));
+        r.revocation_refresh_locks
+            .insert("never.com".into(), Arc::new(Semaphore::new(1)));
+        assert_eq!(r.revocation_refresh_locks.len(), 3);
 
         r.revocation_refresh_locks
-            .retain(|domain, _| r.caches.is_domain_seen(domain));
+            .retain(|domain, _| r.caches.was_domain_seen_within(domain, NOW, window));
+        r.caches.sweep_domain_last_seen(NOW, window);
+
         assert_eq!(r.revocation_refresh_locks.len(), 1);
-        assert!(r.revocation_refresh_locks.contains_key("live.com"));
-        assert!(!r.revocation_refresh_locks.contains_key("stale.com"));
+        assert!(r.revocation_refresh_locks.contains_key("recent.com"));
+        assert!(!r.revocation_refresh_locks.contains_key("old.com"));
+        assert!(!r.revocation_refresh_locks.contains_key("never.com"));
     }
 }

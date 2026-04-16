@@ -277,8 +277,9 @@ impl ResolverCaches {
         self.claim.contains_key(key)
     }
 
-    pub fn is_domain_seen(&self, domain: &str) -> bool {
-        self.domain_last_seen.contains_key(&domain.to_ascii_lowercase())
+    pub fn sweep_domain_last_seen(&self, now: u64, window_secs: u64) {
+        self.domain_last_seen
+            .retain(|_, last| now < last.saturating_add(window_secs));
     }
 
     // --- Sweep ---
