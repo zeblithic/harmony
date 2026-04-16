@@ -1104,6 +1104,7 @@ def main() -> None:
             "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms",
             "hg_0", "hg_1", "hg_2", "hg_3", "hg_4", "hg_5", "hg_6", "hg_7",
             "hg_std", "hg_min", "hg_max",
+            "mse_loss", "consol_phase", "inject_mult",
         ]
         legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         legacy_header_no_ann = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
@@ -1512,9 +1513,18 @@ def main() -> None:
                         f"  hg_min={gates.min().item():.3f}"
                         f"  hg_max={gates.max().item():.3f}"
                     )
+                consol_str = ""
+                if consol_decoder is not None:
+                    raw_mse = accum_mse_loss / args.grad_accum_steps
+                    consol_active = 1 if step >= args.consolidation_start_step else 0
+                    consol_str = (
+                        f"  mse={raw_mse:.4f}"
+                        f"  phase={consol_active}"
+                        f"  inject={inject_mult:.3f}"
+                    )
                 print(
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
-                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}"
+                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}"
                 )
 
             val_loss_str = ""
@@ -1571,7 +1581,7 @@ def main() -> None:
                     ann_ent_str = f"{accum_ann_ent_loss / args.grad_accum_steps:.6f}"
                     ann_gate_str = f"{accum_ann_gate_mean / args.grad_accum_steps:.6f}"
                     ann_lambda_str = f"{dynamic_entropy_lambda:.6f}"
-                n_hg_slots = len(expected_header) - 13  # 13 base columns before hg_*
+                n_hg_slots = len(expected_header) - 16  # 13 base columns before hg_*, 3 consol columns after
                 hg_cols = [""] * n_hg_slots
                 hg_module = None
                 if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
@@ -1587,6 +1597,13 @@ def main() -> None:
                     hg_cols[-3] = f"{gates.std().item():.6f}"
                     hg_cols[-2] = f"{gates.min().item():.6f}"
                     hg_cols[-1] = f"{gates.max().item():.6f}"
+                mse_loss_str = ""
+                consol_phase_str = ""
+                inject_mult_str = ""
+                if consol_decoder is not None:
+                    mse_loss_str = f"{accum_mse_loss / args.grad_accum_steps:.6f}"
+                    consol_phase_str = "1" if step >= args.consolidation_start_step else "0"
+                    inject_mult_str = f"{inject_mult:.6f}"
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
@@ -1602,6 +1619,9 @@ def main() -> None:
                     num_thoughts,
                     f"{dt_ms:.1f}",
                     *hg_cols,
+                    mse_loss_str,
+                    consol_phase_str,
+                    inject_mult_str,
                 ])
                 csv_file.flush()
 
