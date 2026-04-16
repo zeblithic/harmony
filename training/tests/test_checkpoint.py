@@ -107,7 +107,8 @@ class TestResumableCheckpoint:
 
             # Model weights should match
             for (n1, p1), (n2, p2) in zip(
-                model.named_parameters(), model2.named_parameters()
+                model.named_parameters(), model2.named_parameters(),
+                strict=True,
             ):
                 assert n1 == n2
                 assert torch.allclose(p1, p2), f"Mismatch in {n1}"

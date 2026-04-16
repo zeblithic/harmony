@@ -805,6 +805,14 @@ def main() -> None:
     if args.resume_from is not None and args.resume_from.endswith(".pt"):
         print(f"Loading resumable checkpoint from {args.resume_from}")
         ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt or "step" not in ckpt:
+            print(
+                f"Error: {args.resume_from} is not a resumable checkpoint "
+                "(expected keys: step, model_state_dict). Use a .safetensors "
+                "file for weights-only resume.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         start_step = ckpt["step"] + 1
         _pending_optimizer_state = ckpt.get("optimizer_state_dict")
@@ -1341,14 +1349,19 @@ def main() -> None:
                         f"  lambda_ent={dynamic_entropy_lambda:.4f}"
                     )
                 hg_str = ""
+                hg_mod = None
                 if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
-                    with torch.no_grad():
-                        gates = torch.sigmoid(model.engram_xattn.head_gates)
-                    hg_str = f"  hg_std={gates.std().item():.3f}"
+                    hg_mod = model.engram_xattn
                 elif hasattr(model, "engram_ann") and model.engram_ann is not None and hasattr(model.engram_ann, "head_gates"):
+                    hg_mod = model.engram_ann
+                if hg_mod is not None:
                     with torch.no_grad():
-                        gates = torch.sigmoid(model.engram_ann.head_gates)
-                    hg_str = f"  hg_std={gates.std().item():.3f}"
+                        gates = torch.sigmoid(hg_mod.head_gates)
+                    hg_str = (
+                        f"  hg_std={gates.std().item():.3f}"
+                        f"  hg_min={gates.min().item():.3f}"
+                        f"  hg_max={gates.max().item():.3f}"
+                    )
                 print(
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
                     f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}"
@@ -1451,8 +1464,9 @@ def main() -> None:
             _save_mtp_head(mtp_head, args.steps, args.output_dir)
         if latent_projection is not None and args.contrastive_loss:
             _save_latent_projection(latent_projection, args.steps, args.output_dir)
+        final_val_loss = None
         if val_loader is not None:
-            val_loss = compute_validation_loss(
+            final_val_loss = compute_validation_loss(
                 model, val_loader, config.vocab_size, device,
                 amp_dtype=amp_dtype, engram_table=engram_table,
                 thought_norm=thought_norm,
@@ -1460,7 +1474,14 @@ def main() -> None:
                 num_thoughts=num_thoughts,
                 latent_projection=latent_projection,
             )
-            print(f"Final val_loss={val_loss:.4f}")
+            print(f"Final val_loss={final_val_loss:.4f}")
+        if args.checkpoint_interval > 0:
+            save_resumable_checkpoint(
+                model, optimizer, args.steps, args.output_dir,
+                rng_state=capture_rng_state(device),
+                last_val_loss=final_val_loss,
+                dynamic_entropy_lambda=dynamic_entropy_lambda,
+            )
         print(f"Training complete. Final checkpoint at step {args.steps}")
     finally:
         if csv_file is not None:
