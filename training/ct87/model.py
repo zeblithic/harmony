@@ -66,6 +66,7 @@ class HarmonyModelConfig:
     ct_confidence_threshold: float | None = None
     use_ann_engram: bool = False
     use_xattn_engram: bool = False
+    use_head_gates: bool = False
     ffn_dim_overrides: dict[int, int] | None = None
 
     def __post_init__(self) -> None:
@@ -195,6 +196,19 @@ class HarmonyModelConfig:
         return base
 
     @staticmethod
+    def tiny_engram_xattn_routed() -> HarmonyModelConfig:
+        """Model epsilon - cross-attention + per-head gate scalars (ZEB-127).
+
+        Extends Model delta with learned per-head gate scalars that give
+        the model N_heads degrees of freedom to selectively route engram
+        signal. Inspired by thalamic routing literature.
+        """
+        base = HarmonyModelConfig.tiny()
+        base.use_xattn_engram = True
+        base.use_head_gates = True
+        return base
+
+    @staticmethod
     def tiny_engram_ann() -> HarmonyModelConfig:
         """Model gamma - gated-residual + ANN retrieval + anti-collapse (ZEB-117).
 
@@ -209,6 +223,17 @@ class HarmonyModelConfig:
         """
         base = HarmonyModelConfig.tiny()
         base.use_ann_engram = True
+        return base
+
+    @staticmethod
+    def tiny_engram_ann_routed() -> HarmonyModelConfig:
+        """Model epsilon ablation 3: gamma gated-residual + per-head gates (ZEB-127).
+
+        Tests whether per-head routing helps the gamma injection mechanism.
+        """
+        base = HarmonyModelConfig.tiny()
+        base.use_ann_engram = True
+        base.use_head_gates = True
         return base
 
 

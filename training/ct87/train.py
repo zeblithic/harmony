@@ -142,6 +142,80 @@ def _save_latent_projection(
     torch.save(projection.state_dict(), path)
 
 
+def save_resumable_checkpoint(
+    model: HarmonyModel,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    output_dir: str,
+    rng_state: dict | None = None,
+    last_val_loss: float | None = None,
+    dynamic_entropy_lambda: float | None = None,
+) -> None:
+    """Save a full resumable checkpoint with atomic rename.
+
+    NOTE: Only saves model + optimizer state. Auxiliary modules
+    (thought_norm, uq_head, mtp_head, latent_projection) are NOT
+    included — they're rebuilt from scratch on resume. This is fine
+    for engram experiments (epsilon/ablations) which don't use those
+    modules. Extend when needed.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    payload = {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "last_val_loss": last_val_loss,
+    }
+    if rng_state is not None:
+        payload["rng_state"] = rng_state
+    if dynamic_entropy_lambda is not None:
+        payload["dynamic_entropy_lambda"] = dynamic_entropy_lambda
+
+    ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    prev_path = os.path.join(output_dir, "checkpoint_prev.pt")
+    tmp_path = os.path.join(output_dir, "checkpoint.tmp")
+
+    torch.save(payload, tmp_path)
+
+    if os.path.exists(ckpt_path):
+        if os.path.exists(prev_path):
+            os.remove(prev_path)
+        os.rename(ckpt_path, prev_path)
+    os.rename(tmp_path, ckpt_path)
+
+
+def capture_rng_state(device: torch.device | None = None) -> dict:
+    """Capture all RNG states for deterministic resume."""
+    import random
+    import numpy as np
+
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if device is not None and device.type == "cuda":
+        state["torch_cuda"] = torch.cuda.get_rng_state(device)
+    elif torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state()
+    return state
+
+
+def restore_rng_state(state: dict, device: torch.device | None = None) -> None:
+    """Restore all RNG states from a checkpoint."""
+    import random
+    import numpy as np
+
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if "torch_cuda" in state:
+        if device is not None and device.type == "cuda":
+            torch.cuda.set_rng_state(state["torch_cuda"], device)
+        elif torch.cuda.is_available():
+            torch.cuda.set_rng_state(state["torch_cuda"])
+
+
 def load_checkpoint(
     model: HarmonyModel,
     output_dir: str,
@@ -244,7 +318,8 @@ def main() -> None:
         "--config",
         choices=[
             "tiny", "target", "tiny_ffn_expanded",
-            "tiny_engram_ann", "tiny_engram_xattn",
+            "tiny_engram_ann", "tiny_engram_ann_routed",
+            "tiny_engram_xattn", "tiny_engram_xattn_routed",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -263,6 +338,14 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--save-every", type=int, default=250)
+    parser.add_argument(
+        "--checkpoint-interval", type=int, default=0,
+        help="Save resumable checkpoint every N steps (0=disabled). "
+             "Includes model, optimizer, and global RNG state. "
+             "Dataloader position is not checkpointed, so resumed "
+             "runs may see different batch ordering. "
+             "Retains last 2 checkpoints for crash recovery.",
+    )
     parser.add_argument("--output-dir", type=str, default="training/checkpoints")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
@@ -516,14 +599,18 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_ffn_expanded()
     elif args.config == "tiny_engram_ann":
         config = HarmonyModelConfig.tiny_engram_ann()
+    elif args.config == "tiny_engram_ann_routed":
+        config = HarmonyModelConfig.tiny_engram_ann_routed()
     elif args.config == "tiny_engram_xattn":
         config = HarmonyModelConfig.tiny_engram_xattn()
+    elif args.config == "tiny_engram_xattn_routed":
+        config = HarmonyModelConfig.tiny_engram_xattn_routed()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
 
     # Model gamma arg validation (ZEB-117)
-    if args.config == "tiny_engram_ann":
+    if args.config in ("tiny_engram_ann", "tiny_engram_ann_routed"):
         if args.engram_ann_table is None:
             print(
                 "Error: --config=tiny_engram_ann requires --engram-ann-table "
@@ -551,7 +638,7 @@ def main() -> None:
             sys.exit(1)
 
     # Model delta arg validation (ZEB-117)
-    if args.config == "tiny_engram_xattn":
+    if args.config in ("tiny_engram_xattn", "tiny_engram_xattn_routed"):
         if args.engram_xattn_table is None:
             print(
                 "Error: --config=tiny_engram_xattn requires --engram-xattn-table "
@@ -649,6 +736,7 @@ def main() -> None:
             ann_table,
             clamp_until_step=args.engram_ann_warmup_steps,
             clamp_min=args.engram_ann_gate_clamp_min,
+            use_head_gates=config.use_head_gates,
         ).to(device)
         model.attach_engram_ann(ann_module)
         print(
@@ -693,6 +781,7 @@ def main() -> None:
             num_heads=args.engram_xattn_num_heads,
             k_retrieved=args.engram_xattn_k_retrieved,
             retrieval_bias_weight=args.engram_xattn_retrieval_bias_weight,
+            use_head_gates=config.use_head_gates,
         ).to(device)
         model.attach_engram_xattn(xattn_module)
         print(
@@ -710,7 +799,36 @@ def main() -> None:
     # Resume from checkpoint after all modules are attached (including ANN)
     # so their weights are loaded. strict=False handles tied embeddings where
     # lm_head shares embed_tokens weights (missing key is expected).
-    if args.resume_from is not None:
+    start_step = 0
+    _pending_optimizer_state = None
+    _pending_entropy_lambda = None
+    if args.resume_from is not None and args.resume_from.endswith(".pt"):
+        print(f"Loading resumable checkpoint from {args.resume_from}")
+        ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt or "step" not in ckpt:
+            print(
+                f"Error: {args.resume_from} is not a resumable checkpoint "
+                "(expected keys: step, model_state_dict). Use a .safetensors "
+                "file for weights-only resume.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        start_step = ckpt["step"] + 1
+        _pending_optimizer_state = ckpt.get("optimizer_state_dict")
+        if "rng_state" in ckpt:
+            restore_rng_state(ckpt["rng_state"], device)
+        if "dynamic_entropy_lambda" in ckpt:
+            _pending_entropy_lambda = ckpt["dynamic_entropy_lambda"]
+        last_val = ckpt.get("last_val_loss")
+        if last_val is None:
+            last_val = ckpt.get("best_val_loss")
+        if last_val is not None:
+            print(f"  Resuming from step {start_step}, last_val_loss={last_val:.4f}")
+        else:
+            print(f"  Resuming from step {start_step}")
+        del ckpt
+    elif args.resume_from is not None:
         from safetensors import safe_open
         with safe_open(args.resume_from, framework="pt") as f:
             ckpt_keys = set(f.keys())
@@ -835,6 +953,17 @@ def main() -> None:
     if latent_projection is not None and args.contrastive_loss:
         adam_params.extend(latent_projection.parameters())
     optimizer = Muon(muon_params, adam_params, lr=args.lr, adam_lr=args.lr)
+    if _pending_optimizer_state is not None:
+        try:
+            optimizer.load_state_dict(_pending_optimizer_state)
+            print(f"  Optimizer state restored for step {start_step}")
+        except (ValueError, KeyError) as e:
+            print(
+                f"  Warning: could not restore optimizer state ({e}); "
+                "continuing with fresh optimizer (weights still loaded)",
+                file=sys.stderr,
+            )
+        del _pending_optimizer_state
     schedule = WSDSchedule(warmup_steps=args.warmup, total_steps=args.steps)
 
     if args.synthetic:
@@ -854,9 +983,16 @@ def main() -> None:
             "step", "loss", "uq_loss", "mtp_loss", "cl_loss",
             "ann_ent_loss", "ann_gate_mean", "ann_lambda_ent",
             "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms",
+            "hg_0", "hg_1", "hg_2", "hg_3", "hg_4", "hg_5", "hg_6", "hg_7",
+            "hg_std", "hg_min", "hg_max",
         ]
         legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         legacy_header_no_ann = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
+        legacy_header_no_hg = [
+            "step", "loss", "uq_loss", "mtp_loss", "cl_loss",
+            "ann_ent_loss", "ann_gate_mean", "ann_lambda_ent",
+            "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms",
+        ]
         if os.path.exists(args.log_file) and os.path.getsize(args.log_file) > 0:
             with open(args.log_file, newline="") as existing:
                 header = next(csv.reader(existing), [])
@@ -865,6 +1001,8 @@ def main() -> None:
                 migrations_needed.append("cl_loss")
             if header in (legacy_header_no_cl, legacy_header_no_ann):
                 migrations_needed.append("ann")
+            if header == legacy_header_no_hg:
+                migrations_needed.append("hg")
             if migrations_needed:
                 with open(args.log_file, newline="") as f:
                     rows = list(csv.reader(f))
@@ -877,6 +1015,12 @@ def main() -> None:
                         # Insert three empty ann columns after cl_loss
                         for offset in (5, 5, 5):
                             rows[i].insert(offset, "")
+                    if "hg" in migrations_needed:
+                        rows[i].extend([""] * 11)
+                    # Pad any remaining column deficit (covers multi-generation gaps)
+                    deficit = len(expected_header) - len(rows[i])
+                    if deficit > 0:
+                        rows[i].extend([""] * deficit)
                 with open(args.log_file, "w", newline="") as f:
                     csv.writer(f).writerows(rows)
             elif header and header != expected_header:
@@ -900,13 +1044,17 @@ def main() -> None:
     # inside engram_ann_entropy_bounds. Scales multiplicatively after each
     # step based on whether the mean drifted out of band.
     dynamic_entropy_lambda = float(args.engram_ann_entropy_weight)
+    if start_step > 0 and _pending_entropy_lambda is not None:
+        dynamic_entropy_lambda = _pending_entropy_lambda
+        print(f"  dynamic_entropy_lambda restored: {dynamic_entropy_lambda:.6f}")
     ENTROPY_LAMBDA_SCALE_UP = 1.10
     ENTROPY_LAMBDA_SCALE_DOWN = 0.95
     ENTROPY_LAMBDA_MIN = float(args.engram_ann_entropy_weight)
     ENTROPY_LAMBDA_MAX = 1.0
+    num_thoughts = 0
 
     try:
-        for step in range(args.steps):
+        for step in range(start_step, args.steps):
             # Model gamma: propagate current step to the ANN engram so it
             # knows whether to apply the hard gate clamp.
             if model.engram_ann is not None:
@@ -1203,9 +1351,23 @@ def main() -> None:
                         f"  ann_gate={raw_gate:.3f}"
                         f"  lambda_ent={dynamic_entropy_lambda:.4f}"
                     )
+                hg_str = ""
+                hg_mod = None
+                if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
+                    hg_mod = model.engram_xattn
+                elif hasattr(model, "engram_ann") and model.engram_ann is not None and hasattr(model.engram_ann, "head_gates"):
+                    hg_mod = model.engram_ann
+                if hg_mod is not None:
+                    with torch.no_grad():
+                        gates = torch.sigmoid(hg_mod.head_gates)
+                    hg_str = (
+                        f"  hg_std={gates.std().item():.3f}"
+                        f"  hg_min={gates.min().item():.3f}"
+                        f"  hg_max={gates.max().item():.3f}"
+                    )
                 print(
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
-                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}"
+                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}"
                 )
 
             val_loss_str = ""
@@ -1232,6 +1394,19 @@ def main() -> None:
                     val_loss_str = f"{val_loss:.6f}"
                     print(f"  -> val_loss={val_loss:.4f}")
 
+            if (
+                args.checkpoint_interval > 0
+                and step > 0
+                and step % args.checkpoint_interval == 0
+            ):
+                save_resumable_checkpoint(
+                    model, optimizer, step, args.output_dir,
+                    rng_state=capture_rng_state(device),
+                    last_val_loss=float(val_loss_str) if val_loss_str else None,
+                    dynamic_entropy_lambda=dynamic_entropy_lambda,
+                )
+                print(f"  -> resumable checkpoint saved at step {step}")
+
             if step % 10 == 0 and csv_writer is not None:
                 uq_loss_str = ""
                 if uq_head is not None:
@@ -1249,6 +1424,22 @@ def main() -> None:
                     ann_ent_str = f"{accum_ann_ent_loss / args.grad_accum_steps:.6f}"
                     ann_gate_str = f"{accum_ann_gate_mean / args.grad_accum_steps:.6f}"
                     ann_lambda_str = f"{dynamic_entropy_lambda:.6f}"
+                n_hg_slots = len(expected_header) - 13  # 13 base columns before hg_*
+                hg_cols = [""] * n_hg_slots
+                hg_module = None
+                if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
+                    hg_module = model.engram_xattn
+                elif hasattr(model, "engram_ann") and model.engram_ann is not None and hasattr(model.engram_ann, "head_gates"):
+                    hg_module = model.engram_ann
+                if hg_module is not None:
+                    with torch.no_grad():
+                        gates = torch.sigmoid(hg_module.head_gates)
+                    n_logged = min(n_hg_slots - 3, gates.numel())
+                    for i in range(n_logged):
+                        hg_cols[i] = f"{gates[i].item():.6f}"
+                    hg_cols[-3] = f"{gates.std().item():.6f}"
+                    hg_cols[-2] = f"{gates.min().item():.6f}"
+                    hg_cols[-1] = f"{gates.max().item():.6f}"
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
@@ -1263,29 +1454,41 @@ def main() -> None:
                     f"{grad_norm:.6f}" if grad_norm is not None else "",
                     num_thoughts,
                     f"{dt_ms:.1f}",
+                    *hg_cols,
                 ])
                 csv_file.flush()
 
-        save_checkpoint(model, optimizer, args.steps, args.output_dir)
-        if thought_norm is not None:
-            _save_thought_norm(thought_norm, args.steps, args.output_dir)
-        if uq_head is not None:
-            _save_uq_head(uq_head, args.steps, args.output_dir)
-        if mtp_head is not None:
-            _save_mtp_head(mtp_head, args.steps, args.output_dir)
-        if latent_projection is not None and args.contrastive_loss:
-            _save_latent_projection(latent_projection, args.steps, args.output_dir)
-        if val_loader is not None:
-            val_loss = compute_validation_loss(
-                model, val_loader, config.vocab_size, device,
-                amp_dtype=amp_dtype, engram_table=engram_table,
-                thought_norm=thought_norm,
-                think_token_id=args.think_token_id if args.coconut else None,
-                num_thoughts=num_thoughts,
-                latent_projection=latent_projection,
-            )
-            print(f"Final val_loss={val_loss:.4f}")
-        print(f"Training complete. Final checkpoint at step {args.steps}")
+        if start_step >= args.steps:
+            print(f"Nothing to do: already at step {start_step} (--steps={args.steps})")
+        else:
+            save_checkpoint(model, optimizer, args.steps, args.output_dir)
+            if thought_norm is not None:
+                _save_thought_norm(thought_norm, args.steps, args.output_dir)
+            if uq_head is not None:
+                _save_uq_head(uq_head, args.steps, args.output_dir)
+            if mtp_head is not None:
+                _save_mtp_head(mtp_head, args.steps, args.output_dir)
+            if latent_projection is not None and args.contrastive_loss:
+                _save_latent_projection(latent_projection, args.steps, args.output_dir)
+            final_val_loss = None
+            if val_loader is not None:
+                final_val_loss = compute_validation_loss(
+                    model, val_loader, config.vocab_size, device,
+                    amp_dtype=amp_dtype, engram_table=engram_table,
+                    thought_norm=thought_norm,
+                    think_token_id=args.think_token_id if args.coconut else None,
+                    num_thoughts=num_thoughts,
+                    latent_projection=latent_projection,
+                )
+                print(f"Final val_loss={final_val_loss:.4f}")
+            if args.checkpoint_interval > 0:
+                save_resumable_checkpoint(
+                    model, optimizer, args.steps - 1, args.output_dir,
+                    rng_state=capture_rng_state(device),
+                    last_val_loss=final_val_loss,
+                    dynamic_entropy_lambda=dynamic_entropy_lambda,
+                )
+            print(f"Training complete. Final checkpoint at step {args.steps}")
     finally:
         if csv_file is not None:
             csv_file.close()

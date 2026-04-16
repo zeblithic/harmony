@@ -531,6 +531,7 @@ class EngramANNInjection(nn.Module):
         clamp_until_step: int = 800,
         clamp_min: float = 0.5,
         retrieval_temperature: float | None = None,
+        use_head_gates: bool = False,
     ):
         super().__init__()
         if table.dim() != 2:
@@ -616,6 +617,18 @@ class EngramANNInjection(nn.Module):
         # Cache the current step as a Python int to avoid per-forward
         # GPU->CPU sync via .item().
         self._current_step_int: int = 0
+
+        self.use_head_gates = use_head_gates
+        if use_head_gates:
+            if config.hidden_dim % config.num_query_heads != 0:
+                raise ValueError(
+                    f"hidden_dim {config.hidden_dim} must be divisible by "
+                    f"num_query_heads {config.num_query_heads} when "
+                    "use_head_gates=True"
+                )
+            self.head_gates = nn.Parameter(torch.zeros(config.num_query_heads))
+            self._num_heads = config.num_query_heads
+            self._head_dim = config.hidden_dim // config.num_query_heads
 
     def set_step(self, step: int) -> None:
         """Update the current training step for gate-clamp scheduling."""
@@ -744,6 +757,13 @@ class EngramANNInjection(nn.Module):
 
         gated_value = gate * value
 
+        if self.use_head_gates:
+            B, L, _ = gated_value.shape
+            H, D = self._num_heads, self._head_dim
+            gated_value = gated_value.view(B, L, H, D)
+            gate_weights = torch.sigmoid(self.head_gates).view(1, 1, H, 1)
+            gated_value = (gated_value * gate_weights).view(B, L, H * D)
+
         ncl = gated_value.transpose(1, 2)
         padded = F.pad(ncl, (self.conv_kernel_size - 1, 0))
         conv_out = self.conv1d(padded)
@@ -836,6 +856,7 @@ class EngramCrossAttention(nn.Module):
         k_retrieved: int = 8,
         retrieval_temperature: float | None = None,
         retrieval_bias_weight: float = 1.0,
+        use_head_gates: bool = False,
     ):
         super().__init__()
         if table.dim() != 2:
@@ -933,6 +954,10 @@ class EngramCrossAttention(nn.Module):
         # as EngramANNInjection.conv1d).
         nn.init.zeros_(self.o_proj.weight)
 
+        self.use_head_gates = use_head_gates
+        if use_head_gates:
+            self.head_gates = nn.Parameter(torch.zeros(self.num_heads))
+
     def _refresh_table_normalized(self) -> None:
         """Recompute the normalized-table cache after `self.table` changes."""
         self.table_normalized = F.normalize(self.table, dim=-1, eps=1e-8)
@@ -1005,11 +1030,14 @@ class EngramCrossAttention(nn.Module):
         scores = scores + self.retrieval_bias_weight * topk_sims.unsqueeze(2)
         attn = F.softmax(scores, dim=-1)
 
-        # [B, L, H, D] -> [B, L, hidden_dim]
-        out = torch.einsum("blhk,blkhd->blhd", attn, v_tensor).reshape(
-            B, L, H * D,
-        )
-        return self.o_proj(out)
+        # [B, L, H, D]
+        out = torch.einsum("blhk,blkhd->blhd", attn, v_tensor)
+
+        if self.use_head_gates:
+            gate_weights = torch.sigmoid(self.head_gates).view(1, 1, H, 1)
+            out = out * gate_weights
+
+        return self.o_proj(out.reshape(B, L, H * D))
 
     @staticmethod
     def load_corpus_table(

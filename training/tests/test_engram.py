@@ -900,3 +900,156 @@ class TestEngramCrossAttention:
         assert delta_config.hidden_dim == base.hidden_dim
         assert delta_config.engram_injection_layer == base.engram_injection_layer
         assert delta_config.engram_dim == base.engram_dim
+
+
+class TestEngramCrossAttentionHeadGates:
+    """Experiment epsilon: per-head gate scalars for bio-inspired routing (ZEB-127)."""
+
+    @staticmethod
+    def _xattn_config() -> HarmonyModelConfig:
+        c = _tiny_config()
+        c.use_xattn_engram = True
+        return c
+
+    @staticmethod
+    def _fake_table(total_entries: int, engram_dim: int) -> torch.Tensor:
+        g = torch.Generator().manual_seed(0)
+        return torch.randn(total_entries, engram_dim, generator=g)
+
+    def test_head_gates_parameter_exists_when_enabled(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t, use_head_gates=True)
+        param_names = {n for n, _ in m.named_parameters()}
+        assert "head_gates" in param_names
+
+    def test_head_gates_not_present_when_disabled(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t, use_head_gates=False)
+        param_names = {n for n, _ in m.named_parameters()}
+        assert "head_gates" not in param_names
+
+    def test_head_gates_initialized_to_zero(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t, use_head_gates=True)
+        assert torch.allclose(m.head_gates, torch.zeros(c.num_query_heads))
+
+    def test_head_gates_shape_matches_num_heads(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t, use_head_gates=True, num_heads=4)
+        assert m.head_gates.shape == (4,)
+
+    def test_head_gates_at_init_produce_same_output_as_ungated(self):
+        """At init, sigmoid(0)=0.5 scales all heads equally.
+
+        With o_proj zero-init, both gated and ungated produce zero output.
+        After perturbing o_proj, the gated version should produce exactly
+        0.5x the ungated version (uniform scaling).
+        """
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m_gated = EngramCrossAttention(c, t, use_head_gates=True)
+        m_ungated = EngramCrossAttention(c, t, use_head_gates=False)
+
+        # Copy all shared weights from ungated to gated
+        m_gated.load_state_dict(m_ungated.state_dict(), strict=False)
+
+        # Perturb o_proj so output is nonzero
+        with torch.no_grad():
+            m_gated.o_proj.weight.copy_(torch.randn_like(m_gated.o_proj.weight) * 0.01)
+            m_ungated.o_proj.weight.copy_(m_gated.o_proj.weight)
+
+        h = torch.randn(2, 6, c.hidden_dim)
+        out_gated = m_gated(h)
+        out_ungated = m_ungated(h)
+
+        # sigmoid(0) = 0.5, so gated output should be 0.5x ungated
+        assert torch.allclose(out_gated, out_ungated * 0.5, atol=1e-5), (
+            f"At init (gates=0), gated output should be 0.5x ungated. "
+            f"Max diff: {(out_gated - out_ungated * 0.5).abs().max().item():.4e}"
+        )
+
+    def test_head_gates_gradient_flows(self):
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t, use_head_gates=True)
+        # Perturb o_proj so gradient can flow
+        with torch.no_grad():
+            m.o_proj.weight.add_(torch.randn_like(m.o_proj.weight) * 0.01)
+        h = torch.randn(2, 5, c.hidden_dim)
+        out = m(h)
+        out.sum().backward()
+        assert m.head_gates.grad is not None, "head_gates must receive gradient"
+        assert not torch.allclose(m.head_gates.grad, torch.zeros_like(m.head_gates.grad)), (
+            "head_gates gradient should be nonzero with perturbed o_proj"
+        )
+
+    def test_differentiated_gates_produce_nonuniform_scaling(self):
+        """When gates differ, heads contribute unequally."""
+        from ct87.engram import EngramCrossAttention
+        c = self._xattn_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramCrossAttention(c, t, use_head_gates=True)
+        with torch.no_grad():
+            m.o_proj.weight.add_(torch.randn_like(m.o_proj.weight) * 0.01)
+            # Set gates to different values: head 0 high, last head low
+            m.head_gates.copy_(torch.tensor(
+                [2.0, 0.5, -0.5, -2.0]
+            ))
+        h = torch.randn(2, 6, c.hidden_dim)
+        out = m(h)
+        # Output should be nonzero and not uniform across hidden dims
+        assert out.abs().max() > 1e-6
+
+    def test_tiny_engram_xattn_routed_config(self):
+        c = HarmonyModelConfig.tiny_engram_xattn_routed()
+        assert c.use_xattn_engram is True
+        assert c.use_head_gates is True
+        assert c.num_query_heads == 8
+
+
+class TestEngramANNHeadGates:
+    """Ablation epsilon-a3: per-head gates on the gamma gated-residual path."""
+
+    @staticmethod
+    def _ann_config() -> HarmonyModelConfig:
+        c = _tiny_config()
+        c.use_ann_engram = True
+        return c
+
+    @staticmethod
+    def _fake_table(total_entries: int, engram_dim: int) -> torch.Tensor:
+        g = torch.Generator().manual_seed(0)
+        return torch.randn(total_entries, engram_dim, generator=g)
+
+    def test_ann_head_gates_exist_when_enabled(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t, use_head_gates=True)
+        assert hasattr(m, "head_gates")
+        assert m.head_gates.shape == (c.num_query_heads,)
+
+    def test_ann_head_gates_gradient_flows(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t, use_head_gates=True)
+        h = torch.randn(2, 5, c.hidden_dim)
+        out, gate = m(h)
+        out.sum().backward()
+        assert m.head_gates.grad is not None
+
+    def test_ann_routed_config(self):
+        c = HarmonyModelConfig.tiny_engram_ann_routed()
+        assert c.use_ann_engram is True
+        assert c.use_head_gates is True
