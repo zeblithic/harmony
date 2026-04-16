@@ -1,0 +1,25 @@
+[package]
+name = "harmony-groups"
+description = "Decentralized persistent group membership for the Harmony network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3 = { workspace = true, default-features = false }
+hashbrown = { workspace = true, default-features = false, features = ["serde"] }
+postcard = { workspace = true, default-features = false, features = ["alloc"] }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+
+[features]
+default = ["std"]
+std = [
+    "blake3/std",
+    "postcard/use-std",
+    "serde/std",
+]
+
+[dev-dependencies]
+rand = { workspace = true }

@@ -8,6 +8,7 @@ members = [
     "crates/harmony-contacts",
     "crates/harmony-credential",
     "crates/harmony-discovery",
+    "crates/harmony-groups",
     "crates/harmony-engram",
     "crates/harmony-content",
     "crates/harmony-db",
@@ -149,6 +150,7 @@ harmony-compute = { path = "crates/harmony-compute" }
 harmony-contacts = { path = "crates/harmony-contacts", default-features = false }
 harmony-credential = { path = "crates/harmony-credential", default-features = false }
 harmony-discovery = { path = "crates/harmony-discovery", default-features = false }
+harmony-groups = { path = "crates/harmony-groups", default-features = false }
 harmony-engram = { path = "crates/harmony-engram", default-features = false }
 harmony-content = { path = "crates/harmony-content", default-features = false }
 harmony-db = { path = "crates/harmony-db" }
