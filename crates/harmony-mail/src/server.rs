@@ -1147,8 +1147,12 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                                 }
                                 harmony_mail_discovery::resolver::ResolveOutcome::Transient { reason } => {
                                     tracing::warn!(local_part, %domain, reason, "RCPT: transient resolver failure");
-                                    // TODO(Task 24): emit HarmonyResolveTransient → 451, not 550
-                                    None
+                                    let callback_actions = session.handle(SmtpEvent::HarmonyResolveTransient {
+                                        local_part: local_part.clone(),
+                                        reason,
+                                    });
+                                    execute_actions_generic(&callback_actions, writer).await?;
+                                    continue;
                                 }
                             }
                         }
@@ -4172,6 +4176,86 @@ node_config = "/tmp/test-node.toml"
         assert!(
             !response.contains("550"),
             "should NOT get 550 user-not-found for resolved non-local recipient; got: {response:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn non_local_rcpt_transient_returns_451() {
+        use harmony_mail_discovery::resolver::ResolveOutcome;
+
+        struct TransientResolver;
+        #[async_trait::async_trait]
+        impl harmony_mail_discovery::resolver::EmailResolver for TransientResolver {
+            async fn resolve(&self, _local: &str, _domain: &str) -> ResolveOutcome {
+                ResolveOutcome::Transient { reason: "dns_timeout" }
+            }
+        }
+
+        let er: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> =
+            Arc::new(TransientResolver);
+
+        let smtp_test_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::imap_store::ImapStore::open(&smtp_test_dir.path().join("smtp-test.db"))
+                .unwrap(),
+        );
+
+        let smtp_config = SmtpConfig {
+            domain: "local".to_string(),
+            mx_host: "mail.local".to_string(),
+            max_message_size: 10 * 1024 * 1024,
+            max_recipients: 100,
+            tls_available: false,
+        };
+        let mut session = SmtpSession::new(smtp_config);
+
+        session.handle(SmtpEvent::Connected {
+            peer_ip: "127.0.0.1".parse().unwrap(),
+            tls: false,
+        });
+        session.handle(SmtpEvent::Command(SmtpCommand::Ehlo { domain: "test".to_string() }));
+        session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+            address: "sender@local".to_string(),
+        }));
+
+        let actions = session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+            address: "alice@remote.example".to_string(),
+        }));
+        assert!(
+            actions.iter().any(|a| matches!(a, SmtpAction::ResolveHarmonyAddress { .. })),
+            "RCPT TO should emit ResolveHarmonyAddress; got: {actions:?}",
+        );
+
+        let mut writer = Vec::<u8>::new();
+        let mut spf_result = crate::spam::SpfResult::None;
+
+        process_async_actions(
+            &actions,
+            &mut session,
+            &mut writer,
+            &store,
+            &None,
+            "local",
+            smtp_test_dir.path(),
+            &mut spf_result,
+            1000,
+            &None,
+            &None,
+            &None,
+            &None,
+            &Some(er),
+        )
+        .await
+        .expect("process_async_actions should succeed");
+
+        let response = String::from_utf8_lossy(&writer);
+        assert!(
+            response.contains("451"),
+            "transient resolver failure should yield 451; got: {response:?}",
+        );
+        assert!(
+            !response.contains("550"),
+            "transient resolver failure should NOT yield 550; got: {response:?}",
         );
     }
 }
