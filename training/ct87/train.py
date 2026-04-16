@@ -1458,34 +1458,37 @@ def main() -> None:
                 ])
                 csv_file.flush()
 
-        save_checkpoint(model, optimizer, args.steps, args.output_dir)
-        if thought_norm is not None:
-            _save_thought_norm(thought_norm, args.steps, args.output_dir)
-        if uq_head is not None:
-            _save_uq_head(uq_head, args.steps, args.output_dir)
-        if mtp_head is not None:
-            _save_mtp_head(mtp_head, args.steps, args.output_dir)
-        if latent_projection is not None and args.contrastive_loss:
-            _save_latent_projection(latent_projection, args.steps, args.output_dir)
-        final_val_loss = None
-        if val_loader is not None:
-            final_val_loss = compute_validation_loss(
-                model, val_loader, config.vocab_size, device,
-                amp_dtype=amp_dtype, engram_table=engram_table,
-                thought_norm=thought_norm,
-                think_token_id=args.think_token_id if args.coconut else None,
-                num_thoughts=num_thoughts,
-                latent_projection=latent_projection,
-            )
-            print(f"Final val_loss={final_val_loss:.4f}")
-        if args.checkpoint_interval > 0:
-            save_resumable_checkpoint(
-                model, optimizer, args.steps - 1, args.output_dir,
-                rng_state=capture_rng_state(device),
-                last_val_loss=final_val_loss,
-                dynamic_entropy_lambda=dynamic_entropy_lambda,
-            )
-        print(f"Training complete. Final checkpoint at step {args.steps}")
+        if start_step >= args.steps:
+            print(f"Nothing to do: already at step {start_step} (--steps={args.steps})")
+        else:
+            save_checkpoint(model, optimizer, args.steps, args.output_dir)
+            if thought_norm is not None:
+                _save_thought_norm(thought_norm, args.steps, args.output_dir)
+            if uq_head is not None:
+                _save_uq_head(uq_head, args.steps, args.output_dir)
+            if mtp_head is not None:
+                _save_mtp_head(mtp_head, args.steps, args.output_dir)
+            if latent_projection is not None and args.contrastive_loss:
+                _save_latent_projection(latent_projection, args.steps, args.output_dir)
+            final_val_loss = None
+            if val_loader is not None:
+                final_val_loss = compute_validation_loss(
+                    model, val_loader, config.vocab_size, device,
+                    amp_dtype=amp_dtype, engram_table=engram_table,
+                    thought_norm=thought_norm,
+                    think_token_id=args.think_token_id if args.coconut else None,
+                    num_thoughts=num_thoughts,
+                    latent_projection=latent_projection,
+                )
+                print(f"Final val_loss={final_val_loss:.4f}")
+            if args.checkpoint_interval > 0:
+                save_resumable_checkpoint(
+                    model, optimizer, args.steps - 1, args.output_dir,
+                    rng_state=capture_rng_state(device),
+                    last_val_loss=final_val_loss,
+                    dynamic_entropy_lambda=dynamic_entropy_lambda,
+                )
+            print(f"Training complete. Final checkpoint at step {args.steps}")
     finally:
         if csv_file is not None:
             csv_file.close()
