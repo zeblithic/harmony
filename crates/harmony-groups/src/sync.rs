@@ -1,13 +1,211 @@
 use alloc::vec::Vec;
+use hashbrown::HashSet;
+
 use crate::types::{GroupOp, OpId};
 
-/// Returns the subset of `local_ops` that the remote peer is missing, given the
-/// set of op IDs the remote peer already has.
+/// Returns the `OpId`s from `local_ops` that the remote peer is missing.
 ///
-/// This is a placeholder stub; full implementation follows in a later task.
-pub fn ops_to_send<'a>(local_ops: &'a [GroupOp], remote_has: &[OpId]) -> Vec<&'a GroupOp> {
+/// Given the remote peer's DAG tip hashes (`remote_tips`), we walk backwards
+/// through the parent graph of our local ops to discover every op the remote
+/// already has (their tips plus all transitive ancestors of those tips that
+/// exist in our local set). Everything in `local_ops` that is **not** reachable
+/// from those tips is missing on the remote side.
+///
+/// # Behaviour
+/// - If `remote_tips` is empty, the remote has nothing — all local op IDs are
+///   returned.
+/// - If a remote tip is unknown locally, it is silently ignored when walking
+///   (we cannot walk its parents) but it still counts as "remote has it."
+///   In practice an unknown tip means the remote is ahead of us on some branch;
+///   we return all of our local ops since we cannot determine overlap.
+pub fn ops_to_send(local_ops: &[GroupOp], remote_tips: &[OpId]) -> Vec<OpId> {
+    if remote_tips.is_empty() {
+        // Remote has nothing — send every local op.
+        return local_ops.iter().map(|o| o.id).collect();
+    }
+
+    // Build a map from OpId → parents for fast parent lookups.
+    let parent_map: hashbrown::HashMap<OpId, &[OpId]> =
+        local_ops.iter().map(|o| (o.id, o.parents.as_slice())).collect();
+
+    // BFS/DFS backwards from each remote tip to collect all ops the remote has.
+    let mut remote_has: HashSet<OpId> = HashSet::new();
+    let mut stack: Vec<OpId> = Vec::new();
+
+    for &tip in remote_tips {
+        if remote_has.insert(tip) {
+            stack.push(tip);
+        }
+    }
+
+    while let Some(id) = stack.pop() {
+        if let Some(&parents) = parent_map.get(&id) {
+            for &parent in parents {
+                if remote_has.insert(parent) {
+                    stack.push(parent);
+                }
+            }
+        }
+        // If the id is not in our local set, we cannot walk its parents but
+        // the id itself is already recorded in remote_has.
+    }
+
+    // Return local ops that the remote does not have.
     local_ops
         .iter()
-        .filter(|op| !remote_has.contains(&op.id))
+        .filter(|o| !remote_has.contains(&o.id))
+        .map(|o| o.id)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{GroupAction, GroupMode, GroupOp};
+    use alloc::string::String;
+    use alloc::vec;
+
+    const FOUNDER: [u8; 16] = [0x01; 16];
+    const ALICE: [u8; 16] = [0x02; 16];
+    const GROUP_ID: [u8; 16] = [0xAA; 16];
+
+    fn make_genesis() -> GroupOp {
+        let (op, _) = GroupOp::new_unsigned(
+            vec![],
+            FOUNDER,
+            1000,
+            GroupAction::Create {
+                group_id: GROUP_ID,
+                name: String::from("TestGroup"),
+                mode: GroupMode::InviteOnly,
+            },
+        );
+        op
+    }
+
+    fn make_op(parents: Vec<OpId>, author: [u8; 16], ts: u64, action: GroupAction) -> GroupOp {
+        let (op, _) = GroupOp::new_unsigned(parents, author, ts, action);
+        op
+    }
+
+    // ── empty remote tips → send all ──────────────────────────────────────
+
+    #[test]
+    fn empty_remote_tips_sends_all() {
+        let g = make_genesis();
+        let invite = make_op(
+            vec![g.id],
+            FOUNDER,
+            1001,
+            GroupAction::Invite { invitee: ALICE },
+        );
+
+        let local = vec![g.clone(), invite.clone()];
+        let to_send = ops_to_send(&local, &[]);
+
+        let mut ids: Vec<OpId> = to_send;
+        ids.sort_unstable();
+        let mut expected = vec![g.id, invite.id];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+    }
+
+    // ── remote has same tip → send nothing ───────────────────────────────
+
+    #[test]
+    fn same_tip_sends_nothing() {
+        let g = make_genesis();
+        let invite = make_op(
+            vec![g.id],
+            FOUNDER,
+            1001,
+            GroupAction::Invite { invitee: ALICE },
+        );
+
+        let local = vec![g.clone(), invite.clone()];
+        // Remote tip is the invite (the head). Because it and all its ancestors
+        // are reachable, nothing should be sent.
+        let to_send = ops_to_send(&local, &[invite.id]);
+
+        assert!(to_send.is_empty(), "expected nothing to send, got: {:?}", to_send);
+    }
+
+    // ── remote behind by one op → sends the missing op ───────────────────
+
+    #[test]
+    fn remote_behind_sends_missing() {
+        let g = make_genesis();
+        let invite = make_op(
+            vec![g.id],
+            FOUNDER,
+            1001,
+            GroupAction::Invite { invitee: ALICE },
+        );
+        let accept = make_op(
+            vec![invite.id],
+            ALICE,
+            1002,
+            GroupAction::Accept { invite_op: invite.id },
+        );
+
+        let local = vec![g.clone(), invite.clone(), accept.clone()];
+        // Remote knows up to `invite` — it's missing `accept`.
+        let to_send = ops_to_send(&local, &[invite.id]);
+
+        assert_eq!(to_send, vec![accept.id]);
+    }
+
+    // ── unknown remote tip → sends all local ops ─────────────────────────
+
+    #[test]
+    fn unknown_remote_tip_sends_all() {
+        let g = make_genesis();
+        let invite = make_op(
+            vec![g.id],
+            FOUNDER,
+            1001,
+            GroupAction::Invite { invitee: ALICE },
+        );
+
+        let local = vec![g.clone(), invite.clone()];
+        // Remote claims a tip that doesn't exist locally.
+        let unknown_tip: OpId = [0xFF; 32];
+        let to_send = ops_to_send(&local, &[unknown_tip]);
+
+        // The unknown tip is in remote_has but none of our local ops are
+        // ancestors of it (we can't walk its parents), so all local ops
+        // are returned.
+        let mut ids = to_send;
+        ids.sort_unstable();
+        let mut expected = vec![g.id, invite.id];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+    }
+
+    // ── remote behind on one branch of a fork ────────────────────────────
+
+    #[test]
+    fn remote_missing_one_branch() {
+        let g = make_genesis();
+        // Two concurrent ops off genesis (a fork).
+        let invite_a = make_op(
+            vec![g.id],
+            FOUNDER,
+            1001,
+            GroupAction::Invite { invitee: ALICE },
+        );
+        let invite_b = make_op(
+            vec![g.id],
+            FOUNDER,
+            1002,
+            GroupAction::Invite { invitee: [0x05; 16] },
+        );
+
+        let local = vec![g.clone(), invite_a.clone(), invite_b.clone()];
+        // Remote knows only invite_a (and transitively, genesis).
+        let to_send = ops_to_send(&local, &[invite_a.id]);
+
+        // Only invite_b should be sent.
+        assert_eq!(to_send, vec![invite_b.id]);
+    }
 }

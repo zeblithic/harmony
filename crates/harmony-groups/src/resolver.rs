@@ -1226,6 +1226,141 @@ mod tests {
         );
     }
 
+    // ── shuffle invariant (Task 6) ─────────────────────────────────────────
+
+    /// Build a complex DAG (~9 ops) and prove that shuffling the input 50 times
+    /// with a seeded RNG always produces identical `GroupState`.
+    ///
+    /// This is the single most important invariant test: it proves the resolver
+    /// is fully deterministic regardless of op arrival order.
+    #[test]
+    fn shuffle_invariant_randomized() {
+        use rand::seq::SliceRandom;
+        use rand::SeedableRng;
+
+        const CAROL: MemberAddr = [0x04; 16];
+
+        // DAG shape:
+        //   genesis → invite_alice → accept_alice → promote_alice (Officer)
+        //          → invite_bob
+        //               ↓ (two concurrent children)
+        //          accept_bob  ←→  kick_bob (both children of invite_bob)
+        //               ↓ (merges both branches)
+        //          invite_carol → accept_carol
+        let g = genesis(FOUNDER, GroupMode::InviteOnly);
+        let invite_alice = op(
+            vec![g.id],
+            FOUNDER,
+            1001,
+            GroupAction::Invite { invitee: ALICE },
+        );
+        let accept_alice = op(
+            vec![invite_alice.id],
+            ALICE,
+            1002,
+            GroupAction::Accept {
+                invite_op: invite_alice.id,
+            },
+        );
+        let promote_alice = op(
+            vec![accept_alice.id],
+            FOUNDER,
+            1003,
+            GroupAction::Promote { target: ALICE },
+        );
+        let invite_bob = op(
+            vec![promote_alice.id],
+            ALICE,
+            1004,
+            GroupAction::Invite { invitee: BOB },
+        );
+        // Two concurrent ops off invite_bob: Bob accepts, Founder kicks Bob.
+        let accept_bob = op(
+            vec![invite_bob.id],
+            BOB,
+            1005,
+            GroupAction::Accept {
+                invite_op: invite_bob.id,
+            },
+        );
+        let kick_bob = op(
+            vec![invite_bob.id],
+            FOUNDER,
+            1005,
+            GroupAction::Kick { target: BOB },
+        );
+        // After the fork merges, Alice invites Carol.
+        let invite_carol = op(
+            vec![kick_bob.id, accept_bob.id],
+            ALICE,
+            1006,
+            GroupAction::Invite { invitee: CAROL },
+        );
+        let accept_carol = op(
+            vec![invite_carol.id],
+            CAROL,
+            1007,
+            GroupAction::Accept {
+                invite_op: invite_carol.id,
+            },
+        );
+
+        let all_ops = vec![
+            g,
+            invite_alice,
+            accept_alice,
+            promote_alice,
+            invite_bob,
+            accept_bob,
+            kick_bob,
+            invite_carol,
+            accept_carol,
+        ];
+
+        // Reference state with canonical order.
+        let reference = resolve(&all_ops).unwrap();
+
+        // 50 shuffles with a deterministic seeded RNG — all must match.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
+        for i in 0..50 {
+            let mut shuffled = all_ops.clone();
+            shuffled.shuffle(&mut rng);
+            let state = resolve(&shuffled).unwrap();
+
+            assert_eq!(
+                reference.members.len(),
+                state.members.len(),
+                "shuffle {i}: member count differs"
+            );
+            assert_eq!(
+                reference.dissolved,
+                state.dissolved,
+                "shuffle {i}: dissolved differs"
+            );
+            assert_eq!(reference.name, state.name, "shuffle {i}: name differs");
+            assert_eq!(
+                reference.role_of(&FOUNDER),
+                state.role_of(&FOUNDER),
+                "shuffle {i}: founder role differs"
+            );
+            assert_eq!(
+                reference.role_of(&ALICE),
+                state.role_of(&ALICE),
+                "shuffle {i}: alice role differs"
+            );
+            assert_eq!(
+                reference.is_member(&BOB),
+                state.is_member(&BOB),
+                "shuffle {i}: bob membership differs"
+            );
+            assert_eq!(
+                reference.role_of(&CAROL),
+                state.role_of(&CAROL),
+                "shuffle {i}: carol role differs"
+            );
+        }
+    }
+
     /// After a member is kicked, any subsequent op authored by that member
     /// must be rejected (they are no longer in the group).
     #[test]
