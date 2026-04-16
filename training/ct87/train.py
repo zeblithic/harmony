@@ -1477,7 +1477,7 @@ def main() -> None:
             print(f"Final val_loss={final_val_loss:.4f}")
         if args.checkpoint_interval > 0:
             save_resumable_checkpoint(
-                model, optimizer, args.steps, args.output_dir,
+                model, optimizer, args.steps - 1, args.output_dir,
                 rng_state=capture_rng_state(device),
                 last_val_loss=final_val_loss,
                 dynamic_entropy_lambda=dynamic_entropy_lambda,
