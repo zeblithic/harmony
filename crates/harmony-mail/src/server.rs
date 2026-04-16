@@ -3702,7 +3702,8 @@ node_config = "/tmp/test-node.toml"
         ) {
             let gw: Option<Arc<harmony_identity::PrivateIdentity>> = None;
             let rr: Option<Arc<dyn crate::remote_delivery::RecipientResolver>> = None;
-            let _ = run(config, gw.clone(), rr.clone()).await;
+            let rd: Option<RemoteDeliveryContext> = None;
+            let _ = run(config, rd).await;
             let _ = handle_connection(
                 stream,
                 peer_ip,
