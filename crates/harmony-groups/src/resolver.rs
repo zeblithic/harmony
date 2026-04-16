@@ -315,14 +315,25 @@ fn apply_op(state: &mut GroupState, op: &GroupOp) {
         }
 
         GroupAction::Promote { target } => {
+            // Pre-batch authorization required target to be a Member, but a
+            // concurrent Leave+succession in the same batch may have promoted
+            // the target to Founder before this op applies. Only raise a
+            // Member — never overwrite a Founder's role.
             if let Some(entry) = state.members.get_mut(target) {
-                entry.role = Role::Officer;
+                if entry.role == Role::Member {
+                    entry.role = Role::Officer;
+                }
             }
         }
 
         GroupAction::Demote { target } => {
+            // Similar guard: pre-batch auth saw target as Officer, but a
+            // concurrent Leave+succession may have promoted them to Founder.
+            // Only demote an Officer — never a Founder.
             if let Some(entry) = state.members.get_mut(target) {
-                entry.role = Role::Member;
+                if entry.role == Role::Officer {
+                    entry.role = Role::Member;
+                }
             }
         }
 
@@ -1522,5 +1533,86 @@ mod tests {
             );
             assert_eq!(founders[0].0, &BOB, "Bob should have been promoted to Founder");
         }
+    }
+
+    // ── concurrent Founder Leave + Demote cannot clobber the new Founder ─
+
+    #[test]
+    fn concurrent_founder_leave_and_demote_of_successor_preserves_founder() {
+        // Pre-state: FOUNDER + Alice (Officer). If Founder concurrently
+        // Leaves and Demotes Alice, Leave's successor logic may promote
+        // Alice to Founder before the Demote applies. The Demote must not
+        // then clobber Alice's new Founder role back to Member.
+        let g = genesis(FOUNDER, GroupMode::InviteOnly);
+        let invite_a = op(vec![g.id], FOUNDER, 1001, GroupAction::Invite { invitee: ALICE });
+        let accept_a = op(vec![invite_a.id], ALICE, 1002, GroupAction::Accept { invite_op: invite_a.id });
+        let promote_a = op(vec![accept_a.id], FOUNDER, 1003, GroupAction::Promote { target: ALICE });
+
+        let leave = op(vec![promote_a.id], FOUNDER, 1004, GroupAction::Leave);
+        let demote_alice = op(vec![promote_a.id], FOUNDER, 1004, GroupAction::Demote { target: ALICE });
+
+        let state = resolve(&[g, invite_a, accept_a, promote_a, leave, demote_alice]).unwrap();
+
+        assert!(!state.is_member(&FOUNDER), "Founder left");
+        assert!(state.is_member(&ALICE), "Alice still in group");
+        assert_eq!(
+            state.role_of(&ALICE),
+            Some(Role::Founder),
+            "Alice must be Founder — succession must not be clobbered by the concurrent Demote"
+        );
+        assert!(!state.dissolved);
+    }
+
+    // ── concurrent Founder Leave + Promote cannot clobber the new Founder ─
+
+    #[test]
+    fn concurrent_founder_leave_and_promote_of_successor_preserves_founder() {
+        // Pre-state: FOUNDER + Alice (Member, no Officers). If Founder
+        // concurrently Leaves and Promotes Alice, Leave's succession will
+        // pick Alice (longest-tenured Member) and make her Founder. The
+        // Promote must not then clobber her back to Officer.
+        //
+        // The resolver applies equal-authority ops in OpId order within a
+        // batch, and OpIds are BLAKE3 hashes — essentially random relative
+        // to op content. To reliably exercise the *buggy* path (Leave
+        // applies before Promote, so succession runs before the would-be
+        // clobber), we enumerate several plausible timestamp tweaks and
+        // require at least one to land in the buggy ordering.
+        let g = genesis(FOUNDER, GroupMode::Open);
+        let join_a = op(vec![g.id], ALICE, 1001, GroupAction::Join);
+
+        let mut exercised_buggy_ordering = false;
+        for ts_tweak in 0u64..10 {
+            let leave = op(vec![join_a.id], FOUNDER, 1002 + ts_tweak, GroupAction::Leave);
+            let promote_alice = op(
+                vec![join_a.id],
+                FOUNDER,
+                1002 + ts_tweak,
+                GroupAction::Promote { target: ALICE },
+            );
+
+            // The resolver reverses the compare for max-heap ordering, so
+            // the op with the *smaller* OpId is actually popped first and
+            // applied first. Confirm this tweak actually exercises the bug
+            // path (Leave before Promote).
+            if leave.id < promote_alice.id {
+                exercised_buggy_ordering = true;
+            }
+
+            let state = resolve(&[g.clone(), join_a.clone(), leave, promote_alice]).unwrap();
+
+            assert!(!state.is_member(&FOUNDER), "Founder left");
+            assert!(state.is_member(&ALICE));
+            assert_eq!(
+                state.role_of(&ALICE),
+                Some(Role::Founder),
+                "Alice must be Founder — succession must not be clobbered by the concurrent Promote (ts_tweak={ts_tweak})"
+            );
+            assert!(!state.dissolved);
+        }
+        assert!(
+            exercised_buggy_ordering,
+            "none of the tried timestamps produced the Leave-before-Promote ordering — test may not be catching the regression"
+        );
     }
 }
