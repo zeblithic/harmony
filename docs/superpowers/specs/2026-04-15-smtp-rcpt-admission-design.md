@@ -601,7 +601,7 @@ Worst-case propagation lag: 6 hours.
 |---|---|---|
 | 200 + valid CBOR claim | → verify step | positive cache on success |
 | 200 + malformed CBOR | `Transient{"claim_parse"}` | no |
-| 200 + verification fails | `Transient{"claim_invalid"}` | yes, 60s |
+| 200 + verification fails | `Transient{"claim_invalid"}` | no |
 | 404 | `UserUnknown` | yes, 60s |
 | 5xx / connection refused / TLS failure / timeout | `Transient{"http_*"}` | no |
 | 3xx redirect | `Transient{"http_redirect_refused"}` | no |

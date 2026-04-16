@@ -201,7 +201,9 @@ impl EmailResolver for DefaultEmailResolver {
                     return ResolveOutcome::DomainDoesNotParticipate;
                 }
                 Err(DnsFetchError::UnsupportedVersion(_)) => {
-                    return ResolveOutcome::DomainDoesNotParticipate;
+                    return ResolveOutcome::Transient {
+                        reason: "dns_unsupported_version",
+                    };
                 }
                 Err(DnsFetchError::MultipleRecords) => {
                     return ResolveOutcome::Transient {

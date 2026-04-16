@@ -156,7 +156,11 @@ impl HttpClient for ReqwestHttpClient {
                 HttpError::Other(e.to_string())
             }
         })?;
-        let status = resp.status().as_u16();
+        let status = resp.status();
+        if status.is_redirection() {
+            return Err(HttpError::RedirectRefused);
+        }
+        let status = status.as_u16();
         // Bounded body read — prevents oversize responses from blowing
         // memory. reqwest doesn't expose chunked reads cleanly, so we
         // check Content-Length as a first line of defense, then cap on
