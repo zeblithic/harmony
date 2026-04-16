@@ -294,29 +294,24 @@ fn apply_op(state: &mut GroupState, op: &GroupOp) {
         }
 
         GroupAction::Leave => {
-            let leaving = op.author;
-            let was_founder = state.role_of(&leaving) == Some(Role::Founder);
-            state.members.remove(&leaving);
-
+            let was_founder = state.role_of(&op.author) == Some(Role::Founder);
+            state.members.remove(&op.author);
             if was_founder {
-                if state.members.is_empty() {
-                    // Last member left — dissolve.
-                    state.dissolved = true;
-                } else {
-                    // Promote the longest-tenured Officer, or if no Officers,
-                    // the longest-tenured Member.
-                    let successor = find_successor(&state.members);
-                    if let Some(addr) = successor {
-                        if let Some(entry) = state.members.get_mut(&addr) {
-                            entry.role = Role::Founder;
-                        }
-                    }
-                }
+                handle_founder_removed(state);
             }
         }
 
         GroupAction::Kick { target } => {
+            // Kick authorization normally prevents a Founder from being
+            // kicked, but concurrent Leave+Kick in the same batch (both by
+            // the Founder) can promote `target` to Founder via successor
+            // selection before this Kick applies. Re-run succession if the
+            // removed member was currently the Founder.
+            let was_founder = state.role_of(target) == Some(Role::Founder);
             state.members.remove(target);
+            if was_founder {
+                handle_founder_removed(state);
+            }
         }
 
         GroupAction::Promote { target } => {
@@ -342,6 +337,21 @@ fn apply_op(state: &mut GroupState, op: &GroupOp) {
             if let Some(m) = mode {
                 state.mode = *m;
             }
+        }
+    }
+}
+
+/// Promote a successor after the current Founder has been removed, or
+/// dissolve the group if no members remain. Called by both `Leave` and
+/// `Kick` apply paths when the removed member held the Founder role.
+fn handle_founder_removed(state: &mut GroupState) {
+    if state.members.is_empty() {
+        state.dissolved = true;
+        return;
+    }
+    if let Some(addr) = find_successor(&state.members) {
+        if let Some(entry) = state.members.get_mut(&addr) {
+            entry.role = Role::Founder;
         }
     }
 }
@@ -1470,5 +1480,47 @@ mod tests {
         let state = resolve(&[g, invite_alice, accept_alice]).unwrap();
         // Accept should be rejected: the invite is not in accept's ancestry.
         assert!(!state.is_member(&ALICE));
+    }
+
+    // ── concurrent Founder Leave + Kick cannot leave group Founder-less ──
+
+    #[test]
+    fn concurrent_founder_leave_and_kick_of_successor_still_has_founder() {
+        // Set up: Founder + Alice (Officer) + Bob (Member).
+        let g = genesis(FOUNDER, GroupMode::InviteOnly);
+        let invite_a = op(vec![g.id], FOUNDER, 1001, GroupAction::Invite { invitee: ALICE });
+        let accept_a = op(vec![invite_a.id], ALICE, 1002, GroupAction::Accept { invite_op: invite_a.id });
+        let promote_a = op(vec![accept_a.id], FOUNDER, 1003, GroupAction::Promote { target: ALICE });
+        let invite_b = op(vec![promote_a.id], FOUNDER, 1004, GroupAction::Invite { invitee: BOB });
+        let accept_b = op(vec![invite_b.id], BOB, 1005, GroupAction::Accept { invite_op: invite_b.id });
+
+        // Founder concurrently Leaves and Kicks Alice (the successor).
+        // Both ops branch off accept_b — same authority (Founder), same batch.
+        let leave = op(vec![accept_b.id], FOUNDER, 1006, GroupAction::Leave);
+        let kick_alice = op(vec![accept_b.id], FOUNDER, 1006, GroupAction::Kick { target: ALICE });
+
+        let state = resolve(&[
+            g, invite_a, accept_a, promote_a, invite_b, accept_b, leave, kick_alice,
+        ])
+        .unwrap();
+
+        // Whatever ordering the batch processor picks, the group must have a
+        // Founder (or be dissolved) — never Founder-less with active members.
+        assert!(!state.is_member(&FOUNDER), "Founder left");
+        assert!(!state.is_member(&ALICE), "Alice was kicked");
+        if !state.dissolved {
+            let founders: Vec<_> = state
+                .members
+                .iter()
+                .filter(|(_, e)| e.role == Role::Founder)
+                .collect();
+            assert_eq!(
+                founders.len(),
+                1,
+                "group must have exactly one Founder after Leave+Kick race, got {}",
+                founders.len()
+            );
+            assert_eq!(founders[0].0, &BOB, "Bob should have been promoted to Founder");
+        }
     }
 }

@@ -22,12 +22,12 @@ use crate::types::{GroupOp, OpId};
 ///   return all local ops.
 pub fn ops_to_send(local_ops: &[GroupOp], remote_tips: &[OpId]) -> Vec<OpId> {
     if remote_tips.is_empty() {
-        // Remote has nothing — send every local op.
-        return local_ops.iter().map(|o| o.id).collect();
+        // Remote has nothing — send every local op, topo-sorted.
+        return topo_sort(local_ops);
     }
 
     // Build a map from OpId → parents for fast parent lookups.
-    let parent_map: hashbrown::HashMap<OpId, &[OpId]> =
+    let parent_map: HashMap<OpId, &[OpId]> =
         local_ops.iter().map(|o| (o.id, o.parents.as_slice())).collect();
 
     // BFS/DFS backwards from each remote tip to collect all ops the remote has.
@@ -57,19 +57,28 @@ pub fn ops_to_send(local_ops: &[GroupOp], remote_tips: &[OpId]) -> Vec<OpId> {
         .iter()
         .filter(|o| !remote_has.contains(&o.id))
         .collect();
+    topo_sort_refs(&missing)
+}
 
-    if missing.is_empty() {
+/// Topologically sort a slice of ops so that for every op, its parents
+/// (that are also in the input) appear first in the result.
+fn topo_sort(ops: &[GroupOp]) -> Vec<OpId> {
+    let refs: Vec<&GroupOp> = ops.iter().collect();
+    topo_sort_refs(&refs)
+}
+
+fn topo_sort_refs(ops: &[&GroupOp]) -> Vec<OpId> {
+    if ops.is_empty() {
         return Vec::new();
     }
-
-    let missing_set: HashSet<OpId> = missing.iter().map(|o| o.id).collect();
+    let id_set: HashSet<OpId> = ops.iter().map(|o| o.id).collect();
     let mut in_degree: HashMap<OpId, usize> = HashMap::new();
     let mut children: HashMap<OpId, Vec<OpId>> = HashMap::new();
-    for &op in &missing {
-        let deg = op.parents.iter().filter(|p| missing_set.contains(*p)).count();
+    for &op in ops {
+        let deg = op.parents.iter().filter(|p| id_set.contains(*p)).count();
         in_degree.insert(op.id, deg);
         for &p in &op.parents {
-            if missing_set.contains(&p) {
+            if id_set.contains(&p) {
                 children.entry(p).or_default().push(op.id);
             }
         }
@@ -80,7 +89,7 @@ pub fn ops_to_send(local_ops: &[GroupOp], remote_tips: &[OpId]) -> Vec<OpId> {
         .filter(|(_, &d)| d == 0)
         .map(|(&id, _)| id)
         .collect();
-    let mut result = Vec::with_capacity(missing.len());
+    let mut result = Vec::with_capacity(ops.len());
     while let Some(id) = queue.pop_front() {
         result.push(id);
         if let Some(kids) = children.get(&id) {
@@ -245,5 +254,35 @@ mod tests {
 
         // Only invite_b should be sent.
         assert_eq!(to_send, vec![invite_b.id]);
+    }
+
+    // ── empty remote tips returns ops in topological order ───────────────
+
+    #[test]
+    fn empty_remote_tips_topologically_sorted() {
+        let g = make_genesis();
+        let invite = make_op(
+            vec![g.id],
+            FOUNDER,
+            1001,
+            GroupAction::Invite { invitee: ALICE },
+        );
+        let accept = make_op(
+            vec![invite.id],
+            ALICE,
+            1002,
+            GroupAction::Accept { invite_op: invite.id },
+        );
+
+        // Deliberately pass ops in reverse order — expect genesis first.
+        let local = vec![accept.clone(), invite.clone(), g.clone()];
+        let to_send = ops_to_send(&local, &[]);
+
+        assert_eq!(to_send.len(), 3);
+        let g_pos = to_send.iter().position(|&id| id == g.id).unwrap();
+        let inv_pos = to_send.iter().position(|&id| id == invite.id).unwrap();
+        let acc_pos = to_send.iter().position(|&id| id == accept.id).unwrap();
+        assert!(g_pos < inv_pos, "genesis must come before invite");
+        assert!(inv_pos < acc_pos, "invite must come before accept");
     }
 }
