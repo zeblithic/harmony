@@ -223,16 +223,46 @@ fn default_max_auth_failures() -> u32 {
     3
 }
 
-/// Optional Zenoh configuration for Merkle mailbox publication.
+/// Optional Zenoh configuration for Merkle mailbox publication and remote
+/// delivery.
 ///
 /// If absent or disabled, SMTP delivery still works — messages go to the
-/// IMAP store and CAS, but root CID updates are not published to the network.
+/// IMAP store and CAS, but root CID updates are not published to the network
+/// and remote recipient resolution uses default peer discovery.
 #[derive(Debug, Deserialize)]
 pub struct ZenohConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Explicit Zenoh endpoint. If omitted, uses Zenoh's default peer discovery.
     pub endpoint: Option<String>,
+}
+
+impl ZenohConfig {
+    /// Build a `zenoh::Config` in client mode (connect-only, no incoming
+    /// listener) with the optional explicit endpoint.
+    pub fn to_zenoh_config(&self) -> Result<zenoh::Config, String> {
+        let mut zc = zenoh::Config::default();
+        zc.insert_json5("mode", "\"client\"")
+            .map_err(|e| format!("Zenoh client-mode config rejected: {e}"))?;
+        zc.insert_json5("listen/endpoints", "[]")
+            .map_err(|e| format!("Zenoh listen-endpoints config rejected: {e}"))?;
+        if let Some(ep) = &self.endpoint {
+            let ep_json = serde_json::to_string(ep)
+                .map_err(|e| format!("Zenoh endpoint JSON-encode failed: {e}"))?;
+            zc.insert_json5("connect/endpoints", &format!("[{ep_json}]"))
+                .map_err(|e| format!("Zenoh endpoint config rejected: {e}"))?;
+        }
+        Ok(zc)
+    }
+}
+
+/// Build a default client-mode Zenoh config with no explicit endpoint.
+pub fn default_zenoh_client_config() -> Result<zenoh::Config, String> {
+    let stub = ZenohConfig {
+        enabled: true,
+        endpoint: None,
+    };
+    stub.to_zenoh_config()
 }
 
 impl Config {
@@ -522,5 +552,37 @@ identity_key = "/tmp/test.key"
     fn parse_config_without_zenoh() {
         let config = Config::from_toml(FULL_CONFIG).expect("should parse without zenoh section");
         assert!(config.zenoh.is_none());
+    }
+
+    #[test]
+    fn zenoh_config_builds_client_mode_without_endpoint() {
+        let zc = ZenohConfig {
+            enabled: true,
+            endpoint: None,
+        };
+        let cfg = zc.to_zenoh_config().expect("should build");
+        let json = serde_json::to_value(cfg).expect("should serialize");
+        assert_eq!(json["mode"], "client");
+    }
+
+    #[test]
+    fn zenoh_config_builds_client_mode_with_endpoint() {
+        let zc = ZenohConfig {
+            enabled: true,
+            endpoint: Some("tcp/10.0.0.1:7447".to_string()),
+        };
+        let cfg = zc.to_zenoh_config().expect("should build");
+        let json = serde_json::to_value(cfg).expect("should serialize");
+        assert_eq!(json["mode"], "client");
+        let endpoints = json["connect"]["endpoints"].as_array().expect("array");
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0], "tcp/10.0.0.1:7447");
+    }
+
+    #[test]
+    fn default_zenoh_client_config_is_client_mode() {
+        let cfg = default_zenoh_client_config().expect("should build");
+        let json = serde_json::to_value(cfg).expect("should serialize");
+        assert_eq!(json["mode"], "client");
     }
 }
