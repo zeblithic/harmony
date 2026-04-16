@@ -164,3 +164,35 @@ class TestInjectionMultiplier:
         logits_no_engram = model2(x).detach()
 
         assert torch.allclose(logits_zero, logits_no_engram, atol=1e-5)
+
+
+class TestConsolidationConfigPresets:
+
+    def test_consol_online_preset(self):
+        config = HarmonyModelConfig.tiny_engram_xattn_consol_online()
+        assert config.use_xattn_engram is True
+        assert config.use_head_gates is False
+        assert config.use_ann_engram is False
+
+    def test_consol_phased_preset(self):
+        config = HarmonyModelConfig.tiny_engram_xattn_consol_phased()
+        assert config.use_xattn_engram is True
+        assert config.use_head_gates is False
+        assert config.use_ann_engram is False
+
+    def test_ctrl_preset(self):
+        config = HarmonyModelConfig.tiny_engram_xattn_ctrl()
+        assert config.use_xattn_engram is True
+        assert config.use_head_gates is False
+        assert config.use_ann_engram is False
+
+    def test_all_three_presets_equivalent(self):
+        a = HarmonyModelConfig.tiny_engram_xattn_consol_online()
+        b = HarmonyModelConfig.tiny_engram_xattn_consol_phased()
+        c = HarmonyModelConfig.tiny_engram_xattn_ctrl()
+        for field in ["num_layers", "hidden_dim", "num_query_heads",
+                       "head_dim", "ffn_dim", "vocab_size", "engram_dim",
+                       "engram_injection_layer", "use_xattn_engram",
+                       "use_head_gates", "use_ann_engram"]:
+            assert getattr(a, field) == getattr(b, field) == getattr(c, field), \
+                f"Mismatch in {field}"

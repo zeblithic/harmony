@@ -236,6 +236,27 @@ class HarmonyModelConfig:
         base.use_head_gates = True
         return base
 
+    @staticmethod
+    def tiny_engram_xattn_consol_online() -> HarmonyModelConfig:
+        """Zeta-A: cross-attention + online consolidation (ZEB-128)."""
+        base = HarmonyModelConfig.tiny()
+        base.use_xattn_engram = True
+        return base
+
+    @staticmethod
+    def tiny_engram_xattn_consol_phased() -> HarmonyModelConfig:
+        """Zeta-B: cross-attention + phased consolidation (ZEB-128)."""
+        base = HarmonyModelConfig.tiny()
+        base.use_xattn_engram = True
+        return base
+
+    @staticmethod
+    def tiny_engram_xattn_ctrl() -> HarmonyModelConfig:
+        """Zeta-ctrl: cross-attention control, no consolidation (ZEB-128)."""
+        base = HarmonyModelConfig.tiny()
+        base.use_xattn_engram = True
+        return base
+
 
 # ---------------------------------------------------------------------------
 # Layer building blocks
