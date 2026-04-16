@@ -23,7 +23,7 @@ async fn main() {
     };
 
     let dns: Arc<dyn harmony_mail_discovery::dns::DnsClient> =
-        Arc::new(HickoryDnsClient::from_system(Duration::from_secs(5)));
+        Arc::new(HickoryDnsClient::from_system_or_google(Duration::from_secs(5)));
     let http: Arc<dyn harmony_mail_discovery::http::HttpClient> = Arc::new(
         ReqwestHttpClient::new(Duration::from_secs(5), Duration::from_secs(10), 1_000_000)
             .expect("build reqwest client"),

@@ -161,26 +161,25 @@ impl HttpClient for ReqwestHttpClient {
             return Err(HttpError::RedirectRefused);
         }
         let status = status.as_u16();
-        // Bounded body read — prevents oversize responses from blowing
-        // memory. reqwest doesn't expose chunked reads cleanly, so we
-        // check Content-Length as a first line of defense, then cap on
-        // the collected bytes as a second.
         if let Some(len) = resp.content_length() {
             if len > self.body_cap_bytes as u64 {
                 return Err(HttpError::BodyTooLarge);
             }
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| HttpError::Other(e.to_string()))?;
-        if bytes.len() > self.body_cap_bytes {
-            return Err(HttpError::BodyTooLarge);
+        // Incremental body read: stream chunks and enforce the size cap
+        // per-chunk so a chunked-transfer response without Content-Length
+        // cannot force unbounded memory allocation.
+        use futures_util::TryStreamExt;
+        let cap = self.body_cap_bytes;
+        let mut body = Vec::with_capacity(cap.min(8192));
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.try_next().await.map_err(|e| HttpError::Other(e.to_string()))? {
+            if chunk.len() > cap.saturating_sub(body.len()) {
+                return Err(HttpError::BodyTooLarge);
+            }
+            body.extend_from_slice(&chunk);
         }
-        Ok(HttpResponse {
-            status,
-            body: bytes.to_vec(),
-        })
+        Ok(HttpResponse { status, body })
     }
 }
 

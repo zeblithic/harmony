@@ -273,6 +273,15 @@ impl ResolverCaches {
         self.negative.get(key).map(|e| now < *e).unwrap_or(false)
     }
 
+    pub fn has_claim_key(&self, key: &(String, HashedLocalPart)) -> bool {
+        self.claim.contains_key(key)
+    }
+
+    pub fn sweep_domain_last_seen(&self, now: u64, window_secs: u64) {
+        self.domain_last_seen
+            .retain(|_, last| now < last.saturating_add(window_secs));
+    }
+
     // --- Sweep ---
 
     /// Evict expired entries from claim, signing_key, master_key, and negative
