@@ -209,11 +209,8 @@ fn is_authorized(state: &GroupState, op: &GroupOp, dag: &Dag, authorized_ops: &H
             if state.role_of(&op.author) != Some(Role::Founder) {
                 return false;
             }
-            // Target must be a member (and not already Founder).
-            match state.role_of(target) {
-                Some(role) => role != Role::Founder,
-                None => false,
-            }
+            // Target must be a plain Member (not already Officer or Founder).
+            matches!(state.role_of(target), Some(Role::Member))
         }
 
         GroupAction::Demote { target } => {
