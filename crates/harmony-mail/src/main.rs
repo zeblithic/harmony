@@ -105,7 +105,7 @@ async fn build_remote_delivery(
     );
 
     let dns: Arc<dyn harmony_mail_discovery::dns::DnsClient> = Arc::new(
-        harmony_mail_discovery::dns::HickoryDnsClient::from_system(Duration::from_secs(5)),
+        harmony_mail_discovery::dns::HickoryDnsClient::from_system(Duration::from_secs(5))?,
     );
     let http: Arc<dyn harmony_mail_discovery::http::HttpClient> = Arc::new(
         harmony_mail_discovery::http::ReqwestHttpClient::new(

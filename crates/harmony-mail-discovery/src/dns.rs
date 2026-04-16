@@ -149,9 +149,22 @@ pub struct HickoryDnsClient {
 }
 
 impl HickoryDnsClient {
-    /// Build with system-config defaults (honors /etc/resolv.conf on
-    /// Unix). Falls back to Google DNS if system config lookup fails.
-    pub fn from_system(timeout: Duration) -> Self {
+    /// Build with system-config defaults (honors /etc/resolv.conf on Unix).
+    ///
+    /// Returns an error if the system resolver config cannot be read,
+    /// preventing silent fallback to a third-party DNS provider.
+    pub fn from_system(timeout: Duration) -> Result<Self, std::io::Error> {
+        let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()?;
+        opts.timeout = timeout;
+        Ok(Self {
+            inner: TokioAsyncResolver::tokio(config, opts),
+        })
+    }
+
+    /// Build with system-config defaults, falling back to Google Public DNS
+    /// if system config is unavailable. Suitable for debug/diagnostic tools
+    /// where privacy of DNS queries is less critical.
+    pub fn from_system_or_google(timeout: Duration) -> Self {
         let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()
             .unwrap_or_else(|_| (ResolverConfig::google(), ResolverOpts::default()));
         opts.timeout = timeout;
