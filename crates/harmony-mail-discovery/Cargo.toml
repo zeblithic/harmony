@@ -29,6 +29,7 @@ async-trait = { workspace = true }
 dashmap = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber = { workspace = true }
 hickory-resolver = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }
