@@ -1030,4 +1030,241 @@ mod tests {
         let state = resolve(&[g, join, invite]).unwrap();
         assert_eq!(state.members.len(), 2);
     }
+
+    // ── Strong Removal: Task 5 ─────────────────────────────────────────────
+
+    /// Build a realistic base DAG: genesis → invite Alice → Alice accepts →
+    /// Founder promotes Alice to Officer → invite Bob → Bob accepts.
+    /// Returns (ops_vec, branch_point_id) where branch_point_id is the id of
+    /// the last op before the concurrent branch.
+    fn build_base_with_officer_and_member() -> (Vec<GroupOp>, OpId) {
+        let g = genesis(FOUNDER, GroupMode::InviteOnly);
+        let invite_alice = op(
+            vec![g.id],
+            FOUNDER,
+            1001,
+            GroupAction::Invite { invitee: ALICE },
+        );
+        let accept_alice = op(
+            vec![invite_alice.id],
+            ALICE,
+            1002,
+            GroupAction::Accept {
+                invite_op: invite_alice.id,
+            },
+        );
+        let promote_alice = op(
+            vec![accept_alice.id],
+            FOUNDER,
+            1003,
+            GroupAction::Promote { target: ALICE },
+        );
+        let invite_bob = op(
+            vec![promote_alice.id],
+            ALICE,
+            1004,
+            GroupAction::Invite { invitee: BOB },
+        );
+        let accept_bob = op(
+            vec![invite_bob.id],
+            BOB,
+            1005,
+            GroupAction::Accept {
+                invite_op: invite_bob.id,
+            },
+        );
+        let branch_id = accept_bob.id;
+        let ops = vec![g, invite_alice, accept_alice, promote_alice, invite_bob, accept_bob];
+        (ops, branch_id)
+    }
+
+    /// Founder demotes Officer A while Officer A concurrently kicks Member B.
+    /// Both ops share the same parent (Strong Removal scenario).
+    ///
+    /// Expected: Founder's demote (power 0) wins over Officer's kick (power 1).
+    /// Alice is demoted to Member. Bob's kick is voided (Alice is no longer an
+    /// Officer when her kick is validated), so Bob survives.
+    #[test]
+    fn concurrent_founder_demotes_officer_voids_officer_kick() {
+        let (mut base_ops, branch_id) = build_base_with_officer_and_member();
+
+        // Concurrent branch: Founder demotes Alice, Alice kicks Bob (same parent).
+        let demote_alice = op(
+            vec![branch_id],
+            FOUNDER,
+            1006,
+            GroupAction::Demote { target: ALICE },
+        );
+        let kick_bob_by_alice = op(
+            vec![branch_id],
+            ALICE,
+            1006,
+            GroupAction::Kick { target: BOB },
+        );
+
+        base_ops.push(demote_alice);
+        base_ops.push(kick_bob_by_alice);
+
+        let state = resolve(&base_ops).unwrap();
+
+        // Alice is demoted to Member (Founder's op wins at authority 0).
+        assert_eq!(state.role_of(&ALICE), Some(Role::Member));
+        // Bob survives — Alice's kick is voided because she is no longer
+        // an Officer (or Founder) when her kick's authority is checked.
+        assert!(state.is_member(&BOB));
+        assert_eq!(state.role_of(&BOB), Some(Role::Member));
+    }
+
+    /// Founder kicks Officer while Officer concurrently invites a new member.
+    /// Officer's invite is voided because the Officer is no longer in the group
+    /// when his/her invite's authorization is evaluated.
+    #[test]
+    fn concurrent_founder_kick_voids_officer_invite() {
+        let (mut base_ops, branch_id) = build_base_with_officer_and_member();
+
+        // Introduce Carol as the "new member" Alice would try to invite.
+        const CAROL: MemberAddr = [0x04; 16];
+
+        // Concurrent: Founder kicks Alice (Officer), Alice invites Carol.
+        let kick_alice = op(
+            vec![branch_id],
+            FOUNDER,
+            1006,
+            GroupAction::Kick { target: ALICE },
+        );
+        let invite_carol_by_alice = op(
+            vec![branch_id],
+            ALICE,
+            1006,
+            GroupAction::Invite { invitee: CAROL },
+        );
+
+        base_ops.push(kick_alice);
+        base_ops.push(invite_carol_by_alice);
+
+        let state = resolve(&base_ops).unwrap();
+
+        // Alice is kicked (Founder wins, power 0).
+        assert!(!state.is_member(&ALICE));
+        // Carol was never admitted — Alice's invite was voided.
+        assert!(!state.is_member(&CAROL));
+        // Bob and Founder remain.
+        assert!(state.is_member(&BOB));
+        assert!(state.is_member(&FOUNDER));
+    }
+
+    /// The same set of ops must produce identical state regardless of the order
+    /// in which they are passed to `resolve`. Tests forward, reverse, and a
+    /// hand-shuffled permutation.
+    #[test]
+    fn concurrent_ops_deterministic_regardless_of_input_order() {
+        let (mut base_ops, branch_id) = build_base_with_officer_and_member();
+
+        let demote_alice = op(
+            vec![branch_id],
+            FOUNDER,
+            1006,
+            GroupAction::Demote { target: ALICE },
+        );
+        let kick_bob_by_alice = op(
+            vec![branch_id],
+            ALICE,
+            1006,
+            GroupAction::Kick { target: BOB },
+        );
+
+        base_ops.push(demote_alice);
+        base_ops.push(kick_bob_by_alice);
+
+        // Reference state using the original order.
+        let reference = resolve(&base_ops).unwrap();
+
+        // Reversed order.
+        let mut reversed = base_ops.clone();
+        reversed.reverse();
+        let state_rev = resolve(&reversed).unwrap();
+        assert_eq!(
+            reference.members.len(),
+            state_rev.members.len(),
+            "reversed: member count differs"
+        );
+        assert_eq!(
+            reference.role_of(&FOUNDER),
+            state_rev.role_of(&FOUNDER),
+            "reversed: founder role differs"
+        );
+        assert_eq!(
+            reference.role_of(&ALICE),
+            state_rev.role_of(&ALICE),
+            "reversed: alice role differs"
+        );
+        assert_eq!(
+            reference.is_member(&BOB),
+            state_rev.is_member(&BOB),
+            "reversed: bob membership differs"
+        );
+
+        // A hand-shuffled permutation (rotate by half).
+        let n = base_ops.len();
+        let mut shuffled = base_ops.clone();
+        shuffled.rotate_right(n / 2);
+        let state_shuffled = resolve(&shuffled).unwrap();
+        assert_eq!(
+            reference.members.len(),
+            state_shuffled.members.len(),
+            "shuffled: member count differs"
+        );
+        assert_eq!(
+            reference.role_of(&ALICE),
+            state_shuffled.role_of(&ALICE),
+            "shuffled: alice role differs"
+        );
+        assert_eq!(
+            reference.is_member(&BOB),
+            state_shuffled.is_member(&BOB),
+            "shuffled: bob membership differs"
+        );
+    }
+
+    /// After a member is kicked, any subsequent op authored by that member
+    /// must be rejected (they are no longer in the group).
+    #[test]
+    fn kicked_member_subsequent_ops_rejected() {
+        let g = genesis(FOUNDER, GroupMode::InviteOnly);
+        let invite_alice = op(
+            vec![g.id],
+            FOUNDER,
+            1001,
+            GroupAction::Invite { invitee: ALICE },
+        );
+        let accept_alice = op(
+            vec![invite_alice.id],
+            ALICE,
+            1002,
+            GroupAction::Accept {
+                invite_op: invite_alice.id,
+            },
+        );
+        let kick_alice = op(
+            vec![accept_alice.id],
+            FOUNDER,
+            1003,
+            GroupAction::Kick { target: ALICE },
+        );
+        // Alice tries to Leave after being kicked — she is no longer a member.
+        let leave_alice = op(
+            vec![kick_alice.id],
+            ALICE,
+            1004,
+            GroupAction::Leave,
+        );
+
+        let state = resolve(&[g, invite_alice, accept_alice, kick_alice, leave_alice]).unwrap();
+
+        // Alice is not a member (was kicked, Leave was rejected since she's not a member).
+        assert!(!state.is_member(&ALICE));
+        // Founder is the only member.
+        assert!(state.is_member(&FOUNDER));
+        assert_eq!(state.members.len(), 1);
+    }
 }
