@@ -626,8 +626,8 @@ Worst-case propagation lag: 6 hours.
 |---|---|---|
 | `DomainMismatch` | `Transient{"claim_domain_mismatch"}` | WARN |
 | `HashedLocalPartMismatch` | `Transient{"claim_lp_mismatch"}` | WARN |
-| `CertSignatureInvalid` | `Transient{"cert_sig"}` (60s neg-cache) | WARN |
-| `ClaimSignatureInvalid` | `Transient{"claim_sig"}` (60s neg-cache) | WARN |
+| `CertSignatureInvalid` | `Transient{"cert_sig"}` | WARN |
+| `ClaimSignatureInvalid` | `Transient{"claim_sig"}` | WARN |
 | `CertNotYetValid` | `Transient{"cert_future"}` | INFO |
 | `CertExpired` | `Transient{"cert_expired"}` | WARN |
 | `CertRevoked` | `Revoked` | INFO |

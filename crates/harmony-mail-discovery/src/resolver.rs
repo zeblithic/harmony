@@ -396,6 +396,13 @@ impl DefaultEmailResolver {
             .await
             .map_err(|_| "revocation_bootstrap_failed")?;
 
+        // Re-check: a concurrent waiter may have already populated the cache.
+        if let Some((view, expires_at, _)) = self.caches.get_revocation(domain) {
+            if now < expires_at {
+                return Ok(view);
+            }
+        }
+
         // Get master pubkey for verifying the list.
         let Some(domain_record) = self.caches.get_master_key(domain, now) else {
             return Err("revocation_bootstrap_failed");
@@ -403,7 +410,7 @@ impl DefaultEmailResolver {
 
         match crate::http::fetch_revocation_list(self.http.as_ref(), domain).await {
             Ok(RevocationFetchResult::Found(list)) => {
-                if let Err(reason) = verify_revocation_list(&list, &domain_record) {
+                if let Err(reason) = verify_revocation_list(&list, domain, &domain_record) {
                     error!(%domain, %reason, "revocation list signature failed — potential attack");
                     return Err("revocation_bootstrap_failed");
                 }
@@ -433,8 +440,15 @@ impl DefaultEmailResolver {
 
 fn verify_revocation_list(
     list: &RevocationList,
+    queried_domain: &str,
     domain_record: &DomainRecord,
 ) -> Result<(), &'static str> {
+    if list.version != 1 {
+        return Err("unsupported_version");
+    }
+    if list.domain != queried_domain {
+        return Err("domain_mismatch");
+    }
     let MasterPubkey::Ed25519(k) = domain_record.master_pubkey;
     let vk = VerifyingKey::from_bytes(&k).map_err(|_| "master_key_parse")?;
     let bytes = canonical_cbor(&list.signable()).map_err(|_| "encoding_failed")?;

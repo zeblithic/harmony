@@ -581,9 +581,10 @@ impl SmtpSession {
             return vec![];
         }
         self.pending_rcpt = None;
+        let _ = reason;
         vec![SmtpAction::SendResponse(
             451,
-            format!("4.3.0 Temporary resolver failure ({})", reason),
+            "4.3.0 Temporary failure, please retry later".to_string(),
         )]
     }
 }
@@ -1557,7 +1558,7 @@ mod tests {
         match &actions[0] {
             SmtpAction::SendResponse(code, msg) => {
                 assert_eq!(*code, 451);
-                assert!(msg.contains("dns_timeout"), "message should contain reason: {msg}");
+                assert!(msg.contains("please retry"), "message should be generic: {msg}");
             }
             other => panic!("expected SendResponse(451), got: {other:?}"),
         }
