@@ -149,6 +149,7 @@ def save_resumable_checkpoint(
     output_dir: str,
     rng_state: dict | None = None,
     best_val_loss: float | None = None,
+    dynamic_entropy_lambda: float | None = None,
 ) -> None:
     """Save a full resumable checkpoint with atomic rename."""
     os.makedirs(output_dir, exist_ok=True)
@@ -160,6 +161,8 @@ def save_resumable_checkpoint(
     }
     if rng_state is not None:
         payload["rng_state"] = rng_state
+    if dynamic_entropy_lambda is not None:
+        payload["dynamic_entropy_lambda"] = dynamic_entropy_lambda
 
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     prev_path = os.path.join(output_dir, "checkpoint_prev.pt")
@@ -174,7 +177,7 @@ def save_resumable_checkpoint(
     os.rename(tmp_path, ckpt_path)
 
 
-def capture_rng_state() -> dict:
+def capture_rng_state(device: torch.device | None = None) -> dict:
     """Capture all RNG states for deterministic resume."""
     import random
     import numpy as np
@@ -184,12 +187,14 @@ def capture_rng_state() -> dict:
         "numpy": np.random.get_state(),
         "torch_cpu": torch.get_rng_state(),
     }
-    if torch.cuda.is_available():
+    if device is not None and device.type == "cuda":
+        state["torch_cuda"] = torch.cuda.get_rng_state(device)
+    elif torch.cuda.is_available():
         state["torch_cuda"] = torch.cuda.get_rng_state()
     return state
 
 
-def restore_rng_state(state: dict) -> None:
+def restore_rng_state(state: dict, device: torch.device | None = None) -> None:
     """Restore all RNG states from a checkpoint."""
     import random
     import numpy as np
@@ -197,8 +202,11 @@ def restore_rng_state(state: dict) -> None:
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch_cpu"])
-    if "torch_cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state(state["torch_cuda"])
+    if "torch_cuda" in state:
+        if device is not None and device.type == "cuda":
+            torch.cuda.set_rng_state(state["torch_cuda"], device)
+        elif torch.cuda.is_available():
+            torch.cuda.set_rng_state(state["torch_cuda"])
 
 
 def load_checkpoint(
@@ -326,7 +334,9 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint-interval", type=int, default=0,
         help="Save resumable checkpoint every N steps (0=disabled). "
-             "Includes model, optimizer, RNG state for exact resume. "
+             "Includes model, optimizer, and global RNG state. "
+             "Dataloader position is not checkpointed, so resumed "
+             "runs may see different batch ordering. "
              "Retains last 2 checkpoints for crash recovery.",
     )
     parser.add_argument("--output-dir", type=str, default="training/checkpoints")
@@ -784,18 +794,21 @@ def main() -> None:
     # lm_head shares embed_tokens weights (missing key is expected).
     start_step = 0
     _pending_optimizer_state = None
+    _pending_entropy_lambda = None
     if args.resume_from is not None and args.resume_from.endswith(".pt"):
         print(f"Loading resumable checkpoint from {args.resume_from}")
         ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        start_step = ckpt["step"]
+        start_step = ckpt["step"] + 1
         _pending_optimizer_state = ckpt.get("optimizer_state_dict")
         if "rng_state" in ckpt:
-            restore_rng_state(ckpt["rng_state"])
+            restore_rng_state(ckpt["rng_state"], device)
+        if "dynamic_entropy_lambda" in ckpt:
+            _pending_entropy_lambda = ckpt["dynamic_entropy_lambda"]
         if ckpt.get("best_val_loss") is not None:
-            print(f"  Resumed from step {start_step}, best_val_loss={ckpt['best_val_loss']:.4f}")
+            print(f"  Resuming from step {start_step}, best_val_loss={ckpt['best_val_loss']:.4f}")
         else:
-            print(f"  Resumed from step {start_step}")
+            print(f"  Resuming from step {start_step}")
         del ckpt
     elif args.resume_from is not None:
         from safetensors import safe_open
@@ -923,9 +936,16 @@ def main() -> None:
         adam_params.extend(latent_projection.parameters())
     optimizer = Muon(muon_params, adam_params, lr=args.lr, adam_lr=args.lr)
     if _pending_optimizer_state is not None:
-        optimizer.load_state_dict(_pending_optimizer_state)
+        try:
+            optimizer.load_state_dict(_pending_optimizer_state)
+            print(f"  Optimizer state restored for step {start_step}")
+        except (ValueError, KeyError) as e:
+            print(
+                f"  Warning: could not restore optimizer state ({e}); "
+                "continuing with fresh optimizer (weights still loaded)",
+                file=sys.stderr,
+            )
         del _pending_optimizer_state
-        print(f"  Optimizer state restored for step {start_step}")
     schedule = WSDSchedule(warmup_steps=args.warmup, total_steps=args.steps)
 
     if args.synthetic:
@@ -979,6 +999,10 @@ def main() -> None:
                             rows[i].insert(offset, "")
                     if "hg" in migrations_needed:
                         rows[i].extend([""] * 11)
+                    # Pad any remaining column deficit (covers multi-generation gaps)
+                    deficit = len(expected_header) - len(rows[i])
+                    if deficit > 0:
+                        rows[i].extend([""] * deficit)
                 with open(args.log_file, "w", newline="") as f:
                     csv.writer(f).writerows(rows)
             elif header and header != expected_header:
@@ -1002,6 +1026,9 @@ def main() -> None:
     # inside engram_ann_entropy_bounds. Scales multiplicatively after each
     # step based on whether the mean drifted out of band.
     dynamic_entropy_lambda = float(args.engram_ann_entropy_weight)
+    if start_step > 0 and _pending_entropy_lambda is not None:
+        dynamic_entropy_lambda = _pending_entropy_lambda
+        print(f"  dynamic_entropy_lambda restored: {dynamic_entropy_lambda:.6f}")
     ENTROPY_LAMBDA_SCALE_UP = 1.10
     ENTROPY_LAMBDA_SCALE_DOWN = 0.95
     ENTROPY_LAMBDA_MIN = float(args.engram_ann_entropy_weight)
@@ -1350,8 +1377,9 @@ def main() -> None:
             ):
                 save_resumable_checkpoint(
                     model, optimizer, step, args.output_dir,
-                    rng_state=capture_rng_state(),
+                    rng_state=capture_rng_state(device),
                     best_val_loss=float(val_loss_str) if val_loss_str else None,
+                    dynamic_entropy_lambda=dynamic_entropy_lambda,
                 )
                 print(f"  -> resumable checkpoint saved at step {step}")
 

@@ -620,6 +620,12 @@ class EngramANNInjection(nn.Module):
 
         self.use_head_gates = use_head_gates
         if use_head_gates:
+            if config.hidden_dim % config.num_query_heads != 0:
+                raise ValueError(
+                    f"hidden_dim {config.hidden_dim} must be divisible by "
+                    f"num_query_heads {config.num_query_heads} when "
+                    "use_head_gates=True"
+                )
             self.head_gates = nn.Parameter(torch.zeros(config.num_query_heads))
             self._num_heads = config.num_query_heads
             self._head_dim = config.hidden_dim // config.num_query_heads
