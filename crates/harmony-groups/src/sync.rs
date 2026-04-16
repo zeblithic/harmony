@@ -1,5 +1,6 @@
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 
 use crate::types::{GroupOp, OpId};
 
@@ -51,12 +52,48 @@ pub fn ops_to_send(local_ops: &[GroupOp], remote_tips: &[OpId]) -> Vec<OpId> {
         // the id itself is already recorded in remote_has.
     }
 
-    // Return local ops that the remote does not have.
-    local_ops
+    // Collect missing ops and topologically sort so parents precede children.
+    let missing: Vec<&GroupOp> = local_ops
         .iter()
         .filter(|o| !remote_has.contains(&o.id))
-        .map(|o| o.id)
-        .collect()
+        .collect();
+
+    if missing.is_empty() {
+        return Vec::new();
+    }
+
+    let missing_set: HashSet<OpId> = missing.iter().map(|o| o.id).collect();
+    let mut in_degree: HashMap<OpId, usize> = HashMap::new();
+    let mut children: HashMap<OpId, Vec<OpId>> = HashMap::new();
+    for &op in &missing {
+        let deg = op.parents.iter().filter(|p| missing_set.contains(*p)).count();
+        in_degree.insert(op.id, deg);
+        for &p in &op.parents {
+            if missing_set.contains(&p) {
+                children.entry(p).or_default().push(op.id);
+            }
+        }
+    }
+
+    let mut queue: VecDeque<OpId> = in_degree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&id, _)| id)
+        .collect();
+    let mut result = Vec::with_capacity(missing.len());
+    while let Some(id) = queue.pop_front() {
+        result.push(id);
+        if let Some(kids) = children.get(&id) {
+            for &kid in kids {
+                let d = in_degree.get_mut(&kid).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    queue.push_back(kid);
+                }
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]

@@ -8,9 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-blake3 = { workspace = true }
-hashbrown = { workspace = true, features = ["serde"] }
-postcard = { workspace = true }
+blake3 = { workspace = true, default-features = false }
+hashbrown = { workspace = true, default-features = false, features = ["serde"] }
+postcard = { workspace = true, default-features = false, features = ["alloc"] }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 
 [features]

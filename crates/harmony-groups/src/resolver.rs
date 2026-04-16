@@ -280,23 +280,17 @@ fn apply_op(state: &mut GroupState, op: &GroupOp) {
         }
 
         GroupAction::Join => {
-            state.members.insert(
-                op.author,
-                MemberEntry {
-                    role: Role::Member,
-                    joined_at: op.timestamp,
-                },
-            );
+            state.members.entry(op.author).or_insert(MemberEntry {
+                role: Role::Member,
+                joined_at: op.timestamp,
+            });
         }
 
         GroupAction::Accept { .. } => {
-            state.members.insert(
-                op.author,
-                MemberEntry {
-                    role: Role::Member,
-                    joined_at: op.timestamp,
-                },
-            );
+            state.members.entry(op.author).or_insert(MemberEntry {
+                role: Role::Member,
+                joined_at: op.timestamp,
+            });
         }
 
         GroupAction::Leave => {
