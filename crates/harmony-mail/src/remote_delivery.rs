@@ -97,9 +97,8 @@ pub fn seal_for_recipient(
 /// `RecipientResolver` that will translate discovery `AnnounceRecord`s
 /// into `Identity` values lives in the follow-up main.rs wiring PR,
 /// within this same crate. External callers have no need for it today.
-/// Exercised by the unit tests below; `#[allow(dead_code)]` covers the
-/// non-test build where no production caller exists yet.
-#[allow(dead_code)]
+/// Exercised by the unit tests below; now also called by the production
+/// `ZenohRecipientResolver` within this crate.
 pub(crate) fn identity_from_announce_record(
     rec: &AnnounceRecord,
 ) -> Result<Identity, RemoteDeliveryError> {
@@ -144,6 +143,59 @@ pub(crate) fn identity_from_announce_record(
 /// the wrong public keys.
 pub trait RecipientResolver: Send + Sync + 'static {
     fn resolve(&self, address_hash: &IdentityHash) -> Option<Identity>;
+}
+
+/// A `RecipientResolver` that queries the Zenoh network for identity
+/// announcements in real time. Uses the `harmony/identity/{hex}/resolve`
+/// key expression to fetch an `AnnounceRecord`, then converts it to an
+/// `Identity` via `identity_from_announce_record`.
+///
+/// Because `RecipientResolver::resolve` is synchronous but Zenoh's API is
+/// async, this implementation bridges via `tokio::task::block_in_place` +
+/// `Handle::current().block_on`. This requires a multi-threaded Tokio runtime
+/// (which `harmony-mail` uses via `#[tokio::main]`).
+pub struct ZenohRecipientResolver {
+    session: std::sync::Arc<zenoh::Session>,
+    query_timeout: std::time::Duration,
+}
+
+impl ZenohRecipientResolver {
+    pub fn new(
+        session: std::sync::Arc<zenoh::Session>,
+        query_timeout: std::time::Duration,
+    ) -> Self {
+        Self { session, query_timeout }
+    }
+}
+
+impl RecipientResolver for ZenohRecipientResolver {
+    fn resolve(&self, address_hash: &IdentityHash) -> Option<Identity> {
+        let hex = hex::encode(address_hash);
+        let key = harmony_zenoh::namespace::identity::resolve_key(&hex);
+        let session = std::sync::Arc::clone(&self.session);
+        let timeout = self.query_timeout;
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let replies = session.get(&key).await.ok()?;
+                tokio::time::timeout(timeout, async {
+                    while let Ok(reply) = replies.recv_async().await {
+                        match reply.result() {
+                            Ok(sample) => {
+                                let bytes = sample.payload().to_bytes();
+                                let rec = AnnounceRecord::deserialize(&bytes).ok()?;
+                                return identity_from_announce_record(&rec).ok();
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                    None
+                })
+                .await
+                .ok()?
+            })
+        })
+    }
 }
 
 #[cfg(test)]
