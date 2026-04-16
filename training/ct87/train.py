@@ -1042,6 +1042,43 @@ def main() -> None:
         val_loader = make_hf_dataloader(args.val_data, seq_len, args.batch_size, args.seed + 1)
         print(f"Validation data loaded from {args.val_data}")
 
+    # ZEB-128: Zero-injection evaluation mode
+    if args.zero_injection_eval:
+        if args.resume_from is None:
+            print("Error: --zero-injection-eval requires --resume-from", file=sys.stderr)
+            sys.exit(1)
+        if val_loader is None:
+            print("Error: --zero-injection-eval requires --val-data", file=sys.stderr)
+            sys.exit(1)
+        ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        required_keys = {"model_state_dict", "step"}
+        if not required_keys.issubset(ckpt.keys()):
+            print(
+                f"Error: checkpoint missing required keys: "
+                f"{required_keys - ckpt.keys()}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        step = ckpt["step"]
+        val_pre = compute_validation_loss(
+            model, val_loader, config.vocab_size, device,
+            amp_dtype=amp_dtype, engram_table=engram_table,
+            latent_projection=latent_projection,
+        )
+        model.engram_inject_mult = 0.0
+        val_post = compute_validation_loss(
+            model, val_loader, config.vocab_size, device,
+            amp_dtype=amp_dtype, engram_table=engram_table,
+            latent_projection=latent_projection,
+        )
+        delta_removal = val_post - val_pre
+        print(f"Step: {step}")
+        print(f"Val loss (with injection):    {val_pre:.6f}")
+        print(f"Val loss (without injection): {val_post:.6f}")
+        print(f"Delta (removal cost):         {delta_removal:+.6f}")
+        return
+
     csv_file = None
     csv_writer = None
     if args.log_file:
