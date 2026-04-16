@@ -86,8 +86,8 @@ async fn build_remote_delivery(
     );
 
     let zenoh_config = match config.zenoh.as_ref() {
-        Some(zc) => zc.to_zenoh_config(),
-        None => harmony_mail::config::default_zenoh_client_config(),
+        Some(zc) if zc.enabled => zc.to_zenoh_config(),
+        _ => harmony_mail::config::default_zenoh_client_config(),
     }
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 

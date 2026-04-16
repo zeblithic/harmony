@@ -328,10 +328,11 @@ pub async fn run(
                 "Zenoh enabled but MailboxManager unavailable — skipping session open to avoid leaking the drain task"
             );
         } else if zenoh_enabled {
-            let zenoh_config = match config.zenoh.as_ref() {
-                Some(zc) => zc.to_zenoh_config(),
-                None => crate::config::default_zenoh_client_config(),
-            };
+            let zenoh_config = config
+                .zenoh
+                .as_ref()
+                .expect("zenoh_enabled implies config.zenoh.is_some()")
+                .to_zenoh_config();
             match zenoh_config {
                 Err(e) => {
                     tracing::error!(error = %e, "Zenoh config build failed, mailbox notifications disabled");

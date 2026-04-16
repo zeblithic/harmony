@@ -563,6 +563,7 @@ identity_key = "/tmp/test.key"
         let cfg = zc.to_zenoh_config().expect("should build");
         let json = serde_json::to_value(cfg).expect("should serialize");
         assert_eq!(json["mode"], "client");
+        assert_eq!(json["listen"]["endpoints"], serde_json::json!([]));
     }
 
     #[test]
@@ -574,6 +575,7 @@ identity_key = "/tmp/test.key"
         let cfg = zc.to_zenoh_config().expect("should build");
         let json = serde_json::to_value(cfg).expect("should serialize");
         assert_eq!(json["mode"], "client");
+        assert_eq!(json["listen"]["endpoints"], serde_json::json!([]));
         let endpoints = json["connect"]["endpoints"].as_array().expect("array");
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0], "tcp/10.0.0.1:7447");
@@ -584,5 +586,6 @@ identity_key = "/tmp/test.key"
         let cfg = default_zenoh_client_config().expect("should build");
         let json = serde_json::to_value(cfg).expect("should serialize");
         assert_eq!(json["mode"], "client");
+        assert_eq!(json["listen"]["endpoints"], serde_json::json!([]));
     }
 }
