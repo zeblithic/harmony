@@ -1001,9 +1001,9 @@ class TestEngramCrossAttentionHeadGates:
         m = EngramCrossAttention(c, t, use_head_gates=True)
         with torch.no_grad():
             m.o_proj.weight.add_(torch.randn_like(m.o_proj.weight) * 0.01)
-            # Set gates to different values: head 0 high, head 7 low
+            # Set gates to different values: head 0 high, last head low
             m.head_gates.copy_(torch.tensor(
-                [2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -2.0]
+                [2.0, 0.5, -0.5, -2.0]
             ))
         h = torch.randn(2, 6, c.hidden_dim)
         out = m(h)
