@@ -109,3 +109,58 @@ class TestXattnOutputCapture:
         assert model._last_pre_injection_hidden is not None
         assert model._last_pre_injection_hidden.shape == (1, 16, config.hidden_dim)
         assert not model._last_pre_injection_hidden.requires_grad  # detached
+
+
+class TestInjectionMultiplier:
+
+    def test_multiplier_scales_xattn_output(self):
+        config = _tiny_config()
+        config.use_xattn_engram = True
+        model = HarmonyModel(config)
+        table = _fake_table(100, config.engram_dim)
+        xattn = EngramCrossAttention(config, table)
+        model.attach_engram_xattn(xattn)
+
+        x = torch.randint(0, config.vocab_size, (1, 16))
+
+        model.engram_inject_mult = 1.0
+        model(x)
+        full_output = model._last_xattn_output.clone()
+
+        model.engram_inject_mult = 0.5
+        model(x)
+        half_output = model._last_xattn_output.clone()
+
+        # Captured output should be the same (pre-scaling)
+        assert torch.allclose(full_output, half_output, atol=1e-5)
+
+    def test_zero_multiplier_zeroes_injection(self):
+        config = _tiny_config()
+        config.use_xattn_engram = True
+        model = HarmonyModel(config)
+        table = _fake_table(100, config.engram_dim)
+        xattn = EngramCrossAttention(config, table)
+        model.attach_engram_xattn(xattn)
+
+        x = torch.randint(0, config.vocab_size, (1, 16))
+
+        # Train for a step to break zero-init symmetry on o_proj
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        model.engram_inject_mult = 1.0
+        logits = model(x)
+        logits.sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        model.engram_inject_mult = 1.0
+        logits_full = model(x).detach()
+        model.engram_inject_mult = 0.0
+        logits_zero = model(x).detach()
+
+        # Compare to no-xattn model
+        config2 = _tiny_config()
+        model2 = HarmonyModel(config2)
+        model2.load_state_dict(model.state_dict(), strict=False)
+        logits_no_engram = model2(x).detach()
+
+        assert torch.allclose(logits_zero, logits_no_engram, atol=1e-5)

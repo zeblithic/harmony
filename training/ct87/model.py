@@ -468,6 +468,7 @@ class HarmonyModel(nn.Module):
         self._last_ann_gate: torch.Tensor | None = None
         self._last_xattn_output: torch.Tensor | None = None
         self._last_pre_injection_hidden: torch.Tensor | None = None
+        self.engram_inject_mult: float = 1.0
 
         # Tied embeddings
         if config.tie_embeddings:
@@ -624,7 +625,7 @@ class HarmonyModel(nn.Module):
                     self._last_pre_injection_hidden = h.detach()
                     xattn_out = self.engram_xattn(h)
                     self._last_xattn_output = xattn_out
-                    h = h + xattn_out
+                    h = h + xattn_out * self.engram_inject_mult
                 elif self.engram_ann is not None:
                     residual, gate = self.engram_ann(h)
                     h = h + residual
