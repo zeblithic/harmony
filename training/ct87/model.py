@@ -643,7 +643,7 @@ class HarmonyModel(nn.Module):
             #   Model delta (xattn) > Model gamma (ANN) > production (embeddings)
             if i == self.config.engram_injection_layer:
                 if self.engram_xattn is not None:
-                    self._last_pre_injection_hidden = h.detach()
+                    self._last_pre_injection_hidden = h
                     xattn_out = self.engram_xattn(h)
                     self._last_xattn_output = xattn_out
                     h = h + xattn_out * self.engram_inject_mult

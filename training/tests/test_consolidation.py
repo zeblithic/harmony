@@ -112,7 +112,7 @@ class TestXattnOutputCapture:
 
         assert model._last_pre_injection_hidden is not None
         assert model._last_pre_injection_hidden.shape == (1, 16, config.hidden_dim)
-        assert not model._last_pre_injection_hidden.requires_grad  # detached
+        assert model._last_pre_injection_hidden.requires_grad  # live — MSE grads flow into model
 
 
 class TestInjectionMultiplier:
