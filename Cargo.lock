@@ -3373,6 +3373,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-groups"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hashbrown 0.15.5",
+ "postcard",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harmony-identity"
 version = "0.1.0"
 dependencies = [
@@ -3526,8 +3538,10 @@ dependencies = [
  "ciborium",
  "dashmap",
  "ed25519-dalek",
+ "futures-util",
  "harmony-crypto",
  "harmony-identity",
+ "harmony-mail-discovery",
  "hex",
  "hickory-resolver 0.24.4",
  "rand_core 0.6.4",
