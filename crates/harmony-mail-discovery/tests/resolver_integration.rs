@@ -463,3 +463,51 @@ async fn soft_fail_expires_after_72h_and_returns_does_not_participate() {
         ResolveOutcome::DomainDoesNotParticipate,
     );
 }
+
+#[tokio::test]
+async fn verification_failure_does_not_poison_negative_cache() {
+    let (d, dns, http, _time, resolver) = setup();
+    let mut rng = OsRng;
+    let sk = d.mint_signing_key(&mut rng, NOW - 100, NOW + 90 * 86_400);
+    let claim = ClaimBuilder::new(&d, &sk, NOW).build();
+    dns.set("_harmony.q8.fyi", Ok(vec![build_dns_txt(&d)]));
+    http.set_not_found(&harmony_mail_discovery::http::revocation_url(&d.domain));
+
+    // Serve a malformed claim body (bad CBOR) → first resolve returns Transient.
+    let h = claim.payload.hashed_local_part;
+    let claim_url = harmony_mail_discovery::http::claim_url(&d.domain, &h);
+    http.set(
+        &claim_url,
+        Ok(HttpResponse {
+            status: 200,
+            body: vec![0xff, 0xff, 0xff],
+        }),
+    );
+    match resolver.resolve("alice", "q8.fyi").await {
+        ResolveOutcome::Transient { .. } => {}
+        other => panic!("first call: expected Transient, got {other:?}"),
+    }
+
+    // Fix the claim. Second resolve should NOT return UserUnknown from a
+    // poisoned negative cache — it should re-fetch and succeed.
+    let revocation_url = harmony_mail_discovery::http::revocation_url(&d.domain);
+    let rev_list = d.revocation_list(NOW, vec![]);
+    http.set(
+        &revocation_url,
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&rev_list).unwrap(),
+        }),
+    );
+    http.set(
+        &claim_url,
+        Ok(HttpResponse {
+            status: 200,
+            body: canonical_cbor(&claim).unwrap(),
+        }),
+    );
+    match resolver.resolve("alice", "q8.fyi").await {
+        ResolveOutcome::Resolved(_) => {}
+        other => panic!("second call: expected Resolved, got {other:?}"),
+    }
+}

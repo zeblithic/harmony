@@ -79,8 +79,13 @@ fn parse_single_harmony_txt(txt: &str) -> Result<DomainRecord, DnsFetchError> {
             .ok_or_else(|| DnsFetchError::Malformed(format!("field missing '=': {field}")))?;
         match name.trim() {
             "v" => {
-                if value.trim() != "harmony1" {
-                    return Err(DnsFetchError::UnsupportedVersion(0));
+                let trimmed = value.trim();
+                if trimmed != "harmony1" {
+                    let ver = trimmed
+                        .strip_prefix("harmony")
+                        .and_then(|n| n.parse::<u8>().ok())
+                        .unwrap_or(0);
+                    return Err(DnsFetchError::UnsupportedVersion(ver));
                 }
                 version = Some(1);
             }

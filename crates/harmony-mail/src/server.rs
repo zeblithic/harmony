@@ -1135,7 +1135,16 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                     // Non-local domain: consult the EmailResolver (ZEB-120).
                     match email_resolver {
                         Some(er) => {
-                            match er.resolve(local_part, domain).await {
+                            let outcome = match tokio::time::timeout(
+                                Duration::from_secs(15),
+                                er.resolve(local_part, domain),
+                            ).await {
+                                Ok(o) => o,
+                                Err(_) => harmony_mail_discovery::resolver::ResolveOutcome::Transient {
+                                    reason: "resolver_timeout",
+                                },
+                            };
+                            match outcome {
                                 harmony_mail_discovery::resolver::ResolveOutcome::Resolved(hash) => {
                                     Some(hash)
                                 }

@@ -152,8 +152,6 @@ impl HttpClient for ReqwestHttpClient {
                 HttpError::Timeout
             } else if e.is_connect() {
                 HttpError::Connect(e.to_string())
-            } else if e.is_redirect() {
-                HttpError::RedirectRefused
             } else {
                 HttpError::Other(e.to_string())
             }
@@ -164,7 +162,7 @@ impl HttpClient for ReqwestHttpClient {
         // check Content-Length as a first line of defense, then cap on
         // the collected bytes as a second.
         if let Some(len) = resp.content_length() {
-            if len as usize > self.body_cap_bytes {
+            if len > self.body_cap_bytes as u64 {
                 return Err(HttpError::BodyTooLarge);
             }
         }

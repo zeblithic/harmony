@@ -322,10 +322,6 @@ impl EmailResolver for DefaultEmailResolver {
             Err(VerifyError::CertRevoked { .. }) => ResolveOutcome::Revoked,
             Err(e) => {
                 warn!(error = %e, %domain, %local_part, "claim verification failed");
-                self.caches.mark_negative(
-                    (domain.clone(), h),
-                    now.saturating_add(self.config.negative_cache_secs),
-                );
                 ResolveOutcome::Transient {
                     reason: verify_err_reason(&e),
                 }

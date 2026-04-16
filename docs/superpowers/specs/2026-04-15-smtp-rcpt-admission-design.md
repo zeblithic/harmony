@@ -591,7 +591,7 @@ Worst-case propagation lag: 6 hours.
 | Multiple `v=harmony1` TXT records | `Transient{"dns_multiple_records"}` | 451 |
 | Malformed required fields, within soft-fail | `Transient{"dns_malformed"}` | 451 |
 | Malformed required fields, outside soft-fail | `DomainDoesNotParticipate` | 550 |
-| Unknown `v=` version | `DomainDoesNotParticipate` | 550 |
+| Unknown `v=` version | `Transient{"dns_unsupported_version"}` | 451 |
 | DNS timeout / SERVFAIL | `Transient{"dns_timeout"}` or `Transient{"dns_error"}` | 451 |
 | Domain name syntactically invalid (pre-flight) | `UserUnknown` | 550 |
 

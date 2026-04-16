@@ -183,8 +183,11 @@ impl RecipientResolver for ZenohRecipientResolver {
                         match reply.result() {
                             Ok(sample) => {
                                 let bytes = sample.payload().to_bytes();
-                                let rec = AnnounceRecord::deserialize(&bytes).ok()?;
-                                return identity_from_announce_record(&rec).ok();
+                                if let Ok(rec) = AnnounceRecord::deserialize(&bytes) {
+                                    if let Ok(id) = identity_from_announce_record(&rec) {
+                                        return Some(id);
+                                    }
+                                }
                             }
                             Err(_) => continue,
                         }
