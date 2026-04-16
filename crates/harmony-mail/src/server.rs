@@ -140,12 +140,28 @@ const DATA_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 /// Interval for cleaning up stale per-IP entries.
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// All context needed for remote (non-local) delivery via the Harmony network.
+///
+/// Wrapping the three collaborators in a single struct eliminates the invalid
+/// state where one `Option` is `Some` and the other is `None`.
+#[derive(Clone)]
+pub struct RemoteDeliveryContext {
+    pub gateway_identity: Arc<harmony_identity::PrivateIdentity>,
+    pub recipient_resolver: Arc<dyn crate::remote_delivery::RecipientResolver>,
+    pub email_resolver: Arc<dyn harmony_mail_discovery::resolver::EmailResolver>,
+}
+
 /// Run the SMTP server with the given configuration.
 pub async fn run(
     config: Config,
-    gateway_identity: Option<Arc<harmony_identity::PrivateIdentity>>,
-    recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>>,
+    remote_delivery: Option<RemoteDeliveryContext>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Shadow the old two-Option locals so all downstream code is unchanged.
+    let gateway_identity =
+        remote_delivery.as_ref().map(|ctx| Arc::clone(&ctx.gateway_identity));
+    let recipient_resolver: Option<Arc<dyn crate::remote_delivery::RecipientResolver>> =
+        remote_delivery.as_ref().map(|ctx| Arc::clone(&ctx.recipient_resolver));
+
     let max_message_size = parse_message_size(&config.spam.max_message_size);
 
     let shared = Arc::new(SharedState::new(config.spam.max_connections_per_ip));

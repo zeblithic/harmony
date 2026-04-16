@@ -95,7 +95,7 @@ async fn main() {
                     eprintln!("Failed to load config from {config_path}: {e}");
                     std::process::exit(1);
                 });
-            if let Err(e) = harmony_mail::server::run(config, None, None).await {
+            if let Err(e) = harmony_mail::server::run(config, None).await {
                 eprintln!("Server error: {e}");
                 std::process::exit(1);
             }

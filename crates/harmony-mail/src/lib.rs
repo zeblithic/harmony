@@ -15,6 +15,7 @@ pub mod outbound;
 pub mod registry;
 pub mod remote_delivery;
 pub mod server;
+pub use server::RemoteDeliveryContext;
 pub mod smtp;
 pub mod smtp_parse;
 pub mod spam;
