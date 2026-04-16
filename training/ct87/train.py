@@ -820,7 +820,9 @@ def main() -> None:
             restore_rng_state(ckpt["rng_state"], device)
         if "dynamic_entropy_lambda" in ckpt:
             _pending_entropy_lambda = ckpt["dynamic_entropy_lambda"]
-        last_val = ckpt.get("last_val_loss") or ckpt.get("best_val_loss")
+        last_val = ckpt.get("last_val_loss")
+        if last_val is None:
+            last_val = ckpt.get("best_val_loss")
         if last_val is not None:
             print(f"  Resuming from step {start_step}, last_val_loss={last_val:.4f}")
         else:
