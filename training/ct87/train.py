@@ -320,6 +320,9 @@ def main() -> None:
             "tiny", "target", "tiny_ffn_expanded",
             "tiny_engram_ann", "tiny_engram_ann_routed",
             "tiny_engram_xattn", "tiny_engram_xattn_routed",
+            "tiny_engram_xattn_consol_online",
+            "tiny_engram_xattn_consol_phased",
+            "tiny_engram_xattn_ctrl",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -497,9 +500,41 @@ def main() -> None:
         "--qat-start-pct", type=float, default=0.9,
         help="Fraction of total steps at which to activate QAT (default: 0.9 = last 10%%)",
     )
+    # ---- ZEB-128: Engram consolidation ----
+    parser.add_argument(
+        "--consolidation-mode", choices=["none", "online", "phased"],
+        default="none",
+        help="Consolidation strategy: 'none' (control), 'online' (MSE loss "
+             "throughout), 'phased' (MSE loss after --consolidation-start-step)",
+    )
+    parser.add_argument(
+        "--consolidation-lambda", type=float, default=0.1,
+        help="Weight for consolidation MSE loss (default: 0.1)",
+    )
+    parser.add_argument(
+        "--consolidation-start-step", type=int, default=0,
+        help="Step at which consolidation MSE loss activates (default: 0 for "
+             "online, typically 7000 for phased)",
+    )
+    parser.add_argument(
+        "--consolidation-anneal", action="store_true",
+        help="Linearly anneal injection multiplier from 1.0 to 0.0 during "
+             "consolidation phase (only meaningful with --consolidation-mode=phased)",
+    )
+    parser.add_argument(
+        "--zero-injection-eval", action="store_true",
+        help="Load checkpoint, zero engram injection, run validation, and exit. "
+             "Used for post-removal measurement in consolidation experiments.",
+    )
     args = parser.parse_args()
 
-    if args.data is None and not args.synthetic:
+    # --zero-injection-eval is an eval-only early-exit path, so training data
+    # is not required when that flag is set.
+    if (
+        args.data is None
+        and not args.synthetic
+        and not args.zero_injection_eval
+    ):
         print("Error: must provide --data <path> or --synthetic", file=sys.stderr)
         sys.exit(1)
 
@@ -605,6 +640,12 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_engram_xattn()
     elif args.config == "tiny_engram_xattn_routed":
         config = HarmonyModelConfig.tiny_engram_xattn_routed()
+    elif args.config == "tiny_engram_xattn_consol_online":
+        config = HarmonyModelConfig.tiny_engram_xattn_consol_online()
+    elif args.config == "tiny_engram_xattn_consol_phased":
+        config = HarmonyModelConfig.tiny_engram_xattn_consol_phased()
+    elif args.config == "tiny_engram_xattn_ctrl":
+        config = HarmonyModelConfig.tiny_engram_xattn_ctrl()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
@@ -638,7 +679,10 @@ def main() -> None:
             sys.exit(1)
 
     # Model delta arg validation (ZEB-117)
-    if args.config in ("tiny_engram_xattn", "tiny_engram_xattn_routed"):
+    if args.config in ("tiny_engram_xattn", "tiny_engram_xattn_routed",
+                        "tiny_engram_xattn_consol_online",
+                        "tiny_engram_xattn_consol_phased",
+                        "tiny_engram_xattn_ctrl"):
         if args.engram_xattn_table is None:
             print(
                 "Error: --config=tiny_engram_xattn requires --engram-xattn-table "
@@ -667,6 +711,34 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+
+    # ZEB-128 consolidation arg validation
+    if args.consolidation_mode != "none":
+        if not config.use_xattn_engram:
+            print(
+                "Error: --consolidation-mode requires a cross-attention engram "
+                "config (e.g. tiny_engram_xattn_consol_online)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.consolidation_lambda <= 0 or not math.isfinite(args.consolidation_lambda):
+            print(
+                "Error: --consolidation-lambda must be finite and > 0",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.consolidation_start_step < 0:
+            print(
+                "Error: --consolidation-start-step must be >= 0",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    if args.consolidation_anneal and args.consolidation_mode != "phased":
+        print(
+            "Error: --consolidation-anneal only applies to --consolidation-mode=phased",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if args.coconut:
         if args.think_token_id < 0:
@@ -795,6 +867,17 @@ def main() -> None:
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
+
+    # ZEB-128: Consolidation decoder
+    consol_decoder = None
+    if args.consolidation_mode != "none" and model.engram_xattn is not None:
+        from ct87.engram import EngramConsolidationDecoder
+        consol_decoder = EngramConsolidationDecoder(config.hidden_dim).to(device)
+        print(
+            f"Consolidation decoder attached: mode={args.consolidation_mode}, "
+            f"lambda={args.consolidation_lambda}, "
+            f"start_step={args.consolidation_start_step}"
+        )
 
     # Resume from checkpoint after all modules are attached (including ANN)
     # so their weights are loaded. strict=False handles tied embeddings where
@@ -953,6 +1036,14 @@ def main() -> None:
     if latent_projection is not None and args.contrastive_loss:
         adam_params.extend(latent_projection.parameters())
     optimizer = Muon(muon_params, adam_params, lr=args.lr, adam_lr=args.lr)
+    # Add the consolidation decoder's param group BEFORE loading optimizer
+    # state. Otherwise resuming a consolidation run hits a param-group-count
+    # mismatch in load_state_dict and falls back to a fresh optimizer.
+    if consol_decoder is not None:
+        optimizer.add_param_group({
+            "params": list(consol_decoder.parameters()),
+            "lr": args.lr,
+        })
     if _pending_optimizer_state is not None:
         try:
             optimizer.load_state_dict(_pending_optimizer_state)
@@ -966,15 +1057,76 @@ def main() -> None:
         del _pending_optimizer_state
     schedule = WSDSchedule(warmup_steps=args.warmup, total_steps=args.steps)
 
-    if args.synthetic:
-        dataloader = make_synthetic_dataloader(config.vocab_size, seq_len, args.batch_size, args.seed)
-    else:
-        dataloader = make_hf_dataloader(args.data, seq_len, args.batch_size, args.seed)
+    # Skip building the training dataloader for eval-only runs — they never
+    # enter the training loop, and --zero-injection-eval is allowed to omit
+    # --data / --synthetic.
+    dataloader = None
+    if not args.zero_injection_eval:
+        if args.synthetic:
+            dataloader = make_synthetic_dataloader(config.vocab_size, seq_len, args.batch_size, args.seed)
+        else:
+            dataloader = make_hf_dataloader(args.data, seq_len, args.batch_size, args.seed)
 
     val_loader = None
     if args.val_data is not None:
         val_loader = make_hf_dataloader(args.val_data, seq_len, args.batch_size, args.seed + 1)
         print(f"Validation data loaded from {args.val_data}")
+
+    # ZEB-128: Zero-injection evaluation mode
+    if args.zero_injection_eval:
+        if args.resume_from is None:
+            print("Error: --zero-injection-eval requires --resume-from", file=sys.stderr)
+            sys.exit(1)
+        if not args.resume_from.endswith(".pt"):
+            print(
+                "Error: --zero-injection-eval requires a resumable .pt "
+                "checkpoint (safetensors checkpoints do not carry the step "
+                "metadata needed for this mode)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if val_loader is None:
+            print("Error: --zero-injection-eval requires --val-data", file=sys.stderr)
+            sys.exit(1)
+        ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        required_keys = {"model_state_dict", "step"}
+        if not required_keys.issubset(ckpt.keys()):
+            print(
+                f"Error: checkpoint missing required keys: "
+                f"{required_keys - ckpt.keys()}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        step = ckpt["step"]
+        # Materialize a fixed set of validation batches so pre/post
+        # measurements compare the same data — otherwise delta_removal is
+        # dominated by batch sampling noise rather than the injection toggle.
+        val_batches = [next(val_loader) for _ in range(10)]
+
+        def _replay_batches():
+            for b in val_batches:
+                yield b
+
+        val_pre = compute_validation_loss(
+            model, _replay_batches(), config.vocab_size, device,
+            num_batches=len(val_batches),
+            amp_dtype=amp_dtype, engram_table=engram_table,
+            latent_projection=latent_projection,
+        )
+        model.engram_inject_mult = 0.0
+        val_post = compute_validation_loss(
+            model, _replay_batches(), config.vocab_size, device,
+            num_batches=len(val_batches),
+            amp_dtype=amp_dtype, engram_table=engram_table,
+            latent_projection=latent_projection,
+        )
+        delta_removal = val_post - val_pre
+        print(f"Step: {step}")
+        print(f"Val loss (with injection):    {val_pre:.6f}")
+        print(f"Val loss (without injection): {val_post:.6f}")
+        print(f"Delta (removal cost):         {delta_removal:+.6f}")
+        return
 
     csv_file = None
     csv_writer = None
@@ -985,6 +1137,7 @@ def main() -> None:
             "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms",
             "hg_0", "hg_1", "hg_2", "hg_3", "hg_4", "hg_5", "hg_6", "hg_7",
             "hg_std", "hg_min", "hg_max",
+            "mse_loss", "consol_phase", "inject_mult",
         ]
         legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         legacy_header_no_ann = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
@@ -1003,7 +1156,18 @@ def main() -> None:
                 migrations_needed.append("ann")
             if header == legacy_header_no_hg:
                 migrations_needed.append("hg")
-            if migrations_needed:
+            # Generalized trailing-column migration: if the existing header is
+            # a prefix of expected_header, pad rows with empty trailing columns.
+            # Covers pre-consolidation (hg columns present, no mse/consol) and
+            # any future appended-column migrations without needing a named
+            # legacy constant per generation.
+            is_trailing_prefix = (
+                header
+                and header != expected_header
+                and len(header) < len(expected_header)
+                and header == expected_header[: len(header)]
+            )
+            if migrations_needed or is_trailing_prefix:
                 with open(args.log_file, newline="") as f:
                     rows = list(csv.reader(f))
                 rows[0] = expected_header
@@ -1017,7 +1181,8 @@ def main() -> None:
                             rows[i].insert(offset, "")
                     if "hg" in migrations_needed:
                         rows[i].extend([""] * 11)
-                    # Pad any remaining column deficit (covers multi-generation gaps)
+                    # Pad any remaining column deficit (covers multi-generation
+                    # gaps and the generalized trailing-prefix case).
                     deficit = len(expected_header) - len(rows[i])
                     if deficit > 0:
                         rows[i].extend([""] * deficit)
@@ -1078,9 +1243,25 @@ def main() -> None:
             accum_cl_loss = 0.0
             accum_ann_ent_loss = 0.0
             accum_ann_gate_mean = 0.0
+            accum_mse_loss = 0.0
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
             need_hidden = mtp_head is not None
             use_coconut = args.coconut and num_thoughts > 0
+
+            # ZEB-128: Update injection multiplier for phased annealing.
+            # Denominator uses (args.steps - 1) so inject_mult reaches exactly
+            # 0.0 on the final executed step (range(start, args.steps) stops
+            # at args.steps - 1).
+            inject_mult = 1.0
+            if args.consolidation_anneal and step >= args.consolidation_start_step:
+                anneal_steps = max(
+                    1, (args.steps - 1) - args.consolidation_start_step
+                )
+                progress = (step - args.consolidation_start_step) / anneal_steps
+                inject_mult = max(0.0, 1.0 - progress)
+            if model.engram_xattn is not None:
+                model.engram_inject_mult = inject_mult
+
             for micro_step in range(args.grad_accum_steps):
                 batch = next(dataloader).to(device)
                 input_ids = batch[:, :-1]
@@ -1278,6 +1459,20 @@ def main() -> None:
                         accum_ann_ent_loss += ent_loss.item()
                         accum_ann_gate_mean += gate.mean().item()
 
+                    # ZEB-128: Consolidation MSE loss
+                    if (
+                        consol_decoder is not None
+                        and model._last_xattn_output is not None
+                        and model._last_pre_injection_hidden is not None
+                        and step >= args.consolidation_start_step
+                    ):
+                        consol_target = model._last_xattn_output.detach()
+                        consol_input = model._last_pre_injection_hidden
+                        consol_pred = consol_decoder(consol_input)
+                        mse_loss = F.mse_loss(consol_pred, consol_target)
+                        loss = loss + args.consolidation_lambda * mse_loss
+                        accum_mse_loss += mse_loss.item()
+
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
 
@@ -1292,6 +1487,8 @@ def main() -> None:
                     all_params.extend(mtp_head.parameters())
                 if latent_projection is not None and args.contrastive_loss:
                     all_params.extend(latent_projection.parameters())
+                if consol_decoder is not None:
+                    all_params.extend(consol_decoder.parameters())
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     all_params, args.max_grad_norm,
                 ).item()
@@ -1365,9 +1562,18 @@ def main() -> None:
                         f"  hg_min={gates.min().item():.3f}"
                         f"  hg_max={gates.max().item():.3f}"
                     )
+                consol_str = ""
+                if consol_decoder is not None:
+                    raw_mse = accum_mse_loss / args.grad_accum_steps
+                    consol_active = 1 if step >= args.consolidation_start_step else 0
+                    consol_str = (
+                        f"  mse={raw_mse:.4f}"
+                        f"  phase={consol_active}"
+                        f"  inject={inject_mult:.3f}"
+                    )
                 print(
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
-                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}"
+                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}"
                 )
 
             val_loss_str = ""
@@ -1424,7 +1630,7 @@ def main() -> None:
                     ann_ent_str = f"{accum_ann_ent_loss / args.grad_accum_steps:.6f}"
                     ann_gate_str = f"{accum_ann_gate_mean / args.grad_accum_steps:.6f}"
                     ann_lambda_str = f"{dynamic_entropy_lambda:.6f}"
-                n_hg_slots = len(expected_header) - 13  # 13 base columns before hg_*
+                n_hg_slots = len(expected_header) - 16  # 13 base columns before hg_*, 3 consol columns after
                 hg_cols = [""] * n_hg_slots
                 hg_module = None
                 if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
@@ -1440,6 +1646,13 @@ def main() -> None:
                     hg_cols[-3] = f"{gates.std().item():.6f}"
                     hg_cols[-2] = f"{gates.min().item():.6f}"
                     hg_cols[-1] = f"{gates.max().item():.6f}"
+                mse_loss_str = ""
+                consol_phase_str = ""
+                inject_mult_str = ""
+                if consol_decoder is not None:
+                    mse_loss_str = f"{accum_mse_loss / args.grad_accum_steps:.6f}"
+                    consol_phase_str = "1" if step >= args.consolidation_start_step else "0"
+                    inject_mult_str = f"{inject_mult:.6f}"
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
@@ -1455,6 +1668,9 @@ def main() -> None:
                     num_thoughts,
                     f"{dt_ms:.1f}",
                     *hg_cols,
+                    mse_loss_str,
+                    consol_phase_str,
+                    inject_mult_str,
                 ])
                 csv_file.flush()
 

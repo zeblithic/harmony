@@ -1051,3 +1051,28 @@ class EngramCrossAttention(nn.Module):
         they're using to load the shared table.
         """
         return EngramANNInjection.load_corpus_table(path, tensor_name)
+
+
+class EngramConsolidationDecoder(nn.Module):
+    """Lightweight decoder for engram consolidation (ZEB-128).
+
+    Predicts the engram module's residual output from the model's own
+    hidden state. Used as an auxiliary MSE training target to force
+    internalization of the engram signal into parametric knowledge.
+    Discarded after training — never saved or shipped.
+    """
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        nn.init.xavier_uniform_(self.net[0].weight)
+        nn.init.zeros_(self.net[0].bias)
+        nn.init.xavier_uniform_(self.net[2].weight)
+        nn.init.zeros_(self.net[2].bias)
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        return self.net(hidden_state)
