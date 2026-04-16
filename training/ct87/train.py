@@ -142,6 +142,65 @@ def _save_latent_projection(
     torch.save(projection.state_dict(), path)
 
 
+def save_resumable_checkpoint(
+    model: HarmonyModel,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    output_dir: str,
+    rng_state: dict | None = None,
+    best_val_loss: float | None = None,
+) -> None:
+    """Save a full resumable checkpoint with atomic rename."""
+    os.makedirs(output_dir, exist_ok=True)
+    payload = {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_val_loss": best_val_loss,
+    }
+    if rng_state is not None:
+        payload["rng_state"] = rng_state
+
+    ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    prev_path = os.path.join(output_dir, "checkpoint_prev.pt")
+    tmp_path = os.path.join(output_dir, "checkpoint.tmp")
+
+    torch.save(payload, tmp_path)
+
+    if os.path.exists(ckpt_path):
+        if os.path.exists(prev_path):
+            os.remove(prev_path)
+        os.rename(ckpt_path, prev_path)
+    os.rename(tmp_path, ckpt_path)
+
+
+def capture_rng_state() -> dict:
+    """Capture all RNG states for deterministic resume."""
+    import random
+    import numpy as np
+
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state()
+    return state
+
+
+def restore_rng_state(state: dict) -> None:
+    """Restore all RNG states from a checkpoint."""
+    import random
+    import numpy as np
+
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if "torch_cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state(state["torch_cuda"])
+
+
 def load_checkpoint(
     model: HarmonyModel,
     output_dir: str,
@@ -245,6 +304,7 @@ def main() -> None:
         choices=[
             "tiny", "target", "tiny_ffn_expanded",
             "tiny_engram_ann", "tiny_engram_xattn",
+            "tiny_engram_xattn_routed",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -263,6 +323,12 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--save-every", type=int, default=250)
+    parser.add_argument(
+        "--checkpoint-interval", type=int, default=0,
+        help="Save resumable checkpoint every N steps (0=disabled). "
+             "Includes model, optimizer, RNG state for exact resume. "
+             "Retains last 2 checkpoints for crash recovery.",
+    )
     parser.add_argument("--output-dir", type=str, default="training/checkpoints")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
@@ -518,6 +584,8 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_engram_ann()
     elif args.config == "tiny_engram_xattn":
         config = HarmonyModelConfig.tiny_engram_xattn()
+    elif args.config == "tiny_engram_xattn_routed":
+        config = HarmonyModelConfig.tiny_engram_xattn_routed()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
@@ -551,7 +619,7 @@ def main() -> None:
             sys.exit(1)
 
     # Model delta arg validation (ZEB-117)
-    if args.config == "tiny_engram_xattn":
+    if args.config in ("tiny_engram_xattn", "tiny_engram_xattn_routed"):
         if args.engram_xattn_table is None:
             print(
                 "Error: --config=tiny_engram_xattn requires --engram-xattn-table "
@@ -693,6 +761,7 @@ def main() -> None:
             num_heads=args.engram_xattn_num_heads,
             k_retrieved=args.engram_xattn_k_retrieved,
             retrieval_bias_weight=args.engram_xattn_retrieval_bias_weight,
+            use_head_gates=config.use_head_gates,
         ).to(device)
         model.attach_engram_xattn(xattn_module)
         print(

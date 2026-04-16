@@ -1009,3 +1009,9 @@ class TestEngramCrossAttentionHeadGates:
         out = m(h)
         # Output should be nonzero and not uniform across hidden dims
         assert out.abs().max() > 1e-6
+
+    def test_tiny_engram_xattn_routed_config(self):
+        c = HarmonyModelConfig.tiny_engram_xattn_routed()
+        assert c.use_xattn_engram is True
+        assert c.use_head_gates is True
+        assert c.num_query_heads == 8
