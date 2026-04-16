@@ -862,6 +862,17 @@ def main() -> None:
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
 
+    # ZEB-128: Consolidation decoder
+    consol_decoder = None
+    if args.consolidation_mode != "none" and model.engram_xattn is not None:
+        from ct87.engram import EngramConsolidationDecoder
+        consol_decoder = EngramConsolidationDecoder(config.hidden_dim).to(device)
+        print(
+            f"Consolidation decoder attached: mode={args.consolidation_mode}, "
+            f"lambda={args.consolidation_lambda}, "
+            f"start_step={args.consolidation_start_step}"
+        )
+
     # Resume from checkpoint after all modules are attached (including ANN)
     # so their weights are loaded. strict=False handles tied embeddings where
     # lm_head shares embed_tokens weights (missing key is expected).
@@ -1030,6 +1041,11 @@ def main() -> None:
                 file=sys.stderr,
             )
         del _pending_optimizer_state
+    if consol_decoder is not None:
+        optimizer.add_param_group({
+            "params": list(consol_decoder.parameters()),
+            "lr": args.lr,
+        })
     schedule = WSDSchedule(warmup_steps=args.warmup, total_steps=args.steps)
 
     if args.synthetic:
@@ -1181,9 +1197,21 @@ def main() -> None:
             accum_cl_loss = 0.0
             accum_ann_ent_loss = 0.0
             accum_ann_gate_mean = 0.0
+            accum_mse_loss = 0.0
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
             need_hidden = mtp_head is not None
             use_coconut = args.coconut and num_thoughts > 0
+
+            # ZEB-128: Update injection multiplier for phased annealing
+            inject_mult = 1.0
+            if args.consolidation_anneal and step >= args.consolidation_start_step:
+                progress = (step - args.consolidation_start_step) / max(
+                    1, args.steps - args.consolidation_start_step
+                )
+                inject_mult = max(0.0, 1.0 - progress)
+            if model.engram_xattn is not None:
+                model.engram_inject_mult = inject_mult
+
             for micro_step in range(args.grad_accum_steps):
                 batch = next(dataloader).to(device)
                 input_ids = batch[:, :-1]
@@ -1381,6 +1409,20 @@ def main() -> None:
                         accum_ann_ent_loss += ent_loss.item()
                         accum_ann_gate_mean += gate.mean().item()
 
+                    # ZEB-128: Consolidation MSE loss
+                    if (
+                        consol_decoder is not None
+                        and model._last_xattn_output is not None
+                        and model._last_pre_injection_hidden is not None
+                        and step >= args.consolidation_start_step
+                    ):
+                        consol_target = model._last_xattn_output.detach()
+                        consol_input = model._last_pre_injection_hidden
+                        consol_pred = consol_decoder(consol_input)
+                        mse_loss = F.mse_loss(consol_pred, consol_target)
+                        loss = loss + args.consolidation_lambda * mse_loss
+                        accum_mse_loss += mse_loss.item()
+
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
 
@@ -1395,6 +1437,8 @@ def main() -> None:
                     all_params.extend(mtp_head.parameters())
                 if latent_projection is not None and args.contrastive_loss:
                     all_params.extend(latent_projection.parameters())
+                if consol_decoder is not None:
+                    all_params.extend(consol_decoder.parameters())
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     all_params, args.max_grad_norm,
                 ).item()
