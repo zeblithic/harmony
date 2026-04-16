@@ -36,6 +36,7 @@ base64 = { workspace = true }
 hex.workspace = true
 
 [dev-dependencies]
+harmony-mail-discovery = { path = ".", features = ["test-support"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 rand_core = { workspace = true, features = ["std", "getrandom"] }
 base64 = { workspace = true }

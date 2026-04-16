@@ -109,19 +109,18 @@ pub struct DefaultEmailResolver {
     /// One `Semaphore(1)` per domain, used to serialise concurrent revocation
     /// refreshes for the same domain without blocking unrelated domains.
     ///
-    /// NOTE: this map grows once per distinct domain ever resolved and is
-    /// never pruned. For the expected footprint of a single gateway this is
-    /// a bounded cost, but Task 19's background sweep should evict entries
-    /// for domains that have not been seen recently (cf. `domain_last_seen`).
+    /// Pruned by the background sweep: entries for domains not seen within
+    /// the soft-fail window are evicted every sweep interval.
     revocation_refresh_locks: Arc<dashmap::DashMap<String, Arc<Semaphore>>>,
     /// Highest observed claim serial per `(domain, hashed_local_part)`.
     /// Used to detect serial rollback attacks: a claim whose serial is
     /// strictly less than the previously-seen highest is rejected as
     /// `Transient("claim_serial_rollback")`.
     ///
-    /// NOTE: this tracker lives only in memory, so a resolver restart
-    /// resets the high-water mark. Persistence is a Phase-2 concern
-    /// (spec §5.4.3 treats this protection as best-effort).
+    /// Pruned by the background sweep: entries whose corresponding claim
+    /// cache entry no longer exists are evicted every sweep interval.
+    /// Persistence is a Phase-2 concern (spec §5.4.3 treats this
+    /// protection as best-effort).
     highest_serial: Arc<DashMap<(String, [u8; 32]), u64>>,
     /// Handle to the background sweep task; held so the task is cancelled when
     /// the resolver is dropped. Wired up by the background-sweep task (Task 17+).
@@ -494,6 +493,9 @@ impl DefaultEmailResolver {
                 };
                 let now = this.time.now();
                 this.caches.sweep_expired(now);
+                this.highest_serial.retain(|k, _| this.caches.has_claim_key(k));
+                this.revocation_refresh_locks
+                    .retain(|domain, _| this.caches.is_domain_seen(domain));
                 // Per-domain revocation refresh scheduling: collect
                 // domains whose last_refreshed + refresh_secs < now.
                 let to_refresh: Vec<String> = this
@@ -524,5 +526,63 @@ impl Drop for DefaultEmailResolver {
                 handle.abort();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{ClaimBuilder, FakeTimeSource, TestDomain};
+    use rand_core::OsRng;
+
+    const NOW: u64 = 1_000_000;
+
+    fn make_resolver() -> DefaultEmailResolver {
+        let dns: Arc<dyn DnsClient> = Arc::new(crate::test_support::FakeDnsClient::new());
+        let http: Arc<dyn HttpClient> = Arc::new(crate::test_support::FakeHttpClient::new());
+        let time: Arc<dyn TimeSource> = Arc::new(FakeTimeSource::new(NOW));
+        DefaultEmailResolver::new(dns, http, time, ResolverConfig::default())
+    }
+
+    #[test]
+    fn sweep_prunes_highest_serial_without_claim() {
+        let r = make_resolver();
+        let mut rng = OsRng;
+        let d = TestDomain::new(&mut rng, "example.com");
+        let sk = d.mint_signing_key(&mut rng, NOW - 100, NOW + 86_400);
+        let claim = ClaimBuilder::new(&d, &sk, NOW).build();
+
+        let key_live: (String, [u8; 32]) =
+            ("example.com".into(), claim.payload.hashed_local_part);
+        let key_stale: (String, [u8; 32]) = ("example.com".into(), [2u8; 32]);
+
+        r.caches.put_claim(key_live.clone(), claim, u64::MAX, 0);
+        r.highest_serial.insert(key_live.clone(), 42);
+        r.highest_serial.insert(key_stale.clone(), 99);
+        assert_eq!(r.highest_serial.len(), 2);
+
+        r.highest_serial
+            .retain(|k, _| r.caches.has_claim_key(k));
+        assert_eq!(r.highest_serial.len(), 1);
+        assert!(r.highest_serial.contains_key(&key_live));
+        assert!(!r.highest_serial.contains_key(&key_stale));
+    }
+
+    #[test]
+    fn sweep_prunes_revocation_locks_for_unseen_domains() {
+        let r = make_resolver();
+
+        r.caches.mark_domain_seen("live.com", 1_000_000);
+        r.revocation_refresh_locks
+            .insert("live.com".into(), Arc::new(Semaphore::new(1)));
+        r.revocation_refresh_locks
+            .insert("stale.com".into(), Arc::new(Semaphore::new(1)));
+        assert_eq!(r.revocation_refresh_locks.len(), 2);
+
+        r.revocation_refresh_locks
+            .retain(|domain, _| r.caches.is_domain_seen(domain));
+        assert_eq!(r.revocation_refresh_locks.len(), 1);
+        assert!(r.revocation_refresh_locks.contains_key("live.com"));
+        assert!(!r.revocation_refresh_locks.contains_key("stale.com"));
     }
 }
