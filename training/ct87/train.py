@@ -303,8 +303,8 @@ def main() -> None:
         "--config",
         choices=[
             "tiny", "target", "tiny_ffn_expanded",
-            "tiny_engram_ann", "tiny_engram_xattn",
-            "tiny_engram_xattn_routed",
+            "tiny_engram_ann", "tiny_engram_ann_routed",
+            "tiny_engram_xattn", "tiny_engram_xattn_routed",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -582,6 +582,8 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_ffn_expanded()
     elif args.config == "tiny_engram_ann":
         config = HarmonyModelConfig.tiny_engram_ann()
+    elif args.config == "tiny_engram_ann_routed":
+        config = HarmonyModelConfig.tiny_engram_ann_routed()
     elif args.config == "tiny_engram_xattn":
         config = HarmonyModelConfig.tiny_engram_xattn()
     elif args.config == "tiny_engram_xattn_routed":
@@ -591,7 +593,7 @@ def main() -> None:
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
 
     # Model gamma arg validation (ZEB-117)
-    if args.config == "tiny_engram_ann":
+    if args.config in ("tiny_engram_ann", "tiny_engram_ann_routed"):
         if args.engram_ann_table is None:
             print(
                 "Error: --config=tiny_engram_ann requires --engram-ann-table "
@@ -717,6 +719,7 @@ def main() -> None:
             ann_table,
             clamp_until_step=args.engram_ann_warmup_steps,
             clamp_min=args.engram_ann_gate_clamp_min,
+            use_head_gates=config.use_head_gates,
         ).to(device)
         model.attach_engram_ann(ann_module)
         print(

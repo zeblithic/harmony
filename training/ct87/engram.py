@@ -531,6 +531,7 @@ class EngramANNInjection(nn.Module):
         clamp_until_step: int = 800,
         clamp_min: float = 0.5,
         retrieval_temperature: float | None = None,
+        use_head_gates: bool = False,
     ):
         super().__init__()
         if table.dim() != 2:
@@ -616,6 +617,12 @@ class EngramANNInjection(nn.Module):
         # Cache the current step as a Python int to avoid per-forward
         # GPU->CPU sync via .item().
         self._current_step_int: int = 0
+
+        self.use_head_gates = use_head_gates
+        if use_head_gates:
+            self.head_gates = nn.Parameter(torch.zeros(config.num_query_heads))
+            self._num_heads = config.num_query_heads
+            self._head_dim = config.hidden_dim // config.num_query_heads
 
     def set_step(self, step: int) -> None:
         """Update the current training step for gate-clamp scheduling."""
@@ -743,6 +750,13 @@ class EngramANNInjection(nn.Module):
             gate = raw_gate
 
         gated_value = gate * value
+
+        if self.use_head_gates:
+            B, L, _ = gated_value.shape
+            H, D = self._num_heads, self._head_dim
+            gated_value = gated_value.view(B, L, H, D)
+            gate_weights = torch.sigmoid(self.head_gates).view(1, 1, H, 1)
+            gated_value = (gated_value * gate_weights).view(B, L, H * D)
 
         ncl = gated_value.transpose(1, 2)
         padded = F.pad(ncl, (self.conv_kernel_size - 1, 0))

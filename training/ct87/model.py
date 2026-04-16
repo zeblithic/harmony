@@ -225,6 +225,17 @@ class HarmonyModelConfig:
         base.use_ann_engram = True
         return base
 
+    @staticmethod
+    def tiny_engram_ann_routed() -> HarmonyModelConfig:
+        """Model epsilon ablation 3: gamma gated-residual + per-head gates (ZEB-127).
+
+        Tests whether per-head routing helps the gamma injection mechanism.
+        """
+        base = HarmonyModelConfig.tiny()
+        base.use_ann_engram = True
+        base.use_head_gates = True
+        return base
+
 
 # ---------------------------------------------------------------------------
 # Layer building blocks

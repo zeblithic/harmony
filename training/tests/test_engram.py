@@ -1015,3 +1015,41 @@ class TestEngramCrossAttentionHeadGates:
         assert c.use_xattn_engram is True
         assert c.use_head_gates is True
         assert c.num_query_heads == 8
+
+
+class TestEngramANNHeadGates:
+    """Ablation epsilon-a3: per-head gates on the gamma gated-residual path."""
+
+    @staticmethod
+    def _ann_config() -> HarmonyModelConfig:
+        c = _tiny_config()
+        c.use_ann_engram = True
+        return c
+
+    @staticmethod
+    def _fake_table(total_entries: int, engram_dim: int) -> torch.Tensor:
+        g = torch.Generator().manual_seed(0)
+        return torch.randn(total_entries, engram_dim, generator=g)
+
+    def test_ann_head_gates_exist_when_enabled(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t, use_head_gates=True)
+        assert hasattr(m, "head_gates")
+        assert m.head_gates.shape == (c.num_query_heads,)
+
+    def test_ann_head_gates_gradient_flows(self):
+        from ct87.engram import EngramANNInjection
+        c = self._ann_config()
+        t = self._fake_table(20, c.engram_dim)
+        m = EngramANNInjection(c, t, use_head_gates=True)
+        h = torch.randn(2, 5, c.hidden_dim)
+        out, gate = m(h)
+        out.sum().backward()
+        assert m.head_gates.grad is not None
+
+    def test_ann_routed_config(self):
+        c = HarmonyModelConfig.tiny_engram_ann_routed()
+        assert c.use_ann_engram is True
+        assert c.use_head_gates is True
