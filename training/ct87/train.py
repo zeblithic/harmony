@@ -942,9 +942,16 @@ def main() -> None:
             "step", "loss", "uq_loss", "mtp_loss", "cl_loss",
             "ann_ent_loss", "ann_gate_mean", "ann_lambda_ent",
             "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms",
+            "hg_0", "hg_1", "hg_2", "hg_3", "hg_4", "hg_5", "hg_6", "hg_7",
+            "hg_std", "hg_min", "hg_max",
         ]
         legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         legacy_header_no_ann = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
+        legacy_header_no_hg = [
+            "step", "loss", "uq_loss", "mtp_loss", "cl_loss",
+            "ann_ent_loss", "ann_gate_mean", "ann_lambda_ent",
+            "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms",
+        ]
         if os.path.exists(args.log_file) and os.path.getsize(args.log_file) > 0:
             with open(args.log_file, newline="") as existing:
                 header = next(csv.reader(existing), [])
@@ -953,6 +960,8 @@ def main() -> None:
                 migrations_needed.append("cl_loss")
             if header in (legacy_header_no_cl, legacy_header_no_ann):
                 migrations_needed.append("ann")
+            if header == legacy_header_no_hg:
+                migrations_needed.append("hg")
             if migrations_needed:
                 with open(args.log_file, newline="") as f:
                     rows = list(csv.reader(f))
@@ -965,6 +974,8 @@ def main() -> None:
                         # Insert three empty ann columns after cl_loss
                         for offset in (5, 5, 5):
                             rows[i].insert(offset, "")
+                    if "hg" in migrations_needed:
+                        rows[i].extend([""] * 11)
                 with open(args.log_file, "w", newline="") as f:
                     csv.writer(f).writerows(rows)
             elif header and header != expected_header:
@@ -1291,9 +1302,18 @@ def main() -> None:
                         f"  ann_gate={raw_gate:.3f}"
                         f"  lambda_ent={dynamic_entropy_lambda:.4f}"
                     )
+                hg_str = ""
+                if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
+                    with torch.no_grad():
+                        gates = torch.sigmoid(model.engram_xattn.head_gates)
+                    hg_str = f"  hg_std={gates.std().item():.3f}"
+                elif hasattr(model, "engram_ann") and model.engram_ann is not None and hasattr(model.engram_ann, "head_gates"):
+                    with torch.no_grad():
+                        gates = torch.sigmoid(model.engram_ann.head_gates)
+                    hg_str = f"  hg_std={gates.std().item():.3f}"
                 print(
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
-                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}"
+                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}"
                 )
 
             val_loss_str = ""
@@ -1349,6 +1369,20 @@ def main() -> None:
                     ann_ent_str = f"{accum_ann_ent_loss / args.grad_accum_steps:.6f}"
                     ann_gate_str = f"{accum_ann_gate_mean / args.grad_accum_steps:.6f}"
                     ann_lambda_str = f"{dynamic_entropy_lambda:.6f}"
+                hg_cols = [""] * 11
+                hg_module = None
+                if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
+                    hg_module = model.engram_xattn
+                elif hasattr(model, "engram_ann") and model.engram_ann is not None and hasattr(model.engram_ann, "head_gates"):
+                    hg_module = model.engram_ann
+                if hg_module is not None:
+                    with torch.no_grad():
+                        gates = torch.sigmoid(hg_module.head_gates)
+                    for i in range(min(8, gates.numel())):
+                        hg_cols[i] = f"{gates[i].item():.6f}"
+                    hg_cols[8] = f"{gates.std().item():.6f}"
+                    hg_cols[9] = f"{gates.min().item():.6f}"
+                    hg_cols[10] = f"{gates.max().item():.6f}"
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
@@ -1363,6 +1397,7 @@ def main() -> None:
                     f"{grad_norm:.6f}" if grad_norm is not None else "",
                     num_thoughts,
                     f"{dt_ms:.1f}",
+                    *hg_cols,
                 ])
                 csv_file.flush()
 
