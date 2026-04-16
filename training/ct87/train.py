@@ -786,7 +786,7 @@ def main() -> None:
     _pending_optimizer_state = None
     if args.resume_from is not None and args.resume_from.endswith(".pt"):
         print(f"Loading resumable checkpoint from {args.resume_from}")
-        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         start_step = ckpt["step"]
         _pending_optimizer_state = ckpt.get("optimizer_state_dict")
