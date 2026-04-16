@@ -1,4 +1,7 @@
 """Tests for ZEB-128 engram consolidation."""
+import subprocess
+import sys
+import os
 import torch
 import torch.nn.functional as F
 import pytest
@@ -239,3 +242,56 @@ class TestInjectionMultiplierAnnealing:
             else:
                 mult = 1.0
             assert abs(mult - expected) < 1e-6, f"Step {step}: {mult} != {expected}"
+
+
+class TestConsolidationSmoke:
+
+    @pytest.fixture
+    def fake_table_path(self, tmp_path):
+        """Create a minimal safetensors table for testing."""
+        from safetensors.torch import save_file
+        table = torch.randn(100, 128)  # 100 entries, engram_dim=128 (matches tiny config)
+        path = str(tmp_path / "test_table.safetensors")
+        save_file({"engram.weight": table}, path)
+        return path
+
+    def _run_train(self, args, tmp_path, fake_table_path):
+        """Helper to run ct87.train with common args."""
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--engram-xattn-table", fake_table_path,
+                "--synthetic", "--steps", "10",
+                "--output-dir", str(tmp_path / "out"),
+                *args,
+            ],
+            capture_output=True, text=True,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            timeout=120,
+        )
+        return result
+
+    def test_online_mode_runs(self, tmp_path, fake_table_path):
+        result = self._run_train([
+            "--config", "tiny_engram_xattn_consol_online",
+            "--consolidation-mode", "online",
+            "--consolidation-lambda", "0.1",
+        ], tmp_path, fake_table_path)
+        assert result.returncode == 0, f"STDERR:\n{result.stderr}"
+
+    def test_phased_mode_runs(self, tmp_path, fake_table_path):
+        result = self._run_train([
+            "--config", "tiny_engram_xattn_consol_phased",
+            "--consolidation-mode", "phased",
+            "--consolidation-start-step", "5",
+            "--consolidation-anneal",
+            "--consolidation-lambda", "0.1",
+        ], tmp_path, fake_table_path)
+        assert result.returncode == 0, f"STDERR:\n{result.stderr}"
+
+    def test_ctrl_mode_runs(self, tmp_path, fake_table_path):
+        result = self._run_train([
+            "--config", "tiny_engram_xattn_ctrl",
+            "--consolidation-mode", "none",
+        ], tmp_path, fake_table_path)
+        assert result.returncode == 0, f"STDERR:\n{result.stderr}"
