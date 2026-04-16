@@ -328,77 +328,40 @@ pub async fn run(
                 "Zenoh enabled but MailboxManager unavailable — skipping session open to avoid leaking the drain task"
             );
         } else if zenoh_enabled {
-            // Build Zenoh config. The gateway is a publisher only — we never
-            // want it to open a listening socket. Default config would run in
-            // peer mode and bind a random TCP port, which is unexpected for
-            // a gateway and a security concern. Force client mode and clear
-            // listen endpoints before handing off to `zenoh::open()`.
-            let mut zenoh_config = zenoh::Config::default();
-            let endpoint = config.zenoh.as_ref().and_then(|z| z.endpoint.as_ref());
-            let mut config_ok = true;
-
-            // Force client mode (connect-only, no incoming listener).
-            if let Err(e) = zenoh_config.insert_json5("mode", "\"client\"") {
-                tracing::error!(error = %e, "Zenoh client-mode config rejected, mailbox notifications disabled");
-                config_ok = false;
-            }
-            // Belt-and-suspenders: explicitly zero the listen endpoints.
-            if config_ok {
-                if let Err(e) = zenoh_config.insert_json5("listen/endpoints", "[]") {
-                    tracing::error!(error = %e, "Zenoh listen-endpoints config rejected, mailbox notifications disabled");
-                    config_ok = false;
+            let zenoh_config = config
+                .zenoh
+                .as_ref()
+                .expect("zenoh_enabled implies config.zenoh.is_some()")
+                .to_zenoh_config();
+            match zenoh_config {
+                Err(e) => {
+                    tracing::error!(error = %e, "Zenoh config build failed, mailbox notifications disabled");
                 }
-            }
-
-            if config_ok {
-                if let Some(ep) = endpoint {
-                    match serde_json::to_string(ep) {
-                        Ok(ep_json) => {
-                            if let Err(e) = zenoh_config
-                                .insert_json5("connect/endpoints", &format!("[{ep_json}]"))
-                            {
-                                tracing::error!(error = %e, endpoint = %ep, "Zenoh endpoint config rejected, mailbox notifications disabled");
-                                config_ok = false;
+                Ok(zenoh_config) => {
+                    if config.zenoh.as_ref().and_then(|z| z.endpoint.as_ref()).is_none() {
+                        tracing::info!(
+                            "Zenoh enabled without explicit endpoint — running in client mode with peer discovery"
+                        );
+                    }
+                    let mgr_arc = mailbox_mgr
+                        .as_ref()
+                        .expect("mailbox_mgr.is_some() checked by outer gate");
+                    match zenoh::open(zenoh_config).await {
+                        Ok(session) => {
+                            tracing::info!("Zenoh session opened for mailbox notifications");
+                            let publisher_arc = Arc::new(ZenohPublisher::new(session, cancel.clone()));
+                            match mgr_arc.lock() {
+                                Ok(mut mgr) => mgr.set_publisher(Arc::clone(&publisher_arc)),
+                                Err(poisoned) => {
+                                    tracing::warn!("MailboxManager mutex poisoned during Zenoh publisher attach, recovering");
+                                    poisoned.into_inner().set_publisher(Arc::clone(&publisher_arc));
+                                }
                             }
+                            mailbox_publisher = Some(publisher_arc);
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, endpoint = %ep, "Zenoh endpoint JSON-encode failed, mailbox notifications disabled");
-                            config_ok = false;
+                            tracing::warn!(error = %e, "Zenoh open failed, mailbox notifications disabled");
                         }
-                    }
-                } else {
-                    tracing::info!(
-                        "Zenoh enabled without explicit endpoint — running in client mode with peer discovery"
-                    );
-                }
-            }
-
-            if config_ok {
-                // The outer gate guarantees mailbox_mgr.is_some() here, so it
-                // is safe to open the session without risking a leaked drain
-                // task with no consumer.
-                let mgr_arc = mailbox_mgr
-                    .as_ref()
-                    .expect("mailbox_mgr.is_some() checked by outer gate");
-                match zenoh::open(zenoh_config).await {
-                    Ok(session) => {
-                        tracing::info!("Zenoh session opened for mailbox notifications");
-                        let publisher_arc = Arc::new(ZenohPublisher::new(session, cancel.clone()));
-                        // Give the manager its own refcount bump so root-CID
-                        // notify() calls inside insert_message keep working;
-                        // keep a separate handle for the async raw-publish
-                        // path below.
-                        match mgr_arc.lock() {
-                            Ok(mut mgr) => mgr.set_publisher(Arc::clone(&publisher_arc)),
-                            Err(poisoned) => {
-                                tracing::warn!("MailboxManager mutex poisoned during Zenoh publisher attach, recovering");
-                                poisoned.into_inner().set_publisher(Arc::clone(&publisher_arc));
-                            }
-                        }
-                        mailbox_publisher = Some(publisher_arc);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Zenoh open failed, mailbox notifications disabled");
                     }
                 }
             }

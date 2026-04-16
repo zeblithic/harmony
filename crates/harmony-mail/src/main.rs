@@ -85,8 +85,14 @@ async fn build_remote_delivery(
         harmony_identity::PrivateIdentity::from_private_bytes(&identity_bytes)?
     );
 
+    let zenoh_config = match config.zenoh.as_ref() {
+        Some(zc) if zc.enabled => zc.to_zenoh_config(),
+        _ => harmony_mail::config::default_zenoh_client_config(),
+    }
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
     let zenoh_session = Arc::new(
-        zenoh::open(zenoh::Config::default())
+        zenoh::open(zenoh_config)
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e.to_string())) })?,
     );
