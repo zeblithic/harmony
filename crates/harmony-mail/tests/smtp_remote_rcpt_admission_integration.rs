@@ -375,3 +375,439 @@ async fn smtp_rcpt_to_remote_domain_resolves_seals_publishes() {
     drop(session_b);
     drop(session_a);
 }
+
+// ── Helper: build a minimal SmtpConfig for edge-case tests ──────────────────
+
+fn edge_case_smtp_config() -> SmtpConfig {
+    SmtpConfig {
+        domain: "local.example".to_string(),
+        mx_host: "mail.local.example".to_string(),
+        max_message_size: 10 * 1024 * 1024,
+        max_recipients: 100,
+        tls_available: false,
+    }
+}
+
+/// Drive Connected → EHLO → MAIL FROM → RCPT TO and return the writer bytes.
+///
+/// The `email_resolver` is used for all `process_async_actions` calls, and the
+/// test only needs the RCPT TO response.
+async fn drive_rcpt(
+    rcpt_address: &str,
+    email_resolver: Arc<dyn harmony_mail_discovery::resolver::EmailResolver>,
+    store: Arc<ImapStore>,
+    content_path: &std::path::Path,
+) -> Vec<u8> {
+    let mut session = SmtpSession::new(edge_case_smtp_config());
+    let mut writer = Vec::<u8>::new();
+    let mut spf = SpfResult::None;
+    let er = Some(email_resolver);
+
+    let actions = session.handle(SmtpEvent::Connected {
+        peer_ip: "127.0.0.1".parse().unwrap(),
+        tls: false,
+    });
+    process_async_actions(
+        &actions,
+        &mut session,
+        &mut writer,
+        &store,
+        &None,
+        "local.example",
+        content_path,
+        &mut spf,
+        1000,
+        &None,
+        &None,
+        &None,
+        &None,
+        &er,
+    )
+    .await
+    .unwrap();
+
+    let actions = session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+        domain: "test".to_string(),
+    }));
+    process_async_actions(
+        &actions,
+        &mut session,
+        &mut writer,
+        &store,
+        &None,
+        "local.example",
+        content_path,
+        &mut spf,
+        1000,
+        &None,
+        &None,
+        &None,
+        &None,
+        &er,
+    )
+    .await
+    .unwrap();
+
+    let actions = session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+        address: "sender@test.example".to_string(),
+    }));
+    process_async_actions(
+        &actions,
+        &mut session,
+        &mut writer,
+        &store,
+        &None,
+        "local.example",
+        content_path,
+        &mut spf,
+        1000,
+        &None,
+        &None,
+        &None,
+        &None,
+        &er,
+    )
+    .await
+    .unwrap();
+
+    let actions = session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+        address: rcpt_address.to_string(),
+    }));
+    process_async_actions(
+        &actions,
+        &mut session,
+        &mut writer,
+        &store,
+        &None,
+        "local.example",
+        content_path,
+        &mut spf,
+        1000,
+        &None,
+        &None,
+        &None,
+        &None,
+        &er,
+    )
+    .await
+    .unwrap();
+
+    writer
+}
+
+// ── Test 1: unknown user → 550 ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn smtp_rcpt_to_unknown_user_returns_550() {
+    struct AlwaysUserUnknown;
+    #[async_trait::async_trait]
+    impl harmony_mail_discovery::resolver::EmailResolver for AlwaysUserUnknown {
+        async fn resolve(
+            &self,
+            _local_part: &str,
+            _domain: &str,
+        ) -> harmony_mail_discovery::resolver::ResolveOutcome {
+            harmony_mail_discovery::resolver::ResolveOutcome::UserUnknown
+        }
+    }
+
+    let er: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> =
+        Arc::new(AlwaysUserUnknown);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ImapStore::open(&tmp.path().join("test.db")).unwrap());
+
+    let writer = drive_rcpt("ghost@remote.example", er, store, tmp.path()).await;
+    let response = String::from_utf8_lossy(&writer);
+    assert!(
+        response.contains("550"),
+        "expected 550 for UserUnknown; got: {response:?}",
+    );
+}
+
+// ── Test 2: non-participating domain → 550 ───────────────────────────────────
+
+#[tokio::test]
+async fn smtp_rcpt_to_non_participating_domain_returns_550() {
+    struct AlwaysDomainDoesNotParticipate;
+    #[async_trait::async_trait]
+    impl harmony_mail_discovery::resolver::EmailResolver for AlwaysDomainDoesNotParticipate {
+        async fn resolve(
+            &self,
+            _local_part: &str,
+            _domain: &str,
+        ) -> harmony_mail_discovery::resolver::ResolveOutcome {
+            harmony_mail_discovery::resolver::ResolveOutcome::DomainDoesNotParticipate
+        }
+    }
+
+    let er: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> =
+        Arc::new(AlwaysDomainDoesNotParticipate);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ImapStore::open(&tmp.path().join("test.db")).unwrap());
+
+    let writer = drive_rcpt("alice@remote.example", er, store, tmp.path()).await;
+    let response = String::from_utf8_lossy(&writer);
+    assert!(
+        response.contains("550"),
+        "expected 550 for DomainDoesNotParticipate; got: {response:?}",
+    );
+}
+
+// ── Test 3: transient DNS failure → 451, not 550 ─────────────────────────────
+
+#[tokio::test]
+async fn smtp_rcpt_to_transient_dns_failure_returns_451() {
+    struct AlwaysTransient;
+    #[async_trait::async_trait]
+    impl harmony_mail_discovery::resolver::EmailResolver for AlwaysTransient {
+        async fn resolve(
+            &self,
+            _local_part: &str,
+            _domain: &str,
+        ) -> harmony_mail_discovery::resolver::ResolveOutcome {
+            harmony_mail_discovery::resolver::ResolveOutcome::Transient {
+                reason: "dns_timeout",
+            }
+        }
+    }
+
+    let er: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> = Arc::new(AlwaysTransient);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ImapStore::open(&tmp.path().join("test.db")).unwrap());
+
+    let writer = drive_rcpt("alice@remote.example", er, store, tmp.path()).await;
+    let response = String::from_utf8_lossy(&writer);
+    assert!(
+        response.contains("451"),
+        "expected 451 for Transient; got: {response:?}",
+    );
+    assert!(
+        !response.contains("550"),
+        "should NOT contain 550 for transient error; got: {response:?}",
+    );
+}
+
+// ── Test 4: revoked recipient → 550 ──────────────────────────────────────────
+
+#[tokio::test]
+async fn smtp_rcpt_to_revoked_recipient_returns_550() {
+    struct AlwaysRevoked;
+    #[async_trait::async_trait]
+    impl harmony_mail_discovery::resolver::EmailResolver for AlwaysRevoked {
+        async fn resolve(
+            &self,
+            _local_part: &str,
+            _domain: &str,
+        ) -> harmony_mail_discovery::resolver::ResolveOutcome {
+            harmony_mail_discovery::resolver::ResolveOutcome::Revoked
+        }
+    }
+
+    let er: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> = Arc::new(AlwaysRevoked);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ImapStore::open(&tmp.path().join("test.db")).unwrap());
+
+    let writer = drive_rcpt("alice@remote.example", er, store, tmp.path()).await;
+    let response = String::from_utf8_lossy(&writer);
+    assert!(
+        response.contains("550"),
+        "expected 550 for Revoked; got: {response:?}",
+    );
+}
+
+// ── Test 5: mixed local + remote recipients ───────────────────────────────────
+
+#[tokio::test]
+async fn smtp_rcpt_to_mixed_local_and_remote_recipients() {
+    use harmony_mail::message::ADDRESS_HASH_LEN;
+
+    // Resolver: "alice@remote.example" → Resolved, "ghost@remote.example" → UserUnknown
+    struct MixedResolver {
+        alice_hash: [u8; ADDRESS_HASH_LEN],
+    }
+    #[async_trait::async_trait]
+    impl harmony_mail_discovery::resolver::EmailResolver for MixedResolver {
+        async fn resolve(
+            &self,
+            local_part: &str,
+            domain: &str,
+        ) -> harmony_mail_discovery::resolver::ResolveOutcome {
+            if local_part == "alice" && domain == "remote.example" {
+                harmony_mail_discovery::resolver::ResolveOutcome::Resolved(self.alice_hash)
+            } else {
+                harmony_mail_discovery::resolver::ResolveOutcome::UserUnknown
+            }
+        }
+    }
+
+    let alice_hash: [u8; ADDRESS_HASH_LEN] = [0xAA; ADDRESS_HASH_LEN];
+    let bob_address_hash: [u8; ADDRESS_HASH_LEN] = [0xBB; ADDRESS_HASH_LEN];
+
+    let er: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> =
+        Arc::new(MixedResolver { alice_hash });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ImapStore::open(&tmp.path().join("test.db")).unwrap());
+
+    // Add local user "bob" to the IMAP store
+    store.create_user("bob", "hunter2", &bob_address_hash).unwrap();
+
+    let mut session = SmtpSession::new(edge_case_smtp_config());
+    let mut writer = Vec::<u8>::new();
+    let mut spf = SpfResult::None;
+    let er_opt = Some(Arc::clone(&er));
+
+    // Connected
+    let actions = session.handle(SmtpEvent::Connected {
+        peer_ip: "127.0.0.1".parse().unwrap(),
+        tls: false,
+    });
+    process_async_actions(
+        &actions,
+        &mut session,
+        &mut writer,
+        &store,
+        &None,
+        "local.example",
+        tmp.path(),
+        &mut spf,
+        1000,
+        &None,
+        &None,
+        &None,
+        &None,
+        &er_opt,
+    )
+    .await
+    .unwrap();
+
+    // EHLO
+    let actions = session.handle(SmtpEvent::Command(SmtpCommand::Ehlo {
+        domain: "test".to_string(),
+    }));
+    process_async_actions(
+        &actions,
+        &mut session,
+        &mut writer,
+        &store,
+        &None,
+        "local.example",
+        tmp.path(),
+        &mut spf,
+        1000,
+        &None,
+        &None,
+        &None,
+        &None,
+        &er_opt,
+    )
+    .await
+    .unwrap();
+
+    // MAIL FROM
+    let actions = session.handle(SmtpEvent::Command(SmtpCommand::MailFrom {
+        address: "sender@test.example".to_string(),
+    }));
+    process_async_actions(
+        &actions,
+        &mut session,
+        &mut writer,
+        &store,
+        &None,
+        "local.example",
+        tmp.path(),
+        &mut spf,
+        1000,
+        &None,
+        &None,
+        &None,
+        &None,
+        &er_opt,
+    )
+    .await
+    .unwrap();
+
+    // RCPT TO: bob@local.example (local user → 250)
+    let actions = session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+        address: "bob@local.example".to_string(),
+    }));
+    process_async_actions(
+        &actions,
+        &mut session,
+        &mut writer,
+        &store,
+        &None,
+        "local.example",
+        tmp.path(),
+        &mut spf,
+        1000,
+        &None,
+        &None,
+        &None,
+        &None,
+        &er_opt,
+    )
+    .await
+    .unwrap();
+
+    // RCPT TO: alice@remote.example (remote, resolves → 250)
+    let actions = session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+        address: "alice@remote.example".to_string(),
+    }));
+    process_async_actions(
+        &actions,
+        &mut session,
+        &mut writer,
+        &store,
+        &None,
+        "local.example",
+        tmp.path(),
+        &mut spf,
+        1000,
+        &None,
+        &None,
+        &None,
+        &None,
+        &er_opt,
+    )
+    .await
+    .unwrap();
+
+    // RCPT TO: ghost@remote.example (remote, UserUnknown → 550)
+    let actions = session.handle(SmtpEvent::Command(SmtpCommand::RcptTo {
+        address: "ghost@remote.example".to_string(),
+    }));
+    process_async_actions(
+        &actions,
+        &mut session,
+        &mut writer,
+        &store,
+        &None,
+        "local.example",
+        tmp.path(),
+        &mut spf,
+        1000,
+        &None,
+        &None,
+        &None,
+        &None,
+        &er_opt,
+    )
+    .await
+    .unwrap();
+
+    let response = String::from_utf8_lossy(&writer);
+
+    // Count 250 occurrences for RCPT responses: bob + alice = 2
+    let count_250 = response.matches("250 OK").count();
+    assert_eq!(
+        count_250, 2,
+        "expected 2 accepted recipients (bob + alice); response: {response:?}",
+    );
+
+    // ghost should have been rejected with 550
+    assert!(
+        response.contains("550"),
+        "expected 550 for ghost@remote.example; response: {response:?}",
+    );
+}
