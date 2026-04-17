@@ -340,7 +340,7 @@ class TestInitFromFlag:
         assert unexpected == []
         # Missing, if any, must only be engram_injections keys.
         for k in missing:
-            assert k.startswith("engram_injections"), (
+            assert k.startswith("engram_injections."), (
                 f"Unexpected missing key outside engram_injections: {k}"
             )
 
@@ -399,7 +399,7 @@ class TestFreezeBackbone:
         from ct87.train import freeze_backbone_for_capgap
         freeze_backbone_for_capgap(model)
         for name, p in model.named_parameters():
-            if name.startswith("engram_injections"):
+            if name.startswith("engram_injections."):
                 assert p.requires_grad, f"{name} should be trainable"
             else:
                 assert not p.requires_grad, f"{name} should be frozen"
@@ -491,7 +491,7 @@ class TestCapgapTrainingLoopWiring:
         out_ckpt = torch.load(out_ckpt_path, map_location="cpu", weights_only=False)
         injection_params = [
             k for k in out_ckpt["model_state_dict"].keys()
-            if k.startswith("engram_injections")
+            if k.startswith("engram_injections.")
         ]
         assert len(injection_params) > 0, (
             f"No engram_injections params in saved state dict. Got keys: "
@@ -569,7 +569,7 @@ class TestCapgapSmokeIntegration:
 
         # Step D: confirm engram_injections params DO exist in the output.
         injection_param_names = [
-            n for n in out_state.keys() if n.startswith("engram_injections")
+            n for n in out_state.keys() if n.startswith("engram_injections.")
         ]
         assert len(injection_param_names) > 0, (
             "No engram_injections params saved — check attach wiring"
