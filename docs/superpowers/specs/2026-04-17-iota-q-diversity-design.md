@@ -510,7 +510,7 @@ python scripts/train.py \
 | Δ-removal diff (real − shuffled) | +0.000183 | **≥ +0.002** | Content-routing achieved |
 | Cross-run cos L2 | +0.72 | **≤ 0.30** | No shared-amplifier direction |
 | Cross-run cos L5 | +0.84 | **≤ 0.30** | No shared-amplifier direction |
-| (X) corrected \|cos\| (post-PR #251) | TBD | **ideally ≤ 0.30** | V content-sensitivity confirmed |
+| (X) corrected \|cos\| | η: 0.38-0.45 / θ: 0.11-0.16 | **≤ 0.30** | V content-sensitivity confirmed (see 7d) |
 | qdiv_aux_loss final | n/a | **≤ 3.0** | Q uses ≥ 3000 of 10000 rows (S ≥ 3000) |
 | LM val loss | 4.5379 | **≤ 4.55** | Aux doesn't cripple main objective |
 
@@ -543,7 +543,38 @@ Success = (D) + (Δ-removal diff) + (cross-run cos) all met. (X) corrected infor
 
 Total KRILE GPU time ~20 min. Total Koya analysis ~1 hour.
 
-### 7d. Live-monitoring signals during training
+### 7d. Baseline data (KRILE, 2026-04-17, post-PR #251 corrected probes)
+
+After PR #251 fixed the (X) cross-table probe (random-gaussian alt table, per-model primary), KRILE re-ran forensics on η-B and θ capgap checkpoints. The data **confirms H3** and refines ι's hypothesis:
+
+**Corrected (X) |cos| readings** (alt-table-seed=42):
+
+| Layer / Run | η real | η shuf | θ real | θ shuf | Random-pair floor |
+|---|---|---|---|---|---|
+| L2 | 0.451 | 0.436 | 0.156 | 0.178 | ~0.17 |
+| L5 | 0.379 | 0.370 | 0.111 | 0.098 | ~0.15 (η) / ~0.66 (θ) |
+
+- **θ's V is cleanly content-sensitive** (|cos| < 0.20 on all 4 layer×model cells). V-contrast did its advertised job on V.
+- **η's V is partially content-sensitive** (|cos| 0.37-0.45, materially above the 0.15 floor but well below 0.80). V has some content routing overlaid on hidden-state structure even without V-contrast.
+- **Implication for ι₁ hypothesis:** Q-div alone on η isn't "build content-sensitive V from scratch" — it's "unlock η's latent partial V content-sensitivity by broadening Q's coverage." Weaker hypothesis → more likely to succeed than the spec originally assumed.
+
+**(Y) V-output dispersion within retrieved subset S** (held-out subset-vs-control, cosine pair mean):
+
+| Run / Layer | \|S\| | S \|cos\| | Non-S control \|cos\| | S eff_rank / control |
+|---|---|---|---|---|
+| η L2 | 4339 (43%) | 0.133 | 0.163 | 104.2 / 101.8 |
+| η L5 | 4887 (49%) | 0.137 | 0.184 | 104.8 / 97.8 |
+| θ L2 | 498 (5%) | 0.127 | 0.210 | 96.4 / 94.1 |
+| θ L5 | 198 (2%) | 0.137 | 0.191 | 74.0 / 85.0 |
+
+- **V over-specializes on S in both runs** (S |cos| < non-S control |cos| in every cell). V learns to separate the rows Q actually queries.
+- **|S| is the 10-23× lever between θ and η** — V's per-row orthogonalization quality is identical across runs (S |cos| ≈ 0.13 both). The gap is entirely Q's breadth.
+- **θ L5's S is rank-deficient** (eff_rank 74 vs control 85) — Q queries a low-dim subspace of the 128-dim engram space. MoE load-balancing over row marginals necessarily pushes Q across the full rank (uniform over N can't live in a rank-74 subspace), so our loss formulation already targets this.
+- **η's caveat that matters for ι₁:** η retrieves 49% of the table at L5 and still has content-invariant training metrics. So "unique rows" (|S|) alone isn't the full story — *uniform per-row usage* is. Our MoE `L = N · Σ fᵢ · Pᵢ` targets marginal uniformity, not just |S|.
+
+Raw forensic log available in KRILE's 2026-04-17 report.
+
+### 7e. Live-monitoring signals during training
 
 - **qdiv_aux trajectory**: should start ~30-60 (reflecting θ's ~S=169 initial state if init from ζ-ctrl-2048), descend toward 1-3 as Q spreads. Plateau at 1-3 = healthy.
 - **qdiv_aux_L2 vs qdiv_aux_L5 divergence**: flags per-layer Q-quality asymmetry; informs possible per-layer λ in ι₁.₁ follow-up.
