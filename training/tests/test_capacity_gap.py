@@ -164,6 +164,29 @@ class TestCapacityGapConfig:
                 engram_inject_layers=(-1, 2),
             )
 
+    def test_config_rejects_float_inject_layer(self):
+        """Float entries (2.0) would stringify to "2.0" and miss str(2) probing."""
+        with pytest.raises(TypeError, match="plain int"):
+            HarmonyModelConfig(
+                num_layers=8, hidden_dim=512, num_query_heads=8, num_kv_heads=4,
+                head_dim=64, ffn_dim=1365, vocab_size=32000, max_seq_len=4096,
+                rope_theta=1e6, rms_norm_eps=1e-6, layers_per_block=2,
+                engram_injection_layer=2, engram_dim=128, tie_embeddings=True,
+                engram_inject_layers=(2.0, 5),
+            )
+
+    def test_config_rejects_bool_inject_layer(self):
+        """Bool entries (True/False) pass isinstance(int) but stringify to
+        'True'/'False', which forward() would never probe."""
+        with pytest.raises(TypeError, match="plain int"):
+            HarmonyModelConfig(
+                num_layers=8, hidden_dim=512, num_query_heads=8, num_kv_heads=4,
+                head_dim=64, ffn_dim=1365, vocab_size=32000, max_seq_len=4096,
+                rope_theta=1e6, rms_norm_eps=1e-6, layers_per_block=2,
+                engram_injection_layer=2, engram_dim=128, tie_embeddings=True,
+                engram_inject_layers=(True, 5),
+            )
+
 
 class TestHarmonyModelMultiLayerInjection:
     """HarmonyModel supports GatedEngramInjection at multiple layers via ModuleDict."""
@@ -328,17 +351,37 @@ class TestInitFromFlag:
             src_ckpt,
         )
 
-        # Load into a capgap-configured target (which has extra engram_injections keys
-        # after attach — but with no attach called, state_dict is equivalent).
+        # Load into a capgap-configured target WITH injections attached, so
+        # engram_injections.* keys actually exist in the target state dict.
+        # Without this attach, missing would be trivially empty and this test
+        # would not observe regressions in the --init-from path's handling of
+        # engram-injection keys.
         ckpt = torch.load(src_ckpt, map_location="cpu", weights_only=False)
         new_config = HarmonyModelConfig.tiny_engram_xattn_capgap()
         new_model = HarmonyModel(new_config)
+        table = torch.randn(16, new_config.engram_dim)
+        new_model.attach_gated_engram_injections({
+            layer_idx: GatedEngramInjection(
+                EngramCrossAttention(
+                    new_config, table, num_heads=2, k_retrieved=4,
+                ),
+                alpha_init=0.0,
+            )
+            for layer_idx in new_config.engram_inject_layers
+        })
         missing, unexpected = new_model.load_state_dict(
             ckpt["model_state_dict"], strict=False
         )
-        # No unexpected keys (source is strict subset of target)
+        # No unexpected keys (source is strict subset of target).
         assert unexpected == []
-        # Missing, if any, must only be engram_injections keys.
+        # Missing must be non-empty (the engram_injections.* params we just
+        # attached are not in the source checkpoint) and must be *only*
+        # engram_injections.* keys.
+        assert len(missing) > 0, (
+            "Expected engram_injections.* to be missing after attach; empty "
+            "missing list means the test can't catch regressions in the "
+            "--init-from handling of engram-injection keys."
+        )
         for k in missing:
             assert k.startswith("engram_injections."), (
                 f"Unexpected missing key outside engram_injections: {k}"

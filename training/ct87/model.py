@@ -99,6 +99,21 @@ class HarmonyModelConfig:
                     "mutually exclusive with use_xattn_engram / use_ann_engram "
                     "(single-point legacy paths)."
                 )
+            # Type check must come BEFORE the duplicate check: set() equality
+            # would treat 2 and 2.0 as the same element (so duplicate detection
+            # passes), but ModuleDict keys str(2) vs str(2.0) would collide
+            # with forward() probing for str(layer_idx) using an integer
+            # loop counter, silently never firing the injection.
+            for layer_idx in self.engram_inject_layers:
+                # `type(x) is int` rejects bool too (True/False are 1/0 under
+                # isinstance but would stringify to "True"/"False" keys).
+                if type(layer_idx) is not int:
+                    raise TypeError(
+                        "engram_inject_layers entries must be plain int "
+                        f"(got {layer_idx!r} of type "
+                        f"{type(layer_idx).__name__}); ModuleDict keys "
+                        "would not match str(layer_idx) probed by forward()."
+                    )
             if len(self.engram_inject_layers) != len(set(self.engram_inject_layers)):
                 raise ValueError(
                     "engram_inject_layers contains duplicate layer indices: "
