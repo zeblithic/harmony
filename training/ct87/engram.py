@@ -1213,6 +1213,8 @@ class GatedEngramInjection(nn.Module):
         vcontrast_sink: list[torch.Tensor] | None = None,
         qdiv_sink: list[torch.Tensor] | None = None,
         shuffle_generator: torch.Generator | None = None,
+        ema_subtract: bool = False,
+        ema_momentum: float = 0.99,
     ) -> None:
         super().__init__()
         self.engram_xattn = engram_xattn
@@ -1223,6 +1225,30 @@ class GatedEngramInjection(nn.Module):
         self._vcontrast_sink: list[torch.Tensor] | None = vcontrast_sink
         self._qdiv_sink: list[torch.Tensor] | None = qdiv_sink
         self._shuffle_generator: torch.Generator | None = shuffle_generator
+
+        # ZEB-135: EMA baseline-subtraction. Tracks the running mean of the
+        # per-token gated injection output. At eval AND training time (when
+        # enabled), the stored EMA is subtracted from the injection output
+        # so the model sees content_signal = out - baseline_mean rather
+        # than out. If the injection is dominated by a near-constant
+        # baseline vector — the failure mode ZEB-135 tests for — this
+        # subtraction removes the baseline and forces the LM to route on
+        # the residual content signal. Gradient does NOT flow through the
+        # EMA update; the .detach() on the batch mean is load-bearing.
+        if not 0.0 < ema_momentum < 1.0:
+            raise ValueError(
+                f"ema_momentum must be in (0, 1), got {ema_momentum}"
+            )
+        self._ema_subtract: bool = bool(ema_subtract)
+        self.ema_momentum: float = float(ema_momentum)
+        # Persistent buffer so the EMA survives checkpointing. Shape
+        # matches the gated injection output's last dimension
+        # (= hidden_dim, matching engram_xattn.o_proj.out_features).
+        hidden_dim = engram_xattn.o_proj.out_features
+        self.register_buffer(
+            "inj_ema", torch.zeros(hidden_dim, dtype=torch.float32),
+            persistent=True,
+        )
 
         # Break the dual-zero-init gradient dead zone. EngramCrossAttention
         # zero-inits o_proj.weight as its own anti-collapse mechanism (used by
@@ -1294,6 +1320,32 @@ class GatedEngramInjection(nn.Module):
         # for the rest of the injected layer. Cast the gate into inj_real's
         # dtype so the residual stays in low precision.
         gate = torch.tanh(self.alpha).to(dtype=inj_real.dtype)
-        return gate * inj_real
+        out = gate * inj_real
+
+        # ZEB-135: EMA baseline-subtraction. Update the running mean in
+        # training mode (detach to keep the EMA out of the grad graph),
+        # then subtract it from `out` in both training and eval so the
+        # caller sees the baseline-free signal.
+        if self._ema_subtract:
+            if self.training:
+                # Reduce over every dim except the last (hidden_dim) so
+                # the result has shape [hidden_dim]. Works for any rank
+                # >= 2; typically out is [B, L, D].
+                reduce_dims = tuple(range(out.ndim - 1))
+                batch_mean = out.mean(dim=reduce_dims).detach().to(
+                    dtype=self.inj_ema.dtype,
+                )
+                # In-place EMA update: inj_ema = m * inj_ema + (1-m) * batch_mean.
+                # In-place is safe here because inj_ema is a buffer (not a
+                # parameter with autograd history).
+                self.inj_ema.mul_(self.ema_momentum).add_(
+                    batch_mean, alpha=1.0 - self.ema_momentum,
+                )
+            # Always subtract — also at eval — so the eval behavior matches
+            # what the optimizer was minimizing.
+            ema_view = self.inj_ema.view(*([1] * (out.ndim - 1)), -1)
+            out = out - ema_view.to(dtype=out.dtype)
+
+        return out
 
 

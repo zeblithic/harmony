@@ -609,6 +609,30 @@ def main() -> None:
             "a qdiv-enabled preset. None = use preset's value."
         ),
     )
+    # ---- ZEB-135: EMA baseline-subtraction ----
+    parser.add_argument(
+        "--engram-ema-subtract",
+        action="store_true",
+        help=(
+            "Enable EMA baseline subtraction in each GatedEngramInjection "
+            "(ZEB-135). During training the wrapper maintains a running "
+            "per-dim mean of its gated injection output and subtracts it "
+            "at both train and eval time, so the model only sees the "
+            "content-residual above baseline. Tests whether the ι₂ "
+            "forensic-success / LM-blindness regime is caused by the "
+            "injection output being dominated by a near-constant baseline."
+        ),
+    )
+    parser.add_argument(
+        "--engram-ema-momentum",
+        type=float,
+        default=0.99,
+        help=(
+            "EMA momentum for --engram-ema-subtract. Must satisfy "
+            "math.isfinite(m) and 0 < m < 1. Default 0.99 tracks a "
+            "~100-step running mean at a per-step discount of 0.99."
+        ),
+    )
     parser.add_argument(
         "--latent-intermediate-dim", type=int, default=None,
         help="Intermediate dimension for latent projection MLP",
@@ -973,6 +997,20 @@ def main() -> None:
     if config.engram_qdiv_enabled:
         config.__post_init__()
 
+    # ZEB-135: EMA baseline-subtraction momentum validation. Reject
+    # NaN/Inf (isfinite catches both) and reject 0/1 so the in-place
+    # update is always a true mixture of old and new — 0 would freeze
+    # the EMA at zero, 1 would pin it to the first batch mean forever.
+    if not math.isfinite(args.engram_ema_momentum) or not (
+        0.0 < args.engram_ema_momentum < 1.0
+    ):
+        print(
+            "Error: --engram-ema-momentum must be finite and in (0, 1), "
+            f"got {args.engram_ema_momentum!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Model gamma arg validation (ZEB-117)
     if args.config in ("tiny_engram_ann", "tiny_engram_ann_routed"):
         if args.engram_ann_table is None:
@@ -1270,6 +1308,8 @@ def main() -> None:
                     model._qdiv_aux_losses if config.engram_qdiv_enabled else None
                 ),
                 shuffle_generator=capgap_shuffle_gen,
+                ema_subtract=args.engram_ema_subtract,
+                ema_momentum=args.engram_ema_momentum,
             )
         model.attach_gated_engram_injections(capgap_injections)
         if config.engram_vcontrast_enabled:
@@ -1285,6 +1325,8 @@ def main() -> None:
             aux_tags.append("+vcontrast")
         if config.engram_qdiv_enabled:
             aux_tags.append("+qdiv")
+        if args.engram_ema_subtract:
+            aux_tags.append("+ema-sub")
         aux_suffix = f"({','.join(aux_tags)})" if aux_tags else ""
         setup_parts = [
             f"[capgap] Attached GatedEngramInjection{aux_suffix}"
@@ -1300,6 +1342,10 @@ def main() -> None:
             setup_parts.append(
                 f"; qdiv lambda={config.engram_qdiv_lambda} "
                 f"warmup={config.engram_qdiv_warmup_steps}"
+            )
+        if args.engram_ema_subtract:
+            setup_parts.append(
+                f"; ema-sub momentum={args.engram_ema_momentum}"
             )
         print("".join(setup_parts))
 
