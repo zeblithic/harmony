@@ -425,3 +425,75 @@ class TestFreezeBackbone:
         from ct87.train import freeze_backbone_for_capgap
         with pytest.raises(RuntimeError, match="engram_injections"):
             freeze_backbone_for_capgap(model)
+
+
+class TestCapgapTrainingLoopWiring:
+    """Verify the capgap preset attaches GatedEngramInjection modules at the
+    declared layers when the training loop runs."""
+
+    def test_capgap_config_dispatch_attaches_injections(self, tmp_path):
+        """Running train.py with --config tiny_engram_xattn_capgap must
+        attach engram_injections as a ModuleDict before the first step."""
+        import os
+        import subprocess
+        import sys
+
+        # Build a minimal "source" checkpoint so --init-from has something
+        # to load (needed because the capgap path implies init-from in practice).
+        src_ckpt = tmp_path / "src" / "checkpoint.pt"
+        src_ckpt.parent.mkdir()
+        src_config = HarmonyModelConfig.tiny()
+        torch.manual_seed(0)
+        src_model = HarmonyModel(src_config)
+        torch.save(
+            {
+                "model_state_dict": src_model.state_dict(),
+                "optimizer_state_dict": {},
+                "step": 0,
+                "rng_state": torch.get_rng_state(),
+                "config": src_config,
+            },
+            src_ckpt,
+        )
+
+        training_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out_dir = tmp_path / "out"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--init-from", str(src_ckpt),
+                "--freeze-backbone",
+                "--config", "tiny_engram_xattn_capgap",
+                "--synthetic",
+                "--output-dir", str(out_dir),
+                "--steps", "1",
+                "--batch-size", "2",
+                "--seq-len", "32",
+                "--checkpoint-interval", "1",
+            ],
+            capture_output=True, text=True, timeout=180,
+            cwd=training_root,
+        )
+        # If this fails, likely the capgap wiring didn't actually build + attach
+        # the injections. Print full output for diagnosis.
+        assert result.returncode == 0, (
+            f"train.py exited {result.returncode}\n"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        # Should see the capgap attach log line.
+        assert "[capgap]" in (result.stdout + result.stderr), (
+            f"Expected [capgap] log line in output:\n"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        # Checkpoint must contain engram_injections.* params.
+        out_ckpt_path = out_dir / "checkpoint.pt"
+        assert out_ckpt_path.exists(), "train.py didn't save checkpoint"
+        out_ckpt = torch.load(out_ckpt_path, map_location="cpu", weights_only=False)
+        injection_params = [
+            k for k in out_ckpt["model_state_dict"].keys()
+            if k.startswith("engram_injections")
+        ]
+        assert len(injection_params) > 0, (
+            f"No engram_injections params in saved state dict. Got keys: "
+            f"{list(out_ckpt['model_state_dict'].keys())[:20]}..."
+        )

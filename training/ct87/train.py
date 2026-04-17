@@ -421,6 +421,10 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--xattn-top-k", type=int, default=4,
+        help="top-k for cross-attention retrieval (shared by δ and η-B paths).",
+    )
+    parser.add_argument(
         "--gradient-checkpoint", action="store_true",
         help="Enable gradient checkpointing (recompute activations to save VRAM)",
     )
@@ -941,6 +945,46 @@ def main() -> None:
             f"num_heads={xattn_module.num_heads}, "
             f"k_retrieved={xattn_module.k_retrieved}, "
             f"bias_weight={xattn_module.retrieval_bias_weight}"
+        )
+
+    # η-B multi-layer gated injection (ZEB-130).
+    # Must happen BEFORE freeze_backbone_for_capgap() which raises if no
+    # engram_injections are attached.
+    if config.engram_inject_layers:
+        from ct87.engram import EngramCrossAttention, GatedEngramInjection
+
+        if args.engram_xattn_table is not None:
+            capgap_table = EngramCrossAttention.load_corpus_table(args.engram_xattn_table)
+        else:
+            # --synthetic or no table provided: build a random placeholder sized
+            # (vocab_size, engram_dim). Real runs must pass --engram-xattn-table.
+            print(
+                "[capgap] No --engram-xattn-table provided; using random "
+                f"({config.vocab_size}, {config.engram_dim}) placeholder table for "
+                "smoke-test compatibility."
+            )
+            capgap_table = torch.randn(config.vocab_size, config.engram_dim)
+
+        capgap_injections: dict[int, GatedEngramInjection] = {}
+        for layer_idx in config.engram_inject_layers:
+            xattn_mod = EngramCrossAttention(
+                config,
+                capgap_table,
+                num_heads=config.num_query_heads,
+                k_retrieved=args.xattn_top_k,
+            )
+            capgap_injections[layer_idx] = GatedEngramInjection(
+                xattn_mod,
+                alpha_init=config.engram_gate_init,
+            )
+        model.attach_gated_engram_injections(capgap_injections)
+        # Ensure newly-attached submodules are on the correct device (model was
+        # already moved to device before this block).
+        model.engram_injections.to(device)
+        print(
+            f"[capgap] Attached GatedEngramInjection at layers "
+            f"{list(config.engram_inject_layers)} with alpha_init="
+            f"{config.engram_gate_init}"
         )
 
     param_count = sum(p.numel() for p in model.parameters())
