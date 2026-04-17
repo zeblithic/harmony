@@ -656,12 +656,29 @@ class HarmonyModel(nn.Module):
                 f"attach_gated_engram_injections() got layer_idx keys "
                 f"{sorted(got)} but config declares {sorted(expected)}."
             )
-        for inj in injections_by_layer.values():
+        # Track object identity to reject reuse of the same
+        # GatedEngramInjection across layer slots. nn.ModuleDict silently
+        # accepts duplicate module references (it registers the module once
+        # and points both keys at it), which would cause the shared alpha +
+        # xattn params to receive two gradient contributions per step and
+        # break the "one injection per layer" contract the experiment relies
+        # on.
+        seen_ids: dict[int, int] = {}
+        for layer_idx, inj in injections_by_layer.items():
             if not isinstance(inj, GatedEngramInjection):
                 raise TypeError(
                     "attach_gated_engram_injections() values must be "
                     "GatedEngramInjection instances."
                 )
+            prior = seen_ids.get(id(inj))
+            if prior is not None:
+                raise ValueError(
+                    "attach_gated_engram_injections() got the same "
+                    "GatedEngramInjection instance for layers "
+                    f"{prior} and {layer_idx}; each configured layer must "
+                    "have its own module so parameters aren't shared."
+                )
+            seen_ids[id(inj)] = layer_idx
         self.engram_injections = nn.ModuleDict({
             str(layer_idx): injections_by_layer[layer_idx]
             for layer_idx in self.config.engram_inject_layers

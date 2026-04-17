@@ -267,6 +267,23 @@ class TestHarmonyModelMultiLayerInjection:
         with pytest.raises(ValueError, match="layer_idx"):
             model.attach_gated_engram_injections({})
 
+    def test_attach_rejects_shared_injection_instance(self):
+        """The same GatedEngramInjection instance cannot back two layer slots.
+        nn.ModuleDict silently accepts duplicate module references, which would
+        make both layers share a single alpha + xattn parameter set (double
+        gradient contribution per step, broken per-layer gate logging)."""
+        model = self._build_model()
+        table = torch.randn(16, model.config.engram_dim)
+        shared = GatedEngramInjection(
+            EngramCrossAttention(
+                model.config, table, num_heads=2, k_retrieved=4,
+            ),
+            alpha_init=0.0,
+        )
+        reused = {layer_idx: shared for layer_idx in model.config.engram_inject_layers}
+        with pytest.raises(ValueError, match="same GatedEngramInjection instance"):
+            model.attach_gated_engram_injections(reused)
+
     def test_attach_rejects_double_attach(self):
         """Second attach call raises — prevents orphaning params of the
         first ModuleDict from PyTorch's module tree (which would desync
@@ -397,7 +414,7 @@ class TestInitFromFlag:
                 f"Unexpected missing key outside engram_injections: {k}"
             )
 
-    def test_train_rejects_both_init_from_and_resume_from(self):
+    def test_train_rejects_both_init_from_and_resume_from(self, tmp_path):
         """CLI validation rejects using both flags simultaneously."""
         import os
         import subprocess
@@ -405,14 +422,18 @@ class TestInitFromFlag:
         # Resolve `training/` (the parent of `tests/`) so the subprocess can
         # `python -m ct87.train` regardless of where pytest was invoked from.
         training_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # Paths don't need to exist — argparse mutex fires before any file IO.
+        # Use tmp_path rather than hardcoded /tmp locations so parallel runs
+        # can't collide and the tests stay OS-agnostic.
+        missing_ckpt = str(tmp_path / "nonexistent.pt")
         result = subprocess.run(
             [
                 sys.executable, "-m", "ct87.train",
-                "--init-from", "/tmp/nonexistent.pt",
-                "--resume-from", "/tmp/nonexistent.pt",
+                "--init-from", missing_ckpt,
+                "--resume-from", missing_ckpt,
                 "--config", "tiny_engram_xattn_capgap",
                 "--synthetic",
-                "--output-dir", "/tmp/capgap_test",
+                "--output-dir", str(tmp_path / "capgap_test"),
                 "--steps", "1",
             ],
             capture_output=True, text=True, timeout=30,
@@ -804,11 +825,13 @@ class TestHardFailGuards:
         """Capgap preset must refuse to build a random placeholder table in real runs."""
         src = tmp_path / "src.pt"
         self._save_ckpt(src, HarmonyModelConfig.tiny(), with_config_key=True)
-        # Use --data with a non-existent path so we never reach the dataloader.
+        # Use a non-existent --data path so we never reach the dataloader —
+        # the xattn-table guard fires first. tmp_path keeps the fake path
+        # per-test and OS-agnostic.
         r = self._run_train(
             "--init-from", str(src),
             "--config", "tiny_engram_xattn_capgap",
-            "--data", "/tmp/does-not-exist",
+            "--data", str(tmp_path / "does-not-exist"),
             "--output-dir", str(tmp_path / "out"),
             "--steps", "1",
         )
