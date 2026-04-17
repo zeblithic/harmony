@@ -34,6 +34,47 @@ from ct87.model import HarmonyModelConfig, RMSNorm
 CONV_KERNEL_SIZE = 3
 
 
+def compute_qdiv_aux(
+    topk_idx: torch.Tensor,
+    attn: torch.Tensor,
+    table_size: int,
+) -> torch.Tensor:
+    """MoE-style load-balancing auxiliary loss over retrieval row usage.
+
+    Minimized when Q spreads retrieval uniformly over table rows (loss -> 1);
+    maximized under full concentration on a single row (loss -> table_size).
+
+    Only P (soft attention-weighted mass) carries gradient — f (hard top-k
+    selection frequency) is non-differentiable and serves as a frequency
+    weight. Gradient flows through attn into the softmax, then into q_proj,
+    k_proj, and retrieval_query_proj (via the retrieval_bias_weight * topk_sims
+    term that also participates in the pre-softmax scores).
+
+    Args:
+        topk_idx: [B, L, k] int64 — top-k row indices selected per query.
+        attn:     [B, L, H, k] float — softmaxed attention weights per head.
+        table_size: N — full corpus table size.
+
+    Returns:
+        Scalar loss. Under uniform row usage, this equals 1.0. Under full
+        concentration on one row, it equals table_size. Under uniform over
+        S<N rows, it equals table_size/S.
+    """
+    B, L, k = topk_idx.shape
+    H = attn.shape[2]
+
+    f = torch.bincount(
+        topk_idx.reshape(-1), minlength=table_size,
+    ).to(attn.dtype) / (B * L * k)
+
+    idx = topk_idx.unsqueeze(2).expand(B, L, H, k).reshape(-1)
+    P = torch.zeros(table_size, device=attn.device, dtype=attn.dtype)
+    P.scatter_add_(0, idx, attn.reshape(-1))
+    P = P / (B * L * H)
+
+    return table_size * (f * P).sum()
+
+
 class EngramGatedResidual(nn.Module):
     """Gated residual injection for Engram embeddings.
 
