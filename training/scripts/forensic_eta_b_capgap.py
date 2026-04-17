@@ -28,6 +28,24 @@ both models, runs them on a fixed val batch, and reports:
                             it's added to. |A| ≈ 1 = residual-axis
                             amplifier; 0 = injection is orthogonal to the
                             current hidden direction
+  (Q-overlap) Per-token     Monte-Carlo random-pair Jaccard of top-k row
+              retrieval     indices. 1 ⇒ every token retrieves the same
+              fixity        subset (content-blind Q despite possibly large
+                            |S|); ~k/table_size ⇒ per-token retrieval is
+                            content-dispersive. Distinguishes "Q has
+                            broad marginal usage but fixed per-token
+                            retrieval" from "Q varies per-token."
+  (Q-occupancy) Uniformity  Coefficient of variation of row-occupancy
+              of row usage  counts among USED rows. 0 ⇒ every used row is
+                            retrieved equally often; high ⇒ a few rows
+                            dominate. Orthogonal to |S| alone.
+  (V-rank)    Effective     rank(V(E[S])) vs rank(E[S]) for the retrieved
+              output rank   subset S. Reports hard rank (SVD threshold)
+              of V          and effective rank (entropy of σ²). V losing
+                            rank relative to E suggests V-output
+                            compression — informs whether Q breadth alone
+                            can unlock content-routing or whether V has a
+                            deeper capacity limit.
 
 These drive a verdict:
 
@@ -307,6 +325,132 @@ class InjectionPreHook:
         self.captured = None
 
 
+def _q_overlap_stats(
+    topk_idx: torch.Tensor,
+    num_pairs: int = 500,
+    seed: int = 0,
+) -> dict[str, float]:
+    """Per-token retrieval fixity via Monte-Carlo random-pair Jaccard.
+
+    Tests H3a: does Q retrieve ~the same rows for every token (content-blind
+    per-token retrieval), or do different tokens retrieve genuinely different
+    neighborhoods? If marginal |S| is large but random-pair Jaccard is near
+    1, retrieval is fixed per-token — a pathology that the MoE-style marginal
+    Q-diversity aux alone would NOT fix.
+
+    Full O(N²) Jaccard is 256MB+ at N~8k; we instead sample `num_pairs`
+    random index pairs and compute intersection via the broadcast
+    `[M,k,1] == [M,1,k] → .any(-1).sum(-1)` identity (exploits that top-k
+    returns distinct rows, so each pair_a value matches pair_b at most once).
+    500 pairs gives SE ≈ 0.02 on mean Jaccard — plenty for a forensic
+    verdict.
+
+    Also reports the coefficient of variation (std/mean) of row-occupancy
+    counts among USED rows — a per-row-usage uniformity measure that is
+    orthogonal to |S|. Together, mean Jaccard + occupancy CV locate where
+    Q's pathology lives: marginal vs per-token, usage vs set.
+
+    Args:
+        topk_idx: Retrieved row indices, shape [B, L, k]. Must be distinct
+            per row (standard topk output).
+        num_pairs: Monte-Carlo sample size. 500 is a good default.
+        seed: RNG seed for pair sampling. Fixed default for reproducibility
+            across a single forensic run; we resample with different seeds
+            if inter-batch variance matters.
+    """
+    B, L, k = topk_idx.shape
+    N = B * L
+    flat = topk_idx.reshape(N, k)
+
+    gen = torch.Generator(device=flat.device).manual_seed(seed)
+    idx_a = torch.randint(0, N, (num_pairs,), generator=gen, device=flat.device)
+    idx_b = torch.randint(0, N, (num_pairs,), generator=gen, device=flat.device)
+    pair_a = flat[idx_a]
+    pair_b = flat[idx_b]
+
+    match = (pair_a.unsqueeze(-1) == pair_b.unsqueeze(-2)).any(dim=-1)
+    intersection = match.sum(dim=-1).to(torch.float32)
+    union = (2 * k) - intersection
+    jaccard = intersection / union.clamp_min(1.0)
+
+    f = torch.bincount(flat.reshape(-1))
+    used = f[f > 0].to(torch.float32)
+    if used.numel() > 1:
+        occupancy_cv = (used.std(unbiased=False) / used.mean().clamp_min(1.0)).item()
+    else:
+        occupancy_cv = 0.0
+
+    return {
+        "q_overlap_random_pair_jaccard_mean": jaccard.mean().item(),
+        "q_overlap_random_pair_jaccard_p50": jaccard.median().item(),
+        "q_occupancy_cv_used": occupancy_cv,
+    }
+
+
+def _effective_rank(matrix: torch.Tensor) -> float:
+    """Entropy-based effective rank: exp(H(σ² / ||σ²||)).
+
+    Smoother than a hard SVD-threshold rank (no cliff at the cutoff).
+    exp(H) equals the hard rank when σ is uniform-supported on k dimensions
+    and decays smoothly as the singular-value spectrum concentrates.
+    """
+    s = torch.linalg.svdvals(matrix.to(torch.float32))
+    s_sq = s * s
+    total = s_sq.sum().clamp_min(1e-12)
+    p = s_sq / total
+    p_safe = p.clamp_min(1e-12)
+    entropy = -(p * p_safe.log()).sum()
+    return float(torch.exp(entropy).item())
+
+
+def _v_rank_stats(
+    xattn: "EngramCrossAttention",
+    topk_idx: torch.Tensor,
+) -> dict[str, float]:
+    """V-output rank on the retrieved subset S.
+
+    Tests H3c: does V compress the retrieved-row span into a narrower
+    output subspace? θ L5's forensic reported |S|=198 rank-74 — V losing
+    ~20 dims vs the retrieved input. Reproduces that comparison on any
+    checkpoint: rank of `V(retrieval_norm(E[S]))` vs rank of
+    `retrieval_norm(E[S])` itself.
+
+    Reports both hard rank (`torch.linalg.matrix_rank` with default
+    tolerance) and effective rank (entropy of normalized σ²). Effective
+    rank is less threshold-sensitive and usually the more informative
+    number for "is V preserving or compressing information?".
+
+    Runs the V projection in torch.no_grad and on the module's current
+    device. For typical forensic settings |S| ≤ 10000 and hidden_dim ≤ 512,
+    SVD is a fraction of a second on CUDA.
+    """
+    unique_rows = topk_idx.unique()
+    e_s = xattn.table[unique_rows]
+    # Cast to the layer-norm's parameter dtype so the forward runs under whatever
+    # precision the loaded checkpoint uses. Fall back to the table's own dtype
+    # when retrieval_norm has no parameters (e.g. Identity in unit tests).
+    ln_dtype = next(
+        (p.dtype for p in xattn.retrieval_norm.parameters()),
+        xattn.table.dtype,
+    )
+    e_s_normed = xattn.retrieval_norm(e_s.to(ln_dtype))
+    v_e_s = xattn.v_proj(e_s_normed)
+
+    e_rank = int(torch.linalg.matrix_rank(e_s_normed.to(torch.float32)).item())
+    v_rank = int(torch.linalg.matrix_rank(v_e_s.to(torch.float32)).item())
+    e_eff = _effective_rank(e_s_normed)
+    v_eff = _effective_rank(v_e_s)
+
+    return {
+        "subset_size_S": int(unique_rows.numel()),
+        "e_rank_hard": float(e_rank),
+        "v_rank_hard": float(v_rank),
+        "e_rank_effective": e_eff,
+        "v_rank_effective": v_eff,
+        "v_rank_ratio": v_rank / max(e_rank, 1),
+    }
+
+
 @torch.no_grad()
 def analyze_injection(
     wrapper: GatedEngramInjection,
@@ -435,6 +579,9 @@ def analyze_injection(
     injection_vs_hidden_signed = per_token_vs_hidden.mean().item()
     injection_vs_hidden_abs = per_token_vs_hidden.abs().mean().item()
 
+    q_overlap = _q_overlap_stats(topk_idx)
+    v_rank = _v_rank_stats(xattn, topk_idx)
+
     scalar_stats: dict[str, float | int] = {
         "unique_rows": unique_rows,
         "n_slots": n_slots,
@@ -450,6 +597,8 @@ def analyze_injection(
         "within_run_axis_rms": within_run_axis_rms,
         "injection_vs_hidden_signed": injection_vs_hidden_signed,
         "injection_vs_hidden_abs": injection_vs_hidden_abs,
+        **q_overlap,
+        **v_rank,
     }
     return scalar_stats, injection
 
@@ -669,6 +818,15 @@ def print_per_run_diagnostics(
         print(f"      within-run axis RMS cos             {_mean(real, 'within_run_axis_rms'):8.4f}     {_mean(shuf, 'within_run_axis_rms'):8.4f}")
         print(f"  (A) cos(inj, hidden)  signed            {_mean(real, 'injection_vs_hidden_signed'):+8.4f}     {_mean(shuf, 'injection_vs_hidden_signed'):+8.4f}")
         print(f"      cos(inj, hidden)  |abs|             {_mean(real, 'injection_vs_hidden_abs'):8.4f}     {_mean(shuf, 'injection_vs_hidden_abs'):8.4f}")
+        print(f"  (Q-overlap) random-pair Jaccard mean    {_mean(real, 'q_overlap_random_pair_jaccard_mean'):8.4f}     {_mean(shuf, 'q_overlap_random_pair_jaccard_mean'):8.4f}")
+        print(f"              random-pair Jaccard p50     {_mean(real, 'q_overlap_random_pair_jaccard_p50'):8.4f}     {_mean(shuf, 'q_overlap_random_pair_jaccard_p50'):8.4f}")
+        print(f"  (Q-occupancy) CV (used rows)            {_mean(real, 'q_occupancy_cv_used'):8.4f}     {_mean(shuf, 'q_occupancy_cv_used'):8.4f}")
+        print(f"  (V-rank) |S|                          {_mean(real, 'subset_size_S'):10.0f}     {_mean(shuf, 'subset_size_S'):10.0f}")
+        print(f"           rank(E[S])        hard          {_mean(real, 'e_rank_hard'):8.2f}     {_mean(shuf, 'e_rank_hard'):8.2f}")
+        print(f"           rank(V(E[S]))     hard          {_mean(real, 'v_rank_hard'):8.2f}     {_mean(shuf, 'v_rank_hard'):8.2f}")
+        print(f"           rank(E[S])        effective     {_mean(real, 'e_rank_effective'):8.2f}     {_mean(shuf, 'e_rank_effective'):8.2f}")
+        print(f"           rank(V(E[S]))     effective     {_mean(real, 'v_rank_effective'):8.2f}     {_mean(shuf, 'v_rank_effective'):8.2f}")
+        print(f"           v / e rank ratio                {_mean(real, 'v_rank_ratio'):8.4f}     {_mean(shuf, 'v_rank_ratio'):8.4f}")
 
 
 def print_cross_run(
@@ -799,6 +957,55 @@ random-pair |cos| floor (printed alongside each (X) reading): if (X) is
 near the floor, V is dispersing tokens across axes but not specifically
 content-routing; if (X) is materially above the floor, there is partial
 content dependence.
+
+--- (Q-overlap), (Q-occupancy), (V-rank) readings (added 2026-04-17) ---
+
+The (D) unique-rows probe answers "how many rows does Q use in aggregate"
+but not "is Q content-sensitive at a per-token granularity." η-B's 49%
+retrieval + content-invariance paradox suggests a large |S| can coexist
+with per-token retrieval fixity. The (Q-overlap) and (Q-occupancy) probes
+split (D) into two orthogonal questions, and (V-rank) tests whether V
+further compresses the retrieved span.
+
+(Q-overlap) random-pair Jaccard mean J̄:
+  J̄ ≳ 0.8  → per-token retrieval is near-fixed; marginal breadth is a
+             projection artifact. The MoE f·P aux alone would NOT fix
+             this; need a per-token Q-entropy or Q-diversity term.
+  J̄ ≈ 0.5  → moderate per-token variation. Shared neighborhood but
+             not fully fixed.
+  J̄ ≲ 0.2  → per-token retrieval is content-dispersive. The (D) = 5%
+             η-pre-ι reading combined with low J̄ would mean each token
+             has its own neighborhood; the pathology is elsewhere.
+
+(Q-occupancy) CV (coefficient of variation among used rows):
+  CV ≲ 0.3 → row usage is nearly uniform among the |S| selected rows.
+             This is what the MoE f·P aux targets — η-B post-ι₁ should
+             move toward this.
+  CV ≳ 1.0 → a few rows dominate the used set. High CV + high |S| =
+             "many rows are used, but only a handful get most traffic."
+  CV ≳ 2.0 → severe concentration (effectively retrieval-collapsed even
+             if |S| looks large).
+
+(V-rank) rank(V(E[S])) vs rank(E[S]):
+  v/e ≈ 1  → V preserves the retrieved subset's rank. V's output
+             dimensionality matches its input; no compression.
+  v/e ≲ 0.8 → V loses rank on the retrieved subset. If V is otherwise
+             content-sensitive ((X) |cos| low), this signals a V-side
+             bottleneck orthogonal to Q — even broadening Q might not
+             unlock full content-routing.
+  v/e ≲ 0.5 → severe V compression. Consider V-side redesign
+             (e.g., V-contrast tightening, wider hidden_dim).
+
+Joint readings define the next experimental direction:
+
+  High J̄ (≳ 0.8), low CV  → H3a confirmed; queue ι₃ (per-token
+                             Q-entropy aux, orthogonal to marginal f·P).
+  Low J̄ (≲ 0.2), high CV  → Per-token retrieval is dispersed but
+                             marginal usage is peaked; ι₁'s f·P aux
+                             should help directly.
+  v/e ≲ 0.8 on both runs   → V-side bottleneck co-exists with Q issues;
+                             consider V-rank-preservation aux or V
+                             widening.
 """)
 
 
