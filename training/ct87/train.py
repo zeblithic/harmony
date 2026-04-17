@@ -1627,6 +1627,10 @@ def main() -> None:
             accum_ann_ent_loss = 0.0
             accum_ann_gate_mean = 0.0
             accum_mse_loss = 0.0
+            # θ-V-contrast (ZEB-130): aux-loss accumulators. Sum is captured
+            # as a scalar (no grad), per-layer values are retained for CSV.
+            accum_vcontrast_aux = 0.0
+            accum_vcontrast_per_layer: dict[str, float] = {}
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
             need_hidden = mtp_head is not None
             use_coconut = args.coconut and num_thoughts > 0
@@ -1855,6 +1859,38 @@ def main() -> None:
                         mse_loss = F.mse_loss(consol_pred, consol_target)
                         loss = loss + args.consolidation_lambda * mse_loss
                         accum_mse_loss += mse_loss.item()
+
+                    # θ-V-contrast (ZEB-130): aggregate per-layer V-contrastive
+                    # aux losses appended by ContrastiveGatedEngramInjection
+                    # forwards. The sink is owned by the model and cleared
+                    # at the start of every training-mode forward.
+                    if (
+                        config.engram_vcontrast_enabled
+                        and model._contrastive_aux_losses
+                    ):
+                        aux_per_layer = model._contrastive_aux_losses
+                        # Stack to a single tensor so the .sum() is a single
+                        # CUDA op rather than a Python-loop over scalars.
+                        aux_total = torch.stack(aux_per_layer).sum()
+                        lam = lambda_schedule(
+                            step,
+                            config.engram_vcontrast_warmup_steps,
+                            config.engram_vcontrast_lambda,
+                        )
+                        loss = loss + lam * aux_total
+                        # Detach for logging — these are consumed by CSV /
+                        # console emit and must not retain the graph.
+                        accum_vcontrast_aux += aux_total.detach().item()
+                        # Per-layer accumulator: keys are str(layer_idx),
+                        # matching the ModuleDict key convention.
+                        for layer_key, layer_loss in zip(
+                            (str(i) for i in config.engram_inject_layers),
+                            aux_per_layer,
+                        ):
+                            accum_vcontrast_per_layer[layer_key] = (
+                                accum_vcontrast_per_layer.get(layer_key, 0.0)
+                                + layer_loss.detach().item()
+                            )
 
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
