@@ -1554,6 +1554,8 @@ git commit -m "docs: add θ-V-contrast runbook section"
 
 ### Task 14: Cross-table forensic probe (separate worktree, separate PR)
 
+> **HISTORICAL (superseded 2026-04-17):** Task 14 as originally written used `alt_table = primary_table[perm]` (a row permutation) and a `--alt-shuffle-seed` CLI flag. The row permutation is tautological on cosine top-k retrieval — it always produces `|cos| = 1.0`, not a content-sensitivity signal. The corrected design uses a random-gaussian alt table with matched per-dim statistics, sampled from each model's own training table, via a `--alt-table-seed` flag. The step-by-step instructions below are preserved for historical context; do NOT follow them verbatim. See `training/scripts/forensic_eta_b_capgap.py` and its `analyze_cross_table` / `_sample_matched_gaussian_alt` functions for the authoritative implementation.
+
 **Files:**
 - Create new worktree from `origin/main`
 - Modify: `training/scripts/forensic_eta_b_capgap.py`

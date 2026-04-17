@@ -6,6 +6,8 @@
 **Depends on:** PR #247 (η-B capgap infrastructure), PR #249 (forensic (W)/(A) probes)
 **Status:** Design approved, awaiting implementation plan
 
+> **Errata (post-merge, 2026-04-17):** the `(X) cross-table within-run probe` design below (Task 14 in the plan) used `alt_table = primary_table[perm]`. This is a row permutation, which is mathematically a no-op on top-k cosine retrieval — the retrieved content is identical up to j-label relabeling, so the probe is tautological and always reports |cos| = 1.0. Superseded by a fix that samples `alt_table` from a random Gaussian with matched per-dim mean and std (a genuine content swap). See the current `forensic_eta_b_capgap.py` docstring and `analyze_cross_table` for the authoritative design.
+
 ## Motivation
 
 The 40M engram cross-attention architecture is **content-invariant**: training metrics (val loss, Δ-removal) are identical when the oracle table is row-shuffled (η-B 2026-04-16: real +0.0125 vs shuffled +0.0124; ζ-ctrl 2026-04-17: real +0.0163 vs shuffled +0.0158). Two independent architectures (xxhash/conv1d from Phase 0 and cross-attention from η-B / ζ-ctrl) both show the same failure mode.
@@ -241,6 +243,8 @@ Both runs enable aux loss. "Primary" means the table used for the residual-contr
 3. **Cross-table within-run probe** (new forensic extension, separate small PR ahead of training).
 
 ### Cross-table within-run probe
+
+> **HISTORICAL — superseded by PR #251.** The original design below built `alt_table` as `primary_table[perm]` (a row permutation). Under cosine top-k retrieval this selects the same rows, just at different j-labels, so the retrieved content is identical and `|cos|` is always 1.0. The corrected design samples `alt_table` from a random gaussian at matched per-dim mean and std, and probes each model against ITS OWN training table (not args.real_table for both). See the current `forensic_eta_b_capgap.py` `analyze_cross_table` + `_sample_matched_gaussian_alt`.
 
 For a single trained model, forward the same tokens through its engram against TWO different tables — its training primary, and a fresh held-out random shuffle (never seen during training). Compute cos between matched-position injection outputs.
 
