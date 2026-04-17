@@ -77,6 +77,14 @@ from ct87.model import HarmonyModel, HarmonyModelConfig  # noqa: E402
 from ct87.train import make_hf_dataloader  # noqa: E402
 
 
+def _positive_int(value: str) -> int:
+    """argparse type that rejects <= 0 (protects downstream divide-by-zero / topk)."""
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {ivalue}")
+    return ivalue
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Forensic analysis for ZEB-130 η-B shuffle-oracle control.",
@@ -92,12 +100,12 @@ def parse_args() -> argparse.Namespace:
                    help="Safetensors oracle table the shuffled checkpoint was trained with.")
     p.add_argument("--val-data", required=True, type=str,
                    help="Validation HF dataset path (same format as --val-data in train.py).")
-    p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--seq-len", type=int, default=2048)
-    p.add_argument("--num-batches", type=int, default=2,
+    p.add_argument("--batch-size", type=_positive_int, default=4)
+    p.add_argument("--seq-len", type=_positive_int, default=2048)
+    p.add_argument("--num-batches", type=_positive_int, default=2,
                    help="Number of val batches to forensic over. 2 is usually enough "
                         "since each batch is B*L = thousands of tokens.")
-    p.add_argument("--k-retrieved", type=int, default=8,
+    p.add_argument("--k-retrieved", type=_positive_int, default=8,
                    help="Top-k retrieval parameter. Must match the training run's "
                         "--xattn-top-k value for the forensic to reflect the trained model.")
     p.add_argument("--device", type=str,
@@ -154,16 +162,28 @@ def load_capgap_model(
         )
     model.attach_gated_engram_injections(injections)
 
-    _missing, unexpected = model.load_state_dict(
+    # `.table` and `.table_normalized` on every EngramCrossAttention are
+    # non-persistent buffers, so they're never in a checkpoint's state_dict
+    # and will always appear in `missing`. Filter them out of both sides —
+    # anything else missing or unexpected means the checkpoint is wrong for
+    # this architecture, and forensic results would be run on partially-
+    # initialized weights. Fail fast rather than print a warning nobody reads.
+    missing, unexpected = model.load_state_dict(
         payload["model_state_dict"], strict=False,
     )
+    real_missing = [k for k in missing if ".table" not in k]
     real_unexpected = [k for k in unexpected if ".table" not in k]
-    if real_unexpected:
-        head = real_unexpected[:5]
-        tail = " ..." if len(real_unexpected) > 5 else ""
-        print(
-            f"WARN {ckpt_path.name}: unexpected state_dict keys: {head}{tail}",
-            file=sys.stderr,
+    if real_missing or real_unexpected:
+        def _summary(keys: list[str]) -> str:
+            head = keys[:5]
+            tail = f" (+{len(keys) - 5} more)" if len(keys) > 5 else ""
+            return f"{head}{tail}"
+        raise RuntimeError(
+            f"{ckpt_path.name}: incompatible state_dict load — forensic would "
+            f"run on partially-initialized weights and produce invalid verdicts. "
+            f"missing={_summary(real_missing)} unexpected={_summary(real_unexpected)}. "
+            f"Check that --real-ckpt / --shuffled-ckpt point at η-B capgap "
+            f"checkpoints matching the current architecture.",
         )
 
     model.eval().to(device)
@@ -171,7 +191,12 @@ def load_capgap_model(
 
 
 class InjectionPreHook:
-    """Forward pre-hook that captures the input hidden state to an injection."""
+    """Forward pre-hook that captures the input hidden state to an injection.
+
+    Reset `captured` to None between batches via `reset()` so a hook that
+    fails to fire on a subsequent batch surfaces as a None-check failure
+    instead of silently analyzing stale data from the prior batch.
+    """
 
     def __init__(self) -> None:
         self.captured: torch.Tensor | None = None
@@ -181,12 +206,15 @@ class InjectionPreHook:
     ) -> None:
         self.captured = inputs[0].detach()
 
+    def reset(self) -> None:
+        self.captured = None
+
 
 @torch.no_grad()
 def analyze_injection(
     wrapper: GatedEngramInjection,
     hidden_state: torch.Tensor,
-) -> dict[str, Any]:
+) -> tuple[dict[str, float | int], torch.Tensor]:
     """Re-run the injection forward manually so we can capture intermediates.
 
     The public `EngramCrossAttention.forward` returns only the final residual,
@@ -194,6 +222,13 @@ def analyze_injection(
     the forward inline so the retrieval and attention tensors are available
     for diagnostics. Logic is byte-for-byte the same as
     `EngramCrossAttention.forward` as of commit b2c3a96.
+
+    Returns `(scalar_stats, injection)`:
+      - `scalar_stats` has no tensors so callers can accumulate it cheaply
+        across batches.
+      - `injection` is the gate × xattn_out tensor ([B, L, hidden_dim]) for
+        cross-run comparison; callers should consume it immediately and
+        drop the reference so tensors don't accumulate across batches.
     """
     xattn = wrapper.engram_xattn
     B, L, _ = hidden_state.shape
@@ -220,8 +255,11 @@ def analyze_injection(
         out = out * gate_heads
     xattn_out = xattn.o_proj(out.reshape(B, L, H * D))
 
-    gate_scalar = torch.tanh(wrapper.alpha).item()
-    injection = gate_scalar * xattn_out
+    # Mirror GatedEngramInjection.forward: keep the gate as a tensor, cast
+    # to xattn_out's dtype before multiplying. Avoids a gratuitous GPU→CPU
+    # sync and matches the production dtype contract.
+    gate = torch.tanh(wrapper.alpha).to(dtype=xattn_out.dtype)
+    injection = gate * xattn_out
 
     # (D) retrieval diversity — unique table rows touched across B*L*k slots.
     unique_rows = int(topk_idx.unique().numel())
@@ -242,7 +280,7 @@ def analyze_injection(
     hidden_norm = hidden_state.norm(dim=-1).clamp_min(1e-9)
     magnitude_ratio = (injection_norm / hidden_norm).mean().item()
 
-    return {
+    scalar_stats: dict[str, float | int] = {
         "unique_rows": unique_rows,
         "n_slots": n_slots,
         "unique_rows_frac": unique_rows / max(n_slots, 1),
@@ -252,9 +290,9 @@ def analyze_injection(
         "mean_entropy": mean_entropy,
         "entropy_frac_of_max": mean_entropy / max_entropy if max_entropy > 0 else 0.0,
         "injection_vs_hidden_norm": magnitude_ratio,
-        "gate": gate_scalar,
-        "injection": injection,
+        "gate": float(gate.detach().float().item()),
     }
+    return scalar_stats, injection
 
 
 def _mean(per_batch_stats: list[dict[str, Any]], key: str) -> float:
@@ -287,27 +325,27 @@ def print_per_run_diagnostics(
 
 
 def print_cross_run(
-    per_layer_real: dict[int, list[dict[str, Any]]],
-    per_layer_shuf: dict[int, list[dict[str, Any]]],
+    cross_run_per_layer: dict[int, list[tuple[float, float]]],
     layers: list[int],
 ) -> None:
+    """Print cross-run cosine from pre-aggregated scalar stats.
+
+    `cross_run_per_layer[layer_idx]` is a list of `(signed_cos_mean,
+    abs_cos_mean)` tuples, one per batch. Aggregated at print time rather
+    than at compute time so the per-batch numbers remain inspectable if we
+    want to add them to the output later.
+    """
     print("\n" + "=" * 80)
     print("CROSS-RUN COMPARISON  (real vs shuffled on matched tokens)")
     print("=" * 80)
     print("Signed cos ≈ 0 AND |cos| ≈ 0 → the two runs picked arbitrary")
     print("orthogonal directions (fingerprint of content-free utilization).\n")
     for layer_idx in layers:
-        real_batches = per_layer_real[layer_idx]
-        shuf_batches = per_layer_shuf[layer_idx]
-        cos_means: list[float] = []
-        cos_abs_means: list[float] = []
-        for r, s in zip(real_batches, shuf_batches):
-            cos = F.cosine_similarity(r["injection"], s["injection"], dim=-1)
-            cos_means.append(cos.mean().item())
-            cos_abs_means.append(cos.abs().mean().item())
-        mean_cos = sum(cos_means) / len(cos_means)
-        abs_mean = sum(cos_abs_means) / len(cos_abs_means)
-        print(f"  Layer {layer_idx}:  signed cos = {mean_cos:+.4f}    |cos| = {abs_mean:.4f}")
+        batches = cross_run_per_layer[layer_idx]
+        n = len(batches)
+        mean_signed = sum(s for s, _ in batches) / n
+        mean_abs = sum(a for _, a in batches) / n
+        print(f"  Layer {layer_idx}:  signed cos = {mean_signed:+.4f}    |cos| = {mean_abs:.4f}")
 
 
 def print_verdict_criteria(k: int) -> None:
@@ -402,10 +440,22 @@ def run_forensic(args: argparse.Namespace) -> None:
         f"(batch_size={args.batch_size}, seq_len={args.seq_len})\n",
     )
 
-    per_layer_real: dict[int, list[dict[str, Any]]] = {i: [] for i in layers}
-    per_layer_shuf: dict[int, list[dict[str, Any]]] = {i: [] for i in layers}
+    # Accumulated scalar stats only — no [B, L, hidden_dim] tensors retained
+    # across batches. The large injection tensors are consumed inline to
+    # compute cross-run cosine, then dropped.
+    per_layer_real: dict[int, list[dict[str, float | int]]] = {i: [] for i in layers}
+    per_layer_shuf: dict[int, list[dict[str, float | int]]] = {i: [] for i in layers}
+    cross_run_per_layer: dict[int, list[tuple[float, float]]] = {i: [] for i in layers}
 
     for _batch_idx in range(args.num_batches):
+        # Clear prior captures so a hook that fails to fire this batch surfaces
+        # as a None-check failure instead of silently reusing the prior batch's
+        # hidden state.
+        for probe in real_probes.values():
+            probe.reset()
+        for probe in shuf_probes.values():
+            probe.reset()
+
         batch = next(val_loader).to(device)
         input_ids = batch[:, :-1]
 
@@ -421,19 +471,25 @@ def run_forensic(args: argparse.Namespace) -> None:
                     f"Pre-hook at layer {layer_idx} did not fire — check that "
                     f"engram_injections are attached and in the forward path.",
                 )
-            per_layer_real[layer_idx].append(
-                analyze_injection(
-                    real_model.engram_injections[str(layer_idx)], real_h,
-                ),
+            real_stats, real_inj = analyze_injection(
+                real_model.engram_injections[str(layer_idx)], real_h,
             )
-            per_layer_shuf[layer_idx].append(
-                analyze_injection(
-                    shuf_model.engram_injections[str(layer_idx)], shuf_h,
-                ),
+            shuf_stats, shuf_inj = analyze_injection(
+                shuf_model.engram_injections[str(layer_idx)], shuf_h,
             )
+            # Compute cross-run cosine inline so the [B, L, hidden_dim]
+            # injection tensors can be dropped before the next batch.
+            cos = F.cosine_similarity(real_inj, shuf_inj, dim=-1)
+            signed = cos.mean().item()
+            abs_mean = cos.abs().mean().item()
+            cross_run_per_layer[layer_idx].append((signed, abs_mean))
+            del real_inj, shuf_inj, cos
+
+            per_layer_real[layer_idx].append(real_stats)
+            per_layer_shuf[layer_idx].append(shuf_stats)
 
     print_per_run_diagnostics(per_layer_real, per_layer_shuf, layers, args.k_retrieved)
-    print_cross_run(per_layer_real, per_layer_shuf, layers)
+    print_cross_run(cross_run_per_layer, layers)
     print_verdict_criteria(args.k_retrieved)
 
 
