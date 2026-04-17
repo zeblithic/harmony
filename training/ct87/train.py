@@ -1164,6 +1164,7 @@ def main() -> None:
         # Unified: GatedEngramInjection accepts optional aux-loss sink kwargs.
         # vcontrast_sink is passed only when vcontrast is enabled (the sink is
         # None otherwise, which disables the V-contrast branch in forward()).
+        # qdiv_sink is passed only when qdiv is enabled.
         capgap_injections: dict[int, GatedEngramInjection] = {}
         for layer_idx in config.engram_inject_layers:
             xattn_mod = EngramCrossAttention(
@@ -1177,6 +1178,9 @@ def main() -> None:
                 alpha_init=config.engram_gate_init,
                 vcontrast_sink=(
                     capgap_aux_sink if config.engram_vcontrast_enabled else None
+                ),
+                qdiv_sink=(
+                    model._qdiv_aux_losses if config.engram_qdiv_enabled else None
                 ),
                 shuffle_generator=capgap_shuffle_gen,
             )

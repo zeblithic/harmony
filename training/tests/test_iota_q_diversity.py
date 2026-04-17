@@ -252,3 +252,44 @@ class TestGatedEngramInjectionSinkMatrix:
         _ = wrapper(hidden)
         assert len(vsink) == 0
         assert len(qsink) == 0
+
+
+class TestHarmonyModelQdivSink:
+    def test_model_exposes_qdiv_aux_losses_list(self):
+        from ct87.model import HarmonyModel, HarmonyModelConfig
+        c = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        c.engram_qdiv_enabled = True
+        c.__post_init__()
+        model = HarmonyModel(c)
+        assert hasattr(model, "_qdiv_aux_losses")
+        assert isinstance(model._qdiv_aux_losses, list)
+        assert len(model._qdiv_aux_losses) == 0
+
+    def test_qdiv_sink_receives_one_per_layer_per_forward(self):
+        from ct87.engram import EngramCrossAttention, GatedEngramInjection
+        from ct87.model import HarmonyModel, HarmonyModelConfig
+        c = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        c.engram_qdiv_enabled = True
+        c.__post_init__()
+        model = HarmonyModel(c)
+
+        # Build + attach injections the same way train.py does.
+        table = torch.randn(100, c.engram_dim)
+        injections = {}
+        for layer_idx in c.engram_inject_layers:
+            xattn = EngramCrossAttention(
+                c, table, num_heads=4, k_retrieved=4
+            )
+            injections[layer_idx] = GatedEngramInjection(
+                xattn,
+                alpha_init=c.engram_gate_init,
+                qdiv_sink=model._qdiv_aux_losses,
+            )
+        model.attach_gated_engram_injections(injections)
+
+        model.train()
+        B, L = 1, 8
+        input_ids = torch.randint(0, c.vocab_size, (B, L))
+        model._qdiv_aux_losses.clear()
+        _ = model(input_ids)
+        assert len(model._qdiv_aux_losses) == len(c.engram_inject_layers)

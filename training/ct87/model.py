@@ -636,6 +636,13 @@ class HarmonyModel(nn.Module):
         # `_vcontrast_sink`); cleared at the start of every training-mode
         # forward.
         self._contrastive_aux_losses: list[torch.Tensor] | None = None
+        # ι-Q-diversity (ZEB-130): aux-loss sink populated by
+        # GatedEngramInjection wrappers (when qdiv_sink is set) during
+        # the forward pass. Owned by the training script (which assigns the
+        # same list reference into both this attribute and each wrapper's
+        # `_qdiv_sink`); cleared at the start of every training-mode
+        # forward.
+        self._qdiv_aux_losses: list[torch.Tensor] = []
         self.engram_inject_mult: float = 1.0
 
         # Tied embeddings
@@ -843,6 +850,9 @@ class HarmonyModel(nn.Module):
         # being wiped out.
         if self._contrastive_aux_losses is not None and self.training:
             self._contrastive_aux_losses.clear()
+        # ι-Q-diversity aux-loss sink: clear in training mode.
+        if self.training:
+            self._qdiv_aux_losses.clear()
 
         # η-B misuse guard: a multi-layer capgap config without an attach call
         # would silently fall through to the legacy single-point elif below
