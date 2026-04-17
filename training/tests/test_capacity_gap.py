@@ -35,7 +35,7 @@ class TestGatedEngramInjection:
         return xattn
 
     def test_forward_zero_at_init(self):
-        """With alpha=0, tanh(alpha)=0, so output must equal input exactly."""
+        """With alpha_init=0, tanh(0)=0 so the gate output is the zero tensor."""
         torch.manual_seed(0)
         wrapper = GatedEngramInjection(self._make_xattn(), alpha_init=0.0)
         wrapper.train(False)
