@@ -17,7 +17,11 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _gradient_checkpoint
 
 if TYPE_CHECKING:
-    from ct87.engram import EngramANNInjection, EngramCrossAttention
+    from ct87.engram import (
+        EngramANNInjection,
+        EngramCrossAttention,
+        GatedEngramInjection,
+    )
 
 
 @dataclass
@@ -68,6 +72,11 @@ class HarmonyModelConfig:
     use_xattn_engram: bool = False
     use_head_gates: bool = False
     ffn_dim_overrides: dict[int, int] | None = None
+    # η-B / ZEB-130: multi-layer gated cross-attention injection.
+    # Non-empty means use the GatedEngramInjection ModuleDict path
+    # (mutually exclusive with use_xattn_engram / use_ann_engram).
+    engram_inject_layers: tuple[int, ...] = ()
+    engram_gate_init: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate `ffn_dim_overrides` up front so misconfigurations fail fast.
@@ -81,6 +90,43 @@ class HarmonyModelConfig:
                 "exclusive - only one research-only engram injection "
                 "module can be attached at a time."
             )
+        # η-B multi-layer injection is mutually exclusive with the legacy
+        # single-point paths (model delta xattn, model gamma ANN).
+        if self.engram_inject_layers:
+            if self.use_xattn_engram or self.use_ann_engram:
+                raise ValueError(
+                    "engram_inject_layers (multi-layer gated injection) is "
+                    "mutually exclusive with use_xattn_engram / use_ann_engram "
+                    "(single-point legacy paths)."
+                )
+            # Type check must come BEFORE the duplicate check: set() equality
+            # would treat 2 and 2.0 as the same element (so duplicate detection
+            # passes), but ModuleDict keys str(2) vs str(2.0) would collide
+            # with forward() probing for str(layer_idx) using an integer
+            # loop counter, silently never firing the injection.
+            for layer_idx in self.engram_inject_layers:
+                # `type(x) is int` rejects bool too (True/False are 1/0 under
+                # isinstance but would stringify to "True"/"False" keys).
+                if type(layer_idx) is not int:
+                    raise TypeError(
+                        "engram_inject_layers entries must be plain int "
+                        f"(got {layer_idx!r} of type "
+                        f"{type(layer_idx).__name__}); ModuleDict keys "
+                        "would not match str(layer_idx) probed by forward()."
+                    )
+            if len(self.engram_inject_layers) != len(set(self.engram_inject_layers)):
+                raise ValueError(
+                    "engram_inject_layers contains duplicate layer indices: "
+                    f"{self.engram_inject_layers!r}. Each injection point must "
+                    "be a unique layer index (ModuleDict keys would collide)."
+                )
+            for layer_idx in self.engram_inject_layers:
+                if not (0 <= layer_idx < self.num_layers):
+                    raise ValueError(
+                        f"engram_inject_layers has layer_idx={layer_idx} "
+                        f"outside [0, {self.num_layers}) - would be silently "
+                        "ignored at model construction."
+                    )
         if self.ffn_dim_overrides is None:
             return
         for layer_idx, dim in self.ffn_dim_overrides.items():
@@ -255,6 +301,26 @@ class HarmonyModelConfig:
         """Zeta-ctrl: cross-attention control, no consolidation (ZEB-128)."""
         base = HarmonyModelConfig.tiny()
         base.use_xattn_engram = True
+        return base
+
+    @staticmethod
+    def tiny_engram_xattn_capgap() -> HarmonyModelConfig:
+        """η-B capacity-gap: multi-layer zero-init gated xattn injection (ZEB-130).
+
+        Attaches gated cross-attention injection at layers 2 and 5 (early +
+        mid-late, matching DeepSeek Engram's U-shaped scaling). Gate alpha
+        initialized to 0 so tanh(0)=0 produces no perturbation at step 0 —
+        preserves the frozen pretrained baseline's behavior until the
+        optimizer learns to open the gate.
+
+        Used with --freeze-backbone and --init-from <beta_checkpoint> to test
+        H2: can a well-trained backbone leverage a gated engram signal that
+        the from-scratch co-training setup could not?
+        """
+        base = HarmonyModelConfig.tiny()
+        base.engram_inject_layers = (2, 5)
+        base.engram_gate_init = 0.0
+        base.__post_init__()  # re-validate after mutation (matches tiny_ffn_expanded pattern)
         return base
 
 
@@ -482,6 +548,10 @@ class HarmonyModel(nn.Module):
         self.engram_residual = EngramGatedResidual(config)
         self.engram_ann: EngramANNInjection | None = None
         self.engram_xattn: EngramCrossAttention | None = None
+        # η-B multi-layer injection path (ZEB-130).
+        # Populated by attach_gated_engram_injections(). ModuleDict keys are
+        # str(layer_idx). Mutually exclusive with engram_ann / engram_xattn.
+        self.engram_injections: nn.ModuleDict | None = None
         # Side channel for the training loop to read the gate after each
         # forward (used for entropy regularization and optional
         # reconstruction loss). Reset every forward that uses the ANN
@@ -551,6 +621,69 @@ class HarmonyModel(nn.Module):
             )
         self.engram_xattn = module
 
+    def attach_gated_engram_injections(
+        self, injections_by_layer: dict[int, GatedEngramInjection]
+    ) -> None:
+        """Attach the η-B multi-layer gated injection modules (ZEB-130).
+
+        Called by the training script after constructing the model.
+        `injections_by_layer` must cover exactly the layer indices listed
+        in `config.engram_inject_layers`.
+
+        Registers the injections as submodules (keyed by str(layer_idx))
+        so their parameters are discovered by the optimizer and their
+        buffers move with `.to(device)`.
+        """
+        from ct87.engram import GatedEngramInjection  # avoid top-level circular
+
+        if self.engram_injections is not None:
+            raise ValueError(
+                "attach_gated_engram_injections() called but engram_injections "
+                "is already set - re-attach would orphan existing parameters "
+                "from the module tree and desync any optimizer built against them."
+            )
+        if not self.config.engram_inject_layers:
+            raise ValueError(
+                "attach_gated_engram_injections() called but "
+                "config.engram_inject_layers is empty - use "
+                "HarmonyModelConfig.tiny_engram_xattn_capgap() (or set the "
+                "field directly) before attaching."
+            )
+        expected = set(self.config.engram_inject_layers)
+        got = set(injections_by_layer.keys())
+        if got != expected:
+            raise ValueError(
+                f"attach_gated_engram_injections() got layer_idx keys "
+                f"{sorted(got)} but config declares {sorted(expected)}."
+            )
+        # Track object identity to reject reuse of the same
+        # GatedEngramInjection across layer slots. nn.ModuleDict silently
+        # accepts duplicate module references (it registers the module once
+        # and points both keys at it), which would cause the shared alpha +
+        # xattn params to receive two gradient contributions per step and
+        # break the "one injection per layer" contract the experiment relies
+        # on.
+        seen_ids: dict[int, int] = {}
+        for layer_idx, inj in injections_by_layer.items():
+            if not isinstance(inj, GatedEngramInjection):
+                raise TypeError(
+                    "attach_gated_engram_injections() values must be "
+                    "GatedEngramInjection instances."
+                )
+            prior = seen_ids.get(id(inj))
+            if prior is not None:
+                raise ValueError(
+                    "attach_gated_engram_injections() got the same "
+                    "GatedEngramInjection instance for layers "
+                    f"{prior} and {layer_idx}; each configured layer must "
+                    "have its own module so parameters aren't shared."
+                )
+            seen_ids[id(inj)] = layer_idx
+        self.engram_injections = nn.ModuleDict({
+            str(layer_idx): injections_by_layer[layer_idx]
+            for layer_idx in self.config.engram_inject_layers
+        })
+
     def _init_weights(self):
         """Initialize weights matching candle HarmonyModel::new().
 
@@ -599,7 +732,10 @@ class HarmonyModel(nn.Module):
             engram_embeddings: optional [batch, seq_len, engram_dim] Engram
                 embeddings from an EngramTable lookup. When provided, the
                 EngramGatedResidual module injects them after the configured
-                engram_injection_layer.
+                engram_injection_layer. Ignored when η-B multi-layer injection
+                is attached (via attach_gated_engram_injections) or when a
+                research engram module (ANN/xattn) is attached — the active
+                engram path takes precedence.
             input_embeds: optional [batch, seq_len, hidden_dim] embeddings to
                 use instead of token lookup. Used by COCONUT continuous thought
                 to feed hidden states back as input.
@@ -626,6 +762,21 @@ class HarmonyModel(nn.Module):
         self._last_xattn_output = None
         self._last_pre_injection_hidden = None
 
+        # η-B misuse guard: a multi-layer capgap config without an attach call
+        # would silently fall through to the legacy single-point elif below
+        # (which probes engram_injection_layer, typically still set from the
+        # base preset) and do nothing, producing a model that behaves as if
+        # no injection were configured. Fail here so tests/training notice
+        # the missing attach_gated_engram_injections() call immediately.
+        if self.config.engram_inject_layers and self.engram_injections is None:
+            raise RuntimeError(
+                "config.engram_inject_layers="
+                f"{self.config.engram_inject_layers!r} declares multi-layer "
+                "engram injection but attach_gated_engram_injections() was "
+                "never called. The forward pass would otherwise be a no-op "
+                "at every configured layer."
+            )
+
         for i, layer in enumerate(self.layers):
             # Block boundary mixing (blocks > 0)
             if i > 0 and i % layers_per_block == 0:
@@ -638,10 +789,15 @@ class HarmonyModel(nn.Module):
             else:
                 h = layer(h)
 
-            # Engram injection at the configured layer.
+            # Engram injection at configured layer(s).
             # Precedence (mutually exclusive by construction):
-            #   Model delta (xattn) > Model gamma (ANN) > production (embeddings)
-            if i == self.config.engram_injection_layer:
+            #   η-B multi-layer > Model delta xattn > Model gamma ANN > production
+            if self.engram_injections is not None:
+                key = str(i)
+                if key in self.engram_injections:
+                    injection_out = self.engram_injections[key](h)
+                    h = h + self.engram_inject_mult * injection_out
+            elif i == self.config.engram_injection_layer:
                 if self.engram_xattn is not None:
                     self._last_pre_injection_hidden = h
                     xattn_out = self.engram_xattn(h)

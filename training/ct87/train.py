@@ -165,6 +165,12 @@ def save_resumable_checkpoint(
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "last_val_loss": last_val_loss,
+        # Persist the model config so --init-from can run its architecture-
+        # compatibility check against checkpoints produced by this script.
+        # Without this, the compat check silently skips (because
+        # ckpt.get('config') is None) and strict=False would load zero
+        # backbone params on an architecture mismatch.
+        "config": model.config,
     }
     if rng_state is not None:
         payload["rng_state"] = rng_state
@@ -312,6 +318,46 @@ def detect_device(requested: str | None) -> torch.device:
     return torch.device("cpu")
 
 
+def freeze_backbone_for_capgap(model: "HarmonyModel") -> None:
+    """Freeze all parameters except engram_injections.* (η-B / ZEB-130).
+
+    Sets requires_grad=False on every parameter whose name does not start
+    with "engram_injections." — the optimizer then only sees the
+    GatedEngramInjection params (xattn projections + alpha scalars) when
+    constructed from a requires_grad filter.
+
+    Raises RuntimeError if the model has no attached engram_injections —
+    freezing everything with zero trainable params would leave the optimizer
+    with empty param groups and the first optimizer step would crash with
+    an obscure PyTorch error.
+    """
+    if getattr(model, "engram_injections", None) is None:
+        raise RuntimeError(
+            "freeze_backbone_for_capgap() requires engram_injections to be "
+            "attached (use --config tiny_engram_xattn_capgap and construct "
+            "GatedEngramInjection modules first). The model has no "
+            "engram_injections.* params — freezing everything would leave "
+            "the optimizer with zero trainable parameters."
+        )
+    frozen_count = 0
+    trainable_count = 0
+    for name, param in model.named_parameters():
+        # Trailing dot matters: "engram_injections.0.alpha" is trainable, but
+        # a hypothetical future "engram_injections_shared" sibling field would
+        # NOT be caught by `startswith("engram_injections")` alone and would
+        # silently be left trainable.
+        if name.startswith("engram_injections."):
+            param.requires_grad = True
+            trainable_count += param.numel()
+        else:
+            param.requires_grad = False
+            frozen_count += param.numel()
+    print(
+        f"[capgap] Frozen {frozen_count:,} backbone params; "
+        f"{trainable_count:,} engram params remain trainable."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train ct87 model")
     parser.add_argument(
@@ -323,6 +369,7 @@ def main() -> None:
             "tiny_engram_xattn_consol_online",
             "tiny_engram_xattn_consol_phased",
             "tiny_engram_xattn_ctrl",
+            "tiny_engram_xattn_capgap",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -359,6 +406,39 @@ def main() -> None:
     parser.add_argument(
         "--resume-from", type=str, default=None,
         help="Path to safetensors checkpoint to resume/fine-tune from",
+    )
+    parser.add_argument(
+        "--init-from", type=str, default=None,
+        help=(
+            "Path to a checkpoint .pt file for weight initialization only "
+            "(η-B capacity-gap / ZEB-130). Loads model weights via "
+            "strict=False (missing keys for new engram injections are "
+            "allowed), then starts training fresh (step=0, fresh optimizer, "
+            "fresh RNG). Mutually exclusive with --resume-from."
+        ),
+    )
+    parser.add_argument(
+        "--allow-partial-init", action="store_true",
+        help=(
+            "Permit --init-from to proceed when non-engram backbone keys are "
+            "missing (otherwise the load fails hard to prevent silently "
+            "running with a randomly-initialized backbone). Also permits "
+            "--init-from when the source checkpoint has no config metadata "
+            "to compare against."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-backbone", action="store_true",
+        help=(
+            "Freeze all non-engram parameters (η-B capacity-gap / ZEB-130). "
+            "Only engram_injections.* params receive gradients and are "
+            "added to the optimizer. Typically combined with --init-from "
+            "and the tiny_engram_xattn_capgap config."
+        ),
+    )
+    parser.add_argument(
+        "--xattn-top-k", type=int, default=4,
+        help="top-k for cross-attention retrieval (shared by δ and η-B paths).",
     )
     parser.add_argument(
         "--gradient-checkpoint", action="store_true",
@@ -528,6 +608,50 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.init_from is not None and args.resume_from is not None:
+        print(
+            "Error: --init-from and --resume-from are mutually exclusive. "
+            "Use --resume-from to continue training from a checkpoint; use "
+            "--init-from to load weights only and start a fresh run.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.init_from is not None and not args.init_from.endswith(".pt"):
+        print(
+            "Error: --init-from must point to a resumable checkpoint .pt "
+            "file (weights + config), not a safetensors file.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # η-B capacity-gap contract: --freeze-backbone is meant to train ONLY
+    # engram_injections.* params. The optimizer-construction path below still
+    # adds thought_norm / uq_head / mtp_head / latent_projection / consol_decoder
+    # param groups unconditionally, so combining --freeze-backbone with any of
+    # the aux-module flags silently breaks the "injections-only" invariant.
+    # Fail here instead so the run doesn't complete hours later as a confounded
+    # experiment.
+    if args.freeze_backbone:
+        aux_conflicts = []
+        if args.coconut:
+            aux_conflicts.append("--coconut")
+        if args.uq_head:
+            aux_conflicts.append("--uq-head")
+        if args.mtp_head:
+            aux_conflicts.append("--mtp-head")
+        if args.contrastive_loss:
+            aux_conflicts.append("--contrastive-loss")
+        if args.consolidation_mode != "none":
+            aux_conflicts.append(f"--consolidation-mode={args.consolidation_mode}")
+        if aux_conflicts:
+            print(
+                "Error: --freeze-backbone is incompatible with aux-trainable "
+                "modules; capgap runs must optimize only engram_injections.*. "
+                f"Conflicting flags: {', '.join(aux_conflicts)}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     # --zero-injection-eval is an eval-only early-exit path, so training data
     # is not required when that flag is set.
     if (
@@ -646,6 +770,8 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_engram_xattn_consol_phased()
     elif args.config == "tiny_engram_xattn_ctrl":
         config = HarmonyModelConfig.tiny_engram_xattn_ctrl()
+    elif args.config == "tiny_engram_xattn_capgap":
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
@@ -865,6 +991,57 @@ def main() -> None:
             f"bias_weight={xattn_module.retrieval_bias_weight}"
         )
 
+    # η-B multi-layer gated injection (ZEB-130).
+    # Must happen BEFORE freeze_backbone_for_capgap() which raises if no
+    # engram_injections are attached.
+    if config.engram_inject_layers:
+        from ct87.engram import EngramCrossAttention, GatedEngramInjection
+
+        if args.engram_xattn_table is not None:
+            capgap_table = EngramCrossAttention.load_corpus_table(args.engram_xattn_table)
+        elif args.synthetic:
+            # Synthetic smoke tests can use a random placeholder table sized
+            # (vocab_size, engram_dim) so the capgap path is exercised without
+            # requiring a real oracle table artifact on disk.
+            print(
+                "[capgap] --synthetic with no --engram-xattn-table; using random "
+                f"({config.vocab_size}, {config.engram_dim}) placeholder table."
+            )
+            capgap_table = torch.randn(config.vocab_size, config.engram_dim)
+        else:
+            # Real run with no table would silently attend over random memory
+            # and produce meaningless retrieval — fail loudly instead.
+            print(
+                "Error: --config=tiny_engram_xattn_capgap requires "
+                "--engram-xattn-table for non-synthetic runs (a random "
+                "placeholder table would invalidate the experiment). Pass "
+                "--synthetic for smoke tests.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        capgap_injections: dict[int, GatedEngramInjection] = {}
+        for layer_idx in config.engram_inject_layers:
+            xattn_mod = EngramCrossAttention(
+                config,
+                capgap_table,
+                num_heads=config.num_query_heads,
+                k_retrieved=args.xattn_top_k,
+            )
+            capgap_injections[layer_idx] = GatedEngramInjection(
+                xattn_mod,
+                alpha_init=config.engram_gate_init,
+            )
+        model.attach_gated_engram_injections(capgap_injections)
+        # Ensure newly-attached submodules are on the correct device (model was
+        # already moved to device before this block).
+        model.engram_injections.to(device)
+        print(
+            f"[capgap] Attached GatedEngramInjection at layers "
+            f"{list(config.engram_inject_layers)} with alpha_init="
+            f"{config.engram_gate_init}"
+        )
+
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
 
@@ -932,6 +1109,99 @@ def main() -> None:
         from safetensors.torch import load_model
         load_model(model, args.resume_from, strict=False)
         print(f"Resumed from checkpoint: {args.resume_from}")
+    elif args.init_from is not None:
+        print(f"Initializing model weights from {args.init_from}")
+        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        if "model_state_dict" not in ckpt:
+            print(
+                f"Error: {args.init_from} is not a resumable checkpoint "
+                "(no model_state_dict).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        # Architecture-compatibility check. strict=False silently skips
+        # shape-mismatched keys; without this guard, an --init-from from an
+        # incompatible architecture (e.g., different hidden_dim) would load
+        # zero backbone params and the run would proceed with a randomly-
+        # initialized model masquerading as "loaded from checkpoint".
+        src_config = ckpt.get("config")
+        if src_config is None and not args.allow_partial_init:
+            print(
+                f"Error: --init-from source {args.init_from} has no config "
+                "metadata to compare against. Without a compat check, "
+                "strict=False could silently load zero backbone params on an "
+                "architecture mismatch. Pass --allow-partial-init to override "
+                "(e.g., for legacy checkpoints).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if src_config is not None:
+            _shape_critical_fields = (
+                "num_layers", "hidden_dim", "num_query_heads", "num_kv_heads",
+                "head_dim", "ffn_dim", "vocab_size", "engram_dim",
+            )
+            mismatches = [
+                (f, getattr(src_config, f, None), getattr(config, f, None))
+                for f in _shape_critical_fields
+                if getattr(src_config, f, None) != getattr(config, f, None)
+            ]
+            if mismatches:
+                print(
+                    "Error: --init-from source architecture is incompatible "
+                    "with the current config (strict=False would silently skip "
+                    "shape-mismatched params). Mismatches:",
+                    file=sys.stderr,
+                )
+                for name, src_val, cur_val in mismatches:
+                    print(
+                        f"  {name}: source={src_val!r} vs current={cur_val!r}",
+                        file=sys.stderr,
+                    )
+                sys.exit(2)
+        missing, unexpected = model.load_state_dict(
+            ckpt["model_state_dict"], strict=False
+        )
+        if unexpected:
+            preview = ", ".join(unexpected[:5])
+            if len(unexpected) > 5:
+                preview += f", ... (+{len(unexpected) - 5} more)"
+            print(
+                f"Warning: --init-from has {len(unexpected)} unexpected "
+                f"keys (will be ignored): {preview}",
+                file=sys.stderr,
+            )
+        if missing:
+            non_engram_missing = [
+                k for k in missing if not k.startswith("engram_injections.")
+            ]
+            if non_engram_missing:
+                preview = ", ".join(non_engram_missing[:5])
+                if len(non_engram_missing) > 5:
+                    preview += f", ... (+{len(non_engram_missing) - 5} more)"
+                if args.allow_partial_init:
+                    print(
+                        f"Warning: --init-from missing "
+                        f"{len(non_engram_missing)} non-engram keys "
+                        f"(--allow-partial-init override): {preview}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"Error: --init-from missing "
+                        f"{len(non_engram_missing)} non-engram backbone keys; "
+                        "would run with randomly-initialized parameters. Pass "
+                        "--allow-partial-init to override. Missing: "
+                        f"{preview}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
+            else:
+                print(
+                    f"--init-from loaded cleanly (missing only "
+                    f"{len(missing)} engram_injections keys as expected)."
+                )
+        # Explicitly DO NOT touch optimizer, step, or RNG: this is a fresh run.
+        del ckpt
 
     # Load Engram table if provided
     engram_table = None
@@ -1026,6 +1296,12 @@ def main() -> None:
         mtp_param_count = sum(p.numel() for p in mtp_head.parameters())
         print(f"MTP head enabled: depth={args.mtp_depth}, {mtp_param_count:,} params, loss_weight={args.mtp_loss_weight}")
 
+    # η-B capacity-gap freezing: MUST come before optimizer construction so
+    # the Muon partitioner only sees trainable params (frozen backbone gets
+    # zero optimizer-state overhead).
+    if args.freeze_backbone:
+        freeze_backbone_for_capgap(model)
+
     muon_params, adam_params = partition_params(model)
     if thought_norm is not None:
         adam_params.extend(thought_norm.parameters())
@@ -1085,6 +1361,12 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if val_loader is None and args.synthetic:
+            # --synthetic smoke-test compatibility: build a synthetic val loader
+            # so --zero-injection-eval works without a real corpus (ZEB-130).
+            val_loader = make_synthetic_dataloader(
+                config.vocab_size, seq_len, args.batch_size, args.seed + 1
+            )
         if val_loader is None:
             print("Error: --zero-injection-eval requires --val-data", file=sys.stderr)
             sys.exit(1)
@@ -1571,9 +1853,20 @@ def main() -> None:
                         f"  phase={consol_active}"
                         f"  inject={inject_mult:.3f}"
                     )
+                # η-B capgap: log tanh(alpha) gate values per injection layer.
+                # This is the primary diagnostic for whether the optimizer opens
+                # the gates (alpha > 0 tanh -> 0.5+) or keeps them closed.
+                capgap_str = ""
+                if model.engram_injections is not None:
+                    with torch.no_grad():
+                        gate_parts = []
+                        for layer_key, injection in model.engram_injections.items():
+                            gate_val = torch.tanh(injection.alpha).item()
+                            gate_parts.append(f"g{layer_key}={gate_val:+.3f}")
+                        capgap_str = "  " + " ".join(gate_parts)
                 print(
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
-                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}"
+                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}{capgap_str}"
                 )
 
             val_loss_str = ""
