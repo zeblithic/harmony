@@ -745,6 +745,21 @@ class HarmonyModel(nn.Module):
         self._last_xattn_output = None
         self._last_pre_injection_hidden = None
 
+        # η-B misuse guard: a multi-layer capgap config without an attach call
+        # would silently fall through to the legacy single-point elif below
+        # (which probes engram_injection_layer, typically still set from the
+        # base preset) and do nothing, producing a model that behaves as if
+        # no injection were configured. Fail here so tests/training notice
+        # the missing attach_gated_engram_injections() call immediately.
+        if self.config.engram_inject_layers and self.engram_injections is None:
+            raise RuntimeError(
+                "config.engram_inject_layers="
+                f"{self.config.engram_inject_layers!r} declares multi-layer "
+                "engram injection but attach_gated_engram_injections() was "
+                "never called. The forward pass would otherwise be a no-op "
+                "at every configured layer."
+            )
+
         for i, layer in enumerate(self.layers):
             # Block boundary mixing (blocks > 0)
             if i > 0 and i % layers_per_block == 0:

@@ -228,6 +228,16 @@ class TestHarmonyModelMultiLayerInjection:
         assert isinstance(model.engram_injections, nn.ModuleDict)
         assert set(model.engram_injections.keys()) == {"2", "5"}
 
+    def test_forward_rejects_configured_capgap_without_attach(self):
+        """Multi-layer capgap config without attach_gated_engram_injections()
+        must raise in forward() — otherwise the `elif` branch would silently
+        evaluate to a no-op at every layer and the misuse would go unnoticed."""
+        model = self._build_model()
+        assert model.engram_injections is None
+        x = torch.randint(0, model.config.vocab_size, (1, 16))
+        with pytest.raises(RuntimeError, match="attach_gated_engram_injections"):
+            model(x)
+
     def test_attach_rejects_wrong_layer_indices(self):
         """Attach rejects layer indices not declared in config.engram_inject_layers."""
         model = self._build_model()
