@@ -129,3 +129,37 @@ class TestCapacityGapConfig:
                 engram_injection_layer=2, engram_dim=128, tie_embeddings=True,
                 engram_inject_layers=(2, 99),
             )
+
+    def test_config_rejects_mixing_ann_and_multi_layer(self):
+        """Config must not set use_ann_engram=True alongside non-empty inject_layers."""
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            HarmonyModelConfig(
+                num_layers=8, hidden_dim=512, num_query_heads=8, num_kv_heads=4,
+                head_dim=64, ffn_dim=1365, vocab_size=32000, max_seq_len=4096,
+                rope_theta=1e6, rms_norm_eps=1e-6, layers_per_block=2,
+                engram_injection_layer=2, engram_dim=128, tie_embeddings=True,
+                use_ann_engram=True,
+                engram_inject_layers=(2, 5),
+            )
+
+    def test_config_rejects_duplicate_inject_layers(self):
+        """Duplicate layer indices would cause ModuleDict key collisions."""
+        with pytest.raises(ValueError, match="duplicate"):
+            HarmonyModelConfig(
+                num_layers=8, hidden_dim=512, num_query_heads=8, num_kv_heads=4,
+                head_dim=64, ffn_dim=1365, vocab_size=32000, max_seq_len=4096,
+                rope_theta=1e6, rms_norm_eps=1e-6, layers_per_block=2,
+                engram_injection_layer=2, engram_dim=128, tie_embeddings=True,
+                engram_inject_layers=(2, 2, 5),
+            )
+
+    def test_config_rejects_first_position_out_of_range(self):
+        """First layer index out-of-range is still caught (not just last)."""
+        with pytest.raises(ValueError, match="outside"):
+            HarmonyModelConfig(
+                num_layers=8, hidden_dim=512, num_query_heads=8, num_kv_heads=4,
+                head_dim=64, ffn_dim=1365, vocab_size=32000, max_seq_len=4096,
+                rope_theta=1e6, rms_norm_eps=1e-6, layers_per_block=2,
+                engram_injection_layer=2, engram_dim=128, tie_embeddings=True,
+                engram_inject_layers=(-1, 2),
+            )

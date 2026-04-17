@@ -95,6 +95,12 @@ class HarmonyModelConfig:
                     "mutually exclusive with use_xattn_engram / use_ann_engram "
                     "(single-point legacy paths)."
                 )
+            if len(self.engram_inject_layers) != len(set(self.engram_inject_layers)):
+                raise ValueError(
+                    "engram_inject_layers contains duplicate layer indices: "
+                    f"{self.engram_inject_layers!r}. Each injection point must "
+                    "be a unique layer index (ModuleDict keys would collide)."
+                )
             for layer_idx in self.engram_inject_layers:
                 if not (0 <= layer_idx < self.num_layers):
                     raise ValueError(
@@ -295,6 +301,7 @@ class HarmonyModelConfig:
         base = HarmonyModelConfig.tiny()
         base.engram_inject_layers = (2, 5)
         base.engram_gate_init = 0.0
+        base.__post_init__()  # re-validate after mutation (matches tiny_ffn_expanded pattern)
         return base
 
 
