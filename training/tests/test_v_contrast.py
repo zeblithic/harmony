@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -157,7 +161,7 @@ class TestAttentionBlockRefactor:
         assert len(two) == 2
 
         # Three-tuple with indices
-        retrieved, topk_sims, topk_idx = xattn.retrieve_topk(h, return_indices=True)
+        retrieved, _topk_sims, topk_idx = xattn.retrieve_topk(h, return_indices=True)
         assert topk_idx.shape == (2, 5, 4)
         # Gathering the table with the returned indices must reconstruct the
         # returned `retrieved` — contract the V-contrast path relies on.
@@ -298,7 +302,7 @@ class TestContrastiveGatedEngramInjection:
             w_b(h)
 
         assert len(sink_a) == 3 and len(sink_b) == 3
-        for a, b in zip(sink_a, sink_b):
+        for a, b in zip(sink_a, sink_b, strict=True):
             assert torch.allclose(a, b, atol=0), (
                 "Same-seeded generators must produce bit-identical aux losses; "
                 "got divergence — shuffle generator isn't actually driving the perm."
@@ -420,6 +424,49 @@ class TestModelAuxLossSink:
         assert len(sink) == 1
         assert sink[0].item() == 42.0
 
+    def test_sink_equivalence_with_ascending_or_out_of_order_declaration(self):
+        """train.py relies on `_contrastive_aux_losses` being populated in
+        ascending layer-index order regardless of how `engram_inject_layers`
+        was declared. Two models built from identical weights but with
+        different declaration orders — `(1, 2)` vs `(2, 1)` — must produce
+        the same sink sequence. If this broke, the `zip(sorted(...),
+        aux_per_layer)` pattern in train.py would silently swap aux values
+        between layer-key buckets.
+        """
+        def build_and_run(inject_layers: tuple[int, ...]) -> list[float]:
+            torch.manual_seed(0)  # same RNG → same tables + weights
+            c = _tiny_config()
+            c.engram_inject_layers = inject_layers
+            c.engram_vcontrast_enabled = True
+            c.__post_init__()
+            model = HarmonyModel(c)
+            table = torch.randn(16, c.engram_dim)
+            sink: list = []
+            injections = {}
+            for layer_idx in sorted(inject_layers):  # deterministic build order
+                xattn = EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
+                injections[layer_idx] = ContrastiveGatedEngramInjection(
+                    xattn, alpha_init=0.0, aux_loss_sink=sink,
+                )
+            model.attach_gated_engram_injections(injections)
+            model._contrastive_aux_losses = sink
+            model.train(True)
+            torch.manual_seed(1)
+            input_ids = torch.randint(0, c.vocab_size, (2, 5))
+            _ = model(input_ids)
+            return [s.item() for s in sink]
+
+        ascending = build_and_run((1, 2))
+        out_of_order = build_and_run((2, 1))
+        assert len(ascending) == len(out_of_order) == 2
+        # Forward iterates in ascending numerical order, so sink order must
+        # be identical whether the declaration was (1, 2) or (2, 1).
+        assert ascending == pytest.approx(out_of_order, abs=1e-6), (
+            "Sink population order depends on declaration order of "
+            "engram_inject_layers — this breaks train.py's per-layer "
+            "accumulator zip, which assumes ascending forward order."
+        )
+
 
 class TestOneStepIntegration:
     """One forward + backward + optimizer step exercises the full V-contrast wiring
@@ -493,11 +540,6 @@ class TestOneStepIntegration:
             "v_proj weight unchanged after a V-contrast aux-loss step — the "
             "aux gradient is not reaching V."
         )
-
-
-import subprocess
-import sys
-from pathlib import Path
 
 
 class TestTrainPyVContrastSmoke:
@@ -675,7 +717,7 @@ class TestShuffleGeneratorCheckpointing:
             for _ in range(3)
         ]
 
-        for e, g in zip(expected, got):
+        for e, g in zip(expected, got, strict=True):
             assert torch.equal(e, g), (
                 "restore_rng_state didn't restore the shuffle generator's "
                 "state — next permutation diverged."

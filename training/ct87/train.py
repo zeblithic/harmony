@@ -1584,9 +1584,13 @@ def main() -> None:
         # than a fixed (2, 5) preset.
         vcontrast_cols: list[str] = []
         if config.engram_vcontrast_enabled:
+            # Sorted to match the forward-pass population order of
+            # `_contrastive_aux_losses` (ascending layer index). Keeps CSV
+            # columns and the per-layer accumulator aligned regardless of
+            # how the preset declared engram_inject_layers.
             vcontrast_cols = [
                 "vcontrast_aux_loss",
-                *(f"vcontrast_aux_L{i}" for i in (config.engram_inject_layers or ())),
+                *(f"vcontrast_aux_L{i}" for i in sorted(config.engram_inject_layers or ())),
                 "vcontrast_lambda",
             ]
         expected_header = [
@@ -1958,10 +1962,17 @@ def main() -> None:
                         # console emit and must not retain the graph.
                         accum_vcontrast_aux += aux_total.detach().item()
                         # Per-layer accumulator: keys are str(layer_idx),
-                        # matching the ModuleDict key convention.
+                        # matching the ModuleDict key convention. The model's
+                        # forward iterates layer indices in ASCENDING order
+                        # and appends one aux-loss per injection hit, so
+                        # `aux_per_layer[i]` corresponds to the i-th
+                        # smallest entry in `config.engram_inject_layers`.
+                        # Sort here so a config like `(5, 2)` maps values to
+                        # the correct keys instead of silently swapping them.
                         for layer_key, layer_loss in zip(
-                            (str(i) for i in config.engram_inject_layers),
+                            (str(i) for i in sorted(config.engram_inject_layers)),
                             aux_per_layer,
+                            strict=True,
                         ):
                             accum_vcontrast_per_layer[layer_key] = (
                                 accum_vcontrast_per_layer.get(layer_key, 0.0)
@@ -2087,7 +2098,8 @@ def main() -> None:
                         config.engram_vcontrast_lambda,
                     )
                     parts = [f"aux={raw_aux:.4f}"]
-                    for lk in (str(i) for i in config.engram_inject_layers):
+                    # Sorted to match CSV column order.
+                    for lk in (str(i) for i in sorted(config.engram_inject_layers)):
                         if lk in accum_vcontrast_per_layer:
                             v = accum_vcontrast_per_layer[lk] / args.grad_accum_steps
                             parts.append(f"aux_L{lk}={v:.4f}")
@@ -2188,7 +2200,8 @@ def main() -> None:
                 if config.engram_vcontrast_enabled:
                     raw_aux = accum_vcontrast_aux / args.grad_accum_steps
                     vcontrast_row_cells.append(f"{raw_aux:.6f}")
-                    for layer_idx in (config.engram_inject_layers or ()):
+                    # Sorted to match header order and the accumulator's zip.
+                    for layer_idx in sorted(config.engram_inject_layers or ()):
                         lk = str(layer_idx)
                         if lk in accum_vcontrast_per_layer:
                             v = accum_vcontrast_per_layer[lk] / args.grad_accum_steps
