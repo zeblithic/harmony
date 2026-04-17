@@ -364,7 +364,19 @@ def _q_overlap_stats(
 
     gen = torch.Generator(device=flat.device).manual_seed(seed)
     idx_a = torch.randint(0, N, (num_pairs,), generator=gen, device=flat.device)
-    idx_b = torch.randint(0, N, (num_pairs,), generator=gen, device=flat.device)
+    if N > 1:
+        # Exclude self-pairs without a rejection loop: draw an offset in
+        # [1, N) uniformly, then idx_b = (idx_a + offset) mod N. Guarantees
+        # idx_b != idx_a and keeps the distribution uniform over the
+        # off-diagonal pairs. Self-pairs would force Jaccard=1 and bias
+        # the mean upward on small-N forensic runs (N=B*L can be as small
+        # as ~100 in quick smoke tests).
+        offset = torch.randint(1, N, (num_pairs,), generator=gen, device=flat.device)
+        idx_b = (idx_a + offset) % N
+    else:
+        # N=1 is pathological (single token) — return zero Jaccard rather
+        # than forcing self-pair comparisons.
+        idx_b = idx_a
     pair_a = flat[idx_a]
     pair_b = flat[idx_b]
 
@@ -373,8 +385,11 @@ def _q_overlap_stats(
     union = (2 * k) - intersection
     jaccard = intersection / union.clamp_min(1.0)
 
-    f = torch.bincount(flat.reshape(-1))
-    used = f[f > 0].to(torch.float32)
+    # Sparse count: allocates an output sized by the number of DISTINCT used
+    # rows, not max(topk_idx)+1. torch.bincount would allocate a dense vector
+    # sized by max_index+1 — wasteful for 10k+ row tables.
+    _, counts = flat.reshape(-1).unique(return_counts=True)
+    used = counts.to(torch.float32)
     if used.numel() > 1:
         occupancy_cv = (used.std(unbiased=False) / used.mean().clamp_min(1.0)).item()
     else:
@@ -387,24 +402,52 @@ def _q_overlap_stats(
     }
 
 
+def _rank_stats_from_svdvals(
+    s: torch.Tensor, m: int, n: int,
+) -> tuple[int, float]:
+    """Derive both hard rank and entropy-based effective rank from a
+    pre-computed singular-value spectrum.
+
+    Hard-rank tolerance matches torch.linalg.matrix_rank's default:
+    ``max(M, N) * eps * max(s)``. Precomputing the SVD once and deriving
+    both ranks avoids the double decomposition the naive path does
+    (matrix_rank + svdvals each run their own SVD).
+
+    Returns ``(hard_rank, effective_rank)``.
+    """
+    if s.numel() == 0:
+        return 0, 0.0
+    eps = torch.finfo(s.dtype).eps
+    tol = max(m, n) * eps * s.max().item()
+    hard_rank = int((s > tol).sum().item())
+    s_sq = s * s
+    total = s_sq.sum().clamp_min(1e-12)
+    p = s_sq / total
+    p_safe = p.clamp_min(1e-12)
+    entropy = -(p * p_safe.log()).sum()
+    effective_rank = float(torch.exp(entropy).item())
+    return hard_rank, effective_rank
+
+
 def _effective_rank(matrix: torch.Tensor) -> float:
     """Entropy-based effective rank: exp(H(σ² / ||σ²||)).
 
     Smoother than a hard SVD-threshold rank (no cliff at the cutoff).
     exp(H) equals the hard rank when σ is uniform-supported on k dimensions
     and decays smoothly as the singular-value spectrum concentrates.
+
+    Thin wrapper over ``_rank_stats_from_svdvals`` — callers that already
+    have the SVD should use the shared helper directly to avoid a second
+    decomposition.
     """
-    s = torch.linalg.svdvals(matrix.to(torch.float32))
-    s_sq = s * s
-    total = s_sq.sum().clamp_min(1e-12)
-    p = s_sq / total
-    p_safe = p.clamp_min(1e-12)
-    entropy = -(p * p_safe.log()).sum()
-    return float(torch.exp(entropy).item())
+    matrix_fp32 = matrix.to(torch.float32)
+    s = torch.linalg.svdvals(matrix_fp32)
+    _, effective_rank = _rank_stats_from_svdvals(s, *matrix_fp32.shape)
+    return effective_rank
 
 
 def _v_rank_stats(
-    xattn: "EngramCrossAttention",
+    xattn: EngramCrossAttention,
     topk_idx: torch.Tensor,
 ) -> dict[str, float]:
     """V-output rank on the retrieved subset S.
@@ -415,14 +458,14 @@ def _v_rank_stats(
     checkpoint: rank of `V(retrieval_norm(E[S]))` vs rank of
     `retrieval_norm(E[S])` itself.
 
-    Reports both hard rank (`torch.linalg.matrix_rank` with default
-    tolerance) and effective rank (entropy of normalized σ²). Effective
-    rank is less threshold-sensitive and usually the more informative
-    number for "is V preserving or compressing information?".
+    Reports both hard rank (tolerance mirroring
+    ``torch.linalg.matrix_rank``'s default) and effective rank (entropy
+    of normalized σ²). Effective rank is less threshold-sensitive and
+    usually the more informative number for "is V preserving or
+    compressing information?".
 
-    Runs the V projection in torch.no_grad and on the module's current
-    device. For typical forensic settings |S| ≤ 10000 and hidden_dim ≤ 512,
-    SVD is a fraction of a second on CUDA.
+    Runs SVD exactly once per matrix — hard and effective rank are both
+    derived from the same singular-value spectrum.
     """
     unique_rows = topk_idx.unique()
     e_s = xattn.table[unique_rows]
@@ -436,10 +479,12 @@ def _v_rank_stats(
     e_s_normed = xattn.retrieval_norm(e_s.to(ln_dtype))
     v_e_s = xattn.v_proj(e_s_normed)
 
-    e_rank = int(torch.linalg.matrix_rank(e_s_normed.to(torch.float32)).item())
-    v_rank = int(torch.linalg.matrix_rank(v_e_s.to(torch.float32)).item())
-    e_eff = _effective_rank(e_s_normed)
-    v_eff = _effective_rank(v_e_s)
+    e_s_fp32 = e_s_normed.to(torch.float32)
+    v_e_s_fp32 = v_e_s.to(torch.float32)
+    e_svd = torch.linalg.svdvals(e_s_fp32)
+    v_svd = torch.linalg.svdvals(v_e_s_fp32)
+    e_rank, e_eff = _rank_stats_from_svdvals(e_svd, *e_s_fp32.shape)
+    v_rank, v_eff = _rank_stats_from_svdvals(v_svd, *v_e_s_fp32.shape)
 
     return {
         "subset_size_S": int(unique_rows.numel()),

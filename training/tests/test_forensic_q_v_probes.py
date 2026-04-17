@@ -101,12 +101,17 @@ class TestQOverlapProbe:
         """Every row in S retrieved the same number of times → CV = 0.
 
         This is the MoE load-balancing-aux target: uniform marginal usage
-        among whatever rows Q decides to use. η-B's forensic should move
-        toward this post-ι₁.
+        among whatever rows Q decides to use. iota-B's forensic should
+        move toward this post-iota-1.
+
+        Construction respects the "distinct per row" precondition of
+        _q_overlap_stats by giving every token the same k distinct rows
+        [0..k-1]. Each row is then retrieved B*L times → counts all
+        equal → CV = 0.
         """
         B, L, k = 4, 4, 4
-        rows_cycled = torch.arange(16).view(B * L, 1).expand(B * L, k)
-        topk = rows_cycled.reshape(B, L, k)
+        shared_rows = torch.arange(k)
+        topk = shared_rows.view(1, 1, k).expand(B, L, k).contiguous()
 
         stats = _q_overlap_stats(topk, num_pairs=100)
 
@@ -148,6 +153,32 @@ class TestQOverlapProbe:
         assert stats_a["q_overlap_random_pair_jaccard_p50"] == stats_b[
             "q_overlap_random_pair_jaccard_p50"
         ]
+
+    def test_self_pairs_excluded_from_jaccard(self) -> None:
+        """Self-pairs (idx_a == idx_b) would force Jaccard=1 and bias the
+        mean upward. With N*(N-1) off-diagonal pairs and a diversified
+        retrieval, the mean Jaccard should stay well below the self-pair
+        contribution baseline — this test would fail on small-N samples
+        if self-pairs crept back in.
+
+        Construction: N=B*L = 8 tokens (deliberately small to amplify
+        self-pair bias), each with disjoint k=4 rows. True off-diagonal
+        Jaccard is 0 (no shared rows); with a 1/8 self-pair rate the
+        biased estimator would show ~0.125. Assert strictly below.
+        """
+        B, L, k = 2, 4, 4
+        N = B * L
+        # Disjoint per-token row sets: token i gets rows [i*k, i*k+1, ..., i*k+k-1].
+        topk = torch.arange(N * k).view(B, L, k)
+
+        stats = _q_overlap_stats(topk, num_pairs=10000, seed=0)
+
+        assert stats["q_overlap_random_pair_jaccard_mean"] < 0.02, (
+            f"disjoint per-token retrieval must yield Jaccard ≈ 0; self-"
+            f"pair inclusion would inflate the mean toward 1/N = "
+            f"{1.0/N:.3f}. Got "
+            f"{stats['q_overlap_random_pair_jaccard_mean']:.4f}."
+        )
 
 
 class _MockXattn:
