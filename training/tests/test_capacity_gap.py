@@ -305,3 +305,66 @@ class TestHarmonyModelMultiLayerInjection:
             out_zeroed = model(ids)
             out_plain = model_plain(ids)
         assert torch.allclose(out_zeroed, out_plain, atol=1e-5)
+
+
+class TestInitFromFlag:
+    """--init-from loads model weights but not training state."""
+
+    def test_init_from_loads_backbone_weights(self, tmp_path):
+        """After --init-from, a new model can load a source checkpoint via strict=False."""
+        # Build a source checkpoint: tiny baseline (no engram injections).
+        src_ckpt = tmp_path / "src" / "checkpoint.pt"
+        src_ckpt.parent.mkdir()
+        config = HarmonyModelConfig.tiny()
+        model = HarmonyModel(config)
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": {},
+                "step": 500,
+                "rng_state": torch.get_rng_state(),
+                "config": config,
+            },
+            src_ckpt,
+        )
+
+        # Load into a capgap-configured target (which has extra engram_injections keys
+        # after attach — but with no attach called, state_dict is equivalent).
+        ckpt = torch.load(src_ckpt, map_location="cpu", weights_only=False)
+        new_config = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        new_model = HarmonyModel(new_config)
+        missing, unexpected = new_model.load_state_dict(
+            ckpt["model_state_dict"], strict=False
+        )
+        # No unexpected keys (source is strict subset of target)
+        assert unexpected == []
+        # Missing, if any, must only be engram_injections keys.
+        for k in missing:
+            assert k.startswith("engram_injections"), (
+                f"Unexpected missing key outside engram_injections: {k}"
+            )
+
+    def test_train_rejects_both_init_from_and_resume_from(self):
+        """CLI validation rejects using both flags simultaneously."""
+        import subprocess
+        import sys
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--init-from", "/tmp/nonexistent.pt",
+                "--resume-from", "/tmp/nonexistent.pt",
+                "--config", "tiny_engram_xattn_capgap",
+                "--synthetic",
+                "--output-dir", "/tmp/capgap_test",
+                "--steps", "1",
+            ],
+            capture_output=True, text=True, timeout=30,
+            cwd="/Users/zeblith/work/zeblithic/harmony/.worktrees/zeb-130-eta-capgap/training",
+        )
+        assert result.returncode != 0, f"Expected non-zero exit but got stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        combined = result.stderr + result.stdout
+        assert (
+            "--init-from" in combined
+            and "--resume-from" in combined
+            and "mutually exclusive" in combined.lower()
+        ), f"Error message did not mention both flags + 'mutually exclusive':\n{combined}"

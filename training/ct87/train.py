@@ -323,6 +323,7 @@ def main() -> None:
             "tiny_engram_xattn_consol_online",
             "tiny_engram_xattn_consol_phased",
             "tiny_engram_xattn_ctrl",
+            "tiny_engram_xattn_capgap",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -359,6 +360,16 @@ def main() -> None:
     parser.add_argument(
         "--resume-from", type=str, default=None,
         help="Path to safetensors checkpoint to resume/fine-tune from",
+    )
+    parser.add_argument(
+        "--init-from", type=str, default=None,
+        help=(
+            "Path to a checkpoint .pt file for weight initialization only "
+            "(η-B capacity-gap / ZEB-130). Loads model weights via "
+            "strict=False (missing keys for new engram injections are "
+            "allowed), then starts training fresh (step=0, fresh optimizer, "
+            "fresh RNG). Mutually exclusive with --resume-from."
+        ),
     )
     parser.add_argument(
         "--gradient-checkpoint", action="store_true",
@@ -528,6 +539,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.init_from is not None and args.resume_from is not None:
+        print(
+            "Error: --init-from and --resume-from are mutually exclusive. "
+            "Use --resume-from to continue training from a checkpoint; use "
+            "--init-from to load weights only and start a fresh run.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.init_from is not None and not args.init_from.endswith(".pt"):
+        print(
+            "Error: --init-from must point to a resumable checkpoint .pt "
+            "file (weights + config), not a safetensors file.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     # --zero-injection-eval is an eval-only early-exit path, so training data
     # is not required when that flag is set.
     if (
@@ -646,6 +673,8 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_engram_xattn_consol_phased()
     elif args.config == "tiny_engram_xattn_ctrl":
         config = HarmonyModelConfig.tiny_engram_xattn_ctrl()
+    elif args.config == "tiny_engram_xattn_capgap":
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
@@ -932,6 +961,46 @@ def main() -> None:
         from safetensors.torch import load_model
         load_model(model, args.resume_from, strict=False)
         print(f"Resumed from checkpoint: {args.resume_from}")
+    elif args.init_from is not None:
+        print(f"Initializing model weights from {args.init_from}")
+        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        if "model_state_dict" not in ckpt:
+            print(
+                f"Error: {args.init_from} is not a resumable checkpoint "
+                "(no model_state_dict).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        missing, unexpected = model.load_state_dict(
+            ckpt["model_state_dict"], strict=False
+        )
+        if unexpected:
+            preview = ", ".join(unexpected[:5])
+            if len(unexpected) > 5:
+                preview += f", ... (+{len(unexpected) - 5} more)"
+            print(
+                f"Warning: --init-from has {len(unexpected)} unexpected "
+                f"keys (will be ignored): {preview}"
+            )
+        if missing:
+            non_engram_missing = [
+                k for k in missing if not k.startswith("engram_injections")
+            ]
+            if non_engram_missing:
+                preview = ", ".join(non_engram_missing[:5])
+                if len(non_engram_missing) > 5:
+                    preview += f", ... (+{len(non_engram_missing) - 5} more)"
+                print(
+                    f"Warning: --init-from missing {len(non_engram_missing)} "
+                    f"non-engram keys: {preview}"
+                )
+            else:
+                print(
+                    f"--init-from loaded cleanly (missing only "
+                    f"{len(missing)} engram_injections keys as expected)."
+                )
+        # Explicitly DO NOT touch optimizer, step, or RNG: this is a fresh run.
+        del ckpt
 
     # Load Engram table if provided
     engram_table = None
