@@ -1297,3 +1297,106 @@ class GatedEngramInjection(nn.Module):
         return gate * inj_real
 
 
+# ---------------------------------------------------------------------------
+# ZEB-134 Skip-to-Logit engram router.
+# ---------------------------------------------------------------------------
+
+
+class SkipToLogitEngramRouter(nn.Module):
+    """Route the engram injection output directly to logit space.
+
+    Motivation (ZEB-130 ι₂ failure mode): at 40M scale, ι₂ shows all the
+    forensic markers of content routing working (cross-run alignment,
+    (X) content-sensitivity, broad Q occupancy with ZEB-135 EMA-sub) but
+    val_loss Delta-diff against the shuffled oracle stays near zero. The
+    ZEB-133 layer-decay probe confirms that 88% of the L5 injection
+    magnitude survives to LM-head input, with max LM-head row cosine
+    0.156 - the signal is there but only weakly aligned with vocab
+    directions.
+
+    The Skip-to-Logit router bypasses the frozen L6/L7 + final_norm
+    pathway entirely by adding a dedicated adapter from engram output
+    straight into the logit sum:
+
+        logits_final = logits_from_main + alpha * (W_align(engram_out) @ W_lm.T)
+
+    W_align is a trainable linear projection in hidden_dim that learns
+    to rotate the engram output onto the vocabulary direction basis.
+    W_lm (the LM head) is reused by reference - the router does NOT own
+    a copy so the tied-embedding invariant remains intact.
+
+    Safe-init contract: W_align starts at exact zero so the router's
+    output is zero regardless of input. The first backprop step gets
+    gradient only via alpha (through the nonzero engram_out) -
+    analogous to GatedEngramInjection's alpha-gate warmup pattern. Once
+    alpha moves off its init, W_align starts receiving gradient too.
+
+    alpha is stored as log_alpha (trainable scalar) with alpha =
+    torch.exp(log_alpha), which keeps alpha > 0 without a hard clamp.
+    alpha_init is specified as the target initial alpha value; the
+    constructor sets log_alpha = log(alpha_init).
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        lm_head_weight: nn.Parameter,
+        alpha_init: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if not math.isfinite(alpha_init) or alpha_init <= 0:
+            raise ValueError(
+                f"alpha_init must be finite and > 0, got {alpha_init!r}"
+            )
+        if lm_head_weight.dim() != 2:
+            raise ValueError(
+                "lm_head_weight must be 2-D (vocab, hidden_dim); got "
+                f"shape {tuple(lm_head_weight.shape)}"
+            )
+        if lm_head_weight.shape[-1] != hidden_dim:
+            raise ValueError(
+                f"lm_head_weight last dim {lm_head_weight.shape[-1]} "
+                f"must equal hidden_dim ({hidden_dim})"
+            )
+        # Hold the LM head by reference (NOT as a submodule parameter,
+        # so we don't double-count it in the param set and so tied
+        # embeddings stay tied). Direct attribute assignment skips the
+        # nn.Module __setattr__ machinery that would otherwise try to
+        # register it as a parameter.
+        object.__setattr__(self, "_lm_head_weight_ref", lm_head_weight)
+
+        self.hidden_dim = hidden_dim
+        self.W_align = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.W_align.weight)  # safe-init: router(x) = 0
+        self.log_alpha = nn.Parameter(
+            torch.tensor(math.log(alpha_init), dtype=torch.float32)
+        )
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return torch.exp(self.log_alpha)
+
+    def forward(self, engram_out: torch.Tensor) -> torch.Tensor:
+        """Project engram output into logit space.
+
+        Args:
+            engram_out: [B, L, hidden_dim] - the gated engram injection
+                output at the last injection site.
+
+        Returns:
+            logits: [B, L, vocab] - to be ADDED (not replacing) to the
+                main model logits before softmax.
+        """
+        if engram_out.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                f"engram_out last dim {engram_out.shape[-1]} must equal "
+                f"hidden_dim ({self.hidden_dim})"
+            )
+        aligned = self.W_align(engram_out)
+        alpha = self.alpha.to(dtype=aligned.dtype)
+        # Resolve the LM head weight lazily so device/dtype moves done
+        # AFTER construction (HarmonyModel.to(device), autocast) are
+        # picked up on every forward. Using the stored reference means
+        # we always see the live embed_tokens.weight when tied.
+        lm_weight = self._lm_head_weight_ref.to(dtype=aligned.dtype)
+        return alpha * (aligned @ lm_weight.T)

@@ -374,14 +374,17 @@ def freeze_backbone_for_capgap(model: "HarmonyModel") -> None:
             "engram_injections.* params — freezing everything would leave "
             "the optimizer with zero trainable parameters."
         )
+    # Both the multi-layer injection modules and the ZEB-134 skip-to-logit
+    # router are research-only adapters that must train under capgap.
+    # Trailing dots in the prefixes matter: "engram_injections.0.alpha" is
+    # trainable, but a hypothetical future "engram_injections_shared"
+    # sibling would NOT be caught by `startswith("engram_injections")`
+    # alone and would silently be left trainable.
+    trainable_prefixes = ("engram_injections.", "engram_skip_router.")
     frozen_count = 0
     trainable_count = 0
     for name, param in model.named_parameters():
-        # Trailing dot matters: "engram_injections.0.alpha" is trainable, but
-        # a hypothetical future "engram_injections_shared" sibling field would
-        # NOT be caught by `startswith("engram_injections")` alone and would
-        # silently be left trainable.
-        if name.startswith("engram_injections."):
+        if any(name.startswith(p) for p in trainable_prefixes):
             param.requires_grad = True
             trainable_count += param.numel()
         else:
@@ -607,6 +610,31 @@ def main() -> None:
         help=(
             "Override warmup steps for Q-div lambda. Requires --engram-qdiv + "
             "a qdiv-enabled preset. None = use preset's value."
+        ),
+    )
+    # ---- ZEB-134: Skip-to-Logit engram router ----
+    parser.add_argument(
+        "--engram-skip-to-logit",
+        action="store_true",
+        help=(
+            "Attach a SkipToLogitEngramRouter that feeds the engram "
+            "output at the last entry of engram_inject_layers directly "
+            "into the logit sum, bypassing the frozen decoder layers. "
+            "Tests whether the ι₂ forensic-success / LM-blindness "
+            "regime is a decoder-bypass problem (ZEB-134). Requires a "
+            "multi-layer gated-injection preset (tiny_engram_xattn_capgap*)."
+        ),
+    )
+    parser.add_argument(
+        "--engram-skip-alpha-init",
+        type=float,
+        default=0.1,
+        help=(
+            "Initial alpha for the Skip-to-Logit router (ZEB-134). "
+            "Must be finite and > 0. Stored internally as log_alpha so "
+            "alpha stays positive without a hard clamp. 0.1 is small "
+            "enough to avoid destabilizing the main logit path on the "
+            "first training step while leaving room for alpha to grow."
         ),
     )
     parser.add_argument(
@@ -1280,11 +1308,36 @@ def main() -> None:
         # Ensure newly-attached submodules are on the correct device (model was
         # already moved to device before this block).
         model.engram_injections.to(device)
+
+        # ZEB-134 Skip-to-Logit router attachment. Construct after
+        # injections so the router can reference the model's lm_head
+        # weight by identity (keeps the tied-embedding invariant).
+        if args.engram_skip_to_logit:
+            if (
+                not math.isfinite(args.engram_skip_alpha_init)
+                or args.engram_skip_alpha_init <= 0
+            ):
+                print(
+                    "Error: --engram-skip-alpha-init must be finite and > 0, "
+                    f"got {args.engram_skip_alpha_init!r}.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            from ct87.engram import SkipToLogitEngramRouter
+            skip_router = SkipToLogitEngramRouter(
+                hidden_dim=config.hidden_dim,
+                lm_head_weight=model.lm_head.weight,
+                alpha_init=args.engram_skip_alpha_init,
+            ).to(device)
+            model.attach_engram_skip_router(skip_router)
+
         aux_tags = []
         if config.engram_vcontrast_enabled:
             aux_tags.append("+vcontrast")
         if config.engram_qdiv_enabled:
             aux_tags.append("+qdiv")
+        if args.engram_skip_to_logit:
+            aux_tags.append("+skip-to-logit")
         aux_suffix = f"({','.join(aux_tags)})" if aux_tags else ""
         setup_parts = [
             f"[capgap] Attached GatedEngramInjection{aux_suffix}"
