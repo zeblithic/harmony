@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
+from ct87.engram import EngramCrossAttention
 from ct87.model import HarmonyModelConfig
 
 
@@ -103,3 +105,32 @@ class TestLambdaSchedule:
         # (avoids division-by-zero and matches "no warmup" semantics).
         assert lambda_schedule(0, warmup=0, target=1.0) == 1.0
         assert lambda_schedule(100, warmup=0, target=1.0) == 1.0
+
+
+class TestAttentionBlockRefactor:
+    """The post-retrieval attention pipeline must be callable on caller-supplied
+    (retrieved, topk_sims) so the V-contrast subclass can run it against a
+    shuffled table without a second `retrieve_topk` call duplicating the
+    matmul against `self.table_normalized`."""
+
+    def test_attention_block_matches_forward(self):
+        torch.manual_seed(0)
+        c = _tiny_config()
+        c.use_xattn_engram = True
+        table = torch.randn(16, c.engram_dim)
+        xattn = EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
+        # Init o_proj non-zero so the residual is non-trivial (it's
+        # zero-init'd by default for the legacy delta path; we override
+        # here so the test catches a refactor that drops a step).
+        torch.nn.init.xavier_uniform_(xattn.o_proj.weight)
+        xattn.eval()
+
+        h = torch.randn(2, 5, c.hidden_dim)
+        retrieved, topk_sims = xattn.retrieve_topk(h)
+
+        out_via_forward = xattn(h)
+        out_via_block = xattn._attention_block(h, retrieved, topk_sims)
+        assert torch.allclose(out_via_forward, out_via_block, atol=1e-6), (
+            "_attention_block must reproduce forward() bit-for-bit when "
+            "fed the same retrieved tensors."
+        )

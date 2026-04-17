@@ -1000,6 +1000,52 @@ class EngramCrossAttention(nn.Module):
         retrieved = self.table[topk_idx]
         return retrieved, topk_sims
 
+    def _attention_block(
+        self,
+        hidden_state: torch.Tensor,
+        retrieved: torch.Tensor,
+        topk_sims: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the post-retrieval attention pipeline on caller-supplied retrievals.
+
+        Exposed so V-contrastive variants (θ-V-contrast, ZEB-130) can run
+        the same attention/o_proj path against a shuffled-table retrieval
+        without duplicating the Q/K/V/o_proj logic. Logic must stay
+        bit-identical to what was previously inlined in `forward`.
+
+        Args:
+            hidden_state: [batch, seq_len, hidden_dim]
+            retrieved:    [batch, seq_len, k_retrieved, engram_dim] — raw
+                          (pre-`retrieval_norm`) retrieved rows.
+            topk_sims:    [batch, seq_len, k_retrieved] — cosine sims to add
+                          as the differentiable retrieval bias.
+
+        Returns:
+            [batch, seq_len, hidden_dim] residual (pre-gate).
+        """
+        B, L, _ = hidden_state.shape
+        H, D, k = self.num_heads, self.head_dim, self.k_retrieved
+
+        retrieved = self.retrieval_norm(retrieved)
+
+        q = self.q_proj(hidden_state).view(B, L, H, D)
+        q = self.q_norm(q)
+        k_tensor = self.k_proj(retrieved).view(B, L, k, H, D)
+        k_tensor = self.k_norm(k_tensor)
+        v_tensor = self.v_proj(retrieved).view(B, L, k, H, D)
+
+        scores = torch.einsum("blhd,blkhd->blhk", q, k_tensor) / (D ** 0.5)
+        scores = scores + self.retrieval_bias_weight * topk_sims.unsqueeze(2)
+        attn = F.softmax(scores, dim=-1)
+
+        out = torch.einsum("blhk,blkhd->blhd", attn, v_tensor)
+
+        if self.use_head_gates:
+            gate_weights = torch.sigmoid(self.head_gates).view(1, 1, H, 1)
+            out = out * gate_weights
+
+        return self.o_proj(out.reshape(B, L, H * D))
+
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Compute cross-attention residual for the injection layer.
 
@@ -1010,34 +1056,8 @@ class EngramCrossAttention(nn.Module):
             [batch, seq_len, hidden_dim] residual. Zero at step 0 due to
             `o_proj` zero-init; caller adds to hidden state.
         """
-        B, L, _ = hidden_state.shape
-        H, D, k = self.num_heads, self.head_dim, self.k_retrieved
-
         retrieved, topk_sims = self.retrieve_topk(hidden_state)
-        retrieved = self.retrieval_norm(retrieved)
-
-        q = self.q_proj(hidden_state).view(B, L, H, D)
-        q = self.q_norm(q)
-        k_tensor = self.k_proj(retrieved).view(B, L, k, H, D)
-        k_tensor = self.k_norm(k_tensor)
-        v_tensor = self.v_proj(retrieved).view(B, L, k, H, D)
-
-        # Per-position cross-attention: [B, L, H, k]
-        scores = torch.einsum("blhd,blkhd->blhk", q, k_tensor) / (D ** 0.5)
-        # Broadcast the retrieval-similarity bias across heads. This is
-        # the only path through which `retrieval_query_proj` receives
-        # gradient from the main loss (topk gather blocks the rest).
-        scores = scores + self.retrieval_bias_weight * topk_sims.unsqueeze(2)
-        attn = F.softmax(scores, dim=-1)
-
-        # [B, L, H, D]
-        out = torch.einsum("blhk,blkhd->blhd", attn, v_tensor)
-
-        if self.use_head_gates:
-            gate_weights = torch.sigmoid(self.head_gates).view(1, 1, H, 1)
-            out = out * gate_weights
-
-        return self.o_proj(out.reshape(B, L, H * D))
+        return self._attention_block(hidden_state, retrieved, topk_sims)
 
     @staticmethod
     def load_corpus_table(
