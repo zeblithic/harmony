@@ -617,6 +617,12 @@ class HarmonyModel(nn.Module):
         """
         from ct87.engram import GatedEngramInjection  # avoid top-level circular
 
+        if self.engram_injections is not None:
+            raise ValueError(
+                "attach_gated_engram_injections() called but engram_injections "
+                "is already set - re-attach would orphan existing parameters "
+                "from the module tree and desync any optimizer built against them."
+            )
         if not self.config.engram_inject_layers:
             raise ValueError(
                 "attach_gated_engram_injections() called but "
@@ -690,7 +696,10 @@ class HarmonyModel(nn.Module):
             engram_embeddings: optional [batch, seq_len, engram_dim] Engram
                 embeddings from an EngramTable lookup. When provided, the
                 EngramGatedResidual module injects them after the configured
-                engram_injection_layer.
+                engram_injection_layer. Ignored when η-B multi-layer injection
+                is attached (via attach_gated_engram_injections) or when a
+                research engram module (ANN/xattn) is attached — the active
+                engram path takes precedence.
             input_embeds: optional [batch, seq_len, hidden_dim] embeddings to
                 use instead of token lookup. Used by COCONUT continuous thought
                 to feed hidden states back as input.

@@ -226,6 +226,26 @@ class TestHarmonyModelMultiLayerInjection:
         with pytest.raises(ValueError, match="engram_inject_layers"):
             model.attach_gated_engram_injections({})
 
+    def test_attach_rejects_empty_dict_when_layers_declared(self):
+        """Empty dict against non-empty config raises — prevents a silent
+        dead-zone where engram_injections is an empty ModuleDict and the
+        forward's `elif` would permanently skip all legacy injection paths."""
+        model = self._build_model()
+        with pytest.raises(ValueError, match="layer_idx"):
+            model.attach_gated_engram_injections({})
+
+    def test_attach_rejects_double_attach(self):
+        """Second attach call raises — prevents orphaning params of the
+        first ModuleDict from PyTorch's module tree (which would desync
+        any optimizer built against those params)."""
+        model = self._build_model()
+        injections = self._build_injections(model.config)
+        model.attach_gated_engram_injections(injections)
+        # Second call must raise.
+        injections2 = self._build_injections(model.config)
+        with pytest.raises(ValueError, match="already set"):
+            model.attach_gated_engram_injections(injections2)
+
     def test_forward_zero_perturbation_at_init(self):
         """With alpha_init=0 on all injections, forward must match a no-injection baseline."""
         torch.manual_seed(123)
