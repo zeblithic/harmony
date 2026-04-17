@@ -346,8 +346,12 @@ class TestInitFromFlag:
 
     def test_train_rejects_both_init_from_and_resume_from(self):
         """CLI validation rejects using both flags simultaneously."""
+        import os
         import subprocess
         import sys
+        # Resolve `training/` (the parent of `tests/`) so the subprocess can
+        # `python -m ct87.train` regardless of where pytest was invoked from.
+        training_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         result = subprocess.run(
             [
                 sys.executable, "-m", "ct87.train",
@@ -359,7 +363,7 @@ class TestInitFromFlag:
                 "--steps", "1",
             ],
             capture_output=True, text=True, timeout=30,
-            cwd="/Users/zeblith/work/zeblithic/harmony/.worktrees/zeb-130-eta-capgap/training",
+            cwd=training_root,
         )
         assert result.returncode != 0, f"Expected non-zero exit but got stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         combined = result.stderr + result.stdout

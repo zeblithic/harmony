@@ -971,6 +971,35 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(2)
+        # Architecture-compatibility check. strict=False silently skips
+        # shape-mismatched keys; without this guard, an --init-from from an
+        # incompatible architecture (e.g., different hidden_dim) would load
+        # zero backbone params and the run would proceed with a randomly-
+        # initialized model masquerading as "loaded from checkpoint".
+        src_config = ckpt.get("config")
+        if src_config is not None:
+            _shape_critical_fields = (
+                "num_layers", "hidden_dim", "num_query_heads", "num_kv_heads",
+                "head_dim", "ffn_dim", "vocab_size", "engram_dim",
+            )
+            mismatches = [
+                (f, getattr(src_config, f, None), getattr(config, f, None))
+                for f in _shape_critical_fields
+                if getattr(src_config, f, None) != getattr(config, f, None)
+            ]
+            if mismatches:
+                print(
+                    "Error: --init-from source architecture is incompatible "
+                    "with the current config (strict=False would silently skip "
+                    "shape-mismatched params). Mismatches:",
+                    file=sys.stderr,
+                )
+                for name, src_val, cur_val in mismatches:
+                    print(
+                        f"  {name}: source={src_val!r} vs current={cur_val!r}",
+                        file=sys.stderr,
+                    )
+                sys.exit(2)
         missing, unexpected = model.load_state_dict(
             ckpt["model_state_dict"], strict=False
         )
@@ -980,7 +1009,8 @@ def main() -> None:
                 preview += f", ... (+{len(unexpected) - 5} more)"
             print(
                 f"Warning: --init-from has {len(unexpected)} unexpected "
-                f"keys (will be ignored): {preview}"
+                f"keys (will be ignored): {preview}",
+                file=sys.stderr,
             )
         if missing:
             non_engram_missing = [
@@ -992,7 +1022,8 @@ def main() -> None:
                     preview += f", ... (+{len(non_engram_missing) - 5} more)"
                 print(
                     f"Warning: --init-from missing {len(non_engram_missing)} "
-                    f"non-engram keys: {preview}"
+                    f"non-engram keys: {preview}",
+                    file=sys.stderr,
                 )
             else:
                 print(
