@@ -1076,3 +1076,35 @@ class EngramConsolidationDecoder(nn.Module):
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         return self.net(hidden_state)
+
+
+class GatedEngramInjection(nn.Module):
+    """Cross-attention engram injection gated by a learnable scalar (η-B / ZEB-130).
+
+    Wraps an ``EngramCrossAttention`` and applies a learnable scalar ``alpha``
+    through ``tanh`` to the xattn output. When ``alpha_init=0`` the gate
+    outputs zero on the first forward pass, so a freshly attached
+    ``GatedEngramInjection`` produces no perturbation until the optimizer
+    opens the gate — the capacity-gap experiment relies on this to preserve
+    a frozen pretrained baseline's step-0 behavior.
+
+    Forward: ``h_out = tanh(alpha) * xattn(h)``.
+
+    The model's forward loop adds this to the residual stream via
+    ``h = h + engram_inject_mult * wrapper(h)`` so that the global
+    ``engram_inject_mult`` (used by ``--zero-injection-eval``) still zeroes
+    out the injection regardless of gate state.
+    """
+
+    def __init__(
+        self,
+        engram_xattn: EngramCrossAttention,
+        alpha_init: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.engram_xattn = engram_xattn
+        self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        xattn_out = self.engram_xattn(hidden_state)
+        return torch.tanh(self.alpha) * xattn_out
