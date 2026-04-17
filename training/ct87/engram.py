@@ -977,8 +977,10 @@ class EngramCrossAttention(nn.Module):
         return int(self.table.shape[0])
 
     def retrieve_topk(
-        self, hidden_state: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        hidden_state: torch.Tensor,
+        return_indices: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Retrieve top-k nearest corpus embeddings per position.
 
         The top-k gather is non-differentiable, but `topk_sims` is a
@@ -988,17 +990,72 @@ class EngramCrossAttention(nn.Module):
 
         Args:
             hidden_state: [batch, seq_len, hidden_dim]
+            return_indices: if True, also return the gather indices so callers
+                (e.g. the V-contrastive branch) can reuse them without
+                recomputing the similarity matmul and top-k.
 
         Returns:
             retrieved:  [batch, seq_len, k_retrieved, engram_dim]
             topk_sims:  [batch, seq_len, k_retrieved] (raw cosine sims)
+            topk_idx:   [batch, seq_len, k_retrieved] (only when return_indices)
         """
         q = self.retrieval_query_proj(hidden_state)
         q_norm = F.normalize(q, dim=-1, eps=1e-8)
         sims = torch.einsum("ble,te->blt", q_norm, self.table_normalized)
         topk_sims, topk_idx = sims.topk(self.k_retrieved, dim=-1)
         retrieved = self.table[topk_idx]
+        if return_indices:
+            return retrieved, topk_sims, topk_idx
         return retrieved, topk_sims
+
+    def _attention_block(
+        self,
+        hidden_state: torch.Tensor,
+        retrieved: torch.Tensor,
+        topk_sims: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the post-retrieval attention pipeline on caller-supplied retrievals.
+
+        Exposed so V-contrastive variants (θ-V-contrast, ZEB-130) can run
+        the same attention/o_proj path against a shuffled-table retrieval
+        without duplicating the Q/K/V/o_proj logic. Logic must stay
+        bit-identical to what was previously inlined in `forward`.
+
+        Args:
+            hidden_state: [batch, seq_len, hidden_dim]
+            retrieved:    [batch, seq_len, k_retrieved, engram_dim] — raw
+                          (pre-`retrieval_norm`) retrieved rows.
+            topk_sims:    [batch, seq_len, k_retrieved] — cosine sims to add
+                          as the differentiable retrieval bias.
+
+        Returns:
+            [batch, seq_len, hidden_dim] residual (pre-gate).
+        """
+        B, L, _ = hidden_state.shape
+        H, D, k = self.num_heads, self.head_dim, self.k_retrieved
+
+        retrieved = self.retrieval_norm(retrieved)
+
+        q = self.q_proj(hidden_state).view(B, L, H, D)
+        q = self.q_norm(q)
+        k_tensor = self.k_proj(retrieved).view(B, L, k, H, D)
+        k_tensor = self.k_norm(k_tensor)
+        v_tensor = self.v_proj(retrieved).view(B, L, k, H, D)
+
+        scores = torch.einsum("blhd,blkhd->blhk", q, k_tensor) / (D ** 0.5)
+        # Broadcast the retrieval-similarity bias across heads. This is the
+        # only path through which `retrieval_query_proj` receives gradient
+        # from the main loss (topk gather blocks the rest).
+        scores = scores + self.retrieval_bias_weight * topk_sims.unsqueeze(2)
+        attn = F.softmax(scores, dim=-1)
+
+        out = torch.einsum("blhk,blkhd->blhd", attn, v_tensor)
+
+        if self.use_head_gates:
+            gate_weights = torch.sigmoid(self.head_gates).view(1, 1, H, 1)
+            out = out * gate_weights
+
+        return self.o_proj(out.reshape(B, L, H * D))
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Compute cross-attention residual for the injection layer.
@@ -1010,34 +1067,8 @@ class EngramCrossAttention(nn.Module):
             [batch, seq_len, hidden_dim] residual. Zero at step 0 due to
             `o_proj` zero-init; caller adds to hidden state.
         """
-        B, L, _ = hidden_state.shape
-        H, D, k = self.num_heads, self.head_dim, self.k_retrieved
-
         retrieved, topk_sims = self.retrieve_topk(hidden_state)
-        retrieved = self.retrieval_norm(retrieved)
-
-        q = self.q_proj(hidden_state).view(B, L, H, D)
-        q = self.q_norm(q)
-        k_tensor = self.k_proj(retrieved).view(B, L, k, H, D)
-        k_tensor = self.k_norm(k_tensor)
-        v_tensor = self.v_proj(retrieved).view(B, L, k, H, D)
-
-        # Per-position cross-attention: [B, L, H, k]
-        scores = torch.einsum("blhd,blkhd->blhk", q, k_tensor) / (D ** 0.5)
-        # Broadcast the retrieval-similarity bias across heads. This is
-        # the only path through which `retrieval_query_proj` receives
-        # gradient from the main loss (topk gather blocks the rest).
-        scores = scores + self.retrieval_bias_weight * topk_sims.unsqueeze(2)
-        attn = F.softmax(scores, dim=-1)
-
-        # [B, L, H, D]
-        out = torch.einsum("blhk,blkhd->blhd", attn, v_tensor)
-
-        if self.use_head_gates:
-            gate_weights = torch.sigmoid(self.head_gates).view(1, 1, H, 1)
-            out = out * gate_weights
-
-        return self.o_proj(out.reshape(B, L, H * D))
+        return self._attention_block(hidden_state, retrieved, topk_sims)
 
     @staticmethod
     def load_corpus_table(
@@ -1138,3 +1169,92 @@ class GatedEngramInjection(nn.Module):
         # dtype so the residual stays in low precision.
         gate = torch.tanh(self.alpha).to(dtype=xattn_out.dtype)
         return gate * xattn_out
+
+
+class ContrastiveGatedEngramInjection(GatedEngramInjection):
+    """V-contrastive engram injection (θ-V-contrast, ZEB-130).
+
+    Subclasses ``GatedEngramInjection`` to add a training-only auxiliary
+    loss path. On every forward in training mode, runs a second xattn
+    pipeline against a per-step random row-permutation of the primary
+    table, then appends ``(cos(inj_real, inj_shuf)**2).mean()`` to the
+    caller-supplied ``aux_loss_sink`` list. The shuffled branch never
+    contributes to the residual — only the parent's primary-branch
+    output is gated and returned.
+
+    The aux loss measures alignment at the post-``o_proj`` pre-gate level,
+    so a shrinking gate (``tanh(alpha) -> 0``) cannot be used to minimize
+    it — the gate's role is firing rate, the aux loss's role is
+    response-shape. They must remain independent.
+
+    Cheap permutation: ``F.normalize`` is row-permute-equivariant, so we
+    use the cached ``self.engram_xattn.table_normalized`` indexed by the
+    fresh ``perm`` instead of re-normalizing per step.
+    """
+
+    def __init__(
+        self,
+        engram_xattn: EngramCrossAttention,
+        alpha_init: float = 0.0,
+        aux_loss_sink: list[torch.Tensor] | None = None,
+        shuffle_generator: torch.Generator | None = None,
+    ) -> None:
+        super().__init__(engram_xattn, alpha_init=alpha_init)
+        # Held by reference: the training script owns the list (so it can
+        # clear it between optimizer steps and stack the per-layer scalars)
+        # and the wrappers append to it. A None sink disables the aux
+        # branch — used so HarmonyModel can construct the contrastive
+        # variant before the sink is wired up if needed.
+        self._aux_sink: list[torch.Tensor] | None = aux_loss_sink
+        # Optional dedicated RNG for the per-step row permutation. When None,
+        # the global PyTorch RNG is used (preferred for production). A seeded
+        # generator is for reproducibility debugging only.
+        self._shuffle_generator: torch.Generator | None = shuffle_generator
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        xattn = self.engram_xattn
+
+        if self.training and self._aux_sink is not None:
+            # Reuse the real-branch top-k indices for the shuffled branch so
+            # we don't re-run the similarity matmul and top-k gather twice.
+            retrieved_real, topk_sims_real, topk_idx_real = xattn.retrieve_topk(
+                hidden_state, return_indices=True,
+            )
+            inj_real = xattn._attention_block(hidden_state, retrieved_real, topk_sims_real)
+
+            # Per-step random row-permutation of the primary table (value
+            # shuffle). We keep the retrieval *keys* fixed (same top-k indices
+            # as the real branch) but supply content from a permuted table so
+            # the shuffled branch sees genuinely different rows at those
+            # positions. A full key+value permutation would be a semantic no-op:
+            # top-k selection is permutation-equivariant, so the same logical
+            # rows would win and the injections would be identical.
+            #
+            # Index-only shuffle: apply the permutation to the gather indices
+            # (`perm[topk_idx_real]`) instead of materializing a full [N, D]
+            # `table_shuf` and then re-gathering k rows from it. Same result,
+            # O(B·L·k) rather than O(N·D) bandwidth per forward.
+            N = xattn.table.shape[0]
+            gen = self._shuffle_generator
+            if gen is not None:
+                perm = torch.randperm(N, generator=gen, device=gen.device)
+                if perm.device != xattn.table.device:
+                    perm = perm.to(xattn.table.device)
+            else:
+                perm = torch.randperm(N, device=xattn.table.device)
+            shuf_idx = perm[topk_idx_real]
+            retrieved_shuf = xattn.table[shuf_idx]
+            inj_shuf = xattn._attention_block(hidden_state, retrieved_shuf, topk_sims_real)
+
+            # Mean-squared cosine across [B, L]. Smooth, bounded [0, 1],
+            # natural attractor at cos=0. Avoids the anti-alignment
+            # pathology of signed cosine minimization.
+            cos = F.cosine_similarity(inj_real, inj_shuf, dim=-1)
+            aux_loss = (cos ** 2).mean()
+            self._aux_sink.append(aux_loss)
+        else:
+            retrieved_real, topk_sims_real = xattn.retrieve_topk(hidden_state)
+            inj_real = xattn._attention_block(hidden_state, retrieved_real, topk_sims_real)
+
+        gate = torch.tanh(self.alpha).to(dtype=inj_real.dtype)
+        return gate * inj_real

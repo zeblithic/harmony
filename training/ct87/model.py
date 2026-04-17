@@ -77,6 +77,14 @@ class HarmonyModelConfig:
     # (mutually exclusive with use_xattn_engram / use_ann_engram).
     engram_inject_layers: tuple[int, ...] = ()
     engram_gate_init: float = 0.0
+    # θ-V-contrast (ZEB-130): V-contrastive auxiliary loss. Adds a second
+    # xattn forward against a per-step row-permutation of the primary table
+    # and penalizes cosine alignment between real-branch and shuffled-branch
+    # post-o_proj outputs. Only meaningful when engram_inject_layers is set
+    # (rides on top of the multi-layer gated injection path).
+    engram_vcontrast_enabled: bool = False
+    engram_vcontrast_lambda: float = 1.0
+    engram_vcontrast_warmup_steps: int = 200
 
     def __post_init__(self) -> None:
         """Validate `ffn_dim_overrides` up front so misconfigurations fail fast.
@@ -127,6 +135,23 @@ class HarmonyModelConfig:
                         f"outside [0, {self.num_layers}) - would be silently "
                         "ignored at model construction."
                     )
+        if self.engram_vcontrast_enabled:
+            if not self.engram_inject_layers:
+                raise ValueError(
+                    "engram_vcontrast_enabled=True requires "
+                    "engram_inject_layers to be non-empty (V-contrast lives "
+                    "on top of the multi-layer gated injection path)."
+                )
+            if self.engram_vcontrast_lambda < 0.0:
+                raise ValueError(
+                    "engram_vcontrast_lambda must be >= 0.0, got "
+                    f"{self.engram_vcontrast_lambda!r}"
+                )
+            if self.engram_vcontrast_warmup_steps < 0:
+                raise ValueError(
+                    "engram_vcontrast_warmup_steps must be >= 0, got "
+                    f"{self.engram_vcontrast_warmup_steps!r}"
+                )
         if self.ffn_dim_overrides is None:
             return
         for layer_idx, dim in self.ffn_dim_overrides.items():
@@ -321,6 +346,25 @@ class HarmonyModelConfig:
         base.engram_inject_layers = (2, 5)
         base.engram_gate_init = 0.0
         base.__post_init__()  # re-validate after mutation (matches tiny_ffn_expanded pattern)
+        return base
+
+    @staticmethod
+    def tiny_engram_xattn_capgap_vcontrast() -> HarmonyModelConfig:
+        """θ-V-contrast: η-B capgap + V-contrastive auxiliary loss (ZEB-130).
+
+        Extends `tiny_engram_xattn_capgap` with a per-step shuffled-table
+        contrastive auxiliary loss on the post-o_proj pre-gate outputs of
+        every injection layer. Used to address the (D*) DISTRIBUTIONAL
+        ALIGNMENT verdict from the 2026-04-17 (W)/(A) forensic — V's
+        per-token output directions are diverse within a run but align
+        across runs despite different retrievals; the aux loss pressures
+        V toward content-sensitivity.
+        """
+        base = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        base.engram_vcontrast_enabled = True
+        base.engram_vcontrast_lambda = 1.0
+        base.engram_vcontrast_warmup_steps = 200
+        base.__post_init__()  # re-validate after mutation
         return base
 
 
@@ -559,6 +603,12 @@ class HarmonyModel(nn.Module):
         self._last_ann_gate: torch.Tensor | None = None
         self._last_xattn_output: torch.Tensor | None = None
         self._last_pre_injection_hidden: torch.Tensor | None = None
+        # θ-V-contrast (ZEB-130): aux-loss sink populated by
+        # ContrastiveGatedEngramInjection wrappers during the forward pass.
+        # Owned by the training script (which assigns the same list reference
+        # into both this attribute and each wrapper's `_aux_sink`); cleared
+        # at the start of every training-mode forward.
+        self._contrastive_aux_losses: list[torch.Tensor] | None = None
         self.engram_inject_mult: float = 1.0
 
         # Tied embeddings
@@ -761,6 +811,11 @@ class HarmonyModel(nn.Module):
         self._last_ann_gate = None
         self._last_xattn_output = None
         self._last_pre_injection_hidden = None
+        # V-contrast aux-loss sink: clear only in training mode so eval-time
+        # callers (e.g. forensic) can inspect a pre-loaded list without it
+        # being wiped out.
+        if self._contrastive_aux_losses is not None and self.training:
+            self._contrastive_aux_losses.clear()
 
         # η-B misuse guard: a multi-layer capgap config without an attach call
         # would silently fall through to the legacy single-point elif below

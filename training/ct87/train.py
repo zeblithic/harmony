@@ -190,8 +190,17 @@ def save_resumable_checkpoint(
     os.rename(tmp_path, ckpt_path)
 
 
-def capture_rng_state(device: torch.device | None = None) -> dict:
-    """Capture all RNG states for deterministic resume."""
+def capture_rng_state(
+    device: torch.device | None = None,
+    capgap_shuffle_gen: torch.Generator | None = None,
+) -> dict:
+    """Capture all RNG states for deterministic resume.
+
+    The optional `capgap_shuffle_gen` is the dedicated V-contrast shuffle
+    generator (see `--engram-vcontrast-shuffle-seed`). It advances with each
+    training forward, so resuming without restoring its state would replay
+    permutations from step 0 and break the reproducibility contract.
+    """
     import random
     import numpy as np
 
@@ -204,10 +213,16 @@ def capture_rng_state(device: torch.device | None = None) -> dict:
         state["torch_cuda"] = torch.cuda.get_rng_state(device)
     elif torch.cuda.is_available():
         state["torch_cuda"] = torch.cuda.get_rng_state()
+    if capgap_shuffle_gen is not None:
+        state["capgap_shuffle_gen"] = capgap_shuffle_gen.get_state()
     return state
 
 
-def restore_rng_state(state: dict, device: torch.device | None = None) -> None:
+def restore_rng_state(
+    state: dict,
+    device: torch.device | None = None,
+    capgap_shuffle_gen: torch.Generator | None = None,
+) -> None:
     """Restore all RNG states from a checkpoint."""
     import random
     import numpy as np
@@ -220,6 +235,13 @@ def restore_rng_state(state: dict, device: torch.device | None = None) -> None:
             torch.cuda.set_rng_state(state["torch_cuda"], device)
         elif torch.cuda.is_available():
             torch.cuda.set_rng_state(state["torch_cuda"])
+    # Restore the V-contrast shuffle generator in-place (the wrappers already
+    # hold a reference to it, so mutating its state is enough). Silently skip
+    # when either the checkpoint or the current run lacks the generator — one
+    # side may be a pre-θ-V-contrast checkpoint, or the current run may not
+    # use --engram-vcontrast-shuffle-seed.
+    if capgap_shuffle_gen is not None and "capgap_shuffle_gen" in state:
+        capgap_shuffle_gen.set_state(state["capgap_shuffle_gen"])
 
 
 def load_checkpoint(
@@ -318,6 +340,19 @@ def detect_device(requested: str | None) -> torch.device:
     return torch.device("cpu")
 
 
+def lambda_schedule(step: int, warmup: int, target: float) -> float:
+    """Linear warmup from 0 to `target` over `warmup` steps; constant `target` after.
+
+    θ-V-contrast aux-loss schedule (ZEB-130). When `warmup` is 0 (or negative),
+    the linear ramp is skipped and `target` is returned for all steps.
+    """
+    if warmup <= 0:
+        return target
+    if step >= warmup:
+        return target
+    return target * step / warmup
+
+
 def freeze_backbone_for_capgap(model: "HarmonyModel") -> None:
     """Freeze all parameters except engram_injections.* (η-B / ZEB-130).
 
@@ -370,6 +405,7 @@ def main() -> None:
             "tiny_engram_xattn_consol_phased",
             "tiny_engram_xattn_ctrl",
             "tiny_engram_xattn_capgap",
+            "tiny_engram_xattn_capgap_vcontrast",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -510,6 +546,39 @@ def main() -> None:
         "--engram-xattn-num-heads", type=int, default=None,
         help="Override the cross-attention head count (default: inherit "
              "config.num_query_heads). hidden_dim must be divisible by this value.",
+    )
+    # ---- ZEB-130: θ-V-contrast ----
+    parser.add_argument(
+        "--engram-vcontrast", action="store_true",
+        help=(
+            "Enable θ-V-contrast V-contrastive auxiliary loss (ZEB-130). "
+            "Requires --config=tiny_engram_xattn_capgap_vcontrast (or another "
+            "preset with engram_inject_layers set). Adds a per-layer aux loss "
+            "penalizing cosine alignment between real-table and shuffled-table "
+            "post-o_proj outputs."
+        ),
+    )
+    parser.add_argument(
+        "--engram-vcontrast-lambda", type=float, default=None,
+        help=(
+            "Override the config's engram_vcontrast_lambda (default 1.0). "
+            "Aux loss is added as lambda * sum_layers(aux_loss_l)."
+        ),
+    )
+    parser.add_argument(
+        "--engram-vcontrast-warmup-steps", type=int, default=None,
+        help=(
+            "Override the config's engram_vcontrast_warmup_steps "
+            "(default 200). Linear warmup from 0 to lambda."
+        ),
+    )
+    parser.add_argument(
+        "--engram-vcontrast-shuffle-seed", type=int, default=None,
+        help=(
+            "Optional seed for the per-step shuffle generator. Default: "
+            "use the global PyTorch RNG (preferred for production runs; "
+            "the seed is for reproducibility debugging only)."
+        ),
     )
     parser.add_argument(
         "--latent-intermediate-dim", type=int, default=None,
@@ -772,9 +841,50 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_engram_xattn_ctrl()
     elif args.config == "tiny_engram_xattn_capgap":
         config = HarmonyModelConfig.tiny_engram_xattn_capgap()
+    elif args.config == "tiny_engram_xattn_capgap_vcontrast":
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
+
+    # θ-V-contrast (ZEB-130): --engram-vcontrast must exactly match the
+    # preset's `engram_vcontrast_enabled`. Preset mutation via flag makes
+    # CSV logs ambiguous (the recorded `--config=` no longer describes what
+    # actually ran) — better to fail fast than silently change the loss
+    # surface under the wrong preset name.
+    if args.engram_vcontrast != config.engram_vcontrast_enabled:
+        print(
+            "Error: --engram-vcontrast must match the selected preset. "
+            f"--config={args.config} has "
+            f"engram_vcontrast_enabled={config.engram_vcontrast_enabled}; "
+            f"--engram-vcontrast={'set' if args.engram_vcontrast else 'unset'}. "
+            "Use --config=tiny_engram_xattn_capgap_vcontrast (or another "
+            "V-contrast preset) for V-contrast runs; otherwise drop the flag.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # Override knobs only make sense when V-contrast is on. Rejecting them
+    # otherwise catches typos like forgetting the `_vcontrast` suffix on the
+    # preset name while still passing tuning flags.
+    if not config.engram_vcontrast_enabled and (
+        args.engram_vcontrast_lambda is not None
+        or args.engram_vcontrast_warmup_steps is not None
+        or args.engram_vcontrast_shuffle_seed is not None
+    ):
+        print(
+            "Error: --engram-vcontrast-{lambda,warmup-steps,shuffle-seed} "
+            "require a V-contrast preset + --engram-vcontrast.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.engram_vcontrast_lambda is not None:
+        config.engram_vcontrast_lambda = args.engram_vcontrast_lambda
+    if args.engram_vcontrast_warmup_steps is not None:
+        config.engram_vcontrast_warmup_steps = args.engram_vcontrast_warmup_steps
+    if config.engram_vcontrast_enabled:
+        # Re-run validation after CLI mutation, mirroring tiny_ffn_expanded /
+        # tiny_engram_xattn_capgap pattern.
+        config.__post_init__()
 
     # Model gamma arg validation (ZEB-117)
     if args.config in ("tiny_engram_ann", "tiny_engram_ann_routed"):
@@ -991,11 +1101,21 @@ def main() -> None:
             f"bias_weight={xattn_module.retrieval_bias_weight}"
         )
 
+    # Hoisted so the capture/restore sites in the training loop (which need
+    # to include this generator's state in resumable checkpoints) can
+    # reference it unconditionally — set to a real Generator inside the
+    # engram-injection block below when V-contrast is enabled + seeded.
+    capgap_shuffle_gen: torch.Generator | None = None
+
     # η-B multi-layer gated injection (ZEB-130).
     # Must happen BEFORE freeze_backbone_for_capgap() which raises if no
     # engram_injections are attached.
     if config.engram_inject_layers:
-        from ct87.engram import EngramCrossAttention, GatedEngramInjection
+        from ct87.engram import (
+            ContrastiveGatedEngramInjection,
+            EngramCrossAttention,
+            GatedEngramInjection,
+        )
 
         if args.engram_xattn_table is not None:
             capgap_table = EngramCrossAttention.load_corpus_table(args.engram_xattn_table)
@@ -1020,6 +1140,28 @@ def main() -> None:
             )
             sys.exit(2)
 
+        # θ-V-contrast: when enabled, construct ContrastiveGatedEngramInjection
+        # wrappers sharing a single aux-loss list. The training step pulls aux
+        # losses out of that list, sums them, and adds lambda * sum to LM loss.
+        capgap_aux_sink: list[torch.Tensor] | None = (
+            [] if config.engram_vcontrast_enabled else None
+        )
+        # Optional dedicated generator for the per-step value-shuffle. All
+        # wrappers share a single generator so seeding once makes the sequence
+        # of permutations across layers reproducible. CPU device avoids
+        # device-placement sensitivity — the permutation tensor is a small
+        # index tensor that gets moved to the table's device inside the
+        # wrapper if needed. Hoisted above; assigned here when enabled.
+        if (
+            config.engram_vcontrast_enabled
+            and args.engram_vcontrast_shuffle_seed is not None
+        ):
+            capgap_shuffle_gen = torch.Generator(device="cpu")
+            capgap_shuffle_gen.manual_seed(int(args.engram_vcontrast_shuffle_seed))
+            print(
+                "[capgap] V-contrast shuffle seeded with "
+                f"{args.engram_vcontrast_shuffle_seed} (reproducibility mode)"
+            )
         capgap_injections: dict[int, GatedEngramInjection] = {}
         for layer_idx in config.engram_inject_layers:
             xattn_mod = EngramCrossAttention(
@@ -1028,18 +1170,37 @@ def main() -> None:
                 num_heads=config.num_query_heads,
                 k_retrieved=args.xattn_top_k,
             )
-            capgap_injections[layer_idx] = GatedEngramInjection(
-                xattn_mod,
-                alpha_init=config.engram_gate_init,
-            )
+            if config.engram_vcontrast_enabled:
+                capgap_injections[layer_idx] = ContrastiveGatedEngramInjection(
+                    xattn_mod,
+                    alpha_init=config.engram_gate_init,
+                    aux_loss_sink=capgap_aux_sink,
+                    shuffle_generator=capgap_shuffle_gen,
+                )
+            else:
+                capgap_injections[layer_idx] = GatedEngramInjection(
+                    xattn_mod,
+                    alpha_init=config.engram_gate_init,
+                )
         model.attach_gated_engram_injections(capgap_injections)
+        if config.engram_vcontrast_enabled:
+            # Both the model and the wrappers reference the same list — the
+            # model clears it at the start of each training-mode forward and
+            # the wrappers append per-layer scalars.
+            model._contrastive_aux_losses = capgap_aux_sink
         # Ensure newly-attached submodules are on the correct device (model was
         # already moved to device before this block).
         model.engram_injections.to(device)
         print(
-            f"[capgap] Attached GatedEngramInjection at layers "
-            f"{list(config.engram_inject_layers)} with alpha_init="
+            f"[capgap] Attached "
+            f"{'ContrastiveGatedEngramInjection' if config.engram_vcontrast_enabled else 'GatedEngramInjection'}"
+            f" at layers {list(config.engram_inject_layers)} with alpha_init="
             f"{config.engram_gate_init}"
+            + (
+                f"; vcontrast lambda={config.engram_vcontrast_lambda} "
+                f"warmup={config.engram_vcontrast_warmup_steps}"
+                if config.engram_vcontrast_enabled else ""
+            )
         )
 
     param_count = sum(p.numel() for p in model.parameters())
@@ -1077,7 +1238,10 @@ def main() -> None:
         start_step = ckpt["step"] + 1
         _pending_optimizer_state = ckpt.get("optimizer_state_dict")
         if "rng_state" in ckpt:
-            restore_rng_state(ckpt["rng_state"], device)
+            restore_rng_state(
+                ckpt["rng_state"], device,
+                capgap_shuffle_gen=capgap_shuffle_gen,
+            )
         if "dynamic_entropy_lambda" in ckpt:
             _pending_entropy_lambda = ckpt["dynamic_entropy_lambda"]
         last_val = ckpt.get("last_val_loss")
@@ -1413,6 +1577,22 @@ def main() -> None:
     csv_file = None
     csv_writer = None
     if args.log_file:
+        # θ-V-contrast (ZEB-130) CSV columns are only emitted when the
+        # feature is enabled — non-vcontrast runs keep their existing CSV
+        # shape, and per-layer `vcontrast_aux_L{i}` columns are derived from
+        # `engram_inject_layers` so they reflect the active config rather
+        # than a fixed (2, 5) preset.
+        vcontrast_cols: list[str] = []
+        if config.engram_vcontrast_enabled:
+            # Sorted to match the forward-pass population order of
+            # `_contrastive_aux_losses` (ascending layer index). Keeps CSV
+            # columns and the per-layer accumulator aligned regardless of
+            # how the preset declared engram_inject_layers.
+            vcontrast_cols = [
+                "vcontrast_aux_loss",
+                *(f"vcontrast_aux_L{i}" for i in sorted(config.engram_inject_layers or ())),
+                "vcontrast_lambda",
+            ]
         expected_header = [
             "step", "loss", "uq_loss", "mtp_loss", "cl_loss",
             "ann_ent_loss", "ann_gate_mean", "ann_lambda_ent",
@@ -1420,6 +1600,7 @@ def main() -> None:
             "hg_0", "hg_1", "hg_2", "hg_3", "hg_4", "hg_5", "hg_6", "hg_7",
             "hg_std", "hg_min", "hg_max",
             "mse_loss", "consol_phase", "inject_mult",
+            *vcontrast_cols,
         ]
         legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         legacy_header_no_ann = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
@@ -1526,6 +1707,10 @@ def main() -> None:
             accum_ann_ent_loss = 0.0
             accum_ann_gate_mean = 0.0
             accum_mse_loss = 0.0
+            # θ-V-contrast (ZEB-130): aux-loss accumulators. Sum is captured
+            # as a scalar (no grad), per-layer values are retained for CSV.
+            accum_vcontrast_aux = 0.0
+            accum_vcontrast_per_layer: dict[str, float] = {}
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
             need_hidden = mtp_head is not None
             use_coconut = args.coconut and num_thoughts > 0
@@ -1755,6 +1940,45 @@ def main() -> None:
                         loss = loss + args.consolidation_lambda * mse_loss
                         accum_mse_loss += mse_loss.item()
 
+                    # θ-V-contrast (ZEB-130): aggregate per-layer V-contrastive
+                    # aux losses appended by ContrastiveGatedEngramInjection
+                    # forwards. The sink is owned by the model and cleared
+                    # at the start of every training-mode forward.
+                    if (
+                        config.engram_vcontrast_enabled
+                        and model._contrastive_aux_losses
+                    ):
+                        aux_per_layer = model._contrastive_aux_losses
+                        # Stack to a single tensor so the .sum() is a single
+                        # CUDA op rather than a Python-loop over scalars.
+                        aux_total = torch.stack(aux_per_layer).sum()
+                        lam = lambda_schedule(
+                            step,
+                            config.engram_vcontrast_warmup_steps,
+                            config.engram_vcontrast_lambda,
+                        )
+                        loss = loss + lam * aux_total
+                        # Detach for logging — these are consumed by CSV /
+                        # console emit and must not retain the graph.
+                        accum_vcontrast_aux += aux_total.detach().item()
+                        # Per-layer accumulator: keys are str(layer_idx),
+                        # matching the ModuleDict key convention. The model's
+                        # forward iterates layer indices in ASCENDING order
+                        # and appends one aux-loss per injection hit, so
+                        # `aux_per_layer[i]` corresponds to the i-th
+                        # smallest entry in `config.engram_inject_layers`.
+                        # Sort here so a config like `(5, 2)` maps values to
+                        # the correct keys instead of silently swapping them.
+                        for layer_key, layer_loss in zip(
+                            (str(i) for i in sorted(config.engram_inject_layers)),
+                            aux_per_layer,
+                            strict=True,
+                        ):
+                            accum_vcontrast_per_layer[layer_key] = (
+                                accum_vcontrast_per_layer.get(layer_key, 0.0)
+                                + layer_loss.detach().item()
+                            )
+
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
 
@@ -1864,9 +2088,26 @@ def main() -> None:
                             gate_val = torch.tanh(injection.alpha).item()
                             gate_parts.append(f"g{layer_key}={gate_val:+.3f}")
                         capgap_str = "  " + " ".join(gate_parts)
+                # θ-V-contrast (ZEB-130): aux loss + lambda + per-layer.
+                vcontrast_str = ""
+                if config.engram_vcontrast_enabled:
+                    raw_aux = accum_vcontrast_aux / args.grad_accum_steps
+                    raw_lam = lambda_schedule(
+                        step,
+                        config.engram_vcontrast_warmup_steps,
+                        config.engram_vcontrast_lambda,
+                    )
+                    parts = [f"aux={raw_aux:.4f}"]
+                    # Sorted to match CSV column order.
+                    for lk in (str(i) for i in sorted(config.engram_inject_layers)):
+                        if lk in accum_vcontrast_per_layer:
+                            v = accum_vcontrast_per_layer[lk] / args.grad_accum_steps
+                            parts.append(f"aux_L{lk}={v:.4f}")
+                    parts.append(f"λ={raw_lam:.3f}")
+                    vcontrast_str = "  " + "  ".join(parts)
                 print(
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
-                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}{capgap_str}"
+                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}{vcontrast_str}{capgap_str}"
                 )
 
             val_loss_str = ""
@@ -1900,7 +2141,9 @@ def main() -> None:
             ):
                 save_resumable_checkpoint(
                     model, optimizer, step, args.output_dir,
-                    rng_state=capture_rng_state(device),
+                    rng_state=capture_rng_state(
+                        device, capgap_shuffle_gen=capgap_shuffle_gen,
+                    ),
                     last_val_loss=float(val_loss_str) if val_loss_str else None,
                     dynamic_entropy_lambda=dynamic_entropy_lambda,
                 )
@@ -1923,7 +2166,11 @@ def main() -> None:
                     ann_ent_str = f"{accum_ann_ent_loss / args.grad_accum_steps:.6f}"
                     ann_gate_str = f"{accum_ann_gate_mean / args.grad_accum_steps:.6f}"
                     ann_lambda_str = f"{dynamic_entropy_lambda:.6f}"
-                n_hg_slots = len(expected_header) - 16  # 13 base columns before hg_*, 3 consol columns after
+                # Non-hg columns: 13 base + 3 consol + (0 when vcontrast off)
+                # or (2 scalars + N per-layer) when on. Subtract from total to
+                # size the hg block (hg_0..hg_N, std/min/max).
+                n_vcontrast_cols = len(vcontrast_cols)
+                n_hg_slots = len(expected_header) - (16 + n_vcontrast_cols)
                 hg_cols = [""] * n_hg_slots
                 hg_module = None
                 if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
@@ -1946,6 +2193,27 @@ def main() -> None:
                     mse_loss_str = f"{accum_mse_loss / args.grad_accum_steps:.6f}"
                     consol_phase_str = "1" if step >= args.consolidation_start_step else "0"
                     inject_mult_str = f"{inject_mult:.6f}"
+                # θ-V-contrast (ZEB-130): emit aux + per-layer + lambda only
+                # when enabled, matching the conditional header. Row cell
+                # order must track `vcontrast_cols` exactly.
+                vcontrast_row_cells: list[str] = []
+                if config.engram_vcontrast_enabled:
+                    raw_aux = accum_vcontrast_aux / args.grad_accum_steps
+                    vcontrast_row_cells.append(f"{raw_aux:.6f}")
+                    # Sorted to match header order and the accumulator's zip.
+                    for layer_idx in sorted(config.engram_inject_layers or ()):
+                        lk = str(layer_idx)
+                        if lk in accum_vcontrast_per_layer:
+                            v = accum_vcontrast_per_layer[lk] / args.grad_accum_steps
+                            vcontrast_row_cells.append(f"{v:.6f}")
+                        else:
+                            vcontrast_row_cells.append("")
+                    current_lam = lambda_schedule(
+                        step,
+                        config.engram_vcontrast_warmup_steps,
+                        config.engram_vcontrast_lambda,
+                    )
+                    vcontrast_row_cells.append(f"{current_lam:.6f}")
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
@@ -1964,6 +2232,7 @@ def main() -> None:
                     mse_loss_str,
                     consol_phase_str,
                     inject_mult_str,
+                    *vcontrast_row_cells,
                 ])
                 csv_file.flush()
 
@@ -1993,11 +2262,34 @@ def main() -> None:
             if args.checkpoint_interval > 0:
                 save_resumable_checkpoint(
                     model, optimizer, args.steps - 1, args.output_dir,
-                    rng_state=capture_rng_state(device),
+                    rng_state=capture_rng_state(
+                        device, capgap_shuffle_gen=capgap_shuffle_gen,
+                    ),
                     last_val_loss=final_val_loss,
                     dynamic_entropy_lambda=dynamic_entropy_lambda,
                 )
             print(f"Training complete. Final checkpoint at step {args.steps}")
+
+            # θ-V-contrast (ZEB-130): final summary block.
+            if config.engram_vcontrast_enabled:
+                with torch.no_grad():
+                    print(f"[vcontrast] Final step={args.steps}")
+                    if model._contrastive_aux_losses:
+                        # The list survives one final forward — but reliably the
+                        # most recent training-step accumulator is what we want.
+                        print(
+                            f"    last_aux_total = {accum_vcontrast_aux / max(args.grad_accum_steps, 1):.6f}"
+                        )
+                    if final_val_loss is not None:
+                        print(f"    val_loss (with inj)    = {final_val_loss:.6f}")
+                    if model.engram_injections is not None:
+                        for layer_key, injection in model.engram_injections.items():
+                            alpha_val = injection.alpha.detach().item()
+                            print(
+                                f"    alpha_L{layer_key} = {alpha_val:+.6f}, "
+                                f"tanh(alpha_L{layer_key}) = "
+                                f"{math.tanh(alpha_val):+.6f}"
+                            )
     finally:
         if csv_file is not None:
             csv_file.close()
