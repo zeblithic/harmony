@@ -130,9 +130,15 @@ def load_capgap_model(
     `_load_from_state_dict` hook. Passing the correct table path for each
     run is what makes the forensic meaningful.
     """
-    payload: dict[str, Any] = torch.load(
-        str(ckpt_path), map_location="cpu", weights_only=False,
-    )
+    # weights_only=True refuses to deserialize arbitrary Python objects, so
+    # HarmonyModelConfig (the dataclass stored alongside the state_dict by
+    # save_resumable_checkpoint) must be explicitly allow-listed. The config
+    # fields are all primitives + tuples + dicts of primitives, so the outer
+    # dataclass is the only custom type in the pickle stream.
+    with torch.serialization.safe_globals([HarmonyModelConfig]):
+        payload: dict[str, Any] = torch.load(
+            str(ckpt_path), map_location="cpu", weights_only=True,
+        )
     if "config" not in payload:
         raise KeyError(
             f"{ckpt_path} has no 'config' key — predates config persistence. "
@@ -214,6 +220,7 @@ class InjectionPreHook:
 def analyze_injection(
     wrapper: GatedEngramInjection,
     hidden_state: torch.Tensor,
+    inject_mult: float = 1.0,
 ) -> tuple[dict[str, float | int], torch.Tensor]:
     """Re-run the injection forward manually so we can capture intermediates.
 
@@ -223,12 +230,19 @@ def analyze_injection(
     for diagnostics. Logic is byte-for-byte the same as
     `EngramCrossAttention.forward` as of commit b2c3a96.
 
+    `inject_mult` mirrors `HarmonyModel.engram_inject_mult` — the runtime-only
+    scalar the model multiplies the wrapper's output by before adding to the
+    residual stream (default 1.0; `--zero-injection-eval` sets it to 0). The
+    forensic's injection tensor reflects the actual residual added, not just
+    the wrapper output, so (M) and cross-run cosine are comparable to what
+    the forward path produces at inference time.
+
     Returns `(scalar_stats, injection)`:
       - `scalar_stats` has no tensors so callers can accumulate it cheaply
         across batches.
-      - `injection` is the gate × xattn_out tensor ([B, L, hidden_dim]) for
-        cross-run comparison; callers should consume it immediately and
-        drop the reference so tensors don't accumulate across batches.
+      - `injection` is the `inject_mult × gate × xattn_out` tensor
+        ([B, L, hidden_dim]) for cross-run comparison; callers should
+        consume it immediately and drop the reference.
     """
     xattn = wrapper.engram_xattn
     B, L, _ = hidden_state.shape
@@ -255,11 +269,16 @@ def analyze_injection(
         out = out * gate_heads
     xattn_out = xattn.o_proj(out.reshape(B, L, H * D))
 
-    # Mirror GatedEngramInjection.forward: keep the gate as a tensor, cast
-    # to xattn_out's dtype before multiplying. Avoids a gratuitous GPU→CPU
-    # sync and matches the production dtype contract.
+    # Mirror the full residual add from HarmonyModel.forward:
+    #   h = h + engram_inject_mult * wrapper(h)
+    # where wrapper(h) = gate * xattn_out. Keeping the gate as a tensor (cast
+    # to xattn_out's dtype) avoids a gratuitous GPU→CPU sync and matches
+    # GatedEngramInjection.forward's dtype contract. The mult is folded in
+    # here so `injection` reflects the actual residual added, not just the
+    # wrapper's intermediate output — (M) and cross-run cos then correspond
+    # to what the forward path produces at eval time.
     gate = torch.tanh(wrapper.alpha).to(dtype=xattn_out.dtype)
-    injection = gate * xattn_out
+    injection = inject_mult * gate * xattn_out
 
     # (D) retrieval diversity — unique table rows touched across B*L*k slots.
     unique_rows = int(topk_idx.unique().numel())
@@ -313,7 +332,7 @@ def print_per_run_diagnostics(
         real = per_layer_real[layer_idx]
         shuf = per_layer_shuf[layer_idx]
         print(f"\nLayer {layer_idx}   (k_retrieved = {k}, log(k) = {log_k:.3f})")
-        print(f"                                            real           shuffled")
+        print("                                            real           shuffled")
         print(f"  (D) unique rows selected              {_mean(real, 'unique_rows'):10.0f}     {_mean(shuf, 'unique_rows'):10.0f}")
         print(f"      unique / (B*L*k) positions         {100*_mean(real, 'unique_rows_frac'):8.3f}%    {100*_mean(shuf, 'unique_rows_frac'):8.3f}%")
         print(f"  (P) top-1 sim                           {_mean(real, 'top1_sim'):+8.4f}     {_mean(shuf, 'top1_sim'):+8.4f}")
@@ -471,11 +490,17 @@ def run_forensic(args: argparse.Namespace) -> None:
                     f"Pre-hook at layer {layer_idx} did not fire — check that "
                     f"engram_injections are attached and in the forward path.",
                 )
+            # engram_inject_mult is a runtime-only HarmonyModel attribute
+            # (default 1.0, set to 0 under --zero-injection-eval). Pass
+            # whatever each model instance has so the reconstructed residual
+            # matches what that model's forward path actually produces.
             real_stats, real_inj = analyze_injection(
                 real_model.engram_injections[str(layer_idx)], real_h,
+                inject_mult=real_model.engram_inject_mult,
             )
             shuf_stats, shuf_inj = analyze_injection(
                 shuf_model.engram_injections[str(layer_idx)], shuf_h,
+                inject_mult=shuf_model.engram_inject_mult,
             )
             # Compute cross-run cosine inline so the [B, L, hidden_dim]
             # injection tensors can be dropped before the next batch.
