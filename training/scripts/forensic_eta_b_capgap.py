@@ -108,6 +108,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--k-retrieved", type=_positive_int, default=8,
                    help="Top-k retrieval parameter. Must match the training run's "
                         "--xattn-top-k value for the forensic to reflect the trained model.")
+    # retrieval_bias_weight and retrieval_temperature are constructor-only
+    # floats on EngramCrossAttention — plain Python attributes, not
+    # nn.Parameters or persistent buffers. load_state_dict cannot restore
+    # them, so they must be supplied at construction time to match the
+    # training run. Defaults mirror train.py and the module constructor:
+    # bias_weight=1.0, temperature=None → 1/sqrt(engram_dim).
+    p.add_argument("--retrieval-bias-weight", type=float, default=1.0,
+                   help="Mirrors train.py --engram-xattn-retrieval-bias-weight. "
+                        "Must match the value the checkpoints were trained with.")
+    p.add_argument("--retrieval-temperature", type=float, default=None,
+                   help="Softmax temperature for retrieve_softmax_weighted. Not "
+                        "used in the forensic's inline forward (we reproduce "
+                        "retrieve_topk), but passed to the constructor for parity "
+                        "with the trained module. None = 1/sqrt(engram_dim).")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0,
@@ -120,6 +134,8 @@ def load_capgap_model(
     ckpt_path: Path,
     table_path: Path,
     k_retrieved: int,
+    retrieval_bias_weight: float,
+    retrieval_temperature: float | None,
     device: str,
 ) -> tuple[HarmonyModel, HarmonyModelConfig, list[int]]:
     """Load an η-B capgap checkpoint and attach its engram injections.
@@ -162,6 +178,8 @@ def load_capgap_model(
             config, table,
             num_heads=config.num_query_heads,
             k_retrieved=k_retrieved,
+            retrieval_bias_weight=retrieval_bias_weight,
+            retrieval_temperature=retrieval_temperature,
         )
         injections[layer_idx] = GatedEngramInjection(
             xattn, alpha_init=config.engram_gate_init,
@@ -418,11 +436,13 @@ def run_forensic(args: argparse.Namespace) -> None:
     device = args.device
     print(f"Loading real-oracle model from {args.real_ckpt} ...")
     real_model, real_config, layers_real = load_capgap_model(
-        args.real_ckpt, args.real_table, args.k_retrieved, device,
+        args.real_ckpt, args.real_table, args.k_retrieved,
+        args.retrieval_bias_weight, args.retrieval_temperature, device,
     )
     print(f"Loading shuffled-oracle model from {args.shuffled_ckpt} ...")
     shuf_model, shuf_config, layers_shuf = load_capgap_model(
-        args.shuffled_ckpt, args.shuffled_table, args.k_retrieved, device,
+        args.shuffled_ckpt, args.shuffled_table, args.k_retrieved,
+        args.retrieval_bias_weight, args.retrieval_temperature, device,
     )
 
     if layers_real != layers_shuf:
@@ -435,6 +455,16 @@ def run_forensic(args: argparse.Namespace) -> None:
         raise ValueError(
             f"Vocab size mismatch: real={real_config.vocab_size} "
             f"shuffled={shuf_config.vocab_size}. Forensic needs matched models.",
+        )
+    # hidden_dim is the shape contract for the injection tensors fed into
+    # F.cosine_similarity below. Without this check, a mismatch would load
+    # both checkpoints cleanly and only crash inside the cosine op on the
+    # first batch. Fail fast alongside the other config-compat checks.
+    if real_config.hidden_dim != shuf_config.hidden_dim:
+        raise ValueError(
+            f"Hidden dim mismatch: real={real_config.hidden_dim} "
+            f"shuffled={shuf_config.hidden_dim}. Cross-run cosine requires "
+            f"matched injection output geometry.",
         )
     layers = layers_real
 
