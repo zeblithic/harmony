@@ -549,3 +549,152 @@ class TestTrainPyVContrastSmoke:
         # Reject any stale hardcoded lowercase-l columns.
         assert "vcontrast_aux_l2" not in header
         assert "vcontrast_aux_l5" not in header
+
+
+class TestCsvHeaderConditional:
+    """V-contrast CSV columns must only appear when the feature is enabled —
+    otherwise non-vcontrast runs get polluted with empty columns they don't
+    produce data for (Cursor PR 250 review: 'Vcontrast per-layer CSV columns
+    emitted when feature disabled')."""
+
+    def test_vcontrast_cols_absent_when_disabled(self, tmp_path):
+        """Running a plain synthetic capgap config (no V-contrast) must NOT
+        emit any vcontrast_* columns in the CSV header."""
+        log_file = tmp_path / "train.csv"
+        output_dir = tmp_path / "output"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--config", "tiny_engram_xattn_capgap",
+                "--synthetic",
+                "--steps", "2",
+                "--save-every", "0",
+                "--log-file", str(log_file),
+                "--output-dir", str(output_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=Path(__file__).parent.parent,
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)},
+        )
+        assert result.returncode == 0, (
+            f"train.py exited {result.returncode}\n"
+            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        )
+        header = log_file.read_text().splitlines()[0].split(",")
+        assert not any(c.startswith("vcontrast_") for c in header), (
+            f"Non-vcontrast run should not emit any vcontrast_* columns; "
+            f"got: {[c for c in header if c.startswith('vcontrast_')]}"
+        )
+
+
+class TestCliFlagPresetConsistency:
+    """PR 250 CodeRabbit review: --engram-vcontrast must match the preset's
+    engram_vcontrast_enabled symmetrically. Preset mutation via flag makes
+    CSV logs ambiguous — the recorded --config name should always describe
+    what actually ran."""
+
+    def test_flag_without_preset_rejected(self, tmp_path):
+        """--engram-vcontrast on a non-vcontrast preset must exit non-zero."""
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--config", "tiny_engram_xattn_capgap",
+                "--engram-vcontrast",
+                "--synthetic",
+                "--steps", "1",
+                "--save-every", "0",
+                "--log-file", str(tmp_path / "t.csv"),
+                "--output-dir", str(tmp_path / "out"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=Path(__file__).parent.parent,
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)},
+        )
+        assert result.returncode != 0
+        assert "must match the selected preset" in result.stderr
+
+    def test_override_flag_without_vcontrast_rejected(self, tmp_path):
+        """--engram-vcontrast-lambda without V-contrast must exit non-zero."""
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--config", "tiny_engram_xattn_capgap",
+                "--engram-vcontrast-lambda", "0.5",
+                "--synthetic",
+                "--steps", "1",
+                "--save-every", "0",
+                "--log-file", str(tmp_path / "t.csv"),
+                "--output-dir", str(tmp_path / "out"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=Path(__file__).parent.parent,
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)},
+        )
+        assert result.returncode != 0
+        assert "require a V-contrast preset" in result.stderr
+
+
+class TestShuffleGeneratorCheckpointing:
+    """PR 250 CodeRabbit review: capgap_shuffle_gen state must survive
+    checkpoint → resume. Otherwise --engram-vcontrast-shuffle-seed replays
+    permutations from step 0 on every resume, breaking determinism."""
+
+    def test_capture_and_restore_round_trip(self):
+        """Round-trip a generator's state through capture_rng_state +
+        restore_rng_state — the restored generator must produce identical
+        perms to the original."""
+        from ct87.train import capture_rng_state, restore_rng_state
+
+        gen = torch.Generator(device="cpu").manual_seed(42)
+        # Advance the generator a few steps so its state differs from the
+        # freshly-seeded state — this is what the training loop does.
+        for _ in range(7):
+            torch.randperm(16, generator=gen, device="cpu")
+
+        state = capture_rng_state(device=None, capgap_shuffle_gen=gen)
+        assert "capgap_shuffle_gen" in state
+
+        # Snapshot the next 3 perms from the original generator:
+        expected = [
+            torch.randperm(16, generator=gen, device="cpu").clone()
+            for _ in range(3)
+        ]
+
+        # Build a fresh generator, seeded differently, and restore into it.
+        gen2 = torch.Generator(device="cpu").manual_seed(9999)
+        restore_rng_state(state, device=None, capgap_shuffle_gen=gen2)
+
+        got = [
+            torch.randperm(16, generator=gen2, device="cpu").clone()
+            for _ in range(3)
+        ]
+
+        for e, g in zip(expected, got):
+            assert torch.equal(e, g), (
+                "restore_rng_state didn't restore the shuffle generator's "
+                "state — next permutation diverged."
+            )
+
+    def test_capture_absent_when_no_generator(self):
+        """If V-contrast is off (no generator), the state dict must NOT have
+        a capgap_shuffle_gen key — it would be meaningless and would bloat
+        checkpoints."""
+        from ct87.train import capture_rng_state
+        state = capture_rng_state(device=None, capgap_shuffle_gen=None)
+        assert "capgap_shuffle_gen" not in state
+
+    def test_restore_silently_skips_when_absent(self):
+        """Restoring a pre-θ-V-contrast checkpoint (no capgap_shuffle_gen
+        key) must not error when a generator is passed — we degrade to
+        'no restore, caller gets a fresh-seeded generator'."""
+        from ct87.train import capture_rng_state, restore_rng_state
+        legacy_state = capture_rng_state(device=None)  # no gen
+        gen = torch.Generator(device="cpu").manual_seed(7)
+        # Must not raise:
+        restore_rng_state(legacy_state, device=None, capgap_shuffle_gen=gen)
