@@ -45,11 +45,17 @@ These drive a verdict:
 
 Key observation: `EngramCrossAttention.retrieve_topk()` is pure cosine top-k
 over the full table, so row-permuting the table is mathematically a no-op
-on WHICH rows get retrieved given identical Q projections. Any difference
-in behavior between the two runs localizes entirely to training-trajectory
-divergence of the learned projections. The (C) cross-run comparison is the
-definitive probe for whether the two trajectories found the same useful
-direction or two arbitrary ones.
+on the retrieved CONTENT given identical Q projections (the same rows are
+selected, just at different j-labels). Any difference in behavior between
+the two runs localizes entirely to training-trajectory divergence of the
+learned projections. The (C) cross-run comparison is the definitive probe
+for whether the two trajectories found the same useful direction or two
+arbitrary ones.
+
+The (X) cross-table within-run probe handles this correctly by sampling
+the alt table from a random Gaussian with matched per-dim statistics — a
+genuine CONTENT swap, not a row relabeling — so top-k on the alt table
+returns truly different vectors from top-k on the primary table.
 
 Usage (on KRILE):
 
@@ -179,15 +185,19 @@ def parse_args() -> argparse.Namespace:
                    help="Seed for val-batch selection. Identical across both models so they "
                         "see the same tokens — required for (C) cross-run comparison.")
     p.add_argument(
-        "--alt-shuffle-seed", type=int, default=42,
+        "--alt-table-seed", type=int, default=42,
         help=(
-            "Seed for the held-out alt shuffle used by the cross-table "
-            "within-run probe. Default 42 (explicitly different from any "
-            "training-time shuffle seed). The probe forwards a single "
-            "trained model against its training-primary table AND a fresh "
-            "torch.randperm(N) of that table seeded by this argument; "
-            "comparing matched-position injection outputs is the direct "
-            "test of V content-sensitivity."
+            "Seed for the random-gaussian alt table used by the (X) cross-"
+            "table within-run probe. Default 42. The probe forwards a single "
+            "trained model against its training-primary table AND against a "
+            "freshly-sampled random-gaussian table with matched per-dim mean "
+            "and std (seeded by this argument). Comparing injection outputs "
+            "is the direct test of V content-sensitivity: a content-blind V "
+            "produces similar outputs for both tables; a content-sensitive V "
+            "produces near-orthogonal outputs. Row-permuting the primary "
+            "table is a no-op on top-k retrieved content (same rows, "
+            "relabeled), so this probe instead samples genuinely different "
+            "content at matched first and second moments."
         ),
     )
     return p.parse_args()
@@ -457,24 +467,36 @@ def analyze_cross_table(
     For each injection layer, runs the model twice on each batch — once with
     the primary table installed on the layer's xattn, once with the alt
     table installed — and computes cosine alignment between matched-position
-    injection outputs. A content-sensitive V should produce different
-    outputs when the table changes (cross-table cos near 0). A V that has
-    found the trivial-orthogonality shortcut produces near-zero cross-table
-    cos as a side effect of randomness; the secondary "random-baseline"
-    probe (cos between two random tokens' V outputs in the same forward)
-    distinguishes the two cases.
+    injection outputs. A content-sensitive V produces different outputs
+    when the retrieved vectors actually differ (cross-table |cos| near 0);
+    a content-blind V produces near-identical outputs regardless of what
+    gets retrieved (|cos| near 1). The secondary "random-baseline" probe
+    (|cos| between two random tokens' V outputs within a single forward)
+    gives a dispersion floor — if V's within-run token-to-token variation
+    is already high, a low cross-table |cos| is less surprising; if V is
+    token-concentrated, a low cross-table |cos| is a strong content-
+    sensitivity signal.
+
+    `alt_table` must be a GENUINE content swap, not a row permutation:
+    row-permuting `primary_table` is mathematically a no-op on the
+    retrieved content under cosine top-k (same rows get selected, just
+    at different j-labels), so the probe would always report |cos| = 1.
+    Callers should pass a random-gaussian `alt_table` with matched per-
+    dim mean and std (see the main-function construction).
 
     Args:
         model: Trained HarmonyModel with `engram_injections` attached.
         primary_table: The table the model was trained against.
-        alt_table: A held-out random row-permutation of `primary_table`.
+        alt_table: A content-different alt table of matching shape
+            (typically random-gaussian with matched primary-table
+            statistics; see caller in `run_forensic`).
         val_batches: Validation token batches (each [batch, seq_len]).
         layers: Injection-layer indices (typically [2, 5]).
 
     Returns:
         Per-layer dict with keys:
             'cross_table_cos_signed', 'cross_table_cos_abs',
-            'within_run_random_pair_cos_abs' (the trivial-orthogonality floor).
+            'within_run_random_pair_cos_abs' (the dispersion floor).
     """
     if primary_table.shape != alt_table.shape:
         raise ValueError(
@@ -718,6 +740,35 @@ Interpretation rubric for 2026-04-16 η-B + 2026-04-17 ζ-ctrl data:
     → Rules out (R), (I), (I*). Rubric pointed to (H), but (H) alone
       doesn't explain content-invariance of training metrics.
     → NEXT: (W) and (A) measurement to select between (I**) / (I***) / (D*).
+
+--- (X) cross-table content-sensitivity reading (added 2026-04-17) ---
+
+(X) is the within-run content-swap probe: forward the same trained model
+against its training-primary table AND against a random-gaussian alt
+table of matched per-dim statistics. Both (P) retrievals are genuine
+top-k — the alt table contains different vectors, so the retrieved
+content differs (not just relabeled).
+
+(V-CONTENT-BLIND)  (X) |cos| ≳ 0.8 on both runs
+  → V emits similar injection outputs regardless of retrieved content.
+    V is functionally a projection of (hidden, attention-weight summary)
+    with the retrieved vectors contributing little. Redesign must force
+    V-side content dependence (e.g., V-contrastive aux, KV tying, no-
+    bias V projection).
+
+(V-CONTENT-SENSITIVE)  (X) |cos| ≲ 0.2 on both runs
+  → V responds to retrieved content. If the model is ALSO content-
+    invariant at training metrics (shuffle-kill pattern), the pathology
+    localizes upstream of V: Q queries a narrow row neighborhood where V
+    orthogonalizes without the breadth needed for LM-task content
+    routing. Redesign target is Q-side (load-balancing / retrieval-
+    diversity aux).
+
+(X) |cos| between 0.2 and 0.8 is ambiguous — compare to the within-run
+random-pair |cos| floor (printed alongside each (X) reading): if (X) is
+near the floor, V is dispersing tokens across axes but not specifically
+content-routing; if (X) is materially above the floor, there is partial
+content dependence.
 """)
 
 
@@ -836,15 +887,22 @@ def run_forensic(args: argparse.Namespace) -> None:
     print_cross_run(cross_run_per_layer, layers)
 
     print("\n--- (X) cross-table within-run probe ---")
-    print(f"Alt-shuffle seed: {args.alt_shuffle_seed}")
+    print(f"Alt-table seed: {args.alt_table_seed}")
 
-    # Re-load the real-oracle table to use as the primary; derive the alt
-    # table by held-out random permutation seeded by --alt-shuffle-seed.
+    # Re-load the real-oracle table to use as the primary; sample the alt
+    # table from a random gaussian with matched per-dim mean and std so
+    # that top-k retrieval returns GENUINELY DIFFERENT content (not a
+    # relabeling of the same rows as a row-permutation would produce).
     primary_table = EngramCrossAttention.load_corpus_table(str(args.real_table))
     g = torch.Generator(device="cpu")
-    g.manual_seed(args.alt_shuffle_seed)
-    perm = torch.randperm(primary_table.shape[0], generator=g)
-    alt_table = primary_table[perm]
+    g.manual_seed(args.alt_table_seed)
+    primary_mean = primary_table.mean(dim=0, keepdim=True)
+    primary_std = primary_table.std(dim=0, keepdim=True).clamp(min=1e-8)
+    alt_table = (
+        torch.randn(primary_table.shape, generator=g, dtype=primary_table.dtype)
+        * primary_std
+        + primary_mean
+    )
 
     # Re-collect val batches for the cross-table probe (val_loader is
     # one-shot in some implementations; safest to reuse the same dataloader
