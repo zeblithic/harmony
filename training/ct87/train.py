@@ -383,6 +383,7 @@ def main() -> None:
             "tiny_engram_xattn_consol_phased",
             "tiny_engram_xattn_ctrl",
             "tiny_engram_xattn_capgap",
+            "tiny_engram_xattn_capgap_vcontrast",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -523,6 +524,39 @@ def main() -> None:
         "--engram-xattn-num-heads", type=int, default=None,
         help="Override the cross-attention head count (default: inherit "
              "config.num_query_heads). hidden_dim must be divisible by this value.",
+    )
+    # ---- ZEB-130: θ-V-contrast ----
+    parser.add_argument(
+        "--engram-vcontrast", action="store_true",
+        help=(
+            "Enable θ-V-contrast V-contrastive auxiliary loss (ZEB-130). "
+            "Requires --config=tiny_engram_xattn_capgap_vcontrast (or another "
+            "preset with engram_inject_layers set). Adds a per-layer aux loss "
+            "penalizing cosine alignment between real-table and shuffled-table "
+            "post-o_proj outputs."
+        ),
+    )
+    parser.add_argument(
+        "--engram-vcontrast-lambda", type=float, default=None,
+        help=(
+            "Override the config's engram_vcontrast_lambda (default 1.0). "
+            "Aux loss is added as lambda * sum_layers(aux_loss_l)."
+        ),
+    )
+    parser.add_argument(
+        "--engram-vcontrast-warmup-steps", type=int, default=None,
+        help=(
+            "Override the config's engram_vcontrast_warmup_steps "
+            "(default 200). Linear warmup from 0 to lambda."
+        ),
+    )
+    parser.add_argument(
+        "--engram-vcontrast-shuffle-seed", type=int, default=None,
+        help=(
+            "Optional seed for the per-step shuffle generator. Default: "
+            "use the global PyTorch RNG (preferred for production runs; "
+            "the seed is for reproducibility debugging only)."
+        ),
     )
     parser.add_argument(
         "--latent-intermediate-dim", type=int, default=None,
@@ -785,9 +819,35 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_engram_xattn_ctrl()
     elif args.config == "tiny_engram_xattn_capgap":
         config = HarmonyModelConfig.tiny_engram_xattn_capgap()
+    elif args.config == "tiny_engram_xattn_capgap_vcontrast":
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
+
+    # θ-V-contrast (ZEB-130): apply CLI overrides on top of the preset's
+    # defaults, then re-validate. --engram-vcontrast must agree with the
+    # preset; mismatch is a configuration error (silently ignoring either
+    # flag leads to runs that look complete but are actually misconfigured).
+    if args.engram_vcontrast and not config.engram_vcontrast_enabled:
+        config.engram_vcontrast_enabled = True
+    elif config.engram_vcontrast_enabled and not args.engram_vcontrast:
+        print(
+            f"Error: --config={args.config} enables engram_vcontrast but "
+            "--engram-vcontrast was not passed. Pass --engram-vcontrast "
+            "explicitly to confirm intent (V-contrast doubles engram-forward "
+            "compute and changes the loss surface).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.engram_vcontrast_lambda is not None:
+        config.engram_vcontrast_lambda = args.engram_vcontrast_lambda
+    if args.engram_vcontrast_warmup_steps is not None:
+        config.engram_vcontrast_warmup_steps = args.engram_vcontrast_warmup_steps
+    if config.engram_vcontrast_enabled:
+        # Re-run validation after CLI mutation, mirroring tiny_ffn_expanded /
+        # tiny_engram_xattn_capgap pattern.
+        config.__post_init__()
 
     # Model gamma arg validation (ZEB-117)
     if args.config in ("tiny_engram_ann", "tiny_engram_ann_routed"):
