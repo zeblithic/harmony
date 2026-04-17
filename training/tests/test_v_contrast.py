@@ -1,6 +1,7 @@
 """Tests for θ-V-contrast V-contrastive engram injection (ZEB-130)."""
 from __future__ import annotations
 
+import os
 import pytest
 import torch
 
@@ -394,3 +395,45 @@ class TestOneStepIntegration:
             "v_proj weight unchanged after a V-contrast aux-loss step — the "
             "aux gradient is not reaching V."
         )
+
+
+import subprocess
+import sys
+from pathlib import Path
+
+
+class TestTrainPyVContrastSmoke:
+
+    def test_train_steps_with_vcontrast(self, tmp_path):
+        """Run train.py for 2 steps with --synthetic + --engram-vcontrast and
+        verify the CSV log has the new vcontrast_* columns populated."""
+        log_file = tmp_path / "train.csv"
+        output_dir = tmp_path / "output"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--config", "tiny_engram_xattn_capgap_vcontrast",
+                "--engram-vcontrast",
+                "--synthetic",
+                "--steps", "2",
+                "--save-every", "0",
+                "--log-file", str(log_file),
+                "--output-dir", str(output_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=Path(__file__).parent.parent,  # training/
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)},
+        )
+        assert result.returncode == 0, (
+            f"train.py exited {result.returncode}\n"
+            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        )
+        # Confirm V-contrast banner printed during setup
+        assert "ContrastiveGatedEngramInjection" in result.stdout
+        # Confirm CSV header includes the V-contrast columns
+        lines = log_file.read_text().splitlines()
+        header = lines[0].split(",")
+        assert "vcontrast_aux_loss" in header
+        assert "vcontrast_lambda" in header
