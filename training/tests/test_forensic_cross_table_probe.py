@@ -98,10 +98,10 @@ def test_gaussian_alt_table_preserves_first_and_second_moments() -> None:
         + primary_mean
     )
 
-    # Both tables are N=5000 samples; each has per-dim SEM ≈ σ/√N ≈ 0.02
-    # around the true mean, so the MAX pair-wise difference across 64 dims
-    # lands around ~4× that. Loose tolerance captures 'matched within
-    # sampling noise' rather than 'bit-identical'.
+    # Both tables are N=5000 samples; each has per-dim SEM ~= sigma/sqrt(N)
+    # ~= 0.02 around the true mean, so the MAX pair-wise difference across
+    # 64 dims lands around ~4x that. Loose tolerance captures 'matched
+    # within sampling noise' rather than 'bit-identical'.
     assert torch.allclose(
         alt_table.mean(dim=0), primary_table.mean(dim=0), atol=0.15,
     ), "Alt table per-dim mean should match primary within sampling noise."

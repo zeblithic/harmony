@@ -464,18 +464,23 @@ def analyze_cross_table(
 ) -> dict[int, dict[str, float]]:
     """Cross-table within-run probe: same model, same tokens, different table.
 
-    For each injection layer, runs the model twice on each batch — once with
-    the primary table installed on the layer's xattn, once with the alt
-    table installed — and computes cosine alignment between matched-position
-    injection outputs. A content-sensitive V produces different outputs
-    when the retrieved vectors actually differ (cross-table |cos| near 0);
-    a content-blind V produces near-identical outputs regardless of what
-    gets retrieved (|cos| near 1). The secondary "random-baseline" probe
-    (|cos| between two random tokens' V outputs within a single forward)
-    gives a dispersion floor — if V's within-run token-to-token variation
-    is already high, a low cross-table |cos| is less surprising; if V is
-    token-concentrated, a low cross-table |cos| is a strong content-
-    sensitivity signal.
+    Per batch, runs one full model forward to capture each injection layer's
+    input hidden state via a forward pre-hook. For each layer, then computes
+    TWO injection outputs from that single captured hidden state: one using
+    the primary table's retrieval, one using the alt table's retrieval.
+    Compares matched-position cosines. (The model itself is NOT run twice —
+    doing so would let earlier-layer injections diverge between primary and
+    alt, confounding the per-layer V content-sensitivity reading. Sharing
+    the hidden state isolates the V projection under test.)
+
+    A content-sensitive V produces different outputs when the retrieved
+    vectors actually differ (cross-table |cos| near 0); a content-blind V
+    produces near-identical outputs regardless of what gets retrieved (|cos|
+    near 1). The secondary "random-baseline" probe (|cos| between two random
+    tokens' V outputs within a single forward) gives a dispersion floor — if
+    V's within-run token-to-token variation is already high, a low cross-
+    table |cos| is less surprising; if V is token-concentrated, a low cross-
+    table |cos| is a strong content-sensitivity signal.
 
     `alt_table` must be a GENUINE content swap, not a row permutation:
     row-permuting `primary_table` is mathematically a no-op on the
@@ -486,7 +491,10 @@ def analyze_cross_table(
 
     Args:
         model: Trained HarmonyModel with `engram_injections` attached.
-        primary_table: The table the model was trained against.
+        primary_table: The table the model was trained against. Each
+            model should be probed against ITS OWN training table —
+            probing a shuffled-oracle model against the real oracle
+            tests OOD behavior, not V content-sensitivity.
         alt_table: A content-different alt table of matching shape
             (typically random-gaussian with matched primary-table
             statistics; see caller in `run_forensic`).
@@ -583,6 +591,28 @@ def analyze_cross_table(
             ) / n,
         }
     return out
+
+
+def _sample_matched_gaussian_alt(
+    primary_table: torch.Tensor, seed: int,
+) -> torch.Tensor:
+    """Sample a random-gaussian alt table at matched per-dim mean and std.
+
+    Used by the (X) cross-table probe as a genuine content-swap
+    counterfactual (row-permuting the primary would be a no-op on top-k
+    cosine retrieval). Matched statistics keep retrieval similarities
+    in a comparable range so the probe measures V's sensitivity rather
+    than its response to OOD magnitudes.
+    """
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    table_mean = primary_table.mean(dim=0, keepdim=True)
+    table_std = primary_table.std(dim=0, keepdim=True).clamp(min=1e-8)
+    return (
+        torch.randn(primary_table.shape, generator=gen, dtype=primary_table.dtype)
+        * table_std
+        + table_mean
+    )
 
 
 def _injection_with_table(
@@ -889,20 +919,15 @@ def run_forensic(args: argparse.Namespace) -> None:
     print("\n--- (X) cross-table within-run probe ---")
     print(f"Alt-table seed: {args.alt_table_seed}")
 
-    # Re-load the real-oracle table to use as the primary; sample the alt
-    # table from a random gaussian with matched per-dim mean and std so
-    # that top-k retrieval returns GENUINELY DIFFERENT content (not a
-    # relabeling of the same rows as a row-permutation would produce).
-    primary_table = EngramCrossAttention.load_corpus_table(str(args.real_table))
-    g = torch.Generator(device="cpu")
-    g.manual_seed(args.alt_table_seed)
-    primary_mean = primary_table.mean(dim=0, keepdim=True)
-    primary_std = primary_table.std(dim=0, keepdim=True).clamp(min=1e-8)
-    alt_table = (
-        torch.randn(primary_table.shape, generator=g, dtype=primary_table.dtype)
-        * primary_std
-        + primary_mean
-    )
+    # Each model is probed against ITS OWN training table as primary, with
+    # an alt table sampled from a random gaussian at matched per-dim mean
+    # and std. Probing shuf_model against args.real_table would test OOD
+    # behavior (V seeing a table it never trained on) rather than V's
+    # content-sensitivity on its actual training distribution.
+    primary_table_real = EngramCrossAttention.load_corpus_table(str(args.real_table))
+    primary_table_shuf = EngramCrossAttention.load_corpus_table(str(args.shuffled_table))
+    alt_table_real = _sample_matched_gaussian_alt(primary_table_real, args.alt_table_seed)
+    alt_table_shuf = _sample_matched_gaussian_alt(primary_table_shuf, args.alt_table_seed)
 
     # Re-collect val batches for the cross-table probe (val_loader is
     # one-shot in some implementations; safest to reuse the same dataloader
@@ -915,7 +940,7 @@ def run_forensic(args: argparse.Namespace) -> None:
         val_batches.append(next(val_loader_xtable)[:, :-1])
 
     cross_table_real = analyze_cross_table(
-        real_model, primary_table, alt_table, val_batches, layers,
+        real_model, primary_table_real, alt_table_real, val_batches, layers,
     )
     print("\n[real-oracle model]")
     for layer_idx in layers:
@@ -926,7 +951,7 @@ def run_forensic(args: argparse.Namespace) -> None:
         print(f"    random-pair |cos| (orth. floor)   {stats['within_run_random_pair_cos_abs']:.4f}")
 
     cross_table_shuf = analyze_cross_table(
-        shuf_model, primary_table, alt_table, val_batches, layers,
+        shuf_model, primary_table_shuf, alt_table_shuf, val_batches, layers,
     )
     print("\n[shuffled-oracle model]")
     for layer_idx in layers:

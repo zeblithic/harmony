@@ -244,6 +244,8 @@ Both runs enable aux loss. "Primary" means the table used for the residual-contr
 
 ### Cross-table within-run probe
 
+> **HISTORICAL — superseded by PR #251.** The original design below built `alt_table` as `primary_table[perm]` (a row permutation). Under cosine top-k retrieval this selects the same rows, just at different j-labels, so the retrieved content is identical and `|cos|` is always 1.0. The corrected design samples `alt_table` from a random gaussian at matched per-dim mean and std, and probes each model against ITS OWN training table (not args.real_table for both). See the current `forensic_eta_b_capgap.py` `analyze_cross_table` + `_sample_matched_gaussian_alt`.
+
 For a single trained model, forward the same tokens through its engram against TWO different tables — its training primary, and a fresh held-out random shuffle (never seen during training). Compute cos between matched-position injection outputs.
 
 ```python
