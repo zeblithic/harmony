@@ -1284,6 +1284,12 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if val_loader is None and args.synthetic:
+            # --synthetic smoke-test compatibility: build a synthetic val loader
+            # so --zero-injection-eval works without a real corpus (ZEB-130).
+            val_loader = make_synthetic_dataloader(
+                config.vocab_size, seq_len, args.batch_size, args.seed + 1
+            )
         if val_loader is None:
             print("Error: --zero-injection-eval requires --val-data", file=sys.stderr)
             sys.exit(1)

@@ -497,3 +497,150 @@ class TestCapgapTrainingLoopWiring:
             f"No engram_injections params in saved state dict. Got keys: "
             f"{list(out_ckpt['model_state_dict'].keys())[:20]}..."
         )
+
+
+class TestCapgapSmokeIntegration:
+    """End-to-end: init from source checkpoint, train N steps frozen, eval."""
+
+    def test_frozen_backbone_params_unchanged_after_training(self, tmp_path):
+        """After N training steps with --freeze-backbone, backbone weights must be bitwise unchanged."""
+        import copy
+        import os
+        import subprocess
+        import sys
+
+        # Step A: build a source checkpoint with random weights (substitute for β).
+        src_ckpt = tmp_path / "src" / "checkpoint.pt"
+        src_ckpt.parent.mkdir()
+        src_config = HarmonyModelConfig.tiny()
+        torch.manual_seed(42)
+        src_model = HarmonyModel(src_config)
+        torch.save(
+            {
+                "model_state_dict": src_model.state_dict(),
+                "optimizer_state_dict": {},
+                "step": 1000,
+                "rng_state": torch.get_rng_state(),
+                "config": src_config,
+            },
+            src_ckpt,
+        )
+
+        # Snapshot the source state dict for later comparison.
+        src_state = copy.deepcopy(src_model.state_dict())
+
+        # Step B: run train.py with --init-from + --freeze-backbone + capgap preset.
+        training_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out_dir = tmp_path / "run"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--init-from", str(src_ckpt),
+                "--freeze-backbone",
+                "--config", "tiny_engram_xattn_capgap",
+                "--synthetic",
+                "--output-dir", str(out_dir),
+                "--steps", "3",
+                "--batch-size", "2",
+                "--seq-len", "32",
+                "--checkpoint-interval", "1",
+            ],
+            capture_output=True, text=True, timeout=180,
+            cwd=training_root,
+        )
+        assert result.returncode == 0, (
+            f"train.py failed (exit {result.returncode}):\n"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
+        # Step C: load the output checkpoint and confirm backbone is bit-identical.
+        out_ckpt_path = out_dir / "checkpoint.pt"
+        assert out_ckpt_path.exists(), "checkpoint.pt not written after training"
+        out_ckpt = torch.load(out_ckpt_path, map_location="cpu", weights_only=False)
+        out_state = out_ckpt["model_state_dict"]
+        for name, src_tensor in src_state.items():
+            out_tensor = out_state.get(name)
+            assert out_tensor is not None, (
+                f"Source param '{name}' missing from output checkpoint"
+            )
+            assert torch.equal(src_tensor, out_tensor), (
+                f"Backbone param '{name}' changed despite --freeze-backbone"
+            )
+
+        # Step D: confirm engram_injections params DO exist in the output.
+        injection_param_names = [
+            n for n in out_state.keys() if n.startswith("engram_injections")
+        ]
+        assert len(injection_param_names) > 0, (
+            "No engram_injections params saved — check attach wiring"
+        )
+
+    def test_zero_injection_eval_works_on_capgap_checkpoint(self, tmp_path):
+        """After a capgap run, --zero-injection-eval must produce a sensible delta."""
+        import os
+        import subprocess
+        import sys
+
+        src_ckpt = tmp_path / "src" / "checkpoint.pt"
+        src_ckpt.parent.mkdir()
+        src_config = HarmonyModelConfig.tiny()
+        torch.manual_seed(7)
+        src_model = HarmonyModel(src_config)
+        torch.save(
+            {
+                "model_state_dict": src_model.state_dict(),
+                "optimizer_state_dict": {},
+                "step": 100,
+                "rng_state": torch.get_rng_state(),
+                "config": src_config,
+            },
+            src_ckpt,
+        )
+        training_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        run_dir = tmp_path / "run"
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--init-from", str(src_ckpt),
+                "--freeze-backbone",
+                "--config", "tiny_engram_xattn_capgap",
+                "--synthetic",
+                "--output-dir", str(run_dir),
+                "--steps", "5",
+                "--batch-size", "2",
+                "--seq-len", "32",
+                "--checkpoint-interval", "1",
+            ],
+            capture_output=True, text=True, timeout=180,
+            cwd=training_root,
+        )
+        assert r.returncode == 0, (
+            f"train failed (exit {r.returncode}):\n"
+            f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+        )
+
+        eval_dir = tmp_path / "eval"
+        r2 = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--resume-from", str(run_dir / "checkpoint.pt"),
+                "--zero-injection-eval",
+                "--config", "tiny_engram_xattn_capgap",
+                "--synthetic",
+                "--output-dir", str(eval_dir),
+                "--batch-size", "2",
+                "--seq-len", "32",
+            ],
+            capture_output=True, text=True, timeout=180,
+            cwd=training_root,
+        )
+        assert r2.returncode == 0, (
+            f"eval failed (exit {r2.returncode}):\n"
+            f"STDOUT:\n{r2.stdout}\nSTDERR:\n{r2.stderr}"
+        )
+        # Must report val_loss with/without and a delta.
+        combined = r2.stdout.lower() + r2.stderr.lower()
+        assert "delta" in combined, (
+            f"--zero-injection-eval did not report delta:\n"
+            f"STDOUT:\n{r2.stdout}\nSTDERR:\n{r2.stderr}"
+        )
