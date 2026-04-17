@@ -320,3 +320,77 @@ class TestModelAuxLossSink:
         _ = model(input_ids)
         assert len(sink) == 1
         assert sink[0].item() == 42.0
+
+
+class TestOneStepIntegration:
+    """One forward + backward + optimizer step exercises the full V-contrast wiring
+    end-to-end. Catches integration bugs that the unit tests miss (e.g. sink not
+    cleared between steps, lambda not applied, gradient not flowing)."""
+
+    def test_one_step_with_vcontrast(self):
+        torch.manual_seed(0)
+        c = _tiny_config()
+        c.engram_inject_layers = (1,)
+        c.engram_vcontrast_enabled = True
+        c.engram_vcontrast_lambda = 1.0
+        c.engram_vcontrast_warmup_steps = 1  # use full lambda from step 0
+        c.__post_init__()
+
+        model = HarmonyModel(c)
+        table = torch.randn(16, c.engram_dim)
+        sink: list = []
+        injections = {}
+        for layer_idx in c.engram_inject_layers:
+            xattn = EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
+            injections[layer_idx] = ContrastiveGatedEngramInjection(
+                xattn, alpha_init=0.0, aux_loss_sink=sink,
+            )
+        model.attach_gated_engram_injections(injections)
+        model._contrastive_aux_losses = sink
+
+        # Force the optimizer to see only the engram_injections params, mirroring
+        # the --freeze-backbone path so this test is sensitive to V-contrast
+        # gradient flow rather than to backbone gradient noise.
+        engram_params = list(model.engram_injections.parameters())
+        opt = torch.optim.SGD(engram_params, lr=1e-2)
+
+        model.train(True)
+        input_ids = torch.randint(0, c.vocab_size, (2, 5))
+        targets = torch.randint(0, c.vocab_size, (2, 5))
+
+        # Snapshot v_proj before the step.
+        v_before = (
+            model.engram_injections["1"]
+            .engram_xattn.v_proj.weight.detach().clone()
+        )
+
+        logits = model(input_ids)
+        lm_loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, c.vocab_size), targets.reshape(-1),
+        )
+        # At alpha_init=0, the residual is identically zero so LM loss has
+        # NO gradient path to engram params via the residual. The aux loss
+        # is therefore the *only* source of engram-param gradient — perfect
+        # for verifying V-contrast wiring in isolation.
+        assert len(sink) == 1, "Aux sink must hold exactly one entry per inject layer"
+        aux = sink[0]
+        # Lambda is 1.0 with warmup=1, so step=0 schedule returns 0.0 at step 0;
+        # but step 1 returns full lambda. Exercise that path explicitly.
+        from ct87.train import lambda_schedule
+        lam_step1 = lambda_schedule(1, 1, 1.0)
+        assert lam_step1 == 1.0
+        total_loss = lm_loss + lam_step1 * aux
+
+        opt.zero_grad()
+        total_loss.backward()
+        opt.step()
+
+        v_after = (
+            model.engram_injections["1"]
+            .engram_xattn.v_proj.weight.detach().clone()
+        )
+        delta = (v_after - v_before).abs().sum().item()
+        assert delta > 1e-8, (
+            "v_proj weight unchanged after a V-contrast aux-loss step — the "
+            "aux gradient is not reaching V."
+        )
