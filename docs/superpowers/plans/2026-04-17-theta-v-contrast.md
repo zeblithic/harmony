@@ -620,9 +620,11 @@ class ContrastiveGatedEngramInjection(GatedEngramInjection):
     it — the gate's role is firing rate, the aux loss's role is
     response-shape. They must remain independent.
 
-    Cheap permutation: ``F.normalize`` is row-permute-equivariant, so we
-    use the cached ``self.engram_xattn.table_normalized`` indexed by the
-    fresh ``perm`` instead of re-normalizing per step.
+    Value-only shuffle: we keep the real branch's top-k indices and substitute
+    content from a permuted table at those same positions. A full key+value
+    permutation would be a semantic no-op: top-k selection is permutation-
+    equivariant, so the same logical rows win and retrieved_shuf ≡ retrieved_real,
+    yielding zero contrastive signal.
     """
 
     def __init__(
@@ -647,21 +649,26 @@ class ContrastiveGatedEngramInjection(GatedEngramInjection):
         inj_real = xattn._attention_block(hidden_state, retrieved_real, topk_sims_real)
 
         if self.training and self._aux_sink is not None:
-            # Per-step random row-permutation of the primary table.
-            # Both `table` and `table_normalized` are non-persistent buffers
-            # on `xattn`; we re-index rather than re-normalize because
-            # F.normalize is row-permute-equivariant.
+            # Per-step random row-permutation of the primary table (value
+            # shuffle). We keep the retrieval *keys* fixed (same top-k indices
+            # as the real branch) but supply content from a permuted table so
+            # the shuffled branch sees genuinely different rows at those
+            # positions. A full key+value permutation would be a semantic no-op:
+            # top-k selection is permutation-equivariant, so the same logical
+            # rows would win and the injections would be identical.
             N = xattn.table.shape[0]
             perm = torch.randperm(N, device=xattn.table.device)
             table_shuf = xattn.table[perm]
-            table_shuf_normalized = xattn.table_normalized[perm]
 
+            # Re-derive the top-k index tensor (not exposed by retrieve_topk)
+            # using the already-computed retrieval projection. One q-proj
+            # forward + einsum + topk — no _attention_block overhead.
             q = xattn.retrieval_query_proj(hidden_state)
             q_norm = F.normalize(q, dim=-1, eps=1e-8)
-            sims_shuf = torch.einsum("ble,te->blt", q_norm, table_shuf_normalized)
-            topk_sims_shuf, topk_idx_shuf = sims_shuf.topk(xattn.k_retrieved, dim=-1)
-            retrieved_shuf = table_shuf[topk_idx_shuf]
-            inj_shuf = xattn._attention_block(hidden_state, retrieved_shuf, topk_sims_shuf)
+            sims_real = torch.einsum("ble,te->blt", q_norm, xattn.table_normalized)
+            topk_sims_real2, topk_idx_real = sims_real.topk(xattn.k_retrieved, dim=-1)
+            retrieved_shuf = table_shuf[topk_idx_real]
+            inj_shuf = xattn._attention_block(hidden_state, retrieved_shuf, topk_sims_real2)
 
             # Mean-squared cosine across [B, L]. Smooth, bounded [0, 1],
             # natural attractor at cos=0. Avoids the anti-alignment

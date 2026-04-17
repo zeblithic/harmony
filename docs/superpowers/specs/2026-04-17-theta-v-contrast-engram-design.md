@@ -38,13 +38,28 @@ Because both branches share parameters, any V that learns content-sensitivity on
 retrieved_real, topk_sims_real = retrieve_topk(h, table_real, table_real_normalized)
 inj_real = xattn_pipeline(h, retrieved_real, topk_sims_real)   # [B, L, hidden_dim]
 
-# Shuffled branch (training only, aux-loss only):
+# Shuffled branch (training only, aux-loss only).
+# Value-only shuffle: we keep the real branch's top-k *indices* and substitute
+# content from a permuted table at those same positions. A full key+value
+# permutation would be a semantic no-op — top-k selection is permutation-
+# equivariant, so the same logical rows win and retrieved_shuf ≡ retrieved_real,
+# yielding zero contrastive signal.
 if self.training:
     perm = torch.randperm(N, device=table_real.device)
-    table_shuf = table_real[perm]
-    table_shuf_normalized = table_real_normalized[perm]    # normalize is row-permute-equivariant
-    retrieved_shuf, topk_sims_shuf = retrieve_topk(h, table_shuf, table_shuf_normalized)
-    inj_shuf = xattn_pipeline(h, retrieved_shuf, topk_sims_shuf)
+    table_shuf = table_real[perm]                          # [N, engram_dim]
+    # Re-derive top-k indices on the REAL table (retrieve_topk does not
+    # expose them). This uses the already-trained retrieval_query_proj so
+    # gradient still flows into it via the shuf branch's attention-bias.
+    q = retrieval_query_proj(h)
+    q_norm = F.normalize(q, dim=-1, eps=1e-8)
+    sims_real = torch.einsum("ble,te->blt", q_norm, table_real_normalized)
+    topk_sims_real, topk_idx_real = sims_real.topk(k_retrieved, dim=-1)
+    # Substitute shuffled-table content at the same retrieval positions.
+    # `topk_sims_real` is passed as the retrieval bias so attention scoring
+    # sees the same "rank" signal as the real branch — isolating V/K as the
+    # projections whose content-sensitivity is being pressured.
+    retrieved_shuf = table_shuf[topk_idx_real]
+    inj_shuf = xattn_pipeline(h, retrieved_shuf, topk_sims_real)
 
     cos = F.cosine_similarity(inj_real, inj_shuf, dim=-1)   # [B, L]
     aux_loss_this_layer = (cos ** 2).mean()
@@ -61,7 +76,7 @@ return gate * inj_real
 
 **Loss shape: mean squared cosine.** Per-position `cos(inj_real, inj_shuf)²`, averaged over `[B, L]`. Smooth everywhere, natural attractor at `cos=0`, bounded `[0, 1]`. Avoids the anti-alignment pathology of signed cosine minimization (where V could converge to `V(shuf) = -V(real)`, still fixed).
 
-**Shuffle strategy: per-step re-permutation of the primary table.** Fresh `torch.randperm(N)` each forward prevents V from learning features specific to one fixed shuffle. Implementation is ~free: normalize-equivariance under row permutation lets us cache `F.normalize(table_real)` once and index with `perm`, avoiding per-step re-normalization.
+**Shuffle strategy: per-step value-only permutation of the primary table.** Fresh `torch.randperm(N)` each forward prevents V from learning features specific to one fixed shuffle. Value-only means we keep the real branch's top-k indices (`topk_idx_real`) and substitute content at those positions from a permuted table (`table_shuf = table_real[perm]`, `retrieved_shuf = table_shuf[topk_idx_real] = table_real[perm[topk_idx_real]]`). This delivers genuinely different content at the same retrieval positions. A full key+value permutation would be a semantic no-op: top-k selection is permutation-equivariant, so the same logical rows win regardless of row ordering, and `retrieved_shuf ≡ retrieved_real`, yielding zero contrastive signal. Runtime cost: one extra `retrieval_query_proj` + einsum + topk per layer (the primary `retrieve_topk` does not expose its `topk_idx`, so the shuf branch re-derives them).
 
 **Training protocol: capgap with frozen backbone.** Mirrors η-B exactly: load β-baseline weights, freeze backbone, train only engram params. Clean isolation — any content-sensitivity gained is attributable to aux pressure on the engram module, not backbone co-adaptation. If θ-V-contrast succeeds at capgap, end-to-end (ζ-style) extension is a follow-up experiment.
 
