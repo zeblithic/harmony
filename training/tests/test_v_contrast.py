@@ -55,3 +55,20 @@ class TestVContrastConfig:
         c.engram_vcontrast_enabled = True  # but engram_inject_layers stays empty
         with pytest.raises(ValueError, match="engram_inject_layers"):
             c.__post_init__()
+
+
+class TestVContrastPreset:
+
+    def test_preset_extends_capgap(self):
+        c = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast()
+        # capgap-inherited fields:
+        assert c.engram_inject_layers == (2, 5)
+        assert c.engram_gate_init == 0.0
+        # V-contrast-specific fields:
+        assert c.engram_vcontrast_enabled is True
+        assert c.engram_vcontrast_lambda == 1.0
+        assert c.engram_vcontrast_warmup_steps == 200
+
+    def test_preset_passes_post_init(self):
+        # Re-validates after __post_init__ runs (preset calls it explicitly).
+        HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast()

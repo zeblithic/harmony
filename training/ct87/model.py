@@ -348,6 +348,25 @@ class HarmonyModelConfig:
         base.__post_init__()  # re-validate after mutation (matches tiny_ffn_expanded pattern)
         return base
 
+    @staticmethod
+    def tiny_engram_xattn_capgap_vcontrast() -> HarmonyModelConfig:
+        """θ-V-contrast: η-B capgap + V-contrastive auxiliary loss (ZEB-130).
+
+        Extends `tiny_engram_xattn_capgap` with a per-step shuffled-table
+        contrastive auxiliary loss on the post-o_proj pre-gate outputs of
+        every injection layer. Used to address the (D*) DISTRIBUTIONAL
+        ALIGNMENT verdict from the 2026-04-17 (W)/(A) forensic — V's
+        per-token output directions are diverse within a run but align
+        across runs despite different retrievals; the aux loss pressures
+        V toward content-sensitivity.
+        """
+        base = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        base.engram_vcontrast_enabled = True
+        base.engram_vcontrast_lambda = 1.0
+        base.engram_vcontrast_warmup_steps = 200
+        base.__post_init__()  # re-validate after mutation
+        return base
+
 
 # ---------------------------------------------------------------------------
 # Layer building blocks
