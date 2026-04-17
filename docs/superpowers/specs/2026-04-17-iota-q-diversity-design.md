@@ -197,6 +197,12 @@ class GatedEngramInjection(nn.Module):
         self._shuffle_generator = shuffle_generator
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Returns the injection tensor ``gate * inj_real``, NOT the
+        residual-added hidden state. HarmonyModel.forward handles the
+        residual add via ``h = h + engram_inject_mult * wrapper(h)``, so
+        the global ``engram_inject_mult`` (used by ``--zero-injection-eval``)
+        zeroes out the injection regardless of gate state.
+        """
         xattn = self.engram_xattn
         need_vcontrast = self.training and self._vcontrast_sink is not None
         need_qdiv = self.training and self._qdiv_sink is not None
@@ -238,7 +244,11 @@ class GatedEngramInjection(nn.Module):
             cos = F.cosine_similarity(inj_real, inj_shuf, dim=-1)
             self._vcontrast_sink.append((cos ** 2).mean())
 
-        return hidden_state + torch.tanh(self.alpha) * inj_real
+        # Cast the gate to inj_real's dtype (bf16 under autocast) so the
+        # returned residual stays in low precision and doesn't defeat AMP
+        # for the rest of the injected layer.
+        gate = torch.tanh(self.alpha).to(dtype=inj_real.dtype)
+        return gate * inj_real
 ```
 
 ### 3c. Delete `ContrastiveGatedEngramInjection`
@@ -369,27 +379,25 @@ class HarmonyModelConfig:
 
 ### 5b. `__post_init__` validation
 
+`HarmonyModelConfig` does not have a single `engram_xattn_enabled` field; the cross-attention path is active when `engram_inject_layers` is non-empty. Validation gates Q-div on that signal (matches the `engram_vcontrast_enabled` validator pattern):
+
 ```python
-if self.engram_qdiv_enabled and not self.engram_xattn_enabled:
-    raise ValueError(
-        "engram_qdiv_enabled requires engram_xattn_enabled=True; "
-        "Q-div operates on retrieval softmax which only exists in the "
-        "cross-attention engram path."
-    )
-if self.engram_qdiv_enabled and not self.engram_inject_layers:
-    raise ValueError(
-        "engram_qdiv_enabled requires at least one injection layer; "
-        "configure engram_inject_layers before enabling Q-div."
-    )
-if self.engram_qdiv_lambda < 0:
-    raise ValueError(
-        f"engram_qdiv_lambda must be ≥ 0, got {self.engram_qdiv_lambda}"
-    )
-if self.engram_qdiv_warmup_steps < 0:
-    raise ValueError(
-        f"engram_qdiv_warmup_steps must be ≥ 0, got "
-        f"{self.engram_qdiv_warmup_steps}"
-    )
+if self.engram_qdiv_enabled:
+    if not self.engram_inject_layers:
+        raise ValueError(
+            "engram_qdiv_enabled requires engram_inject_layers to be "
+            "non-empty; Q-div operates on retrieval softmax which only "
+            "exists in the cross-attention engram path."
+        )
+    if self.engram_qdiv_lambda < 0:
+        raise ValueError(
+            f"engram_qdiv_lambda must be >= 0, got {self.engram_qdiv_lambda}"
+        )
+    if self.engram_qdiv_warmup_steps < 0:
+        raise ValueError(
+            f"engram_qdiv_warmup_steps must be >= 0, got "
+            f"{self.engram_qdiv_warmup_steps}"
+        )
 ```
 
 ### 5c. Two new presets

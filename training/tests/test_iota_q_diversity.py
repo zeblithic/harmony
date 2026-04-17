@@ -367,6 +367,26 @@ class TestCliFlagPresetConsistency:
         combined = (result.stderr + result.stdout).lower()
         assert "engram-qdiv" in combined or "engram_qdiv" in combined
 
+    @pytest.mark.parametrize("bad_value", ["nan", "inf", "-inf"])
+    def test_qdiv_lambda_non_finite_rejected(self, bad_value):
+        """NaN/Inf slip past the `< 0` check in __post_init__ because NaN
+        comparisons always return False. train.py must reject them before
+        config mutation so a bad CLI value can't silently corrupt the loss.
+        """
+        result = _run_train_py([
+            "--config", "tiny_engram_xattn_capgap_qdiv",
+            "--engram-qdiv",
+            "--engram-qdiv-lambda", bad_value,
+            "--steps", "0",
+            "--synthetic",
+        ])
+        assert result.returncode != 0, (
+            f"--engram-qdiv-lambda={bad_value} should be rejected; "
+            f"got returncode={result.returncode}"
+        )
+        combined = (result.stderr + result.stdout).lower()
+        assert "finite" in combined or "engram-qdiv-lambda" in combined
+
 
 class TestQdivTrainingStep:
     """Mid-training behavior: sinks drain per step, lambda warmup applies,
@@ -424,7 +444,7 @@ class TestCsvQdivColumns:
     pattern for V-contrast columns)."""
 
     def test_qdiv_cols_present_when_enabled(self, tmp_path):
-        # Use ι_1 preset; it has engram_qdiv_enabled=True.
+        # Use iota-1 preset; it has engram_qdiv_enabled=True.
         log_file = tmp_path / "train.csv"
         output_dir = tmp_path / "output"
         result = subprocess.run(
@@ -444,10 +464,14 @@ class TestCsvQdivColumns:
             cwd=Path(__file__).parent.parent,
             env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)},
         )
-        assert result.returncode == 0, (
-            f"train.py exited {result.returncode}\n"
-            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
-        )
+        # Project requires Python 3.10+ (pyproject.toml). Only on that path do
+        # we assert end-to-end success; on 3.9 we accept the known
+        # zip(strict=True) mid-run crash and verify only header schema.
+        if sys.version_info >= (3, 10):
+            assert result.returncode == 0, (
+                f"train.py exited {result.returncode}\n"
+                f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+            )
         assert log_file.exists(), (
             f"No CSV produced; stderr={result.stderr!r}, stdout={result.stdout[-2000:]!r}"
         )
@@ -494,27 +518,35 @@ class TestSinkLayerOrder:
     """Regression test: sinks receive per-layer aux losses in ascending
     layer order regardless of engram_inject_layers declaration order.
     HarmonyModel.forward iterates i in range(num_layers), so the sink
-    append order is forward-order, not declaration-order."""
+    append order is forward-order, not declaration-order. train.py
+    relies on this to zip(sorted_layers, sink, strict=True) for per-
+    layer CSV attribution — if append order ever regresses (e.g. to
+    declaration order), that zip mis-attributes."""
 
     def test_sinks_receive_ascending_layer_order_qdiv(self):
         from ct87.engram import EngramCrossAttention, GatedEngramInjection
         from ct87.model import HarmonyModel, HarmonyModelConfig
 
         def build_and_run(inject_layers):
-            # Build model and injections fresh per call; use same seed for
-            # model init but accept that different xattn modules will produce
-            # different numerical values. The key invariant is that sinks
-            # receive aux losses in forward-iteration order (ascending layer index).
+            # Per-layer seed: layer 1's module weights are identical across
+            # both (1,2) and (2,1) declaration orders, ditto for layer 2.
+            # That makes the per-layer loss VALUES directly comparable, so
+            # the final assertion can catch append-order regressions (which
+            # would shuffle values) rather than structural breakage (which
+            # the old enumerate-based assertion would catch but cared less
+            # about — the failure mode the zip(strict=True) in train.py
+            # actually cares about is value mis-ordering).
             torch.manual_seed(0)
             c = HarmonyModelConfig.tiny_engram_xattn_capgap()
             c.engram_inject_layers = inject_layers
             c.engram_qdiv_enabled = True
             c.__post_init__()
             model = HarmonyModel(c)
+            torch.manual_seed(12345)
             table = torch.randn(100, c.engram_dim)
             injections = {}
-            # Build injections in the order specified (may not match layer order).
-            for layer_idx in c.engram_inject_layers:
+            for layer_idx in inject_layers:
+                torch.manual_seed(1000 + layer_idx)
                 xattn = EngramCrossAttention(
                     c, table, num_heads=4, k_retrieved=4,
                 )
@@ -525,26 +557,29 @@ class TestSinkLayerOrder:
                 )
             model.attach_gated_engram_injections(injections)
             model.train()
+            torch.manual_seed(99)
             input_ids = torch.randint(0, c.vocab_size, (1, 8))
             model._qdiv_aux_losses.clear()
             _ = model(input_ids)
-            # Return list of (layer_index, loss_value) tuples by tracking
-            # which injection fires in which order.
-            return list(enumerate([t.item() for t in model._qdiv_aux_losses]))
+            return [t.item() for t in model._qdiv_aux_losses]
 
-        # Both declarations should yield len==2, with indices [0, 1] (ascending).
-        # The values will differ, but the structure is deterministic: the first
-        # element is from layer 1, the second from layer 2, regardless of order.
         ascending = build_and_run((1, 2))
         out_of_order = build_and_run((2, 1))
 
-        # Both should have 2 sinks in order [0, 1].
         assert len(ascending) == 2
         assert len(out_of_order) == 2
-        assert ascending[0][0] == 0  # First sink at index 0
-        assert ascending[1][0] == 1  # Second sink at index 1
-        assert out_of_order[0][0] == 0
-        assert out_of_order[1][0] == 1
+        # Exact equality: per-layer seeding gives identical xattn weights for
+        # each layer regardless of declaration order, so if the sink receives
+        # losses in consistent ascending-layer-index order, the two lists are
+        # bit-identical. If append order ever regressed to declaration order,
+        # out_of_order would become [layer-2-loss, layer-1-loss] — detectable.
+        assert ascending == out_of_order, (
+            f"Sink append order regressed: declaration (1,2) yielded "
+            f"{ascending}, (2,1) yielded {out_of_order}. They must match "
+            f"because HarmonyModel.forward iterates layers in ascending "
+            f"index order. train.py's zip(sorted_layers, sink, strict=True) "
+            f"assumes this invariant."
+        )
 
 
 class TestOneStepSmokes:
@@ -565,27 +600,39 @@ class TestOneStepSmokes:
             "--log-file", str(log_file),
             "--output-dir", str(output_dir),
         ])
-        # Train.py should create the CSV header and at least one row, or fail
-        # before creating it. If it fails after header creation (e.g. Python
-        # 3.9's zip(strict=True) issue), we still verify the schema was correct.
+
+        # Project requires Python 3.10+ (see pyproject.toml). On 3.10+, the
+        # one-step run MUST succeed end-to-end; no tolerance for silent
+        # crashes that leave an empty CSV. Only Python 3.9 local dev gets
+        # the relaxed path because train.py uses zip(strict=True).
+        py_is_310_plus = sys.version_info >= (3, 10)
+        if py_is_310_plus:
+            assert result.returncode == 0, (
+                f"train.py exited {result.returncode} on a supported Python "
+                f"version.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+            )
+
         assert log_file.exists(), (
             f"Expected a CSV file at {log_file}; stderr={result.stderr!r}"
         )
         with open(log_file) as fh:
-            reader = csv.DictReader(fh)
-            fieldnames = reader.fieldnames
+            fieldnames = csv.DictReader(fh).fieldnames
         assert fieldnames is not None
         assert "qdiv_aux_loss" in fieldnames
         assert "qdiv_lambda" in fieldnames
-        # On Python 3.10+, there should be at least one data row;
-        # on Python 3.9, a zip(strict=True) error may prevent rows from being
-        # written (this is a known pre-existing limitation, not a bug in the test).
+
         with open(log_file) as fh:
             rows = list(csv.DictReader(fh))
-        if len(rows) >= 1:
-            first_row = rows[0]
-            qdiv_val = float(first_row["qdiv_aux_loss"])
-            assert qdiv_val >= 0.0  # MoE loss is non-negative
+        if py_is_310_plus:
+            assert len(rows) >= 1, (
+                "Expected at least one data row; train.py ran but wrote no "
+                "data."
+            )
+            qdiv_val = float(rows[0]["qdiv_aux_loss"])
+            assert qdiv_val >= 0.0
+        elif rows:
+            qdiv_val = float(rows[0]["qdiv_aux_loss"])
+            assert qdiv_val >= 0.0
 
     def test_iota_2_one_step_completes(self, tmp_path):
         log_file = tmp_path / "train.csv"
@@ -601,24 +648,36 @@ class TestOneStepSmokes:
             "--log-file", str(log_file),
             "--output-dir", str(output_dir),
         ])
+
+        py_is_310_plus = sys.version_info >= (3, 10)
+        if py_is_310_plus:
+            assert result.returncode == 0, (
+                f"train.py exited {result.returncode} on a supported Python "
+                f"version.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+            )
+
         assert log_file.exists(), (
             f"Expected a CSV file at {log_file}; stderr={result.stderr!r}"
         )
         with open(log_file) as fh:
-            reader = csv.DictReader(fh)
-            fieldnames = reader.fieldnames
+            fieldnames = csv.DictReader(fh).fieldnames
         assert fieldnames is not None
-        # Both aux types should be in the header.
         assert "vcontrast_aux_loss" in fieldnames
         assert "qdiv_aux_loss" in fieldnames
-        # On Python 3.10+, there should be at least one data row;
-        # on Python 3.9, a zip(strict=True) error may prevent rows from being
-        # written (this is a known pre-existing limitation, not a bug in the test).
+
         with open(log_file) as fh:
             rows = list(csv.DictReader(fh))
-        if len(rows) >= 1:
-            first_row = rows[0]
-            vcontrast_val = float(first_row["vcontrast_aux_loss"])
-            qdiv_val = float(first_row["qdiv_aux_loss"])
+        if py_is_310_plus:
+            assert len(rows) >= 1, (
+                "Expected at least one data row; train.py ran but wrote no "
+                "data."
+            )
+            vcontrast_val = float(rows[0]["vcontrast_aux_loss"])
+            qdiv_val = float(rows[0]["qdiv_aux_loss"])
+            assert 0.0 <= vcontrast_val <= 10.0
+            assert qdiv_val >= 0.0
+        elif rows:
+            vcontrast_val = float(rows[0]["vcontrast_aux_loss"])
+            qdiv_val = float(rows[0]["qdiv_aux_loss"])
             assert 0.0 <= vcontrast_val <= 10.0
             assert qdiv_val >= 0.0

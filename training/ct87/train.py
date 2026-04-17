@@ -343,7 +343,7 @@ def detect_device(requested: str | None) -> torch.device:
 def lambda_schedule(step: int, warmup_steps: int, target: float) -> float:
     """Linear warmup from 0 to `target` over `warmup_steps` steps; constant `target` after.
 
-    θ-V-contrast / ι-Q-diversity aux-loss schedule (ZEB-130). When `warmup_steps` is 0
+    theta-V-contrast / iota-Q-diversity aux-loss schedule (ZEB-130). When `warmup_steps` is 0
     (or negative), the linear ramp is skipped and `target` is returned for all steps.
     """
     if warmup_steps <= 0:
@@ -582,7 +582,7 @@ def main() -> None:
             "the seed is for reproducibility debugging only)."
         ),
     )
-    # ---- ZEB-130: ι-Q-diversity ----
+    # ---- ZEB-130: iota-Q-diversity ----
     parser.add_argument(
         "--engram-qdiv",
         action="store_true",
@@ -919,7 +919,7 @@ def main() -> None:
         # tiny_engram_xattn_capgap pattern.
         config.__post_init__()
 
-    # ι-Q-diversity (ZEB-130): --engram-qdiv must exactly match the preset's
+    # iota-Q-diversity (ZEB-130): --engram-qdiv must exactly match the preset's
     # engram_qdiv_enabled. Same reasoning as V-contrast: preset mutation via
     # flag makes CSV logs ambiguous.
     if args.engram_qdiv != config.engram_qdiv_enabled:
@@ -941,13 +941,22 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Apply overrides after validation
+    # Apply overrides after validation. The < 0 check in __post_init__ misses
+    # NaN/Inf (NaN comparisons always return False), so validate finite-ness
+    # explicitly before mutating config — NaN leaking into the loss would
+    # silently corrupt every subsequent training step.
     if args.engram_qdiv_lambda is not None:
+        if not math.isfinite(args.engram_qdiv_lambda):
+            print(
+                "Error: --engram-qdiv-lambda must be finite, got "
+                f"{args.engram_qdiv_lambda!r}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         config.engram_qdiv_lambda = args.engram_qdiv_lambda
     if args.engram_qdiv_warmup_steps is not None:
         config.engram_qdiv_warmup_steps = args.engram_qdiv_warmup_steps
     if config.engram_qdiv_enabled:
-        # Re-run validation after CLI mutation, mirroring V-contrast pattern.
         config.__post_init__()
 
     # Model gamma arg validation (ZEB-117)
@@ -1257,17 +1266,28 @@ def main() -> None:
         # Ensure newly-attached submodules are on the correct device (model was
         # already moved to device before this block).
         model.engram_injections.to(device)
-        print(
-            f"[capgap] Attached GatedEngramInjection"
-            f"{'(+vcontrast)' if config.engram_vcontrast_enabled else ''}"
+        aux_tags = []
+        if config.engram_vcontrast_enabled:
+            aux_tags.append("+vcontrast")
+        if config.engram_qdiv_enabled:
+            aux_tags.append("+qdiv")
+        aux_suffix = f"({','.join(aux_tags)})" if aux_tags else ""
+        setup_parts = [
+            f"[capgap] Attached GatedEngramInjection{aux_suffix}"
             f" at layers {list(config.engram_inject_layers)} with alpha_init="
             f"{config.engram_gate_init}"
-            + (
+        ]
+        if config.engram_vcontrast_enabled:
+            setup_parts.append(
                 f"; vcontrast lambda={config.engram_vcontrast_lambda} "
                 f"warmup={config.engram_vcontrast_warmup_steps}"
-                if config.engram_vcontrast_enabled else ""
             )
-        )
+        if config.engram_qdiv_enabled:
+            setup_parts.append(
+                f"; qdiv lambda={config.engram_qdiv_lambda} "
+                f"warmup={config.engram_qdiv_warmup_steps}"
+            )
+        print("".join(setup_parts))
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
@@ -1659,7 +1679,7 @@ def main() -> None:
                 *(f"vcontrast_aux_L{i}" for i in sorted(config.engram_inject_layers or ())),
                 "vcontrast_lambda",
             ]
-        # ι-Q-diversity (ZEB-130): conditional CSV columns, mirroring the
+        # iota-Q-diversity (ZEB-130): conditional CSV columns, mirroring the
         # V-contrast pattern above. Only emitted when qdiv is enabled.
         qdiv_cols: list[str] = []
         if config.engram_qdiv_enabled:
@@ -1790,7 +1810,7 @@ def main() -> None:
             # as a scalar (no grad), per-layer values are retained for CSV.
             accum_vcontrast_aux = 0.0
             accum_vcontrast_per_layer: dict[str, float] = {}
-            # ι-Q-diversity (ZEB-130): parallel aux-loss accumulators.
+            # iota-Q-diversity (ZEB-130): parallel aux-loss accumulators.
             accum_qdiv_aux = 0.0
             accum_qdiv_per_layer: dict[str, float] = {}
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
@@ -2061,7 +2081,7 @@ def main() -> None:
                                 + layer_loss.detach().item()
                             )
 
-                    # ι-Q-diversity (ZEB-130): drain Q-div aux loss sink,
+                    # iota-Q-diversity (ZEB-130): drain Q-div aux loss sink,
                     # apply lambda warmup, add to total loss before backward.
                     # Accumulators (accum_qdiv_aux, accum_qdiv_per_layer) are
                     # populated here so the CSV / console blocks below can read
@@ -2219,8 +2239,12 @@ def main() -> None:
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
                     f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}{vcontrast_str}{capgap_str}"
                 )
-                # ι-Q-diversity (ZEB-130): separate console line for qdiv aux.
-                if config.engram_qdiv_enabled and accum_qdiv_aux > 0.0:
+                # iota-Q-diversity (ZEB-130): separate console line for qdiv
+                # aux. Print unconditionally when qdiv is enabled — suppressing
+                # the line when accum_qdiv_aux == 0.0 hides both (a) warmup
+                # steps where lambda is still 0 and (b) regressions where the
+                # sink failed to populate. Both are signals we want visible.
+                if config.engram_qdiv_enabled:
                     raw_qdiv_aux = accum_qdiv_aux / args.grad_accum_steps
                     raw_qdiv_lam = lambda_schedule(
                         step,
@@ -2232,7 +2256,7 @@ def main() -> None:
                         if lk in accum_qdiv_per_layer:
                             v = accum_qdiv_per_layer[lk] / args.grad_accum_steps
                             qdiv_parts.append(f"aux_L{lk}={v:.4f}")
-                    qdiv_parts.append(f"λ={raw_qdiv_lam:.3f}")
+                    qdiv_parts.append(f"lambda={raw_qdiv_lam:.3f}")
                     print("  [qdiv] " + "  ".join(qdiv_parts))
 
             val_loss_str = ""
@@ -2340,7 +2364,7 @@ def main() -> None:
                         config.engram_vcontrast_lambda,
                     )
                     vcontrast_row_cells.append(f"{current_lam:.6f}")
-                # ι-Q-diversity (ZEB-130): emit aux + per-layer + lambda only
+                # iota-Q-diversity (ZEB-130): emit aux + per-layer + lambda only
                 # when enabled, matching `qdiv_cols` order exactly.
                 qdiv_row_cells: list[str] = []
                 if config.engram_qdiv_enabled:
@@ -2437,7 +2461,7 @@ def main() -> None:
                                 f"{math.tanh(alpha_val):+.6f}"
                             )
 
-            # ι-Q-diversity (ZEB-130): final summary block, mirroring V-contrast.
+            # iota-Q-diversity (ZEB-130): final summary block, mirroring V-contrast.
             if config.engram_qdiv_enabled:
                 print(f"[qdiv] Final step={args.steps}")
                 print(
