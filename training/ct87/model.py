@@ -85,6 +85,15 @@ class HarmonyModelConfig:
     engram_vcontrast_enabled: bool = False
     engram_vcontrast_lambda: float = 1.0
     engram_vcontrast_warmup_steps: int = 200
+    # ι-Q-diversity (ZEB-130): MoE load-balancing auxiliary loss on the
+    # retrieval-row marginal distribution. Penalizes imbalance in the softmax
+    # of Q @ K^T across retrieval rows (importance weighting toward uniform
+    # coverage). Only meaningful when engram_inject_layers is non-empty
+    # (Q-div operates on the retrieval softmax which only exists when
+    # engram cross-attention is injected into some layer).
+    engram_qdiv_enabled: bool = False
+    engram_qdiv_lambda: float = 0.01
+    engram_qdiv_warmup_steps: int = 200
 
     def __post_init__(self) -> None:
         """Validate `ffn_dim_overrides` up front so misconfigurations fail fast.
@@ -151,6 +160,23 @@ class HarmonyModelConfig:
                 raise ValueError(
                     "engram_vcontrast_warmup_steps must be >= 0, got "
                     f"{self.engram_vcontrast_warmup_steps!r}"
+                )
+        if self.engram_qdiv_enabled:
+            if not self.engram_inject_layers:
+                raise ValueError(
+                    "engram_qdiv_enabled=True requires "
+                    "engram_inject_layers to be non-empty (Q-div operates "
+                    "on retrieval softmax which only exists in the "
+                    "multi-layer cross-attention engram path)."
+                )
+            if self.engram_qdiv_lambda < 0:
+                raise ValueError(
+                    f"engram_qdiv_lambda must be >= 0, got {self.engram_qdiv_lambda}"
+                )
+            if self.engram_qdiv_warmup_steps < 0:
+                raise ValueError(
+                    f"engram_qdiv_warmup_steps must be >= 0, got "
+                    f"{self.engram_qdiv_warmup_steps}"
                 )
         if self.ffn_dim_overrides is None:
             return
@@ -366,6 +392,32 @@ class HarmonyModelConfig:
         base.engram_vcontrast_warmup_steps = 200
         base.__post_init__()  # re-validate after mutation
         return base
+
+    @staticmethod
+    def tiny_engram_xattn_capgap_qdiv() -> "HarmonyModelConfig":
+        """ι_1: capgap baseline + Q-div aux only (no V-contrast).
+
+        Ablation test: does load-balancing Q's retrieval distribution alone
+        unstick the η-B content-invariance, or is V-side pressure also needed?
+        Spec: docs/superpowers/specs/2026-04-17-iota-q-diversity-design.md
+        """
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        config.engram_qdiv_enabled = True
+        config.__post_init__()
+        return config
+
+    @staticmethod
+    def tiny_engram_xattn_capgap_vcontrast_qdiv() -> "HarmonyModelConfig":
+        """ι_2: capgap + V-contrast + Q-div together.
+
+        Combined shortcut-closure test: does pressuring V toward content-
+        sensitivity AND Q toward diversity jointly content-route at 40M?
+        Spec: docs/superpowers/specs/2026-04-17-iota-q-diversity-design.md
+        """
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast()
+        config.engram_qdiv_enabled = True
+        config.__post_init__()
+        return config
 
 
 # ---------------------------------------------------------------------------
@@ -604,11 +656,19 @@ class HarmonyModel(nn.Module):
         self._last_xattn_output: torch.Tensor | None = None
         self._last_pre_injection_hidden: torch.Tensor | None = None
         # θ-V-contrast (ZEB-130): aux-loss sink populated by
-        # ContrastiveGatedEngramInjection wrappers during the forward pass.
-        # Owned by the training script (which assigns the same list reference
-        # into both this attribute and each wrapper's `_aux_sink`); cleared
-        # at the start of every training-mode forward.
+        # GatedEngramInjection wrappers (when vcontrast_sink is set) during
+        # the forward pass. Owned by the training script (which assigns the
+        # same list reference into both this attribute and each wrapper's
+        # `_vcontrast_sink`); cleared at the start of every training-mode
+        # forward.
         self._contrastive_aux_losses: list[torch.Tensor] | None = None
+        # ι-Q-diversity (ZEB-130): aux-loss sink populated by
+        # GatedEngramInjection wrappers (when qdiv_sink is set) during
+        # the forward pass. Owned by the training script (which assigns the
+        # same list reference into both this attribute and each wrapper's
+        # `_qdiv_sink`); cleared at the start of every training-mode
+        # forward.
+        self._qdiv_aux_losses: list[torch.Tensor] = []
         self.engram_inject_mult: float = 1.0
 
         # Tied embeddings
@@ -816,6 +876,9 @@ class HarmonyModel(nn.Module):
         # being wiped out.
         if self._contrastive_aux_losses is not None and self.training:
             self._contrastive_aux_losses.clear()
+        # ι-Q-diversity aux-loss sink: clear in training mode.
+        if self.training:
+            self._qdiv_aux_losses.clear()
 
         # η-B misuse guard: a multi-layer capgap config without an attach call
         # would silently fall through to the legacy single-point elif below

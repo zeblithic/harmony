@@ -34,6 +34,47 @@ from ct87.model import HarmonyModelConfig, RMSNorm
 CONV_KERNEL_SIZE = 3
 
 
+def compute_qdiv_aux(
+    topk_idx: torch.Tensor,
+    attn: torch.Tensor,
+    table_size: int,
+) -> torch.Tensor:
+    """MoE-style load-balancing auxiliary loss over retrieval row usage.
+
+    Minimized when Q spreads retrieval uniformly over table rows (loss -> 1);
+    maximized under full concentration on a single row (loss -> table_size).
+
+    Only P (soft attention-weighted mass) carries gradient — f (hard top-k
+    selection frequency) is non-differentiable and serves as a frequency
+    weight. Gradient flows through attn into the softmax, then into q_proj,
+    k_proj, and retrieval_query_proj (via the retrieval_bias_weight * topk_sims
+    term that also participates in the pre-softmax scores).
+
+    Args:
+        topk_idx: [B, L, k] int64 — top-k row indices selected per query.
+        attn:     [B, L, H, k] float — softmaxed attention weights per head.
+        table_size: N — full corpus table size.
+
+    Returns:
+        Scalar loss. Under uniform row usage, this equals 1.0. Under full
+        concentration on one row, it equals table_size. Under uniform over
+        S<N rows, it equals table_size/S.
+    """
+    B, L, k = topk_idx.shape
+    H = attn.shape[2]
+
+    f = torch.bincount(
+        topk_idx.reshape(-1), minlength=table_size,
+    ).to(device=attn.device, dtype=attn.dtype) / (B * L * k)
+
+    idx = topk_idx.unsqueeze(2).expand(B, L, H, k).reshape(-1)
+    P = torch.zeros(table_size, device=attn.device, dtype=attn.dtype)
+    P.scatter_add_(0, idx, attn.reshape(-1))
+    P = P / (B * L * H)
+
+    return table_size * (f * P).sum()
+
+
 class EngramGatedResidual(nn.Module):
     """Gated residual injection for Engram embeddings.
 
@@ -1013,7 +1054,8 @@ class EngramCrossAttention(nn.Module):
         hidden_state: torch.Tensor,
         retrieved: torch.Tensor,
         topk_sims: torch.Tensor,
-    ) -> torch.Tensor:
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the post-retrieval attention pipeline on caller-supplied retrievals.
 
         Exposed so V-contrastive variants (θ-V-contrast, ZEB-130) can run
@@ -1027,9 +1069,13 @@ class EngramCrossAttention(nn.Module):
                           (pre-`retrieval_norm`) retrieved rows.
             topk_sims:    [batch, seq_len, k_retrieved] — cosine sims to add
                           as the differentiable retrieval bias.
+            return_attn:  if True, also return the [B, L, H, k] softmax
+                          attention weights (for Q-div load-balancing aux).
 
         Returns:
-            [batch, seq_len, hidden_dim] residual (pre-gate).
+            out:  [batch, seq_len, hidden_dim] residual (pre-gate).
+            attn: [batch, seq_len, H, k] softmax weights (only when
+                  return_attn=True).
         """
         B, L, _ = hidden_state.shape
         H, D, k = self.num_heads, self.head_dim, self.k_retrieved
@@ -1055,7 +1101,11 @@ class EngramCrossAttention(nn.Module):
             gate_weights = torch.sigmoid(self.head_gates).view(1, 1, H, 1)
             out = out * gate_weights
 
-        return self.o_proj(out.reshape(B, L, H * D))
+        out = self.o_proj(out.reshape(B, L, H * D))
+
+        if return_attn:
+            return out, attn
+        return out
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Compute cross-attention residual for the injection layer.
@@ -1110,7 +1160,8 @@ class EngramConsolidationDecoder(nn.Module):
 
 
 class GatedEngramInjection(nn.Module):
-    """Cross-attention engram injection gated by a learnable scalar (η-B / ZEB-130).
+    """Gated engram cross-attention injection with optional training-only
+    auxiliary losses (η-B / ZEB-130).
 
     Wraps an ``EngramCrossAttention`` and applies a learnable scalar ``alpha``
     through ``tanh`` to the xattn output. When ``alpha_init=0`` the gate
@@ -1132,16 +1183,46 @@ class GatedEngramInjection(nn.Module):
     Without that, both ``tanh(alpha_init)`` and ``o_proj`` starting at zero
     creates a gradient dead zone (both partial derivatives vanish) and the
     injection can never learn.
+
+    Two independent aux-loss hooks can be attached via caller-supplied sink
+    lists (each of which the training loop drains once per optimizer step and
+    scales by its own lambda x warmup schedule):
+
+    - vcontrast_sink: V-contrastive aux (PR #250, ZEB-130 theta). On every
+      training forward, runs a second xattn with a per-step random row-
+      permuted value branch; appends (cos(inj_real, inj_shuf) ** 2).mean().
+    - qdiv_sink: Q-div aux (ZEB-130 iota). Captures the softmax attention
+      weights and top-k indices from the main forward and computes the
+      MoE load-balancing loss N * sum_i f[i] * P[i]; appends the scalar.
+
+    When both sinks are provided, both run independently; their losses are
+    summed into the training objective with separate lambdas. Passing None
+    (or any aux sink but calling model.eval()) disables the corresponding
+    aux path entirely (no extra compute beyond the baseline forward).
+
+    shuffle_generator is an optional dedicated RNG for V-contrast's per-step
+    row permutation (reproducibility debugging only); used only when
+    vcontrast_sink is not None.
     """
 
     def __init__(
         self,
         engram_xattn: EngramCrossAttention,
         alpha_init: float = 0.0,
+        *,
+        vcontrast_sink: list[torch.Tensor] | None = None,
+        qdiv_sink: list[torch.Tensor] | None = None,
+        shuffle_generator: torch.Generator | None = None,
     ) -> None:
         super().__init__()
         self.engram_xattn = engram_xattn
         self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+        # Held by reference: the training script owns each list (so it can
+        # clear it between optimizer steps and stack the per-layer scalars)
+        # and the wrappers append to them.
+        self._vcontrast_sink: list[torch.Tensor] | None = vcontrast_sink
+        self._qdiv_sink: list[torch.Tensor] | None = qdiv_sink
+        self._shuffle_generator: torch.Generator | None = shuffle_generator
 
         # Break the dual-zero-init gradient dead zone. EngramCrossAttention
         # zero-inits o_proj.weight as its own anti-collapse mechanism (used by
@@ -1162,78 +1243,33 @@ class GatedEngramInjection(nn.Module):
             nn.init.zeros_(self.engram_xattn.o_proj.bias)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        xattn_out = self.engram_xattn(hidden_state)
-        # Under bf16 autocast, xattn_out is bf16 but self.alpha stays fp32;
-        # a plain multiply would promote the product to fp32 and defeat AMP
-        # for the rest of the injected layer. Cast the gate into xattn_out's
-        # dtype so the residual stays in low precision.
-        gate = torch.tanh(self.alpha).to(dtype=xattn_out.dtype)
-        return gate * xattn_out
-
-
-class ContrastiveGatedEngramInjection(GatedEngramInjection):
-    """V-contrastive engram injection (θ-V-contrast, ZEB-130).
-
-    Subclasses ``GatedEngramInjection`` to add a training-only auxiliary
-    loss path. On every forward in training mode, runs a second xattn
-    pipeline against a per-step random row-permutation of the primary
-    table, then appends ``(cos(inj_real, inj_shuf)**2).mean()`` to the
-    caller-supplied ``aux_loss_sink`` list. The shuffled branch never
-    contributes to the residual — only the parent's primary-branch
-    output is gated and returned.
-
-    The aux loss measures alignment at the post-``o_proj`` pre-gate level,
-    so a shrinking gate (``tanh(alpha) -> 0``) cannot be used to minimize
-    it — the gate's role is firing rate, the aux loss's role is
-    response-shape. They must remain independent.
-
-    Cheap permutation: ``F.normalize`` is row-permute-equivariant, so we
-    use the cached ``self.engram_xattn.table_normalized`` indexed by the
-    fresh ``perm`` instead of re-normalizing per step.
-    """
-
-    def __init__(
-        self,
-        engram_xattn: EngramCrossAttention,
-        alpha_init: float = 0.0,
-        aux_loss_sink: list[torch.Tensor] | None = None,
-        shuffle_generator: torch.Generator | None = None,
-    ) -> None:
-        super().__init__(engram_xattn, alpha_init=alpha_init)
-        # Held by reference: the training script owns the list (so it can
-        # clear it between optimizer steps and stack the per-layer scalars)
-        # and the wrappers append to it. A None sink disables the aux
-        # branch — used so HarmonyModel can construct the contrastive
-        # variant before the sink is wired up if needed.
-        self._aux_sink: list[torch.Tensor] | None = aux_loss_sink
-        # Optional dedicated RNG for the per-step row permutation. When None,
-        # the global PyTorch RNG is used (preferred for production). A seeded
-        # generator is for reproducibility debugging only.
-        self._shuffle_generator: torch.Generator | None = shuffle_generator
-
-    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         xattn = self.engram_xattn
+        need_vcontrast = self.training and self._vcontrast_sink is not None
+        need_qdiv = self.training and self._qdiv_sink is not None
 
-        if self.training and self._aux_sink is not None:
-            # Reuse the real-branch top-k indices for the shuffled branch so
-            # we don't re-run the similarity matmul and top-k gather twice.
+        if need_vcontrast or need_qdiv:
+            # One retrieval covers both aux paths when both are enabled.
             retrieved_real, topk_sims_real, topk_idx_real = xattn.retrieve_topk(
                 hidden_state, return_indices=True,
             )
-            inj_real = xattn._attention_block(hidden_state, retrieved_real, topk_sims_real)
+        else:
+            retrieved_real, topk_sims_real = xattn.retrieve_topk(hidden_state)
 
-            # Per-step random row-permutation of the primary table (value
-            # shuffle). We keep the retrieval *keys* fixed (same top-k indices
-            # as the real branch) but supply content from a permuted table so
-            # the shuffled branch sees genuinely different rows at those
-            # positions. A full key+value permutation would be a semantic no-op:
-            # top-k selection is permutation-equivariant, so the same logical
-            # rows would win and the injections would be identical.
-            #
-            # Index-only shuffle: apply the permutation to the gather indices
-            # (`perm[topk_idx_real]`) instead of materializing a full [N, D]
-            # `table_shuf` and then re-gathering k rows from it. Same result,
-            # O(B·L·k) rather than O(N·D) bandwidth per forward.
+        # Main injection forward — conditionally capture attn weights for Q-div.
+        if need_qdiv:
+            inj_real, attn_weights = xattn._attention_block(
+                hidden_state, retrieved_real, topk_sims_real, return_attn=True,
+            )
+            self._qdiv_sink.append(
+                compute_qdiv_aux(topk_idx_real, attn_weights, xattn.table.shape[0])
+            )
+        else:
+            inj_real = xattn._attention_block(
+                hidden_state, retrieved_real, topk_sims_real,
+            )
+
+        # V-contrast aux — shuffled-value second forward (training only).
+        if need_vcontrast:
             N = xattn.table.shape[0]
             gen = self._shuffle_generator
             if gen is not None:
@@ -1244,17 +1280,20 @@ class ContrastiveGatedEngramInjection(GatedEngramInjection):
                 perm = torch.randperm(N, device=xattn.table.device)
             shuf_idx = perm[topk_idx_real]
             retrieved_shuf = xattn.table[shuf_idx]
-            inj_shuf = xattn._attention_block(hidden_state, retrieved_shuf, topk_sims_real)
-
+            inj_shuf = xattn._attention_block(
+                hidden_state, retrieved_shuf, topk_sims_real,
+            )
             # Mean-squared cosine across [B, L]. Smooth, bounded [0, 1],
             # natural attractor at cos=0. Avoids the anti-alignment
             # pathology of signed cosine minimization.
             cos = F.cosine_similarity(inj_real, inj_shuf, dim=-1)
-            aux_loss = (cos ** 2).mean()
-            self._aux_sink.append(aux_loss)
-        else:
-            retrieved_real, topk_sims_real = xattn.retrieve_topk(hidden_state)
-            inj_real = xattn._attention_block(hidden_state, retrieved_real, topk_sims_real)
+            self._vcontrast_sink.append((cos ** 2).mean())
 
+        # Under bf16 autocast, inj_real is bf16 but self.alpha stays fp32;
+        # a plain multiply would promote the product to fp32 and defeat AMP
+        # for the rest of the injected layer. Cast the gate into inj_real's
+        # dtype so the residual stays in low precision.
         gate = torch.tanh(self.alpha).to(dtype=inj_real.dtype)
         return gate * inj_real
+
+

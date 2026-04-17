@@ -340,17 +340,17 @@ def detect_device(requested: str | None) -> torch.device:
     return torch.device("cpu")
 
 
-def lambda_schedule(step: int, warmup: int, target: float) -> float:
-    """Linear warmup from 0 to `target` over `warmup` steps; constant `target` after.
+def lambda_schedule(step: int, warmup_steps: int, target: float) -> float:
+    """Linear warmup from 0 to `target` over `warmup_steps` steps; constant `target` after.
 
-    θ-V-contrast aux-loss schedule (ZEB-130). When `warmup` is 0 (or negative),
-    the linear ramp is skipped and `target` is returned for all steps.
+    theta-V-contrast / iota-Q-diversity aux-loss schedule (ZEB-130). When `warmup_steps` is 0
+    (or negative), the linear ramp is skipped and `target` is returned for all steps.
     """
-    if warmup <= 0:
+    if warmup_steps <= 0:
         return target
-    if step >= warmup:
+    if step >= warmup_steps:
         return target
-    return target * step / warmup
+    return target * step / warmup_steps
 
 
 def freeze_backbone_for_capgap(model: "HarmonyModel") -> None:
@@ -406,6 +406,8 @@ def main() -> None:
             "tiny_engram_xattn_ctrl",
             "tiny_engram_xattn_capgap",
             "tiny_engram_xattn_capgap_vcontrast",
+            "tiny_engram_xattn_capgap_qdiv",
+            "tiny_engram_xattn_capgap_vcontrast_qdiv",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -578,6 +580,33 @@ def main() -> None:
             "Optional seed for the per-step shuffle generator. Default: "
             "use the global PyTorch RNG (preferred for production runs; "
             "the seed is for reproducibility debugging only)."
+        ),
+    )
+    # ---- ZEB-130: iota-Q-diversity ----
+    parser.add_argument(
+        "--engram-qdiv",
+        action="store_true",
+        help=(
+            "Enable Q-side load-balancing aux loss. Must match the selected "
+            "preset's engram_qdiv_enabled value."
+        ),
+    )
+    parser.add_argument(
+        "--engram-qdiv-lambda",
+        type=float,
+        default=None,
+        help=(
+            "Override lambda for Q-div aux loss. Requires --engram-qdiv + a "
+            "qdiv-enabled preset. None = use preset's value."
+        ),
+    )
+    parser.add_argument(
+        "--engram-qdiv-warmup-steps",
+        type=int,
+        default=None,
+        help=(
+            "Override warmup steps for Q-div lambda. Requires --engram-qdiv + "
+            "a qdiv-enabled preset. None = use preset's value."
         ),
     )
     parser.add_argument(
@@ -843,6 +872,10 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_engram_xattn_capgap()
     elif args.config == "tiny_engram_xattn_capgap_vcontrast":
         config = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast()
+    elif args.config == "tiny_engram_xattn_capgap_qdiv":
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap_qdiv()
+    elif args.config == "tiny_engram_xattn_capgap_vcontrast_qdiv":
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast_qdiv()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
@@ -884,6 +917,60 @@ def main() -> None:
     if config.engram_vcontrast_enabled:
         # Re-run validation after CLI mutation, mirroring tiny_ffn_expanded /
         # tiny_engram_xattn_capgap pattern.
+        config.__post_init__()
+
+    # iota-Q-diversity (ZEB-130): --engram-qdiv must exactly match the preset's
+    # engram_qdiv_enabled. Same reasoning as V-contrast: preset mutation via
+    # flag makes CSV logs ambiguous.
+    if args.engram_qdiv != config.engram_qdiv_enabled:
+        print(
+            "Error: --engram-qdiv must match the selected preset's "
+            f"engram_qdiv_enabled (preset={config.engram_qdiv_enabled}, "
+            f"flag={args.engram_qdiv}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not config.engram_qdiv_enabled and (
+        args.engram_qdiv_lambda is not None
+        or args.engram_qdiv_warmup_steps is not None
+    ):
+        print(
+            "Error: --engram-qdiv-{lambda,warmup-steps} require a Q-div "
+            "preset + --engram-qdiv.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Apply overrides after validation. Two reasons to validate at the CLI
+    # layer before mutating config:
+    #   (a) The `< 0` check in __post_init__ misses NaN/Inf because all
+    #       comparisons with NaN return False — NaN leaking into the loss
+    #       would silently corrupt every subsequent training step.
+    #   (b) Fail-fast with a clear message naming the flag, so the user
+    #       sees "--engram-qdiv-lambda must be ..." rather than the
+    #       generic "engram_qdiv_lambda must be >= 0" from __post_init__.
+    if args.engram_qdiv_lambda is not None:
+        if (
+            not math.isfinite(args.engram_qdiv_lambda)
+            or args.engram_qdiv_lambda < 0
+        ):
+            print(
+                "Error: --engram-qdiv-lambda must be finite and >= 0, got "
+                f"{args.engram_qdiv_lambda!r}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        config.engram_qdiv_lambda = args.engram_qdiv_lambda
+    if args.engram_qdiv_warmup_steps is not None:
+        if args.engram_qdiv_warmup_steps < 0:
+            print(
+                "Error: --engram-qdiv-warmup-steps must be >= 0, got "
+                f"{args.engram_qdiv_warmup_steps!r}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        config.engram_qdiv_warmup_steps = args.engram_qdiv_warmup_steps
+    if config.engram_qdiv_enabled:
         config.__post_init__()
 
     # Model gamma arg validation (ZEB-117)
@@ -1112,7 +1199,6 @@ def main() -> None:
     # engram_injections are attached.
     if config.engram_inject_layers:
         from ct87.engram import (
-            ContrastiveGatedEngramInjection,
             EngramCrossAttention,
             GatedEngramInjection,
         )
@@ -1140,9 +1226,9 @@ def main() -> None:
             )
             sys.exit(2)
 
-        # θ-V-contrast: when enabled, construct ContrastiveGatedEngramInjection
-        # wrappers sharing a single aux-loss list. The training step pulls aux
-        # losses out of that list, sums them, and adds lambda * sum to LM loss.
+        # θ-V-contrast: when enabled, wrappers share a single aux-loss list.
+        # The training step pulls aux losses out of that list, sums them, and
+        # adds lambda * sum to LM loss.
         capgap_aux_sink: list[torch.Tensor] | None = (
             [] if config.engram_vcontrast_enabled else None
         )
@@ -1162,6 +1248,10 @@ def main() -> None:
                 "[capgap] V-contrast shuffle seeded with "
                 f"{args.engram_vcontrast_shuffle_seed} (reproducibility mode)"
             )
+        # Unified: GatedEngramInjection accepts optional aux-loss sink kwargs.
+        # vcontrast_sink is passed only when vcontrast is enabled (the sink is
+        # None otherwise, which disables the V-contrast branch in forward()).
+        # qdiv_sink is passed only when qdiv is enabled.
         capgap_injections: dict[int, GatedEngramInjection] = {}
         for layer_idx in config.engram_inject_layers:
             xattn_mod = EngramCrossAttention(
@@ -1170,18 +1260,17 @@ def main() -> None:
                 num_heads=config.num_query_heads,
                 k_retrieved=args.xattn_top_k,
             )
-            if config.engram_vcontrast_enabled:
-                capgap_injections[layer_idx] = ContrastiveGatedEngramInjection(
-                    xattn_mod,
-                    alpha_init=config.engram_gate_init,
-                    aux_loss_sink=capgap_aux_sink,
-                    shuffle_generator=capgap_shuffle_gen,
-                )
-            else:
-                capgap_injections[layer_idx] = GatedEngramInjection(
-                    xattn_mod,
-                    alpha_init=config.engram_gate_init,
-                )
+            capgap_injections[layer_idx] = GatedEngramInjection(
+                xattn_mod,
+                alpha_init=config.engram_gate_init,
+                vcontrast_sink=(
+                    capgap_aux_sink if config.engram_vcontrast_enabled else None
+                ),
+                qdiv_sink=(
+                    model._qdiv_aux_losses if config.engram_qdiv_enabled else None
+                ),
+                shuffle_generator=capgap_shuffle_gen,
+            )
         model.attach_gated_engram_injections(capgap_injections)
         if config.engram_vcontrast_enabled:
             # Both the model and the wrappers reference the same list — the
@@ -1191,17 +1280,28 @@ def main() -> None:
         # Ensure newly-attached submodules are on the correct device (model was
         # already moved to device before this block).
         model.engram_injections.to(device)
-        print(
-            f"[capgap] Attached "
-            f"{'ContrastiveGatedEngramInjection' if config.engram_vcontrast_enabled else 'GatedEngramInjection'}"
+        aux_tags = []
+        if config.engram_vcontrast_enabled:
+            aux_tags.append("+vcontrast")
+        if config.engram_qdiv_enabled:
+            aux_tags.append("+qdiv")
+        aux_suffix = f"({','.join(aux_tags)})" if aux_tags else ""
+        setup_parts = [
+            f"[capgap] Attached GatedEngramInjection{aux_suffix}"
             f" at layers {list(config.engram_inject_layers)} with alpha_init="
             f"{config.engram_gate_init}"
-            + (
+        ]
+        if config.engram_vcontrast_enabled:
+            setup_parts.append(
                 f"; vcontrast lambda={config.engram_vcontrast_lambda} "
                 f"warmup={config.engram_vcontrast_warmup_steps}"
-                if config.engram_vcontrast_enabled else ""
             )
-        )
+        if config.engram_qdiv_enabled:
+            setup_parts.append(
+                f"; qdiv lambda={config.engram_qdiv_lambda} "
+                f"warmup={config.engram_qdiv_warmup_steps}"
+            )
+        print("".join(setup_parts))
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count:,}")
@@ -1593,6 +1693,18 @@ def main() -> None:
                 *(f"vcontrast_aux_L{i}" for i in sorted(config.engram_inject_layers or ())),
                 "vcontrast_lambda",
             ]
+        # iota-Q-diversity (ZEB-130): conditional CSV columns, mirroring the
+        # V-contrast pattern above. Only emitted when qdiv is enabled.
+        qdiv_cols: list[str] = []
+        if config.engram_qdiv_enabled:
+            qdiv_cols = [
+                "qdiv_aux_loss",
+                *(
+                    f"qdiv_aux_L{i}"
+                    for i in sorted(config.engram_inject_layers or ())
+                ),
+                "qdiv_lambda",
+            ]
         expected_header = [
             "step", "loss", "uq_loss", "mtp_loss", "cl_loss",
             "ann_ent_loss", "ann_gate_mean", "ann_lambda_ent",
@@ -1601,6 +1713,7 @@ def main() -> None:
             "hg_std", "hg_min", "hg_max",
             "mse_loss", "consol_phase", "inject_mult",
             *vcontrast_cols,
+            *qdiv_cols,
         ]
         legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         legacy_header_no_ann = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
@@ -1711,6 +1824,9 @@ def main() -> None:
             # as a scalar (no grad), per-layer values are retained for CSV.
             accum_vcontrast_aux = 0.0
             accum_vcontrast_per_layer: dict[str, float] = {}
+            # iota-Q-diversity (ZEB-130): parallel aux-loss accumulators.
+            accum_qdiv_aux = 0.0
+            accum_qdiv_per_layer: dict[str, float] = {}
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
             need_hidden = mtp_head is not None
             use_coconut = args.coconut and num_thoughts > 0
@@ -1941,9 +2057,9 @@ def main() -> None:
                         accum_mse_loss += mse_loss.item()
 
                     # θ-V-contrast (ZEB-130): aggregate per-layer V-contrastive
-                    # aux losses appended by ContrastiveGatedEngramInjection
-                    # forwards. The sink is owned by the model and cleared
-                    # at the start of every training-mode forward.
+                    # aux losses appended by GatedEngramInjection forwards.
+                    # The sink is owned by the model and cleared at the start
+                    # of every training-mode forward.
                     if (
                         config.engram_vcontrast_enabled
                         and model._contrastive_aux_losses
@@ -1976,6 +2092,34 @@ def main() -> None:
                         ):
                             accum_vcontrast_per_layer[layer_key] = (
                                 accum_vcontrast_per_layer.get(layer_key, 0.0)
+                                + layer_loss.detach().item()
+                            )
+
+                    # iota-Q-diversity (ZEB-130): drain Q-div aux loss sink,
+                    # apply lambda warmup, add to total loss before backward.
+                    # Accumulators (accum_qdiv_aux, accum_qdiv_per_layer) are
+                    # populated here so the CSV / console blocks below can read
+                    # them without holding live tensors past backward.
+                    if config.engram_qdiv_enabled and model._qdiv_aux_losses:
+                        per_layer_qd: list[torch.Tensor] = list(
+                            model._qdiv_aux_losses
+                        )
+                        model._qdiv_aux_losses.clear()
+                        aux_qdiv_total = torch.stack(per_layer_qd).sum()
+                        lam_qdiv = lambda_schedule(
+                            step,
+                            config.engram_qdiv_warmup_steps,
+                            config.engram_qdiv_lambda,
+                        )
+                        loss = loss + lam_qdiv * aux_qdiv_total
+                        accum_qdiv_aux += aux_qdiv_total.detach().item()
+                        for layer_key, layer_loss in zip(
+                            (str(i) for i in sorted(config.engram_inject_layers)),
+                            per_layer_qd,
+                            strict=True,
+                        ):
+                            accum_qdiv_per_layer[layer_key] = (
+                                accum_qdiv_per_layer.get(layer_key, 0.0)
                                 + layer_loss.detach().item()
                             )
 
@@ -2109,6 +2253,25 @@ def main() -> None:
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
                     f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}{vcontrast_str}{capgap_str}"
                 )
+                # iota-Q-diversity (ZEB-130): separate console line for qdiv
+                # aux. Print unconditionally when qdiv is enabled — suppressing
+                # the line when accum_qdiv_aux == 0.0 hides both (a) warmup
+                # steps where lambda is still 0 and (b) regressions where the
+                # sink failed to populate. Both are signals we want visible.
+                if config.engram_qdiv_enabled:
+                    raw_qdiv_aux = accum_qdiv_aux / args.grad_accum_steps
+                    raw_qdiv_lam = lambda_schedule(
+                        step,
+                        config.engram_qdiv_warmup_steps,
+                        config.engram_qdiv_lambda,
+                    )
+                    qdiv_parts = [f"aux={raw_qdiv_aux:.4f}"]
+                    for lk in (str(i) for i in sorted(config.engram_inject_layers)):
+                        if lk in accum_qdiv_per_layer:
+                            v = accum_qdiv_per_layer[lk] / args.grad_accum_steps
+                            qdiv_parts.append(f"aux_L{lk}={v:.4f}")
+                    qdiv_parts.append(f"lambda={raw_qdiv_lam:.3f}")
+                    print("  [qdiv] " + "  ".join(qdiv_parts))
 
             val_loss_str = ""
             if args.save_every > 0 and step > 0 and step % args.save_every == 0:
@@ -2170,7 +2333,8 @@ def main() -> None:
                 # or (2 scalars + N per-layer) when on. Subtract from total to
                 # size the hg block (hg_0..hg_N, std/min/max).
                 n_vcontrast_cols = len(vcontrast_cols)
-                n_hg_slots = len(expected_header) - (16 + n_vcontrast_cols)
+                n_qdiv_cols = len(qdiv_cols)
+                n_hg_slots = len(expected_header) - (16 + n_vcontrast_cols + n_qdiv_cols)
                 hg_cols = [""] * n_hg_slots
                 hg_module = None
                 if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
@@ -2214,6 +2378,25 @@ def main() -> None:
                         config.engram_vcontrast_lambda,
                     )
                     vcontrast_row_cells.append(f"{current_lam:.6f}")
+                # iota-Q-diversity (ZEB-130): emit aux + per-layer + lambda only
+                # when enabled, matching `qdiv_cols` order exactly.
+                qdiv_row_cells: list[str] = []
+                if config.engram_qdiv_enabled:
+                    raw_qdiv = accum_qdiv_aux / args.grad_accum_steps
+                    qdiv_row_cells.append(f"{raw_qdiv:.6f}")
+                    for layer_idx in sorted(config.engram_inject_layers or ()):
+                        lk = str(layer_idx)
+                        if lk in accum_qdiv_per_layer:
+                            v = accum_qdiv_per_layer[lk] / args.grad_accum_steps
+                            qdiv_row_cells.append(f"{v:.6f}")
+                        else:
+                            qdiv_row_cells.append("")
+                    current_qdiv_lam = lambda_schedule(
+                        step,
+                        config.engram_qdiv_warmup_steps,
+                        config.engram_qdiv_lambda,
+                    )
+                    qdiv_row_cells.append(f"{current_qdiv_lam:.6f}")
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
@@ -2233,6 +2416,7 @@ def main() -> None:
                     consol_phase_str,
                     inject_mult_str,
                     *vcontrast_row_cells,
+                    *qdiv_row_cells,
                 ])
                 csv_file.flush()
 
@@ -2290,6 +2474,23 @@ def main() -> None:
                                 f"tanh(alpha_L{layer_key}) = "
                                 f"{math.tanh(alpha_val):+.6f}"
                             )
+
+            # iota-Q-diversity (ZEB-130): final summary block, mirroring V-contrast.
+            if config.engram_qdiv_enabled:
+                print(f"[qdiv] Final step={args.steps}")
+                print(
+                    f"    last_aux_total = {accum_qdiv_aux / max(args.grad_accum_steps, 1):.6f}"
+                )
+                for lk in (str(i) for i in sorted(config.engram_inject_layers or ())):
+                    if lk in accum_qdiv_per_layer:
+                        v = accum_qdiv_per_layer[lk] / max(args.grad_accum_steps, 1)
+                        print(f"    last_aux_L{lk} = {v:.6f}")
+                final_qdiv_lam = lambda_schedule(
+                    args.steps - 1,
+                    config.engram_qdiv_warmup_steps,
+                    config.engram_qdiv_lambda,
+                )
+                print(f"    final_lambda = {final_qdiv_lam:.6f}")
     finally:
         if csv_file is not None:
             csv_file.close()

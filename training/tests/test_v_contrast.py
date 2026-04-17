@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from ct87.engram import (
-    ContrastiveGatedEngramInjection,
     EngramCrossAttention,
     GatedEngramInjection,
 )
@@ -88,31 +87,31 @@ class TestLambdaSchedule:
 
     def test_step_zero_returns_zero(self):
         from ct87.train import lambda_schedule
-        assert lambda_schedule(0, warmup=200, target=1.0) == 0.0
+        assert lambda_schedule(0, warmup_steps=200, target=1.0) == 0.0
 
     def test_warmup_linear(self):
         from ct87.train import lambda_schedule
         # 100/200 = 0.5 of target
-        assert lambda_schedule(100, warmup=200, target=1.0) == pytest.approx(0.5)
+        assert lambda_schedule(100, warmup_steps=200, target=1.0) == pytest.approx(0.5)
         # 50/200 = 0.25
-        assert lambda_schedule(50, warmup=200, target=2.0) == pytest.approx(0.5)
+        assert lambda_schedule(50, warmup_steps=200, target=2.0) == pytest.approx(0.5)
 
     def test_at_warmup_boundary(self):
         from ct87.train import lambda_schedule
         # Spec: returns target AT and past the warmup boundary.
-        assert lambda_schedule(200, warmup=200, target=1.0) == 1.0
+        assert lambda_schedule(200, warmup_steps=200, target=1.0) == 1.0
 
     def test_past_warmup_returns_target(self):
         from ct87.train import lambda_schedule
-        assert lambda_schedule(500, warmup=200, target=1.5) == 1.5
-        assert lambda_schedule(10000, warmup=200, target=0.3) == 0.3
+        assert lambda_schedule(500, warmup_steps=200, target=1.5) == 1.5
+        assert lambda_schedule(10000, warmup_steps=200, target=0.3) == 0.3
 
     def test_zero_warmup_returns_target_immediately(self):
         from ct87.train import lambda_schedule
-        # Edge case: warmup=0 should never enter the linear ramp branch
+        # Edge case: warmup_steps=0 should never enter the linear ramp branch
         # (avoids division-by-zero and matches "no warmup" semantics).
-        assert lambda_schedule(0, warmup=0, target=1.0) == 1.0
-        assert lambda_schedule(100, warmup=0, target=1.0) == 1.0
+        assert lambda_schedule(0, warmup_steps=0, target=1.0) == 1.0
+        assert lambda_schedule(100, warmup_steps=0, target=1.0) == 1.0
 
 
 class TestAttentionBlockRefactor:
@@ -167,7 +166,7 @@ class TestAttentionBlockRefactor:
         assert torch.allclose(retrieved, xattn.table[topk_idx], atol=0)
 
 
-class TestContrastiveGatedEngramInjection:
+class TestGatedEngramInjectionVContrast:
 
     def _make_xattn(self) -> EngramCrossAttention:
         c = _tiny_config()
@@ -181,8 +180,8 @@ class TestContrastiveGatedEngramInjection:
         torch.manual_seed(0)
         xattn = self._make_xattn()
         sink: list = []
-        wrapper = ContrastiveGatedEngramInjection(
-            xattn, alpha_init=0.5, aux_loss_sink=sink,
+        wrapper = GatedEngramInjection(
+            xattn, alpha_init=0.5, vcontrast_sink=sink,
         )
         wrapper.eval()
         h = torch.randn(2, 5, 64)
@@ -199,8 +198,8 @@ class TestContrastiveGatedEngramInjection:
         torch.manual_seed(0)
         xattn = self._make_xattn()
         sink: list = []
-        wrapper = ContrastiveGatedEngramInjection(
-            xattn, alpha_init=0.5, aux_loss_sink=sink,
+        wrapper = GatedEngramInjection(
+            xattn, alpha_init=0.5, vcontrast_sink=sink,
         )
         wrapper.train(True)
         h = torch.randn(2, 5, 64)
@@ -216,8 +215,8 @@ class TestContrastiveGatedEngramInjection:
         for the aux compute when V-contrast is disabled."""
         torch.manual_seed(0)
         xattn = self._make_xattn()
-        wrapper = ContrastiveGatedEngramInjection(
-            xattn, alpha_init=0.5, aux_loss_sink=None,
+        wrapper = GatedEngramInjection(
+            xattn, alpha_init=0.5, vcontrast_sink=None,
         )
         wrapper.train(True)
         h = torch.randn(2, 5, 64)
@@ -233,8 +232,8 @@ class TestContrastiveGatedEngramInjection:
         torch.manual_seed(0)
         xattn = self._make_xattn()
         sink: list = []
-        wrapper = ContrastiveGatedEngramInjection(
-            xattn, alpha_init=0.5, aux_loss_sink=sink,
+        wrapper = GatedEngramInjection(
+            xattn, alpha_init=0.5, vcontrast_sink=sink,
         )
         wrapper.train(True)
         h = torch.randn(2, 5, 64)
@@ -252,8 +251,8 @@ class TestContrastiveGatedEngramInjection:
         torch.manual_seed(0)
         xattn = self._make_xattn()
         sink: list = []
-        wrapper = ContrastiveGatedEngramInjection(
-            xattn, alpha_init=0.0, aux_loss_sink=sink,
+        wrapper = GatedEngramInjection(
+            xattn, alpha_init=0.0, vcontrast_sink=sink,
         )
         wrapper.train(True)
         h = torch.randn(2, 5, 64)
@@ -285,8 +284,8 @@ class TestContrastiveGatedEngramInjection:
             # Seed global RNG deterministically before wrapper init so
             # o_proj.weight is identical across runs.
             torch.manual_seed(1)
-            wrapper = ContrastiveGatedEngramInjection(
-                xattn, alpha_init=0.0, aux_loss_sink=sink, shuffle_generator=gen,
+            wrapper = GatedEngramInjection(
+                xattn, alpha_init=0.0, vcontrast_sink=sink, shuffle_generator=gen,
             )
             wrapper.train(True)
             return wrapper, sink
@@ -328,8 +327,8 @@ class TestContrastiveGatedEngramInjection:
         torch.manual_seed(0)
         xattn = self._make_xattn()
         sink: list = []
-        wrapper = ContrastiveGatedEngramInjection(
-            xattn, alpha_init=0.0, aux_loss_sink=sink,
+        wrapper = GatedEngramInjection(
+            xattn, alpha_init=0.0, vcontrast_sink=sink,
         )
         wrapper.train(True)
         h = torch.randn(2, 5, 64)
@@ -352,8 +351,8 @@ class TestContrastiveGatedEngramInjection:
         torch.manual_seed(0)
         xattn = self._make_xattn()
         sink: list = []
-        wrapper = ContrastiveGatedEngramInjection(
-            xattn, alpha_init=0.5, aux_loss_sink=sink,
+        wrapper = GatedEngramInjection(
+            xattn, alpha_init=0.5, vcontrast_sink=sink,
         )
         wrapper.train(True)
         h = torch.randn(2, 5, 64)
@@ -374,7 +373,7 @@ class TestContrastiveGatedEngramInjection:
 class TestModelAuxLossSink:
 
     def _make_capgap_vcontrast_model(self):
-        """Build a tiny model + ContrastiveGatedEngramInjection wrappers
+        """Build a tiny model + GatedEngramInjection wrappers (with vcontrast_sink)
         without going through train.py — keeps the test self-contained."""
         c = _tiny_config()
         c.engram_inject_layers = (1,)
@@ -386,8 +385,8 @@ class TestModelAuxLossSink:
         injections = {}
         for layer_idx in c.engram_inject_layers:
             xattn = EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
-            injections[layer_idx] = ContrastiveGatedEngramInjection(
-                xattn, alpha_init=0.0, aux_loss_sink=sink,
+            injections[layer_idx] = GatedEngramInjection(
+                xattn, alpha_init=0.0, vcontrast_sink=sink,
             )
         model.attach_gated_engram_injections(injections)
         model._contrastive_aux_losses = sink
@@ -446,8 +445,8 @@ class TestModelAuxLossSink:
             injections = {}
             for layer_idx in sorted(inject_layers):  # deterministic build order
                 xattn = EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
-                injections[layer_idx] = ContrastiveGatedEngramInjection(
-                    xattn, alpha_init=0.0, aux_loss_sink=sink,
+                injections[layer_idx] = GatedEngramInjection(
+                    xattn, alpha_init=0.0, vcontrast_sink=sink,
                 )
             model.attach_gated_engram_injections(injections)
             model._contrastive_aux_losses = sink
@@ -489,8 +488,8 @@ class TestOneStepIntegration:
         injections = {}
         for layer_idx in c.engram_inject_layers:
             xattn = EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
-            injections[layer_idx] = ContrastiveGatedEngramInjection(
-                xattn, alpha_init=0.0, aux_loss_sink=sink,
+            injections[layer_idx] = GatedEngramInjection(
+                xattn, alpha_init=0.0, vcontrast_sink=sink,
             )
         model.attach_gated_engram_injections(injections)
         model._contrastive_aux_losses = sink
@@ -572,7 +571,7 @@ class TestTrainPyVContrastSmoke:
             f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
         )
         # Confirm V-contrast banner printed during setup
-        assert "ContrastiveGatedEngramInjection" in result.stdout
+        assert "GatedEngramInjection(+vcontrast)" in result.stdout
         # Confirm CSV header includes the V-contrast columns
         lines = log_file.read_text().splitlines()
         header = lines[0].split(",")
