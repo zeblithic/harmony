@@ -364,3 +364,54 @@ class TestCliFlagPresetConsistency:
         assert result.returncode != 0
         combined = (result.stderr + result.stdout).lower()
         assert "engram-qdiv" in combined or "engram_qdiv" in combined
+
+
+class TestQdivTrainingStep:
+    """Mid-training behavior: sinks drain per step, lambda warmup applies,
+    total_loss includes scaled qdiv term."""
+
+    def test_qdiv_sink_drained_per_step(self):
+        """After a forward, sink has len == num_layers; after training-loop
+        'drain' (list + clear), sink is empty and forward re-fills it."""
+        from ct87.model import HarmonyModel, HarmonyModelConfig
+
+        c = HarmonyModelConfig.tiny_engram_xattn_capgap_qdiv()
+        # Build + attach engram injections the same way train.py does.
+        from ct87.engram import EngramCrossAttention, GatedEngramInjection
+
+        model = HarmonyModel(c)
+        table = torch.randn(100, c.engram_dim)
+        injections = {}
+        for layer_idx in c.engram_inject_layers:
+            xattn = EngramCrossAttention(c, table, num_heads=4, k_retrieved=4)
+            injections[layer_idx] = GatedEngramInjection(
+                xattn,
+                alpha_init=c.engram_gate_init,
+                qdiv_sink=model._qdiv_aux_losses,
+            )
+        model.attach_gated_engram_injections(injections)
+        model.train()
+
+        input_ids = torch.randint(0, c.vocab_size, (1, 8))
+        # Step 1
+        _ = model(input_ids)
+        assert len(model._qdiv_aux_losses) == len(c.engram_inject_layers)
+        per_layer_qd = list(model._qdiv_aux_losses)
+        model._qdiv_aux_losses.clear()
+        assert len(model._qdiv_aux_losses) == 0
+        total = torch.stack(per_layer_qd).sum()
+        # MoE load-balancing loss has a floor of 1.0 per layer.
+        assert total.item() >= 1.0 * len(c.engram_inject_layers) - 1e-3
+
+        # Step 2 should also fill the sink after clearing.
+        _ = model(input_ids)
+        assert len(model._qdiv_aux_losses) == len(c.engram_inject_layers)
+
+    def test_lambda_schedule_warmup_linear(self):
+        """lambda_schedule helper (from PR #250) linearly ramps 0 -> target
+        over warmup_steps, then stays constant at target."""
+        from ct87.train import lambda_schedule
+        assert lambda_schedule(step=0, target=0.01, warmup_steps=200) == 0.0
+        assert lambda_schedule(step=100, target=0.01, warmup_steps=200) == pytest.approx(0.005)
+        assert lambda_schedule(step=200, target=0.01, warmup_steps=200) == pytest.approx(0.01)
+        assert lambda_schedule(step=500, target=0.01, warmup_steps=200) == pytest.approx(0.01)

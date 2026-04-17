@@ -340,17 +340,17 @@ def detect_device(requested: str | None) -> torch.device:
     return torch.device("cpu")
 
 
-def lambda_schedule(step: int, warmup: int, target: float) -> float:
-    """Linear warmup from 0 to `target` over `warmup` steps; constant `target` after.
+def lambda_schedule(step: int, warmup_steps: int, target: float) -> float:
+    """Linear warmup from 0 to `target` over `warmup_steps` steps; constant `target` after.
 
-    θ-V-contrast aux-loss schedule (ZEB-130). When `warmup` is 0 (or negative),
-    the linear ramp is skipped and `target` is returned for all steps.
+    θ-V-contrast / ι-Q-diversity aux-loss schedule (ZEB-130). When `warmup_steps` is 0
+    (or negative), the linear ramp is skipped and `target` is returned for all steps.
     """
-    if warmup <= 0:
+    if warmup_steps <= 0:
         return target
-    if step >= warmup:
+    if step >= warmup_steps:
         return target
-    return target * step / warmup
+    return target * step / warmup_steps
 
 
 def freeze_backbone_for_capgap(model: "HarmonyModel") -> None:
@@ -2044,6 +2044,21 @@ def main() -> None:
                                 accum_vcontrast_per_layer.get(layer_key, 0.0)
                                 + layer_loss.detach().item()
                             )
+
+                    # ι-Q-diversity (ZEB-130): drain Q-div aux loss sink,
+                    # apply lambda warmup, add to total loss before backward.
+                    if config.engram_qdiv_enabled and model._qdiv_aux_losses:
+                        per_layer_qd: list[torch.Tensor] = list(
+                            model._qdiv_aux_losses
+                        )
+                        model._qdiv_aux_losses.clear()
+                        aux_qdiv_total = torch.stack(per_layer_qd).sum()
+                        lam_qdiv = lambda_schedule(
+                            step,
+                            config.engram_qdiv_warmup_steps,
+                            config.engram_qdiv_lambda,
+                        )
+                        loss = loss + lam_qdiv * aux_qdiv_total
 
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
