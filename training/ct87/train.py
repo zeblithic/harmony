@@ -1112,7 +1112,6 @@ def main() -> None:
     # engram_injections are attached.
     if config.engram_inject_layers:
         from ct87.engram import (
-            ContrastiveGatedEngramInjection,
             EngramCrossAttention,
             GatedEngramInjection,
         )
@@ -1140,9 +1139,9 @@ def main() -> None:
             )
             sys.exit(2)
 
-        # θ-V-contrast: when enabled, construct ContrastiveGatedEngramInjection
-        # wrappers sharing a single aux-loss list. The training step pulls aux
-        # losses out of that list, sums them, and adds lambda * sum to LM loss.
+        # θ-V-contrast: when enabled, wrappers share a single aux-loss list.
+        # The training step pulls aux losses out of that list, sums them, and
+        # adds lambda * sum to LM loss.
         capgap_aux_sink: list[torch.Tensor] | None = (
             [] if config.engram_vcontrast_enabled else None
         )
@@ -1162,6 +1161,9 @@ def main() -> None:
                 "[capgap] V-contrast shuffle seeded with "
                 f"{args.engram_vcontrast_shuffle_seed} (reproducibility mode)"
             )
+        # Unified: GatedEngramInjection accepts optional aux-loss sink kwargs.
+        # vcontrast_sink is passed only when vcontrast is enabled (the sink is
+        # None otherwise, which disables the V-contrast branch in forward()).
         capgap_injections: dict[int, GatedEngramInjection] = {}
         for layer_idx in config.engram_inject_layers:
             xattn_mod = EngramCrossAttention(
@@ -1170,18 +1172,14 @@ def main() -> None:
                 num_heads=config.num_query_heads,
                 k_retrieved=args.xattn_top_k,
             )
-            if config.engram_vcontrast_enabled:
-                capgap_injections[layer_idx] = ContrastiveGatedEngramInjection(
-                    xattn_mod,
-                    alpha_init=config.engram_gate_init,
-                    aux_loss_sink=capgap_aux_sink,
-                    shuffle_generator=capgap_shuffle_gen,
-                )
-            else:
-                capgap_injections[layer_idx] = GatedEngramInjection(
-                    xattn_mod,
-                    alpha_init=config.engram_gate_init,
-                )
+            capgap_injections[layer_idx] = GatedEngramInjection(
+                xattn_mod,
+                alpha_init=config.engram_gate_init,
+                vcontrast_sink=(
+                    capgap_aux_sink if config.engram_vcontrast_enabled else None
+                ),
+                shuffle_generator=capgap_shuffle_gen,
+            )
         model.attach_gated_engram_injections(capgap_injections)
         if config.engram_vcontrast_enabled:
             # Both the model and the wrappers reference the same list — the
@@ -1192,8 +1190,8 @@ def main() -> None:
         # already moved to device before this block).
         model.engram_injections.to(device)
         print(
-            f"[capgap] Attached "
-            f"{'ContrastiveGatedEngramInjection' if config.engram_vcontrast_enabled else 'GatedEngramInjection'}"
+            f"[capgap] Attached GatedEngramInjection"
+            f"{'(+vcontrast)' if config.engram_vcontrast_enabled else ''}"
             f" at layers {list(config.engram_inject_layers)} with alpha_init="
             f"{config.engram_gate_init}"
             + (
@@ -1941,9 +1939,9 @@ def main() -> None:
                         accum_mse_loss += mse_loss.item()
 
                     # θ-V-contrast (ZEB-130): aggregate per-layer V-contrastive
-                    # aux losses appended by ContrastiveGatedEngramInjection
-                    # forwards. The sink is owned by the model and cleared
-                    # at the start of every training-mode forward.
+                    # aux losses appended by GatedEngramInjection forwards.
+                    # The sink is owned by the model and cleared at the start
+                    # of every training-mode forward.
                     if (
                         config.engram_vcontrast_enabled
                         and model._contrastive_aux_losses
