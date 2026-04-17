@@ -1035,6 +1035,9 @@ class EngramCrossAttention(nn.Module):
         v_tensor = self.v_proj(retrieved).view(B, L, k, H, D)
 
         scores = torch.einsum("blhd,blkhd->blhk", q, k_tensor) / (D ** 0.5)
+        # Broadcast the retrieval-similarity bias across heads. This is the
+        # only path through which `retrieval_query_proj` receives gradient
+        # from the main loss (topk gather blocks the rest).
         scores = scores + self.retrieval_bias_weight * topk_sims.unsqueeze(2)
         attn = F.softmax(scores, dim=-1)
 
