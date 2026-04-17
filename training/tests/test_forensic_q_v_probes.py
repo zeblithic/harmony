@@ -154,6 +154,26 @@ class TestQOverlapProbe:
             "q_overlap_random_pair_jaccard_p50"
         ]
 
+    def test_n_equals_one_returns_zero_jaccard(self) -> None:
+        """Single-token forensic (B=1, L=1) has no valid off-diagonal pairs.
+
+        The N=1 branch must NOT fall back to self-pair sampling (which
+        would force Jaccard=1 for every sample and report spurious
+        perfect overlap). Expected: 0.0 sentinel, occupancy CV still
+        well-defined since it's a count-based statistic.
+        """
+        B, L, k = 1, 1, 4
+        topk = torch.arange(k).view(B, L, k)
+
+        stats = _q_overlap_stats(topk, num_pairs=100)
+
+        assert stats["q_overlap_random_pair_jaccard_mean"] == 0.0, (
+            f"N=1 must return 0.0 Jaccard sentinel, not a self-pair "
+            f"forced value. Got "
+            f"{stats['q_overlap_random_pair_jaccard_mean']}."
+        )
+        assert stats["q_overlap_random_pair_jaccard_p50"] == 0.0
+
     def test_self_pairs_excluded_from_jaccard(self) -> None:
         """Self-pairs (idx_a == idx_b) would force Jaccard=1 and bias the
         mean upward. With N*(N-1) off-diagonal pairs and a diversified

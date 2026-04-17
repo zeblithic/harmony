@@ -362,8 +362,6 @@ def _q_overlap_stats(
     N = B * L
     flat = topk_idx.reshape(N, k)
 
-    gen = torch.Generator(device=flat.device).manual_seed(seed)
-    idx_a = torch.randint(0, N, (num_pairs,), generator=gen, device=flat.device)
     if N > 1:
         # Exclude self-pairs without a rejection loop: draw an offset in
         # [1, N) uniformly, then idx_b = (idx_a + offset) mod N. Guarantees
@@ -371,19 +369,29 @@ def _q_overlap_stats(
         # off-diagonal pairs. Self-pairs would force Jaccard=1 and bias
         # the mean upward on small-N forensic runs (N=B*L can be as small
         # as ~100 in quick smoke tests).
+        gen = torch.Generator(device=flat.device).manual_seed(seed)
+        idx_a = torch.randint(0, N, (num_pairs,), generator=gen, device=flat.device)
         offset = torch.randint(1, N, (num_pairs,), generator=gen, device=flat.device)
         idx_b = (idx_a + offset) % N
-    else:
-        # N=1 is pathological (single token) — return zero Jaccard rather
-        # than forcing self-pair comparisons.
-        idx_b = idx_a
-    pair_a = flat[idx_a]
-    pair_b = flat[idx_b]
+        pair_a = flat[idx_a]
+        pair_b = flat[idx_b]
 
-    match = (pair_a.unsqueeze(-1) == pair_b.unsqueeze(-2)).any(dim=-1)
-    intersection = match.sum(dim=-1).to(torch.float32)
-    union = (2 * k) - intersection
-    jaccard = intersection / union.clamp_min(1.0)
+        match = (pair_a.unsqueeze(-1) == pair_b.unsqueeze(-2)).any(dim=-1)
+        intersection = match.sum(dim=-1).to(torch.float32)
+        union = (2 * k) - intersection
+        jaccard = intersection / union.clamp_min(1.0)
+        jaccard_mean = jaccard.mean().item()
+        jaccard_p50 = jaccard.median().item()
+    else:
+        # N=1 is pathological: no valid off-diagonal pairs exist, so the
+        # random-pair Jaccard is undefined. Return 0.0 as a sentinel —
+        # it's distinguishable from any real reading (content-dispersive
+        # retrieval sits near k / table_size, not at 0) and the
+        # occupancy CV still reports the meaningful count statistic.
+        # Real forensic runs never hit N=1 (B*L is thousands); this is
+        # defensive scaffolding only.
+        jaccard_mean = 0.0
+        jaccard_p50 = 0.0
 
     # Sparse count: allocates an output sized by the number of DISTINCT used
     # rows, not max(topk_idx)+1. torch.bincount would allocate a dense vector
@@ -396,8 +404,8 @@ def _q_overlap_stats(
         occupancy_cv = 0.0
 
     return {
-        "q_overlap_random_pair_jaccard_mean": jaccard.mean().item(),
-        "q_overlap_random_pair_jaccard_p50": jaccard.median().item(),
+        "q_overlap_random_pair_jaccard_mean": jaccard_mean,
+        "q_overlap_random_pair_jaccard_p50": jaccard_p50,
         "q_occupancy_cv_used": occupancy_cv,
     }
 
