@@ -417,3 +417,11 @@ class TestFreezeBackbone:
         assert trainable * 10 < frozen, (
             f"Trainable ({trainable}) should be under 10% of frozen ({frozen})"
         )
+
+    def test_freeze_rejects_model_without_injections(self):
+        """Freezing without injections would leave the optimizer empty — must error."""
+        config = HarmonyModelConfig.tiny()  # no engram_inject_layers, no attach
+        model = HarmonyModel(config)
+        from ct87.train import freeze_backbone_for_capgap
+        with pytest.raises(RuntimeError, match="engram_injections"):
+            freeze_backbone_for_capgap(model)

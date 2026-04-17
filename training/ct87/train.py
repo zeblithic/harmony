@@ -319,11 +319,28 @@ def freeze_backbone_for_capgap(model: "HarmonyModel") -> None:
     with "engram_injections." — the optimizer then only sees the
     GatedEngramInjection params (xattn projections + alpha scalars) when
     constructed from a requires_grad filter.
+
+    Raises RuntimeError if the model has no attached engram_injections —
+    freezing everything with zero trainable params would leave the optimizer
+    with empty param groups and the first optimizer step would crash with
+    an obscure PyTorch error.
     """
+    if getattr(model, "engram_injections", None) is None:
+        raise RuntimeError(
+            "freeze_backbone_for_capgap() requires engram_injections to be "
+            "attached (use --config tiny_engram_xattn_capgap and construct "
+            "GatedEngramInjection modules first). The model has no "
+            "engram_injections.* params — freezing everything would leave "
+            "the optimizer with zero trainable parameters."
+        )
     frozen_count = 0
     trainable_count = 0
     for name, param in model.named_parameters():
-        if name.startswith("engram_injections"):
+        # Trailing dot matters: "engram_injections.0.alpha" is trainable, but
+        # a hypothetical future "engram_injections_shared" sibling field would
+        # NOT be caught by `startswith("engram_injections")` alone and would
+        # silently be left trainable.
+        if name.startswith("engram_injections."):
             param.requires_grad = True
             trainable_count += param.numel()
         else:
