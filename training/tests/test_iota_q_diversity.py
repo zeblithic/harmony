@@ -112,3 +112,45 @@ class TestComputeQdivAux:
         a = compute_qdiv_aux(idx, attn, N)
         b = compute_qdiv_aux(idx, attn, N)
         assert torch.equal(a, b)
+
+
+class TestAttentionBlockReturnAttn:
+    """API extension for _attention_block: optional return of [B,L,H,k]
+    softmax attention weights so Q-div can see them without recomputing.
+    Symmetric to retrieve_topk(return_indices=True) from PR #250."""
+
+    def _build_xattn(self, seed=0):
+        from ct87.engram import EngramCrossAttention
+        torch.manual_seed(seed)
+        c = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        N, E, H, k = 100, c.engram_dim, 4, 4
+        table = torch.randn(N, E)
+        return EngramCrossAttention(
+            c,
+            table,
+            num_heads=H,
+            k_retrieved=k,
+        )
+
+    def test_return_attn_shape(self):
+        xattn = self._build_xattn()
+        B, L = 2, 7
+        hidden = torch.randn(B, L, xattn.hidden_dim)
+        retrieved, topk_sims = xattn.retrieve_topk(hidden)
+        out, attn = xattn._attention_block(
+            hidden, retrieved, topk_sims, return_attn=True,
+        )
+        assert out.shape == (B, L, xattn.hidden_dim)
+        assert attn.shape == (B, L, xattn.num_heads, xattn.k_retrieved)
+        assert torch.allclose(attn.sum(dim=-1), torch.ones_like(attn.sum(dim=-1)), atol=1e-5)
+
+    def test_return_attn_false_matches_default(self):
+        xattn = self._build_xattn(seed=1)
+        B, L = 2, 5
+        hidden = torch.randn(B, L, xattn.hidden_dim)
+        retrieved, topk_sims = xattn.retrieve_topk(hidden)
+        out_default = xattn._attention_block(hidden, retrieved, topk_sims)
+        out_with_attn, _ = xattn._attention_block(
+            hidden, retrieved, topk_sims, return_attn=True,
+        )
+        assert torch.equal(out_default, out_with_attn)

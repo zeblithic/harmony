@@ -1054,7 +1054,8 @@ class EngramCrossAttention(nn.Module):
         hidden_state: torch.Tensor,
         retrieved: torch.Tensor,
         topk_sims: torch.Tensor,
-    ) -> torch.Tensor:
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the post-retrieval attention pipeline on caller-supplied retrievals.
 
         Exposed so V-contrastive variants (θ-V-contrast, ZEB-130) can run
@@ -1068,9 +1069,13 @@ class EngramCrossAttention(nn.Module):
                           (pre-`retrieval_norm`) retrieved rows.
             topk_sims:    [batch, seq_len, k_retrieved] — cosine sims to add
                           as the differentiable retrieval bias.
+            return_attn:  if True, also return the [B, L, H, k] softmax
+                          attention weights (for Q-div load-balancing aux).
 
         Returns:
-            [batch, seq_len, hidden_dim] residual (pre-gate).
+            out:  [batch, seq_len, hidden_dim] residual (pre-gate).
+            attn: [batch, seq_len, H, k] softmax weights (only when
+                  return_attn=True).
         """
         B, L, _ = hidden_state.shape
         H, D, k = self.num_heads, self.head_dim, self.k_retrieved
@@ -1096,7 +1101,11 @@ class EngramCrossAttention(nn.Module):
             gate_weights = torch.sigmoid(self.head_gates).view(1, 1, H, 1)
             out = out * gate_weights
 
-        return self.o_proj(out.reshape(B, L, H * D))
+        out = self.o_proj(out.reshape(B, L, H * D))
+
+        if return_attn:
+            return out, attn
+        return out
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Compute cross-attention residual for the injection layer.
