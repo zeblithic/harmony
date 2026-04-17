@@ -18,6 +18,16 @@ both models, runs them on a fixed val batch, and reports:
   (C) Cross-run alignment:  cosine similarity between real-run and
                             shuffled-run injection outputs at matched
                             (batch, token) positions
+  (W) Within-run concentration: per-run resultant length (Fisher-von Mises
+                            R) of per-token injection unit vectors. 1 = all
+                            tokens emit the same direction (fixed amplifier);
+                            0 = uniform distribution. Distinguishes "V is a
+                            fixed projection" from "V is token-sensitive
+                            but cross-run response distributions align."
+  (A) Injection-vs-hidden:  cos between injection and the residual stream
+                            it's added to. |A| ≈ 1 = residual-axis
+                            amplifier; 0 = injection is orthogonal to the
+                            current hidden direction
 
 These drive a verdict:
 
@@ -65,6 +75,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -75,6 +86,46 @@ if str(_REPO_TRAINING) not in sys.path:
 from ct87.engram import EngramCrossAttention, GatedEngramInjection  # noqa: E402
 from ct87.model import HarmonyModel, HarmonyModelConfig  # noqa: E402
 from ct87.train import make_hf_dataloader  # noqa: E402
+
+# train.py saves numpy RNG state alongside the torch state_dict for run
+# reproducibility. That state pickles through numpy's _reconstruct factory,
+# which is not on torch's default weights_only=True allow-list. Enumerate
+# the minimum set of numpy globals needed to round-trip the saved RNG so we
+# can load real capgap checkpoints without falling back to weights_only=False
+# (which would re-open the arbitrary-code-execution surface that round 2 of
+# PR 248 review closed). _reconstruct moved from numpy.core to numpy._core
+# in numpy 2.0; import path try-order covers both.
+try:
+    from numpy._core.multiarray import _reconstruct as _NUMPY_RECONSTRUCT  # noqa: E402
+except ImportError:  # numpy 1.x
+    from numpy.core.multiarray import _reconstruct as _NUMPY_RECONSTRUCT  # noqa: E402
+
+# numpy 2.x introduced concrete scalar-dtype classes (numpy.dtypes.UInt32DType
+# etc.) that appear in the pickle stream of any ndarray/RNG-state payload.
+# Without allow-listing them, weights_only=True refuses with errors like
+# "got <class 'numpy.dtypes.UInt32DType'>". Enumerate common numeric dtypes;
+# getattr guards so this still works on numpy 1.x (no numpy.dtypes module).
+_NUMPY_DTYPE_CLASS_NAMES: tuple[str, ...] = (
+    "BoolDType",
+    "Int8DType", "Int16DType", "Int32DType", "Int64DType",
+    "UInt8DType", "UInt16DType", "UInt32DType", "UInt64DType",
+    "Float16DType", "Float32DType", "Float64DType",
+)
+_numpy_dtype_classes: list = []
+_numpy_dtypes_mod = getattr(np, "dtypes", None)
+if _numpy_dtypes_mod is not None:
+    for _name in _NUMPY_DTYPE_CLASS_NAMES:
+        _cls = getattr(_numpy_dtypes_mod, _name, None)
+        if isinstance(_cls, type):
+            _numpy_dtype_classes.append(_cls)
+
+_TORCH_LOAD_SAFE_GLOBALS: list = [
+    HarmonyModelConfig,
+    _NUMPY_RECONSTRUCT,
+    np.ndarray,
+    np.dtype,
+    *_numpy_dtype_classes,
+]
 
 
 def _positive_int(value: str) -> int:
@@ -158,12 +209,12 @@ def load_capgap_model(
     `_load_from_state_dict` hook. Passing the correct table path for each
     run is what makes the forensic meaningful.
     """
-    # weights_only=True refuses to deserialize arbitrary Python objects, so
-    # HarmonyModelConfig (the dataclass stored alongside the state_dict by
-    # save_resumable_checkpoint) must be explicitly allow-listed. The config
-    # fields are all primitives + tuples + dicts of primitives, so the outer
-    # dataclass is the only custom type in the pickle stream.
-    with torch.serialization.safe_globals([HarmonyModelConfig]):
+    # weights_only=True refuses to deserialize arbitrary Python objects.
+    # _TORCH_LOAD_SAFE_GLOBALS enumerates the custom types present in capgap
+    # checkpoints: HarmonyModelConfig (the model config dataclass) and the
+    # numpy globals needed to reconstruct saved RNG state. See the comment
+    # near the module-level definition for the numpy rationale.
+    with torch.serialization.safe_globals(_TORCH_LOAD_SAFE_GLOBALS):
         payload: dict[str, Any] = torch.load(
             str(ckpt_path), map_location="cpu", weights_only=True,
         )
@@ -329,6 +380,51 @@ def analyze_injection(
     hidden_norm = hidden_state.norm(dim=-1).clamp_min(1e-9)
     magnitude_ratio = (injection_norm / hidden_norm).mean().item()
 
+    # Unit-normalize once and reuse for both (W) and (A) — same per-token
+    # direction vector feeds both probes.
+    injection_flat = injection.reshape(-1, injection.shape[-1])
+    injection_unit = F.normalize(injection_flat, dim=-1, eps=1e-8)
+
+    # (W) within-run direction concentration. Two complementary statistics:
+    #
+    #   R  — Fisher-von Mises resultant length ||mean(injection_unit)||.
+    #        R = 1 iff all per-token directions are identical (signed);
+    #        R = 0 for uniform OR ±-symmetric distributions. Signed-direction
+    #        concentration.
+    #
+    #   RMS_cos — sqrt(mean_ij (u_i · u_j)²). Computed without materializing
+    #             the N×N Gram matrix: sum_ij (u_i·u_j)² = ||U^T U||_F² via
+    #             the trace trick. RMS_cos = 1 iff all u_i collinear (any
+    #             sign — captures the ±-symmetric case R misses); RMS_cos
+    #             = 1/√D for uniform distribution on the sphere.
+    #
+    # L2 of η-B showed R ≈ 0 but likely RMS_cos ≈ 1 (gate sign flip + same
+    # magnitude means ± the same axis, which R folds to 0). RMS_cos catches
+    # that; R alone does not. Both reported so the joint reading is visible.
+    mean_unit_raw = injection_unit.mean(dim=0)
+    within_run_concentration = mean_unit_raw.norm().item()
+    n_tokens = injection_unit.shape[0]
+    if n_tokens > 0:
+        # U^T U is [hidden_dim, hidden_dim] — never materializes the full N×N.
+        gram_small = injection_unit.transpose(0, 1) @ injection_unit
+        sum_sq_cos = (gram_small * gram_small).sum().item()
+        mean_sq_cos = sum_sq_cos / (n_tokens * n_tokens)
+        within_run_axis_rms = math.sqrt(max(mean_sq_cos, 0.0))
+    else:
+        within_run_axis_rms = 0.0
+
+    # (A) injection-vs-hidden alignment. Does injection live on the residual-
+    # stream axis it's added to? |cos| ≈ 1 means injection is literally ±
+    # amplifying the hidden direction (strongest "amplifier not router"
+    # reading). Low |cos| means injection writes into directions orthogonal
+    # to the current residual — still could be content-blind, but not the
+    # specific "residual amplifier" story.
+    hidden_flat = hidden_state.reshape(-1, hidden_state.shape[-1])
+    hidden_unit = F.normalize(hidden_flat, dim=-1, eps=1e-8)
+    per_token_vs_hidden = (injection_unit * hidden_unit).sum(dim=-1)
+    injection_vs_hidden_signed = per_token_vs_hidden.mean().item()
+    injection_vs_hidden_abs = per_token_vs_hidden.abs().mean().item()
+
     scalar_stats: dict[str, float | int] = {
         "unique_rows": unique_rows,
         "n_slots": n_slots,
@@ -340,6 +436,10 @@ def analyze_injection(
         "entropy_frac_of_max": mean_entropy / max_entropy if max_entropy > 0 else 0.0,
         "injection_vs_hidden_norm": magnitude_ratio,
         "gate": float(gate.detach().float().item()),
+        "within_run_concentration": within_run_concentration,
+        "within_run_axis_rms": within_run_axis_rms,
+        "injection_vs_hidden_signed": injection_vs_hidden_signed,
+        "injection_vs_hidden_abs": injection_vs_hidden_abs,
     }
     return scalar_stats, injection
 
@@ -513,6 +613,10 @@ def print_per_run_diagnostics(
         print(f"  (E) attn entropy / log(k)               {_mean(real, 'entropy_frac_of_max'):8.4f}     {_mean(shuf, 'entropy_frac_of_max'):8.4f}")
         print(f"  (M) ||inj|| / ||hidden||                {_mean(real, 'injection_vs_hidden_norm'):8.4f}     {_mean(shuf, 'injection_vs_hidden_norm'):8.4f}")
         print(f"      gate = tanh(alpha)                  {_mean(real, 'gate'):+8.4f}     {_mean(shuf, 'gate'):+8.4f}")
+        print(f"  (W) within-run concentration R          {_mean(real, 'within_run_concentration'):8.4f}     {_mean(shuf, 'within_run_concentration'):8.4f}")
+        print(f"      within-run axis RMS cos             {_mean(real, 'within_run_axis_rms'):8.4f}     {_mean(shuf, 'within_run_axis_rms'):8.4f}")
+        print(f"  (A) cos(inj, hidden)  signed            {_mean(real, 'injection_vs_hidden_signed'):+8.4f}     {_mean(shuf, 'injection_vs_hidden_signed'):+8.4f}")
+        print(f"      cos(inj, hidden)  |abs|             {_mean(real, 'injection_vs_hidden_abs'):8.4f}     {_mean(shuf, 'injection_vs_hidden_abs'):8.4f}")
 
 
 def print_cross_run(
@@ -564,25 +668,56 @@ def print_verdict_criteria(k: int) -> None:
 (B) BOTH-BROKEN:  low (D) AND small (M).
 
 (H) HEALTHY (hypothetical):  peaked retrieval + diverse rows + material
-    magnitude + cross-run cos ≳ 0.3 → both runs learned the same direction.
-    This would invalidate the shuffle-kill interpretation; it is NOT
-    expected given the training metrics, but the forensic can confirm.
+    magnitude + cross-run cos ≳ 0.3. The 2026-04-17 forensic landed here,
+    which alone did NOT invalidate the shuffle-kill claim (content-invariant
+    training metrics stand) — it only ruled out (I*)'s "orthogonal per-run
+    directions" prediction.
 
-Interpretation rubric for common expected outcomes:
+--- (W) and (A) joint readings (added 2026-04-17) ---
 
-  Expected (most likely given shuffle-kill data):
-    - Retrieval looks fine: peaked, diverse rows, low entropy.
-    - (M) is ~0.02 × hidden norm: small but not negligible.
-    - Cross-run |cos| near 0: arbitrary direction per run.
-    → Verdict (I*): the 40M backbone+frozen config extracts no content
-      from the injection path regardless of what the retrieval feeds in.
-      Next move: scale up (90M) or redesign integration mechanism.
+The cross-run cos-only rubric above cannot distinguish "fixed per-run
+amplifier with aligned directions" from "token-sensitive V with aligned
+response distributions." (W) and (A) refine the verdict:
 
-  Alternate (weaker):
-    - Retrieval is somewhat peaked but rows clump onto a small subset of
-      the table on both runs.
-    → Verdict (R/I): Q projection is under-trained at this scale.
-      Next move: longer capgap training, or scale up to see if Q learns.
+Pattern matching uses two (W) statistics:
+  R       — signed mean-direction resultant (1 = fixed direction & polarity;
+            0 = uniform OR ±-symmetric).
+  RMS_cos — sign-invariant axis concentration via the Gram-squared trace
+            (1 = fixed axis regardless of polarity; ~1/√D for uniform).
+
+(I**) FIXED RESIDUAL-AXIS AMPLIFIER  — most specific amplifier reading:
+    RMS_cos ≳ 0.9 on both runs
+    AND (A) |cos(inj, hidden)| ≳ 0.5 on both runs
+    → V emits a single axis per run, living on the residual-stream axis.
+      The injection is literally amplifying (or nulling) the hidden state.
+      Scale-up unlikely to help; redesign MUST break V's collapse to a
+      fixed axis. R vs RMS_cos split tells us about polarity stability:
+      R ≈ RMS_cos → same polarity (L5-like); R ≪ RMS_cos → ±-symmetric
+      axis (L2-like, where the axis is learned but the sign is arbitrary).
+
+(I***) FIXED NON-RESIDUAL AMPLIFIER:
+    RMS_cos ≳ 0.9 on both runs AND (A) |cos(inj, hidden)| ≲ 0.2
+    → V emits a fixed axis per run but orthogonal to the residual.
+      Still content-blind; redesign target is same (force V token-
+      sensitivity) but the "residual amplifier" framing doesn't fit.
+
+(D*) DISTRIBUTIONAL ALIGNMENT  — harder-to-fix story:
+    RMS_cos ≲ 0.5 on both runs BUT cross-run cos ≳ 0.3
+    → Per-token injection directions span diverse axes within a run, but
+      the DISTRIBUTIONS of those directions align across runs. V is token-
+      sensitive; the content-invariance is a trained alignment of response
+      patterns, not a fixed projection. Redesign implications differ —
+      hard-gating on retrieval relevance may not be sufficient.
+
+Interpretation rubric for 2026-04-16 η-B + 2026-04-17 ζ-ctrl data:
+
+  Observed at 40M η-B:
+    - Retrieval healthy: (D) 5-6%, (E) ~0.72, (P) sim gap +0.07 to +0.10.
+    - (M) material: 0.04-0.07 × hidden norm.
+    - Cross-run signed cos: +0.336 (L2), +0.630 (L5).
+    → Rules out (R), (I), (I*). Rubric pointed to (H), but (H) alone
+      doesn't explain content-invariance of training metrics.
+    → NEXT: (W) and (A) measurement to select between (I**) / (I***) / (D*).
 """)
 
 
