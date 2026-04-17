@@ -4,7 +4,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from ct87.engram import EngramCrossAttention
+from ct87.engram import (
+    ContrastiveGatedEngramInjection,
+    EngramCrossAttention,
+    GatedEngramInjection,
+)
 from ct87.model import HarmonyModelConfig
 
 
@@ -133,4 +137,131 @@ class TestAttentionBlockRefactor:
         assert torch.allclose(out_via_forward, out_via_block, atol=1e-6), (
             "_attention_block must reproduce forward() bit-for-bit when "
             "fed the same retrieved tensors."
+        )
+
+
+class TestContrastiveGatedEngramInjection:
+
+    def _make_xattn(self) -> EngramCrossAttention:
+        c = _tiny_config()
+        c.use_xattn_engram = True
+        table = torch.randn(16, c.engram_dim)
+        return EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
+
+    def test_residual_matches_parent_when_eval(self):
+        """In eval mode, the contrastive subclass must produce the same residual
+        as the parent — the shuffled branch is training-only."""
+        torch.manual_seed(0)
+        xattn = self._make_xattn()
+        sink: list = []
+        wrapper = ContrastiveGatedEngramInjection(
+            xattn, alpha_init=0.5, aux_loss_sink=sink,
+        )
+        wrapper.eval()
+        h = torch.randn(2, 5, 64)
+
+        out_contrastive = wrapper(h)
+        # Compare to the parent's forward against the same xattn module by
+        # re-running just the parent path:
+        gate = torch.tanh(wrapper.alpha).to(dtype=out_contrastive.dtype)
+        expected = gate * xattn(h)
+        assert torch.allclose(out_contrastive, expected, atol=1e-6)
+        assert sink == [], "Sink must be empty in eval mode"
+
+    def test_training_appends_one_aux_loss(self):
+        torch.manual_seed(0)
+        xattn = self._make_xattn()
+        sink: list = []
+        wrapper = ContrastiveGatedEngramInjection(
+            xattn, alpha_init=0.5, aux_loss_sink=sink,
+        )
+        wrapper.train(True)
+        h = torch.randn(2, 5, 64)
+        _ = wrapper(h)
+        assert len(sink) == 1
+        aux = sink[0]
+        assert aux.dim() == 0, "aux loss must be a scalar"
+        assert 0.0 <= aux.item() <= 1.0, "(cos)^2 is bounded in [0, 1]"
+
+    def test_training_with_no_sink_skips_aux_compute(self):
+        """If aux_loss_sink is None, training mode must not allocate the
+        shuffled branch — used as a guard for accidentally double-paying
+        for the aux compute when V-contrast is disabled."""
+        torch.manual_seed(0)
+        xattn = self._make_xattn()
+        wrapper = ContrastiveGatedEngramInjection(
+            xattn, alpha_init=0.5, aux_loss_sink=None,
+        )
+        wrapper.train(True)
+        h = torch.randn(2, 5, 64)
+        # Should not raise and should produce a valid residual.
+        out = wrapper(h)
+        assert out.shape == h.shape
+
+    def test_per_step_permutation_differs(self):
+        """Two consecutive forwards in training mode must produce different
+        aux-loss values almost-surely (different perms → different shuf branches).
+        We assert different aux scalars rather than reach into the perm tensor
+        directly so the test stays robust to internal refactors."""
+        torch.manual_seed(0)
+        xattn = self._make_xattn()
+        sink: list = []
+        wrapper = ContrastiveGatedEngramInjection(
+            xattn, alpha_init=0.5, aux_loss_sink=sink,
+        )
+        wrapper.train(True)
+        h = torch.randn(2, 5, 64)
+        _ = wrapper(h)
+        _ = wrapper(h)
+        assert len(sink) == 2
+        assert sink[0].item() != sink[1].item(), (
+            "Per-step re-permutation must produce two distinct aux losses; "
+            "if these match exactly, the perm is being cached or reused."
+        )
+
+    def test_gradient_flows_to_v_proj_through_aux(self):
+        """The aux loss must produce non-zero gradient on v_proj — that's
+        the load-bearing pressure on V toward content-sensitivity."""
+        torch.manual_seed(0)
+        xattn = self._make_xattn()
+        sink: list = []
+        wrapper = ContrastiveGatedEngramInjection(
+            xattn, alpha_init=0.0, aux_loss_sink=sink,
+        )
+        wrapper.train(True)
+        h = torch.randn(2, 5, 64)
+        _ = wrapper(h)
+        assert len(sink) == 1
+        sink[0].backward()
+        v_grad = wrapper.engram_xattn.v_proj.weight.grad
+        assert v_grad is not None
+        assert v_grad.abs().sum().item() > 1e-8, (
+            "Aux loss must flow gradient to v_proj — that's the whole point."
+        )
+
+    def test_residual_does_not_depend_on_shuf_branch(self):
+        """The shuffled branch must NOT perturb the residual. Two training-mode
+        forwards on the same input (with sink reset between) must produce the
+        same residual, modulo differences in the shuffle's effect on the residual
+        — which must be zero. We verify by setting torch.manual_seed before each
+        forward AND ensuring the residual depends only on the unshuffled path."""
+        torch.manual_seed(0)
+        xattn = self._make_xattn()
+        sink: list = []
+        wrapper = ContrastiveGatedEngramInjection(
+            xattn, alpha_init=0.5, aux_loss_sink=sink,
+        )
+        wrapper.train(True)
+        h = torch.randn(2, 5, 64)
+
+        # Two forwards: the residual must be identical even though the
+        # internal randperm produces different shuf branches.
+        torch.manual_seed(123)
+        out1 = wrapper(h).clone()
+        torch.manual_seed(456)
+        out2 = wrapper(h).clone()
+        assert torch.allclose(out1, out2, atol=1e-6), (
+            "Residual changed between forwards even though only the shuffled "
+            "branch's RNG should differ — the shuf branch is leaking into "
+            "the residual."
         )

@@ -1161,3 +1161,78 @@ class GatedEngramInjection(nn.Module):
         # dtype so the residual stays in low precision.
         gate = torch.tanh(self.alpha).to(dtype=xattn_out.dtype)
         return gate * xattn_out
+
+
+class ContrastiveGatedEngramInjection(GatedEngramInjection):
+    """V-contrastive engram injection (θ-V-contrast, ZEB-130).
+
+    Subclasses ``GatedEngramInjection`` to add a training-only auxiliary
+    loss path. On every forward in training mode, runs a second xattn
+    pipeline against a per-step random row-permutation of the primary
+    table, then appends ``(cos(inj_real, inj_shuf)**2).mean()`` to the
+    caller-supplied ``aux_loss_sink`` list. The shuffled branch never
+    contributes to the residual — only the parent's primary-branch
+    output is gated and returned.
+
+    The aux loss measures alignment at the post-``o_proj`` pre-gate level,
+    so a shrinking gate (``tanh(alpha) -> 0``) cannot be used to minimize
+    it — the gate's role is firing rate, the aux loss's role is
+    response-shape. They must remain independent.
+
+    Cheap permutation: ``F.normalize`` is row-permute-equivariant, so we
+    use the cached ``self.engram_xattn.table_normalized`` indexed by the
+    fresh ``perm`` instead of re-normalizing per step.
+    """
+
+    def __init__(
+        self,
+        engram_xattn: EngramCrossAttention,
+        alpha_init: float = 0.0,
+        aux_loss_sink: list[torch.Tensor] | None = None,
+    ) -> None:
+        super().__init__(engram_xattn, alpha_init=alpha_init)
+        # Held by reference: the training script owns the list (so it can
+        # clear it between optimizer steps and stack the per-layer scalars)
+        # and the wrappers append to it. A None sink disables the aux
+        # branch — used so HarmonyModel can construct the contrastive
+        # variant before the sink is wired up if needed.
+        self._aux_sink: list[torch.Tensor] | None = aux_loss_sink
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        xattn = self.engram_xattn
+
+        # Primary branch (residual-contributing):
+        retrieved_real, topk_sims_real = xattn.retrieve_topk(hidden_state)
+        inj_real = xattn._attention_block(hidden_state, retrieved_real, topk_sims_real)
+
+        if self.training and self._aux_sink is not None:
+            # Per-step random row-permutation of the primary table (value
+            # shuffle). We keep the retrieval *keys* fixed (same top-k indices
+            # as the real branch) but supply content from a permuted table so
+            # the shuffled branch sees genuinely different rows at those
+            # positions. A full key+value permutation would be a semantic no-op:
+            # top-k selection is permutation-equivariant, so the same logical
+            # rows would win and the injections would be identical.
+            N = xattn.table.shape[0]
+            perm = torch.randperm(N, device=xattn.table.device)
+            table_shuf = xattn.table[perm]
+
+            # Re-derive the top-k index tensor (not exposed by retrieve_topk)
+            # using the already-computed retrieval projection. One q-proj
+            # forward + einsum + topk — no _attention_block overhead.
+            q = xattn.retrieval_query_proj(hidden_state)
+            q_norm = F.normalize(q, dim=-1, eps=1e-8)
+            sims_real = torch.einsum("ble,te->blt", q_norm, xattn.table_normalized)
+            topk_sims_real2, topk_idx_real = sims_real.topk(xattn.k_retrieved, dim=-1)
+            retrieved_shuf = table_shuf[topk_idx_real]
+            inj_shuf = xattn._attention_block(hidden_state, retrieved_shuf, topk_sims_real2)
+
+            # Mean-squared cosine across [B, L]. Smooth, bounded [0, 1],
+            # natural attractor at cos=0. Avoids the anti-alignment
+            # pathology of signed cosine minimization.
+            cos = F.cosine_similarity(inj_real, inj_shuf, dim=-1)
+            aux_loss = (cos ** 2).mean()
+            self._aux_sink.append(aux_loss)
+
+        gate = torch.tanh(self.alpha).to(dtype=inj_real.dtype)
+        return gate * inj_real
