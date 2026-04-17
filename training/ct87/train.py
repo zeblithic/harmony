@@ -1521,6 +1521,9 @@ def main() -> None:
             "hg_0", "hg_1", "hg_2", "hg_3", "hg_4", "hg_5", "hg_6", "hg_7",
             "hg_std", "hg_min", "hg_max",
             "mse_loss", "consol_phase", "inject_mult",
+            # θ-V-contrast (ZEB-130):
+            "vcontrast_aux_loss", "vcontrast_aux_l2", "vcontrast_aux_l5",
+            "vcontrast_lambda",
         ]
         legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         legacy_header_no_ann = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
@@ -2001,9 +2004,25 @@ def main() -> None:
                             gate_val = torch.tanh(injection.alpha).item()
                             gate_parts.append(f"g{layer_key}={gate_val:+.3f}")
                         capgap_str = "  " + " ".join(gate_parts)
+                # θ-V-contrast (ZEB-130): aux loss + lambda + per-layer.
+                vcontrast_str = ""
+                if config.engram_vcontrast_enabled:
+                    raw_aux = accum_vcontrast_aux / args.grad_accum_steps
+                    raw_lam = lambda_schedule(
+                        step,
+                        config.engram_vcontrast_warmup_steps,
+                        config.engram_vcontrast_lambda,
+                    )
+                    parts = [f"aux={raw_aux:.4f}"]
+                    for lk in (str(i) for i in config.engram_inject_layers):
+                        if lk in accum_vcontrast_per_layer:
+                            v = accum_vcontrast_per_layer[lk] / args.grad_accum_steps
+                            parts.append(f"aux_L{lk}={v:.4f}")
+                    parts.append(f"λ={raw_lam:.3f}")
+                    vcontrast_str = "  " + "  ".join(parts)
                 print(
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
-                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}{capgap_str}"
+                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}{vcontrast_str}{capgap_str}"
                 )
 
             val_loss_str = ""
@@ -2060,7 +2079,7 @@ def main() -> None:
                     ann_ent_str = f"{accum_ann_ent_loss / args.grad_accum_steps:.6f}"
                     ann_gate_str = f"{accum_ann_gate_mean / args.grad_accum_steps:.6f}"
                     ann_lambda_str = f"{dynamic_entropy_lambda:.6f}"
-                n_hg_slots = len(expected_header) - 16  # 13 base columns before hg_*, 3 consol columns after
+                n_hg_slots = len(expected_header) - 20  # 13 base + 3 consol + 4 vcontrast = 20 non-hg columns
                 hg_cols = [""] * n_hg_slots
                 hg_module = None
                 if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
@@ -2083,6 +2102,28 @@ def main() -> None:
                     mse_loss_str = f"{accum_mse_loss / args.grad_accum_steps:.6f}"
                     consol_phase_str = "1" if step >= args.consolidation_start_step else "0"
                     inject_mult_str = f"{inject_mult:.6f}"
+                # θ-V-contrast (ZEB-130): per-layer aux losses + total + lambda.
+                vcontrast_aux_str = ""
+                vcontrast_l2_str = ""
+                vcontrast_l5_str = ""
+                vcontrast_lambda_str = ""
+                if config.engram_vcontrast_enabled:
+                    raw_aux = accum_vcontrast_aux / args.grad_accum_steps
+                    vcontrast_aux_str = f"{raw_aux:.6f}"
+                    vcontrast_l2_str = (
+                        f"{accum_vcontrast_per_layer.get('2', 0.0) / args.grad_accum_steps:.6f}"
+                        if "2" in accum_vcontrast_per_layer else ""
+                    )
+                    vcontrast_l5_str = (
+                        f"{accum_vcontrast_per_layer.get('5', 0.0) / args.grad_accum_steps:.6f}"
+                        if "5" in accum_vcontrast_per_layer else ""
+                    )
+                    current_lam = lambda_schedule(
+                        step,
+                        config.engram_vcontrast_warmup_steps,
+                        config.engram_vcontrast_lambda,
+                    )
+                    vcontrast_lambda_str = f"{current_lam:.6f}"
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
@@ -2101,6 +2142,10 @@ def main() -> None:
                     mse_loss_str,
                     consol_phase_str,
                     inject_mult_str,
+                    vcontrast_aux_str,
+                    vcontrast_l2_str,
+                    vcontrast_l5_str,
+                    vcontrast_lambda_str,
                 ])
                 csv_file.flush()
 
@@ -2135,6 +2180,27 @@ def main() -> None:
                     dynamic_entropy_lambda=dynamic_entropy_lambda,
                 )
             print(f"Training complete. Final checkpoint at step {args.steps}")
+
+            # θ-V-contrast (ZEB-130): final summary block.
+            if config.engram_vcontrast_enabled:
+                with torch.no_grad():
+                    print(f"[vcontrast] Final step={args.steps}")
+                    if model._contrastive_aux_losses:
+                        # The list survives one final forward — but reliably the
+                        # most recent training-step accumulator is what we want.
+                        print(
+                            f"    last_aux_total = {accum_vcontrast_aux / max(args.grad_accum_steps, 1):.6f}"
+                        )
+                    if final_val_loss is not None:
+                        print(f"    val_loss (with inj)    = {final_val_loss:.6f}")
+                    if model.engram_injections is not None:
+                        for layer_key, injection in model.engram_injections.items():
+                            alpha_val = injection.alpha.detach().item()
+                            print(
+                                f"    alpha_L{layer_key} = {alpha_val:+.6f}, "
+                                f"tanh(alpha_L{layer_key}) = "
+                                f"{math.tanh(alpha_val):+.6f}"
+                            )
     finally:
         if csv_file is not None:
             csv_file.close()
