@@ -77,6 +77,14 @@ class HarmonyModelConfig:
     # (mutually exclusive with use_xattn_engram / use_ann_engram).
     engram_inject_layers: tuple[int, ...] = ()
     engram_gate_init: float = 0.0
+    # θ-V-contrast (ZEB-130): V-contrastive auxiliary loss. Adds a second
+    # xattn forward against a per-step row-permutation of the primary table
+    # and penalizes cosine alignment between real-branch and shuffled-branch
+    # post-o_proj outputs. Only meaningful when engram_inject_layers is set
+    # (rides on top of the multi-layer gated injection path).
+    engram_vcontrast_enabled: bool = False
+    engram_vcontrast_lambda: float = 1.0
+    engram_vcontrast_warmup_steps: int = 200
 
     def __post_init__(self) -> None:
         """Validate `ffn_dim_overrides` up front so misconfigurations fail fast.
@@ -127,6 +135,23 @@ class HarmonyModelConfig:
                         f"outside [0, {self.num_layers}) - would be silently "
                         "ignored at model construction."
                     )
+        if self.engram_vcontrast_enabled:
+            if not self.engram_inject_layers:
+                raise ValueError(
+                    "engram_vcontrast_enabled=True requires "
+                    "engram_inject_layers to be non-empty (V-contrast lives "
+                    "on top of the multi-layer gated injection path)."
+                )
+            if self.engram_vcontrast_lambda < 0.0:
+                raise ValueError(
+                    "engram_vcontrast_lambda must be >= 0.0, got "
+                    f"{self.engram_vcontrast_lambda!r}"
+                )
+            if self.engram_vcontrast_warmup_steps < 0:
+                raise ValueError(
+                    "engram_vcontrast_warmup_steps must be >= 0, got "
+                    f"{self.engram_vcontrast_warmup_steps!r}"
+                )
         if self.ffn_dim_overrides is None:
             return
         for layer_idx, dim in self.ffn_dim_overrides.items():
