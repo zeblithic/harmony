@@ -163,3 +163,125 @@ class TestCapacityGapConfig:
                 engram_injection_layer=2, engram_dim=128, tie_embeddings=True,
                 engram_inject_layers=(-1, 2),
             )
+
+
+class TestHarmonyModelMultiLayerInjection:
+    """HarmonyModel supports GatedEngramInjection at multiple layers via ModuleDict."""
+
+    def _build_model(self) -> HarmonyModel:
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        return HarmonyModel(config)
+
+    def _build_injections(
+        self, config: HarmonyModelConfig
+    ) -> dict[int, GatedEngramInjection]:
+        """Build injections using the real EngramCrossAttention API, with
+        o_proj overridden to xavier_uniform so the injection produces a
+        non-trivial signal (otherwise xattn's zero-init o_proj would make
+        all 'gate opens' tests pass trivially)."""
+        out: dict[int, GatedEngramInjection] = {}
+        table = torch.randn(16, config.engram_dim)
+        for layer_idx in config.engram_inject_layers:
+            xattn = EngramCrossAttention(
+                config, table, num_heads=2, k_retrieved=4,
+            )
+            nn.init.xavier_uniform_(xattn.o_proj.weight)
+            out[layer_idx] = GatedEngramInjection(
+                xattn, alpha_init=config.engram_gate_init,
+            )
+        return out
+
+    def test_engram_injections_default_none(self):
+        """Model with empty inject_layers has engram_injections=None."""
+        config = HarmonyModelConfig.tiny()  # empty inject_layers
+        model = HarmonyModel(config)
+        assert model.engram_injections is None
+
+    def test_attach_gated_engram_injections(self):
+        """Attaching populates engram_injections as a ModuleDict keyed by layer index."""
+        model = self._build_model()
+        injections = self._build_injections(model.config)
+        model.attach_gated_engram_injections(injections)
+        assert isinstance(model.engram_injections, nn.ModuleDict)
+        assert set(model.engram_injections.keys()) == {"2", "5"}
+
+    def test_attach_rejects_wrong_layer_indices(self):
+        """Attach rejects layer indices not declared in config.engram_inject_layers."""
+        model = self._build_model()
+        table = torch.randn(16, model.config.engram_dim)
+        wrong = {
+            7: GatedEngramInjection(
+                EngramCrossAttention(
+                    model.config, table, num_heads=2, k_retrieved=4,
+                )
+            ),
+        }
+        with pytest.raises(ValueError, match="layer_idx"):
+            model.attach_gated_engram_injections(wrong)
+
+    def test_attach_rejects_when_config_flag_absent(self):
+        """Attach fails if config.engram_inject_layers is empty."""
+        config = HarmonyModelConfig.tiny()
+        model = HarmonyModel(config)
+        with pytest.raises(ValueError, match="engram_inject_layers"):
+            model.attach_gated_engram_injections({})
+
+    def test_forward_zero_perturbation_at_init(self):
+        """With alpha_init=0 on all injections, forward must match a no-injection baseline."""
+        torch.manual_seed(123)
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        model_capgap = HarmonyModel(config)
+        injections = self._build_injections(config)
+        model_capgap.attach_gated_engram_injections(injections)
+        model_capgap.train(False)
+
+        torch.manual_seed(123)
+        config_plain = HarmonyModelConfig.tiny()
+        model_plain = HarmonyModel(config_plain)
+        model_plain.train(False)
+
+        ids = torch.randint(0, config.vocab_size, (2, 16))
+        with torch.no_grad():
+            out_capgap = model_capgap(ids)
+            out_plain = model_plain(ids)
+        assert torch.allclose(out_capgap, out_plain, atol=1e-5)
+
+    def test_forward_diverges_when_gate_opened(self):
+        """Opening the gate must cause outputs to diverge from the no-injection baseline."""
+        torch.manual_seed(123)
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        model = HarmonyModel(config)
+        injections = self._build_injections(config)
+        model.attach_gated_engram_injections(injections)
+        model.train(False)
+
+        ids = torch.randint(0, config.vocab_size, (2, 16))
+        with torch.no_grad():
+            out_closed = model(ids)
+            for injection in model.engram_injections.values():
+                injection.alpha.data = torch.tensor(1.0)
+            out_open = model(ids)
+        assert not torch.allclose(out_closed, out_open, atol=1e-3)
+
+    def test_inject_mult_zero_disables_all_layers(self):
+        """Setting engram_inject_mult=0 must zero all multi-layer injections."""
+        torch.manual_seed(123)
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        model = HarmonyModel(config)
+        injections = self._build_injections(config)
+        model.attach_gated_engram_injections(injections)
+        for injection in model.engram_injections.values():
+            injection.alpha.data = torch.tensor(1.0)
+        model.train(False)
+
+        torch.manual_seed(123)
+        config_plain = HarmonyModelConfig.tiny()
+        model_plain = HarmonyModel(config_plain)
+        model_plain.train(False)
+
+        ids = torch.randint(0, config.vocab_size, (2, 16))
+        with torch.no_grad():
+            model.engram_inject_mult = 0.0
+            out_zeroed = model(ids)
+            out_plain = model_plain(ids)
+        assert torch.allclose(out_zeroed, out_plain, atol=1e-5)
