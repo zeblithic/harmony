@@ -1659,6 +1659,18 @@ def main() -> None:
                 *(f"vcontrast_aux_L{i}" for i in sorted(config.engram_inject_layers or ())),
                 "vcontrast_lambda",
             ]
+        # ι-Q-diversity (ZEB-130): conditional CSV columns, mirroring the
+        # V-contrast pattern above. Only emitted when qdiv is enabled.
+        qdiv_cols: list[str] = []
+        if config.engram_qdiv_enabled:
+            qdiv_cols = [
+                "qdiv_aux_loss",
+                *(
+                    f"qdiv_aux_L{i}"
+                    for i in sorted(config.engram_inject_layers or ())
+                ),
+                "qdiv_lambda",
+            ]
         expected_header = [
             "step", "loss", "uq_loss", "mtp_loss", "cl_loss",
             "ann_ent_loss", "ann_gate_mean", "ann_lambda_ent",
@@ -1667,6 +1679,7 @@ def main() -> None:
             "hg_std", "hg_min", "hg_max",
             "mse_loss", "consol_phase", "inject_mult",
             *vcontrast_cols,
+            *qdiv_cols,
         ]
         legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         legacy_header_no_ann = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
@@ -1777,6 +1790,9 @@ def main() -> None:
             # as a scalar (no grad), per-layer values are retained for CSV.
             accum_vcontrast_aux = 0.0
             accum_vcontrast_per_layer: dict[str, float] = {}
+            # ι-Q-diversity (ZEB-130): parallel aux-loss accumulators.
+            accum_qdiv_aux = 0.0
+            accum_qdiv_per_layer: dict[str, float] = {}
             num_thoughts = coconut_curriculum.num_thoughts(step) if coconut_curriculum is not None else 0
             need_hidden = mtp_head is not None
             use_coconut = args.coconut and num_thoughts > 0
@@ -2047,6 +2063,9 @@ def main() -> None:
 
                     # ι-Q-diversity (ZEB-130): drain Q-div aux loss sink,
                     # apply lambda warmup, add to total loss before backward.
+                    # Accumulators (accum_qdiv_aux, accum_qdiv_per_layer) are
+                    # populated here so the CSV / console blocks below can read
+                    # them without holding live tensors past backward.
                     if config.engram_qdiv_enabled and model._qdiv_aux_losses:
                         per_layer_qd: list[torch.Tensor] = list(
                             model._qdiv_aux_losses
@@ -2059,6 +2078,16 @@ def main() -> None:
                             config.engram_qdiv_lambda,
                         )
                         loss = loss + lam_qdiv * aux_qdiv_total
+                        accum_qdiv_aux += aux_qdiv_total.detach().item()
+                        for layer_key, layer_loss in zip(
+                            (str(i) for i in sorted(config.engram_inject_layers)),
+                            per_layer_qd,
+                            strict=True,
+                        ):
+                            accum_qdiv_per_layer[layer_key] = (
+                                accum_qdiv_per_layer.get(layer_key, 0.0)
+                                + layer_loss.detach().item()
+                            )
 
                 accum_loss += loss.item()
                 (loss / args.grad_accum_steps).backward()
@@ -2190,6 +2219,21 @@ def main() -> None:
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
                     f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}{vcontrast_str}{capgap_str}"
                 )
+                # ι-Q-diversity (ZEB-130): separate console line for qdiv aux.
+                if config.engram_qdiv_enabled and accum_qdiv_aux > 0.0:
+                    raw_qdiv_aux = accum_qdiv_aux / args.grad_accum_steps
+                    raw_qdiv_lam = lambda_schedule(
+                        step,
+                        config.engram_qdiv_warmup_steps,
+                        config.engram_qdiv_lambda,
+                    )
+                    qdiv_parts = [f"aux={raw_qdiv_aux:.4f}"]
+                    for lk in (str(i) for i in sorted(config.engram_inject_layers)):
+                        if lk in accum_qdiv_per_layer:
+                            v = accum_qdiv_per_layer[lk] / args.grad_accum_steps
+                            qdiv_parts.append(f"aux_L{lk}={v:.4f}")
+                    qdiv_parts.append(f"λ={raw_qdiv_lam:.3f}")
+                    print("  [qdiv] " + "  ".join(qdiv_parts))
 
             val_loss_str = ""
             if args.save_every > 0 and step > 0 and step % args.save_every == 0:
@@ -2251,7 +2295,8 @@ def main() -> None:
                 # or (2 scalars + N per-layer) when on. Subtract from total to
                 # size the hg block (hg_0..hg_N, std/min/max).
                 n_vcontrast_cols = len(vcontrast_cols)
-                n_hg_slots = len(expected_header) - (16 + n_vcontrast_cols)
+                n_qdiv_cols = len(qdiv_cols)
+                n_hg_slots = len(expected_header) - (16 + n_vcontrast_cols + n_qdiv_cols)
                 hg_cols = [""] * n_hg_slots
                 hg_module = None
                 if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
@@ -2295,6 +2340,25 @@ def main() -> None:
                         config.engram_vcontrast_lambda,
                     )
                     vcontrast_row_cells.append(f"{current_lam:.6f}")
+                # ι-Q-diversity (ZEB-130): emit aux + per-layer + lambda only
+                # when enabled, matching `qdiv_cols` order exactly.
+                qdiv_row_cells: list[str] = []
+                if config.engram_qdiv_enabled:
+                    raw_qdiv = accum_qdiv_aux / args.grad_accum_steps
+                    qdiv_row_cells.append(f"{raw_qdiv:.6f}")
+                    for layer_idx in sorted(config.engram_inject_layers or ()):
+                        lk = str(layer_idx)
+                        if lk in accum_qdiv_per_layer:
+                            v = accum_qdiv_per_layer[lk] / args.grad_accum_steps
+                            qdiv_row_cells.append(f"{v:.6f}")
+                        else:
+                            qdiv_row_cells.append("")
+                    current_qdiv_lam = lambda_schedule(
+                        step,
+                        config.engram_qdiv_warmup_steps,
+                        config.engram_qdiv_lambda,
+                    )
+                    qdiv_row_cells.append(f"{current_qdiv_lam:.6f}")
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
@@ -2314,6 +2378,7 @@ def main() -> None:
                     consol_phase_str,
                     inject_mult_str,
                     *vcontrast_row_cells,
+                    *qdiv_row_cells,
                 ])
                 csv_file.flush()
 
@@ -2371,6 +2436,23 @@ def main() -> None:
                                 f"tanh(alpha_L{layer_key}) = "
                                 f"{math.tanh(alpha_val):+.6f}"
                             )
+
+            # ι-Q-diversity (ZEB-130): final summary block, mirroring V-contrast.
+            if config.engram_qdiv_enabled:
+                print(f"[qdiv] Final step={args.steps}")
+                print(
+                    f"    last_aux_total = {accum_qdiv_aux / max(args.grad_accum_steps, 1):.6f}"
+                )
+                for lk in (str(i) for i in sorted(config.engram_inject_layers or ())):
+                    if lk in accum_qdiv_per_layer:
+                        v = accum_qdiv_per_layer[lk] / max(args.grad_accum_steps, 1)
+                        print(f"    last_aux_L{lk} = {v:.6f}")
+                final_qdiv_lam = lambda_schedule(
+                    args.steps - 1,
+                    config.engram_qdiv_warmup_steps,
+                    config.engram_qdiv_lambda,
+                )
+                print(f"    final_lambda = {final_qdiv_lam:.6f}")
     finally:
         if csv_file is not None:
             csv_file.close()

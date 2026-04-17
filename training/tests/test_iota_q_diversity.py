@@ -5,6 +5,8 @@ docs/superpowers/specs/2026-04-17-iota-q-diversity-design.md
 
 from __future__ import annotations
 
+import csv
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -415,3 +417,74 @@ class TestQdivTrainingStep:
         assert lambda_schedule(step=100, target=0.01, warmup_steps=200) == pytest.approx(0.005)
         assert lambda_schedule(step=200, target=0.01, warmup_steps=200) == pytest.approx(0.01)
         assert lambda_schedule(step=500, target=0.01, warmup_steps=200) == pytest.approx(0.01)
+
+
+class TestCsvQdivColumns:
+    """CSV column presence is gated on engram_qdiv_enabled (matches PR #250's
+    pattern for V-contrast columns)."""
+
+    def test_qdiv_cols_present_when_enabled(self, tmp_path):
+        # Use ι_1 preset; it has engram_qdiv_enabled=True.
+        log_file = tmp_path / "train.csv"
+        output_dir = tmp_path / "output"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--config", "tiny_engram_xattn_capgap_qdiv",
+                "--engram-qdiv",
+                "--synthetic",
+                "--steps", "2",
+                "--save-every", "0",
+                "--log-file", str(log_file),
+                "--output-dir", str(output_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=Path(__file__).parent.parent,
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)},
+        )
+        assert result.returncode == 0, (
+            f"train.py exited {result.returncode}\n"
+            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        )
+        assert log_file.exists(), (
+            f"No CSV produced; stderr={result.stderr!r}, stdout={result.stdout[-2000:]!r}"
+        )
+        with open(log_file) as fh:
+            header = next(csv.reader(fh))
+        assert "qdiv_aux_loss" in header, f"header={header}"
+        assert "qdiv_lambda" in header, f"header={header}"
+        assert any(h.startswith("qdiv_aux_L") for h in header), f"header={header}"
+
+    def test_qdiv_cols_absent_when_disabled(self, tmp_path):
+        log_file = tmp_path / "train.csv"
+        output_dir = tmp_path / "output"
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ct87.train",
+                "--config", "tiny_engram_xattn_capgap",
+                "--synthetic",
+                "--steps", "2",
+                "--save-every", "0",
+                "--log-file", str(log_file),
+                "--output-dir", str(output_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=Path(__file__).parent.parent,
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)},
+        )
+        assert result.returncode == 0, (
+            f"train.py exited {result.returncode}\n"
+            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        )
+        assert log_file.exists(), (
+            f"No CSV produced; stderr={result.stderr!r}, stdout={result.stdout[-2000:]!r}"
+        )
+        with open(log_file) as fh:
+            header = next(csv.reader(fh))
+        assert not any(h.startswith("qdiv_") for h in header), (
+            f"qdiv columns leaked into non-qdiv preset header: {header}"
+        )
