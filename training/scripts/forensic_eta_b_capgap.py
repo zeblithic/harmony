@@ -127,6 +127,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0,
                    help="Seed for val-batch selection. Identical across both models so they "
                         "see the same tokens — required for (C) cross-run comparison.")
+    p.add_argument(
+        "--alt-shuffle-seed", type=int, default=42,
+        help=(
+            "Seed for the held-out alt shuffle used by the cross-table "
+            "within-run probe. Default 42 (explicitly different from any "
+            "training-time shuffle seed). The probe forwards a single "
+            "trained model against its training-primary table AND a fresh "
+            "torch.randperm(N) of that table seeded by this argument; "
+            "comparing matched-position injection outputs is the direct "
+            "test of V content-sensitivity."
+        ),
+    )
     return p.parse_args()
 
 
@@ -330,6 +342,148 @@ def analyze_injection(
         "gate": float(gate.detach().float().item()),
     }
     return scalar_stats, injection
+
+
+@torch.no_grad()
+def analyze_cross_table(
+    model: HarmonyModel,
+    primary_table: torch.Tensor,
+    alt_table: torch.Tensor,
+    val_batches: list[torch.Tensor],
+    layers: list[int],
+) -> dict[int, dict[str, float]]:
+    """Cross-table within-run probe: same model, same tokens, different table.
+
+    For each injection layer, runs the model twice on each batch — once with
+    the primary table installed on the layer's xattn, once with the alt
+    table installed — and computes cosine alignment between matched-position
+    injection outputs. A content-sensitive V should produce different
+    outputs when the table changes (cross-table cos near 0). A V that has
+    found the trivial-orthogonality shortcut produces near-zero cross-table
+    cos as a side effect of randomness; the secondary "random-baseline"
+    probe (cos between two random tokens' V outputs in the same forward)
+    distinguishes the two cases.
+
+    Args:
+        model: Trained HarmonyModel with `engram_injections` attached.
+        primary_table: The table the model was trained against.
+        alt_table: A held-out random row-permutation of `primary_table`.
+        val_batches: Validation token batches (each [batch, seq_len]).
+        layers: Injection-layer indices (typically [2, 5]).
+
+    Returns:
+        Per-layer dict with keys:
+            'cross_table_cos_signed', 'cross_table_cos_abs',
+            'within_run_random_pair_cos_abs' (the trivial-orthogonality floor).
+    """
+    if primary_table.shape != alt_table.shape:
+        raise ValueError(
+            f"primary_table {primary_table.shape} vs alt_table "
+            f"{alt_table.shape} shape mismatch"
+        )
+    device = next(model.parameters()).device
+    primary_table = primary_table.to(device)
+    alt_table = alt_table.to(device)
+    primary_table_normalized = F.normalize(primary_table, dim=-1, eps=1e-8)
+    alt_table_normalized = F.normalize(alt_table, dim=-1, eps=1e-8)
+
+    # Hook to capture the input hidden state at each injection layer.
+    probes = {layer: InjectionPreHook() for layer in layers}
+    handles = []
+    for layer_idx in layers:
+        h = model.engram_injections[str(layer_idx)].register_forward_pre_hook(
+            probes[layer_idx],
+        )
+        handles.append(h)
+
+    per_layer: dict[int, list[dict[str, float]]] = {i: [] for i in layers}
+
+    try:
+        for batch in val_batches:
+            for probe in probes.values():
+                probe.reset()
+
+            input_ids = batch.to(device)
+            _ = model(input_ids)
+
+            for layer_idx in layers:
+                hidden_state = probes[layer_idx].captured
+                if hidden_state is None:
+                    raise RuntimeError(
+                        f"Pre-hook at layer {layer_idx} did not fire — check "
+                        f"engram_injections are attached and in the forward path."
+                    )
+                wrapper = model.engram_injections[str(layer_idx)]
+                xattn = wrapper.engram_xattn
+
+                # Primary-table injection (using the in-place buffers as
+                # the trained model would see them).
+                primary_inj = _injection_with_table(
+                    xattn, hidden_state, primary_table, primary_table_normalized,
+                )
+                alt_inj = _injection_with_table(
+                    xattn, hidden_state, alt_table, alt_table_normalized,
+                )
+
+                cos = F.cosine_similarity(primary_inj, alt_inj, dim=-1)
+                signed = cos.mean().item()
+                abs_mean = cos.abs().mean().item()
+
+                # Random-baseline within-run pair: shuffle the primary
+                # injection along the (B*L) flattened axis, then compute
+                # |cos| against the unshuffled — this is what V-output
+                # alignment would look like under "random in high-dim".
+                flat = primary_inj.reshape(-1, primary_inj.shape[-1])
+                perm = torch.randperm(flat.shape[0], device=flat.device)
+                random_pair_cos = F.cosine_similarity(
+                    flat, flat[perm], dim=-1,
+                ).abs().mean().item()
+
+                per_layer[layer_idx].append({
+                    "cross_table_cos_signed": signed,
+                    "cross_table_cos_abs": abs_mean,
+                    "within_run_random_pair_cos_abs": random_pair_cos,
+                })
+    finally:
+        for h in handles:
+            h.remove()
+
+    # Average per-layer scalars across batches.
+    out: dict[int, dict[str, float]] = {}
+    for layer_idx in layers:
+        rows = per_layer[layer_idx]
+        n = max(len(rows), 1)
+        out[layer_idx] = {
+            "cross_table_cos_signed": sum(r["cross_table_cos_signed"] for r in rows) / n,
+            "cross_table_cos_abs": sum(r["cross_table_cos_abs"] for r in rows) / n,
+            "within_run_random_pair_cos_abs": sum(
+                r["within_run_random_pair_cos_abs"] for r in rows
+            ) / n,
+        }
+    return out
+
+
+def _injection_with_table(
+    xattn: "EngramCrossAttention",
+    hidden_state: torch.Tensor,
+    table: torch.Tensor,
+    table_normalized: torch.Tensor,
+) -> torch.Tensor:
+    """Compute injection output using a caller-supplied table (no in-place buffer mutation).
+
+    Mirrors `EngramCrossAttention.forward` but uses the supplied table rather
+    than `xattn.table` / `xattn.table_normalized`. We do NOT swap the buffers
+    in-place because that would race with concurrent forwards if any exist
+    and would also leave the model in a wrong state if an exception fires.
+    """
+    q = xattn.retrieval_query_proj(hidden_state)
+    q_norm = F.normalize(q, dim=-1, eps=1e-8)
+    sims = torch.einsum("ble,te->blt", q_norm, table_normalized)
+    topk_sims, topk_idx = sims.topk(xattn.k_retrieved, dim=-1)
+    retrieved = table[topk_idx]
+    # `_attention_block` was added in Task 4 and is guaranteed present in
+    # this bundled PR (no cross-PR version skew concern).
+    return xattn._attention_block(hidden_state, retrieved, topk_sims)
 
 
 def _mean(per_batch_stats: list[dict[str, Any]], key: str) -> float:
@@ -545,6 +699,50 @@ def run_forensic(args: argparse.Namespace) -> None:
 
     print_per_run_diagnostics(per_layer_real, per_layer_shuf, layers, args.k_retrieved)
     print_cross_run(cross_run_per_layer, layers)
+
+    print("\n--- (X) cross-table within-run probe ---")
+    print(f"Alt-shuffle seed: {args.alt_shuffle_seed}")
+
+    # Re-load the real-oracle table to use as the primary; derive the alt
+    # table by held-out random permutation seeded by --alt-shuffle-seed.
+    primary_table = EngramCrossAttention.load_corpus_table(str(args.real_table))
+    g = torch.Generator(device="cpu")
+    g.manual_seed(args.alt_shuffle_seed)
+    perm = torch.randperm(primary_table.shape[0], generator=g)
+    alt_table = primary_table[perm]
+
+    # Re-collect val batches for the cross-table probe (val_loader is
+    # one-shot in some implementations; safest to reuse the same dataloader
+    # constructor with the same seed).
+    val_loader_xtable = make_hf_dataloader(
+        args.val_data, args.seq_len, args.batch_size, args.seed,
+    )
+    val_batches: list[torch.Tensor] = []
+    for _ in range(args.num_batches):
+        val_batches.append(next(val_loader_xtable)[:, :-1])
+
+    cross_table_real = analyze_cross_table(
+        real_model, primary_table, alt_table, val_batches, layers,
+    )
+    print("\n[real-oracle model]")
+    for layer_idx in layers:
+        stats = cross_table_real[layer_idx]
+        print(f"  L{layer_idx}:")
+        print(f"    signed (primary vs alt)           {stats['cross_table_cos_signed']:+.4f}")
+        print(f"    |abs|                             {stats['cross_table_cos_abs']:.4f}")
+        print(f"    random-pair |cos| (orth. floor)   {stats['within_run_random_pair_cos_abs']:.4f}")
+
+    cross_table_shuf = analyze_cross_table(
+        shuf_model, primary_table, alt_table, val_batches, layers,
+    )
+    print("\n[shuffled-oracle model]")
+    for layer_idx in layers:
+        stats = cross_table_shuf[layer_idx]
+        print(f"  L{layer_idx}:")
+        print(f"    signed (primary vs alt)           {stats['cross_table_cos_signed']:+.4f}")
+        print(f"    |abs|                             {stats['cross_table_cos_abs']:.4f}")
+        print(f"    random-pair |cos| (orth. floor)   {stats['within_run_random_pair_cos_abs']:.4f}")
+
     print_verdict_criteria(args.k_retrieved)
 
 
