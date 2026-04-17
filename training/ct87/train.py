@@ -318,6 +318,19 @@ def detect_device(requested: str | None) -> torch.device:
     return torch.device("cpu")
 
 
+def lambda_schedule(step: int, warmup: int, target: float) -> float:
+    """Linear warmup from 0 to `target` over `warmup` steps; constant `target` after.
+
+    θ-V-contrast aux-loss schedule (ZEB-130). When `warmup` is 0 (or negative),
+    the linear ramp is skipped and `target` is returned for all steps.
+    """
+    if warmup <= 0:
+        return target
+    if step >= warmup:
+        return target
+    return target * step / warmup
+
+
 def freeze_backbone_for_capgap(model: "HarmonyModel") -> None:
     """Freeze all parameters except engram_injections.* (η-B / ZEB-130).
 

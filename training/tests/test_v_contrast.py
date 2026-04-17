@@ -72,3 +72,34 @@ class TestVContrastPreset:
     def test_preset_passes_post_init(self):
         # Re-validates after __post_init__ runs (preset calls it explicitly).
         HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast()
+
+
+class TestLambdaSchedule:
+
+    def test_step_zero_returns_zero(self):
+        from ct87.train import lambda_schedule
+        assert lambda_schedule(0, warmup=200, target=1.0) == 0.0
+
+    def test_warmup_linear(self):
+        from ct87.train import lambda_schedule
+        # 100/200 = 0.5 of target
+        assert lambda_schedule(100, warmup=200, target=1.0) == pytest.approx(0.5)
+        # 50/200 = 0.25
+        assert lambda_schedule(50, warmup=200, target=2.0) == pytest.approx(0.5)
+
+    def test_at_warmup_boundary(self):
+        from ct87.train import lambda_schedule
+        # Spec: returns target AT and past the warmup boundary.
+        assert lambda_schedule(200, warmup=200, target=1.0) == 1.0
+
+    def test_past_warmup_returns_target(self):
+        from ct87.train import lambda_schedule
+        assert lambda_schedule(500, warmup=200, target=1.5) == 1.5
+        assert lambda_schedule(10000, warmup=200, target=0.3) == 0.3
+
+    def test_zero_warmup_returns_target_immediately(self):
+        from ct87.train import lambda_schedule
+        # Edge case: warmup=0 should never enter the linear ramp branch
+        # (avoids division-by-zero and matches "no warmup" semantics).
+        assert lambda_schedule(0, warmup=0, target=1.0) == 1.0
+        assert lambda_schedule(100, warmup=0, target=1.0) == 1.0
