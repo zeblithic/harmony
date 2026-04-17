@@ -140,6 +140,29 @@ class TestAttentionBlockRefactor:
             "fed the same retrieved tensors."
         )
 
+    def test_retrieve_topk_return_indices(self):
+        """retrieve_topk(return_indices=True) must return the gather indices
+        used to materialize `retrieved` — this is what the V-contrast branch
+        uses to apply a value-only shuffle without recomputing the matmul."""
+        torch.manual_seed(0)
+        c = _tiny_config()
+        c.use_xattn_engram = True
+        table = torch.randn(16, c.engram_dim)
+        xattn = EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
+        xattn.eval()
+        h = torch.randn(2, 5, c.hidden_dim)
+
+        # Two-tuple backward-compat
+        two = xattn.retrieve_topk(h)
+        assert len(two) == 2
+
+        # Three-tuple with indices
+        retrieved, topk_sims, topk_idx = xattn.retrieve_topk(h, return_indices=True)
+        assert topk_idx.shape == (2, 5, 4)
+        # Gathering the table with the returned indices must reconstruct the
+        # returned `retrieved` — contract the V-contrast path relies on.
+        assert torch.allclose(retrieved, xattn.table[topk_idx], atol=0)
+
 
 class TestContrastiveGatedEngramInjection:
 
@@ -238,6 +261,81 @@ class TestContrastiveGatedEngramInjection:
         assert v_grad is not None
         assert v_grad.abs().sum().item() > 1e-8, (
             "Aux loss must flow gradient to v_proj — that's the whole point."
+        )
+
+    def test_seeded_generator_produces_reproducible_aux(self):
+        """Two wrappers built with generators seeded the same way must produce
+        identical aux-loss sequences across forwards. This is the reproducibility
+        contract of --engram-vcontrast-shuffle-seed.
+
+        Note: both the xattn and the wrapper init consume the *global* RNG
+        (xavier_uniform_ on o_proj.weight, etc.), so we re-seed before each
+        construction to keep module weights bit-identical. The shuffle
+        generator is what we're actually testing — it must drive the
+        per-step perm independently of global-RNG state.
+        """
+        def _build(seed):
+            torch.manual_seed(0)
+            xattn = self._make_xattn()
+            sink: list = []
+            gen = torch.Generator(device="cpu").manual_seed(seed)
+            # Seed global RNG deterministically before wrapper init so
+            # o_proj.weight is identical across runs.
+            torch.manual_seed(1)
+            wrapper = ContrastiveGatedEngramInjection(
+                xattn, alpha_init=0.0, aux_loss_sink=sink, shuffle_generator=gen,
+            )
+            wrapper.train(True)
+            return wrapper, sink
+
+        w_a, sink_a = _build(42)
+        w_b, sink_b = _build(42)
+
+        torch.manual_seed(7)
+        h = torch.randn(2, 5, 64)
+        for _ in range(3):
+            w_a(h)
+            w_b(h)
+
+        assert len(sink_a) == 3 and len(sink_b) == 3
+        for a, b in zip(sink_a, sink_b):
+            assert torch.allclose(a, b, atol=0), (
+                "Same-seeded generators must produce bit-identical aux losses; "
+                "got divergence — shuffle generator isn't actually driving the perm."
+            )
+
+        # Different seed → different aux sequence.
+        _, sink_c = _build(99)
+        torch.manual_seed(7)
+        h2 = torch.randn(2, 5, 64)
+        assert torch.equal(h, h2)  # same `h`
+        # Re-run both; sink_c should diverge from sink_a on the first forward.
+        w_c, sink_c = _build(99)
+        w_c(h)
+        assert not torch.allclose(sink_a[0], sink_c[0], atol=1e-8), (
+            "Different seeds produced identical aux — the seed isn't reaching "
+            "the permutation."
+        )
+
+    def test_unseeded_shuffle_uses_global_rng(self):
+        """With no generator passed, each forward must still randomize — the
+        global-RNG path is the default for production runs."""
+        torch.manual_seed(0)
+        xattn = self._make_xattn()
+        sink: list = []
+        wrapper = ContrastiveGatedEngramInjection(
+            xattn, alpha_init=0.0, aux_loss_sink=sink,
+        )
+        wrapper.train(True)
+        h = torch.randn(2, 5, 64)
+
+        wrapper(h)
+        wrapper(h)
+        # Two forwards with different global RNG states must give different
+        # aux losses (with astronomically high probability for N=16, k=4).
+        assert not torch.allclose(sink[0], sink[1], atol=1e-8), (
+            "Two unseeded forwards gave identical aux losses — the "
+            "per-step permutation isn't actually running."
         )
 
     def test_residual_does_not_depend_on_shuf_branch(self):
@@ -437,3 +535,17 @@ class TestTrainPyVContrastSmoke:
         header = lines[0].split(",")
         assert "vcontrast_aux_loss" in header
         assert "vcontrast_lambda" in header
+        # Per-layer columns must match the preset's engram_inject_layers,
+        # not the hardcoded (2, 5). Preset `tiny_engram_xattn_capgap_vcontrast`
+        # uses the same layers as the capgap preset it extends; whatever those
+        # are, their per-layer columns must be present and no extras.
+        from ct87.model import HarmonyModelConfig
+        cfg = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast()
+        for i in cfg.engram_inject_layers:
+            assert f"vcontrast_aux_L{i}" in header, (
+                f"Expected dynamic per-layer column vcontrast_aux_L{i} in CSV "
+                f"header; got {header}"
+            )
+        # Reject any stale hardcoded lowercase-l columns.
+        assert "vcontrast_aux_l2" not in header
+        assert "vcontrast_aux_l5" not in header

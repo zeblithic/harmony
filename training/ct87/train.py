@@ -1103,6 +1103,23 @@ def main() -> None:
         capgap_aux_sink: list[torch.Tensor] | None = (
             [] if config.engram_vcontrast_enabled else None
         )
+        # Optional dedicated generator for the per-step value-shuffle. All
+        # wrappers share a single generator so seeding once makes the sequence
+        # of permutations across layers reproducible. CPU device avoids
+        # device-placement sensitivity — the permutation tensor is a small
+        # index tensor that gets moved to the table's device inside the
+        # wrapper if needed.
+        capgap_shuffle_gen: torch.Generator | None = None
+        if (
+            config.engram_vcontrast_enabled
+            and args.engram_vcontrast_shuffle_seed is not None
+        ):
+            capgap_shuffle_gen = torch.Generator(device="cpu")
+            capgap_shuffle_gen.manual_seed(int(args.engram_vcontrast_shuffle_seed))
+            print(
+                "[capgap] V-contrast shuffle seeded with "
+                f"{args.engram_vcontrast_shuffle_seed} (reproducibility mode)"
+            )
         capgap_injections: dict[int, GatedEngramInjection] = {}
         for layer_idx in config.engram_inject_layers:
             xattn_mod = EngramCrossAttention(
@@ -1116,6 +1133,7 @@ def main() -> None:
                     xattn_mod,
                     alpha_init=config.engram_gate_init,
                     aux_loss_sink=capgap_aux_sink,
+                    shuffle_generator=capgap_shuffle_gen,
                 )
             else:
                 capgap_injections[layer_idx] = GatedEngramInjection(
@@ -1514,6 +1532,12 @@ def main() -> None:
     csv_file = None
     csv_writer = None
     if args.log_file:
+        # Per-layer V-contrast columns are derived from engram_inject_layers so
+        # they reflect the active config rather than a fixed (2, 5) preset. Empty
+        # when the feature is off or no layers are configured.
+        vcontrast_per_layer_cols = [
+            f"vcontrast_aux_L{i}" for i in (config.engram_inject_layers or ())
+        ]
         expected_header = [
             "step", "loss", "uq_loss", "mtp_loss", "cl_loss",
             "ann_ent_loss", "ann_gate_mean", "ann_lambda_ent",
@@ -1521,8 +1545,9 @@ def main() -> None:
             "hg_0", "hg_1", "hg_2", "hg_3", "hg_4", "hg_5", "hg_6", "hg_7",
             "hg_std", "hg_min", "hg_max",
             "mse_loss", "consol_phase", "inject_mult",
-            # θ-V-contrast (ZEB-130):
-            "vcontrast_aux_loss", "vcontrast_aux_l2", "vcontrast_aux_l5",
+            # θ-V-contrast (ZEB-130): fixed scalars + dynamic per-layer columns.
+            "vcontrast_aux_loss",
+            *vcontrast_per_layer_cols,
             "vcontrast_lambda",
         ]
         legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
@@ -2079,7 +2104,11 @@ def main() -> None:
                     ann_ent_str = f"{accum_ann_ent_loss / args.grad_accum_steps:.6f}"
                     ann_gate_str = f"{accum_ann_gate_mean / args.grad_accum_steps:.6f}"
                     ann_lambda_str = f"{dynamic_entropy_lambda:.6f}"
-                n_hg_slots = len(expected_header) - 20  # 13 base + 3 consol + 4 vcontrast = 20 non-hg columns
+                # Non-hg columns: 13 base + 3 consol + 2 vcontrast scalars
+                # (aux_loss, lambda) + N per-layer vcontrast columns. Subtract
+                # from total to size the hg block (hg_0..hg_N, std/min/max).
+                n_vcontrast_per_layer_cols = len(config.engram_inject_layers or ())
+                n_hg_slots = len(expected_header) - (18 + n_vcontrast_per_layer_cols)
                 hg_cols = [""] * n_hg_slots
                 hg_module = None
                 if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
@@ -2102,22 +2131,19 @@ def main() -> None:
                     mse_loss_str = f"{accum_mse_loss / args.grad_accum_steps:.6f}"
                     consol_phase_str = "1" if step >= args.consolidation_start_step else "0"
                     inject_mult_str = f"{inject_mult:.6f}"
-                # θ-V-contrast (ZEB-130): per-layer aux losses + total + lambda.
+                # θ-V-contrast (ZEB-130): total aux + per-layer (ordered by
+                # engram_inject_layers so columns align with the header) + lambda.
                 vcontrast_aux_str = ""
-                vcontrast_l2_str = ""
-                vcontrast_l5_str = ""
+                vcontrast_per_layer_strs = [""] * n_vcontrast_per_layer_cols
                 vcontrast_lambda_str = ""
                 if config.engram_vcontrast_enabled:
                     raw_aux = accum_vcontrast_aux / args.grad_accum_steps
                     vcontrast_aux_str = f"{raw_aux:.6f}"
-                    vcontrast_l2_str = (
-                        f"{accum_vcontrast_per_layer.get('2', 0.0) / args.grad_accum_steps:.6f}"
-                        if "2" in accum_vcontrast_per_layer else ""
-                    )
-                    vcontrast_l5_str = (
-                        f"{accum_vcontrast_per_layer.get('5', 0.0) / args.grad_accum_steps:.6f}"
-                        if "5" in accum_vcontrast_per_layer else ""
-                    )
+                    for col_idx, layer_idx in enumerate(config.engram_inject_layers or ()):
+                        lk = str(layer_idx)
+                        if lk in accum_vcontrast_per_layer:
+                            v = accum_vcontrast_per_layer[lk] / args.grad_accum_steps
+                            vcontrast_per_layer_strs[col_idx] = f"{v:.6f}"
                     current_lam = lambda_schedule(
                         step,
                         config.engram_vcontrast_warmup_steps,
@@ -2143,8 +2169,7 @@ def main() -> None:
                     consol_phase_str,
                     inject_mult_str,
                     vcontrast_aux_str,
-                    vcontrast_l2_str,
-                    vcontrast_l5_str,
+                    *vcontrast_per_layer_strs,
                     vcontrast_lambda_str,
                 ])
                 csv_file.flush()
