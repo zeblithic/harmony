@@ -165,6 +165,12 @@ def save_resumable_checkpoint(
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "last_val_loss": last_val_loss,
+        # Persist the model config so --init-from can run its architecture-
+        # compatibility check against checkpoints produced by this script.
+        # Without this, the compat check silently skips (because
+        # ckpt.get('config') is None) and strict=False would load zero
+        # backbone params on an architecture mismatch.
+        "config": model.config,
     }
     if rng_state is not None:
         payload["rng_state"] = rng_state
@@ -412,6 +418,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allow-partial-init", action="store_true",
+        help=(
+            "Permit --init-from to proceed when non-engram backbone keys are "
+            "missing (otherwise the load fails hard to prevent silently "
+            "running with a randomly-initialized backbone). Also permits "
+            "--init-from when the source checkpoint has no config metadata "
+            "to compare against."
+        ),
+    )
+    parser.add_argument(
         "--freeze-backbone", action="store_true",
         help=(
             "Freeze all non-engram parameters (η-B capacity-gap / ZEB-130). "
@@ -607,6 +623,34 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
+
+    # η-B capacity-gap contract: --freeze-backbone is meant to train ONLY
+    # engram_injections.* params. The optimizer-construction path below still
+    # adds thought_norm / uq_head / mtp_head / latent_projection / consol_decoder
+    # param groups unconditionally, so combining --freeze-backbone with any of
+    # the aux-module flags silently breaks the "injections-only" invariant.
+    # Fail here instead so the run doesn't complete hours later as a confounded
+    # experiment.
+    if args.freeze_backbone:
+        aux_conflicts = []
+        if args.coconut:
+            aux_conflicts.append("--coconut")
+        if args.uq_head:
+            aux_conflicts.append("--uq-head")
+        if args.mtp_head:
+            aux_conflicts.append("--mtp-head")
+        if args.contrastive_loss:
+            aux_conflicts.append("--contrastive-loss")
+        if args.consolidation_mode != "none":
+            aux_conflicts.append(f"--consolidation-mode={args.consolidation_mode}")
+        if aux_conflicts:
+            print(
+                "Error: --freeze-backbone is incompatible with aux-trainable "
+                "modules; capgap runs must optimize only engram_injections.*. "
+                f"Conflicting flags: {', '.join(aux_conflicts)}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     # --zero-injection-eval is an eval-only early-exit path, so training data
     # is not required when that flag is set.
@@ -955,15 +999,26 @@ def main() -> None:
 
         if args.engram_xattn_table is not None:
             capgap_table = EngramCrossAttention.load_corpus_table(args.engram_xattn_table)
-        else:
-            # --synthetic or no table provided: build a random placeholder sized
-            # (vocab_size, engram_dim). Real runs must pass --engram-xattn-table.
+        elif args.synthetic:
+            # Synthetic smoke tests can use a random placeholder table sized
+            # (vocab_size, engram_dim) so the capgap path is exercised without
+            # requiring a real oracle table artifact on disk.
             print(
-                "[capgap] No --engram-xattn-table provided; using random "
-                f"({config.vocab_size}, {config.engram_dim}) placeholder table for "
-                "smoke-test compatibility."
+                "[capgap] --synthetic with no --engram-xattn-table; using random "
+                f"({config.vocab_size}, {config.engram_dim}) placeholder table."
             )
             capgap_table = torch.randn(config.vocab_size, config.engram_dim)
+        else:
+            # Real run with no table would silently attend over random memory
+            # and produce meaningless retrieval — fail loudly instead.
+            print(
+                "Error: --config=tiny_engram_xattn_capgap requires "
+                "--engram-xattn-table for non-synthetic runs (a random "
+                "placeholder table would invalidate the experiment). Pass "
+                "--synthetic for smoke tests.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
         capgap_injections: dict[int, GatedEngramInjection] = {}
         for layer_idx in config.engram_inject_layers:
@@ -1070,6 +1125,16 @@ def main() -> None:
         # zero backbone params and the run would proceed with a randomly-
         # initialized model masquerading as "loaded from checkpoint".
         src_config = ckpt.get("config")
+        if src_config is None and not args.allow_partial_init:
+            print(
+                f"Error: --init-from source {args.init_from} has no config "
+                "metadata to compare against. Without a compat check, "
+                "strict=False could silently load zero backbone params on an "
+                "architecture mismatch. Pass --allow-partial-init to override "
+                "(e.g., for legacy checkpoints).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         if src_config is not None:
             _shape_critical_fields = (
                 "num_layers", "hidden_dim", "num_query_heads", "num_kv_heads",
@@ -1107,17 +1172,29 @@ def main() -> None:
             )
         if missing:
             non_engram_missing = [
-                k for k in missing if not k.startswith("engram_injections")
+                k for k in missing if not k.startswith("engram_injections.")
             ]
             if non_engram_missing:
                 preview = ", ".join(non_engram_missing[:5])
                 if len(non_engram_missing) > 5:
                     preview += f", ... (+{len(non_engram_missing) - 5} more)"
-                print(
-                    f"Warning: --init-from missing {len(non_engram_missing)} "
-                    f"non-engram keys: {preview}",
-                    file=sys.stderr,
-                )
+                if args.allow_partial_init:
+                    print(
+                        f"Warning: --init-from missing "
+                        f"{len(non_engram_missing)} non-engram keys "
+                        f"(--allow-partial-init override): {preview}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"Error: --init-from missing "
+                        f"{len(non_engram_missing)} non-engram backbone keys; "
+                        "would run with randomly-initialized parameters. Pass "
+                        "--allow-partial-init to override. Missing: "
+                        f"{preview}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
             else:
                 print(
                     f"--init-from loaded cleanly (missing only "

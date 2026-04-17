@@ -1107,4 +1107,9 @@ class GatedEngramInjection(nn.Module):
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         xattn_out = self.engram_xattn(hidden_state)
-        return torch.tanh(self.alpha) * xattn_out
+        # Under bf16 autocast, xattn_out is bf16 but self.alpha stays fp32;
+        # a plain multiply would promote the product to fp32 and defeat AMP
+        # for the rest of the injected layer. Cast the gate into xattn_out's
+        # dtype so the residual stays in low precision.
+        gate = torch.tanh(self.alpha).to(dtype=xattn_out.dtype)
+        return gate * xattn_out

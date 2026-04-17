@@ -644,3 +644,158 @@ class TestCapgapSmokeIntegration:
             f"--zero-injection-eval did not report delta:\n"
             f"STDOUT:\n{r2.stdout}\nSTDERR:\n{r2.stderr}"
         )
+
+
+class TestHardFailGuards:
+    """Guardrails added after PR #247 review: silent misconfiguration must become
+    a hard exit so GPU-hours are not burned on confounded experiments."""
+
+    def _run_train(self, *argv, timeout=30):
+        import os
+        import subprocess
+        import sys
+
+        training_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return subprocess.run(
+            [sys.executable, "-m", "ct87.train", *argv],
+            capture_output=True, text=True, timeout=timeout,
+            cwd=training_root,
+        )
+
+    def _save_ckpt(self, path, config, with_config_key: bool, with_all_keys: bool = True):
+        """Write a .pt checkpoint for --init-from.
+
+        with_config_key=False simulates a legacy checkpoint missing config metadata.
+        with_all_keys=False simulates a checkpoint missing non-engram backbone keys.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        model = HarmonyModel(config)
+        state = model.state_dict()
+        if not with_all_keys:
+            # Drop half the backbone keys to simulate partial/renamed source.
+            keys = sorted(state.keys())
+            for k in keys[: len(keys) // 2]:
+                state.pop(k)
+        payload = {
+            "model_state_dict": state,
+            "optimizer_state_dict": {},
+            "step": 0,
+            "rng_state": torch.get_rng_state(),
+        }
+        if with_config_key:
+            payload["config"] = config
+        torch.save(payload, path)
+
+    def test_init_from_rejects_checkpoint_without_config(self, tmp_path):
+        """Legacy --init-from source missing a 'config' field must exit 2."""
+        src = tmp_path / "legacy.pt"
+        self._save_ckpt(src, HarmonyModelConfig.tiny(), with_config_key=False)
+        r = self._run_train(
+            "--init-from", str(src),
+            "--config", "tiny_engram_xattn_capgap",
+            "--synthetic",
+            "--output-dir", str(tmp_path / "out"),
+            "--steps", "1",
+        )
+        assert r.returncode == 2, (
+            f"Expected exit 2 on missing config metadata, got {r.returncode}\n"
+            f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+        )
+        assert "no config metadata" in (r.stderr + r.stdout).lower()
+
+    def test_init_from_accepts_no_config_with_allow_partial_init(self, tmp_path):
+        """--allow-partial-init permits loading a legacy checkpoint missing config."""
+        src = tmp_path / "legacy.pt"
+        self._save_ckpt(src, HarmonyModelConfig.tiny(), with_config_key=False)
+        r = self._run_train(
+            "--init-from", str(src),
+            "--allow-partial-init",
+            "--config", "tiny_engram_xattn_capgap",
+            "--synthetic",
+            "--output-dir", str(tmp_path / "out"),
+            "--steps", "1",
+            "--batch-size", "2",
+            "--seq-len", "32",
+            "--checkpoint-interval", "1",
+            timeout=180,
+        )
+        assert r.returncode == 0, (
+            f"--allow-partial-init should permit missing config, got exit "
+            f"{r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+        )
+
+    def test_init_from_rejects_missing_backbone_keys(self, tmp_path):
+        """--init-from must exit 2 when non-engram backbone keys are missing."""
+        src = tmp_path / "partial.pt"
+        self._save_ckpt(
+            src, HarmonyModelConfig.tiny(),
+            with_config_key=True, with_all_keys=False,
+        )
+        r = self._run_train(
+            "--init-from", str(src),
+            "--config", "tiny_engram_xattn_capgap",
+            "--synthetic",
+            "--output-dir", str(tmp_path / "out"),
+            "--steps", "1",
+            "--batch-size", "2",
+            "--seq-len", "32",
+        )
+        assert r.returncode == 2, (
+            f"Expected exit 2 on missing backbone keys, got {r.returncode}\n"
+            f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+        )
+        lower = (r.stderr + r.stdout).lower()
+        assert "missing" in lower and "non-engram" in lower
+
+    def test_capgap_requires_xattn_table_without_synthetic(self, tmp_path):
+        """Capgap preset must refuse to build a random placeholder table in real runs."""
+        src = tmp_path / "src.pt"
+        self._save_ckpt(src, HarmonyModelConfig.tiny(), with_config_key=True)
+        # Use --data with a non-existent path so we never reach the dataloader.
+        r = self._run_train(
+            "--init-from", str(src),
+            "--config", "tiny_engram_xattn_capgap",
+            "--data", "/tmp/does-not-exist",
+            "--output-dir", str(tmp_path / "out"),
+            "--steps", "1",
+        )
+        assert r.returncode == 2, (
+            f"Expected exit 2 when capgap run is missing --engram-xattn-table "
+            f"and not --synthetic, got {r.returncode}\n"
+            f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+        )
+        assert "--engram-xattn-table" in (r.stderr + r.stdout)
+
+    def test_freeze_backbone_rejects_coconut(self, tmp_path):
+        """--freeze-backbone + --coconut must exit 2 (aux modules would still train)."""
+        r = self._run_train(
+            "--freeze-backbone",
+            "--coconut",
+            "--think-token-id", "0",
+            "--config", "tiny_engram_xattn_capgap",
+            "--synthetic",
+            "--output-dir", str(tmp_path / "out"),
+            "--steps", "1",
+        )
+        assert r.returncode == 2, (
+            f"Expected exit 2 on --freeze-backbone + --coconut, got "
+            f"{r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+        )
+        combined = r.stderr + r.stdout
+        assert "--freeze-backbone" in combined and "--coconut" in combined
+
+    def test_freeze_backbone_rejects_uq_head(self, tmp_path):
+        """--freeze-backbone + --uq-head must also fail fast."""
+        r = self._run_train(
+            "--freeze-backbone",
+            "--uq-head",
+            "--config", "tiny_engram_xattn_capgap",
+            "--synthetic",
+            "--output-dir", str(tmp_path / "out"),
+            "--steps", "1",
+        )
+        assert r.returncode == 2, (
+            f"Expected exit 2 on --freeze-backbone + --uq-head, got "
+            f"{r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+        )
+        assert "--uq-head" in (r.stderr + r.stdout)

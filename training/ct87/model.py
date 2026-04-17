@@ -17,7 +17,11 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _gradient_checkpoint
 
 if TYPE_CHECKING:
-    from ct87.engram import EngramANNInjection, EngramCrossAttention
+    from ct87.engram import (
+        EngramANNInjection,
+        EngramCrossAttention,
+        GatedEngramInjection,
+    )
 
 
 @dataclass
@@ -603,7 +607,7 @@ class HarmonyModel(nn.Module):
         self.engram_xattn = module
 
     def attach_gated_engram_injections(
-        self, injections_by_layer: "dict[int, GatedEngramInjection]"
+        self, injections_by_layer: dict[int, "GatedEngramInjection"]
     ) -> None:
         """Attach the η-B multi-layer gated injection modules (ZEB-130).
 
