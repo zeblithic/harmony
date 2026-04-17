@@ -393,6 +393,32 @@ class HarmonyModelConfig:
         base.__post_init__()  # re-validate after mutation
         return base
 
+    @staticmethod
+    def tiny_engram_xattn_capgap_qdiv() -> "HarmonyModelConfig":
+        """ι_1: capgap baseline + Q-div aux only (no V-contrast).
+
+        Ablation test: does load-balancing Q's retrieval distribution alone
+        unstick the η-B content-invariance, or is V-side pressure also needed?
+        Spec: docs/superpowers/specs/2026-04-17-iota-q-diversity-design.md
+        """
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        config.engram_qdiv_enabled = True
+        config.__post_init__()
+        return config
+
+    @staticmethod
+    def tiny_engram_xattn_capgap_vcontrast_qdiv() -> "HarmonyModelConfig":
+        """ι_2: capgap + V-contrast + Q-div together.
+
+        Combined shortcut-closure test: does pressuring V toward content-
+        sensitivity AND Q toward diversity jointly content-route at 40M?
+        Spec: docs/superpowers/specs/2026-04-17-iota-q-diversity-design.md
+        """
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast()
+        config.engram_qdiv_enabled = True
+        config.__post_init__()
+        return config
+
 
 # ---------------------------------------------------------------------------
 # Layer building blocks

@@ -406,6 +406,8 @@ def main() -> None:
             "tiny_engram_xattn_ctrl",
             "tiny_engram_xattn_capgap",
             "tiny_engram_xattn_capgap_vcontrast",
+            "tiny_engram_xattn_capgap_qdiv",
+            "tiny_engram_xattn_capgap_vcontrast_qdiv",
         ],
         default="tiny",
         help="Model config. 'tiny_ffn_expanded' is Model beta (params-matched "
@@ -843,6 +845,10 @@ def main() -> None:
         config = HarmonyModelConfig.tiny_engram_xattn_capgap()
     elif args.config == "tiny_engram_xattn_capgap_vcontrast":
         config = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast()
+    elif args.config == "tiny_engram_xattn_capgap_qdiv":
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap_qdiv()
+    elif args.config == "tiny_engram_xattn_capgap_vcontrast_qdiv":
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast_qdiv()
     else:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)

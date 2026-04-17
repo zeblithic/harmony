@@ -293,3 +293,24 @@ class TestHarmonyModelQdivSink:
         model._qdiv_aux_losses.clear()
         _ = model(input_ids)
         assert len(model._qdiv_aux_losses) == len(c.engram_inject_layers)
+
+
+class TestIotaPresets:
+    def test_iota_1_preset_qdiv_on_vcontrast_off(self):
+        c = HarmonyModelConfig.tiny_engram_xattn_capgap_qdiv()
+        assert c.engram_qdiv_enabled is True
+        assert c.engram_vcontrast_enabled is False
+        assert len(c.engram_inject_layers) > 0
+
+    def test_iota_2_preset_both_on(self):
+        c = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast_qdiv()
+        assert c.engram_qdiv_enabled is True
+        assert c.engram_vcontrast_enabled is True
+        assert len(c.engram_inject_layers) > 0
+
+    def test_iota_presets_use_default_lambdas(self):
+        c1 = HarmonyModelConfig.tiny_engram_xattn_capgap_qdiv()
+        assert c1.engram_qdiv_lambda == 0.01
+        assert c1.engram_qdiv_warmup_steps == 200
+        c2 = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast_qdiv()
+        assert c2.engram_qdiv_lambda == 0.01
