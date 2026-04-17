@@ -302,7 +302,9 @@ class TestContrastiveGatedEngramInjection:
 
         assert len(sink_a) == 3 and len(sink_b) == 3
         for a, b in zip(sink_a, sink_b, strict=True):
-            assert torch.allclose(a, b, atol=0), (
+            # torch.equal is bit-identical; torch.allclose with default rtol
+            # would accept ~1e-5 drift and hide a real divergence here.
+            assert torch.equal(a, b), (
                 "Same-seeded generators must produce bit-identical aux losses; "
                 "got divergence — shuffle generator isn't actually driving the perm."
             )
