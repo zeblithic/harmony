@@ -582,6 +582,33 @@ def main() -> None:
             "the seed is for reproducibility debugging only)."
         ),
     )
+    # ---- ZEB-130: ι-Q-diversity ----
+    parser.add_argument(
+        "--engram-qdiv",
+        action="store_true",
+        help=(
+            "Enable Q-side load-balancing aux loss. Must match the selected "
+            "preset's engram_qdiv_enabled value."
+        ),
+    )
+    parser.add_argument(
+        "--engram-qdiv-lambda",
+        type=float,
+        default=None,
+        help=(
+            "Override lambda for Q-div aux loss. Requires --engram-qdiv + a "
+            "qdiv-enabled preset. None = use preset's value."
+        ),
+    )
+    parser.add_argument(
+        "--engram-qdiv-warmup-steps",
+        type=int,
+        default=None,
+        help=(
+            "Override warmup steps for Q-div lambda. Requires --engram-qdiv + "
+            "a qdiv-enabled preset. None = use preset's value."
+        ),
+    )
     parser.add_argument(
         "--latent-intermediate-dim", type=int, default=None,
         help="Intermediate dimension for latent projection MLP",
@@ -890,6 +917,37 @@ def main() -> None:
     if config.engram_vcontrast_enabled:
         # Re-run validation after CLI mutation, mirroring tiny_ffn_expanded /
         # tiny_engram_xattn_capgap pattern.
+        config.__post_init__()
+
+    # ι-Q-diversity (ZEB-130): --engram-qdiv must exactly match the preset's
+    # engram_qdiv_enabled. Same reasoning as V-contrast: preset mutation via
+    # flag makes CSV logs ambiguous.
+    if args.engram_qdiv != config.engram_qdiv_enabled:
+        print(
+            "Error: --engram-qdiv must match the selected preset's "
+            f"engram_qdiv_enabled (preset={config.engram_qdiv_enabled}, "
+            f"flag={args.engram_qdiv}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not config.engram_qdiv_enabled and (
+        args.engram_qdiv_lambda is not None
+        or args.engram_qdiv_warmup_steps is not None
+    ):
+        print(
+            "Error: --engram-qdiv-{lambda,warmup-steps} require a Q-div "
+            "preset + --engram-qdiv.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Apply overrides after validation
+    if args.engram_qdiv_lambda is not None:
+        config.engram_qdiv_lambda = args.engram_qdiv_lambda
+    if args.engram_qdiv_warmup_steps is not None:
+        config.engram_qdiv_warmup_steps = args.engram_qdiv_warmup_steps
+    if config.engram_qdiv_enabled:
+        # Re-run validation after CLI mutation, mirroring V-contrast pattern.
         config.__post_init__()
 
     # Model gamma arg validation (ZEB-117)

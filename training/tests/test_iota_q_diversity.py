@@ -5,11 +5,32 @@ docs/superpowers/specs/2026-04-17-iota-q-diversity-design.md
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from ct87.model import HarmonyModelConfig
+
+
+REPO_TRAINING_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _run_train_py(args: list[str]) -> subprocess.CompletedProcess:
+    import os
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO_TRAINING_ROOT)
+    return subprocess.run(
+        [sys.executable, "ct87/train.py", *args],
+        cwd=REPO_TRAINING_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+    )
 
 
 class TestConfigValidation:
@@ -314,3 +335,32 @@ class TestIotaPresets:
         assert c1.engram_qdiv_warmup_steps == 200
         c2 = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast_qdiv()
         assert c2.engram_qdiv_lambda == 0.01
+
+
+class TestCliFlagPresetConsistency:
+    def test_qdiv_flag_without_preset_rejected(self):
+        """Non-qdiv preset + --engram-qdiv must exit non-zero with a clear error."""
+        result = _run_train_py([
+            "--config", "tiny_engram_xattn_capgap",
+            "--engram-qdiv",
+            "--steps", "0",
+            "--val-data", "/tmp/does-not-exist",
+            "--synthetic",
+        ])
+        assert result.returncode != 0
+        combined = result.stderr + result.stdout
+        # The error should mention both --engram-qdiv and preset in some form
+        assert "engram-qdiv" in combined.lower() or "engram_qdiv" in combined.lower()
+
+    def test_qdiv_lambda_without_enabled_rejected(self):
+        """--engram-qdiv-lambda without --engram-qdiv + qdiv preset exits non-zero."""
+        result = _run_train_py([
+            "--config", "tiny_engram_xattn_capgap",
+            "--engram-qdiv-lambda", "0.02",
+            "--steps", "0",
+            "--val-data", "/tmp/does-not-exist",
+            "--synthetic",
+        ])
+        assert result.returncode != 0
+        combined = (result.stderr + result.stdout).lower()
+        assert "engram-qdiv" in combined or "engram_qdiv" in combined
