@@ -80,3 +80,52 @@ class TestGatedEngramInjection:
         """Default alpha_init is 0.0 (the safe zero-perturbation value)."""
         wrapper = GatedEngramInjection(self._make_xattn())
         assert wrapper.alpha.detach().item() == 0.0
+
+
+class TestCapacityGapConfig:
+    """Config fields and preset for η-B."""
+
+    def test_config_has_inject_layers_default_empty(self):
+        """Default config has empty engram_inject_layers (legacy behavior preserved)."""
+        c = HarmonyModelConfig.tiny()
+        assert c.engram_inject_layers == ()
+
+    def test_config_has_gate_init_default_zero(self):
+        """Default config has engram_gate_init=0.0."""
+        c = HarmonyModelConfig.tiny()
+        assert c.engram_gate_init == 0.0
+
+    def test_capgap_preset_sets_inject_layers(self):
+        """tiny_engram_xattn_capgap uses multi-layer injection at layers 2 and 5."""
+        c = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        assert c.engram_inject_layers == (2, 5)
+        assert c.engram_gate_init == 0.0
+
+    def test_capgap_preset_does_not_set_legacy_xattn_flag(self):
+        """capgap preset uses the new path, not the legacy single-point path."""
+        c = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        assert c.use_xattn_engram is False
+        assert c.use_ann_engram is False
+
+    def test_config_rejects_mixing_legacy_and_multi_layer(self):
+        """Config must not set use_xattn_engram=True alongside non-empty inject_layers."""
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            HarmonyModelConfig(
+                num_layers=8, hidden_dim=512, num_query_heads=8, num_kv_heads=4,
+                head_dim=64, ffn_dim=1365, vocab_size=32000, max_seq_len=4096,
+                rope_theta=1e6, rms_norm_eps=1e-6, layers_per_block=2,
+                engram_injection_layer=2, engram_dim=128, tie_embeddings=True,
+                use_xattn_engram=True,
+                engram_inject_layers=(2, 5),
+            )
+
+    def test_config_rejects_out_of_range_inject_layer(self):
+        """engram_inject_layers must reference valid layer indices."""
+        with pytest.raises(ValueError, match="outside"):
+            HarmonyModelConfig(
+                num_layers=8, hidden_dim=512, num_query_heads=8, num_kv_heads=4,
+                head_dim=64, ffn_dim=1365, vocab_size=32000, max_seq_len=4096,
+                rope_theta=1e6, rms_norm_eps=1e-6, layers_per_block=2,
+                engram_injection_layer=2, engram_dim=128, tie_embeddings=True,
+                engram_inject_layers=(2, 99),
+            )

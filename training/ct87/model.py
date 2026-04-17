@@ -68,6 +68,11 @@ class HarmonyModelConfig:
     use_xattn_engram: bool = False
     use_head_gates: bool = False
     ffn_dim_overrides: dict[int, int] | None = None
+    # η-B / ZEB-130: multi-layer gated cross-attention injection.
+    # Non-empty means use the GatedEngramInjection ModuleDict path
+    # (mutually exclusive with use_xattn_engram / use_ann_engram).
+    engram_inject_layers: tuple[int, ...] = ()
+    engram_gate_init: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate `ffn_dim_overrides` up front so misconfigurations fail fast.
@@ -81,6 +86,22 @@ class HarmonyModelConfig:
                 "exclusive - only one research-only engram injection "
                 "module can be attached at a time."
             )
+        # η-B multi-layer injection is mutually exclusive with the legacy
+        # single-point paths (model delta xattn, model gamma ANN).
+        if self.engram_inject_layers:
+            if self.use_xattn_engram or self.use_ann_engram:
+                raise ValueError(
+                    "engram_inject_layers (multi-layer gated injection) is "
+                    "mutually exclusive with use_xattn_engram / use_ann_engram "
+                    "(single-point legacy paths)."
+                )
+            for layer_idx in self.engram_inject_layers:
+                if not (0 <= layer_idx < self.num_layers):
+                    raise ValueError(
+                        f"engram_inject_layers has layer_idx={layer_idx} "
+                        f"outside [0, {self.num_layers}) - would be silently "
+                        "ignored at model construction."
+                    )
         if self.ffn_dim_overrides is None:
             return
         for layer_idx, dim in self.ffn_dim_overrides.items():
@@ -255,6 +276,25 @@ class HarmonyModelConfig:
         """Zeta-ctrl: cross-attention control, no consolidation (ZEB-128)."""
         base = HarmonyModelConfig.tiny()
         base.use_xattn_engram = True
+        return base
+
+    @staticmethod
+    def tiny_engram_xattn_capgap() -> HarmonyModelConfig:
+        """η-B capacity-gap: multi-layer zero-init gated xattn injection (ZEB-130).
+
+        Attaches gated cross-attention injection at layers 2 and 5 (early +
+        mid-late, matching DeepSeek Engram's U-shaped scaling). Gate alpha
+        initialized to 0 so tanh(0)=0 produces no perturbation at step 0 —
+        preserves the frozen pretrained baseline's behavior until the
+        optimizer learns to open the gate.
+
+        Used with --freeze-backbone and --init-from <beta_checkpoint> to test
+        H2: can a well-trained backbone leverage a gated engram signal that
+        the from-scratch co-training setup could not?
+        """
+        base = HarmonyModelConfig.tiny()
+        base.engram_inject_layers = (2, 5)
+        base.engram_gate_init = 0.0
         return base
 
 
