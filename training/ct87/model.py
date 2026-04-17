@@ -603,6 +603,12 @@ class HarmonyModel(nn.Module):
         self._last_ann_gate: torch.Tensor | None = None
         self._last_xattn_output: torch.Tensor | None = None
         self._last_pre_injection_hidden: torch.Tensor | None = None
+        # θ-V-contrast (ZEB-130): aux-loss sink populated by
+        # ContrastiveGatedEngramInjection wrappers during the forward pass.
+        # Owned by the training script (which assigns the same list reference
+        # into both this attribute and each wrapper's `_aux_sink`); cleared
+        # at the start of every training-mode forward.
+        self._contrastive_aux_losses: list[torch.Tensor] | None = None
         self.engram_inject_mult: float = 1.0
 
         # Tied embeddings
@@ -805,6 +811,11 @@ class HarmonyModel(nn.Module):
         self._last_ann_gate = None
         self._last_xattn_output = None
         self._last_pre_injection_hidden = None
+        # V-contrast aux-loss sink: clear only in training mode so eval-time
+        # callers (e.g. forensic) can inspect a pre-loaded list without it
+        # being wiped out.
+        if self._contrastive_aux_losses is not None and self.training:
+            self._contrastive_aux_losses.clear()
 
         # η-B misuse guard: a multi-layer capgap config without an attach call
         # would silently fall through to the legacy single-point elif below

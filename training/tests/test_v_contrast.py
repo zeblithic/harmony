@@ -9,7 +9,7 @@ from ct87.engram import (
     EngramCrossAttention,
     GatedEngramInjection,
 )
-from ct87.model import HarmonyModelConfig
+from ct87.model import HarmonyModel, HarmonyModelConfig
 
 
 def _tiny_config() -> HarmonyModelConfig:
@@ -265,3 +265,58 @@ class TestContrastiveGatedEngramInjection:
             "branch's RNG should differ — the shuf branch is leaking into "
             "the residual."
         )
+
+
+class TestModelAuxLossSink:
+
+    def _make_capgap_vcontrast_model(self):
+        """Build a tiny model + ContrastiveGatedEngramInjection wrappers
+        without going through train.py — keeps the test self-contained."""
+        c = _tiny_config()
+        c.engram_inject_layers = (1,)
+        c.engram_vcontrast_enabled = True
+        c.__post_init__()
+        model = HarmonyModel(c)
+        table = torch.randn(16, c.engram_dim)
+        sink: list = []
+        injections = {}
+        for layer_idx in c.engram_inject_layers:
+            xattn = EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
+            injections[layer_idx] = ContrastiveGatedEngramInjection(
+                xattn, alpha_init=0.0, aux_loss_sink=sink,
+            )
+        model.attach_gated_engram_injections(injections)
+        model._contrastive_aux_losses = sink
+        return model, sink
+
+    def test_default_attribute_is_none(self):
+        c = _tiny_config()
+        model = HarmonyModel(c)
+        assert model._contrastive_aux_losses is None
+
+    def test_forward_clears_list_in_training(self):
+        model, sink = self._make_capgap_vcontrast_model()
+        # Pre-load the sink with a stale value to verify forward clears it
+        # before the wrappers append.
+        sink.append(torch.tensor(99.0))
+        model.train(True)
+        input_ids = torch.randint(0, model.config.vocab_size, (2, 5))
+        _ = model(input_ids)
+        # After forward, the sink should contain ONLY the per-layer entries
+        # appended during this forward (one per injection layer), not the
+        # stale 99.0 we put in.
+        assert len(sink) == len(model.config.engram_inject_layers)
+        for entry in sink:
+            assert entry.item() != 99.0
+
+    def test_forward_does_not_clear_in_eval(self):
+        """In eval mode the wrappers don't append, but model.forward must
+        also not clear — so a caller's pre-loaded list survives. (Edge case
+        for resumable forensic flows that may want to inspect the sink.)"""
+        model, sink = self._make_capgap_vcontrast_model()
+        sink.append(torch.tensor(42.0))
+        model.eval()
+        input_ids = torch.randint(0, model.config.vocab_size, (2, 5))
+        _ = model(input_ids)
+        assert len(sink) == 1
+        assert sink[0].item() == 42.0
