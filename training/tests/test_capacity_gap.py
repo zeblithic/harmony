@@ -27,12 +27,10 @@ class TestGatedEngramInjection:
     def _make_xattn(self) -> EngramCrossAttention:
         c = _tiny_config()
         table = torch.randn(16, c.engram_dim)
-        xattn = EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
-        # EngramCrossAttention zero-inits o_proj by design (step-0 no-op
-        # contract). Override here so tests that require non-zero xattn
-        # output can observe the gate signal.
-        nn.init.xavier_uniform_(xattn.o_proj.weight)
-        return xattn
+        # No o_proj override needed: GatedEngramInjection.__init__ now
+        # re-initializes o_proj to xavier_uniform itself, because the gate
+        # takes over the step-0 no-op contract from the wrapped xattn.
+        return EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
 
     def test_forward_zero_at_init(self):
         """With alpha_init=0, tanh(0)=0 so the gate output is the zero tensor."""
@@ -66,6 +64,41 @@ class TestGatedEngramInjection:
         loss.backward()
         assert wrapper.alpha.grad is not None
         assert wrapper.alpha.grad.abs().item() > 1e-8
+
+    def test_no_gradient_dead_zone_with_zero_alpha(self):
+        """At alpha_init=0, gradient must still flow to alpha on the first
+        backward. Guards against the dual-zero-init dead zone: if the wrapped
+        xattn's o_proj were left at its zero-init, we'd have
+        tanh(0) * o_proj @ attn = 0 * 0 = 0, with BOTH partials vanishing
+        (∂/∂alpha = sech²(0) * 0 = 0 and ∂/∂o_proj = tanh(0) * attn = 0),
+        leaving the injection frozen for the entire run. GatedEngramInjection
+        breaks this by xavier-initializing the wrapped o_proj."""
+        torch.manual_seed(0)
+        # Build EngramCrossAttention directly (no _make_xattn helper) to
+        # prove the wrapper itself is doing the fix, not the test setup.
+        c = _tiny_config()
+        table = torch.randn(16, c.engram_dim)
+        raw_xattn = EngramCrossAttention(c, table, num_heads=2, k_retrieved=4)
+        wrapper = GatedEngramInjection(raw_xattn, alpha_init=0.0)
+        assert wrapper.engram_xattn.o_proj.weight.abs().sum().item() > 0.0, (
+            "Wrapped o_proj should have been xavier-inited by "
+            "GatedEngramInjection.__init__"
+        )
+        wrapper.train(True)
+        h = torch.randn(2, 5, 64)
+        out = wrapper(h)
+        # out.sum() gives uniform ∂L/∂out = 1 per element, so
+        # ∂L/∂alpha = sech²(0) * sum(xattn_out) = sum(xattn_out). This stays
+        # well-defined even though out itself is identically zero at
+        # alpha_init=0. Using out.pow(2).mean() would zero the upstream
+        # gradient and give a false-pass regardless of the bug.
+        loss = out.sum()
+        loss.backward()
+        assert wrapper.alpha.grad is not None
+        assert wrapper.alpha.grad.abs().item() > 1e-8, (
+            f"alpha.grad vanished (={wrapper.alpha.grad.item()!r}); "
+            "the injection would be frozen for the entire run."
+        )
 
     def test_forward_nonzero_when_alpha_nonzero(self):
         """With alpha != 0, output must be non-zero (injection is active)."""
@@ -198,17 +231,18 @@ class TestHarmonyModelMultiLayerInjection:
     def _build_injections(
         self, config: HarmonyModelConfig
     ) -> dict[int, GatedEngramInjection]:
-        """Build injections using the real EngramCrossAttention API, with
-        o_proj overridden to xavier_uniform so the injection produces a
-        non-trivial signal (otherwise xattn's zero-init o_proj would make
-        all 'gate opens' tests pass trivially)."""
+        """Build injections using the real EngramCrossAttention API.
+
+        No manual o_proj override is needed: GatedEngramInjection.__init__
+        re-initializes the wrapped o_proj to xavier_uniform itself (the
+        gate takes over xattn's step-0 no-op contract). This mirrors the
+        production path in train.py."""
         out: dict[int, GatedEngramInjection] = {}
         table = torch.randn(16, config.engram_dim)
         for layer_idx in config.engram_inject_layers:
             xattn = EngramCrossAttention(
                 config, table, num_heads=2, k_retrieved=4,
             )
-            nn.init.xavier_uniform_(xattn.o_proj.weight)
             out[layer_idx] = GatedEngramInjection(
                 xattn, alpha_init=config.engram_gate_init,
             )

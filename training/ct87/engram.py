@@ -1094,6 +1094,13 @@ class GatedEngramInjection(nn.Module):
     ``h = h + engram_inject_mult * wrapper(h)`` so that the global
     ``engram_inject_mult`` (used by ``--zero-injection-eval``) still zeroes
     out the injection regardless of gate state.
+
+    Note: the wrapper takes over the step-0 no-op job from the wrapped
+    ``EngramCrossAttention``, so ``__init__`` re-initializes
+    ``engram_xattn.o_proj`` from the default zero-init to ``xavier_uniform``.
+    Without that, both ``tanh(alpha_init)`` and ``o_proj`` starting at zero
+    creates a gradient dead zone (both partial derivatives vanish) and the
+    injection can never learn.
     """
 
     def __init__(
@@ -1104,6 +1111,24 @@ class GatedEngramInjection(nn.Module):
         super().__init__()
         self.engram_xattn = engram_xattn
         self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+
+        # Break the dual-zero-init gradient dead zone. EngramCrossAttention
+        # zero-inits o_proj.weight as its own anti-collapse mechanism (used by
+        # the legacy δ path, where there is no gate). When we wrap it with a
+        # gate whose tanh(alpha_init)=0 (the default), the gate itself becomes
+        # the step-0 no-op guarantee, so the wrapped o_proj=0 contract is
+        # redundant — and actively harmful. With both the gate AND o_proj at
+        # zero, forward = tanh(0) * o_proj @ attn_out = 0, AND both partial
+        # derivatives vanish:
+        #   ∂/∂alpha   = sech²(0) * (o_proj @ attn_out) = 1 * 0 = 0
+        #   ∂/∂o_proj  = tanh(0)  * attn_out           = 0 * anything = 0
+        # So neither param ever receives gradient and the injection stays
+        # permanently closed. Re-init o_proj to xavier_uniform so the gate is
+        # the *only* zero: gradients can then flow to alpha (via the non-zero
+        # xattn_out) and once alpha opens, to o_proj itself.
+        nn.init.xavier_uniform_(self.engram_xattn.o_proj.weight)
+        if self.engram_xattn.o_proj.bias is not None:
+            nn.init.zeros_(self.engram_xattn.o_proj.bias)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         xattn_out = self.engram_xattn(hidden_state)
