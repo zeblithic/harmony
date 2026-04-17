@@ -65,7 +65,7 @@ def compute_qdiv_aux(
 
     f = torch.bincount(
         topk_idx.reshape(-1), minlength=table_size,
-    ).to(attn.dtype) / (B * L * k)
+    ).to(device=attn.device, dtype=attn.dtype) / (B * L * k)
 
     idx = topk_idx.unsqueeze(2).expand(B, L, H, k).reshape(-1)
     P = torch.zeros(table_size, device=attn.device, dtype=attn.dtype)
