@@ -69,7 +69,7 @@ Single unified `GatedEngramInjection` class with optional `vcontrast_sink` and `
 
 Per injection-layer per-batch:
 
-```
+```text
 f[i]   = count(topk_idx == i) / (B · L · k)                   # hard frequency, detached
 P[i]   = Σ_(b,l,h,j: topk_idx[b,l,j]=i) attn[b,l,h,j] / (B·L·H)   # soft mass, differentiable
 L_qdiv = N · Σᵢ f[i] · P[i]                                   # scalar, ≥ 1.0 under uniform

@@ -22,7 +22,6 @@ REPO_TRAINING_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _run_train_py(args: list[str]) -> subprocess.CompletedProcess:
-    import os
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_TRAINING_ROOT)
     return subprocess.run(
