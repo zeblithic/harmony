@@ -154,3 +154,101 @@ class TestAttentionBlockReturnAttn:
             hidden, retrieved, topk_sims, return_attn=True,
         )
         assert torch.equal(out_default, out_with_attn)
+
+
+class TestGatedEngramInjectionSinkMatrix:
+    """Four-cell behavior matrix for the unified GatedEngramInjection.
+
+    No sinks   -> baseline η-B behavior (regression guard for PR #247).
+    vcontrast  -> PR #250 V-contrast aux; no Q-div entries.
+    qdiv       -> Q-div aux appended; no shuffled-value second forward.
+    both       -> both aux losses fire independently.
+    """
+
+    def _build(self, seed=0):
+        from ct87.engram import EngramCrossAttention
+        torch.manual_seed(seed)
+        c = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        N, E, H, k = 100, c.engram_dim, 4, 4
+        table = torch.randn(N, E)
+        return EngramCrossAttention(c, table, num_heads=H, k_retrieved=k)
+
+    def test_no_sinks_matches_baseline(self):
+        from ct87.engram import GatedEngramInjection
+        xattn = self._build()
+        wrapper = GatedEngramInjection(xattn, alpha_init=0.1)
+        wrapper.train()
+        hidden = torch.randn(2, 5, xattn.hidden_dim)
+
+        # Reference: the pre-refactor forward was `gate * xattn(hidden)` where
+        # EngramCrossAttention.forward is just retrieve_topk + _attention_block.
+        # With no sinks attached, the new forward must produce the same output.
+        with torch.no_grad():
+            xattn_out = xattn(hidden)
+            gate = torch.tanh(wrapper.alpha).to(dtype=xattn_out.dtype)
+            reference = gate * xattn_out
+            out = wrapper(hidden)
+
+        assert out.shape == hidden.shape
+        assert torch.equal(out, reference), (
+            "No-sink forward must be bit-identical to pre-refactor "
+            "gate * xattn(hidden); got max diff "
+            f"{(out - reference).abs().max().item()}"
+        )
+        # Sinks None confirms no aux compute attached.
+        assert wrapper._vcontrast_sink is None
+        assert wrapper._qdiv_sink is None
+
+    def test_only_qdiv_sink_appends_one_per_forward(self):
+        from ct87.engram import GatedEngramInjection
+        xattn = self._build(seed=1)
+        sink: list[torch.Tensor] = []
+        wrapper = GatedEngramInjection(xattn, alpha_init=0.1, qdiv_sink=sink)
+        wrapper.train()
+        hidden = torch.randn(2, 5, xattn.hidden_dim)
+        _ = wrapper(hidden)
+        assert len(sink) == 1
+        assert sink[0].ndim == 0
+        assert sink[0].item() >= 1.0  # MoE loss floor
+
+    def test_only_vcontrast_sink_appends_one_per_forward(self):
+        from ct87.engram import GatedEngramInjection
+        xattn = self._build(seed=2)
+        sink: list[torch.Tensor] = []
+        wrapper = GatedEngramInjection(xattn, alpha_init=0.1, vcontrast_sink=sink)
+        wrapper.train()
+        hidden = torch.randn(2, 5, xattn.hidden_dim)
+        _ = wrapper(hidden)
+        assert len(sink) == 1
+        assert sink[0].ndim == 0
+        assert 0.0 <= sink[0].item() <= 1.0  # cos^2.mean bounded [0, 1]
+
+    def test_both_sinks_fire_independently(self):
+        from ct87.engram import GatedEngramInjection
+        xattn = self._build(seed=3)
+        vsink: list[torch.Tensor] = []
+        qsink: list[torch.Tensor] = []
+        wrapper = GatedEngramInjection(
+            xattn, alpha_init=0.1,
+            vcontrast_sink=vsink, qdiv_sink=qsink,
+        )
+        wrapper.train()
+        hidden = torch.randn(2, 5, xattn.hidden_dim)
+        _ = wrapper(hidden)
+        assert len(vsink) == 1
+        assert len(qsink) == 1
+
+    def test_eval_mode_skips_aux(self):
+        from ct87.engram import GatedEngramInjection
+        xattn = self._build(seed=4)
+        vsink: list[torch.Tensor] = []
+        qsink: list[torch.Tensor] = []
+        wrapper = GatedEngramInjection(
+            xattn, alpha_init=0.1,
+            vcontrast_sink=vsink, qdiv_sink=qsink,
+        )
+        wrapper.eval()
+        hidden = torch.randn(2, 5, xattn.hidden_dim)
+        _ = wrapper(hidden)
+        assert len(vsink) == 0
+        assert len(qsink) == 0
