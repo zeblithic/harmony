@@ -85,6 +85,15 @@ class HarmonyModelConfig:
     engram_vcontrast_enabled: bool = False
     engram_vcontrast_lambda: float = 1.0
     engram_vcontrast_warmup_steps: int = 200
+    # ι-Q-diversity (ZEB-130): MoE load-balancing auxiliary loss on the
+    # retrieval-row marginal distribution. Penalizes imbalance in the softmax
+    # of Q @ K^T across retrieval rows (importance weighting toward uniform
+    # coverage). Only meaningful when engram_inject_layers is non-empty
+    # (Q-div operates on the retrieval softmax which only exists when
+    # engram cross-attention is injected into some layer).
+    engram_qdiv_enabled: bool = False
+    engram_qdiv_lambda: float = 0.01
+    engram_qdiv_warmup_steps: int = 200
 
     def __post_init__(self) -> None:
         """Validate `ffn_dim_overrides` up front so misconfigurations fail fast.
@@ -151,6 +160,23 @@ class HarmonyModelConfig:
                 raise ValueError(
                     "engram_vcontrast_warmup_steps must be >= 0, got "
                     f"{self.engram_vcontrast_warmup_steps!r}"
+                )
+        if self.engram_qdiv_enabled:
+            if not self.engram_inject_layers:
+                raise ValueError(
+                    "engram_qdiv_enabled=True requires "
+                    "engram_inject_layers to be non-empty (Q-div operates "
+                    "on retrieval softmax which only exists in the "
+                    "multi-layer cross-attention engram path)."
+                )
+            if self.engram_qdiv_lambda < 0:
+                raise ValueError(
+                    f"engram_qdiv_lambda must be >= 0, got {self.engram_qdiv_lambda}"
+                )
+            if self.engram_qdiv_warmup_steps < 0:
+                raise ValueError(
+                    f"engram_qdiv_warmup_steps must be >= 0, got "
+                    f"{self.engram_qdiv_warmup_steps}"
                 )
         if self.ffn_dim_overrides is None:
             return
