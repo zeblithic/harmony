@@ -1199,15 +1199,21 @@ python -m ct87.train \
     --init-from checkpoints/zeta_ctrl_2048/checkpoint.pt \
     --freeze-backbone \
     --config tiny_engram_xattn_capgap \
-    --dataset fineweb-edu-poc \
+    --data <fineweb-edu-poc-path> \
+    --engram-xattn-table <oracle-table-path> \
     --output-dir checkpoints/eta_b_capgap \
     --steps 2000 \
     --batch-size <matching ζ-2048 batch> \
     --seq-len 2048 \
     --lr <matching or slightly higher than ζ-2048, since fewer params> \
-    --checkpoint-every 200 \
-    --eval-every 200
+    --checkpoint-interval 200 \
+    --save-every 200
 ```
+
+CLI flag notes:
+- `--data` (not `--dataset`) points at the training data root
+- `--engram-xattn-table` provides the oracle corpus table (shared with the ζ / δ path); without it, capgap falls back to a random placeholder (only meant for `--synthetic` smoke tests)
+- `--save-every` controls both checkpointing and validation-loss computation (there is no separate `--eval-every`)
 
 Wall time estimate: ~2-3 GPU-hours on the 4090 (200× fewer trainable params than a full ζ run; forward-pass cost dominates).
 
@@ -1218,7 +1224,8 @@ python -m ct87.train \
     --resume-from checkpoints/eta_b_capgap/checkpoint.pt \
     --zero-injection-eval \
     --config tiny_engram_xattn_capgap \
-    --dataset fineweb-edu-poc \
+    --data <fineweb-edu-poc-path> \
+    --engram-xattn-table <oracle-table-path> \
     --output-dir /tmp/eta_b_eval \
     --seq-len 2048
 ```
@@ -1233,7 +1240,11 @@ python -m ct87.train \
 
 ### Primary diagnostic during training
 
-Watch `alpha_layer_2` and `alpha_layer_5` values in the training log. If the gates never leave near-zero, that's the strongest signal that the injection has nothing useful to contribute (either retrieval is bad or the model genuinely can't use it at this scale). If the gates open (α grows to, say, 0.5-1.0), then retrieval IS being used — if the val_loss still doesn't drop, that points to a different flavor of bottleneck.
+Watch the `g2=...` and `g5=...` values appended to each step log line (one per injection layer, showing the current `tanh(α)` gate value in `[-1, +1]`). Typical trajectories:
+
+- **Gates stay near 0 (g2, g5 ∈ [-0.02, +0.02] throughout):** strongest evidence the injection has nothing useful to contribute. Either retrieval is bad or the model can't use it at this scale.
+- **Gates open to positive values (g2, g5 → 0.3 to 0.8+):** retrieval IS being used. If val_loss still doesn't drop, that points to a different bottleneck (e.g., signal is used but adds noise equivalent to what the backbone would have learned anyway).
+- **Gates oscillate or stay negative:** diagnostic unclear; could be optimizer instability, bad initialization interaction, or adversarial signal. Reduce learning rate and re-run.
 
 ---
 

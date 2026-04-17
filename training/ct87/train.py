@@ -1776,9 +1776,20 @@ def main() -> None:
                         f"  phase={consol_active}"
                         f"  inject={inject_mult:.3f}"
                     )
+                # η-B capgap: log tanh(alpha) gate values per injection layer.
+                # This is the primary diagnostic for whether the optimizer opens
+                # the gates (alpha > 0 tanh -> 0.5+) or keeps them closed.
+                capgap_str = ""
+                if model.engram_injections is not None:
+                    with torch.no_grad():
+                        gate_parts = []
+                        for layer_key, injection in model.engram_injections.items():
+                            gate_val = torch.tanh(injection.alpha).item()
+                            gate_parts.append(f"g{layer_key}={gate_val:+.3f}")
+                        capgap_str = "  " + " ".join(gate_parts)
                 print(
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
-                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}"
+                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}{capgap_str}"
                 )
 
             val_loss_str = ""
