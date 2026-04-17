@@ -312,6 +312,29 @@ def detect_device(requested: str | None) -> torch.device:
     return torch.device("cpu")
 
 
+def freeze_backbone_for_capgap(model: "HarmonyModel") -> None:
+    """Freeze all parameters except engram_injections.* (η-B / ZEB-130).
+
+    Sets requires_grad=False on every parameter whose name does not start
+    with "engram_injections." — the optimizer then only sees the
+    GatedEngramInjection params (xattn projections + alpha scalars) when
+    constructed from a requires_grad filter.
+    """
+    frozen_count = 0
+    trainable_count = 0
+    for name, param in model.named_parameters():
+        if name.startswith("engram_injections"):
+            param.requires_grad = True
+            trainable_count += param.numel()
+        else:
+            param.requires_grad = False
+            frozen_count += param.numel()
+    print(
+        f"[capgap] Frozen {frozen_count:,} backbone params; "
+        f"{trainable_count:,} engram params remain trainable."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train ct87 model")
     parser.add_argument(
@@ -369,6 +392,15 @@ def main() -> None:
             "strict=False (missing keys for new engram injections are "
             "allowed), then starts training fresh (step=0, fresh optimizer, "
             "fresh RNG). Mutually exclusive with --resume-from."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-backbone", action="store_true",
+        help=(
+            "Freeze all non-engram parameters (η-B capacity-gap / ZEB-130). "
+            "Only engram_injections.* params receive gradients and are "
+            "added to the optimizer. Typically combined with --init-from "
+            "and the tiny_engram_xattn_capgap config."
         ),
     )
     parser.add_argument(
@@ -1125,6 +1157,12 @@ def main() -> None:
         mtp_head = MtpHead(config, depth=args.mtp_depth).to(device)
         mtp_param_count = sum(p.numel() for p in mtp_head.parameters())
         print(f"MTP head enabled: depth={args.mtp_depth}, {mtp_param_count:,} params, loss_weight={args.mtp_loss_weight}")
+
+    # η-B capacity-gap freezing: MUST come before optimizer construction so
+    # the Muon partitioner only sees trainable params (frozen backbone gets
+    # zero optimizer-state overhead).
+    if args.freeze_backbone:
+        freeze_backbone_for_capgap(model)
 
     muon_params, adam_params = partition_params(model)
     if thought_norm is not None:

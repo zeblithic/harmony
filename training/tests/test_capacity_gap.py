@@ -372,3 +372,48 @@ class TestInitFromFlag:
             and "--resume-from" in combined
             and "mutually exclusive" in combined.lower()
         ), f"Error message did not mention both flags + 'mutually exclusive':\n{combined}"
+
+
+class TestFreezeBackbone:
+    """--freeze-backbone disables grad on all non-engram params."""
+
+    def _build_and_attach(self) -> HarmonyModel:
+        config = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        model = HarmonyModel(config)
+        table = torch.randn(16, config.engram_dim)
+        injections = {
+            layer_idx: GatedEngramInjection(
+                EngramCrossAttention(
+                    config, table, num_heads=2, k_retrieved=4,
+                ),
+                alpha_init=0.0,
+            )
+            for layer_idx in config.engram_inject_layers
+        }
+        model.attach_gated_engram_injections(injections)
+        return model
+
+    def test_freeze_sets_requires_grad_correctly(self):
+        """After freezing, only engram_injections params have requires_grad=True."""
+        model = self._build_and_attach()
+        from ct87.train import freeze_backbone_for_capgap
+        freeze_backbone_for_capgap(model)
+        for name, p in model.named_parameters():
+            if name.startswith("engram_injections"):
+                assert p.requires_grad, f"{name} should be trainable"
+            else:
+                assert not p.requires_grad, f"{name} should be frozen"
+
+    def test_trainable_param_count_is_small(self):
+        """Frozen capgap model has O(engram_injections) trainable params, not O(backbone)."""
+        model = self._build_and_attach()
+        from ct87.train import freeze_backbone_for_capgap
+        freeze_backbone_for_capgap(model)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        # Trainable should be << frozen: the tiny_engram_xattn_capgap config has
+        # ~1.4M engram params vs ~39.6M backbone params (~3.6%), well under 10%.
+        # (Production backbones are much larger, making this ratio even smaller.)
+        assert trainable * 10 < frozen, (
+            f"Trainable ({trainable}) should be under 10% of frozen ({frozen})"
+        )
