@@ -1068,7 +1068,11 @@ def main() -> None:
     # Must happen BEFORE freeze_backbone_for_capgap() which raises if no
     # engram_injections are attached.
     if config.engram_inject_layers:
-        from ct87.engram import EngramCrossAttention, GatedEngramInjection
+        from ct87.engram import (
+            ContrastiveGatedEngramInjection,
+            EngramCrossAttention,
+            GatedEngramInjection,
+        )
 
         if args.engram_xattn_table is not None:
             capgap_table = EngramCrossAttention.load_corpus_table(args.engram_xattn_table)
@@ -1093,6 +1097,12 @@ def main() -> None:
             )
             sys.exit(2)
 
+        # θ-V-contrast: when enabled, construct ContrastiveGatedEngramInjection
+        # wrappers sharing a single aux-loss list. The training step pulls aux
+        # losses out of that list, sums them, and adds lambda * sum to LM loss.
+        capgap_aux_sink: list[torch.Tensor] | None = (
+            [] if config.engram_vcontrast_enabled else None
+        )
         capgap_injections: dict[int, GatedEngramInjection] = {}
         for layer_idx in config.engram_inject_layers:
             xattn_mod = EngramCrossAttention(
@@ -1101,18 +1111,36 @@ def main() -> None:
                 num_heads=config.num_query_heads,
                 k_retrieved=args.xattn_top_k,
             )
-            capgap_injections[layer_idx] = GatedEngramInjection(
-                xattn_mod,
-                alpha_init=config.engram_gate_init,
-            )
+            if config.engram_vcontrast_enabled:
+                capgap_injections[layer_idx] = ContrastiveGatedEngramInjection(
+                    xattn_mod,
+                    alpha_init=config.engram_gate_init,
+                    aux_loss_sink=capgap_aux_sink,
+                )
+            else:
+                capgap_injections[layer_idx] = GatedEngramInjection(
+                    xattn_mod,
+                    alpha_init=config.engram_gate_init,
+                )
         model.attach_gated_engram_injections(capgap_injections)
+        if config.engram_vcontrast_enabled:
+            # Both the model and the wrappers reference the same list — the
+            # model clears it at the start of each training-mode forward and
+            # the wrappers append per-layer scalars.
+            model._contrastive_aux_losses = capgap_aux_sink
         # Ensure newly-attached submodules are on the correct device (model was
         # already moved to device before this block).
         model.engram_injections.to(device)
         print(
-            f"[capgap] Attached GatedEngramInjection at layers "
-            f"{list(config.engram_inject_layers)} with alpha_init="
+            f"[capgap] Attached "
+            f"{'ContrastiveGatedEngramInjection' if config.engram_vcontrast_enabled else 'GatedEngramInjection'}"
+            f" at layers {list(config.engram_inject_layers)} with alpha_init="
             f"{config.engram_gate_init}"
+            + (
+                f"; vcontrast lambda={config.engram_vcontrast_lambda} "
+                f"warmup={config.engram_vcontrast_warmup_steps}"
+                if config.engram_vcontrast_enabled else ""
+            )
         )
 
     param_count = sum(p.numel() for p in model.parameters())
