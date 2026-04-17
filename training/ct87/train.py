@@ -941,20 +941,34 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Apply overrides after validation. The < 0 check in __post_init__ misses
-    # NaN/Inf (NaN comparisons always return False), so validate finite-ness
-    # explicitly before mutating config — NaN leaking into the loss would
-    # silently corrupt every subsequent training step.
+    # Apply overrides after validation. Two reasons to validate at the CLI
+    # layer before mutating config:
+    #   (a) The `< 0` check in __post_init__ misses NaN/Inf because all
+    #       comparisons with NaN return False — NaN leaking into the loss
+    #       would silently corrupt every subsequent training step.
+    #   (b) Fail-fast with a clear message naming the flag, so the user
+    #       sees "--engram-qdiv-lambda must be ..." rather than the
+    #       generic "engram_qdiv_lambda must be >= 0" from __post_init__.
     if args.engram_qdiv_lambda is not None:
-        if not math.isfinite(args.engram_qdiv_lambda):
+        if (
+            not math.isfinite(args.engram_qdiv_lambda)
+            or args.engram_qdiv_lambda < 0
+        ):
             print(
-                "Error: --engram-qdiv-lambda must be finite, got "
+                "Error: --engram-qdiv-lambda must be finite and >= 0, got "
                 f"{args.engram_qdiv_lambda!r}.",
                 file=sys.stderr,
             )
             sys.exit(1)
         config.engram_qdiv_lambda = args.engram_qdiv_lambda
     if args.engram_qdiv_warmup_steps is not None:
+        if args.engram_qdiv_warmup_steps < 0:
+            print(
+                "Error: --engram-qdiv-warmup-steps must be >= 0, got "
+                f"{args.engram_qdiv_warmup_steps!r}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         config.engram_qdiv_warmup_steps = args.engram_qdiv_warmup_steps
     if config.engram_qdiv_enabled:
         config.__post_init__()

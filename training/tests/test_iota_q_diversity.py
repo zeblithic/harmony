@@ -1,4 +1,4 @@
-"""Tests for ι-Q-diversity (ZEB-130): MoE load-balancing aux loss on
+"""Tests for iota-Q-diversity (ZEB-130): MoE load-balancing aux loss on
 retrieval-row marginal distribution. Spec:
 docs/superpowers/specs/2026-04-17-iota-q-diversity-design.md
 """
@@ -367,11 +367,13 @@ class TestCliFlagPresetConsistency:
         combined = (result.stderr + result.stdout).lower()
         assert "engram-qdiv" in combined or "engram_qdiv" in combined
 
-    @pytest.mark.parametrize("bad_value", ["nan", "inf", "-inf"])
-    def test_qdiv_lambda_non_finite_rejected(self, bad_value):
-        """NaN/Inf slip past the `< 0` check in __post_init__ because NaN
-        comparisons always return False. train.py must reject them before
-        config mutation so a bad CLI value can't silently corrupt the loss.
+    @pytest.mark.parametrize("bad_value", ["nan", "inf", "-inf", "-0.01", "-1.0"])
+    def test_qdiv_lambda_invalid_rejected(self, bad_value):
+        """NaN/Inf slip past __post_init__'s `< 0` check (NaN comparisons
+        always return False). Negative finite values are caught by
+        __post_init__ too, but the CLI-layer check gives a fail-fast error
+        naming the actual flag (--engram-qdiv-lambda) instead of the
+        generic field-name error. Both paths exit non-zero.
         """
         result = _run_train_py([
             "--config", "tiny_engram_xattn_capgap_qdiv",
@@ -385,7 +387,22 @@ class TestCliFlagPresetConsistency:
             f"got returncode={result.returncode}"
         )
         combined = (result.stderr + result.stdout).lower()
-        assert "finite" in combined or "engram-qdiv-lambda" in combined
+        assert "engram" in combined and "lambda" in combined, (
+            f"error message should name the flag; got: {combined!r}"
+        )
+
+    def test_qdiv_warmup_steps_negative_rejected(self):
+        """Negative --engram-qdiv-warmup-steps must fail at the CLI layer."""
+        result = _run_train_py([
+            "--config", "tiny_engram_xattn_capgap_qdiv",
+            "--engram-qdiv",
+            "--engram-qdiv-warmup-steps", "-5",
+            "--steps", "0",
+            "--synthetic",
+        ])
+        assert result.returncode != 0
+        combined = (result.stderr + result.stdout).lower()
+        assert "warmup" in combined
 
 
 class TestQdivTrainingStep:

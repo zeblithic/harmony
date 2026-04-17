@@ -279,7 +279,7 @@ if config.engram_vcontrast_enabled:
     if per_layer_vc:
         aux_vcontrast_total = torch.stack(per_layer_vc).sum()
         lam_vcontrast = lambda_schedule(
-            step, config.engram_vcontrast_lambda, config.engram_vcontrast_warmup_steps,
+            step, config.engram_vcontrast_warmup_steps, config.engram_vcontrast_lambda,
         )
 
 if config.engram_qdiv_enabled:
@@ -288,7 +288,7 @@ if config.engram_qdiv_enabled:
     if per_layer_qd:
         aux_qdiv_total = torch.stack(per_layer_qd).sum()
         lam_qdiv = lambda_schedule(
-            step, config.engram_qdiv_lambda, config.engram_qdiv_warmup_steps,
+            step, config.engram_qdiv_warmup_steps, config.engram_qdiv_lambda,
         )
 
 total_loss = loss
@@ -432,22 +432,22 @@ def tiny_engram_xattn_capgap_vcontrast_qdiv() -> "HarmonyModelConfig":
 ### 5d. Example KRILE invocations
 
 ```bash
-# ι₁: Q-div only
-python scripts/train.py \
-    --preset tiny_engram_xattn_capgap_qdiv \
+# iota-1: Q-div only
+python -m ct87.train \
+    --config tiny_engram_xattn_capgap_qdiv \
     --engram-qdiv \
     --seed 42 --seq-len 2048 --batch-size 4 --lr 9e-4 \
-    --xattn-top-k 8 --max-steps 2000 \
+    --xattn-top-k 8 --steps 2000 \
     --init-from checkpoints/zeta_ctrl_2048/checkpoint.pt \
     --allow-partial-init \
     # ... other standard capgap flags ...
 
-# ι₂: V-contrast + Q-div
-python scripts/train.py \
-    --preset tiny_engram_xattn_capgap_vcontrast_qdiv \
+# iota-2: V-contrast + Q-div
+python -m ct87.train \
+    --config tiny_engram_xattn_capgap_vcontrast_qdiv \
     --engram-vcontrast --engram-qdiv \
     --seed 42 --seq-len 2048 --batch-size 4 --lr 9e-4 \
-    --xattn-top-k 8 --max-steps 2000 \
+    --xattn-top-k 8 --steps 2000 \
     --init-from checkpoints/zeta_ctrl_2048/checkpoint.pt \
     --allow-partial-init \
     # ... other standard capgap flags ...
