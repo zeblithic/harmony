@@ -401,6 +401,26 @@ def apply_pca_projection(
 # ---------------------------------------------------------------------------
 
 
+_HARMONY_TEACHER_URI_PREFIX = "harmony:"
+# Tokenizers known to share the Mistral-v0.1 SentencePiece vocab (32K).
+# Any of these can serve as the tokenizer for a Harmony teacher load — we
+# prefer whichever is already in the local HF cache to avoid network/auth.
+_HARMONY_COMPATIBLE_TOKENIZERS = (
+    "mistralai/Mistral-7B-v0.1",
+    "TinyLlama/TinyLlama_v1.1",
+)
+# State-dict prefixes we silently drop when loading a Harmony teacher
+# checkpoint into a stock backbone. Anything matching these is a research
+# engram module attached at training time, irrelevant to teacher hidden-
+# state extraction.
+_TEACHER_IRRELEVANT_PREFIXES = (
+    "engram_injections.",
+    "engram_skip_router.",
+    "engram_xattn.",
+    "engram_ann.",
+)
+
+
 def load_and_validate_teacher(
     teacher_model_id: str,
     device: str,
@@ -415,7 +435,19 @@ def load_and_validate_teacher(
     setup logic is testable in isolation and doesn't visually crowd the
     batch loop. Lazy HuggingFace imports stay local so callers without
     the teacher extras can still import the module.
+
+    A `harmony:<path>` URI dispatches to the Harmony-architecture loader
+    (`_load_harmony_teacher`) instead of the HuggingFace AutoModel path.
     """
+    if teacher_model_id.startswith(_HARMONY_TEACHER_URI_PREFIX):
+        return _load_harmony_teacher(
+            ckpt_path=teacher_model_id[len(_HARMONY_TEACHER_URI_PREFIX):],
+            device=device,
+            dtype=dtype,
+            expected_vocab_size=expected_vocab_size,
+            layer_index=layer_index,
+        )
+
     import torch
     from transformers import AutoModel, AutoTokenizer
 
@@ -477,6 +509,232 @@ def load_and_validate_teacher(
 
     teacher_dim = model.config.hidden_size
     return model, tokenizer, resolved_layer, teacher_dim, torch
+
+
+def _load_harmony_teacher(
+    ckpt_path: str,
+    device: str,
+    dtype: str,
+    expected_vocab_size: int,
+    layer_index: int,
+):
+    """Load a Harmony-architecture checkpoint as a teacher (ZEB-138 prep).
+
+    Handles the integration gap between `transformers.AutoModel` (used for
+    Mistral / TinyLlama / etc.) and `ct87.model.HarmonyModel` (used for
+    same-architecture teacher experiments). Returns the exact same tuple
+    shape as the HF path so `process_batch` is unchanged: the model is
+    wrapped in `_HarmonyTeacherAdapter`, which intercepts the call and
+    exposes a HuggingFace-style `outputs.hidden_states[resolved_layer]`
+    accessor by attaching a forward hook on the target block.
+
+    Checkpoint format requirements (mirrors what `train.py` saves with
+    `--checkpoint-interval > 0`): a torch-pickled dict with keys
+    `model_state_dict` and `config`. Bare per-step safetensors files
+    cannot be used because the architecture isn't recoverable.
+    """
+    import dataclasses
+
+    import torch
+    from transformers import AutoTokenizer
+
+    from ct87.model import HarmonyModel, HarmonyModelConfig
+
+    torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float32
+
+    print(
+        f"Loading Harmony teacher checkpoint {ckpt_path!r} "
+        f"(device={device}, dtype={dtype})...",
+        flush=True,
+    )
+
+    tokenizer = _load_harmony_compatible_tokenizer(expected_vocab_size)
+
+    # `weights_only=False` because the payload includes a HarmonyModelConfig
+    # dataclass. The checkpoint comes from our own train.py and is trusted.
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or "model_state_dict" not in payload or "config" not in payload:
+        raise ValueError(
+            f"{ckpt_path}: expected a resumable Harmony checkpoint with "
+            "'model_state_dict' and 'config' keys (saved by train.py with "
+            "--checkpoint-interval > 0). Got "
+            f"{type(payload).__name__} with keys "
+            f"{sorted(payload.keys()) if isinstance(payload, dict) else 'n/a'}."
+        )
+    config: HarmonyModelConfig = payload["config"]
+    if config.vocab_size != expected_vocab_size:
+        raise ValueError(
+            f"Harmony teacher config has vocab_size={config.vocab_size} but "
+            f"the corpus expects vocab_size={expected_vocab_size}. The student "
+            "and teacher must share a tokenizer for n-gram hash parity."
+        )
+
+    # Clear research-engram declarations so HarmonyModel.forward()'s misuse
+    # guard (which raises if engram_inject_layers is set but no injection
+    # modules were attached) doesn't fire. We only want the bare backbone
+    # for hidden-state extraction; the engram path is irrelevant to teacher
+    # inference. The state_dict's engram_residual.* entries still load
+    # cleanly into the always-built engram_residual module, but it stays
+    # inert because we never pass `engram_embeddings` to forward().
+    teacher_config = dataclasses.replace(
+        config,
+        engram_inject_layers=(),
+        engram_vcontrast_enabled=False,
+        engram_qdiv_enabled=False,
+        use_ann_engram=False,
+        use_xattn_engram=False,
+    )
+    model = HarmonyModel(teacher_config)
+    missing, unexpected = model.load_state_dict(payload["model_state_dict"], strict=False)
+    # Filter known-OK absences/extras:
+    # - `*.table` / `*.table_normalized` are non-persistent buffers on
+    #   EngramCrossAttention modules that aren't in any saved state_dict.
+    # - `lm_head.weight` is missing when tie_embeddings=True (it shares with
+    #   embed_tokens.weight via assignment after construction).
+    # - Engram-attached training modules are irrelevant to teacher inference.
+    real_missing = [
+        k for k in missing
+        if ".table" not in k
+        and not (config.tie_embeddings and k == "lm_head.weight")
+    ]
+    real_unexpected = [
+        k for k in unexpected
+        if ".table" not in k
+        and not any(k.startswith(p) for p in _TEACHER_IRRELEVANT_PREFIXES)
+    ]
+    if real_missing or real_unexpected:
+        def _summarize(keys):
+            return f"{keys[:5]}{f' (+{len(keys) - 5} more)' if len(keys) > 5 else ''}"
+        raise RuntimeError(
+            f"{ckpt_path}: state_dict load incompatible with stock HarmonyModel(config). "
+            f"missing={_summarize(real_missing)} unexpected={_summarize(real_unexpected)}"
+        )
+
+    # Disable autograd machinery for inference. Matches what HF's `train(False)`
+    # implicitly enables but with explicit grad detachment for memory.
+    for p in model.parameters():
+        p.requires_grad_(False)
+    model.to(device=device, dtype=torch_dtype)
+    model.train(False)
+
+    # Resolve --layer against Harmony's num_layers, mirroring the HF semantics
+    # used elsewhere in this module: hidden_states[0] = embedding output;
+    # hidden_states[i+1] = output of layers[i] for i in [0, num_layers).
+    teacher_num_layers = config.num_layers
+    resolved_layer = layer_index
+    if resolved_layer < 0:
+        resolved_layer = teacher_num_layers + 1 + resolved_layer
+    if not 0 <= resolved_layer <= teacher_num_layers:
+        raise ValueError(
+            f"--layer={layer_index} resolves to hidden_states[{resolved_layer}], "
+            f"but Harmony teacher exposes only indices [0, {teacher_num_layers}] "
+            f"(accepts negatives in [-{teacher_num_layers + 1}, -1] also)."
+        )
+    print(
+        f"Harmony teacher has {teacher_num_layers} layers; extracting "
+        f"hidden_states[{resolved_layer}] (arg: {layer_index}).",
+        flush=True,
+    )
+
+    teacher_dim = config.hidden_dim
+    adapter = _HarmonyTeacherAdapter(model, resolved_layer)
+    return adapter, tokenizer, resolved_layer, teacher_dim, torch
+
+
+def _load_harmony_compatible_tokenizer(expected_vocab_size: int):
+    """Try the known Mistral-vocab-compatible tokenizers, return the first that loads.
+
+    The corpus is pre-tokenized, so the tokenizer is only consulted for
+    `vocab_size` (validation) and `pad_token_id` (per-batch padding). Any
+    Mistral-v0.1 SentencePiece tokenizer suffices. We try local-cache
+    candidates in order to avoid HF auth on the gated Mistral model.
+    """
+    from transformers import AutoTokenizer
+
+    last_err: Exception | None = None
+    for candidate in _HARMONY_COMPATIBLE_TOKENIZERS:
+        try:
+            tok = AutoTokenizer.from_pretrained(candidate)
+        except Exception as e:  # noqa: BLE001 — fall through to next candidate
+            last_err = e
+            continue
+        actual_vocab = int(tok.vocab_size)
+        if actual_vocab != expected_vocab_size:
+            continue
+        return tok
+    raise RuntimeError(
+        f"Could not load any Mistral-vocab-compatible tokenizer for the "
+        f"Harmony teacher path (tried {list(_HARMONY_COMPATIBLE_TOKENIZERS)}). "
+        f"Last error: {last_err!r}. Pre-cache one of these via "
+        "`huggingface-cli download <id>` and rerun."
+    )
+
+
+class _HarmonyTeacherAdapter:
+    """HuggingFace-style call interface around a `HarmonyModel`.
+
+    `process_batch` calls `model(input_ids=...)` and reads
+    `outputs.hidden_states[resolved_layer]`. The HF AutoModel path returns
+    a tuple of every layer's hidden state; HarmonyModel returns logits
+    only. We bridge that gap by registering a single forward hook on the
+    target module (embedding for resolved_layer=0, transformer block
+    `resolved_layer-1` otherwise) and exposing the captured tensor
+    through a one-element view.
+    """
+
+    def __init__(self, model, resolved_layer: int):
+        self._model = model
+        self._resolved_layer = resolved_layer
+        if resolved_layer == 0:
+            self._hook_module = model.embed_tokens
+        else:
+            self._hook_module = model.layers[resolved_layer - 1]
+        self._captured = None
+        self._hook_module.register_forward_hook(self._capture_hook)
+
+    def _capture_hook(self, _module, _inputs, output):
+        # Both nn.Embedding and TransformerLayer.forward currently return a
+        # plain tensor. Future-proofing: collapse a tuple to its first elem.
+        self._captured = output[0] if isinstance(output, tuple) else output
+
+    def __call__(self, input_ids):
+        import torch
+
+        self._captured = None
+        with torch.no_grad():
+            self._model(input_ids=input_ids)
+        return _HarmonyTeacherOutput(
+            hidden_states=_HookedHiddenStatesView(self._captured, self._resolved_layer)
+        )
+
+
+class _HarmonyTeacherOutput:
+    """Mimics the `BaseModelOutput.hidden_states` access pattern."""
+
+    def __init__(self, hidden_states):
+        self.hidden_states = hidden_states
+
+
+class _HookedHiddenStatesView:
+    """Single-layer stand-in for `outputs.hidden_states` (a tuple in HF land).
+
+    Only the index that the adapter hooked is queryable — any other index
+    raises, which is the desired loud-failure mode if `process_batch` ever
+    asks for a layer we didn't capture.
+    """
+
+    def __init__(self, tensor, layer_idx: int):
+        self._tensor = tensor
+        self._layer_idx = layer_idx
+
+    def __getitem__(self, idx: int):
+        if idx != self._layer_idx:
+            raise IndexError(
+                f"Harmony teacher adapter only captured layer {self._layer_idx}; "
+                f"requested {idx}. Re-create the adapter with the correct "
+                "resolved_layer."
+            )
+        return self._tensor
 
 
 def process_batch(

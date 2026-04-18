@@ -824,3 +824,230 @@ class TestLayerBoundsGuard:
                 dtype="float32",
                 expected_vocab_size=32000,
             )
+
+
+class TestHarmonyTeacherURI:
+    """ZEB-138 prep: `--teacher harmony:<path>` dispatches to the
+    Harmony-architecture loader instead of HuggingFace AutoModel. These
+    tests round-trip a tiny HarmonyModel through a temp checkpoint to
+    cover the loader, the misuse-guard config-clear, the resolved-layer
+    semantics, and the adapter's `outputs.hidden_states[N]` accessor.
+    """
+
+    @staticmethod
+    def _build_tiny_harmony_checkpoint(tmp_path: Path):
+        """Save a tiny HarmonyModel to a checkpoint file in train.py's
+        resumable-checkpoint payload format and return its path + the
+        live model (handy for shape comparisons).
+        """
+        from ct87.model import HarmonyModel, HarmonyModelConfig
+
+        cfg = HarmonyModelConfig.tiny()
+        model = HarmonyModel(cfg)
+        ckpt_path = tmp_path / "tiny_harmony_teacher.pt"
+        torch.save(
+            {
+                "step": 0,
+                "model_state_dict": model.state_dict(),
+                "config": cfg,
+            },
+            ckpt_path,
+        )
+        return ckpt_path, model
+
+    def test_uri_prefix_dispatches_to_harmony_loader(self, monkeypatch):
+        import ct87.generate_oracle_table as gen
+
+        captured: dict = {}
+
+        def _stub(ckpt_path, device, dtype, expected_vocab_size, layer_index):
+            captured.update(
+                ckpt_path=ckpt_path,
+                device=device,
+                dtype=dtype,
+                expected_vocab_size=expected_vocab_size,
+                layer_index=layer_index,
+            )
+            return ("MODEL", "TOK", 5, 64, "TORCH")
+
+        monkeypatch.setattr(gen, "_load_harmony_teacher", _stub)
+        result = gen.load_and_validate_teacher(
+            teacher_model_id="harmony:/some/path/checkpoint.pt",
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            layer_index=-2,
+        )
+        assert result == ("MODEL", "TOK", 5, 64, "TORCH")
+        # The URI prefix is stripped before reaching the loader.
+        assert captured["ckpt_path"] == "/some/path/checkpoint.pt"
+        assert captured["layer_index"] == -2
+
+    def test_load_returns_signature_compatible_tuple(self, tmp_path, monkeypatch):
+        import ct87.generate_oracle_table as gen
+
+        class _FakeTok:
+            vocab_size = 32000
+            pad_token_id = 0
+
+        monkeypatch.setattr(
+            gen, "_load_harmony_compatible_tokenizer", lambda _v: _FakeTok()
+        )
+        ckpt_path, _model = self._build_tiny_harmony_checkpoint(tmp_path)
+
+        adapter, tok, resolved_layer, teacher_dim, torch_mod = gen._load_harmony_teacher(
+            ckpt_path=str(ckpt_path),
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            layer_index=-2,
+        )
+        assert tok.vocab_size == 32000
+        assert teacher_dim == 512  # tiny.hidden_dim
+        assert resolved_layer == 7  # tiny.num_layers (8) + 1 + (-2) = 7
+        assert torch_mod is torch
+
+    def test_adapter_forward_returns_hooked_layer(self, tmp_path, monkeypatch):
+        """The adapter must run the underlying HarmonyModel and expose
+        the resolved layer's hidden state via outputs.hidden_states[N]."""
+        import ct87.generate_oracle_table as gen
+
+        class _FakeTok:
+            vocab_size = 32000
+            pad_token_id = 0
+
+        monkeypatch.setattr(
+            gen, "_load_harmony_compatible_tokenizer", lambda _v: _FakeTok()
+        )
+        ckpt_path, _model = self._build_tiny_harmony_checkpoint(tmp_path)
+
+        adapter, _tok, resolved_layer, teacher_dim, _ = gen._load_harmony_teacher(
+            ckpt_path=str(ckpt_path),
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            layer_index=-2,
+        )
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        outputs = adapter(input_ids=input_ids)
+        captured = outputs.hidden_states[resolved_layer]
+        assert captured.shape == (1, 4, teacher_dim)
+        with pytest.raises(IndexError, match="only captured layer"):
+            outputs.hidden_states[resolved_layer + 1]
+
+    def test_misuse_guard_cleared_when_loading_capgap_checkpoint(
+        self, tmp_path, monkeypatch,
+    ):
+        """A capgap config declares engram_inject_layers=(2,5), which
+        triggers the misuse guard at HarmonyModel.forward when no
+        engram_injections are attached. The teacher loader must clear
+        the relevant flags so the bare backbone runs forward."""
+        import dataclasses
+        import ct87.generate_oracle_table as gen
+        from ct87.model import HarmonyModel, HarmonyModelConfig
+
+        class _FakeTok:
+            vocab_size = 32000
+            pad_token_id = 0
+
+        monkeypatch.setattr(
+            gen, "_load_harmony_compatible_tokenizer", lambda _v: _FakeTok()
+        )
+
+        cfg = HarmonyModelConfig.tiny_engram_xattn_capgap_vcontrast_qdiv()
+        # Build with cleared inject_layers to get a clean state_dict, then
+        # save the original cfg to mimic train.py's checkpoint payload.
+        cfg_for_save = dataclasses.replace(
+            cfg,
+            engram_inject_layers=(),
+            engram_vcontrast_enabled=False,
+            engram_qdiv_enabled=False,
+        )
+        bare_model = HarmonyModel(cfg_for_save)
+        ckpt_path = tmp_path / "capgap_teacher.pt"
+        torch.save(
+            {"step": 0, "model_state_dict": bare_model.state_dict(), "config": cfg},
+            ckpt_path,
+        )
+
+        adapter, _, _, _, _ = gen._load_harmony_teacher(
+            ckpt_path=str(ckpt_path),
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            layer_index=-2,
+        )
+        # Forward must not raise the multi-layer-injection misuse guard.
+        adapter(input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long))
+
+    def test_vocab_mismatch_in_config_raises(self, tmp_path, monkeypatch):
+        import dataclasses
+        import ct87.generate_oracle_table as gen
+        from ct87.model import HarmonyModel, HarmonyModelConfig
+
+        class _FakeTok:
+            vocab_size = 32000
+            pad_token_id = 0
+
+        monkeypatch.setattr(
+            gen, "_load_harmony_compatible_tokenizer", lambda _v: _FakeTok()
+        )
+        cfg = dataclasses.replace(HarmonyModelConfig.tiny(), vocab_size=50000)
+        model = HarmonyModel(cfg)
+        ckpt_path = tmp_path / "wrong_vocab.pt"
+        torch.save(
+            {"step": 0, "model_state_dict": model.state_dict(), "config": cfg},
+            ckpt_path,
+        )
+        with pytest.raises(ValueError, match="vocab_size"):
+            gen._load_harmony_teacher(
+                ckpt_path=str(ckpt_path),
+                device="cpu",
+                dtype="float32",
+                expected_vocab_size=32000,
+                layer_index=-2,
+            )
+
+    def test_payload_without_config_raises_actionable(self, tmp_path, monkeypatch):
+        import ct87.generate_oracle_table as gen
+
+        class _FakeTok:
+            vocab_size = 32000
+            pad_token_id = 0
+
+        monkeypatch.setattr(
+            gen, "_load_harmony_compatible_tokenizer", lambda _v: _FakeTok()
+        )
+        ckpt_path = tmp_path / "stale_format.pt"
+        torch.save({"step": 0, "model_state_dict": {}}, ckpt_path)
+        with pytest.raises(ValueError, match="model_state_dict.*config"):
+            gen._load_harmony_teacher(
+                ckpt_path=str(ckpt_path),
+                device="cpu",
+                dtype="float32",
+                expected_vocab_size=32000,
+                layer_index=-2,
+            )
+
+    def test_layer_zero_hooks_embedding(self, tmp_path, monkeypatch):
+        """--layer 0 must capture embedding output, not block 0 output."""
+        import ct87.generate_oracle_table as gen
+
+        class _FakeTok:
+            vocab_size = 32000
+            pad_token_id = 0
+
+        monkeypatch.setattr(
+            gen, "_load_harmony_compatible_tokenizer", lambda _v: _FakeTok()
+        )
+        ckpt_path, _model = self._build_tiny_harmony_checkpoint(tmp_path)
+        adapter, _, resolved_layer, _, _ = gen._load_harmony_teacher(
+            ckpt_path=str(ckpt_path),
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            layer_index=0,
+        )
+        assert resolved_layer == 0
+        # Adapter's hook target must be embed_tokens, not layers[0].
+        assert adapter._hook_module is adapter._model.embed_tokens
