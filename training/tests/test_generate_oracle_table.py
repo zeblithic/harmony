@@ -1101,3 +1101,242 @@ class TestHarmonyTeacherURI:
         assert resolved_layer == 0
         # Adapter's hook target must be embed_tokens, not layers[0].
         assert adapter._hook_module is adapter._model.embed_tokens
+
+
+@skip_if_no_transformers
+class TestSaveTeacherLogits:
+    """ZEB-139 prep: --save-teacher-logits gates a second WelfordTable that
+    captures the teacher's full LM-head outputs and writes a bf16 sidecar
+    alongside the main oracle. The training side (KL+CE retrofit) reads
+    that sidecar to compute KL(P_router || P_teacher) without needing
+    any extra metadata exchange.
+    """
+
+    @staticmethod
+    def _patch_hf_for_logits(monkeypatch, *, hidden_dim: int, vocab: int):
+        """Install a fake AutoTokenizer + AutoModelForCausalLM whose forward
+        returns a tensor with `.hidden_states` (tuple of len num_layers+1)
+        and `.logits` (shape [B, T, vocab]). Returns a dict the test can
+        inspect to confirm which model class was used.
+        """
+        import transformers
+        import datasets as hfds
+
+        class _FakeTok:
+            vocab_size = vocab
+            pad_token_id = 0
+
+        class _FakeCfg:
+            num_hidden_layers = 4
+            hidden_size = hidden_dim
+            vocab_size = vocab
+
+        class _FakeOutputs:
+            def __init__(self, hidden_states, logits):
+                self.hidden_states = hidden_states
+                self.logits = logits
+
+        class _FakeModel:
+            config = _FakeCfg()
+            def to(self, _dev): return self
+            def train(self, _flag): return self
+            def __call__(self, input_ids):
+                B, T = input_ids.shape
+                # 5 = num_hidden_layers + 1 (embedding output + 4 blocks).
+                hs = tuple(
+                    torch.full((B, T, hidden_dim), 0.5 * (i + 1))
+                    for i in range(5)
+                )
+                # Make logits contain the position index in dim 0 so the
+                # row-parity test can verify per-(b,p) lookup correctness.
+                logits = torch.zeros((B, T, vocab))
+                for b in range(B):
+                    for t in range(T):
+                        logits[b, t, 0] = float(b * 100 + t)
+                return _FakeOutputs(hidden_states=hs, logits=logits)
+
+        usage: dict = {"used_for_causal_lm": False, "used_automodel": False}
+
+        class _AutoModelCls:
+            @staticmethod
+            def from_pretrained(*_args, **_kwargs):
+                usage["used_automodel"] = True
+                return _FakeModel()
+
+        class _AutoModelForCausalLMCls:
+            @staticmethod
+            def from_pretrained(*_args, **_kwargs):
+                usage["used_for_causal_lm"] = True
+                return _FakeModel()
+
+        class _TokCls:
+            @staticmethod
+            def from_pretrained(_id): return _FakeTok()
+
+        monkeypatch.setattr(transformers, "AutoTokenizer", _TokCls)
+        monkeypatch.setattr(transformers, "AutoModel", _AutoModelCls)
+        monkeypatch.setattr(
+            transformers, "AutoModelForCausalLM", _AutoModelForCausalLMCls,
+        )
+
+        # Stub the dataset to return a tiny, deterministic batch.
+        class _FakeDataset:
+            column_names = ["input_ids"]
+            _data = {"input_ids": [
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                [9, 10, 11, 12, 13, 14, 15, 16],
+            ]}
+            def __len__(self): return len(self._data["input_ids"])
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    return {"input_ids": self._data["input_ids"][key]}
+                return self._data["input_ids"][key]
+
+        monkeypatch.setattr(hfds, "load_from_disk", lambda _p: _FakeDataset())
+        return usage
+
+    def test_run_teacher_pass_returns_tuple_with_none_when_flag_off(
+        self, monkeypatch,
+    ):
+        """Backward-compat: callers that didn't pass save_teacher_logits
+        must get a (table, None) tuple — not a bare WelfordTable, but
+        also not a populated logits table."""
+        import ct87.generate_oracle_table as gen
+        usage = self._patch_hf_for_logits(monkeypatch, hidden_dim=8, vocab=32000)
+
+        table, logits_table = gen.run_teacher_pass(
+            teacher_model_id="mock/teacher",
+            tokenized_dataset_path="/tmp/fake",
+            layer_index=-1,
+            total_entries=64,
+            hash_seeds=(42,),
+            batch_size=2,
+            seq_len=8,
+            max_sequences=2,
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+        )
+        assert isinstance(table, gen.WelfordTable)
+        assert logits_table is None
+        # Default path should NOT load AutoModelForCausalLM.
+        assert usage["used_automodel"] is True
+        assert usage["used_for_causal_lm"] is False
+
+    def test_flag_on_uses_AutoModelForCausalLM_and_returns_logits_table(
+        self, monkeypatch,
+    ):
+        """--save-teacher-logits triggers the AutoModelForCausalLM upgrade
+        AND populates a vocab-wide WelfordTable returned alongside the
+        hidden table."""
+        import ct87.generate_oracle_table as gen
+        usage = self._patch_hf_for_logits(monkeypatch, hidden_dim=8, vocab=32000)
+
+        table, logits_table = gen.run_teacher_pass(
+            teacher_model_id="mock/teacher",
+            tokenized_dataset_path="/tmp/fake",
+            layer_index=-1,
+            total_entries=64,
+            hash_seeds=(42,),
+            batch_size=2,
+            seq_len=8,
+            max_sequences=2,
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            save_teacher_logits=True,
+        )
+        assert isinstance(table, gen.WelfordTable)
+        assert isinstance(logits_table, gen.WelfordTable)
+        assert logits_table.means.shape == (64, 32000)
+        assert logits_table.means.dtype == np.float32
+        # The two tables share the xxhash row-population pattern by
+        # construction — they update at identical (b, p) positions.
+        assert np.array_equal(table.populated_mask, logits_table.populated_mask)
+        # Confirm the upgrade actually happened.
+        assert usage["used_for_causal_lm"] is True
+        assert usage["used_automodel"] is False
+
+    def test_save_teacher_logits_with_harmony_uri_rejected(self, monkeypatch):
+        """--save-teacher-logits + --teacher harmony:* must raise BEFORE
+        any model load. The Harmony adapter only captures hidden states;
+        ZEB-139 (TinyLlama-only) doesn't need this path."""
+        import ct87.generate_oracle_table as gen
+
+        # Stub _load_harmony_teacher to fail loudly if reached.
+        monkeypatch.setattr(
+            gen, "_load_harmony_teacher",
+            lambda **_kw: (_ for _ in ()).throw(
+                AssertionError("must not reach harmony loader"),
+            ),
+        )
+        with pytest.raises(ValueError, match=r"--save-teacher-logits.*harmony:"):
+            gen.load_and_validate_teacher(
+                teacher_model_id="harmony:/path/to/ckpt.pt",
+                device="cpu",
+                dtype="float32",
+                expected_vocab_size=32000,
+                layer_index=-2,
+                save_teacher_logits=True,
+            )
+
+    def test_default_sidecar_path_swaps_safetensors_suffix(self):
+        from ct87.generate_oracle_table import default_teacher_logits_sidecar_path
+
+        # Standard `.safetensors` output → suffix-swap.
+        assert (
+            default_teacher_logits_sidecar_path("/tmp/oracle.safetensors")
+            == Path("/tmp/oracle_teacher_logits.safetensors")
+        )
+        # Unusual extension → append rule (still predictable).
+        assert (
+            default_teacher_logits_sidecar_path("/tmp/oracle.bin")
+            == Path("/tmp/oracle.bin_teacher_logits.safetensors")
+        )
+
+    def test_save_teacher_logits_sidecar_round_trip_preserves_means_within_bf16(
+        self, tmp_path,
+    ):
+        """save_teacher_logits_sidecar writes bf16 — round-trip must
+        preserve the per-row means within bf16's ~3-decimal precision."""
+        from safetensors.torch import load_file
+        from ct87.generate_oracle_table import (
+            TEACHER_LOGITS_SIDECAR_KEY, save_teacher_logits_sidecar,
+        )
+
+        rng = np.random.default_rng(0)
+        # Logits typically span [-20, +20]; bf16 handles that range cleanly.
+        means = rng.standard_normal((16, 256)).astype(np.float32) * 5.0
+        out = tmp_path / "logits.safetensors"
+        save_teacher_logits_sidecar(means, out)
+        assert out.exists()
+
+        loaded = load_file(str(out))
+        assert TEACHER_LOGITS_SIDECAR_KEY in loaded
+        recovered = loaded[TEACHER_LOGITS_SIDECAR_KEY]
+        assert recovered.dtype is torch.bfloat16
+        assert tuple(recovered.shape) == (16, 256)
+        # bf16 has 7-bit mantissa → ~1e-2 relative precision in this range.
+        recovered_f32 = recovered.float().numpy()
+        np.testing.assert_allclose(recovered_f32, means, rtol=2e-2, atol=1e-2)
+
+    def test_argparser_accepts_save_teacher_logits_flag(self):
+        from ct87.generate_oracle_table import build_argparser
+
+        args = build_argparser().parse_args([
+            "--dataset", "/tmp/fake",
+            "--output", "/tmp/x.safetensors",
+            "--save-teacher-logits",
+        ])
+        assert args.save_teacher_logits is True
+        assert args.teacher_logits_output is None  # uses default derivation
+
+    def test_argparser_default_save_teacher_logits_off(self):
+        from ct87.generate_oracle_table import build_argparser
+
+        args = build_argparser().parse_args([
+            "--dataset", "/tmp/fake",
+            "--output", "/tmp/x.safetensors",
+        ])
+        assert args.save_teacher_logits is False
+        assert args.teacher_logits_output is None

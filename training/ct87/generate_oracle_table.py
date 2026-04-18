@@ -96,6 +96,13 @@ DEFAULT_HASH_SEEDS = (42, 99, 137, 251)
 DEFAULT_PCA_SUBSAMPLE = 0.2
 DEFAULT_PCA_BATCH = 512
 
+# Sidecar safetensors written when --save-teacher-logits is set. ZEB-139 KL-
+# retrofit training reads this file in parallel with the main oracle table to
+# compute KL(P_router || P_teacher). The tensor name is fixed so the trainer
+# doesn't need to know the producer's CLI flags.
+TEACHER_LOGITS_SIDECAR_KEY = "teacher_logits.weight"
+TEACHER_LOGITS_SIDECAR_SUFFIX = "_teacher_logits.safetensors"
+
 
 # ---------------------------------------------------------------------------
 # Welford online vector mean
@@ -427,6 +434,7 @@ def load_and_validate_teacher(
     dtype: str,
     expected_vocab_size: int,
     layer_index: int,
+    save_teacher_logits: bool = False,
 ):
     """Load the teacher, validate vocab parity, resolve and validate --layer.
 
@@ -436,10 +444,23 @@ def load_and_validate_teacher(
     batch loop. Lazy HuggingFace imports stay local so callers without
     the teacher extras can still import the module.
 
+    When `save_teacher_logits=True`, the HF branch loads
+    `AutoModelForCausalLM` (which includes the LM head) so callers can
+    read `outputs.logits` for the ZEB-139 KL-retrofit sidecar. The
+    Harmony branch rejects the combo upfront — the adapter only captures
+    hidden states, and ZEB-139 only needs TinyLlama anyway (spec §10).
+
     A `harmony:<path>` URI dispatches to the Harmony-architecture loader
     (`_load_harmony_teacher`) instead of the HuggingFace AutoModel path.
     """
     if teacher_model_id.startswith(_HARMONY_TEACHER_URI_PREFIX):
+        if save_teacher_logits:
+            raise ValueError(
+                "--save-teacher-logits is not supported with the harmony: "
+                "teacher URI. The Harmony adapter captures hidden states "
+                "only; logits would require an additional lm_head pass that "
+                "is out of scope for ZEB-139 (TinyLlama-only). See spec §10."
+            )
         # Strip the prefix and reject empty / whitespace-only paths up-
         # front. Without this, "--teacher harmony:" or "--teacher
         # harmony:   " would fall through to `torch.load("")` and
@@ -460,7 +481,7 @@ def load_and_validate_teacher(
         )
 
     import torch
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
     torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float32
 
@@ -485,7 +506,12 @@ def load_and_validate_teacher(
         )
     # AutoModel (not AutoModelForCausalLM) skips the LM head weights;
     # we only need the transformer trunk for hidden-state extraction.
-    model = AutoModel.from_pretrained(
+    # When --save-teacher-logits is set we upgrade to ForCausalLM so the
+    # forward pass also produces `outputs.logits` for the KL-retrofit
+    # sidecar (ZEB-139). For Mistral-7B the lm_head adds ~250MB at bf16;
+    # for TinyLlama (tied embeddings) the cost is ~zero.
+    model_cls = AutoModelForCausalLM if save_teacher_logits else AutoModel
+    model = model_cls.from_pretrained(
         teacher_model_id,
         torch_dtype=torch_dtype,
         output_hidden_states=True,
@@ -889,6 +915,7 @@ def process_batch(
     device: str,
     seq_len: int,
     torch_module,
+    logits_table: WelfordTable | None = None,
 ) -> int:
     """Run one forward pass + Welford update for a batch. Returns token count.
 
@@ -896,6 +923,13 @@ def process_batch(
     being read when reasoning about throughput or VRAM. Every other
     call here (truncation, padding, forward, Welford) is idempotent
     and has its own tests.
+
+    If `logits_table` is provided, also extracts `outputs.logits` from
+    the same forward pass and Welford-updates the logits table at the
+    same n-gram row indices used for the hidden-state table. Caller
+    must have loaded the model via `AutoModelForCausalLM` (or any model
+    whose forward output exposes `.logits`) — otherwise this raises
+    AttributeError on the first batch.
     """
     # Truncate or pad each sequence to exactly seq_len so the tensor
     # is rectangular. Pad token: tokenizer.pad_token_id if defined,
@@ -916,6 +950,14 @@ def process_batch(
     # Move to CPU fp32 immediately so we can free GPU memory before
     # the next batch. VRAM stays flat across the loop.
     hidden_np = hidden_states.float().cpu().numpy()
+    # Pull logits while still on GPU (cheap — just a view) before the
+    # del/empty_cache below. Cast to fp32 CPU so the Welford accumulator
+    # in float64 can combine deterministically across batches.
+    logits_np = (
+        outputs.logits.float().cpu().numpy()
+        if logits_table is not None
+        else None
+    )
     del hidden_states, outputs, input_ids
     if device.startswith("cuda"):
         torch_module.cuda.empty_cache()
@@ -943,6 +985,16 @@ def process_batch(
         ps = np.array([p[1] for p in batch_positions], dtype=np.int64)
         vectors = hidden_np[bs, ps, :]  # [K, teacher_dim]
         table.update_batch(indices_arr, vectors.astype(np.float32))
+        if logits_table is not None:
+            # Same row indices, same (b, p) positions — guarantees the
+            # logits sidecar's row r corresponds to the hidden table's
+            # row r for the KL-retrofit lookup. Only the value vectors
+            # differ (vocab-wide logits instead of teacher_dim-wide
+            # hidden state).
+            logit_vectors = logits_np[bs, ps, :]  # [K, vocab]
+            logits_table.update_batch(
+                indices_arr, logit_vectors.astype(np.float32),
+            )
 
     return sum(real_lens)
 
@@ -959,13 +1011,21 @@ def run_teacher_pass(
     device: str | None,
     dtype: str,
     expected_vocab_size: int = DEFAULT_EXPECTED_VOCAB_SIZE,
-) -> WelfordTable:
+    save_teacher_logits: bool = False,
+) -> tuple[WelfordTable, WelfordTable | None]:
     """Drive the full teacher forward pass, accumulating Welford means.
 
     High-level flow only: delegate teacher setup to
     `load_and_validate_teacher` and per-batch work to `process_batch`.
     Lazy-imports `datasets` so callers without the teacher extras can
     still import the module for the Welford / PCA tests.
+
+    Returns `(hidden_table, logits_table_or_None)`. The logits table is
+    `None` when `save_teacher_logits=False` (preserves the no-flag
+    memory profile — no extra `[total_entries, vocab]` allocation). The
+    second-element shape is `[total_entries, expected_vocab_size]`
+    float32 when populated (~1.28 GB at 10K rows × 32K vocab; bf16-cast
+    happens at the sidecar save site).
     """
     import torch
     from datasets import load_from_disk
@@ -980,9 +1040,15 @@ def run_teacher_pass(
             dtype=dtype,
             expected_vocab_size=expected_vocab_size,
             layer_index=layer_index,
+            save_teacher_logits=save_teacher_logits,
         )
     )
     table = WelfordTable.zeros(total_entries, teacher_dim)
+    logits_table = (
+        WelfordTable.zeros(total_entries, expected_vocab_size)
+        if save_teacher_logits
+        else None
+    )
 
     print(f"Loading tokenized dataset from {tokenized_dataset_path!r}...", flush=True)
     dataset = load_from_disk(tokenized_dataset_path)
@@ -1022,6 +1088,7 @@ def run_teacher_pass(
                 device=device,
                 seq_len=seq_len,
                 torch_module=torch_module,
+                logits_table=logits_table,
             )
 
             if batch_start % (batch_size * 10) == 0:
@@ -1049,7 +1116,7 @@ def run_teacher_pass(
         f"({100*populated/total_entries:.1f}%)",
         flush=True,
     )
-    return table
+    return table, logits_table
 
 
 # ---------------------------------------------------------------------------
@@ -1075,6 +1142,54 @@ def save_oracle_table(
     out.parent.mkdir(parents=True, exist_ok=True)
     save_file({tensor_name: table}, str(out))
     print(f"Saved oracle table to {out} ({table.shape}, dtype={table.dtype})")
+
+
+def default_teacher_logits_sidecar_path(output_path: str | Path) -> Path:
+    """Derive the default sidecar path from the main `--output` value.
+
+    Strategy: replace the `.safetensors` suffix with
+    `_teacher_logits.safetensors` so `oracle.safetensors` becomes
+    `oracle_teacher_logits.safetensors`. If the suffix is missing, we
+    append the suffix verbatim — keeps the rule simple and predictable
+    for unusual output paths.
+    """
+    out = Path(output_path)
+    if out.suffix == ".safetensors":
+        return out.with_name(out.stem + TEACHER_LOGITS_SIDECAR_SUFFIX)
+    return out.with_name(out.name + TEACHER_LOGITS_SIDECAR_SUFFIX)
+
+
+def save_teacher_logits_sidecar(
+    logits_means: np.ndarray,
+    output_path: str | Path,
+) -> None:
+    """Write the Welford-mean teacher logits to a bf16 safetensors sidecar.
+
+    Output schema is fixed: a single tensor named
+    `TEACHER_LOGITS_SIDECAR_KEY` with shape `[total_entries, vocab]`,
+    dtype `bfloat16`. ZEB-139 KL-retrofit training reads this file
+    keyed by xxhash row index identical to the main oracle table, so
+    `train.py` can compute `KL(P_router || P_teacher)` without any
+    additional metadata exchange.
+
+    bf16 is chosen over fp16 because the logit means span both very
+    large positive (in-context tokens) and very negative (suppressed
+    tokens) values — bf16's wider exponent prevents underflow on the
+    suppressed-token tail that fp16 would zero out.
+    """
+    import torch
+    from safetensors.torch import save_file
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # numpy has no native bf16 — round-trip through torch to get a true
+    # bf16 tensor that safetensors persists losslessly.
+    tensor_bf16 = torch.from_numpy(logits_means).to(torch.bfloat16)
+    save_file({TEACHER_LOGITS_SIDECAR_KEY: tensor_bf16}, str(out))
+    print(
+        f"Saved teacher-logits sidecar to {out} "
+        f"({tuple(tensor_bf16.shape)}, dtype=bfloat16)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1190,6 +1305,27 @@ def build_argparser() -> argparse.ArgumentParser:
             "populated-row count, runtime). Defaults to output + '.stats.json'."
         ),
     )
+    parser.add_argument(
+        "--save-teacher-logits", action="store_true",
+        help=(
+            "Also Welford-mean the teacher's full LM-head outputs and "
+            "save as a bf16 sidecar safetensors at "
+            "<output-stem>_teacher_logits.safetensors (override with "
+            "--teacher-logits-output). Required by ZEB-139 KL-retrofit "
+            "training. Forces the HF teacher to load via "
+            "AutoModelForCausalLM (vs AutoModel) so lm_head is available; "
+            "adds ~1.28GB CPU-resident accumulator at 10K rows × 32K "
+            "vocab. Not supported with --teacher harmony:."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-logits-output", default=None,
+        help=(
+            "Override path for the teacher-logits sidecar. Only consulted "
+            "when --save-teacher-logits is set. Default derives from "
+            "--output via default_teacher_logits_sidecar_path()."
+        ),
+    )
     return parser
 
 
@@ -1224,7 +1360,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rng = np.random.default_rng(args.seed)
 
-    table = run_teacher_pass(
+    table, logits_table = run_teacher_pass(
         teacher_model_id=args.teacher,
         tokenized_dataset_path=args.dataset,
         layer_index=args.layer,
@@ -1236,6 +1372,7 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         dtype=args.dtype,
         expected_vocab_size=args.expected_vocab_size,
+        save_teacher_logits=args.save_teacher_logits,
     )
 
     populated_mask = table.populated_mask
@@ -1265,6 +1402,29 @@ def main(argv: list[str] | None = None) -> int:
     )
     save_oracle_table(projected, args.output)
 
+    teacher_logits_sidecar_path: str | None = None
+    if logits_table is not None:
+        # The logits table is xxhash-keyed identically to the hidden
+        # table, so its populated_mask must match. Hard-fail if it
+        # doesn't — that'd indicate a per-batch bug where the two
+        # update_batch calls saw different indices.
+        logits_populated_mask = logits_table.populated_mask
+        if not np.array_equal(logits_populated_mask, populated_mask):
+            print(
+                "Error: teacher-logits sidecar populated_mask diverged from "
+                "hidden-state oracle populated_mask. They must match exactly "
+                "(same xxhash row indices, same forward-pass batches). "
+                f"hidden_populated={populated}, "
+                f"logits_populated={int(logits_populated_mask.sum())}.",
+                file=sys.stderr,
+            )
+            return 1
+        sidecar_path = args.teacher_logits_output or str(
+            default_teacher_logits_sidecar_path(args.output),
+        )
+        save_teacher_logits_sidecar(logits_table.means, sidecar_path)
+        teacher_logits_sidecar_path = sidecar_path
+
     # Sidecar JSON makes the provenance traceable without reading the
     # safetensors, which is handy when diffing diagnostic runs.
     import json
@@ -1280,6 +1440,7 @@ def main(argv: list[str] | None = None) -> int:
             "populated_rows": populated,
             "populated_fraction": populated / args.entries,
             "pca_explained_variance_ratio_total": variance_ratio,
+            "teacher_logits_sidecar": teacher_logits_sidecar_path,
         }, f, indent=2)
     print(f"Wrote run stats to {stats_path}")
     return 0
