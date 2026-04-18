@@ -20,6 +20,10 @@ Decisively disambiguate **cross-architecture modality gap** from **fundamental 4
 
 ## 2. Context — the attractor observation
 
+**Mechanism (2026-04-18):** The Gemini Deep Research report (`docs/research/2026-04-18-post-zeb138-path-research-findings.md`) establishes the attractor as **gradient-descent autonomously inventing label smoothing**. When the router signal is uninformative, driving `P_router → uniform` minimizes expected CE-loss contribution, and the mixing equation structurally becomes `P_final = (1-α)·P_LM + α·uniform` — the exact formula for label smoothing. α = 0.17 is the empirically optimal smoothing factor for FineWeb-Edu under our base LM's calibration; it is corpus + base-LM dependent, not teacher dependent. This matches the observed teacher-invariance.
+
+Under this mechanism, the ZEB-138 question is precisely: **does same-arch teacher make the router signal informative to the frozen 40M student?** If yes, any non-uniform output beats uniform CE, and gradient descent will vacate the attractor. If no (for any reason), uniform remains optimal and the attractor holds.
+
 ZEB-134 (Mistral-7B, KRILE) and ZEB-136 (TinyLlama-1.1B, AVALON) produced the same router fingerprint within measurement noise:
 
 | Metric                    | ZEB-134 (Mistral-7B) | ZEB-136 (TinyLlama-1.1B) | Spread |
@@ -37,19 +41,20 @@ The attractor is a degenerate optimum: for any router that cannot produce conten
 
 ## 3. Primary diagnostic — attractor break
 
-**Δ-diff alone is insufficient** (too noisy at +0.0002 to distinguish small signal). The attractor-fingerprint gives four orthogonal views; any one threshold crossed is positive signal. All four must hold within tight bands for a clean null.
+**Δ-diff alone is insufficient** (too noisy at +0.0002 to distinguish small signal). The attractor-fingerprint gives five orthogonal views; any one threshold crossed is positive signal. All five must hold within tight bands for a clean null.
 
 | # | Threshold                                                 | Crossed meaning                                                    |
 |---|-----------------------------------------------------------|--------------------------------------------------------------------|
 | 1 | `engram_logit_entropy < log(vocab) − 0.1`                 | Router emits content-sensitive (non-uniform) distributions         |
-| 2 | `α` outside [0.14, 0.20]                                  | No longer KL-balancing against uniform                             |
+| 2 | `α` outside [0.14, 0.20]                                  | No longer the dataset-optimal label-smoothing factor              |
 | 3 | Cross-run cosine of engram-logit outputs < 0.7            | Outputs are content-driven across RNG seeds, not shared baseline   |
 | 4 | Δ-diff ≥ +0.001 nats                                      | Content-routing produces LM-measurable effect                      |
+| 5 | `W_align` Frobenius drift > 2× init                       | W_align received and used non-trivial gradients (structural vs. capacity discriminator — see §7.2 and §8) |
 
 **Decision rules:**
-- All four inside attractor band → attractor holds → capacity ceiling (see §8 Outcome A)
+- All five inside attractor band → attractor holds → further disambiguation needed (see §8 Outcomes A, C)
 - One threshold crossed → soft signal → extend training / investigate which broke first (§8 Outcome B)
-- Two or more crossed → attractor broken → modality gap is the bottleneck (§8 Outcome C)
+- Two or more crossed → attractor broken → modality gap is the bottleneck (§8 Outcome B-strong)
 - Δ-diff ≥ +0.005 → strong result → expand to scaling study (§8 Outcome D)
 
 ---
@@ -143,13 +148,27 @@ Identical to ZEB-134/136's ι₂ + skip-router setup. Fields marked [same as ZEB
 
 ## 7. Forensic suite
 
-Same probe suite as ZEB-134/136, report per cell:
+Same probe suite as ZEB-134/136, with one addition in §7.2.
 
-**Attractor fingerprint (primary):**
-- `engram_logit_entropy` (final-step + trajectory)
-- `log_alpha`, `α` (final-step)
-- `‖W_align‖_F` (final-step)
+### 7.1 Attractor fingerprint (primary)
+- `engram_logit_entropy` (final-step + full trajectory, logged every N steps)
+- `log_alpha`, `α` (final-step + trajectory)
+- `‖W_align‖_F` (final-step + trajectory — see §7.2)
 - Cross-run engram-logit cosine (across cells 3 and 4 = router-on real and router-on shuf)
+
+### 7.2 W_align trajectory logging (NEW, 2026-04-18)
+
+**Why:** under attractor-holds, we cannot distinguish "40M capacity ceiling" (Outcome A) from "linear W_align is structurally too narrow" (Outcome C) without seeing whether W_align actually absorbed gradient signal during training. This is the A-vs-C discriminator.
+
+**Log per training step (or every 50 steps, whichever is cheaper):**
+- `‖W_align‖_F` (Frobenius norm)
+- `‖W_align‖_F / ‖W_align_init‖_F` (drift ratio)
+- `‖∇W_align‖_F` (gradient norm on the alignment matrix)
+- `rank_effective(W_align)` via SVD tail ratio (computed every 500 steps is fine — more expensive)
+
+**Expected patterns:**
+- **Outcome A (capacity ceiling):** `W_align` drift > 2× init, gradients flow throughout training, rank stable. Signal reached the alignment matrix but couldn't be used.
+- **Outcome C (structural ceiling):** `W_align` drift ≈ 1× init, gradients suppressed to near-zero within first 1000 steps, rank collapses. The linear form itself is the ceiling — no signal got absorbed.
 
 **Supporting forensics:**
 - Within-run R (content-sensitivity per token) — expect ~0.09-0.15 per ZEB-136
@@ -164,11 +183,14 @@ Same probe suite as ZEB-134/136, report per cell:
 
 ## 8. Verdict matrix
 
+Restructured 2026-04-18 to distinguish capacity-ceiling (A) from structural-linear-insufficiency (C) under the attractor-holds branch, per Gemini steelman. The key discriminator is `W_align` Frobenius drift (§7.2).
+
 | Outcome | Definition | Conclusion | Next step |
 |---------|------------|------------|-----------|
-| **A (attractor holds)** | All four thresholds inside attractor band | 40M student is capacity-bound; teacher architecture does not matter | File cell C (474M student × same-arch teacher) spec; locate capacity ceiling |
-| **B (one threshold)** | Exactly one of `entropy`, `α`, `cross-run cos`, `Δ-diff` crosses | Soft signal — teacher-match partially helps | Extend training to 2× steps, diagnose which broke first; may reveal slow-converging routing |
-| **C (two+ thresholds)** | Two or more threshold crossings, Δ-diff < 0.005 | Cross-architecture modality gap is the bottleneck | Pursue same-arch teacher as primary substrate; scope follow-up for architectural work |
+| **A (attractor holds + W_align drift > 2× init)** | All five thresholds inside band; W_align absorbed gradients but student couldn't use them | 40M student is capacity-bound; teacher architecture does not matter; W_align was not the ceiling | Unfreeze top 2 layers (Gemini Path-A #1) or apply LoRA to v_proj/o_proj (Gemini Path-A #2); or scale student to 474M |
+| **B (attractor breaks, one threshold)** | Exactly one threshold crosses | Soft signal — teacher-match partially helps | Extend training to 2× steps, diagnose which broke first |
+| **B-strong (attractor breaks, two+ thresholds)** | Two or more threshold crossings, Δ-diff < 0.005 | Cross-architecture modality gap is the bottleneck | Pursue same-arch teacher as primary substrate; switch training objective to Memory-Decoder-style KL + CE (Gemini Path-B #1) |
+| **C (attractor holds + W_align drift ≈ init)** | All five thresholds inside band; W_align near-init, gradients suppressed | **Linear W_align is structurally insufficient** regardless of student capacity; PCA-128d → linear → 32k-vocab pipeline is mathematically too narrow | Replace W_align with multi-layer non-linear module (Memory-Decoder-style auxiliary decoder); unfreezing / scaling student won't help |
 | **D (Δ-diff ≥ 0.005)** | Strong LM-measurable signal | Major result — content-routing is viable at 40M with same-arch teacher | Expand to scaling + ablation study; publish |
 
 **Auxiliary observation:** regardless of outcome, cell-A results get compared directly against cell-B (ZEB-134 Mistral) and ZEB-136 TinyLlama numbers. The three-teacher table is the publication-ready artifact.
@@ -230,3 +252,5 @@ Cell C (if it runs) is the 474M-student cell, requires 22GB for student + oracle
 - **Internal consistency:** §3 thresholds align with §8 verdict matrix. §4 cell table matches §10 dependency table.
 - **Scope:** single implementation (cell A + oracle extraction), testable independently, gates downstream cells. Correct spec scope.
 - **Threshold calibration:** §3 threshold #3 was tightened from the initial 0.5 to **0.7** (2026-04-18) after observing that ZEB-136's cross-run cos = 0.798 sits comfortably in the attractor band. 0.7 is conservative enough that crossing it represents real content-driven variance, not noise. A looser 0.5 would have been easy to rationalize post-hoc, which is exactly the failure mode to avoid.
+- **Verdict matrix restructuring (2026-04-18):** the original A/B/C/D structure conflated "capacity ceiling" with "structural W_align ceiling." Post-Gemini, the verdict matrix now separates capacity-A (W_align drift > 2× init) from structural-C (W_align near-init), using the `W_align` Frobenius trajectory logged under §7.2. This lets a single ZEB-138 run resolve both failure modes instead of requiring a follow-up experiment to disambiguate.
+- **Attractor framing (2026-04-18):** §2 now frames the attractor as emergent label smoothing (mechanism documented in Gemini findings doc). This sharpens the ZEB-138 question from "does teacher-arch matter?" to "does same-arch teacher make the router signal *informative*?" — a precise mathematical criterion rather than a phenomenological observation.
