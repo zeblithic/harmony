@@ -36,7 +36,8 @@ prefix on `--teacher`. Three companion functions added at module scope:
    capture the layer's output tensor inline, return it via a one-element
    view that raises `IndexError` if any other layer is requested.
 
-Total diff: ~250 LOC including docstrings + 7 new unit tests in
+Total diff: ~250 LOC including docstrings + 11 new unit tests
+(9 unique functions, one parametrized × 3) in
 `training/tests/test_generate_oracle_table.py`. Zero changes outside
 `generate_oracle_table.py` and its tests — `model.py` was inspected but
 not modified.
@@ -207,10 +208,11 @@ greenlight the full run.
 
 ## Tests
 
-Added `TestHarmonyTeacherURI` (7 cases) to
-`training/tests/test_generate_oracle_table.py`. Total module test count:
-**42 passed, 1 skipped** (was 35 passed, 1 skipped on origin/main).
-Tests cover:
+Added `TestHarmonyTeacherURI` (9 functions, 11 collected after
+parametrize expansion) to
+`training/tests/test_generate_oracle_table.py`. Total module test
+count: **46 passed, 1 skipped** (was 35 passed, 1 skipped on
+origin/main). Tests cover:
 
 - URI prefix dispatches into `_load_harmony_teacher` with stripped path
 - Loader returns the same 5-tuple shape as the HF path
@@ -219,6 +221,8 @@ Tests cover:
 - Capgap-config misuse guard does NOT fire after the loader's config-clear
 - `vocab_size` mismatch raises `ValueError` with actionable message
 - Missing `config` key in payload raises `ValueError` with actionable message
+- `payload['config']` deserialized as the wrong type raises `ValueError`
+- Empty / whitespace-only `harmony:` URI raises `ValueError` (parametrized x3)
 - `--layer 0` correctly hooks `embed_tokens` (not `layers[0]`)
 
 ## Out-of-scope notes (kept as recommendations, not done in this PR)

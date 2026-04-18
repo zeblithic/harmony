@@ -539,10 +539,22 @@ def _load_harmony_teacher(
     exposes a HuggingFace-style `outputs.hidden_states[resolved_layer]`
     accessor by attaching a forward hook on the target block.
 
-    Checkpoint format requirements (mirrors what `train.py` saves with
-    `--checkpoint-interval > 0`): a torch-pickled dict with keys
-    `model_state_dict` and `config`. Bare per-step safetensors files
-    cannot be used because the architecture isn't recoverable.
+    Checkpoint format requirements: this loader expects the bundled
+    payload that `train.py:save_resumable_checkpoint` writes when
+    `--checkpoint-interval > 0` — a torch-pickled dict with at least
+    `model_state_dict` and `config` keys (see `ct87/train.py:145-190`).
+    The output filename is `<output-dir>/checkpoint.pt`.
+
+    train.py also writes per-step `model_step_<step>.safetensors` +
+    `optimizer_step_<step>.pt` via `ct87/train.py:save_checkpoint` (lines
+    83-98). Those bare safetensors files are NOT accepted here because
+    they hold weights only — without the persisted `config` we cannot
+    reconstruct `HarmonyModel(config)`'s architecture (num_layers,
+    hidden_dim, engram flags, ...). A future revision could add a
+    `<file>.safetensors + <file>.config.json` sidecar branch when KRILE's
+    Harmony-474M handoff format is known; until then the bundled `.pt`
+    is the only supported input and the pre-flight checklist in the
+    findings doc covers verifying it.
     """
     import dataclasses
 
