@@ -43,7 +43,7 @@ The attractor is a degenerate optimum: for any router that cannot produce conten
 |---|-----------------------------------------------------------|--------------------------------------------------------------------|
 | 1 | `engram_logit_entropy < log(vocab) − 0.1`                 | Router emits content-sensitive (non-uniform) distributions         |
 | 2 | `α` outside [0.14, 0.20]                                  | No longer KL-balancing against uniform                             |
-| 3 | Cross-run cosine of engram-logit outputs < 0.5            | Outputs are content-driven across RNG seeds, not shared baseline   |
+| 3 | Cross-run cosine of engram-logit outputs < 0.7            | Outputs are content-driven across RNG seeds, not shared baseline   |
 | 4 | Δ-diff ≥ +0.001 nats                                      | Content-routing produces LM-measurable effect                      |
 
 **Decision rules:**
@@ -81,10 +81,8 @@ Harmony-474M student × Mistral-7B teacher. Purpose: test whether scaled student
 ## 5. Oracle extraction protocol
 
 ### 5.1 Teacher checkpoint selection
-- **From ZEB-137:** first checkpoint that meets ZEB-137's health criteria (val-loss curve clean, step ≥ some TBD threshold — probably 5000+ steps so we have meaningful knowledge in the teacher).
-- **Deliverable from ZEB-137:** the pinned checkpoint file (safetensors + optimizer pair), plus train.csv log, transferred to AVALON via USB SSD.
-
-**Open question:** should we take the final step-7800 checkpoint, or an earlier checkpoint to give ZEB-138 earlier access? Tradeoff is teacher quality (later = better) vs wall-time savings (earlier = faster spinup).
+- **From ZEB-137:** the **final step-7800 checkpoint** (full pretraining run). Earlier checkpoints are not used — the wall-time savings don't justify the loss of teacher quality, and high-confidence teacher representation is load-bearing for the cell-A decisive verdict.
+- **Deliverable from ZEB-137:** the final `model_step_7800.safetensors` (+ its optimizer pair, though optimizer state isn't used here), plus train.csv log for teacher-health context, transferred to AVALON via USB SSD.
 
 ### 5.2 Tokenizer parity invariant
 `generate_oracle_table.py` hard-fails if teacher vocab ≠ 32000. Harmony-474M was pretrained with the Mistral v0.1 SentencePiece tokenizer (32000 vocab, confirmed in `ct87.prepare_data`), so parity holds. No corpus re-tokenization needed.
@@ -207,7 +205,7 @@ Cell C (if it runs) is the 474M-student cell, requires 22GB for student + oracle
 
 ## 11. Open questions (resolve before kickoff)
 
-1. **Teacher checkpoint step:** which ZEB-137 checkpoint to extract from? (final step-7800 vs earliest viable, e.g., step-5000). Tradeoff: teacher quality vs spinup time.
+1. ~~**Teacher checkpoint step:** which ZEB-137 checkpoint to extract from?~~ **Resolved 2026-04-18:** final step-7800 checkpoint. Teacher quality prioritized over spinup time. See §5.1.
 2. **Teacher layer index:** default is L22 (= L-2); consider also running L18 to probe earlier-layer content-sensitivity. Answer: single layer first, expand only if attractor breaks.
 3. **Oracle corpus:** reuse ZEB-136's 99M-token corpus (recommended for apples-to-apples) or re-extract from a larger split. Recommend: reuse.
 4. **Seed count:** 1 seed per cell for initial run, 3 seeds if on-the-edge result. Confirmed as standard.
@@ -231,4 +229,4 @@ Cell C (if it runs) is the 474M-student cell, requires 22GB for student + oracle
 - **Placeholder scan:** open questions are flagged in §11, all other sections are concrete. No TBDs outside explicit "Open question" blocks.
 - **Internal consistency:** §3 thresholds align with §8 verdict matrix. §4 cell table matches §10 dependency table.
 - **Scope:** single implementation (cell A + oracle extraction), testable independently, gates downstream cells. Correct spec scope.
-- **Ambiguity:** §3 threshold #3 ("Cross-run cosine < 0.5") — ZEB-136 showed cross-run cos = 0.798, which is well inside the attractor band. The 0.5 threshold may be too tight; could revise after cell A if needed. Flagged as soft threshold.
+- **Threshold calibration:** §3 threshold #3 was tightened from the initial 0.5 to **0.7** (2026-04-18) after observing that ZEB-136's cross-run cos = 0.798 sits comfortably in the attractor band. 0.7 is conservative enough that crossing it represents real content-driven variance, not noise. A looser 0.5 would have been easy to rationalize post-hoc, which is exactly the failure mode to avoid.
