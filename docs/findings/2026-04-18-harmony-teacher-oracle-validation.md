@@ -81,7 +81,8 @@ python -m ct87.generate_oracle_table \
 ```
 
 Output (last 7 lines):
-```
+
+```text
 Loading Harmony teacher checkpoint '/home/zebli/work/LOCAL/zeb136/checkpoints/zeb136_router_off_real/checkpoint.pt' (device=cuda, dtype=bfloat16)...
 Harmony teacher has 8 layers; extracting hidden_states[7] (arg: -2).
 Loading tokenized dataset from '/home/zebli/work/LOCAL/zeb136/data/fineweb-edu-poc/train'...
@@ -173,6 +174,7 @@ Pre-flight checklist before kicking that off:
       model + B=16 L=2048 activations).
 
 Smoke before the full run:
+
 ```bash
 .venv/bin/python -m ct87.generate_oracle_table \
   --teacher harmony:<...>/checkpoint.pt \

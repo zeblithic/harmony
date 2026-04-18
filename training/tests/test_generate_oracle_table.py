@@ -1020,7 +1020,7 @@ class TestHarmonyTeacherURI:
         )
         ckpt_path = tmp_path / "stale_format.pt"
         torch.save({"step": 0, "model_state_dict": {}}, ckpt_path)
-        with pytest.raises(ValueError, match="model_state_dict.*config"):
+        with pytest.raises(ValueError, match=r"model_state_dict.*config"):
             gen._load_harmony_teacher(
                 ckpt_path=str(ckpt_path),
                 device="cpu",
