@@ -547,8 +547,6 @@ def _load_harmony_teacher(
         flush=True,
     )
 
-    tokenizer = _load_harmony_compatible_tokenizer(expected_vocab_size)
-
     # `weights_only=True` rejects arbitrary pickle globals — necessary
     # because --teacher comes from CLI input and a malicious checkpoint
     # would otherwise execute arbitrary code on torch.load. The safe-
@@ -575,6 +573,13 @@ def _load_harmony_teacher(
             f"the corpus expects vocab_size={expected_vocab_size}. The student "
             "and teacher must share a tokenizer for n-gram hash parity."
         )
+
+    # Resolve the tokenizer only after the checkpoint passes structural
+    # validation. Doing this earlier risks masking a bad --teacher path
+    # (or vocab mismatch) behind an unrelated HuggingFace cache/network
+    # error on offline boxes, which is exactly the wrong error to
+    # surface first.
+    tokenizer = _load_harmony_compatible_tokenizer(expected_vocab_size)
 
     # Clear research-engram declarations so HarmonyModel.forward()'s misuse
     # guard (which raises if engram_inject_layers is set but no injection

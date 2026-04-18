@@ -37,7 +37,7 @@ prefix on `--teacher`. Three companion functions added at module scope:
    view that raises `IndexError` if any other layer is requested.
 
 Total diff: ~250 LOC including docstrings + 7 new unit tests in
-`tests/test_generate_oracle_table.py`. Zero changes outside
+`training/tests/test_generate_oracle_table.py`. Zero changes outside
 `generate_oracle_table.py` and its tests — `model.py` was inspected but
 not modified.
 
@@ -158,8 +158,23 @@ cd ~/work/zeblithic/harmony/training
 ```
 
 Pre-flight checklist before kicking that off:
-- [ ] Verify checkpoint payload via
-      `python -c "import torch; ckpt=torch.load('<path>', weights_only=False); print(sorted(ckpt.keys()))"`
+- [ ] Verify checkpoint payload via the same safe-load pattern
+      `_load_harmony_teacher` uses (do **not** use `weights_only=False`
+      — that re-enables arbitrary pickle execution on CLI-supplied
+      paths, which this PR explicitly hardened against):
+      ```bash
+      python - <<'PY'
+      import torch
+      from ct87.generate_oracle_table import _build_torch_load_safe_globals
+      from ct87.model import HarmonyModelConfig
+
+      with torch.serialization.safe_globals(
+          _build_torch_load_safe_globals(HarmonyModelConfig)
+      ):
+          ckpt = torch.load('<path>', map_location='cpu', weights_only=True)
+      print(sorted(ckpt.keys()))
+      PY
+      ```
       → must contain both `model_state_dict` and `config`. If the
       checkpoint format on KRILE differs (e.g., bare safetensors), add
       a sidecar `config.json` loader to `_load_harmony_teacher` first.
