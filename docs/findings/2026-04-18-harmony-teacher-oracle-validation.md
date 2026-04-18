@@ -179,9 +179,9 @@ print(sorted(ckpt.keys()))
 PY
 ```
 
-      → must contain both `model_state_dict` and `config`. If the
-      checkpoint format on KRILE differs (e.g., bare safetensors), add
-      a sidecar `config.json` loader to `_load_harmony_teacher` first.
+→ must contain both `model_state_dict` and `config`. If the
+checkpoint format on KRILE differs (e.g., bare safetensors), add a
+sidecar `config.json` loader to `_load_harmony_teacher` first.
 - [ ] Verify `config.vocab_size == 32000` and that the dataset's pre-
       tokenized arrow files use the same vocab.
 - [ ] Verify `config.num_layers >= 2` so `--layer -2` resolves

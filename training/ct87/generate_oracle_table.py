@@ -440,8 +440,19 @@ def load_and_validate_teacher(
     (`_load_harmony_teacher`) instead of the HuggingFace AutoModel path.
     """
     if teacher_model_id.startswith(_HARMONY_TEACHER_URI_PREFIX):
+        # Strip the prefix and reject empty / whitespace-only paths up-
+        # front. Without this, "--teacher harmony:" or "--teacher
+        # harmony:   " would fall through to `torch.load("")` and
+        # surface as an opaque OSError ("[Errno 2] No such file or
+        # directory: ''") that doesn't hint at the URI being malformed.
+        ckpt_path = teacher_model_id[len(_HARMONY_TEACHER_URI_PREFIX):].strip()
+        if not ckpt_path:
+            raise ValueError(
+                "--teacher expects 'harmony:<path>' with a non-empty checkpoint "
+                f"path; got {teacher_model_id!r}."
+            )
         return _load_harmony_teacher(
-            ckpt_path=teacher_model_id[len(_HARMONY_TEACHER_URI_PREFIX):],
+            ckpt_path=ckpt_path,
             device=device,
             dtype=dtype,
             expected_vocab_size=expected_vocab_size,

@@ -1029,6 +1029,21 @@ class TestHarmonyTeacherURI:
                 layer_index=-2,
             )
 
+    @pytest.mark.parametrize("malformed_uri", ["harmony:", "harmony:   ", "harmony:\t"])
+    def test_empty_harmony_uri_path_raises_actionable(self, malformed_uri):
+        """`--teacher harmony:` (or whitespace-only path) must fail with a
+        helpful CLI message, not torch.load's opaque '[Errno 2]' OSError."""
+        import ct87.generate_oracle_table as gen
+
+        with pytest.raises(ValueError, match=r"non-empty checkpoint path"):
+            gen.load_and_validate_teacher(
+                teacher_model_id=malformed_uri,
+                device="cpu",
+                dtype="float32",
+                expected_vocab_size=32000,
+                layer_index=-2,
+            )
+
     def test_payload_with_wrong_config_type_raises_actionable(self, tmp_path, monkeypatch):
         """Defense in depth: keys present but config deserialized as a plain dict.
 
