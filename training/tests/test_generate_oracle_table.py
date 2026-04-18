@@ -1029,6 +1029,41 @@ class TestHarmonyTeacherURI:
                 layer_index=-2,
             )
 
+    def test_payload_with_wrong_config_type_raises_actionable(self, tmp_path, monkeypatch):
+        """Defense in depth: keys present but config deserialized as a plain dict.
+
+        With weights_only=True + our restricted safe_globals allowlist, this
+        wouldn't actually round-trip — the unpickle would reject it before
+        we got here. But if a future train.py format saves config as a
+        dict, the explicit type-check produces an actionable error instead
+        of a confusing AttributeError on `config.vocab_size` later.
+        """
+        import ct87.generate_oracle_table as gen
+
+        class _FakeTok:
+            vocab_size = 32000
+            pad_token_id = 0
+
+        monkeypatch.setattr(
+            gen, "_load_harmony_compatible_tokenizer", lambda _v: _FakeTok()
+        )
+        # Force the unpickler past safe_globals by writing a payload that
+        # only uses primitive types — those are always allowed under
+        # weights_only=True regardless of the safe_globals allowlist.
+        ckpt_path = tmp_path / "config_as_dict.pt"
+        torch.save(
+            {"model_state_dict": {"x": torch.zeros(1)}, "config": {"vocab_size": 32000}},
+            ckpt_path,
+        )
+        with pytest.raises(ValueError, match=r"expected payload\['config'\] to be a HarmonyModelConfig"):
+            gen._load_harmony_teacher(
+                ckpt_path=str(ckpt_path),
+                device="cpu",
+                dtype="float32",
+                expected_vocab_size=32000,
+                layer_index=-2,
+            )
+
     def test_layer_zero_hooks_embedding(self, tmp_path, monkeypatch):
         """--layer 0 must capture embedding output, not block 0 output."""
         import ct87.generate_oracle_table as gen

@@ -566,20 +566,30 @@ def _load_harmony_teacher(
             f"{type(payload).__name__} with keys "
             f"{sorted(payload.keys()) if isinstance(payload, dict) else 'n/a'}."
         )
-    config: HarmonyModelConfig = payload["config"]
+    # Type-check the values, not just the keys. With our restricted
+    # safe_globals allowlist + weights_only=True the unpickle would
+    # already reject most divergent payloads, but an explicit guard
+    # turns "AttributeError: 'dict' object has no attribute
+    # 'vocab_size'" / "TypeError: load_state_dict expected a Mapping"
+    # into the same actionable error pattern as the keys check above.
+    model_state_dict = payload["model_state_dict"]
+    config = payload["config"]
+    if not isinstance(model_state_dict, dict):
+        raise ValueError(
+            f"{ckpt_path}: expected payload['model_state_dict'] to be a "
+            f"dict, got {type(model_state_dict).__name__}."
+        )
+    if not isinstance(config, HarmonyModelConfig):
+        raise ValueError(
+            f"{ckpt_path}: expected payload['config'] to be a "
+            f"HarmonyModelConfig, got {type(config).__name__}."
+        )
     if config.vocab_size != expected_vocab_size:
         raise ValueError(
             f"Harmony teacher config has vocab_size={config.vocab_size} but "
             f"the corpus expects vocab_size={expected_vocab_size}. The student "
             "and teacher must share a tokenizer for n-gram hash parity."
         )
-
-    # Resolve the tokenizer only after the checkpoint passes structural
-    # validation. Doing this earlier risks masking a bad --teacher path
-    # (or vocab mismatch) behind an unrelated HuggingFace cache/network
-    # error on offline boxes, which is exactly the wrong error to
-    # surface first.
-    tokenizer = _load_harmony_compatible_tokenizer(expected_vocab_size)
 
     # Clear research-engram declarations so HarmonyModel.forward()'s misuse
     # guard (which raises if engram_inject_layers is set but no injection
@@ -597,7 +607,7 @@ def _load_harmony_teacher(
         use_xattn_engram=False,
     )
     model = HarmonyModel(teacher_config)
-    missing, unexpected = model.load_state_dict(payload["model_state_dict"], strict=False)
+    missing, unexpected = model.load_state_dict(model_state_dict, strict=False)
     # Filter known-OK absences/extras:
     # - `*.table` / `*.table_normalized` are non-persistent buffers on
     #   EngramCrossAttention modules that aren't in any saved state_dict.
@@ -650,6 +660,14 @@ def _load_harmony_teacher(
 
     teacher_dim = config.hidden_dim
     adapter = _HarmonyTeacherAdapter(model, resolved_layer)
+
+    # Resolve the tokenizer last — only after every local checkpoint
+    # check has passed (payload shape, value types, vocab match,
+    # state-dict load, layer-index resolution). This way an HF
+    # cache/network failure can never mask a more-specific, more-
+    # actionable checkpoint error on an offline box.
+    tokenizer = _load_harmony_compatible_tokenizer(expected_vocab_size)
+
     return adapter, tokenizer, resolved_layer, teacher_dim, torch
 
 

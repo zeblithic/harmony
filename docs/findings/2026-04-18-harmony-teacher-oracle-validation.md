@@ -158,23 +158,27 @@ cd ~/work/zeblithic/harmony/training
 ```
 
 Pre-flight checklist before kicking that off:
+
 - [ ] Verify checkpoint payload via the same safe-load pattern
       `_load_harmony_teacher` uses (do **not** use `weights_only=False`
       — that re-enables arbitrary pickle execution on CLI-supplied
-      paths, which this PR explicitly hardened against):
-      ```bash
-      python - <<'PY'
-      import torch
-      from ct87.generate_oracle_table import _build_torch_load_safe_globals
-      from ct87.model import HarmonyModelConfig
+      paths, which this PR explicitly hardened against). Run from
+      `training/`:
 
-      with torch.serialization.safe_globals(
-          _build_torch_load_safe_globals(HarmonyModelConfig)
-      ):
-          ckpt = torch.load('<path>', map_location='cpu', weights_only=True)
-      print(sorted(ckpt.keys()))
-      PY
-      ```
+```bash
+python - <<'PY'
+import torch
+from ct87.generate_oracle_table import _build_torch_load_safe_globals
+from ct87.model import HarmonyModelConfig
+
+with torch.serialization.safe_globals(
+    _build_torch_load_safe_globals(HarmonyModelConfig)
+):
+    ckpt = torch.load('<path>', map_location='cpu', weights_only=True)
+print(sorted(ckpt.keys()))
+PY
+```
+
       → must contain both `model_state_dict` and `config`. If the
       checkpoint format on KRILE differs (e.g., bare safetensors), add
       a sidecar `config.json` loader to `_load_harmony_teacher` first.
