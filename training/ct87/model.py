@@ -670,6 +670,13 @@ class HarmonyModel(nn.Module):
         # forward.
         self._qdiv_aux_losses: list[torch.Tensor] = []
         self.engram_inject_mult: float = 1.0
+        # ZEB-134 Skip-to-Logit router. When attached, the model captures
+        # the engram injection output at the LAST entry of
+        # engram_inject_layers and feeds it through the router to produce
+        # an additive contribution to the final logits. The router itself
+        # lives in ct87.engram to keep all research modules co-located.
+        self.engram_skip_router: nn.Module | None = None
+        self._last_engram_skip_input: torch.Tensor | None = None
 
         # Tied embeddings
         if config.tie_embeddings:
@@ -794,6 +801,31 @@ class HarmonyModel(nn.Module):
             for layer_idx in self.config.engram_inject_layers
         })
 
+    def attach_engram_skip_router(self, router: nn.Module) -> None:
+        """Attach the ZEB-134 SkipToLogitEngramRouter.
+
+        The router takes the engram injection output at the last entry
+        of config.engram_inject_layers and adds a delta-logits tensor
+        to the model's main logits. Must be called after
+        attach_gated_engram_injections() so the injection path is
+        ready to feed the router.
+        """
+        if self.engram_skip_router is not None:
+            raise ValueError(
+                "attach_engram_skip_router() called but engram_skip_router "
+                "is already set - re-attach would orphan existing router "
+                "params from the module tree and desync any optimizer "
+                "built against them."
+            )
+        if self.engram_injections is None:
+            raise ValueError(
+                "attach_engram_skip_router() requires attach_gated_engram_"
+                "injections() to have been called first - the router "
+                "reads the injection output of the last configured "
+                "injection layer."
+            )
+        self.engram_skip_router = router
+
     def _init_weights(self):
         """Initialize weights matching candle HarmonyModel::new().
 
@@ -871,6 +903,7 @@ class HarmonyModel(nn.Module):
         self._last_ann_gate = None
         self._last_xattn_output = None
         self._last_pre_injection_hidden = None
+        self._last_engram_skip_input = None
         # V-contrast aux-loss sink: clear only in training mode so eval-time
         # callers (e.g. forensic) can inspect a pre-loaded list without it
         # being wiped out.
@@ -915,6 +948,13 @@ class HarmonyModel(nn.Module):
                 if key in self.engram_injections:
                     injection_out = self.engram_injections[key](h)
                     h = h + self.engram_inject_mult * injection_out
+                    # ZEB-134: snapshot the LAST injection site's output
+                    # for skip-to-logit routing. Overwriting is intended:
+                    # only the final injection participates in the skip
+                    # path because the decoder layers after that site
+                    # are the ones the router is meant to bypass.
+                    if self.engram_skip_router is not None:
+                        self._last_engram_skip_input = injection_out
             elif i == self.config.engram_injection_layer:
                 if self.engram_xattn is not None:
                     self._last_pre_injection_hidden = h
@@ -932,6 +972,20 @@ class HarmonyModel(nn.Module):
             self.block_attnres.notify_layer_output(i, h, attnres_state, layers_per_block)
 
         logits = self.lm_head(self.final_norm(h))
+
+        # ZEB-134 Skip-to-Logit additive path. The router produces a
+        # delta-logits tensor of shape [B, L, vocab] that bypasses the
+        # frozen L6/L7 + final_norm pipeline. W_align starts at zero so
+        # at step 0 the router contributes zero regardless of input;
+        # gradient flow opens through the nonzero alpha scalar first.
+        if (
+            self.engram_skip_router is not None
+            and self._last_engram_skip_input is not None
+            and self.engram_inject_mult != 0.0
+        ):
+            skip_logits = self.engram_skip_router(self._last_engram_skip_input)
+            logits = logits + skip_logits
+
         if return_hidden_states:
             return logits, h
         return logits
