@@ -59,6 +59,8 @@ from near-empty directions; PCA isolates the signal. See the same doc,
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -95,6 +97,22 @@ DEFAULT_LAYER_INDEX = -2  # penultimate layer (L-1) via HF negative index
 DEFAULT_HASH_SEEDS = (42, 99, 137, 251)
 DEFAULT_PCA_SUBSAMPLE = 0.2
 DEFAULT_PCA_BATCH = 512
+
+# Sidecar safetensors written when --save-teacher-logits is set. ZEB-139 KL-
+# retrofit training reads this file in parallel with the main oracle table to
+# compute KL(P_router || P_teacher). The tensor name is fixed so the trainer
+# doesn't need to know the producer's CLI flags.
+TEACHER_LOGITS_SIDECAR_KEY = "teacher_logits.weight"
+TEACHER_LOGITS_SIDECAR_SUFFIX = "_teacher_logits.safetensors"
+# Chunk size for the per-batch logits Welford update. The hidden-state path
+# materializes a [K, teacher_dim] scratch tensor (~2 GB at K=130k * 4096-dim
+# Mistral teacher) which has been stable in production for ZEB-119/134/136.
+# The logits path is 8x wider (vocab=32000 vs teacher_dim≤4096), so the same
+# unchunked materialization would be ~17 GB at default batch=8/seq_len=2048
+# — release-blocking OOM on most boxes. Chunking K caps the scratch at
+# `LOGITS_UPDATE_CHUNK_K * vocab * 4 bytes` (~64 MB at vocab=32000) and the
+# downstream `update_batch` float64 buffer at the same row count (~128 MB).
+LOGITS_UPDATE_CHUNK_K = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +230,232 @@ class WelfordTable:
     @property
     def populated_mask(self) -> np.ndarray:
         return self.counts > 0
+
+
+@dataclass
+class SumAccumulatorTable:
+    """Lightweight sum + count accumulator; means computed once at the end.
+
+    For wide vectors (e.g. vocab=32000) the per-batch combined-mean math
+    in `WelfordTable.update_batch` becomes the throughput bottleneck:
+    each call allocates a fresh `[unique_rows, dim] float64` scratch,
+    runs `np.unique` on the indices, scatters the in-batch sum, gathers
+    the pre-batch mean, computes the combined mean, and casts back to
+    fp32. At dim=32000 / chunk=512 / 512-chunks-per-batch we measured
+    ~24x slowdown vs the hidden-state path's dim=2048 (205 tok/s vs
+    ~5000 tok/s on a 5080 with TinyLlama).
+
+    This accumulator just scatters sums into a flat fp64 master table
+    and counts per row; the mean is computed via a single divide at
+    the end of the teacher pass (`means` property). Numerics are
+    identical to Welford's combined-mean formula by definition
+    (`mean = sum/count`), but we skip the per-batch combine + cast
+    + intermediate-buffer allocation cost.
+
+    Memory footprint:
+        sum    = total_entries * dim * 8 bytes (fp64)
+        counts = total_entries * 8 bytes (int64)
+
+    At total_entries=10_000, dim=32_000 that is ~2.56 GB for sum +
+    80 KB for counts — CPU-resident on AVALON-class hosts; would not
+    fit at e.g. dim=131072 / total_entries=100k. Callers using this
+    for vocab-sized accumulation should size accordingly.
+
+    API parity with `WelfordTable`: exposes the same `zeros`,
+    `update_batch`, `means`, and `populated_mask` interface so
+    `process_batch` and downstream consumers don't need to switch on
+    the table type.
+    """
+
+    sum: np.ndarray      # [total_entries, dim] float64
+    counts: np.ndarray   # [total_entries] int64
+
+    @classmethod
+    def zeros(cls, total_entries: int, dim: int) -> SumAccumulatorTable:
+        return cls(
+            sum=np.zeros((total_entries, dim), dtype=np.float64),
+            counts=np.zeros(total_entries, dtype=np.int64),
+        )
+
+    def update_batch(
+        self,
+        indices: np.ndarray,
+        vectors: np.ndarray,
+    ) -> None:
+        """Scatter-add `vectors` into `self.sum` at `indices`, +1 per index.
+
+        Matches `WelfordTable.update_batch`'s signature so process_batch
+        can call either type uniformly. Unlike Welford, this does NOT
+        compute a running mean — `self.sum` accumulates raw sums and
+        `self.counts` accumulates per-row update counts. Call `.means`
+        at end-of-pass to get the per-row mean.
+
+        Args:
+            indices: [K] int64 row indices (may contain duplicates;
+                np.add.at handles them correctly with unbuffered
+                scatter accumulation).
+            vectors: [K, dim] float observations, aligned with
+                `indices` by position. Cast to fp64 internally for
+                numerically stable accumulation.
+        """
+        if indices.shape[0] != vectors.shape[0]:
+            raise ValueError(
+                f"indices ({indices.shape[0]}) and vectors "
+                f"({vectors.shape[0]}) must align by first dim"
+            )
+        if vectors.shape[1] != self.sum.shape[1]:
+            raise ValueError(
+                f"vectors have dim={vectors.shape[1]} but table "
+                f"expects {self.sum.shape[1]}"
+            )
+        if indices.size == 0:
+            return
+        # np.add.at provides unbuffered fancy-index accumulation that
+        # handles duplicate indices correctly (the buffered
+        # `self.sum[indices] += ...` would lose updates on duplicates).
+        np.add.at(self.sum, indices, vectors.astype(np.float64))
+        np.add.at(self.counts, indices, 1)
+
+    @property
+    def means(self) -> np.ndarray:
+        """Compute per-row means lazily.
+
+        Unpopulated rows (count == 0) get zero rather than NaN so the
+        downstream sidecar consumer can treat the array as a dense
+        oracle without masking. The returned array is fp32 to match
+        the safetensors sidecar dtype convention.
+        """
+        out = np.zeros(self.sum.shape, dtype=np.float32)
+        populated = self.counts > 0
+        if populated.any():
+            with np.errstate(divide="ignore", invalid="ignore"):
+                out[populated] = (
+                    self.sum[populated] / self.counts[populated, None]
+                ).astype(np.float32)
+        return out
+
+    @property
+    def populated_mask(self) -> np.ndarray:
+        return self.counts > 0
+
+
+class GpuSumAccumulatorTable:
+    """GPU-resident sum + count accumulator for the wide-vector logits path.
+
+    Mirror of `SumAccumulatorTable` but with sum/counts on a torch GPU
+    device so per-batch updates leverage GPU memory bandwidth instead
+    of CPU's. Critical for vocab-wide accumulation: at vocab=32000 /
+    10K rows, the master sum table is ~2.56 GB and per-batch scatter
+    traffic exceeds 100 GB. CPU bandwidth (~10 GB/s effective on this
+    box) bottlenecks throughput at ~450 tok/s; a 5080's ~960 GB/s
+    memory bandwidth + `torch.Tensor.index_add_` brings it back to
+    multi-thousand tok/s — close to the no-logits ZEB-136 baseline.
+
+    API matches `SumAccumulatorTable` for `means` / `populated_mask` so
+    main()'s post-pass code is type-agnostic. The sole API divergence
+    is `update_batch` — this class accepts torch GPU tensors directly
+    (no per-chunk H2D transfer); `process_batch` branches on the
+    accumulator type to call the right interface.
+
+    Memory budget on a 14 GB 5080 (TinyLlama bf16):
+        - TinyLlama weights:           ~2.2 GB
+        - per-batch outputs.logits:    ~2.0 GB (bf16, [16, 2048, 32K])
+        - sum (this class):             2.56 GB (f64, [10K, 32K])
+        - counts:                       ~80 KB
+        - per-chunk fancy-index temp:   ~512 MB at chunk=4096 (f32)
+        - hidden Welford table:         ~80 MB (f32, [10K, 2048])
+        - activations / OS overhead:    ~2-3 GB
+        Total: ~10 GB resident — fits with margin.
+    """
+
+    def __init__(
+        self,
+        total_entries: int,
+        dim: int,
+        device,
+        torch_module,
+    ) -> None:
+        self._torch = torch_module
+        self._device = device
+        self._sum = torch_module.zeros(
+            (total_entries, dim),
+            dtype=torch_module.float64,
+            device=device,
+        )
+        self._counts = torch_module.zeros(
+            total_entries,
+            dtype=torch_module.long,
+            device=device,
+        )
+
+    @classmethod
+    def zeros(
+        cls,
+        total_entries: int,
+        dim: int,
+        device=None,
+        torch_module=None,
+    ) -> GpuSumAccumulatorTable:
+        if torch_module is None:
+            import torch as torch_module  # noqa: PLW0127  (rebind)
+        if device is None:
+            device = "cuda" if torch_module.cuda.is_available() else "cpu"
+        return cls(total_entries, dim, device, torch_module)
+
+    def update_batch_gpu(
+        self,
+        indices: "torch.Tensor",
+        vectors: "torch.Tensor",
+    ) -> None:
+        """Scatter-add `vectors` into `self._sum` at `indices`, +1 per index.
+
+        Both inputs must already be on `self._device`. The chunk loop in
+        `process_batch` slices an existing GPU tensor (`outputs.logits`),
+        so no host transfer happens here. `index_add_` is GPU-native and
+        handles duplicate indices correctly via atomic adds.
+        """
+        if indices.shape[0] != vectors.shape[0]:
+            raise ValueError(
+                f"indices ({indices.shape[0]}) and vectors "
+                f"({vectors.shape[0]}) must align by first dim"
+            )
+        if vectors.shape[1] != self._sum.shape[1]:
+            raise ValueError(
+                f"vectors have dim={vectors.shape[1]} but table "
+                f"expects {self._sum.shape[1]}"
+            )
+        if indices.shape[0] == 0:
+            return
+        # Promote vectors to f64 for accumulation parity with the CPU
+        # SumAccumulatorTable. The cast happens on GPU (cheap) so we
+        # don't pay it on the host's bandwidth.
+        self._sum.index_add_(0, indices, vectors.to(self._sum.dtype))
+        # Counts: scatter +1 per index. ones_like(indices) lives on the
+        # same device as indices, so this stays GPU-resident.
+        self._counts.index_add_(0, indices, self._torch.ones_like(indices))
+
+    @property
+    def means(self) -> np.ndarray:
+        """Compute per-row means lazily, transferring sum/counts to CPU once.
+
+        Called once at end-of-pass; the cost of the transfer (2.56 GB
+        at vocab=32000 / 10K rows) is amortized over the entire run.
+        Returns a numpy fp32 array matching `SumAccumulatorTable.means`.
+        """
+        sum_cpu = self._sum.cpu().numpy()
+        counts_cpu = self._counts.cpu().numpy()
+        out = np.zeros(sum_cpu.shape, dtype=np.float32)
+        populated = counts_cpu > 0
+        if populated.any():
+            with np.errstate(divide="ignore", invalid="ignore"):
+                out[populated] = (
+                    sum_cpu[populated] / counts_cpu[populated, None]
+                ).astype(np.float32)
+        return out
+
+    @property
+    def populated_mask(self) -> np.ndarray:
+        return (self._counts > 0).cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +671,8 @@ def load_and_validate_teacher(
     dtype: str,
     expected_vocab_size: int,
     layer_index: int,
+    *,
+    save_teacher_logits: bool = False,
 ):
     """Load the teacher, validate vocab parity, resolve and validate --layer.
 
@@ -436,10 +682,23 @@ def load_and_validate_teacher(
     batch loop. Lazy HuggingFace imports stay local so callers without
     the teacher extras can still import the module.
 
+    When `save_teacher_logits=True`, the HF branch loads
+    `AutoModelForCausalLM` (which includes the LM head) so callers can
+    read `outputs.logits` for the ZEB-139 KL-retrofit sidecar. The
+    Harmony branch rejects the combo upfront — the adapter only captures
+    hidden states, and ZEB-139 only needs TinyLlama anyway (spec §10).
+
     A `harmony:<path>` URI dispatches to the Harmony-architecture loader
     (`_load_harmony_teacher`) instead of the HuggingFace AutoModel path.
     """
     if teacher_model_id.startswith(_HARMONY_TEACHER_URI_PREFIX):
+        if save_teacher_logits:
+            raise ValueError(
+                "--save-teacher-logits is not supported with the harmony: "
+                "teacher URI. The Harmony adapter captures hidden states "
+                "only; logits would require an additional lm_head pass that "
+                "is out of scope for ZEB-139 (TinyLlama-only). See spec §10."
+            )
         # Strip the prefix and reject empty / whitespace-only paths up-
         # front. Without this, "--teacher harmony:" or "--teacher
         # harmony:   " would fall through to `torch.load("")` and
@@ -460,7 +719,7 @@ def load_and_validate_teacher(
         )
 
     import torch
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
     torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float32
 
@@ -485,7 +744,12 @@ def load_and_validate_teacher(
         )
     # AutoModel (not AutoModelForCausalLM) skips the LM head weights;
     # we only need the transformer trunk for hidden-state extraction.
-    model = AutoModel.from_pretrained(
+    # When --save-teacher-logits is set we upgrade to ForCausalLM so the
+    # forward pass also produces `outputs.logits` for the KL-retrofit
+    # sidecar (ZEB-139). For Mistral-7B the lm_head adds ~250MB at bf16;
+    # for TinyLlama (tied embeddings) the cost is ~zero.
+    model_cls = AutoModelForCausalLM if save_teacher_logits else AutoModel
+    model = model_cls.from_pretrained(
         teacher_model_id,
         torch_dtype=torch_dtype,
         output_hidden_states=True,
@@ -889,6 +1153,7 @@ def process_batch(
     device: str,
     seq_len: int,
     torch_module,
+    logits_table: WelfordTable | SumAccumulatorTable | GpuSumAccumulatorTable | None = None,
 ) -> int:
     """Run one forward pass + Welford update for a batch. Returns token count.
 
@@ -896,6 +1161,13 @@ def process_batch(
     being read when reasoning about throughput or VRAM. Every other
     call here (truncation, padding, forward, Welford) is idempotent
     and has its own tests.
+
+    If `logits_table` is provided, also extracts `outputs.logits` from
+    the same forward pass and Welford-updates the logits table at the
+    same n-gram row indices used for the hidden-state table. Caller
+    must have loaded the model via `AutoModelForCausalLM` (or any model
+    whose forward output exposes `.logits`) — otherwise this raises
+    AttributeError on the first batch.
     """
     # Truncate or pad each sequence to exactly seq_len so the tensor
     # is rectangular. Pad token: tokenizer.pad_token_id if defined,
@@ -913,11 +1185,27 @@ def process_batch(
     input_ids = torch_module.tensor(fixed, dtype=torch_module.long, device=device)
     outputs = model(input_ids=input_ids)
     hidden_states = outputs.hidden_states[resolved_layer]  # [B, T, teacher_dim]
-    # Move to CPU fp32 immediately so we can free GPU memory before
-    # the next batch. VRAM stays flat across the loop.
+    # Move hidden state to CPU fp32 immediately so we can free GPU memory
+    # before the next batch. VRAM stays flat across the loop. The
+    # hidden tensor is small (teacher_dim ≤ 4096) so a full CPU staging
+    # copy is cheap (~2 GB at default batch/seq for Mistral; ~1 GB for
+    # TinyLlama).
     hidden_np = hidden_states.float().cpu().numpy()
+    # Capture a reference to the GPU-side logits tensor (when needed)
+    # WITHOUT staging to CPU: the logits path is 8x wider than the
+    # hidden path (vocab=32000 vs teacher_dim≤4096), so the analogous
+    # full CPU copy would be ~2 GB at default settings. Round-1 (PR
+    # #255) chunked the K-loop downstream of `logits_np` but left this
+    # full-tensor staging in place; CodeRabbit round-2 caught it. We
+    # now per-chunk-pull from `logits_gpu` inside the K loop below,
+    # bounding peak host RAM at chunk*vocab*4 bytes (~64 MB).
+    logits_gpu = outputs.logits if logits_table is not None else None
     del hidden_states, outputs, input_ids
     if device.startswith("cuda"):
+        # NB: empty_cache() doesn't free `logits_gpu` because we still
+        # hold a reference to it. The K-loop's `del logits_gpu` +
+        # second empty_cache() below releases it after the chunked
+        # transfers finish.
         torch_module.cuda.empty_cache()
 
     # For each sequence in the batch, enumerate n-grams over the
@@ -943,6 +1231,86 @@ def process_batch(
         ps = np.array([p[1] for p in batch_positions], dtype=np.int64)
         vectors = hidden_np[bs, ps, :]  # [K, teacher_dim]
         table.update_batch(indices_arr, vectors.astype(np.float32))
+        if logits_table is not None:
+            # Same row indices, same (b, p) positions — guarantees the
+            # logits sidecar's row r corresponds to the hidden table's
+            # row r for the KL-retrofit lookup. Only the value vectors
+            # differ (vocab-wide logits instead of teacher_dim-wide
+            # hidden state).
+            #
+            # Chunked along K to bound the per-chunk fancy-index temp
+            # tensor (full [K, vocab] would be ~33 GB at default
+            # batch=16/seq=2048/vocab=32000).
+            #
+            # Two accumulator types are supported, with parallel
+            # chunked loops:
+            #   - GpuSumAccumulatorTable: keeps everything on GPU,
+            #     uses `torch.Tensor.index_add_`. ~10x throughput vs
+            #     CPU path because the master sum table lives in GPU
+            #     HBM (960 GB/s) instead of system RAM (~10 GB/s).
+            #   - SumAccumulatorTable: chunks pulled to CPU as numpy,
+            #     scattered via `np.add.at`. CPU-only fallback for
+            #     boxes without CUDA + for unit tests.
+            #
+            # Move bs/ps to the same device as logits_gpu once so the
+            # per-chunk fancy index doesn't trigger a fresh H2D copy
+            # of small index tensors on every iteration.
+            bs_t = torch_module.as_tensor(
+                bs, device=logits_gpu.device, dtype=torch_module.long,
+            )
+            ps_t = torch_module.as_tensor(
+                ps, device=logits_gpu.device, dtype=torch_module.long,
+            )
+            if isinstance(logits_table, GpuSumAccumulatorTable):
+                idx_t = torch_module.as_tensor(
+                    indices_arr,
+                    device=logits_gpu.device,
+                    dtype=torch_module.long,
+                )
+                for start in range(
+                    0, indices_arr.shape[0], LOGITS_UPDATE_CHUNK_K,
+                ):
+                    end = start + LOGITS_UPDATE_CHUNK_K
+                    chunk_gpu = logits_gpu[
+                        bs_t[start:end], ps_t[start:end], :
+                    ]
+                    logits_table.update_batch_gpu(
+                        idx_t[start:end], chunk_gpu,
+                    )
+                    del chunk_gpu
+                del idx_t
+            else:
+                for start in range(
+                    0, indices_arr.shape[0], LOGITS_UPDATE_CHUNK_K,
+                ):
+                    end = start + LOGITS_UPDATE_CHUNK_K
+                    idx_chunk = indices_arr[start:end]
+                    # GPU fancy-index pulls only the [chunk, vocab]
+                    # slice, then `.cpu().numpy()` materializes that
+                    # small slice on host. detach() avoids retaining
+                    # autograd state if the caller ever drops the
+                    # inference_mode wrapper.
+                    chunk_gpu = logits_gpu[
+                        bs_t[start:end], ps_t[start:end], :
+                    ]
+                    chunk_np = chunk_gpu.detach().float().cpu().numpy()
+                    logits_table.update_batch(
+                        idx_chunk,
+                        chunk_np.astype(np.float32, copy=False),
+                    )
+                    del chunk_gpu
+            del bs_t, ps_t
+
+    # `logits_gpu` cleanup must happen REGARDLESS of whether
+    # `batch_indices` is empty — without this, an all-padded batch (no
+    # bigrams in any sequence) would leak the full [B, T, vocab] GPU
+    # tensor reference until function return, holding ~2 GB of VRAM
+    # that should have been freed alongside `outputs` above. Cursor
+    # Bugbot caught this on PR #255 round-6.
+    if logits_gpu is not None:
+        del logits_gpu
+        if device.startswith("cuda"):
+            torch_module.cuda.empty_cache()
 
     return sum(real_lens)
 
@@ -959,13 +1327,28 @@ def run_teacher_pass(
     device: str | None,
     dtype: str,
     expected_vocab_size: int = DEFAULT_EXPECTED_VOCAB_SIZE,
-) -> WelfordTable:
+    *,
+    save_teacher_logits: bool = False,
+) -> tuple[WelfordTable, SumAccumulatorTable | GpuSumAccumulatorTable | None]:
     """Drive the full teacher forward pass, accumulating Welford means.
 
     High-level flow only: delegate teacher setup to
     `load_and_validate_teacher` and per-batch work to `process_batch`.
     Lazy-imports `datasets` so callers without the teacher extras can
     still import the module for the Welford / PCA tests.
+
+    Returns `(hidden_table, logits_table_or_None)`. The logits table is
+    `None` when `save_teacher_logits=False` (preserves the no-flag
+    memory profile — no extra `[total_entries, vocab]` allocation).
+    When populated, the logits table is a `SumAccumulatorTable` (not a
+    `WelfordTable`) whose `.means` are computed lazily at end-of-pass
+    — the per-batch combined-mean math in `WelfordTable.update_batch`
+    is too slow at vocab-width (~24x throughput regression observed in
+    the first ZEB-139 oracle re-extraction at vocab=32000). Both types
+    expose the same `update_batch` / `means` / `populated_mask`
+    interface, so `process_batch` doesn't need to switch on the type.
+    Sum-table memory: `[total_entries, vocab] float64` = ~2.56 GB at
+    10K rows × 32K vocab; bf16-cast happens at the sidecar save site.
     """
     import torch
     from datasets import load_from_disk
@@ -980,9 +1363,28 @@ def run_teacher_pass(
             dtype=dtype,
             expected_vocab_size=expected_vocab_size,
             layer_index=layer_index,
+            save_teacher_logits=save_teacher_logits,
         )
     )
     table = WelfordTable.zeros(total_entries, teacher_dim)
+    # Logits accumulator: prefer the GPU-resident
+    # `GpuSumAccumulatorTable` when running on CUDA — CPU
+    # accumulation at vocab=32000 is bandwidth-bound at ~450 tok/s,
+    # while GPU `index_add_` runs ~10x faster. CPU device falls back
+    # to `SumAccumulatorTable` so unit tests (and CPU-only smoke runs)
+    # don't require a GPU.
+    if save_teacher_logits:
+        if device.startswith("cuda"):
+            logits_table = GpuSumAccumulatorTable.zeros(
+                total_entries, expected_vocab_size,
+                device=device, torch_module=torch,
+            )
+        else:
+            logits_table = SumAccumulatorTable.zeros(
+                total_entries, expected_vocab_size,
+            )
+    else:
+        logits_table = None
 
     print(f"Loading tokenized dataset from {tokenized_dataset_path!r}...", flush=True)
     dataset = load_from_disk(tokenized_dataset_path)
@@ -1022,6 +1424,7 @@ def run_teacher_pass(
                 device=device,
                 seq_len=seq_len,
                 torch_module=torch_module,
+                logits_table=logits_table,
             )
 
             if batch_start % (batch_size * 10) == 0:
@@ -1049,7 +1452,7 @@ def run_teacher_pass(
         f"({100*populated/total_entries:.1f}%)",
         flush=True,
     )
-    return table
+    return table, logits_table
 
 
 # ---------------------------------------------------------------------------
@@ -1075,6 +1478,54 @@ def save_oracle_table(
     out.parent.mkdir(parents=True, exist_ok=True)
     save_file({tensor_name: table}, str(out))
     print(f"Saved oracle table to {out} ({table.shape}, dtype={table.dtype})")
+
+
+def default_teacher_logits_sidecar_path(output_path: str | Path) -> Path:
+    """Derive the default sidecar path from the main `--output` value.
+
+    Strategy: replace the `.safetensors` suffix with
+    `_teacher_logits.safetensors` so `oracle.safetensors` becomes
+    `oracle_teacher_logits.safetensors`. If the suffix is missing, we
+    append the suffix verbatim — keeps the rule simple and predictable
+    for unusual output paths.
+    """
+    out = Path(output_path)
+    if out.suffix == ".safetensors":
+        return out.with_name(out.stem + TEACHER_LOGITS_SIDECAR_SUFFIX)
+    return out.with_name(out.name + TEACHER_LOGITS_SIDECAR_SUFFIX)
+
+
+def save_teacher_logits_sidecar(
+    logits_means: np.ndarray,
+    output_path: str | Path,
+) -> None:
+    """Write the Welford-mean teacher logits to a bf16 safetensors sidecar.
+
+    Output schema is fixed: a single tensor named
+    `TEACHER_LOGITS_SIDECAR_KEY` with shape `[total_entries, vocab]`,
+    dtype `bfloat16`. ZEB-139 KL-retrofit training reads this file
+    keyed by xxhash row index identical to the main oracle table, so
+    `train.py` can compute `KL(P_router || P_teacher)` without any
+    additional metadata exchange.
+
+    bf16 is chosen over fp16 because the logit means span both very
+    large positive (in-context tokens) and very negative (suppressed
+    tokens) values — bf16's wider exponent prevents underflow on the
+    suppressed-token tail that fp16 would zero out.
+    """
+    import torch
+    from safetensors.torch import save_file
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # numpy has no native bf16 — round-trip through torch to get a true
+    # bf16 tensor that safetensors persists losslessly.
+    tensor_bf16 = torch.from_numpy(logits_means).to(torch.bfloat16)
+    save_file({TEACHER_LOGITS_SIDECAR_KEY: tensor_bf16}, str(out))
+    print(
+        f"Saved teacher-logits sidecar to {out} "
+        f"({tuple(tensor_bf16.shape)}, dtype=bfloat16)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1190,6 +1641,27 @@ def build_argparser() -> argparse.ArgumentParser:
             "populated-row count, runtime). Defaults to output + '.stats.json'."
         ),
     )
+    parser.add_argument(
+        "--save-teacher-logits", action="store_true",
+        help=(
+            "Also Welford-mean the teacher's full LM-head outputs and "
+            "save as a bf16 sidecar safetensors at "
+            "<output-stem>_teacher_logits.safetensors (override with "
+            "--teacher-logits-output). Required by ZEB-139 KL-retrofit "
+            "training. Forces the HF teacher to load via "
+            "AutoModelForCausalLM (vs AutoModel) so lm_head is available; "
+            "adds ~1.28GB CPU-resident accumulator at 10K rows x 32K "
+            "vocab. Not supported with --teacher harmony:."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-logits-output", default=None,
+        help=(
+            "Override path for the teacher-logits sidecar. Only consulted "
+            "when --save-teacher-logits is set. Default derives from "
+            "--output via default_teacher_logits_sidecar_path()."
+        ),
+    )
     return parser
 
 
@@ -1218,13 +1690,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.entries <= 0 or args.engram_dim <= 0:
         print("Error: --entries and --engram-dim must be positive", file=sys.stderr)
         return 2
+    # `--teacher-logits-output` is only consulted when `--save-teacher-
+    # logits` is set, so passing the override without the flag silently
+    # has no effect — a footgun where the user expects the sidecar at
+    # the explicit path and gets nothing. Fail fast instead.
+    if args.teacher_logits_output and not args.save_teacher_logits:
+        print(
+            "Error: --teacher-logits-output "
+            f"({args.teacher_logits_output!r}) was set without "
+            "--save-teacher-logits. The sidecar path is only consulted "
+            "when --save-teacher-logits is enabled — pass both flags or "
+            "drop --teacher-logits-output to avoid the misconfiguration.",
+            file=sys.stderr,
+        )
+        return 2
 
     # argparse already validated --hash-seeds via type=parse_hash_seeds.
     seeds = args.hash_seeds
 
     rng = np.random.default_rng(args.seed)
 
-    table = run_teacher_pass(
+    table, logits_table = run_teacher_pass(
         teacher_model_id=args.teacher,
         tokenized_dataset_path=args.dataset,
         layer_index=args.layer,
@@ -1236,6 +1722,7 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         dtype=args.dtype,
         expected_vocab_size=args.expected_vocab_size,
+        save_teacher_logits=args.save_teacher_logits,
     )
 
     populated_mask = table.populated_mask
@@ -1260,10 +1747,120 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
+    # Validate logits/hidden parity BEFORE writing any artifacts. If the
+    # check fails, exiting with a half-written `oracle.safetensors` on
+    # disk would let a downstream consumer (e.g. someone re-running
+    # training without --save-teacher-logits) pick up the orphaned
+    # output and not realize the producer aborted. Fail clean instead:
+    # PCA-project, validate, then write everything together or nothing.
+    teacher_logits_sidecar_path: str | None = None
+    if logits_table is not None:
+        # The logits table is xxhash-keyed identically to the hidden
+        # table, so its populated_mask must match. Hard-fail if it
+        # doesn't — that'd indicate a per-batch bug where the two
+        # update_batch calls saw different indices.
+        logits_populated_mask = logits_table.populated_mask
+        if not np.array_equal(logits_populated_mask, populated_mask):
+            print(
+                "Error: teacher-logits sidecar populated_mask diverged from "
+                "hidden-state oracle populated_mask. They must match exactly "
+                "(same xxhash row indices, same forward-pass batches). "
+                f"hidden_populated={populated}, "
+                f"logits_populated={int(logits_populated_mask.sum())}.",
+                file=sys.stderr,
+            )
+            return 1
+        teacher_logits_sidecar_path = args.teacher_logits_output or str(
+            default_teacher_logits_sidecar_path(args.output),
+        )
+        # Reject path collision: if --teacher-logits-output (or the default
+        # derived path, in some pathological --output) resolves to the
+        # same file as --output, the sidecar save would silently overwrite
+        # the just-written oracle. Default derivation
+        # (default_teacher_logits_sidecar_path) is collision-safe by
+        # construction, so this only fires when the user explicitly sets
+        # --teacher-logits-output.
+        if (
+            Path(teacher_logits_sidecar_path).resolve()
+            == Path(args.output).resolve()
+        ):
+            print(
+                "Error: --teacher-logits-output "
+                f"({teacher_logits_sidecar_path!r}) resolves to the same "
+                f"path as --output ({args.output!r}). The sidecar save "
+                "would overwrite the just-written oracle table. Pick "
+                "distinct paths.",
+                file=sys.stderr,
+            )
+            return 2
+
     projected = apply_pca_projection(
         table.means, components, mean_vector, populated_mask=populated_mask,
     )
-    save_oracle_table(projected, args.output)
+
+    # Atomic two-file write: stage both saves to per-PID .tmp siblings
+    # in the target dir, then `Path.replace()` (atomic rename on POSIX)
+    # into place only after BOTH saves succeed. This protects the run
+    # output from leaving the oracle on disk without its matching
+    # sidecar (or vice versa) if a save fails mid-way (disk full,
+    # permission, KeyboardInterrupt, ...). Safetensors itself doesn't
+    # tempfile-and-rename internally, so a partial .safetensors file
+    # would otherwise be possible.
+    #
+    # PID in the .tmp suffix: protects against accidental concurrent
+    # invocations against the same `--output`. Without it, two parallel
+    # runs would both write to `oracle.safetensors.tmp` and clobber
+    # each other. With it, each run owns its own staging files. (Stale
+    # PID-named .tmp files from crashed prior runs still need manual
+    # cleanup — accepted; the alternative of auto-cleanup at startup
+    # would be racy with concurrent runs we just made safe.)
+    #
+    # Rename order — sidecar FIRST, oracle LAST. Downstream consumers
+    # treat the oracle as the primary artifact (KL training opens
+    # `oracle.safetensors` first, then looks for the sidecar next to
+    # it). Renaming the oracle last guarantees consumers never see the
+    # transient state where the oracle exists at its final path but
+    # the sidecar doesn't exist yet (the inverse — sidecar present
+    # without oracle — is harmless because consumers don't check for
+    # the sidecar in isolation).
+    #
+    # Caveat: the OS doesn't provide multi-file atomic rename. If the
+    # second `replace()` fails after the first succeeds (microsecond
+    # window, same filesystem), the sidecar ends up on disk without
+    # the oracle — but consumers won't pick it up because they look
+    # for the oracle first. Strictly worse than success but strictly
+    # better than the inverse failure mode. The except path below
+    # cleans up any surviving .tmp files but doesn't roll back a
+    # successful first rename.
+    pid_suffix = f".{os.getpid()}.tmp"
+    oracle_tmp = Path(str(args.output) + pid_suffix)
+    sidecar_tmp = (
+        Path(str(teacher_logits_sidecar_path) + pid_suffix)
+        if teacher_logits_sidecar_path is not None
+        else None
+    )
+    try:
+        save_oracle_table(projected, oracle_tmp)
+        if teacher_logits_sidecar_path is not None:
+            save_teacher_logits_sidecar(logits_table.means, sidecar_tmp)
+        if sidecar_tmp is not None:
+            sidecar_tmp.replace(teacher_logits_sidecar_path)
+        oracle_tmp.replace(args.output)
+    except BaseException:
+        # BaseException catches KeyboardInterrupt / SystemExit too —
+        # those are the most likely interruption sources during a
+        # multi-GB safetensors write.
+        for p in (oracle_tmp, sidecar_tmp):
+            if p is not None:
+                with contextlib.suppress(OSError):
+                    p.unlink(missing_ok=True)
+        raise
+
+    # Make the final-state paths obvious in the log (the save_* prints
+    # above show the .tmp staging paths, which can read as confusing).
+    if teacher_logits_sidecar_path is not None:
+        print(f"Atomic-rename → {teacher_logits_sidecar_path}", flush=True)
+    print(f"Atomic-rename → {args.output}", flush=True)
 
     # Sidecar JSON makes the provenance traceable without reading the
     # safetensors, which is handy when diffing diagnostic runs.
@@ -1280,6 +1877,7 @@ def main(argv: list[str] | None = None) -> int:
             "populated_rows": populated,
             "populated_fraction": populated / args.entries,
             "pca_explained_variance_ratio_total": variance_ratio,
+            "teacher_logits_sidecar": teacher_logits_sidecar_path,
         }, f, indent=2)
     print(f"Wrote run stats to {stats_path}")
     return 0

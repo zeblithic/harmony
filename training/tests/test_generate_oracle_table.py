@@ -189,6 +189,208 @@ class TestWelfordTable:
         assert mask.tolist() == [False, True, False, True, False]
 
 
+class TestSumAccumulatorTable:
+    """SumAccumulatorTable replaces WelfordTable for the wide-vector logits
+    path. Numerically equivalent (sum/count = running mean) but defers the
+    divide to end-of-pass to dodge the per-batch combine cost that made
+    WelfordTable ~24x slower than the hidden path at vocab=32000.
+    """
+
+    def test_zeros_shape_and_dtypes(self):
+        from ct87.generate_oracle_table import SumAccumulatorTable
+
+        t = SumAccumulatorTable.zeros(10, 4)
+        assert t.sum.shape == (10, 4)
+        assert t.sum.dtype == np.float64
+        assert t.counts.shape == (10,)
+        assert t.counts.dtype == np.int64
+        assert not t.populated_mask.any()
+        # Empty means: no NaN — unpopulated rows return zero (so the
+        # downstream sidecar consumer can treat the array as dense).
+        assert np.all(t.means == 0)
+
+    def test_update_batch_records_sum_and_counts(self):
+        from ct87.generate_oracle_table import SumAccumulatorTable
+
+        t = SumAccumulatorTable.zeros(4, 3)
+        # Two updates to row 0, one each to rows 1 and 2.
+        t.update_batch(
+            np.array([0, 0, 1, 2], dtype=np.int64),
+            np.array([
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+                [10.0, 20.0, 30.0],
+                [-1.0, -1.0, -1.0],
+            ], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            t.counts, np.array([2, 1, 1, 0], dtype=np.int64),
+        )
+        np.testing.assert_allclose(t.sum[0], [5.0, 7.0, 9.0])
+        np.testing.assert_allclose(t.sum[1], [10.0, 20.0, 30.0])
+        np.testing.assert_allclose(t.sum[2], [-1.0, -1.0, -1.0])
+        np.testing.assert_array_equal(t.sum[3], [0.0, 0.0, 0.0])
+
+    def test_means_match_welford_running_mean(self):
+        """Sum/count over multiple batches must equal Welford's running
+        mean to within float32 precision. This is the load-bearing
+        equivalence claim — if this breaks, the oracle's row values no
+        longer mean what the spec says they mean."""
+        from ct87.generate_oracle_table import (
+            SumAccumulatorTable, WelfordTable,
+        )
+
+        rng = np.random.default_rng(0)
+        sum_table = SumAccumulatorTable.zeros(16, 64)
+        welford = WelfordTable.zeros(16, 64)
+        # 5 batches of varying size; some duplicate row indices.
+        for _ in range(5):
+            k = int(rng.integers(8, 32))
+            indices = rng.integers(0, 16, size=k).astype(np.int64)
+            vectors = rng.standard_normal((k, 64)).astype(np.float32)
+            sum_table.update_batch(indices, vectors)
+            welford.update_batch(indices, vectors)
+
+        np.testing.assert_array_equal(sum_table.counts, welford.counts)
+        # Both compute mean = sum / count over the same observations,
+        # using fp64 accumulators internally; final fp32 values should
+        # be very close.
+        np.testing.assert_allclose(
+            sum_table.means, welford.means, rtol=0, atol=1e-5,
+        )
+
+    def test_populated_mask_reflects_counts(self):
+        from ct87.generate_oracle_table import SumAccumulatorTable
+
+        t = SumAccumulatorTable.zeros(5, 2)
+        t.update_batch(
+            np.array([1, 3], dtype=np.int64),
+            np.ones((2, 2), dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            t.populated_mask,
+            np.array([False, True, False, True, False]),
+        )
+
+    def test_update_batch_rejects_misaligned_inputs(self):
+        from ct87.generate_oracle_table import SumAccumulatorTable
+
+        t = SumAccumulatorTable.zeros(4, 3)
+        with pytest.raises(ValueError, match="must align by first dim"):
+            t.update_batch(
+                np.array([0, 1], dtype=np.int64),
+                np.zeros((3, 3), dtype=np.float32),
+            )
+        with pytest.raises(ValueError, match="dim="):
+            t.update_batch(
+                np.array([0], dtype=np.int64),
+                np.zeros((1, 5), dtype=np.float32),
+            )
+
+    def test_empty_indices_is_noop(self):
+        from ct87.generate_oracle_table import SumAccumulatorTable
+
+        t = SumAccumulatorTable.zeros(4, 3)
+        t.update_batch(np.array([], dtype=np.int64), np.zeros((0, 3)))
+        assert not t.populated_mask.any()
+        assert np.all(t.sum == 0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="GpuSumAccumulatorTable requires CUDA",
+)
+class TestGpuSumAccumulatorTable:
+    """GPU-resident sum + count accumulator, used in production runs to
+    bypass the CPU memory-bandwidth bottleneck on the wide-vector logits
+    path. Numerics must match the CPU `SumAccumulatorTable` to within
+    fp64 precision (both accumulate in fp64).
+    """
+
+    def test_zeros_constructs_on_default_device(self):
+        from ct87.generate_oracle_table import GpuSumAccumulatorTable
+
+        t = GpuSumAccumulatorTable.zeros(8, 4)
+        assert str(t._sum.device).startswith("cuda")
+        assert t._sum.shape == (8, 4)
+        assert t._sum.dtype == torch.float64
+        assert t._counts.shape == (8,)
+        assert t._counts.dtype == torch.long
+        assert not t.populated_mask.any()
+        assert np.all(t.means == 0)
+
+    def test_update_batch_gpu_records_sum_and_counts(self):
+        from ct87.generate_oracle_table import GpuSumAccumulatorTable
+
+        t = GpuSumAccumulatorTable.zeros(4, 3)
+        device = t._device
+        indices = torch.tensor([0, 0, 1, 2], dtype=torch.long, device=device)
+        vectors = torch.tensor([
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+            [10.0, 20.0, 30.0],
+            [-1.0, -1.0, -1.0],
+        ], dtype=torch.float32, device=device)
+        t.update_batch_gpu(indices, vectors)
+        np.testing.assert_array_equal(
+            t._counts.cpu().numpy(), np.array([2, 1, 1, 0]),
+        )
+        np.testing.assert_allclose(t._sum[0].cpu().numpy(), [5.0, 7.0, 9.0])
+        np.testing.assert_allclose(t._sum[1].cpu().numpy(), [10.0, 20.0, 30.0])
+
+    def test_means_match_cpu_sum_accumulator(self):
+        """GPU and CPU accumulators must produce identical means (within
+        fp64 precision) given the same inputs. Pins the equivalence
+        contract — process_batch should produce bit-equivalent oracle
+        artifacts whether running on CPU or GPU."""
+        from ct87.generate_oracle_table import (
+            GpuSumAccumulatorTable, SumAccumulatorTable,
+        )
+
+        rng = np.random.default_rng(0)
+        gpu_t = GpuSumAccumulatorTable.zeros(16, 64)
+        cpu_t = SumAccumulatorTable.zeros(16, 64)
+        device = gpu_t._device
+        for _ in range(5):
+            k = int(rng.integers(8, 32))
+            indices_np = rng.integers(0, 16, size=k).astype(np.int64)
+            vectors_np = rng.standard_normal((k, 64)).astype(np.float32)
+            cpu_t.update_batch(indices_np, vectors_np)
+            gpu_t.update_batch_gpu(
+                torch.from_numpy(indices_np).to(device),
+                torch.from_numpy(vectors_np).to(device),
+            )
+        np.testing.assert_array_equal(gpu_t.populated_mask, cpu_t.populated_mask)
+        np.testing.assert_allclose(gpu_t.means, cpu_t.means, rtol=0, atol=1e-5)
+
+    def test_update_batch_gpu_rejects_misaligned_inputs(self):
+        from ct87.generate_oracle_table import GpuSumAccumulatorTable
+
+        t = GpuSumAccumulatorTable.zeros(4, 3)
+        device = t._device
+        with pytest.raises(ValueError, match="must align by first dim"):
+            t.update_batch_gpu(
+                torch.tensor([0, 1], dtype=torch.long, device=device),
+                torch.zeros(3, 3, dtype=torch.float32, device=device),
+            )
+        with pytest.raises(ValueError, match="dim="):
+            t.update_batch_gpu(
+                torch.tensor([0], dtype=torch.long, device=device),
+                torch.zeros(1, 5, dtype=torch.float32, device=device),
+            )
+
+    def test_empty_indices_is_noop_gpu(self):
+        from ct87.generate_oracle_table import GpuSumAccumulatorTable
+
+        t = GpuSumAccumulatorTable.zeros(4, 3)
+        device = t._device
+        t.update_batch_gpu(
+            torch.tensor([], dtype=torch.long, device=device),
+            torch.zeros(0, 3, device=device),
+        )
+        assert not t.populated_mask.any()
+
+
 # ---------------------------------------------------------------------------
 # N-gram extraction + student hash parity
 # ---------------------------------------------------------------------------
@@ -1101,3 +1303,528 @@ class TestHarmonyTeacherURI:
         assert resolved_layer == 0
         # Adapter's hook target must be embed_tokens, not layers[0].
         assert adapter._hook_module is adapter._model.embed_tokens
+
+
+@skip_if_no_transformers
+class TestSaveTeacherLogits:
+    """ZEB-139 prep: --save-teacher-logits gates a second WelfordTable that
+    captures the teacher's full LM-head outputs and writes a bf16 sidecar
+    alongside the main oracle. The training side (KL+CE retrofit) reads
+    that sidecar to compute KL(P_router || P_teacher) without needing
+    any extra metadata exchange.
+    """
+
+    @staticmethod
+    def _patch_hf_for_logits(monkeypatch, *, hidden_dim: int, vocab: int):
+        """Install a fake AutoTokenizer + AutoModelForCausalLM whose forward
+        returns a tensor with `.hidden_states` (tuple of len num_layers+1)
+        and `.logits` (shape [B, T, vocab]). Returns a dict the test can
+        inspect to confirm which model class was used.
+        """
+        import transformers
+        import datasets as hfds
+
+        class _FakeTok:
+            vocab_size = vocab
+            pad_token_id = 0
+
+        class _FakeCfg:
+            num_hidden_layers = 4
+            hidden_size = hidden_dim
+            vocab_size = vocab
+
+        class _FakeOutputs:
+            def __init__(self, hidden_states, logits):
+                self.hidden_states = hidden_states
+                self.logits = logits
+
+        class _FakeModel:
+            config = _FakeCfg()
+            def to(self, _dev): return self
+            def train(self, _flag): return self
+            def __call__(self, input_ids):
+                B, T = input_ids.shape
+                # 5 = num_hidden_layers + 1 (embedding output + 4 blocks).
+                hs = tuple(
+                    torch.full((B, T, hidden_dim), 0.5 * (i + 1))
+                    for i in range(5)
+                )
+                # Make logits contain the position index in dim 0 so the
+                # row-parity test can verify per-(b,p) lookup correctness.
+                logits = torch.zeros((B, T, vocab))
+                for b in range(B):
+                    for t in range(T):
+                        logits[b, t, 0] = float(b * 100 + t)
+                return _FakeOutputs(hidden_states=hs, logits=logits)
+
+        usage: dict = {"used_for_causal_lm": False, "used_automodel": False}
+
+        class _AutoModelCls:
+            @staticmethod
+            def from_pretrained(*_args, **_kwargs):
+                usage["used_automodel"] = True
+                return _FakeModel()
+
+        class _AutoModelForCausalLMCls:
+            @staticmethod
+            def from_pretrained(*_args, **_kwargs):
+                usage["used_for_causal_lm"] = True
+                return _FakeModel()
+
+        class _TokCls:
+            @staticmethod
+            def from_pretrained(_id): return _FakeTok()
+
+        monkeypatch.setattr(transformers, "AutoTokenizer", _TokCls)
+        monkeypatch.setattr(transformers, "AutoModel", _AutoModelCls)
+        monkeypatch.setattr(
+            transformers, "AutoModelForCausalLM", _AutoModelForCausalLMCls,
+        )
+
+        # Stub the dataset to return a tiny, deterministic batch.
+        class _FakeDataset:
+            column_names = ["input_ids"]
+            _data = {"input_ids": [
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                [9, 10, 11, 12, 13, 14, 15, 16],
+            ]}
+            def __len__(self): return len(self._data["input_ids"])
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    return {"input_ids": self._data["input_ids"][key]}
+                return self._data["input_ids"][key]
+
+        monkeypatch.setattr(hfds, "load_from_disk", lambda _p: _FakeDataset())
+        return usage
+
+    def test_run_teacher_pass_returns_tuple_with_none_when_flag_off(
+        self, monkeypatch,
+    ):
+        """Backward-compat: callers that didn't pass save_teacher_logits
+        must get a (table, None) tuple — not a bare WelfordTable, but
+        also not a populated logits table."""
+        import ct87.generate_oracle_table as gen
+        usage = self._patch_hf_for_logits(monkeypatch, hidden_dim=8, vocab=32000)
+
+        table, logits_table = gen.run_teacher_pass(
+            teacher_model_id="mock/teacher",
+            tokenized_dataset_path="/tmp/fake",
+            layer_index=-1,
+            total_entries=64,
+            hash_seeds=(42,),
+            batch_size=2,
+            seq_len=8,
+            max_sequences=2,
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+        )
+        assert isinstance(table, gen.WelfordTable)
+        assert logits_table is None
+        # Default path should NOT load AutoModelForCausalLM.
+        assert usage["used_automodel"] is True
+        assert usage["used_for_causal_lm"] is False
+
+    def test_flag_on_uses_AutoModelForCausalLM_and_returns_logits_table(
+        self, monkeypatch,
+    ):
+        """--save-teacher-logits triggers the AutoModelForCausalLM upgrade
+        AND populates a vocab-wide WelfordTable returned alongside the
+        hidden table."""
+        import ct87.generate_oracle_table as gen
+        usage = self._patch_hf_for_logits(monkeypatch, hidden_dim=8, vocab=32000)
+
+        table, logits_table = gen.run_teacher_pass(
+            teacher_model_id="mock/teacher",
+            tokenized_dataset_path="/tmp/fake",
+            layer_index=-1,
+            total_entries=64,
+            hash_seeds=(42,),
+            batch_size=2,
+            seq_len=8,
+            max_sequences=2,
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            save_teacher_logits=True,
+        )
+        assert isinstance(table, gen.WelfordTable)
+        # Logits table is the throughput-optimized SumAccumulatorTable
+        # (vs WelfordTable for the hidden path) — see SumAccumulatorTable
+        # docstring for the rationale.
+        assert isinstance(logits_table, gen.SumAccumulatorTable)
+        assert logits_table.means.shape == (64, 32000)
+        assert logits_table.means.dtype == np.float32
+        # The two tables share the xxhash row-population pattern by
+        # construction — they update at identical (b, p) positions.
+        assert np.array_equal(table.populated_mask, logits_table.populated_mask)
+        # Confirm the upgrade actually happened.
+        assert usage["used_for_causal_lm"] is True
+        assert usage["used_automodel"] is False
+
+    def test_save_teacher_logits_with_harmony_uri_rejected(self, monkeypatch):
+        """--save-teacher-logits + --teacher harmony:* must raise BEFORE
+        any model load. The Harmony adapter only captures hidden states;
+        ZEB-139 (TinyLlama-only) doesn't need this path."""
+        import ct87.generate_oracle_table as gen
+
+        # Stub _load_harmony_teacher to fail loudly if reached.
+        monkeypatch.setattr(
+            gen, "_load_harmony_teacher",
+            lambda **_kw: (_ for _ in ()).throw(
+                AssertionError("must not reach harmony loader"),
+            ),
+        )
+        with pytest.raises(ValueError, match=r"--save-teacher-logits.*harmony:"):
+            gen.load_and_validate_teacher(
+                teacher_model_id="harmony:/path/to/ckpt.pt",
+                device="cpu",
+                dtype="float32",
+                expected_vocab_size=32000,
+                layer_index=-2,
+                save_teacher_logits=True,
+            )
+
+    def test_default_sidecar_path_swaps_safetensors_suffix(self):
+        from ct87.generate_oracle_table import default_teacher_logits_sidecar_path
+
+        # Standard `.safetensors` output → suffix-swap.
+        assert (
+            default_teacher_logits_sidecar_path("/tmp/oracle.safetensors")
+            == Path("/tmp/oracle_teacher_logits.safetensors")
+        )
+        # Unusual extension → append rule (still predictable).
+        assert (
+            default_teacher_logits_sidecar_path("/tmp/oracle.bin")
+            == Path("/tmp/oracle.bin_teacher_logits.safetensors")
+        )
+
+    def test_save_teacher_logits_sidecar_round_trip_preserves_means_within_bf16(
+        self, tmp_path,
+    ):
+        """save_teacher_logits_sidecar writes bf16 — round-trip must
+        preserve the per-row means within bf16's ~3-decimal precision."""
+        from safetensors.torch import load_file
+        from ct87.generate_oracle_table import (
+            TEACHER_LOGITS_SIDECAR_KEY, save_teacher_logits_sidecar,
+        )
+
+        rng = np.random.default_rng(0)
+        # Logits typically span [-20, +20]; bf16 handles that range cleanly.
+        means = rng.standard_normal((16, 256)).astype(np.float32) * 5.0
+        out = tmp_path / "logits.safetensors"
+        save_teacher_logits_sidecar(means, out)
+        assert out.exists()
+
+        loaded = load_file(str(out))
+        assert TEACHER_LOGITS_SIDECAR_KEY in loaded
+        recovered = loaded[TEACHER_LOGITS_SIDECAR_KEY]
+        assert recovered.dtype is torch.bfloat16
+        assert tuple(recovered.shape) == (16, 256)
+        # bf16 has 7-bit mantissa → ~1e-2 relative precision in this range.
+        recovered_f32 = recovered.float().numpy()
+        np.testing.assert_allclose(recovered_f32, means, rtol=2e-2, atol=1e-2)
+
+    def test_argparser_accepts_save_teacher_logits_flag(self):
+        from ct87.generate_oracle_table import build_argparser
+
+        args = build_argparser().parse_args([
+            "--dataset", "/tmp/fake",
+            "--output", "/tmp/x.safetensors",
+            "--save-teacher-logits",
+        ])
+        assert args.save_teacher_logits is True
+        assert args.teacher_logits_output is None  # uses default derivation
+
+    def test_argparser_default_save_teacher_logits_off(self):
+        from ct87.generate_oracle_table import build_argparser
+
+        args = build_argparser().parse_args([
+            "--dataset", "/tmp/fake",
+            "--output", "/tmp/x.safetensors",
+        ])
+        assert args.save_teacher_logits is False
+        assert args.teacher_logits_output is None
+
+    def test_chunked_logits_update_matches_single_pass(self, monkeypatch):
+        """The K-dimension chunk loop in process_batch must produce the
+        same Welford means as a single unchunked update_batch call.
+
+        Welford is order-invariant across calls (combines pre-batch mean
+        with each chunk's contribution exactly), so chunking K must be
+        bit-identical modulo float64 accumulation order. This test pins
+        that contract — without it, a future "optimization" that reuses
+        the chunk loop for the hidden path could silently change the
+        oracle's row values.
+        """
+        import ct87.generate_oracle_table as gen
+
+        # Force a small chunk size so the loop runs >1 iteration on
+        # modest K values without bloating the test.
+        monkeypatch.setattr(gen, "LOGITS_UPDATE_CHUNK_K", 7)
+
+        usage = self._patch_hf_for_logits(monkeypatch, hidden_dim=8, vocab=32000)
+        del usage  # unused here
+
+        chunked_table, chunked_logits = gen.run_teacher_pass(
+            teacher_model_id="mock/teacher",
+            tokenized_dataset_path="/tmp/fake",
+            layer_index=-1,
+            total_entries=64,
+            hash_seeds=(42,),
+            batch_size=2,
+            seq_len=8,
+            max_sequences=2,
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            save_teacher_logits=True,
+        )
+
+        # Re-run with chunk size larger than any K we'd produce — single
+        # pass through update_batch.
+        monkeypatch.setattr(gen, "LOGITS_UPDATE_CHUNK_K", 10**9)
+        single_table, single_logits = gen.run_teacher_pass(
+            teacher_model_id="mock/teacher",
+            tokenized_dataset_path="/tmp/fake",
+            layer_index=-1,
+            total_entries=64,
+            hash_seeds=(42,),
+            batch_size=2,
+            seq_len=8,
+            max_sequences=2,
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            save_teacher_logits=True,
+        )
+
+        # Hidden path is uneffected by chunking — must be identical.
+        np.testing.assert_array_equal(chunked_table.means, single_table.means)
+        np.testing.assert_array_equal(chunked_table.counts, single_table.counts)
+        # Logits path: equality up to float64 reordering. Welford
+        # combines as `(old_mean*old_n + sum)/new_n` per unique row;
+        # changing the order rows arrive in within a chunk doesn't
+        # change the per-row sum (each update is +=). So means must
+        # match bit-exactly.
+        np.testing.assert_array_equal(chunked_logits.counts, single_logits.counts)
+        np.testing.assert_allclose(
+            chunked_logits.means, single_logits.means,
+            rtol=0, atol=1e-6,
+        )
+
+    def test_main_rejects_teacher_logits_output_without_save_flag(
+        self, capsys, tmp_path,
+    ):
+        """--teacher-logits-output is only consulted when
+        --save-teacher-logits is set, so passing the override without
+        the flag silently produces no sidecar — a footgun where the
+        user expects the path to be honored. main() must fail-fast
+        with rc=2 (CLI misuse) before any teacher load."""
+        import ct87.generate_oracle_table as gen
+
+        rc = gen.main([
+            "--dataset", "/tmp/ignored",
+            "--output", str(tmp_path / "oracle.safetensors"),
+            # Override path passed but flag NOT set — should reject.
+            "--teacher-logits-output",
+            str(tmp_path / "explicit_sidecar.safetensors"),
+            "--entries", "8",
+            "--engram-dim", "2",
+        ])
+        assert rc == 2, "expected rc=2 (CLI misuse) on flag/path inconsistency"
+        captured = capsys.readouterr()
+        assert "--teacher-logits-output" in captured.err
+        assert "--save-teacher-logits" in captured.err
+
+    def test_main_rejects_path_aliasing_between_oracle_and_sidecar(
+        self, monkeypatch, tmp_path,
+    ):
+        """If --teacher-logits-output resolves to the same file as
+        --output, the second save would silently overwrite the first.
+        main() must reject this combination at startup with rc=2 (CLI
+        misuse), before any write happens."""
+        import ct87.generate_oracle_table as gen
+
+        # Stub run_teacher_pass — we don't need a real forward pass to
+        # exercise the path-aliasing guard, just two non-empty tables.
+        hidden_table = gen.WelfordTable.zeros(8, 4)
+        hidden_table.update_batch(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.ones((3, 4), dtype=np.float32),
+        )
+        logits_table = gen.SumAccumulatorTable.zeros(8, 16)
+        logits_table.update_batch(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.ones((3, 16), dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            gen, "run_teacher_pass",
+            lambda **_kw: (hidden_table, logits_table),
+        )
+        save_calls: list[str] = []
+        monkeypatch.setattr(
+            gen, "save_oracle_table",
+            lambda *_a, **_k: save_calls.append("oracle"),
+        )
+        monkeypatch.setattr(
+            gen, "save_teacher_logits_sidecar",
+            lambda *_a, **_k: save_calls.append("sidecar"),
+        )
+
+        out_path = tmp_path / "oracle.safetensors"
+        rc = gen.main([
+            "--dataset", "/tmp/ignored",
+            "--output", str(out_path),
+            "--save-teacher-logits",
+            # Deliberate aliasing — same file as --output.
+            "--teacher-logits-output", str(out_path),
+            "--entries", "8",
+            "--engram-dim", "2",
+            "--pca-batch-size", "2",
+            "--pca-subsample-fraction", "1.0",
+        ])
+        assert rc == 2, "expected rc=2 (CLI misuse) on aliased paths"
+        assert save_calls == [], (
+            "neither oracle nor sidecar should be written when path "
+            f"aliasing is detected; got writes: {save_calls}"
+        )
+
+    def test_main_atomic_write_cleans_up_tmps_on_sidecar_failure(
+        self, monkeypatch, tmp_path,
+    ):
+        """If the sidecar save raises after the oracle .tmp is on disk,
+        main() must clean up the .tmp files and propagate the error —
+        no oracle.safetensors, no oracle.safetensors.tmp, no
+        sidecar.safetensors.tmp left lying around."""
+        import ct87.generate_oracle_table as gen
+
+        hidden_table = gen.WelfordTable.zeros(8, 4)
+        hidden_table.update_batch(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.ones((3, 4), dtype=np.float32),
+        )
+        logits_table = gen.SumAccumulatorTable.zeros(8, 16)
+        logits_table.update_batch(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.ones((3, 16), dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            gen, "run_teacher_pass",
+            lambda **_kw: (hidden_table, logits_table),
+        )
+
+        # Stub save_oracle_table to actually create the .tmp file (so
+        # the cleanup path has something to unlink). Using a simple
+        # touch — content doesn't matter for this test.
+        def _stub_oracle_save(_means, output_path):
+            Path(str(output_path)).touch()
+        monkeypatch.setattr(gen, "save_oracle_table", _stub_oracle_save)
+
+        # Sidecar save raises — simulates disk full, permission, etc.
+        def _stub_sidecar_fail(*_a, **_k):
+            raise OSError("simulated sidecar write failure")
+        monkeypatch.setattr(
+            gen, "save_teacher_logits_sidecar", _stub_sidecar_fail,
+        )
+
+        out_path = tmp_path / "oracle.safetensors"
+        sidecar_path = tmp_path / "oracle_teacher_logits.safetensors"
+
+        with pytest.raises(OSError, match="simulated sidecar write failure"):
+            gen.main([
+                "--dataset", "/tmp/ignored",
+                "--output", str(out_path),
+                "--save-teacher-logits",
+                "--entries", "8",
+                "--engram-dim", "2",
+                "--pca-batch-size", "2",
+                "--pca-subsample-fraction", "1.0",
+            ])
+
+        # Atomic-write contract: nothing should remain on disk. The
+        # .tmp filenames now include PID for concurrent-run safety, so
+        # glob the pattern instead of hardcoding the literal name.
+        assert not out_path.exists(), (
+            "oracle.safetensors must not exist when sidecar save fails"
+        )
+        oracle_tmps = list(tmp_path.glob("oracle.safetensors.*.tmp"))
+        assert oracle_tmps == [], (
+            f"oracle .tmp files must be cleaned up after sidecar "
+            f"failure; leaked: {oracle_tmps}"
+        )
+        assert not sidecar_path.exists(), (
+            "sidecar must not exist (it was the one that failed)"
+        )
+        sidecar_tmps = list(
+            tmp_path.glob("oracle_teacher_logits.safetensors.*.tmp"),
+        )
+        assert sidecar_tmps == [], (
+            f"sidecar .tmp files must be cleaned up too; leaked: "
+            f"{sidecar_tmps}"
+        )
+
+    def test_main_does_not_write_oracle_when_logits_parity_fails(
+        self, monkeypatch, tmp_path,
+    ):
+        """If the logits/hidden populated_mask parity check fails, main()
+        must abort with rc=1 BEFORE writing any artifact. The reordering
+        prevents a half-written `oracle.safetensors` from leaking onto
+        disk that a downstream consumer might then pick up unaware."""
+        import ct87.generate_oracle_table as gen
+
+        # Build two WelfordTables with deliberately mismatched
+        # populated_mask: hidden has rows 0..3 populated, logits has
+        # rows 0..2 (missing row 3). Forces the parity guard to fire.
+        hidden_table = gen.WelfordTable.zeros(8, 4)
+        hidden_table.update_batch(
+            np.array([0, 1, 2, 3], dtype=np.int64),
+            np.ones((4, 4), dtype=np.float32),
+        )
+        logits_table = gen.SumAccumulatorTable.zeros(8, 16)
+        logits_table.update_batch(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.ones((3, 16), dtype=np.float32),
+        )
+        assert not np.array_equal(
+            hidden_table.populated_mask, logits_table.populated_mask,
+        )
+
+        # Stub run_teacher_pass to skip the actual forward pass.
+        monkeypatch.setattr(
+            gen, "run_teacher_pass",
+            lambda **_kw: (hidden_table, logits_table),
+        )
+
+        # Stub the PCA functions so we can detect whether they ran (we
+        # want them to run because they're cheap and pure, but the file
+        # writes must NOT happen).
+        save_calls: list[str] = []
+        monkeypatch.setattr(
+            gen, "save_oracle_table",
+            lambda *_a, **_k: save_calls.append("oracle"),
+        )
+        monkeypatch.setattr(
+            gen, "save_teacher_logits_sidecar",
+            lambda *_a, **_k: save_calls.append("sidecar"),
+        )
+
+        out_path = tmp_path / "oracle.safetensors"
+        rc = gen.main([
+            "--dataset", "/tmp/ignored",
+            "--output", str(out_path),
+            "--save-teacher-logits",
+            "--entries", "8",
+            "--engram-dim", "2",
+            "--pca-batch-size", "2",
+            "--pca-subsample-fraction", "1.0",
+        ])
+        assert rc == 1, "expected non-zero exit on parity mismatch"
+        assert save_calls == [], (
+            "neither oracle nor sidecar should be written when parity "
+            f"check fails; got writes: {save_calls}"
+        )
+        assert not out_path.exists(), (
+            "main() must not leave a half-written oracle.safetensors on "
+            "disk after a parity failure"
+        )
