@@ -1408,6 +1408,125 @@ class TestSaveTeacherLogits:
             rtol=0, atol=1e-6,
         )
 
+    def test_main_rejects_path_aliasing_between_oracle_and_sidecar(
+        self, monkeypatch, tmp_path,
+    ):
+        """If --teacher-logits-output resolves to the same file as
+        --output, the second save would silently overwrite the first.
+        main() must reject this combination at startup with rc=2 (CLI
+        misuse), before any write happens."""
+        import ct87.generate_oracle_table as gen
+
+        # Stub run_teacher_pass — we don't need a real forward pass to
+        # exercise the path-aliasing guard, just two non-empty tables.
+        hidden_table = gen.WelfordTable.zeros(8, 4)
+        hidden_table.update_batch(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.ones((3, 4), dtype=np.float32),
+        )
+        logits_table = gen.WelfordTable.zeros(8, 16)
+        logits_table.update_batch(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.ones((3, 16), dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            gen, "run_teacher_pass",
+            lambda **_kw: (hidden_table, logits_table),
+        )
+        save_calls: list[str] = []
+        monkeypatch.setattr(
+            gen, "save_oracle_table",
+            lambda *_a, **_k: save_calls.append("oracle"),
+        )
+        monkeypatch.setattr(
+            gen, "save_teacher_logits_sidecar",
+            lambda *_a, **_k: save_calls.append("sidecar"),
+        )
+
+        out_path = tmp_path / "oracle.safetensors"
+        rc = gen.main([
+            "--dataset", "/tmp/ignored",
+            "--output", str(out_path),
+            "--save-teacher-logits",
+            # Deliberate aliasing — same file as --output.
+            "--teacher-logits-output", str(out_path),
+            "--entries", "8",
+            "--engram-dim", "2",
+            "--pca-batch-size", "2",
+            "--pca-subsample-fraction", "1.0",
+        ])
+        assert rc == 2, "expected rc=2 (CLI misuse) on aliased paths"
+        assert save_calls == [], (
+            "neither oracle nor sidecar should be written when path "
+            f"aliasing is detected; got writes: {save_calls}"
+        )
+
+    def test_main_atomic_write_cleans_up_tmps_on_sidecar_failure(
+        self, monkeypatch, tmp_path,
+    ):
+        """If the sidecar save raises after the oracle .tmp is on disk,
+        main() must clean up the .tmp files and propagate the error —
+        no oracle.safetensors, no oracle.safetensors.tmp, no
+        sidecar.safetensors.tmp left lying around."""
+        import ct87.generate_oracle_table as gen
+
+        hidden_table = gen.WelfordTable.zeros(8, 4)
+        hidden_table.update_batch(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.ones((3, 4), dtype=np.float32),
+        )
+        logits_table = gen.WelfordTable.zeros(8, 16)
+        logits_table.update_batch(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.ones((3, 16), dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            gen, "run_teacher_pass",
+            lambda **_kw: (hidden_table, logits_table),
+        )
+
+        # Stub save_oracle_table to actually create the .tmp file (so
+        # the cleanup path has something to unlink). Using a simple
+        # touch — content doesn't matter for this test.
+        def _stub_oracle_save(_means, output_path):
+            Path(str(output_path)).touch()
+        monkeypatch.setattr(gen, "save_oracle_table", _stub_oracle_save)
+
+        # Sidecar save raises — simulates disk full, permission, etc.
+        def _stub_sidecar_fail(*_a, **_k):
+            raise IOError("simulated sidecar write failure")
+        monkeypatch.setattr(
+            gen, "save_teacher_logits_sidecar", _stub_sidecar_fail,
+        )
+
+        out_path = tmp_path / "oracle.safetensors"
+        sidecar_path = tmp_path / "oracle_teacher_logits.safetensors"
+
+        with pytest.raises(IOError, match="simulated sidecar write failure"):
+            gen.main([
+                "--dataset", "/tmp/ignored",
+                "--output", str(out_path),
+                "--save-teacher-logits",
+                "--entries", "8",
+                "--engram-dim", "2",
+                "--pca-batch-size", "2",
+                "--pca-subsample-fraction", "1.0",
+            ])
+
+        # Atomic-write contract: nothing should remain on disk.
+        assert not out_path.exists(), (
+            "oracle.safetensors must not exist when sidecar save fails"
+        )
+        assert not (tmp_path / "oracle.safetensors.tmp").exists(), (
+            "oracle.safetensors.tmp must be cleaned up after sidecar failure"
+        )
+        assert not sidecar_path.exists(), (
+            "sidecar must not exist (it was the one that failed)"
+        )
+        assert not (
+            tmp_path / "oracle_teacher_logits.safetensors.tmp"
+        ).exists(), "sidecar .tmp must be cleaned up too"
+
     def test_main_does_not_write_oracle_when_logits_parity_fails(
         self, monkeypatch, tmp_path,
     ):

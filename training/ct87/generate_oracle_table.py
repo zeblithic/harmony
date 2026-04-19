@@ -1476,15 +1476,77 @@ def main(argv: list[str] | None = None) -> int:
         teacher_logits_sidecar_path = args.teacher_logits_output or str(
             default_teacher_logits_sidecar_path(args.output),
         )
+        # Reject path collision: if --teacher-logits-output (or the default
+        # derived path, in some pathological --output) resolves to the
+        # same file as --output, the sidecar save would silently overwrite
+        # the just-written oracle. Default derivation
+        # (default_teacher_logits_sidecar_path) is collision-safe by
+        # construction, so this only fires when the user explicitly sets
+        # --teacher-logits-output.
+        if (
+            Path(teacher_logits_sidecar_path).resolve()
+            == Path(args.output).resolve()
+        ):
+            print(
+                "Error: --teacher-logits-output "
+                f"({teacher_logits_sidecar_path!r}) resolves to the same "
+                f"path as --output ({args.output!r}). The sidecar save "
+                "would overwrite the just-written oracle table. Pick "
+                "distinct paths.",
+                file=sys.stderr,
+            )
+            return 2
 
     projected = apply_pca_projection(
         table.means, components, mean_vector, populated_mask=populated_mask,
     )
-    save_oracle_table(projected, args.output)
+
+    # Atomic two-file write: stage both saves to .tmp siblings in the
+    # target dir, then `Path.replace()` (atomic rename on POSIX) into
+    # place only after BOTH saves succeed. This protects the run output
+    # from leaving the oracle on disk without its matching sidecar (or
+    # vice versa) if a save fails mid-way (disk full, permission,
+    # KeyboardInterrupt, ...). Safetensors itself doesn't tempfile-and-
+    # rename internally, so a partial .safetensors file would otherwise
+    # be possible.
+    #
+    # Caveat: the OS doesn't provide multi-file atomic rename — if the
+    # second `replace()` fails after the first succeeds, the oracle
+    # ends up on disk without the sidecar. The window is microseconds
+    # on the same filesystem; in practice if it happens the user has
+    # bigger problems (FS error). The except path below cleans up any
+    # surviving .tmp files but doesn't roll back a successful first
+    # rename.
+    oracle_tmp = Path(str(args.output) + ".tmp")
+    sidecar_tmp = (
+        Path(str(teacher_logits_sidecar_path) + ".tmp")
+        if teacher_logits_sidecar_path is not None
+        else None
+    )
+    try:
+        save_oracle_table(projected, oracle_tmp)
+        if teacher_logits_sidecar_path is not None:
+            save_teacher_logits_sidecar(logits_table.means, sidecar_tmp)
+        oracle_tmp.replace(args.output)
+        if sidecar_tmp is not None:
+            sidecar_tmp.replace(teacher_logits_sidecar_path)
+    except BaseException:
+        # BaseException catches KeyboardInterrupt / SystemExit too —
+        # those are the most likely interruption sources during a
+        # multi-GB safetensors write.
+        for p in (oracle_tmp, sidecar_tmp):
+            if p is not None:
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        raise
+
+    # Make the final-state paths obvious in the log (the save_* prints
+    # above show the .tmp staging paths, which can read as confusing).
+    print(f"Atomic-rename → {args.output}", flush=True)
     if teacher_logits_sidecar_path is not None:
-        save_teacher_logits_sidecar(
-            logits_table.means, teacher_logits_sidecar_path,
-        )
+        print(f"Atomic-rename → {teacher_logits_sidecar_path}", flush=True)
 
     # Sidecar JSON makes the provenance traceable without reading the
     # safetensors, which is handy when diffing diagnostic runs.
