@@ -956,19 +956,27 @@ def process_batch(
     input_ids = torch_module.tensor(fixed, dtype=torch_module.long, device=device)
     outputs = model(input_ids=input_ids)
     hidden_states = outputs.hidden_states[resolved_layer]  # [B, T, teacher_dim]
-    # Move to CPU fp32 immediately so we can free GPU memory before
-    # the next batch. VRAM stays flat across the loop.
+    # Move hidden state to CPU fp32 immediately so we can free GPU memory
+    # before the next batch. VRAM stays flat across the loop. The
+    # hidden tensor is small (teacher_dim ≤ 4096) so a full CPU staging
+    # copy is cheap (~2 GB at default batch/seq for Mistral; ~1 GB for
+    # TinyLlama).
     hidden_np = hidden_states.float().cpu().numpy()
-    # Pull logits while still on GPU (cheap — just a view) before the
-    # del/empty_cache below. Cast to fp32 CPU so the Welford accumulator
-    # in float64 can combine deterministically across batches.
-    logits_np = (
-        outputs.logits.float().cpu().numpy()
-        if logits_table is not None
-        else None
-    )
+    # Capture a reference to the GPU-side logits tensor (when needed)
+    # WITHOUT staging to CPU: the logits path is 8x wider than the
+    # hidden path (vocab=32000 vs teacher_dim≤4096), so the analogous
+    # full CPU copy would be ~2 GB at default settings. Round-1 (PR
+    # #255) chunked the K-loop downstream of `logits_np` but left this
+    # full-tensor staging in place; CodeRabbit round-2 caught it. We
+    # now per-chunk-pull from `logits_gpu` inside the K loop below,
+    # bounding peak host RAM at chunk*vocab*4 bytes (~64 MB).
+    logits_gpu = outputs.logits if logits_table is not None else None
     del hidden_states, outputs, input_ids
     if device.startswith("cuda"):
+        # NB: empty_cache() doesn't free `logits_gpu` because we still
+        # hold a reference to it. The K-loop's `del logits_gpu` +
+        # second empty_cache() below releases it after the chunked
+        # transfers finish.
         torch_module.cuda.empty_cache()
 
     # For each sequence in the batch, enumerate n-grams over the
@@ -1001,21 +1009,45 @@ def process_batch(
             # differ (vocab-wide logits instead of teacher_dim-wide
             # hidden state).
             #
-            # Chunked along K: the unchunked `logits_np[bs, ps, :]` would
-            # peak at ~17 GB at default batch=8/seq=2048 (K≈130k, vocab=
-            # 32000, fp32). See LOGITS_UPDATE_CHUNK_K rationale above.
+            # Chunked along K AND pulled per-chunk from the GPU tensor
+            # (no full-batch CPU staging). At default batch=8/seq=2048/
+            # vocab=32000 the unchunked `logits_gpu[bs, ps, :]` would
+            # peak at ~17 GB host RAM; per-chunk transfer caps it at
+            # `LOGITS_UPDATE_CHUNK_K * vocab * 4 bytes` (~64 MB at
+            # vocab=32000) plus the downstream Welford float64 buffer
+            # (~128 MB).
+            #
             # Welford correctness is unaffected — `update_batch` already
             # commutes across calls (combines pre-batch mean with each
             # batch's contribution exactly), so K processed in N chunks
             # vs 1 chunk produces bit-equivalent means modulo float
             # accumulation order.
+            #
+            # Move bs/ps to the same device as logits_gpu once so the
+            # per-chunk fancy index doesn't trigger a fresh H2D copy
+            # of small index tensors on every iteration.
+            bs_t = torch_module.as_tensor(
+                bs, device=logits_gpu.device, dtype=torch_module.long,
+            )
+            ps_t = torch_module.as_tensor(
+                ps, device=logits_gpu.device, dtype=torch_module.long,
+            )
             for start in range(0, indices_arr.shape[0], LOGITS_UPDATE_CHUNK_K):
                 end = start + LOGITS_UPDATE_CHUNK_K
                 idx_chunk = indices_arr[start:end]
-                logit_chunk = logits_np[bs[start:end], ps[start:end], :]
+                # GPU fancy-index pulls only the [chunk, vocab] slice,
+                # then `.cpu().numpy()` materializes that small slice on
+                # host. detach() avoids retaining autograd state if the
+                # caller ever drops the inference_mode wrapper.
+                chunk_gpu = logits_gpu[bs_t[start:end], ps_t[start:end], :]
+                chunk_np = chunk_gpu.detach().float().cpu().numpy()
                 logits_table.update_batch(
-                    idx_chunk, logit_chunk.astype(np.float32),
+                    idx_chunk, chunk_np.astype(np.float32, copy=False),
                 )
+                del chunk_gpu
+            del logits_gpu, bs_t, ps_t
+            if device.startswith("cuda"):
+                torch_module.cuda.empty_cache()
 
     return sum(real_lens)
 

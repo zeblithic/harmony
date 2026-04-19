@@ -65,8 +65,15 @@ if args.kl_lambda > 0:
     teacher_logits = oracle_teacher_logits[row_indices]  # [batch, seq, vocab]
     log_p_router  = F.log_softmax(engram_logits, dim=-1)
     p_teacher     = F.softmax(teacher_logits, dim=-1)
-    kl_loss       = F.kl_div(log_p_router, p_teacher, reduction="batchmean")
-    loss          = (1.0 - args.kl_lambda) * ce_loss + args.kl_lambda * kl_loss
+    # Per-token reduction matches CE (which uses reduction="mean" =
+    # divide by batch*seq). F.kl_div's "batchmean" only divides by
+    # batch, so at seq=2048 it would be ~2048x larger per token than
+    # the CE term — making `λ` implicitly control loss normalization
+    # rather than the actual KL/CE blend. If a padding/attention mask
+    # is in scope, replace `.mean()` with `(kl * mask).sum()/mask.sum()`.
+    kl_per_token = F.kl_div(log_p_router, p_teacher, reduction="none").sum(-1)
+    kl_loss      = kl_per_token.mean()
+    loss         = (1.0 - args.kl_lambda) * ce_loss + args.kl_lambda * kl_loss
 ```
 
 The `oracle_teacher_logits` tensor is a new input to the training loop (shape `[10000, 32000]` bf16 ≈ 640MB) loaded alongside the existing oracle table. Lookup uses the same xxhash → row-index the engram retrieval already computes.
