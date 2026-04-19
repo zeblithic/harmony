@@ -90,7 +90,14 @@ def scenario_a_text_only(ds, n_docs: int) -> None:
     n = 0
     total_chars = 0
     for example in ds:
-        total_chars += len(example["text"])
+        # Skip blanks to match the filtering in scenarios B/C/D — otherwise
+        # n_docs counts different workloads across scenarios and the RSS
+        # comparison drifts with how many empty rows happen to land in the
+        # first n_docs of the stream.
+        text = example["text"]
+        if not text or not text.strip():
+            continue
+        total_chars += len(text)
         n += 1
         if n % 10_000 == 0:
             report("A", n, total_chars, t0)

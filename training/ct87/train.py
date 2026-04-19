@@ -59,6 +59,15 @@ def make_hf_dataloader(
     Raises ValueError if the dataset has fewer tokens than seq_len + 1
     (the minimum needed for one input/target pair).
     """
+    # Fail fast on nonsense shape args. Without these, seq_len=0 slips
+    # through as window=1 and yields degenerate (B, 1) batches, and
+    # batch_size=0 only surfaces later as a cryptic torch.stack on an
+    # empty list.
+    if not isinstance(seq_len, int) or seq_len <= 0:
+        raise ValueError(f"seq_len must be a positive integer, got {seq_len!r}")
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+
     import numpy as np
     from datasets import DatasetDict, load_from_disk
 

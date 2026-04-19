@@ -32,6 +32,18 @@ training/.venv/bin/python -u -m ct87.prepare_data \
     > "$STDOUT_LOG" 2>&1 &
 PID=$!
 
+# Forward INT/TERM to the background prep. Without this, Ctrl-C on a
+# multi-hour run exits the wrapper shell but leaves ct87.prepare_data
+# orphaned and still consuming CPU/network. Disable the trap inside the
+# handler so a second signal can force the wrapper to quit immediately.
+_forward_signal() {
+    trap - INT TERM
+    if [[ -n "${PID:-}" ]]; then
+        kill -TERM "$PID" 2>/dev/null || true
+    fi
+}
+trap _forward_signal INT TERM
+
 echo "PID=$PID"
 echo "STDOUT=$STDOUT_LOG"
 echo "RSS=$RSS_CSV"
@@ -60,6 +72,12 @@ if wait "$PID"; then
 else
     RC=$?
 fi
-echo "EXIT=$RC TS=$(date +%s)" >> "$RSS_CSV"
+
+# Emit the exit-code line as a valid CSV row matching the header so
+# downstream parsers (pandas, csv.DictReader) don't choke. All metric
+# columns are empty; the exit code goes into the `state` column as
+# `EXIT:<rc>` which is distinguishable from the single-char process
+# states (R/S/D/Z) above.
+echo "$(date +%s),,,,,EXIT:$RC" >> "$RSS_CSV"
 echo "DONE rc=$RC"
 exit "$RC"

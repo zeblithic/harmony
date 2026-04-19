@@ -110,6 +110,24 @@ class TestHfDataloaderGuard:
             with pytest.raises(ValueError, match="tokens are needed"):
                 make_hf_dataloader(tmpdir, seq_len=16, batch_size=1)
 
+    def test_rejects_zero_seq_len(self):
+        """make_hf_dataloader fails fast on seq_len=0 rather than silently
+        producing degenerate (batch, 1) windows."""
+        from ct87.train import make_hf_dataloader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="seq_len"):
+                make_hf_dataloader(tmpdir, seq_len=0, batch_size=1)
+
+    def test_rejects_zero_batch_size(self):
+        """batch_size=0 would later crash in torch.stack on an empty list —
+        fail up front with an actionable message."""
+        from ct87.train import make_hf_dataloader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="batch_size"):
+                make_hf_dataloader(tmpdir, seq_len=16, batch_size=0)
+
     def test_datasetdict_raises_friendly_error(self):
         """load_from_disk returns a DatasetDict when pointed at a multi-split
         directory; make_hf_dataloader should fail with an actionable hint
