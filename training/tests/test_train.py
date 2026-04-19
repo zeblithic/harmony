@@ -987,3 +987,58 @@ class TestKlRetrofit:
         torch.testing.assert_close(
             kl_call, torch.zeros_like(kl_call), atol=1e-6, rtol=0,
         )
+
+    def test_cli_rejects_malformed_engram_seeds(self):
+        """A non-integer in --engram-seeds must produce a CLI error
+        (rc=2 + stderr message), not an uncaught ValueError traceback.
+        Now matters universally because round-1 hoisted the seeds
+        parse to run unconditionally on every invocation — previously
+        a bad value only surfaced on engram-table runs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res = self._run_train_cli(
+                "--engram-seeds", "42,foo,99",
+                log_dir=tmpdir,
+            )
+            assert res.returncode == 2, res.stderr
+            stderr = res.stderr.lower()
+            assert "--engram-seeds" in stderr
+            # The bad value must appear in the error so the user can
+            # see what they passed.
+            assert "foo" in stderr or "'42,foo,99'" in stderr
+
+    def test_cli_rejects_empty_engram_seeds(self):
+        """Empty --engram-seeds must error with a clear message —
+        not silently produce a zero-length seeds list and crash later."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res = self._run_train_cli(
+                "--engram-seeds", ",,,",
+                log_dir=tmpdir,
+            )
+            assert res.returncode == 2, res.stderr
+            assert "--engram-seeds" in res.stderr.lower()
+
+    def test_cli_rejects_empty_teacher_logits_sidecar(self, tmp_path):
+        """A teacher_logits.weight with shape [0, vocab] passes the
+        dim and vocab checks but would trigger modulo-by-zero in
+        compute_canonical_trigram_row_indices on the first KL step.
+        Must fail at startup."""
+        from safetensors.torch import save_file
+        # Synthesize an empty sidecar with the correct vocab dimension
+        # for the tiny config (32000) so we hit the row-count check
+        # specifically, not the vocab-mismatch check.
+        empty = torch.zeros(0, 32000, dtype=torch.bfloat16)
+        sidecar_path = tmp_path / "empty_sidecar.safetensors"
+        save_file({"teacher_logits.weight": empty}, str(sidecar_path))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res = self._run_train_cli(
+                "--config", "tiny_engram_xattn_capgap",
+                "--engram-skip-to-logit",
+                "--kl-lambda", "0.5",
+                "--oracle-teacher-logits", str(sidecar_path),
+                log_dir=tmpdir,
+            )
+            assert res.returncode == 1, res.stderr
+            stderr = res.stderr.lower()
+            assert "teacher_logits.weight" in stderr
+            assert "at least one row" in stderr or "empty" in stderr

@@ -1619,7 +1619,31 @@ def main() -> None:
     # canonical-row-index helper). Previously seeds was only initialized
     # inside the engram_table branch, causing UnboundLocalError on the
     # KL path when --engram-table was absent.
-    seeds = [int(s) for s in args.engram_seeds.split(",")]
+    #
+    # Robust parse: strip whitespace per element, drop empty pieces (so
+    # "42, 99" or "42,,99" both work), and route int-conversion failures
+    # through the standard stderr+exit(2) CLI-validation path instead of
+    # raising an uncaught ValueError traceback.
+    try:
+        seeds = [
+            int(s.strip())
+            for s in args.engram_seeds.split(",")
+            if s.strip()
+        ]
+    except ValueError:
+        print(
+            f"Error: --engram-seeds must be a comma-separated list of "
+            f"integers; got {args.engram_seeds!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not seeds:
+        print(
+            "Error: --engram-seeds must contain at least one integer; "
+            f"got {args.engram_seeds!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     canonical_seed = seeds[0]
 
     # Load Engram table if provided
@@ -1663,6 +1687,19 @@ def main() -> None:
                 f"Error: teacher_logits.weight must be 2-D "
                 f"[total_entries, vocab]; got shape "
                 f"{tuple(oracle_teacher_logits.shape)}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if oracle_teacher_logits.shape[0] <= 0:
+            # Empty sidecar would pass dim/vocab checks but trigger
+            # modulo-by-zero in `_hash_ngram(...) % total_entries`
+            # inside compute_canonical_trigram_row_indices on the first
+            # KL step. Fail at startup instead.
+            print(
+                f"Error: teacher_logits.weight must have at least one "
+                f"row; got shape {tuple(oracle_teacher_logits.shape)}. "
+                f"An empty sidecar can't anchor the per-position "
+                f"canonical-trigram lookup.",
                 file=sys.stderr,
             )
             sys.exit(1)
