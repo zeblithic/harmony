@@ -270,6 +270,70 @@ def _hash_ngram(tokens: list[int], seed: int) -> int:
     return _xxhash64(data, seed)
 
 
+def compute_canonical_trigram_row_indices(
+    input_ids: torch.Tensor,
+    total_entries: int,
+    canonical_seed: int,
+) -> torch.Tensor:
+    """Per-(b, p) canonical hash for ZEB-139 KL+CE oracle lookup.
+
+    Picks ONE row index per position from the trigram-with-canonical-seed
+    family: `_hash_ngram([t[p-2], t[p-1], t[p]], canonical_seed) %
+    total_entries`. Positions p<2 (no trigram coverage) get -1 so the
+    KL loss can mask them out.
+
+    Why "single canonical" (Option C in the ZEB-139 design notes):
+    `EngramTable.lookup_batch` sum-scatters K bigram + K trigram
+    embeddings per position (K = num_seeds), letting the model's
+    `W_align` learn to integrate the multi-hash signal. Replicating
+    that aggregation on the KL target side would either (a) double-
+    count the multi-hash signal (information already present via the
+    engram-emb path) or (b) require a non-trivial probability-space
+    aggregation choice (mean of softmaxes vs softmax of mean) that the
+    spec doesn't pin. Picking one canonical hash per position avoids
+    both pitfalls and gives the cleanest comparability against the
+    teacher.
+
+    The trigram (vs bigram) is picked because trigram = more context =
+    a sharper teacher distribution. Seed comes from the caller (train.py
+    passes `hash_seeds[0]` from the engram-table config) so the lookup
+    matches the same hash family the engram embeddings come from.
+
+    Args:
+        input_ids: [batch, seq_len] long tensor of token IDs
+        total_entries: oracle table row count (modulo for the hash)
+        canonical_seed: xxhash64 seed to use for the trigram hash
+
+    Returns:
+        [batch, seq_len] long tensor of row indices in [-1, total_entries).
+        -1 marks positions with no trigram (p<2) — caller must mask
+        these out before indexing into the teacher table.
+    """
+    if input_ids.dim() != 2:
+        raise ValueError(
+            f"input_ids must be 2-D [batch, seq_len]; got shape "
+            f"{tuple(input_ids.shape)}"
+        )
+    batch_size, seq_len = input_ids.shape
+    out = torch.full(
+        (batch_size, seq_len), -1, dtype=torch.long, device="cpu",
+    )
+    if seq_len < 3:
+        return out
+    # CPU iteration: matches `EngramTable._collect_indices`'s pattern;
+    # the per-token Python overhead is dwarfed by the GPU-side
+    # KL+CE math downstream. xxhash is implemented in Python here and
+    # in `crates/harmony-engram` in Rust — bit-for-bit identical, see
+    # the `_hash_ngram` docstring above.
+    ids_cpu = input_ids.detach().cpu().tolist()
+    for b in range(batch_size):
+        tokens = ids_cpu[b]
+        for p in range(2, seq_len):
+            trigram = [tokens[p - 2], tokens[p - 1], tokens[p]]
+            out[b, p] = _hash_ngram(trigram, canonical_seed) % total_entries
+    return out
+
+
 class EngramTable:
     """In-memory Engram embedding table for training.
 
@@ -1297,3 +1361,115 @@ class GatedEngramInjection(nn.Module):
         return gate * inj_real
 
 
+# ---------------------------------------------------------------------------
+# ZEB-134 Skip-to-Logit engram router.
+# ---------------------------------------------------------------------------
+
+
+class SkipToLogitEngramRouter(nn.Module):
+    """Route the engram injection output directly to logit space.
+
+    Motivation (ZEB-130 ι₂ failure mode): at 40M scale, ι₂ shows all the
+    forensic markers of content routing working (cross-run alignment,
+    (X) content-sensitivity, broad Q occupancy with ZEB-135 EMA-sub) but
+    val_loss Delta-diff against the shuffled oracle stays near zero. The
+    ZEB-133 layer-decay probe confirms that 88% of the L5 injection
+    magnitude survives to LM-head input, with max LM-head row cosine
+    0.156 - the signal is there but only weakly aligned with vocab
+    directions.
+
+    The Skip-to-Logit router bypasses the frozen L6/L7 + final_norm
+    pathway entirely by adding a dedicated adapter from engram output
+    straight into the logit sum:
+
+        logits_final = logits_from_main + alpha * (W_align(engram_out) @ W_lm.T)
+
+    W_align is a trainable linear projection in hidden_dim that learns
+    to rotate the engram output onto the vocabulary direction basis.
+    W_lm (the LM head) is reused by reference - the router does NOT own
+    a copy so the tied-embedding invariant remains intact.
+
+    Safe-init contract: W_align starts at exact zero so the router's
+    output is zero regardless of input. At step 0:
+      d(loss)/d(log_alpha) = d(loss)/d(out) * (W_align(x) @ W_lm.T)
+                           = d(loss)/d(out) * 0 = 0  (no alpha gradient)
+      d(loss)/d(W_align) = d(loss)/d(out) * alpha * (x outer W_lm)
+                         ≠ 0  (W_align receives gradient via alpha)
+    So the first backprop step trains W_align (not alpha). Once W_align
+    moves off zero, alpha starts receiving gradient too. This is the
+    INVERSE of GatedEngramInjection's alpha-gate warmup — there, alpha
+    is the gate over a fully-initialized signal, so alpha trains first.
+    Test `test_gradient_flows_via_alpha_when_W_align_starts_zero`
+    asserts this contract directly (despite its name, it verifies the
+    W_align-first ordering). CodeRabbit caught the wrong description on
+    PR #257 round-1.
+
+    alpha is stored as log_alpha (trainable scalar) with alpha =
+    torch.exp(log_alpha), which keeps alpha > 0 without a hard clamp.
+    alpha_init is specified as the target initial alpha value; the
+    constructor sets log_alpha = log(alpha_init).
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        lm_head_weight: nn.Parameter,
+        alpha_init: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if not math.isfinite(alpha_init) or alpha_init <= 0:
+            raise ValueError(
+                f"alpha_init must be finite and > 0, got {alpha_init!r}"
+            )
+        if lm_head_weight.dim() != 2:
+            raise ValueError(
+                "lm_head_weight must be 2-D (vocab, hidden_dim); got "
+                f"shape {tuple(lm_head_weight.shape)}"
+            )
+        if lm_head_weight.shape[-1] != hidden_dim:
+            raise ValueError(
+                f"lm_head_weight last dim {lm_head_weight.shape[-1]} "
+                f"must equal hidden_dim ({hidden_dim})"
+            )
+        # Hold the LM head by reference (NOT as a submodule parameter,
+        # so we don't double-count it in the param set and so tied
+        # embeddings stay tied). Direct attribute assignment skips the
+        # nn.Module __setattr__ machinery that would otherwise try to
+        # register it as a parameter.
+        object.__setattr__(self, "_lm_head_weight_ref", lm_head_weight)
+
+        self.hidden_dim = hidden_dim
+        self.W_align = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.W_align.weight)  # safe-init: router(x) = 0
+        self.log_alpha = nn.Parameter(
+            torch.tensor(math.log(alpha_init), dtype=torch.float32)
+        )
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return torch.exp(self.log_alpha)
+
+    def forward(self, engram_out: torch.Tensor) -> torch.Tensor:
+        """Project engram output into logit space.
+
+        Args:
+            engram_out: [B, L, hidden_dim] - the gated engram injection
+                output at the last injection site.
+
+        Returns:
+            logits: [B, L, vocab] - to be ADDED (not replacing) to the
+                main model logits before softmax.
+        """
+        if engram_out.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                f"engram_out last dim {engram_out.shape[-1]} must equal "
+                f"hidden_dim ({self.hidden_dim})"
+            )
+        aligned = self.W_align(engram_out)
+        alpha = self.alpha.to(dtype=aligned.dtype)
+        # Resolve the LM head weight lazily so device/dtype moves done
+        # AFTER construction (HarmonyModel.to(device), autocast) are
+        # picked up on every forward. Using the stored reference means
+        # we always see the live embed_tokens.weight when tied.
+        lm_weight = self._lm_head_weight_ref.to(dtype=aligned.dtype)
+        return alpha * (aligned @ lm_weight.T)
