@@ -40,7 +40,7 @@ Together with ZEB-138, the four outcomes disambiguate the axis structure (see ve
 
 ### 4.1 Loss function
 
-```
+```text
 L_total = (1 − λ) · L_ce + λ · L_kl
 L_kl    = KL(P_router || P_teacher)
 P_router = softmax(engram_logits)       # shape [batch, seq, 32000]
@@ -147,12 +147,14 @@ Full ZEB-138 §3/§7 attractor-fingerprint suite:
 ## 10. Scope boundaries
 
 ### In scope
+
 - Teacher-logits extension to oracle generator
 - KL+CE training-loss implementation
 - 4-cell TinyLlama matrix with the new loss
 - Full attractor-fingerprint forensics + findings doc
 
 ### Out of scope
+
 - **Same-arch teacher + KL:** the 2×2's fourth cell is a follow-up contingent on results here + ZEB-138
 - **Mistral-7B teacher:** 7B teacher's logit extraction is expensive; 640MB × 32k = fine for storage, but forward pass requires re-loading the 7B model. If results here are interesting on TinyLlama, re-running on Mistral can be scoped separately
 - **Backbone unfreezing:** separate Gemini Path-A recommendation; would confound the objective-axis test

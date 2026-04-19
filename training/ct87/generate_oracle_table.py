@@ -102,6 +102,15 @@ DEFAULT_PCA_BATCH = 512
 # doesn't need to know the producer's CLI flags.
 TEACHER_LOGITS_SIDECAR_KEY = "teacher_logits.weight"
 TEACHER_LOGITS_SIDECAR_SUFFIX = "_teacher_logits.safetensors"
+# Chunk size for the per-batch logits Welford update. The hidden-state path
+# materializes a [K, teacher_dim] scratch tensor (~2 GB at K=130k * 4096-dim
+# Mistral teacher) which has been stable in production for ZEB-119/134/136.
+# The logits path is 8x wider (vocab=32000 vs teacher_dim≤4096), so the same
+# unchunked materialization would be ~17 GB at default batch=8/seq_len=2048
+# — release-blocking OOM on most boxes. Chunking K caps the scratch at
+# `LOGITS_UPDATE_CHUNK_K * vocab * 4 bytes` (~64 MB at vocab=32000) and the
+# downstream `update_batch` float64 buffer at the same row count (~128 MB).
+LOGITS_UPDATE_CHUNK_K = 512
 
 
 # ---------------------------------------------------------------------------
@@ -991,10 +1000,22 @@ def process_batch(
             # row r for the KL-retrofit lookup. Only the value vectors
             # differ (vocab-wide logits instead of teacher_dim-wide
             # hidden state).
-            logit_vectors = logits_np[bs, ps, :]  # [K, vocab]
-            logits_table.update_batch(
-                indices_arr, logit_vectors.astype(np.float32),
-            )
+            #
+            # Chunked along K: the unchunked `logits_np[bs, ps, :]` would
+            # peak at ~17 GB at default batch=8/seq=2048 (K≈130k, vocab=
+            # 32000, fp32). See LOGITS_UPDATE_CHUNK_K rationale above.
+            # Welford correctness is unaffected — `update_batch` already
+            # commutes across calls (combines pre-batch mean with each
+            # batch's contribution exactly), so K processed in N chunks
+            # vs 1 chunk produces bit-equivalent means modulo float
+            # accumulation order.
+            for start in range(0, indices_arr.shape[0], LOGITS_UPDATE_CHUNK_K):
+                end = start + LOGITS_UPDATE_CHUNK_K
+                idx_chunk = indices_arr[start:end]
+                logit_chunk = logits_np[bs[start:end], ps[start:end], :]
+                logits_table.update_batch(
+                    idx_chunk, logit_chunk.astype(np.float32),
+                )
 
     return sum(real_lens)
 
@@ -1397,11 +1418,12 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    projected = apply_pca_projection(
-        table.means, components, mean_vector, populated_mask=populated_mask,
-    )
-    save_oracle_table(projected, args.output)
-
+    # Validate logits/hidden parity BEFORE writing any artifacts. If the
+    # check fails, exiting with a half-written `oracle.safetensors` on
+    # disk would let a downstream consumer (e.g. someone re-running
+    # training without --save-teacher-logits) pick up the orphaned
+    # output and not realize the producer aborted. Fail clean instead:
+    # PCA-project, validate, then write everything together or nothing.
     teacher_logits_sidecar_path: str | None = None
     if logits_table is not None:
         # The logits table is xxhash-keyed identically to the hidden
@@ -1419,11 +1441,18 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        sidecar_path = args.teacher_logits_output or str(
+        teacher_logits_sidecar_path = args.teacher_logits_output or str(
             default_teacher_logits_sidecar_path(args.output),
         )
-        save_teacher_logits_sidecar(logits_table.means, sidecar_path)
-        teacher_logits_sidecar_path = sidecar_path
+
+    projected = apply_pca_projection(
+        table.means, components, mean_vector, populated_mask=populated_mask,
+    )
+    save_oracle_table(projected, args.output)
+    if teacher_logits_sidecar_path is not None:
+        save_teacher_logits_sidecar(
+            logits_table.means, teacher_logits_sidecar_path,
+        )
 
     # Sidecar JSON makes the provenance traceable without reading the
     # safetensors, which is handy when diffing diagnostic runs.

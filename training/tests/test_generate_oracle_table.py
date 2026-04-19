@@ -1340,3 +1340,135 @@ class TestSaveTeacherLogits:
         ])
         assert args.save_teacher_logits is False
         assert args.teacher_logits_output is None
+
+    def test_chunked_logits_update_matches_single_pass(self, monkeypatch):
+        """The K-dimension chunk loop in process_batch must produce the
+        same Welford means as a single unchunked update_batch call.
+
+        Welford is order-invariant across calls (combines pre-batch mean
+        with each chunk's contribution exactly), so chunking K must be
+        bit-identical modulo float64 accumulation order. This test pins
+        that contract — without it, a future "optimization" that reuses
+        the chunk loop for the hidden path could silently change the
+        oracle's row values.
+        """
+        import ct87.generate_oracle_table as gen
+
+        # Force a small chunk size so the loop runs >1 iteration on
+        # modest K values without bloating the test.
+        monkeypatch.setattr(gen, "LOGITS_UPDATE_CHUNK_K", 7)
+
+        usage = self._patch_hf_for_logits(monkeypatch, hidden_dim=8, vocab=32000)
+        del usage  # unused here
+
+        chunked_table, chunked_logits = gen.run_teacher_pass(
+            teacher_model_id="mock/teacher",
+            tokenized_dataset_path="/tmp/fake",
+            layer_index=-1,
+            total_entries=64,
+            hash_seeds=(42,),
+            batch_size=2,
+            seq_len=8,
+            max_sequences=2,
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            save_teacher_logits=True,
+        )
+
+        # Re-run with chunk size larger than any K we'd produce — single
+        # pass through update_batch.
+        monkeypatch.setattr(gen, "LOGITS_UPDATE_CHUNK_K", 10**9)
+        single_table, single_logits = gen.run_teacher_pass(
+            teacher_model_id="mock/teacher",
+            tokenized_dataset_path="/tmp/fake",
+            layer_index=-1,
+            total_entries=64,
+            hash_seeds=(42,),
+            batch_size=2,
+            seq_len=8,
+            max_sequences=2,
+            device="cpu",
+            dtype="float32",
+            expected_vocab_size=32000,
+            save_teacher_logits=True,
+        )
+
+        # Hidden path is uneffected by chunking — must be identical.
+        np.testing.assert_array_equal(chunked_table.means, single_table.means)
+        np.testing.assert_array_equal(chunked_table.counts, single_table.counts)
+        # Logits path: equality up to float64 reordering. Welford
+        # combines as `(old_mean*old_n + sum)/new_n` per unique row;
+        # changing the order rows arrive in within a chunk doesn't
+        # change the per-row sum (each update is +=). So means must
+        # match bit-exactly.
+        np.testing.assert_array_equal(chunked_logits.counts, single_logits.counts)
+        np.testing.assert_allclose(
+            chunked_logits.means, single_logits.means,
+            rtol=0, atol=1e-6,
+        )
+
+    def test_main_does_not_write_oracle_when_logits_parity_fails(
+        self, monkeypatch, tmp_path,
+    ):
+        """If the logits/hidden populated_mask parity check fails, main()
+        must abort with rc=1 BEFORE writing any artifact. The reordering
+        prevents a half-written `oracle.safetensors` from leaking onto
+        disk that a downstream consumer might then pick up unaware."""
+        import ct87.generate_oracle_table as gen
+
+        # Build two WelfordTables with deliberately mismatched
+        # populated_mask: hidden has rows 0..3 populated, logits has
+        # rows 0..2 (missing row 3). Forces the parity guard to fire.
+        hidden_table = gen.WelfordTable.zeros(8, 4)
+        hidden_table.update_batch(
+            np.array([0, 1, 2, 3], dtype=np.int64),
+            np.ones((4, 4), dtype=np.float32),
+        )
+        logits_table = gen.WelfordTable.zeros(8, 16)
+        logits_table.update_batch(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.ones((3, 16), dtype=np.float32),
+        )
+        assert not np.array_equal(
+            hidden_table.populated_mask, logits_table.populated_mask,
+        )
+
+        # Stub run_teacher_pass to skip the actual forward pass.
+        monkeypatch.setattr(
+            gen, "run_teacher_pass",
+            lambda **_kw: (hidden_table, logits_table),
+        )
+
+        # Stub the PCA functions so we can detect whether they ran (we
+        # want them to run because they're cheap and pure, but the file
+        # writes must NOT happen).
+        save_calls: list[str] = []
+        monkeypatch.setattr(
+            gen, "save_oracle_table",
+            lambda *_a, **_k: save_calls.append("oracle"),
+        )
+        monkeypatch.setattr(
+            gen, "save_teacher_logits_sidecar",
+            lambda *_a, **_k: save_calls.append("sidecar"),
+        )
+
+        out_path = tmp_path / "oracle.safetensors"
+        rc = gen.main([
+            "--dataset", "/tmp/ignored",
+            "--output", str(out_path),
+            "--save-teacher-logits",
+            "--entries", "8",
+            "--engram-dim", "2",
+            "--pca-batch-size", "2",
+            "--pca-subsample-fraction", "1.0",
+        ])
+        assert rc == 1, "expected non-zero exit on parity mismatch"
+        assert save_calls == [], (
+            "neither oracle nor sidecar should be written when parity "
+            f"check fails; got writes: {save_calls}"
+        )
+        assert not out_path.exists(), (
+            "main() must not leave a half-written oracle.safetensors on "
+            "disk after a parity failure"
+        )
