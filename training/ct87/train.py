@@ -637,6 +637,34 @@ def main() -> None:
             "first training step while leaving room for alpha to grow."
         ),
     )
+    # ---- ZEB-139: KL+CE hybrid loss (Memory-Decoder-style) ----
+    parser.add_argument(
+        "--kl-lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "Mixing weight for the ZEB-139 KL+CE hybrid loss: "
+            "L = (1-λ)·CE + λ·KL(softmax(skip_logits) || softmax("
+            "teacher_logits[trigram_hash])). Default 0 disables the KL "
+            "term. Requires --engram-skip-to-logit (KL targets the "
+            "Skip-to-Logit router's output, not the final mixed logits) "
+            "and --oracle-teacher-logits (the bf16 sidecar produced by "
+            "generate_oracle_table.py --save-teacher-logits)."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-teacher-logits",
+        type=str,
+        default=None,
+        help=(
+            "Path to the teacher-logits sidecar (a safetensors file with "
+            "tensor 'teacher_logits.weight' shape [total_entries, vocab] "
+            "dtype bf16, produced by generate_oracle_table.py --save-"
+            "teacher-logits). Required when --kl-lambda > 0. Loaded into "
+            "CPU bf16 at startup (~640 MB at 10K rows × 32K vocab); "
+            "per-batch row gather is the only GPU traffic."
+        ),
+    )
     parser.add_argument(
         "--latent-intermediate-dim", type=int, default=None,
         help="Intermediate dimension for latent projection MLP",
@@ -795,6 +823,48 @@ def main() -> None:
     if args.coconut and args.think_token_id is None:
         print("Error: --think-token-id is required with --coconut", file=sys.stderr)
         sys.exit(1)
+
+    # ZEB-139 KL+CE validation. Both flags must be set together; either alone
+    # is a misconfiguration we want to catch upfront so the user doesn't burn
+    # a long training run on a silently-disabled KL term.
+    if not 0.0 <= args.kl_lambda <= 1.0:
+        print(
+            f"Error: --kl-lambda must be in [0.0, 1.0]; got "
+            f"{args.kl_lambda!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.kl_lambda > 0:
+        if not args.engram_skip_to_logit:
+            print(
+                "Error: --kl-lambda > 0 requires --engram-skip-to-logit. "
+                "The KL target is the Skip-to-Logit router's output "
+                "(skip_logits); without the router there is nothing for "
+                "the KL term to operate on.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if args.oracle_teacher_logits is None:
+            print(
+                "Error: --kl-lambda > 0 requires --oracle-teacher-logits "
+                "(the bf16 sidecar produced by generate_oracle_table.py "
+                "--save-teacher-logits).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    elif args.oracle_teacher_logits is not None:
+        # Symmetric guard: the path is only consulted when KL is on, so
+        # passing it without --kl-lambda silently has no effect — surface
+        # the misconfiguration before any training time is spent.
+        print(
+            "Error: --oracle-teacher-logits "
+            f"({args.oracle_teacher_logits!r}) was set without "
+            "--kl-lambda > 0. The sidecar is only consulted when the KL "
+            "term is enabled; pass --kl-lambda > 0 or drop "
+            "--oracle-teacher-logits.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     if args.latent_projection is not None:
         if args.latent_intermediate_dim is None or args.latent_dim is None:
@@ -1533,6 +1603,67 @@ def main() -> None:
             f"dim={engram_table.engram_dim}, heads={engram_table.num_heads}"
         )
 
+    # ZEB-139: load the teacher-logits sidecar when KL+CE is enabled.
+    # Kept on CPU as bf16 (~640 MB at 10K rows × 32K vocab); per-batch
+    # `oracle_teacher_logits[row_indices]` returns a small [B, T, vocab]
+    # slice that the loss block transfers to GPU + casts to fp32.
+    # `oracle_teacher_total_entries` is recorded separately so the
+    # canonical-row-index helper can take the modulo against the
+    # sidecar's actual row count (matches what generate_oracle_table.py
+    # used when producing the file — must agree with --engram-table's
+    # total_entries by construction, but enforce here too).
+    oracle_teacher_logits: torch.Tensor | None = None
+    oracle_teacher_total_entries: int = 0
+    if args.kl_lambda > 0:
+        from safetensors.torch import load_file as _load_safetensors
+        sidecar_tensors = _load_safetensors(args.oracle_teacher_logits)
+        if "teacher_logits.weight" not in sidecar_tensors:
+            print(
+                f"Error: --oracle-teacher-logits "
+                f"({args.oracle_teacher_logits!r}) does not contain a "
+                f"'teacher_logits.weight' tensor; available keys: "
+                f"{list(sidecar_tensors.keys())}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        oracle_teacher_logits = sidecar_tensors["teacher_logits.weight"]
+        if oracle_teacher_logits.dim() != 2:
+            print(
+                f"Error: teacher_logits.weight must be 2-D "
+                f"[total_entries, vocab]; got shape "
+                f"{tuple(oracle_teacher_logits.shape)}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if oracle_teacher_logits.shape[1] != config.vocab_size:
+            print(
+                f"Error: teacher_logits.weight vocab dim "
+                f"({oracle_teacher_logits.shape[1]}) does not match the "
+                f"student's config.vocab_size ({config.vocab_size}). The "
+                f"sidecar was produced for a different tokenizer.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if engram_table is not None and oracle_teacher_logits.shape[0] != engram_table.total_entries:
+            print(
+                f"Error: teacher_logits.weight has "
+                f"{oracle_teacher_logits.shape[0]} rows but the engram "
+                f"table has {engram_table.total_entries} — both must use "
+                f"the same xxhash row count (otherwise per-position "
+                f"hashes don't agree). Re-extract one or the other to "
+                f"match.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        oracle_teacher_total_entries = int(oracle_teacher_logits.shape[0])
+        print(
+            f"Teacher-logits sidecar loaded: "
+            f"{oracle_teacher_total_entries:,} rows × "
+            f"{oracle_teacher_logits.shape[1]:,} vocab "
+            f"(dtype={oracle_teacher_logits.dtype}, "
+            f"~{oracle_teacher_logits.element_size() * oracle_teacher_logits.numel() / 1024 ** 2:.0f} MB CPU-resident)"
+        )
+
     # Latent projection setup - three modes:
     # 1. --latent-projection + --contrastive-loss: load from checkpoint, trainable
     # 2. --latent-projection (no contrastive): load from checkpoint, frozen
@@ -1767,6 +1898,11 @@ def main() -> None:
             "mse_loss", "consol_phase", "inject_mult",
             *vcontrast_cols,
             *qdiv_cols,
+            # ZEB-139 KL+CE: appended at the end so existing CSVs from
+            # pre-ZEB-139 runs are still a "trailing prefix" of this
+            # header — caught by the generic migration below and padded
+            # with empty trailing cells without losing data.
+            "kl_loss",
         ]
         legacy_header_no_cl = ["step", "loss", "uq_loss", "mtp_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
         legacy_header_no_ann = ["step", "loss", "uq_loss", "mtp_loss", "cl_loss", "val_loss", "lr", "grad_norm", "num_thoughts", "dt_ms"]
@@ -1873,6 +2009,10 @@ def main() -> None:
             accum_ann_ent_loss = 0.0
             accum_ann_gate_mean = 0.0
             accum_mse_loss = 0.0
+            # ZEB-139 KL+CE: accumulator for the KL term, only populated
+            # when --kl-lambda > 0. Reset per outer step to match the
+            # other aux-loss accumulators' grad_accum_steps averaging.
+            accum_kl_loss = 0.0
             # θ-V-contrast (ZEB-130): aux-loss accumulators. Sum is captured
             # as a scalar (no grad), per-layer values are retained for CSV.
             accum_vcontrast_aux = 0.0
@@ -2017,6 +2157,69 @@ def main() -> None:
                         loss = coconut_loss(logits, aug_targets, think_mask)
                     else:
                         loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), targets.reshape(-1))
+
+                    # ZEB-139 KL+CE: mix KL(P_router || P_teacher) into
+                    # the loss when --kl-lambda > 0. Per-token-normalized
+                    # to match CE's reduction="mean" — see spec §4.3 and
+                    # PR #255 round-2 review for the rationale (batchmean
+                    # would scale KL with seq_len, confounding lambda).
+                    if args.kl_lambda > 0:
+                        skip_logits = model._last_skip_logits
+                        if skip_logits is None:
+                            raise RuntimeError(
+                                "--kl-lambda > 0 but model._last_skip_logits "
+                                "is None after forward — Skip-to-Logit router "
+                                "didn't fire. This usually means engram_inject_mult "
+                                "is 0 or no engram_injections were attached. "
+                                "Check that --engram-skip-to-logit is set with "
+                                "a multi-layer gated-injection preset (e.g. "
+                                "tiny_engram_xattn_capgap*)."
+                            )
+                        # Single canonical hash per position (Option C in
+                        # the ZEB-139 design): trigram with the first
+                        # engram seed. Positions p<2 (no trigram) get -1
+                        # and are masked out of the KL average.
+                        from ct87.engram import compute_canonical_trigram_row_indices
+                        row_indices_cpu = compute_canonical_trigram_row_indices(
+                            input_ids,
+                            total_entries=oracle_teacher_total_entries,
+                            canonical_seed=seeds[0],
+                        )  # [B, T] cpu long, -1 for invalid
+                        kl_mask = (row_indices_cpu >= 0)  # [B, T] cpu bool
+                        # Clamp negatives to 0 for the lookup (masked
+                        # contributions get zeroed out by `kl_mask`
+                        # below; the index value at those positions is
+                        # irrelevant).
+                        valid_indices_cpu = row_indices_cpu.clamp(min=0)
+                        # CPU gather → [B, T, vocab] bf16, then move to
+                        # GPU + cast to fp32 for stable softmax math.
+                        teacher_logits_sample = oracle_teacher_logits[
+                            valid_indices_cpu
+                        ].to(device=skip_logits.device, dtype=torch.float32)
+                        log_p_router = F.log_softmax(
+                            skip_logits.float(), dim=-1,
+                        )
+                        p_teacher = F.softmax(teacher_logits_sample, dim=-1)
+                        kl_per_token = F.kl_div(
+                            log_p_router, p_teacher, reduction="none",
+                        ).sum(-1)  # [B, T]
+                        kl_mask_dev = kl_mask.to(skip_logits.device)
+                        # Masked mean: divide by the number of positions
+                        # that have a valid trigram, not by total tokens.
+                        # `.clamp(min=1)` guards a degenerate batch with
+                        # seq_len < 3 (would otherwise be div-by-zero).
+                        denom = kl_mask_dev.sum().clamp(min=1).to(
+                            kl_per_token.dtype,
+                        )
+                        kl_loss_val = (kl_per_token * kl_mask_dev).sum() / denom
+                        # Convex blend: when lambda=0 KL contributes zero
+                        # and CE is unchanged. When lambda=1 the loss is
+                        # pure KL (no CE pressure on the base LM head).
+                        loss = (
+                            (1.0 - args.kl_lambda) * loss
+                            + args.kl_lambda * kl_loss_val
+                        )
+                        accum_kl_loss += kl_loss_val.item()
 
                     # UQ auxiliary loss
                     if uq_head is not None:
@@ -2242,6 +2445,10 @@ def main() -> None:
                 if args.contrastive_loss:
                     raw_cl = accum_cl_loss / args.grad_accum_steps
                     cl_str = f"  cl_loss={raw_cl:.4f}"
+                kl_str = ""
+                if args.kl_lambda > 0:
+                    raw_kl = accum_kl_loss / args.grad_accum_steps
+                    kl_str = f"  kl_loss={raw_kl:.4f}  kl_lambda={args.kl_lambda:.2f}"
                 ann_str = ""
                 if model.engram_ann is not None:
                     raw_ent = accum_ann_ent_loss / args.grad_accum_steps
@@ -2304,7 +2511,7 @@ def main() -> None:
                     vcontrast_str = "  " + "  ".join(parts)
                 print(
                     f"step={step:5d}  loss={raw_loss:.4f}  lr={current_lr:.6f}"
-                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{ann_str}{hg_str}{consol_str}{vcontrast_str}{capgap_str}"
+                    f"{ct_str}{uq_str}{mtp_str}{cl_str}{kl_str}{ann_str}{hg_str}{consol_str}{vcontrast_str}{capgap_str}"
                 )
                 # iota-Q-diversity (ZEB-130): separate console line for qdiv
                 # aux. Print unconditionally when qdiv is enabled — suppressing
@@ -2382,12 +2589,17 @@ def main() -> None:
                     ann_ent_str = f"{accum_ann_ent_loss / args.grad_accum_steps:.6f}"
                     ann_gate_str = f"{accum_ann_gate_mean / args.grad_accum_steps:.6f}"
                     ann_lambda_str = f"{dynamic_entropy_lambda:.6f}"
-                # Non-hg columns: 13 base + 3 consol + (0 when vcontrast off)
-                # or (2 scalars + N per-layer) when on. Subtract from total to
-                # size the hg block (hg_0..hg_N, std/min/max).
+                # Non-hg columns: 13 base + 3 consol + 1 kl_loss (ZEB-139)
+                # + (0 when vcontrast off) or (2 scalars + N per-layer) when
+                # on. Subtract from total to size the hg block (hg_0..hg_N,
+                # std/min/max). The constant 17 must increase whenever a
+                # non-conditional column is appended to expected_header
+                # outside the hg / vcontrast / qdiv blocks — bumping it
+                # is what keeps `len(hg_cols)` matching the hg slot count
+                # that expected_header reserved.
                 n_vcontrast_cols = len(vcontrast_cols)
                 n_qdiv_cols = len(qdiv_cols)
-                n_hg_slots = len(expected_header) - (16 + n_vcontrast_cols + n_qdiv_cols)
+                n_hg_slots = len(expected_header) - (17 + n_vcontrast_cols + n_qdiv_cols)
                 hg_cols = [""] * n_hg_slots
                 hg_module = None
                 if hasattr(model, "engram_xattn") and model.engram_xattn is not None and hasattr(model.engram_xattn, "head_gates"):
@@ -2450,6 +2662,11 @@ def main() -> None:
                         config.engram_qdiv_lambda,
                     )
                     qdiv_row_cells.append(f"{current_qdiv_lam:.6f}")
+                kl_loss_str = (
+                    f"{accum_kl_loss / args.grad_accum_steps:.6f}"
+                    if args.kl_lambda > 0
+                    else ""
+                )
                 csv_writer.writerow([
                     step,
                     f"{raw_loss:.6f}",
@@ -2470,6 +2687,7 @@ def main() -> None:
                     inject_mult_str,
                     *vcontrast_row_cells,
                     *qdiv_row_cells,
+                    kl_loss_str,
                 ])
                 csv_file.flush()
 

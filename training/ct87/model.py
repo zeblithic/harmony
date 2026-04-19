@@ -677,6 +677,13 @@ class HarmonyModel(nn.Module):
         # lives in ct87.engram to keep all research modules co-located.
         self.engram_skip_router: nn.Module | None = None
         self._last_engram_skip_input: torch.Tensor | None = None
+        # ZEB-139: snapshot of the router's pre-add `skip_logits`
+        # ([B, L, vocab]) so the training loop can compute
+        # `KL(softmax(skip_logits) || P_teacher)` against the oracle's
+        # teacher-logits sidecar without the model needing to know
+        # about the KL pathway. Cleared at the start of every forward
+        # alongside the other `_last_*` snapshots.
+        self._last_skip_logits: torch.Tensor | None = None
 
         # Tied embeddings
         if config.tie_embeddings:
@@ -904,6 +911,7 @@ class HarmonyModel(nn.Module):
         self._last_xattn_output = None
         self._last_pre_injection_hidden = None
         self._last_engram_skip_input = None
+        self._last_skip_logits = None
         # V-contrast aux-loss sink: clear only in training mode so eval-time
         # callers (e.g. forensic) can inspect a pre-loaded list without it
         # being wiped out.
@@ -984,6 +992,11 @@ class HarmonyModel(nn.Module):
             and self.engram_inject_mult != 0.0
         ):
             skip_logits = self.engram_skip_router(self._last_engram_skip_input)
+            # Snapshot for ZEB-139 KL+CE: training loop reads this to
+            # compute KL against the teacher-logits oracle sidecar.
+            # Set BEFORE the additive merge so the snapshot is the
+            # router's isolated output, not the mixed final logits.
+            self._last_skip_logits = skip_logits
             logits = logits + skip_logits
 
         if return_hidden_states:

@@ -270,6 +270,70 @@ def _hash_ngram(tokens: list[int], seed: int) -> int:
     return _xxhash64(data, seed)
 
 
+def compute_canonical_trigram_row_indices(
+    input_ids: torch.Tensor,
+    total_entries: int,
+    canonical_seed: int,
+) -> torch.Tensor:
+    """Per-(b, p) canonical hash for ZEB-139 KL+CE oracle lookup.
+
+    Picks ONE row index per position from the trigram-with-canonical-seed
+    family: `_hash_ngram([t[p-2], t[p-1], t[p]], canonical_seed) %
+    total_entries`. Positions p<2 (no trigram coverage) get -1 so the
+    KL loss can mask them out.
+
+    Why "single canonical" (Option C in the ZEB-139 design notes):
+    `EngramTable.lookup_batch` sum-scatters K bigram + K trigram
+    embeddings per position (K = num_seeds), letting the model's
+    `W_align` learn to integrate the multi-hash signal. Replicating
+    that aggregation on the KL target side would either (a) double-
+    count the multi-hash signal (information already present via the
+    engram-emb path) or (b) require a non-trivial probability-space
+    aggregation choice (mean of softmaxes vs softmax of mean) that the
+    spec doesn't pin. Picking one canonical hash per position avoids
+    both pitfalls and gives the cleanest comparability against the
+    teacher.
+
+    The trigram (vs bigram) is picked because trigram = more context =
+    a sharper teacher distribution. Seed comes from the caller (train.py
+    passes `hash_seeds[0]` from the engram-table config) so the lookup
+    matches the same hash family the engram embeddings come from.
+
+    Args:
+        input_ids: [batch, seq_len] long tensor of token IDs
+        total_entries: oracle table row count (modulo for the hash)
+        canonical_seed: xxhash64 seed to use for the trigram hash
+
+    Returns:
+        [batch, seq_len] long tensor of row indices in [-1, total_entries).
+        -1 marks positions with no trigram (p<2) — caller must mask
+        these out before indexing into the teacher table.
+    """
+    if input_ids.dim() != 2:
+        raise ValueError(
+            f"input_ids must be 2-D [batch, seq_len]; got shape "
+            f"{tuple(input_ids.shape)}"
+        )
+    batch_size, seq_len = input_ids.shape
+    out = torch.full(
+        (batch_size, seq_len), -1, dtype=torch.long, device="cpu",
+    )
+    if seq_len < 3:
+        return out
+    # CPU iteration: matches `EngramTable._collect_indices`'s pattern;
+    # the per-token Python overhead is dwarfed by the GPU-side
+    # KL+CE math downstream. xxhash is implemented in Python here and
+    # in `crates/harmony-engram` in Rust — bit-for-bit identical, see
+    # the `_hash_ngram` docstring above.
+    ids_cpu = input_ids.detach().cpu().tolist()
+    for b in range(batch_size):
+        tokens = ids_cpu[b]
+        for p in range(2, seq_len):
+            trigram = [tokens[p - 2], tokens[p - 1], tokens[p]]
+            out[b, p] = _hash_ngram(trigram, canonical_seed) % total_entries
+    return out
+
+
 class EngramTable:
     """In-memory Engram embedding table for training.
 

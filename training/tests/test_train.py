@@ -720,3 +720,197 @@ class TestMtpCsvLogging:
             assert len(data_rows) == 3
             for row in data_rows:
                 float(row["mtp_loss"])  # populated when --mtp-head is on
+
+
+class TestKlRetrofit:
+    """ZEB-139 KL+CE hybrid loss.
+
+    Covers: model snapshot of `_last_skip_logits` after the ZEB-134
+    Skip-to-Logit router fires, the canonical-trigram-row-index helper
+    used to look up teacher logits per (b, p), and the train.py CLI
+    validation guards (paired flags, lambda bounds).
+    """
+
+    def _build_model_with_skip_router(self, alpha_init: float = 0.1):
+        from ct87.engram import (
+            EngramCrossAttention, GatedEngramInjection, SkipToLogitEngramRouter,
+        )
+        cfg = HarmonyModelConfig.tiny_engram_xattn_capgap()
+        model = HarmonyModel(cfg)
+        # Multi-layer η-B injection: required precondition for the
+        # skip router (it reads the LAST injection layer's output).
+        capgap_table = torch.zeros((1024, cfg.engram_dim))
+        injections = {}
+        for layer_idx in cfg.engram_inject_layers:
+            xattn = EngramCrossAttention(
+                cfg, capgap_table, num_heads=cfg.num_query_heads,
+                k_retrieved=4,
+            )
+            injections[layer_idx] = GatedEngramInjection(
+                xattn, alpha_init=cfg.engram_gate_init,
+            )
+        model.attach_gated_engram_injections(injections)
+        router = SkipToLogitEngramRouter(
+            hidden_dim=cfg.hidden_dim,
+            lm_head_weight=model.lm_head.weight,
+            alpha_init=alpha_init,
+        )
+        model.attach_engram_skip_router(router)
+        return cfg, model
+
+    def test_last_skip_logits_snapshotted_after_forward(self):
+        """The model must expose _last_skip_logits after every forward
+        when the ZEB-134 router is attached. The training loop's KL term
+        depends on this snapshot — losing it (e.g. a future model.py
+        refactor that drops the assignment) would silently disable the
+        KL pathway. Pin the contract."""
+        torch.manual_seed(42)
+        cfg, model = self._build_model_with_skip_router()
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 17))
+        # Initial state: cleared.
+        assert model._last_skip_logits is None
+        logits = model(input_ids)
+        # Post-forward: populated, shape matches main logits.
+        assert model._last_skip_logits is not None
+        assert model._last_skip_logits.shape == logits.shape
+        # The snapshot is the router's ISOLATED output, not the mixed
+        # final logits. Since W_align starts at zero and alpha=0.1, the
+        # router's contribution is exactly zero on the first forward.
+        # The snapshot should reflect that (all-zero tensor).
+        assert torch.all(model._last_skip_logits == 0)
+
+    def test_last_skip_logits_cleared_at_start_of_forward(self):
+        """Each forward must start from a clean slate. A stale snapshot
+        from a prior batch could otherwise leak into the KL term if the
+        router doesn't fire (e.g. inject_mult forced to 0)."""
+        torch.manual_seed(42)
+        cfg, model = self._build_model_with_skip_router()
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 17))
+        model(input_ids)  # populate
+        assert model._last_skip_logits is not None
+        # Force the router to be skipped on the next forward.
+        model.engram_inject_mult = 0.0
+        model(input_ids)
+        # Snapshot should be cleared (None), not stale.
+        assert model._last_skip_logits is None
+
+    def test_canonical_trigram_row_indices_basic(self):
+        from ct87.engram import compute_canonical_trigram_row_indices
+
+        # Simple deterministic input: row indices for positions 0/1
+        # must be -1 (no trigram); positions 2..N-1 get the trigram
+        # hash modulo total_entries.
+        input_ids = torch.tensor([
+            [10, 20, 30, 40, 50],
+            [11, 21, 31, 41, 51],
+        ], dtype=torch.long)
+        row_indices = compute_canonical_trigram_row_indices(
+            input_ids, total_entries=1024, canonical_seed=42,
+        )
+        assert row_indices.shape == (2, 5)
+        assert (row_indices[:, :2] == -1).all()  # p<2 = no trigram
+        assert (row_indices[:, 2:] >= 0).all()
+        assert (row_indices[:, 2:] < 1024).all()
+        # Different sequences hash to different values (with probability
+        # 1 - 1/total_entries; deterministic for these specific inputs).
+        assert not torch.equal(row_indices[0], row_indices[1])
+
+    def test_canonical_trigram_row_indices_reproducible(self):
+        """Same input + seed must always produce the same hash."""
+        from ct87.engram import compute_canonical_trigram_row_indices
+
+        input_ids = torch.randint(0, 32000, (3, 16))
+        a = compute_canonical_trigram_row_indices(input_ids, 1024, 42)
+        b = compute_canonical_trigram_row_indices(input_ids, 1024, 42)
+        assert torch.equal(a, b)
+        # Different seed → different indices (almost always).
+        c = compute_canonical_trigram_row_indices(input_ids, 1024, 99)
+        assert not torch.equal(a[:, 2:], c[:, 2:])
+
+    def test_canonical_trigram_row_indices_short_seq(self):
+        from ct87.engram import compute_canonical_trigram_row_indices
+
+        # seq_len < 3 → no trigrams anywhere → all -1.
+        input_ids = torch.tensor([[1, 2]], dtype=torch.long)
+        row_indices = compute_canonical_trigram_row_indices(input_ids, 1024, 42)
+        assert (row_indices == -1).all()
+
+    def _run_train_cli(self, *extra_args, log_dir):
+        """Helper: invoke ct87.train with --synthetic + minimal common
+        args, return CompletedProcess. Uses --config tiny (no engram)
+        unless extra_args overrides; bumps --steps to 2 for speed."""
+        log_path = os.path.join(log_dir, "train.csv")
+        ckpt_dir = os.path.join(log_dir, "ckpt")
+        training_dir = os.path.join(os.path.dirname(__file__), "..")
+        cmd = [
+            sys.executable, "-m", "ct87.train",
+            "--synthetic", "--config", "tiny",
+            "--steps", "2", "--save-every", "0",
+            "--log-file", log_path,
+            "--dtype", "float32",
+            "--output-dir", ckpt_dir,
+            *extra_args,
+        ]
+        return subprocess.run(
+            cmd, capture_output=True, text=True,
+            cwd=training_dir, timeout=120,
+        )
+
+    def test_cli_rejects_kl_lambda_without_skip_router(self):
+        """--kl-lambda > 0 needs --engram-skip-to-logit. Without it the
+        KL target (skip_logits) doesn't exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res = self._run_train_cli(
+                "--kl-lambda", "0.5",
+                "--oracle-teacher-logits", "/tmp/nonexistent.safetensors",
+                log_dir=tmpdir,
+            )
+            assert res.returncode == 2, res.stderr
+            assert "engram-skip-to-logit" in res.stderr.lower()
+
+    def test_cli_rejects_kl_lambda_without_oracle_logits(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res = self._run_train_cli(
+                "--kl-lambda", "0.5",
+                "--engram-skip-to-logit",
+                log_dir=tmpdir,
+            )
+            assert res.returncode == 2, res.stderr
+            assert "oracle-teacher-logits" in res.stderr.lower()
+
+    def test_cli_rejects_oracle_logits_without_kl_lambda(self):
+        """Symmetric guard: passing the sidecar without kl_lambda > 0
+        silently has no effect — surface the misconfiguration upfront."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res = self._run_train_cli(
+                "--oracle-teacher-logits", "/tmp/some_sidecar.safetensors",
+                log_dir=tmpdir,
+            )
+            assert res.returncode == 2, res.stderr
+            assert "--oracle-teacher-logits" in res.stderr
+            assert "--kl-lambda" in res.stderr
+
+    def test_cli_rejects_kl_lambda_out_of_range(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res = self._run_train_cli(
+                "--kl-lambda", "1.5",
+                "--engram-skip-to-logit",
+                "--oracle-teacher-logits", "/tmp/x.safetensors",
+                log_dir=tmpdir,
+            )
+            assert res.returncode == 2, res.stderr
+            assert "kl-lambda" in res.stderr.lower()
+
+    def test_cli_default_kl_lambda_is_zero_no_validation_fires(self):
+        """Verify the new flags don't break a vanilla run (without
+        --kl-lambda). The training run completes and CSV has the new
+        kl_loss column (empty since KL is off)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res = self._run_train_cli(log_dir=tmpdir)
+            assert res.returncode == 0, res.stderr
+            log_path = os.path.join(tmpdir, "train.csv")
+            with open(log_path) as f:
+                data_rows = list(csv.DictReader(f))
+            assert len(data_rows) >= 1
+            for row in data_rows:
+                assert row["kl_loss"] == ""  # empty when KL off
