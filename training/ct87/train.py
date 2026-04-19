@@ -978,6 +978,23 @@ def main() -> None:
         config = HarmonyModelConfig.target()
     seq_len = args.seq_len or (512 if args.config.startswith("tiny") else 2048)
 
+    # ZEB-134 Skip-to-Logit router only fires inside the multi-layer
+    # `engram_inject_layers` block — without that, the flag silently
+    # no-ops AND any --kl-lambda > 0 run later crashes when it reads
+    # `model._last_skip_logits` (which is None because the router was
+    # never attached). Fail fast here instead.
+    if args.engram_skip_to_logit and not config.engram_inject_layers:
+        print(
+            f"Error: --engram-skip-to-logit requires a multi-layer "
+            f"gated-engram preset (engram_inject_layers must be "
+            f"non-empty). --config={args.config!r} has "
+            f"engram_inject_layers={config.engram_inject_layers!r}. Use "
+            f"e.g. tiny_engram_xattn_capgap or another capgap-derived "
+            f"preset.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     # θ-V-contrast (ZEB-130): --engram-vcontrast must exactly match the
     # preset's `engram_vcontrast_enabled`. Preset mutation via flag makes
     # CSV logs ambiguous (the recorded `--config=` no longer describes what
@@ -1295,6 +1312,11 @@ def main() -> None:
     # η-B multi-layer gated injection (ZEB-130).
     # Must happen BEFORE freeze_backbone_for_capgap() which raises if no
     # engram_injections are attached.
+    # `capgap_table` is bound here (when the block runs) so the ZEB-139
+    # sidecar shape validator below can compare its row count to the
+    # teacher_logits sidecar's. Initialized to None so non-capgap
+    # configs leave it unbound-as-None instead of raising NameError.
+    capgap_table: torch.Tensor | None = None
     if config.engram_inject_layers:
         from ct87.engram import (
             EngramCrossAttention,
@@ -1590,11 +1612,20 @@ def main() -> None:
         # Explicitly DO NOT touch optimizer, step, or RNG: this is a fresh run.
         del ckpt
 
+    # Parse engram hash seeds unconditionally — the canonical seed for
+    # ZEB-139 KL+CE lookup must be available even when --engram-table is
+    # not set (the capgap/skip-router path uses --engram-xattn-table
+    # instead, but still needs the same hash seeds for the trigram-
+    # canonical-row-index helper). Previously seeds was only initialized
+    # inside the engram_table branch, causing UnboundLocalError on the
+    # KL path when --engram-table was absent.
+    seeds = [int(s) for s in args.engram_seeds.split(",")]
+    canonical_seed = seeds[0]
+
     # Load Engram table if provided
     engram_table = None
     if args.engram_table is not None:
         from ct87.engram import EngramTable
-        seeds = [int(s) for s in args.engram_seeds.split(",")]
         engram_table = EngramTable.from_safetensors(
             args.engram_table, hash_seeds=seeds, device=str(device),
         )
@@ -1644,17 +1675,40 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        if engram_table is not None and oracle_teacher_logits.shape[0] != engram_table.total_entries:
-            print(
-                f"Error: teacher_logits.weight has "
-                f"{oracle_teacher_logits.shape[0]} rows but the engram "
-                f"table has {engram_table.total_entries} — both must use "
-                f"the same xxhash row count (otherwise per-position "
-                f"hashes don't agree). Re-extract one or the other to "
-                f"match.",
-                file=sys.stderr,
+        # Cross-validate the sidecar's row count against whichever
+        # engram table is loaded. Two paths matter:
+        #   - engram_table (loaded via --engram-table): the legacy
+        #     ZEB-117/130 path
+        #   - capgap_table (loaded via --engram-xattn-table): the
+        #     ZEB-139 path that uses the SkipToLogitEngramRouter
+        # ZEB-139 typically uses the capgap path with engram_table=None;
+        # the original validator only covered engram_table, so a
+        # mismatched capgap_table + sidecar would silently misalign
+        # per-position hashes for the entire run. Check both.
+        for table_label, table_obj in (
+            ("engram (--engram-table)", engram_table),
+            ("capgap (--engram-xattn-table)", capgap_table),
+        ):
+            if table_obj is None:
+                continue
+            # engram_table is an EngramTable wrapper (.total_entries),
+            # capgap_table is a raw torch.Tensor (.shape[0]).
+            table_rows = (
+                table_obj.total_entries
+                if hasattr(table_obj, "total_entries")
+                else int(table_obj.shape[0])
             )
-            sys.exit(1)
+            if oracle_teacher_logits.shape[0] != table_rows:
+                print(
+                    f"Error: teacher_logits.weight has "
+                    f"{oracle_teacher_logits.shape[0]} rows but the "
+                    f"{table_label} table has {table_rows} — both must "
+                    f"use the same xxhash row count (otherwise "
+                    f"per-position hashes don't agree). Re-extract one "
+                    f"or the other to match.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         oracle_teacher_total_entries = int(oracle_teacher_logits.shape[0])
         print(
             f"Teacher-logits sidecar loaded: "
@@ -2165,6 +2219,17 @@ def main() -> None:
                     # would scale KL with seq_len, confounding lambda).
                     if args.kl_lambda > 0:
                         skip_logits = model._last_skip_logits
+                        # Drop the model's reference immediately — we
+                        # have a local one for the KL backprop, and
+                        # leaving the snapshot alive on the model would
+                        # retain a [B, T, vocab] tensor + its autograd
+                        # graph until the next forward (inflates peak
+                        # GPU memory under grad-accumulation, which can
+                        # micro-step several times before clearing).
+                        # The local `skip_logits` keeps the graph alive
+                        # for backward; setting model._last_skip_logits
+                        # to None just removes the extra reference.
+                        model._last_skip_logits = None
                         if skip_logits is None:
                             raise RuntimeError(
                                 "--kl-lambda > 0 but model._last_skip_logits "
@@ -2183,7 +2248,7 @@ def main() -> None:
                         row_indices_cpu = compute_canonical_trigram_row_indices(
                             input_ids,
                             total_entries=oracle_teacher_total_entries,
-                            canonical_seed=seeds[0],
+                            canonical_seed=canonical_seed,
                         )  # [B, T] cpu long, -1 for invalid
                         kl_mask = (row_indices_cpu >= 0)  # [B, T] cpu bool
                         # Clamp negatives to 0 for the lookup (masked
@@ -2196,12 +2261,26 @@ def main() -> None:
                         teacher_logits_sample = oracle_teacher_logits[
                             valid_indices_cpu
                         ].to(device=skip_logits.device, dtype=torch.float32)
+                        # Forward KL `KL(P_router || P_teacher)` per spec
+                        # §4.1 (mode-seeking, matches Memory Decoder
+                        # framing). PyTorch `F.kl_div(input, target)`
+                        # computes `KL(target || input)` per its
+                        # `target * (log target - input)` formula — so
+                        # to get `KL(p_router || p_teacher)` the router
+                        # log-probs go in the TARGET position. Using
+                        # `log_target=True` lets us pass log-probs for
+                        # both sides, avoiding the explicit
+                        # `softmax(teacher)` materialization that the
+                        # earlier formulation needed.
                         log_p_router = F.log_softmax(
                             skip_logits.float(), dim=-1,
                         )
-                        p_teacher = F.softmax(teacher_logits_sample, dim=-1)
+                        log_p_teacher = F.log_softmax(
+                            teacher_logits_sample, dim=-1,
+                        )
                         kl_per_token = F.kl_div(
-                            log_p_router, p_teacher, reduction="none",
+                            log_p_teacher, log_p_router,
+                            reduction="none", log_target=True,
                         ).sum(-1)  # [B, T]
                         kl_mask_dev = kl_mask.to(skip_logits.device)
                         # Masked mean: divide by the number of positions

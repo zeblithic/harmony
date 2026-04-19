@@ -1390,10 +1390,19 @@ class SkipToLogitEngramRouter(nn.Module):
     a copy so the tied-embedding invariant remains intact.
 
     Safe-init contract: W_align starts at exact zero so the router's
-    output is zero regardless of input. The first backprop step gets
-    gradient only via alpha (through the nonzero engram_out) -
-    analogous to GatedEngramInjection's alpha-gate warmup pattern. Once
-    alpha moves off its init, W_align starts receiving gradient too.
+    output is zero regardless of input. At step 0:
+      d(loss)/d(log_alpha) = d(loss)/d(out) * (W_align(x) @ W_lm.T)
+                           = d(loss)/d(out) * 0 = 0  (no alpha gradient)
+      d(loss)/d(W_align) = d(loss)/d(out) * alpha * (x outer W_lm)
+                         ≠ 0  (W_align receives gradient via alpha)
+    So the first backprop step trains W_align (not alpha). Once W_align
+    moves off zero, alpha starts receiving gradient too. This is the
+    INVERSE of GatedEngramInjection's alpha-gate warmup — there, alpha
+    is the gate over a fully-initialized signal, so alpha trains first.
+    Test `test_gradient_flows_via_alpha_when_W_align_starts_zero`
+    asserts this contract directly (despite its name, it verifies the
+    W_align-first ordering). CodeRabbit caught the wrong description on
+    PR #257 round-1.
 
     alpha is stored as log_alpha (trainable scalar) with alpha =
     torch.exp(log_alpha), which keeps alpha > 0 without a hard clamp.

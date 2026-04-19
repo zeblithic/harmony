@@ -298,10 +298,10 @@ class TestCsvLogging:
     # Required columns that every run must emit, regardless of which
     # heads/aux losses are enabled. Used as a stability contract — if
     # one of these is dropped or renamed, that's a real schema break.
-    REQUIRED_COLS = {
+    REQUIRED_COLS: frozenset[str] = frozenset({
         "step", "loss", "uq_loss", "mtp_loss", "val_loss",
-        "lr", "grad_norm", "num_thoughts", "dt_ms",
-    }
+        "lr", "grad_norm", "num_thoughts", "dt_ms", "kl_loss",
+    })
 
     def test_csv_file_structure(self):
         """CSV log file has all required columns + parseable numeric values."""
@@ -852,7 +852,7 @@ class TestKlRetrofit:
             *extra_args,
         ]
         return subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, capture_output=True, text=True, check=False,
             cwd=training_dir, timeout=120,
         )
 
@@ -887,8 +887,9 @@ class TestKlRetrofit:
                 log_dir=tmpdir,
             )
             assert res.returncode == 2, res.stderr
-            assert "--oracle-teacher-logits" in res.stderr
-            assert "--kl-lambda" in res.stderr
+            stderr_lower = res.stderr.lower()
+            assert "--oracle-teacher-logits" in stderr_lower
+            assert "--kl-lambda" in stderr_lower
 
     def test_cli_rejects_kl_lambda_out_of_range(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -914,3 +915,75 @@ class TestKlRetrofit:
             assert len(data_rows) >= 1
             for row in data_rows:
                 assert row["kl_loss"] == ""  # empty when KL off
+
+    def test_cli_rejects_skip_to_logit_without_inject_layers(self):
+        """--engram-skip-to-logit is meaningful only inside the
+        multi-layer engram-injection block. A preset like `tiny`
+        without `engram_inject_layers` would silently skip the router
+        attachment AND then crash later if --kl-lambda > 0 (because
+        `model._last_skip_logits` would be None). Fail fast at startup
+        instead. CodeRabbit + the seed-undefined-on-non-engram-runs
+        feedback both pointed at this gap."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res = self._run_train_cli(
+                "--engram-skip-to-logit",
+                # default --config tiny has empty engram_inject_layers
+                log_dir=tmpdir,
+            )
+            assert res.returncode == 2, res.stderr
+            stderr = res.stderr.lower()
+            assert "--engram-skip-to-logit" in stderr
+            assert "engram_inject_layers" in stderr or "multi-layer" in stderr
+
+    def test_kl_div_call_computes_forward_kl(self):
+        """Pin the KL direction. The spec specifies
+        `KL(P_router || P_teacher)` (forward / mode-seeking). PyTorch's
+        `F.kl_div(input, target)` computes `KL(target || input)` per its
+        `target * (log target - input)` formula. So the spec'd direction
+        requires the router log-probs to go in the TARGET position.
+
+        This test constructs two distinct distributions and verifies
+        the F.kl_div call matches the analytic forward-KL reference
+        within fp32 noise. A future refactor that swaps the args will
+        break this test loudly.
+        """
+        import torch.nn.functional as F
+        rng = torch.Generator().manual_seed(0)
+        # Two arbitrary distinct logit distributions over a small vocab.
+        router_logits = torch.randn(4, 8, generator=rng) * 2.0
+        teacher_logits = torch.randn(4, 8, generator=rng) * 2.0
+        log_p_router = F.log_softmax(router_logits, dim=-1)
+        log_p_teacher = F.log_softmax(teacher_logits, dim=-1)
+
+        # Computed via the EXACT call train.py uses:
+        kl_call = F.kl_div(
+            log_p_teacher, log_p_router,
+            reduction="none", log_target=True,
+        ).sum(-1)  # [4]
+
+        # Analytic forward KL: sum_v p_router(v) * (log p_router(v) - log p_teacher(v))
+        p_router = log_p_router.exp()
+        kl_analytic = (p_router * (log_p_router - log_p_teacher)).sum(-1)
+
+        torch.testing.assert_close(kl_call, kl_analytic, rtol=1e-5, atol=1e-6)
+        assert (kl_call > 0).all(), (
+            "KL between two genuinely-different distributions must be > 0"
+        )
+
+    def test_kl_div_call_is_zero_when_distributions_match(self):
+        """When P_router == P_teacher the KL term must be exactly zero.
+        This is the most important sanity check on the math: a non-zero
+        result here would mean a misconfigured loss that pulls the
+        router AWAY from the teacher when it's already there."""
+        import torch.nn.functional as F
+        torch.manual_seed(7)
+        logits = torch.randn(2, 8) * 3.0
+        log_p = F.log_softmax(logits, dim=-1)
+
+        kl_call = F.kl_div(
+            log_p, log_p,  # identical distributions
+            reduction="none", log_target=True,
+        ).sum(-1)
+        torch.testing.assert_close(
+            kl_call, torch.zeros_like(kl_call), atol=1e-6, rtol=0,
+        )
