@@ -112,7 +112,7 @@ TEACHER_LOGITS_SIDECAR_SUFFIX = "_teacher_logits.safetensors"
 # — release-blocking OOM on most boxes. Chunking K caps the scratch at
 # `LOGITS_UPDATE_CHUNK_K * vocab * 4 bytes` (~64 MB at vocab=32000) and the
 # downstream `update_batch` float64 buffer at the same row count (~128 MB).
-LOGITS_UPDATE_CHUNK_K = 512
+LOGITS_UPDATE_CHUNK_K = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +230,236 @@ class WelfordTable:
     @property
     def populated_mask(self) -> np.ndarray:
         return self.counts > 0
+
+
+@dataclass
+class SumAccumulatorTable:
+    """Lightweight sum + count accumulator; means computed once at the end.
+
+    For wide vectors (e.g. vocab=32000) the per-batch combined-mean math
+    in `WelfordTable.update_batch` becomes the throughput bottleneck:
+    each call allocates a fresh `[unique_rows, dim] float64` scratch,
+    runs `np.unique` on the indices, scatters the in-batch sum, gathers
+    the pre-batch mean, computes the combined mean, and casts back to
+    fp32. At dim=32000 / chunk=512 / 512-chunks-per-batch we measured
+    ~24x slowdown vs the hidden-state path's dim=2048 (205 tok/s vs
+    ~5000 tok/s on a 5080 with TinyLlama).
+
+    This accumulator just scatters sums into a flat fp64 master table
+    and counts per row; the mean is computed via a single divide at
+    the end of the teacher pass (`means` property). Numerics are
+    identical to Welford's combined-mean formula by definition
+    (`mean = sum/count`), but we skip the per-batch combine + cast
+    + intermediate-buffer allocation cost.
+
+    Memory footprint:
+        sum    = total_entries * dim * 8 bytes (fp64)
+        counts = total_entries * 8 bytes (int64)
+
+    At total_entries=10_000, dim=32_000 that is ~2.56 GB for sum +
+    80 KB for counts — CPU-resident on AVALON-class hosts; would not
+    fit at e.g. dim=131072 / total_entries=100k. Callers using this
+    for vocab-sized accumulation should size accordingly.
+
+    API parity with `WelfordTable`: exposes the same `zeros`,
+    `update_batch`, `means`, and `populated_mask` interface so
+    `process_batch` and downstream consumers don't need to switch on
+    the table type.
+    """
+
+    sum: np.ndarray      # [total_entries, dim] float64
+    counts: np.ndarray   # [total_entries] int64
+
+    @classmethod
+    def zeros(cls, total_entries: int, dim: int) -> SumAccumulatorTable:
+        return cls(
+            sum=np.zeros((total_entries, dim), dtype=np.float64),
+            counts=np.zeros(total_entries, dtype=np.int64),
+        )
+
+    def update_batch(
+        self,
+        indices: np.ndarray,
+        vectors: np.ndarray,
+    ) -> None:
+        """Scatter-add `vectors` into `self.sum` at `indices`, +1 per index.
+
+        Matches `WelfordTable.update_batch`'s signature so process_batch
+        can call either type uniformly. Unlike Welford, this does NOT
+        compute a running mean — `self.sum` accumulates raw sums and
+        `self.counts` accumulates per-row update counts. Call `.means`
+        at end-of-pass to get the per-row mean.
+
+        Args:
+            indices: [K] int64 row indices (may contain duplicates;
+                np.add.at handles them correctly with unbuffered
+                scatter accumulation).
+            vectors: [K, dim] float observations, aligned with
+                `indices` by position. Cast to fp64 internally for
+                numerically stable accumulation.
+        """
+        if indices.shape[0] != vectors.shape[0]:
+            raise ValueError(
+                f"indices ({indices.shape[0]}) and vectors "
+                f"({vectors.shape[0]}) must align by first dim"
+            )
+        if vectors.shape[1] != self.sum.shape[1]:
+            raise ValueError(
+                f"vectors have dim={vectors.shape[1]} but table "
+                f"expects {self.sum.shape[1]}"
+            )
+        if indices.size == 0:
+            return
+        # np.add.at provides unbuffered fancy-index accumulation that
+        # handles duplicate indices correctly (the buffered
+        # `self.sum[indices] += ...` would lose updates on duplicates).
+        np.add.at(self.sum, indices, vectors.astype(np.float64))
+        np.add.at(self.counts, indices, 1)
+
+    @property
+    def means(self) -> np.ndarray:
+        """Compute per-row means lazily.
+
+        Unpopulated rows (count == 0) get zero rather than NaN so the
+        downstream sidecar consumer can treat the array as a dense
+        oracle without masking. The returned array is fp32 to match
+        the safetensors sidecar dtype convention.
+        """
+        out = np.zeros(self.sum.shape, dtype=np.float32)
+        populated = self.counts > 0
+        if populated.any():
+            with np.errstate(divide="ignore", invalid="ignore"):
+                out[populated] = (
+                    self.sum[populated] / self.counts[populated, None]
+                ).astype(np.float32)
+        return out
+
+    @property
+    def populated_mask(self) -> np.ndarray:
+        return self.counts > 0
+
+
+class GpuSumAccumulatorTable:
+    """GPU-resident sum + count accumulator for the wide-vector logits path.
+
+    Mirror of `SumAccumulatorTable` but with sum/counts on a torch GPU
+    device so per-batch updates leverage GPU memory bandwidth instead
+    of CPU's. Critical for vocab-wide accumulation: at vocab=32000 /
+    10K rows, the master sum table is ~2.56 GB and per-batch scatter
+    traffic exceeds 100 GB. CPU bandwidth (~10 GB/s effective on this
+    box) bottlenecks throughput at ~450 tok/s; a 5080's ~960 GB/s
+    memory bandwidth + `torch.Tensor.index_add_` brings it back to
+    multi-thousand tok/s — close to the no-logits ZEB-136 baseline.
+
+    API matches `SumAccumulatorTable` for `means` / `populated_mask` so
+    main()'s post-pass code is type-agnostic. The sole API divergence
+    is `update_batch` — this class accepts torch GPU tensors directly
+    (no per-chunk H2D transfer); `process_batch` branches on the
+    accumulator type to call the right interface.
+
+    Memory budget on a 14 GB 5080 (TinyLlama bf16):
+        - TinyLlama weights:           ~2.2 GB
+        - per-batch outputs.logits:    ~2.0 GB (bf16, [16, 2048, 32K])
+        - sum (this class):             2.56 GB (f64, [10K, 32K])
+        - counts:                       ~80 KB
+        - per-chunk fancy-index temp:   ~512 MB at chunk=4096 (f32)
+        - hidden Welford table:         ~80 MB (f32, [10K, 2048])
+        - activations / OS overhead:    ~2-3 GB
+        Total: ~10 GB resident — fits with margin.
+    """
+
+    def __init__(
+        self,
+        total_entries: int,
+        dim: int,
+        device,
+        torch_module,
+    ) -> None:
+        self._torch = torch_module
+        self._device = device
+        self._sum = torch_module.zeros(
+            (total_entries, dim),
+            dtype=torch_module.float64,
+            device=device,
+        )
+        self._counts = torch_module.zeros(
+            total_entries,
+            dtype=torch_module.long,
+            device=device,
+        )
+        # Cached on first counts query so we don't repeatedly transfer
+        # an [10K] tensor across PCIe per-batch print loop.
+        self._populated_count_cache: int | None = None
+
+    @classmethod
+    def zeros(
+        cls,
+        total_entries: int,
+        dim: int,
+        device=None,
+        torch_module=None,
+    ) -> GpuSumAccumulatorTable:
+        if torch_module is None:
+            import torch as torch_module  # noqa: PLW0127  (rebind)
+        if device is None:
+            device = "cuda" if torch_module.cuda.is_available() else "cpu"
+        return cls(total_entries, dim, device, torch_module)
+
+    def update_batch_gpu(
+        self,
+        indices: "torch.Tensor",
+        vectors: "torch.Tensor",
+    ) -> None:
+        """Scatter-add `vectors` into `self._sum` at `indices`, +1 per index.
+
+        Both inputs must already be on `self._device`. The chunk loop in
+        `process_batch` slices an existing GPU tensor (`outputs.logits`),
+        so no host transfer happens here. `index_add_` is GPU-native and
+        handles duplicate indices correctly via atomic adds.
+        """
+        if indices.shape[0] != vectors.shape[0]:
+            raise ValueError(
+                f"indices ({indices.shape[0]}) and vectors "
+                f"({vectors.shape[0]}) must align by first dim"
+            )
+        if vectors.shape[1] != self._sum.shape[1]:
+            raise ValueError(
+                f"vectors have dim={vectors.shape[1]} but table "
+                f"expects {self._sum.shape[1]}"
+            )
+        if indices.shape[0] == 0:
+            return
+        # Promote vectors to f64 for accumulation parity with the CPU
+        # SumAccumulatorTable. The cast happens on GPU (cheap) so we
+        # don't pay it on the host's bandwidth.
+        self._sum.index_add_(0, indices, vectors.to(self._sum.dtype))
+        # Counts: scatter +1 per index. ones_like(indices) lives on the
+        # same device as indices, so this stays GPU-resident.
+        self._counts.index_add_(0, indices, self._torch.ones_like(indices))
+        self._populated_count_cache = None
+
+    @property
+    def means(self) -> np.ndarray:
+        """Compute per-row means lazily, transferring sum/counts to CPU once.
+
+        Called once at end-of-pass; the cost of the transfer (2.56 GB
+        at vocab=32000 / 10K rows) is amortized over the entire run.
+        Returns a numpy fp32 array matching `SumAccumulatorTable.means`.
+        """
+        sum_cpu = self._sum.cpu().numpy()
+        counts_cpu = self._counts.cpu().numpy()
+        out = np.zeros(sum_cpu.shape, dtype=np.float32)
+        populated = counts_cpu > 0
+        if populated.any():
+            with np.errstate(divide="ignore", invalid="ignore"):
+                out[populated] = (
+                    sum_cpu[populated] / counts_cpu[populated, None]
+                ).astype(np.float32)
+        return out
+
+    @property
+    def populated_mask(self) -> np.ndarray:
+        return (self._counts > 0).cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -927,7 +1157,7 @@ def process_batch(
     device: str,
     seq_len: int,
     torch_module,
-    logits_table: WelfordTable | None = None,
+    logits_table: WelfordTable | SumAccumulatorTable | GpuSumAccumulatorTable | None = None,
 ) -> int:
     """Run one forward pass + Welford update for a batch. Returns token count.
 
@@ -1012,19 +1242,19 @@ def process_batch(
             # differ (vocab-wide logits instead of teacher_dim-wide
             # hidden state).
             #
-            # Chunked along K AND pulled per-chunk from the GPU tensor
-            # (no full-batch CPU staging). At default batch=8/seq=2048/
-            # vocab=32000 the unchunked `logits_gpu[bs, ps, :]` would
-            # peak at ~17 GB host RAM; per-chunk transfer caps it at
-            # `LOGITS_UPDATE_CHUNK_K * vocab * 4 bytes` (~64 MB at
-            # vocab=32000) plus the downstream Welford float64 buffer
-            # (~128 MB).
+            # Chunked along K to bound the per-chunk fancy-index temp
+            # tensor (full [K, vocab] would be ~33 GB at default
+            # batch=16/seq=2048/vocab=32000).
             #
-            # Welford correctness is unaffected — `update_batch` already
-            # commutes across calls (combines pre-batch mean with each
-            # batch's contribution exactly), so K processed in N chunks
-            # vs 1 chunk produces bit-equivalent means modulo float
-            # accumulation order.
+            # Two accumulator types are supported, with parallel
+            # chunked loops:
+            #   - GpuSumAccumulatorTable: keeps everything on GPU,
+            #     uses `torch.Tensor.index_add_`. ~10x throughput vs
+            #     CPU path because the master sum table lives in GPU
+            #     HBM (960 GB/s) instead of system RAM (~10 GB/s).
+            #   - SumAccumulatorTable: chunks pulled to CPU as numpy,
+            #     scattered via `np.add.at`. CPU-only fallback for
+            #     boxes without CUDA + for unit tests.
             #
             # Move bs/ps to the same device as logits_gpu once so the
             # per-chunk fancy index doesn't trigger a fresh H2D copy
@@ -1035,19 +1265,44 @@ def process_batch(
             ps_t = torch_module.as_tensor(
                 ps, device=logits_gpu.device, dtype=torch_module.long,
             )
-            for start in range(0, indices_arr.shape[0], LOGITS_UPDATE_CHUNK_K):
-                end = start + LOGITS_UPDATE_CHUNK_K
-                idx_chunk = indices_arr[start:end]
-                # GPU fancy-index pulls only the [chunk, vocab] slice,
-                # then `.cpu().numpy()` materializes that small slice on
-                # host. detach() avoids retaining autograd state if the
-                # caller ever drops the inference_mode wrapper.
-                chunk_gpu = logits_gpu[bs_t[start:end], ps_t[start:end], :]
-                chunk_np = chunk_gpu.detach().float().cpu().numpy()
-                logits_table.update_batch(
-                    idx_chunk, chunk_np.astype(np.float32, copy=False),
+            if isinstance(logits_table, GpuSumAccumulatorTable):
+                idx_t = torch_module.as_tensor(
+                    indices_arr,
+                    device=logits_gpu.device,
+                    dtype=torch_module.long,
                 )
-                del chunk_gpu
+                for start in range(
+                    0, indices_arr.shape[0], LOGITS_UPDATE_CHUNK_K,
+                ):
+                    end = start + LOGITS_UPDATE_CHUNK_K
+                    chunk_gpu = logits_gpu[
+                        bs_t[start:end], ps_t[start:end], :
+                    ]
+                    logits_table.update_batch_gpu(
+                        idx_t[start:end], chunk_gpu,
+                    )
+                    del chunk_gpu
+                del idx_t
+            else:
+                for start in range(
+                    0, indices_arr.shape[0], LOGITS_UPDATE_CHUNK_K,
+                ):
+                    end = start + LOGITS_UPDATE_CHUNK_K
+                    idx_chunk = indices_arr[start:end]
+                    # GPU fancy-index pulls only the [chunk, vocab]
+                    # slice, then `.cpu().numpy()` materializes that
+                    # small slice on host. detach() avoids retaining
+                    # autograd state if the caller ever drops the
+                    # inference_mode wrapper.
+                    chunk_gpu = logits_gpu[
+                        bs_t[start:end], ps_t[start:end], :
+                    ]
+                    chunk_np = chunk_gpu.detach().float().cpu().numpy()
+                    logits_table.update_batch(
+                        idx_chunk,
+                        chunk_np.astype(np.float32, copy=False),
+                    )
+                    del chunk_gpu
             del logits_gpu, bs_t, ps_t
             if device.startswith("cuda"):
                 torch_module.cuda.empty_cache()
@@ -1069,7 +1324,7 @@ def run_teacher_pass(
     expected_vocab_size: int = DEFAULT_EXPECTED_VOCAB_SIZE,
     *,
     save_teacher_logits: bool = False,
-) -> tuple[WelfordTable, WelfordTable | None]:
+) -> tuple[WelfordTable, SumAccumulatorTable | GpuSumAccumulatorTable | None]:
     """Drive the full teacher forward pass, accumulating Welford means.
 
     High-level flow only: delegate teacher setup to
@@ -1079,10 +1334,16 @@ def run_teacher_pass(
 
     Returns `(hidden_table, logits_table_or_None)`. The logits table is
     `None` when `save_teacher_logits=False` (preserves the no-flag
-    memory profile — no extra `[total_entries, vocab]` allocation). The
-    second-element shape is `[total_entries, expected_vocab_size]`
-    float32 when populated (~1.28 GB at 10K rows × 32K vocab; bf16-cast
-    happens at the sidecar save site).
+    memory profile — no extra `[total_entries, vocab]` allocation).
+    When populated, the logits table is a `SumAccumulatorTable` (not a
+    `WelfordTable`) whose `.means` are computed lazily at end-of-pass
+    — the per-batch combined-mean math in `WelfordTable.update_batch`
+    is too slow at vocab-width (~24x throughput regression observed in
+    the first ZEB-139 oracle re-extraction at vocab=32000). Both types
+    expose the same `update_batch` / `means` / `populated_mask`
+    interface, so `process_batch` doesn't need to switch on the type.
+    Sum-table memory: `[total_entries, vocab] float64` = ~2.56 GB at
+    10K rows × 32K vocab; bf16-cast happens at the sidecar save site.
     """
     import torch
     from datasets import load_from_disk
@@ -1101,11 +1362,24 @@ def run_teacher_pass(
         )
     )
     table = WelfordTable.zeros(total_entries, teacher_dim)
-    logits_table = (
-        WelfordTable.zeros(total_entries, expected_vocab_size)
-        if save_teacher_logits
-        else None
-    )
+    # Logits accumulator: prefer the GPU-resident
+    # `GpuSumAccumulatorTable` when running on CUDA — CPU
+    # accumulation at vocab=32000 is bandwidth-bound at ~450 tok/s,
+    # while GPU `index_add_` runs ~10x faster. CPU device falls back
+    # to `SumAccumulatorTable` so unit tests (and CPU-only smoke runs)
+    # don't require a GPU.
+    if save_teacher_logits:
+        if device.startswith("cuda"):
+            logits_table = GpuSumAccumulatorTable.zeros(
+                total_entries, expected_vocab_size,
+                device=device, torch_module=torch,
+            )
+        else:
+            logits_table = SumAccumulatorTable.zeros(
+                total_entries, expected_vocab_size,
+            )
+    else:
+        logits_table = None
 
     print(f"Loading tokenized dataset from {tokenized_dataset_path!r}...", flush=True)
     dataset = load_from_disk(tokenized_dataset_path)

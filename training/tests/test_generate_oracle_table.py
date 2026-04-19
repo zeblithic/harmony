@@ -189,6 +189,208 @@ class TestWelfordTable:
         assert mask.tolist() == [False, True, False, True, False]
 
 
+class TestSumAccumulatorTable:
+    """SumAccumulatorTable replaces WelfordTable for the wide-vector logits
+    path. Numerically equivalent (sum/count = running mean) but defers the
+    divide to end-of-pass to dodge the per-batch combine cost that made
+    WelfordTable ~24x slower than the hidden path at vocab=32000.
+    """
+
+    def test_zeros_shape_and_dtypes(self):
+        from ct87.generate_oracle_table import SumAccumulatorTable
+
+        t = SumAccumulatorTable.zeros(10, 4)
+        assert t.sum.shape == (10, 4)
+        assert t.sum.dtype == np.float64
+        assert t.counts.shape == (10,)
+        assert t.counts.dtype == np.int64
+        assert not t.populated_mask.any()
+        # Empty means: no NaN — unpopulated rows return zero (so the
+        # downstream sidecar consumer can treat the array as dense).
+        assert np.all(t.means == 0)
+
+    def test_update_batch_records_sum_and_counts(self):
+        from ct87.generate_oracle_table import SumAccumulatorTable
+
+        t = SumAccumulatorTable.zeros(4, 3)
+        # Two updates to row 0, one each to rows 1 and 2.
+        t.update_batch(
+            np.array([0, 0, 1, 2], dtype=np.int64),
+            np.array([
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+                [10.0, 20.0, 30.0],
+                [-1.0, -1.0, -1.0],
+            ], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            t.counts, np.array([2, 1, 1, 0], dtype=np.int64),
+        )
+        np.testing.assert_allclose(t.sum[0], [5.0, 7.0, 9.0])
+        np.testing.assert_allclose(t.sum[1], [10.0, 20.0, 30.0])
+        np.testing.assert_allclose(t.sum[2], [-1.0, -1.0, -1.0])
+        np.testing.assert_array_equal(t.sum[3], [0.0, 0.0, 0.0])
+
+    def test_means_match_welford_running_mean(self):
+        """Sum/count over multiple batches must equal Welford's running
+        mean to within float32 precision. This is the load-bearing
+        equivalence claim — if this breaks, the oracle's row values no
+        longer mean what the spec says they mean."""
+        from ct87.generate_oracle_table import (
+            SumAccumulatorTable, WelfordTable,
+        )
+
+        rng = np.random.default_rng(0)
+        sum_table = SumAccumulatorTable.zeros(16, 64)
+        welford = WelfordTable.zeros(16, 64)
+        # 5 batches of varying size; some duplicate row indices.
+        for _ in range(5):
+            k = int(rng.integers(8, 32))
+            indices = rng.integers(0, 16, size=k).astype(np.int64)
+            vectors = rng.standard_normal((k, 64)).astype(np.float32)
+            sum_table.update_batch(indices, vectors)
+            welford.update_batch(indices, vectors)
+
+        np.testing.assert_array_equal(sum_table.counts, welford.counts)
+        # Both compute mean = sum / count over the same observations,
+        # using fp64 accumulators internally; final fp32 values should
+        # be very close.
+        np.testing.assert_allclose(
+            sum_table.means, welford.means, rtol=0, atol=1e-5,
+        )
+
+    def test_populated_mask_reflects_counts(self):
+        from ct87.generate_oracle_table import SumAccumulatorTable
+
+        t = SumAccumulatorTable.zeros(5, 2)
+        t.update_batch(
+            np.array([1, 3], dtype=np.int64),
+            np.ones((2, 2), dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            t.populated_mask,
+            np.array([False, True, False, True, False]),
+        )
+
+    def test_update_batch_rejects_misaligned_inputs(self):
+        from ct87.generate_oracle_table import SumAccumulatorTable
+
+        t = SumAccumulatorTable.zeros(4, 3)
+        with pytest.raises(ValueError, match="must align by first dim"):
+            t.update_batch(
+                np.array([0, 1], dtype=np.int64),
+                np.zeros((3, 3), dtype=np.float32),
+            )
+        with pytest.raises(ValueError, match="dim="):
+            t.update_batch(
+                np.array([0], dtype=np.int64),
+                np.zeros((1, 5), dtype=np.float32),
+            )
+
+    def test_empty_indices_is_noop(self):
+        from ct87.generate_oracle_table import SumAccumulatorTable
+
+        t = SumAccumulatorTable.zeros(4, 3)
+        t.update_batch(np.array([], dtype=np.int64), np.zeros((0, 3)))
+        assert not t.populated_mask.any()
+        assert np.all(t.sum == 0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="GpuSumAccumulatorTable requires CUDA",
+)
+class TestGpuSumAccumulatorTable:
+    """GPU-resident sum + count accumulator, used in production runs to
+    bypass the CPU memory-bandwidth bottleneck on the wide-vector logits
+    path. Numerics must match the CPU `SumAccumulatorTable` to within
+    fp64 precision (both accumulate in fp64).
+    """
+
+    def test_zeros_constructs_on_default_device(self):
+        from ct87.generate_oracle_table import GpuSumAccumulatorTable
+
+        t = GpuSumAccumulatorTable.zeros(8, 4)
+        assert str(t._sum.device).startswith("cuda")
+        assert t._sum.shape == (8, 4)
+        assert t._sum.dtype == torch.float64
+        assert t._counts.shape == (8,)
+        assert t._counts.dtype == torch.long
+        assert not t.populated_mask.any()
+        assert np.all(t.means == 0)
+
+    def test_update_batch_gpu_records_sum_and_counts(self):
+        from ct87.generate_oracle_table import GpuSumAccumulatorTable
+
+        t = GpuSumAccumulatorTable.zeros(4, 3)
+        device = t._device
+        indices = torch.tensor([0, 0, 1, 2], dtype=torch.long, device=device)
+        vectors = torch.tensor([
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+            [10.0, 20.0, 30.0],
+            [-1.0, -1.0, -1.0],
+        ], dtype=torch.float32, device=device)
+        t.update_batch_gpu(indices, vectors)
+        np.testing.assert_array_equal(
+            t._counts.cpu().numpy(), np.array([2, 1, 1, 0]),
+        )
+        np.testing.assert_allclose(t._sum[0].cpu().numpy(), [5.0, 7.0, 9.0])
+        np.testing.assert_allclose(t._sum[1].cpu().numpy(), [10.0, 20.0, 30.0])
+
+    def test_means_match_cpu_sum_accumulator(self):
+        """GPU and CPU accumulators must produce identical means (within
+        fp64 precision) given the same inputs. Pins the equivalence
+        contract — process_batch should produce bit-equivalent oracle
+        artifacts whether running on CPU or GPU."""
+        from ct87.generate_oracle_table import (
+            GpuSumAccumulatorTable, SumAccumulatorTable,
+        )
+
+        rng = np.random.default_rng(0)
+        gpu_t = GpuSumAccumulatorTable.zeros(16, 64)
+        cpu_t = SumAccumulatorTable.zeros(16, 64)
+        device = gpu_t._device
+        for _ in range(5):
+            k = int(rng.integers(8, 32))
+            indices_np = rng.integers(0, 16, size=k).astype(np.int64)
+            vectors_np = rng.standard_normal((k, 64)).astype(np.float32)
+            cpu_t.update_batch(indices_np, vectors_np)
+            gpu_t.update_batch_gpu(
+                torch.from_numpy(indices_np).to(device),
+                torch.from_numpy(vectors_np).to(device),
+            )
+        np.testing.assert_array_equal(gpu_t.populated_mask, cpu_t.populated_mask)
+        np.testing.assert_allclose(gpu_t.means, cpu_t.means, rtol=0, atol=1e-5)
+
+    def test_update_batch_gpu_rejects_misaligned_inputs(self):
+        from ct87.generate_oracle_table import GpuSumAccumulatorTable
+
+        t = GpuSumAccumulatorTable.zeros(4, 3)
+        device = t._device
+        with pytest.raises(ValueError, match="must align by first dim"):
+            t.update_batch_gpu(
+                torch.tensor([0, 1], dtype=torch.long, device=device),
+                torch.zeros(3, 3, dtype=torch.float32, device=device),
+            )
+        with pytest.raises(ValueError, match="dim="):
+            t.update_batch_gpu(
+                torch.tensor([0], dtype=torch.long, device=device),
+                torch.zeros(1, 5, dtype=torch.float32, device=device),
+            )
+
+    def test_empty_indices_is_noop_gpu(self):
+        from ct87.generate_oracle_table import GpuSumAccumulatorTable
+
+        t = GpuSumAccumulatorTable.zeros(4, 3)
+        device = t._device
+        t.update_batch_gpu(
+            torch.tensor([], dtype=torch.long, device=device),
+            torch.zeros(0, 3, device=device),
+        )
+        assert not t.populated_mask.any()
+
+
 # ---------------------------------------------------------------------------
 # N-gram extraction + student hash parity
 # ---------------------------------------------------------------------------
@@ -1247,7 +1449,10 @@ class TestSaveTeacherLogits:
             save_teacher_logits=True,
         )
         assert isinstance(table, gen.WelfordTable)
-        assert isinstance(logits_table, gen.WelfordTable)
+        # Logits table is the throughput-optimized SumAccumulatorTable
+        # (vs WelfordTable for the hidden path) — see SumAccumulatorTable
+        # docstring for the rationale.
+        assert isinstance(logits_table, gen.SumAccumulatorTable)
         assert logits_table.means.shape == (64, 32000)
         assert logits_table.means.dtype == np.float32
         # The two tables share the xxhash row-population pattern by
@@ -1448,7 +1653,7 @@ class TestSaveTeacherLogits:
             np.array([0, 1, 2], dtype=np.int64),
             np.ones((3, 4), dtype=np.float32),
         )
-        logits_table = gen.WelfordTable.zeros(8, 16)
+        logits_table = gen.SumAccumulatorTable.zeros(8, 16)
         logits_table.update_batch(
             np.array([0, 1, 2], dtype=np.int64),
             np.ones((3, 16), dtype=np.float32),
@@ -1499,7 +1704,7 @@ class TestSaveTeacherLogits:
             np.array([0, 1, 2], dtype=np.int64),
             np.ones((3, 4), dtype=np.float32),
         )
-        logits_table = gen.WelfordTable.zeros(8, 16)
+        logits_table = gen.SumAccumulatorTable.zeros(8, 16)
         logits_table.update_batch(
             np.array([0, 1, 2], dtype=np.int64),
             np.ones((3, 16), dtype=np.float32),
@@ -1576,7 +1781,7 @@ class TestSaveTeacherLogits:
             np.array([0, 1, 2, 3], dtype=np.int64),
             np.ones((4, 4), dtype=np.float32),
         )
-        logits_table = gen.WelfordTable.zeros(8, 16)
+        logits_table = gen.SumAccumulatorTable.zeros(8, 16)
         logits_table.update_batch(
             np.array([0, 1, 2], dtype=np.int64),
             np.ones((3, 16), dtype=np.float32),
