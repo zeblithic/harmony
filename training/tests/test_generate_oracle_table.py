@@ -1408,6 +1408,30 @@ class TestSaveTeacherLogits:
             rtol=0, atol=1e-6,
         )
 
+    def test_main_rejects_teacher_logits_output_without_save_flag(
+        self, capsys, tmp_path,
+    ):
+        """--teacher-logits-output is only consulted when
+        --save-teacher-logits is set, so passing the override without
+        the flag silently produces no sidecar — a footgun where the
+        user expects the path to be honored. main() must fail-fast
+        with rc=2 (CLI misuse) before any teacher load."""
+        import ct87.generate_oracle_table as gen
+
+        rc = gen.main([
+            "--dataset", "/tmp/ignored",
+            "--output", str(tmp_path / "oracle.safetensors"),
+            # Override path passed but flag NOT set — should reject.
+            "--teacher-logits-output",
+            str(tmp_path / "explicit_sidecar.safetensors"),
+            "--entries", "8",
+            "--engram-dim", "2",
+        ])
+        assert rc == 2, "expected rc=2 (CLI misuse) on flag/path inconsistency"
+        captured = capsys.readouterr()
+        assert "--teacher-logits-output" in captured.err
+        assert "--save-teacher-logits" in captured.err
+
     def test_main_rejects_path_aliasing_between_oracle_and_sidecar(
         self, monkeypatch, tmp_path,
     ):
@@ -1513,19 +1537,27 @@ class TestSaveTeacherLogits:
                 "--pca-subsample-fraction", "1.0",
             ])
 
-        # Atomic-write contract: nothing should remain on disk.
+        # Atomic-write contract: nothing should remain on disk. The
+        # .tmp filenames now include PID for concurrent-run safety, so
+        # glob the pattern instead of hardcoding the literal name.
         assert not out_path.exists(), (
             "oracle.safetensors must not exist when sidecar save fails"
         )
-        assert not (tmp_path / "oracle.safetensors.tmp").exists(), (
-            "oracle.safetensors.tmp must be cleaned up after sidecar failure"
+        oracle_tmps = list(tmp_path.glob("oracle.safetensors.*.tmp"))
+        assert oracle_tmps == [], (
+            f"oracle .tmp files must be cleaned up after sidecar "
+            f"failure; leaked: {oracle_tmps}"
         )
         assert not sidecar_path.exists(), (
             "sidecar must not exist (it was the one that failed)"
         )
-        assert not (
-            tmp_path / "oracle_teacher_logits.safetensors.tmp"
-        ).exists(), "sidecar .tmp must be cleaned up too"
+        sidecar_tmps = list(
+            tmp_path.glob("oracle_teacher_logits.safetensors.*.tmp"),
+        )
+        assert sidecar_tmps == [], (
+            f"sidecar .tmp files must be cleaned up too; leaked: "
+            f"{sidecar_tmps}"
+        )
 
     def test_main_does_not_write_oracle_when_logits_parity_fails(
         self, monkeypatch, tmp_path,

@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -1410,6 +1411,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.entries <= 0 or args.engram_dim <= 0:
         print("Error: --entries and --engram-dim must be positive", file=sys.stderr)
         return 2
+    # `--teacher-logits-output` is only consulted when `--save-teacher-
+    # logits` is set, so passing the override without the flag silently
+    # has no effect — a footgun where the user expects the sidecar at
+    # the explicit path and gets nothing. Fail fast instead.
+    if args.teacher_logits_output and not args.save_teacher_logits:
+        print(
+            "Error: --teacher-logits-output "
+            f"({args.teacher_logits_output!r}) was set without "
+            "--save-teacher-logits. The sidecar path is only consulted "
+            "when --save-teacher-logits is enabled — pass both flags or "
+            "drop --teacher-logits-output to avoid the misconfiguration.",
+            file=sys.stderr,
+        )
+        return 2
 
     # argparse already validated --hash-seeds via type=parse_hash_seeds.
     seeds = args.hash_seeds
@@ -1504,25 +1519,44 @@ def main(argv: list[str] | None = None) -> int:
         table.means, components, mean_vector, populated_mask=populated_mask,
     )
 
-    # Atomic two-file write: stage both saves to .tmp siblings in the
-    # target dir, then `Path.replace()` (atomic rename on POSIX) into
-    # place only after BOTH saves succeed. This protects the run output
-    # from leaving the oracle on disk without its matching sidecar (or
-    # vice versa) if a save fails mid-way (disk full, permission,
-    # KeyboardInterrupt, ...). Safetensors itself doesn't tempfile-and-
-    # rename internally, so a partial .safetensors file would otherwise
-    # be possible.
+    # Atomic two-file write: stage both saves to per-PID .tmp siblings
+    # in the target dir, then `Path.replace()` (atomic rename on POSIX)
+    # into place only after BOTH saves succeed. This protects the run
+    # output from leaving the oracle on disk without its matching
+    # sidecar (or vice versa) if a save fails mid-way (disk full,
+    # permission, KeyboardInterrupt, ...). Safetensors itself doesn't
+    # tempfile-and-rename internally, so a partial .safetensors file
+    # would otherwise be possible.
     #
-    # Caveat: the OS doesn't provide multi-file atomic rename — if the
-    # second `replace()` fails after the first succeeds, the oracle
-    # ends up on disk without the sidecar. The window is microseconds
-    # on the same filesystem; in practice if it happens the user has
-    # bigger problems (FS error). The except path below cleans up any
-    # surviving .tmp files but doesn't roll back a successful first
-    # rename.
-    oracle_tmp = Path(str(args.output) + ".tmp")
+    # PID in the .tmp suffix: protects against accidental concurrent
+    # invocations against the same `--output`. Without it, two parallel
+    # runs would both write to `oracle.safetensors.tmp` and clobber
+    # each other. With it, each run owns its own staging files. (Stale
+    # PID-named .tmp files from crashed prior runs still need manual
+    # cleanup — accepted; the alternative of auto-cleanup at startup
+    # would be racy with concurrent runs we just made safe.)
+    #
+    # Rename order — sidecar FIRST, oracle LAST. Downstream consumers
+    # treat the oracle as the primary artifact (KL training opens
+    # `oracle.safetensors` first, then looks for the sidecar next to
+    # it). Renaming the oracle last guarantees consumers never see the
+    # transient state where the oracle exists at its final path but
+    # the sidecar doesn't exist yet (the inverse — sidecar present
+    # without oracle — is harmless because consumers don't check for
+    # the sidecar in isolation).
+    #
+    # Caveat: the OS doesn't provide multi-file atomic rename. If the
+    # second `replace()` fails after the first succeeds (microsecond
+    # window, same filesystem), the sidecar ends up on disk without
+    # the oracle — but consumers won't pick it up because they look
+    # for the oracle first. Strictly worse than success but strictly
+    # better than the inverse failure mode. The except path below
+    # cleans up any surviving .tmp files but doesn't roll back a
+    # successful first rename.
+    pid_suffix = f".{os.getpid()}.tmp"
+    oracle_tmp = Path(str(args.output) + pid_suffix)
     sidecar_tmp = (
-        Path(str(teacher_logits_sidecar_path) + ".tmp")
+        Path(str(teacher_logits_sidecar_path) + pid_suffix)
         if teacher_logits_sidecar_path is not None
         else None
     )
@@ -1530,9 +1564,9 @@ def main(argv: list[str] | None = None) -> int:
         save_oracle_table(projected, oracle_tmp)
         if teacher_logits_sidecar_path is not None:
             save_teacher_logits_sidecar(logits_table.means, sidecar_tmp)
-        oracle_tmp.replace(args.output)
         if sidecar_tmp is not None:
             sidecar_tmp.replace(teacher_logits_sidecar_path)
+        oracle_tmp.replace(args.output)
     except BaseException:
         # BaseException catches KeyboardInterrupt / SystemExit too —
         # those are the most likely interruption sources during a
@@ -1545,9 +1579,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Make the final-state paths obvious in the log (the save_* prints
     # above show the .tmp staging paths, which can read as confusing).
-    print(f"Atomic-rename → {args.output}", flush=True)
     if teacher_logits_sidecar_path is not None:
         print(f"Atomic-rename → {teacher_logits_sidecar_path}", flush=True)
+    print(f"Atomic-rename → {args.output}", flush=True)
 
     # Sidecar JSON makes the provenance traceable without reading the
     # safetensors, which is handy when diffing diagnostic runs.
