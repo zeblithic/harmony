@@ -387,9 +387,6 @@ class GpuSumAccumulatorTable:
             dtype=torch_module.long,
             device=device,
         )
-        # Cached on first counts query so we don't repeatedly transfer
-        # an [10K] tensor across PCIe per-batch print loop.
-        self._populated_count_cache: int | None = None
 
     @classmethod
     def zeros(
@@ -436,7 +433,6 @@ class GpuSumAccumulatorTable:
         # Counts: scatter +1 per index. ones_like(indices) lives on the
         # same device as indices, so this stays GPU-resident.
         self._counts.index_add_(0, indices, self._torch.ones_like(indices))
-        self._populated_count_cache = None
 
     @property
     def means(self) -> np.ndarray:
@@ -1303,9 +1299,18 @@ def process_batch(
                         chunk_np.astype(np.float32, copy=False),
                     )
                     del chunk_gpu
-            del logits_gpu, bs_t, ps_t
-            if device.startswith("cuda"):
-                torch_module.cuda.empty_cache()
+            del bs_t, ps_t
+
+    # `logits_gpu` cleanup must happen REGARDLESS of whether
+    # `batch_indices` is empty — without this, an all-padded batch (no
+    # bigrams in any sequence) would leak the full [B, T, vocab] GPU
+    # tensor reference until function return, holding ~2 GB of VRAM
+    # that should have been freed alongside `outputs` above. Cursor
+    # Bugbot caught this on PR #255 round-6.
+    if logits_gpu is not None:
+        del logits_gpu
+        if device.startswith("cuda"):
+            torch_module.cuda.empty_cache()
 
     return sum(real_lens)
 
