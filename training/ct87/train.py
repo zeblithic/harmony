@@ -60,9 +60,19 @@ def make_hf_dataloader(
     (the minimum needed for one input/target pair).
     """
     import numpy as np
-    from datasets import load_from_disk
+    from datasets import DatasetDict, load_from_disk
 
     dataset = load_from_disk(data_path)
+    # load_from_disk returns a DatasetDict when data_path points at a
+    # multi-split container. Our callers always want a single split — fail
+    # with an actionable hint rather than an opaque AttributeError on .data.
+    if isinstance(dataset, DatasetDict):
+        splits = ", ".join(dataset.keys())
+        raise ValueError(
+            f"load_from_disk({data_path!r}) returned a DatasetDict with splits "
+            f"[{splits}]. Pass a split directory such as {data_path}/train or "
+            f"{data_path}/val instead."
+        )
     # Drop to the underlying pyarrow table to bypass HF 4.8's Column wrapper
     # (which no longer returns numpy directly even with set_format). Works
     # uniformly for FixedSizeList (new prep output) and variable-length List

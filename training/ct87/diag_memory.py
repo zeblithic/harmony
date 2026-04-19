@@ -21,7 +21,20 @@ import sys
 
 
 def rss_kb() -> int:
-    with open(f"/proc/{os.getpid()}/status") as f:
+    """Current RSS in KB via /proc. This diagnostic targets the tokenizer +
+    pyarrow heap-growth regime on Linux/WSL; /proc is the cleanest source of
+    *current* (not peak) RSS, and the leak patterns we're investigating
+    are glibc-specific anyway. Fail loudly on platforms without /proc rather
+    than silently fall back to resource.getrusage.ru_maxrss (which is peak,
+    not current — a confusing semantic shift for a memory-growth diagnostic)."""
+    status_path = f"/proc/{os.getpid()}/status"
+    if not os.path.exists(status_path):
+        raise RuntimeError(
+            "ct87.diag_memory requires /proc (Linux/WSL). "
+            "The leak patterns it reproduces are glibc-specific and the "
+            "script has no meaningful fallback on other platforms."
+        )
+    with open(status_path) as f:
         for line in f:
             if line.startswith("VmRSS:"):
                 return int(line.split()[1])

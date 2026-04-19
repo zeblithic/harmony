@@ -75,6 +75,15 @@ def run_prepare_data(
     Returns a stats dict with content_tokens, stream_tokens,
     num_documents, num_train_chunks, and num_val_chunks.
     """
+    # Fail fast on nonsense parameters — these would otherwise surface hours
+    # later after tokenization finishes, burning the entire CPU+network pass.
+    if not isinstance(seq_len, int) or seq_len <= 0:
+        raise ValueError(f"seq_len must be a positive integer, got {seq_len!r}")
+    if not 0.0 <= float(val_fraction) < 1.0:
+        raise ValueError(
+            f"val_fraction must be in [0.0, 1.0), got {val_fraction!r}"
+        )
+
     import array
     import ctypes
     import gc
@@ -111,16 +120,12 @@ def run_prepare_data(
         def _malloc_trim() -> None:
             pass
 
-    try:
-        import pyarrow as _pa
-        _pa_pool = _pa.default_memory_pool()
-    except (ImportError, AttributeError):
-        _pa_pool = None
+    # pa is imported unconditionally above — the pool is always available.
+    _pa_pool = pa.default_memory_pool()
 
     def _release_unused_heap() -> None:
         gc.collect()
-        if _pa_pool is not None:
-            _pa_pool.release_unused()
+        _pa_pool.release_unused()
         _malloc_trim()
 
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")

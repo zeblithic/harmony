@@ -52,8 +52,14 @@ while kill -0 "$PID" 2>/dev/null; do
     sleep "$INTERVAL"
 done
 
-wait "$PID"
-RC=$?
+# Wrap `wait` in an if/else so `set -e` doesn't abort the script when the
+# prep exits non-zero — we still want to log the exit code and close out
+# the CSV for post-mortem analysis of a failed run.
+if wait "$PID"; then
+    RC=0
+else
+    RC=$?
+fi
 echo "EXIT=$RC TS=$(date +%s)" >> "$RSS_CSV"
 echo "DONE rc=$RC"
 exit "$RC"

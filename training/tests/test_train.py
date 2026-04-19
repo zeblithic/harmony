@@ -110,6 +110,24 @@ class TestHfDataloaderGuard:
             with pytest.raises(ValueError, match="tokens are needed"):
                 make_hf_dataloader(tmpdir, seq_len=16, batch_size=1)
 
+    def test_datasetdict_raises_friendly_error(self):
+        """load_from_disk returns a DatasetDict when pointed at a multi-split
+        directory; make_hf_dataloader should fail with an actionable hint
+        instead of an opaque AttributeError on .data."""
+        from ct87.train import make_hf_dataloader
+        from datasets import Dataset, DatasetDict
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dd = DatasetDict(
+                {
+                    "train": Dataset.from_dict({"input_ids": [[1, 2, 3, 4]]}),
+                    "val": Dataset.from_dict({"input_ids": [[5, 6, 7, 8]]}),
+                }
+            )
+            dd.save_to_disk(tmpdir)
+            with pytest.raises(ValueError, match="DatasetDict"):
+                make_hf_dataloader(tmpdir, seq_len=2, batch_size=1)
+
     def test_zero_rows_raises_friendly_error(self):
         """A valid-but-empty dataset raises the informative ValueError instead
         of numpy's `need at least one array to concatenate`. This case hits
