@@ -44,22 +44,33 @@ def make_hf_dataloader(
 ) -> Iterator[torch.Tensor]:
     """Infinite dataloader from a pre-tokenized HuggingFace dataset.
 
-    Loads the dataset eagerly, concatenates all token sequences into one
-    long stream, then returns an iterator that yields random windows of
-    [seq_len + 1] tokens packed into batches.
+    Builds a flat token stream over the on-disk arrow data and yields random
+    windows of [seq_len + 1] tokens packed into batches.
+
+    The stream is held as an int32 torch tensor viewing the arrow buffer
+    (12 B per 3 B tokens) instead of a Python list (~108 GB for the same —
+    list[int] + torch.tensor(list) materializes a PyLong per token and OOMs
+    on multi-billion-token corpora). Batches are cast to int64 at yield time
+    for compatibility with nn.Embedding.
 
     Raises ValueError if the dataset has fewer tokens than seq_len + 1
     (the minimum needed for one input/target pair).
     """
+    import numpy as np
     from datasets import load_from_disk
 
     dataset = load_from_disk(data_path)
-    all_tokens: list[int] = []
-    for example in dataset:
-        all_tokens.extend(example["input_ids"])
-
-    all_tokens_t = torch.tensor(all_tokens, dtype=torch.long)
-    total = len(all_tokens_t)
+    # Drop to the underlying pyarrow table to bypass HF 4.8's Column wrapper
+    # (which no longer returns numpy directly even with set_format). Works
+    # uniformly for FixedSizeList (new prep output) and variable-length List
+    # (legacy POC); both expose .values on each chunk as a flat int32 array.
+    col = dataset.data.column("input_ids")
+    flat = np.concatenate([
+        chunk.values.to_numpy(zero_copy_only=True).astype(np.int32, copy=False)
+        for chunk in col.chunks
+    ])
+    all_tokens_t = torch.from_numpy(flat)
+    total = all_tokens_t.numel()
     window = seq_len + 1
 
     if total < window:
@@ -70,12 +81,17 @@ def make_hf_dataloader(
         )
 
     def _iter() -> Iterator[torch.Tensor]:
+        # Keeps the arrow table and the concatenated buffer alive for the
+        # lifetime of the iterator (torch.from_numpy refs the numpy array, but
+        # holding `dataset` explicitly is defensive insurance against HF's
+        # internals closing mmap handles mid-run).
+        _keep_alive = (dataset, flat)  # noqa: F841
         rng = torch.Generator()
         rng.manual_seed(seed)
         while True:
             starts = torch.randint(0, total - window + 1, (batch_size,), generator=rng)
             batch = torch.stack([all_tokens_t[s : s + window] for s in starts])
-            yield batch
+            yield batch.to(torch.long)
 
     return _iter()
 
