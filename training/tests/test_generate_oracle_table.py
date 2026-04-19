@@ -1494,7 +1494,7 @@ class TestSaveTeacherLogits:
 
         # Sidecar save raises — simulates disk full, permission, etc.
         def _stub_sidecar_fail(*_a, **_k):
-            raise IOError("simulated sidecar write failure")
+            raise OSError("simulated sidecar write failure")
         monkeypatch.setattr(
             gen, "save_teacher_logits_sidecar", _stub_sidecar_fail,
         )
@@ -1502,7 +1502,7 @@ class TestSaveTeacherLogits:
         out_path = tmp_path / "oracle.safetensors"
         sidecar_path = tmp_path / "oracle_teacher_logits.safetensors"
 
-        with pytest.raises(IOError, match="simulated sidecar write failure"):
+        with pytest.raises(OSError, match="simulated sidecar write failure"):
             gen.main([
                 "--dataset", "/tmp/ignored",
                 "--output", str(out_path),

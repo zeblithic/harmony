@@ -59,6 +59,7 @@ from near-empty directions; PCA isolates the signal. See the same doc,
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 import time
 from dataclasses import dataclass
@@ -443,6 +444,7 @@ def load_and_validate_teacher(
     dtype: str,
     expected_vocab_size: int,
     layer_index: int,
+    *,
     save_teacher_logits: bool = False,
 ):
     """Load the teacher, validate vocab parity, resolve and validate --layer.
@@ -1064,6 +1066,7 @@ def run_teacher_pass(
     device: str | None,
     dtype: str,
     expected_vocab_size: int = DEFAULT_EXPECTED_VOCAB_SIZE,
+    *,
     save_teacher_logits: bool = False,
 ) -> tuple[WelfordTable, WelfordTable | None]:
     """Drive the full teacher forward pass, accumulating Welford means.
@@ -1367,7 +1370,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "--teacher-logits-output). Required by ZEB-139 KL-retrofit "
             "training. Forces the HF teacher to load via "
             "AutoModelForCausalLM (vs AutoModel) so lm_head is available; "
-            "adds ~1.28GB CPU-resident accumulator at 10K rows × 32K "
+            "adds ~1.28GB CPU-resident accumulator at 10K rows x 32K "
             "vocab. Not supported with --teacher harmony:."
         ),
     )
@@ -1536,10 +1539,8 @@ def main(argv: list[str] | None = None) -> int:
         # multi-GB safetensors write.
         for p in (oracle_tmp, sidecar_tmp):
             if p is not None:
-                try:
+                with contextlib.suppress(OSError):
                     p.unlink(missing_ok=True)
-                except OSError:
-                    pass
         raise
 
     # Make the final-state paths obvious in the log (the save_* prints
